@@ -250,25 +250,30 @@ pub(crate) struct RuntimeProvenance<'a> {
     pub device_target: Option<&'a str>,
 }
 
-impl RuntimeProvenance<'_> {
+impl<'a> RuntimeProvenance<'a> {
+    /// Each fact as `(name, recorded value)`, in display order, with `None` for
+    /// a fact that was not recorded.
+    ///
+    /// The one place the names and their order are written down:
+    /// [`Self::fields`] shows these, and `rocm runtimes list --json` writes them
+    /// as its `provenance` object, with `null` for `None`.
+    pub(crate) const fn recorded_fields(&self) -> [(&'static str, Option<&'a str>); 4] {
+        [
+            ("channel", self.channel),
+            ("source", self.source),
+            ("source_layout_generation", self.source_layout_generation),
+            ("device_target", self.device_target),
+        ]
+    }
+
     /// Each fact as `(name, shown value)`, in display order, with
     /// [`UNRECORDED_PROVENANCE`] for a fact that was not recorded.
     ///
     /// `rocm runtimes list` and `rocm examine` both print from this, so the
     /// names and values the two show for one runtime cannot drift apart.
-    pub(crate) fn fields(&self) -> [(&'static str, &str); 4] {
-        fn shown(value: Option<&str>) -> &str {
-            value.unwrap_or(UNRECORDED_PROVENANCE)
-        }
-        [
-            ("channel", shown(self.channel)),
-            ("source", shown(self.source)),
-            (
-                "source_layout_generation",
-                shown(self.source_layout_generation),
-            ),
-            ("device_target", shown(self.device_target)),
-        ]
+    pub(crate) fn fields(&self) -> [(&'static str, &'a str); 4] {
+        self.recorded_fields()
+            .map(|(name, value)| (name, value.unwrap_or(UNRECORDED_PROVENANCE)))
     }
 }
 
@@ -768,8 +773,15 @@ pub(crate) fn select_runtime_manifest<'a>(
 pub(crate) fn runtime_usability_status(manifest: &InstalledRuntimeManifest) -> String {
     match validate_runtime_manifest_for_activation(manifest) {
         Ok(()) => "ready".to_owned(),
-        Err(error) => format!("unusable ({error})"),
+        Err(error) => unusable_status_text(&error.to_string()),
     }
+}
+
+/// How the text reports name a runtime that fails the manifest check
+/// activation applies, given the reason it fails it. `rocm runtimes list`
+/// prints the same words from the reason it also carries in its JSON.
+pub(crate) fn unusable_status_text(reason: &str) -> String {
+    format!("unusable ({reason})")
 }
 
 pub(crate) fn validate_runtime_manifest_for_activation(
