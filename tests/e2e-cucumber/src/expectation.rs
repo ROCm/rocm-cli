@@ -2357,7 +2357,8 @@ flaky = true
         ));
     }
 
-    /// The two rows for Lemonade 11.5.1's failed backend alignment apply to native
+    /// The two rows for the Windows Lemonade backend problems (written while 11.5.1
+    /// was pinned, kept until a nightly shows them stale) apply to native
     /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
     /// default engine is vLLM, where the engine named is what decides), and they are not
     /// `flaky` (an XPASS means the cause is gone and the row is stale). Neither sets

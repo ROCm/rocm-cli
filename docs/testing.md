@@ -2050,6 +2050,31 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
   disk that nothing was downloaded. That variable also waives serve's no-GPU
   refusal, as serve-18's failure hook does.
+- `lemonade-installs-07` (Linux) reaches the refusal of a host whose glibc
+  or OpenSSL falls short of what the pinned `lemond` needs. It reports an
+  Ubuntu 20.04-like host through `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and
+  `ROCM_E2E_LEMONADE_HOST_OPENSSL=missing` (same `rocm/e2e-test-hooks` build):
+  glibc 2.31, and no `libssl.so.3` in the loader cache because only OpenSSL 1.1
+  is installed. It checks that the message names what each library needs and
+  what the host has, and that nothing was downloaded. The probe itself,
+  including a planted `ldconfig -p` that lists `libc.so.6` but no
+  `libssl.so.3`, and refusing to start `lemond` on such a host are unit-tested
+  in [host_libraries.rs](../engines/lemonade/src/host_libraries.rs) and
+  [process.rs](../engines/lemonade/src/process.rs). No scenario reaches the
+  start-time refusal: `rocm serve` runs the install check first, a Linux serve
+  with a packaged `llama-server` never starts `lemond`, and the mock lane has
+  no GPU for serve to resolve.
+- `lemonade-installs-08` (Linux) sets the same old-host hooks plus
+  `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`, and reports the drive
+  nearly full. It checks that the shortfall is printed as a warning naming the
+  variable, and that the install went on past the check to the space refusal
+  without downloading anything. The opt-out on the `lemond` start is
+  unit-tested in [process.rs](../engines/lemonade/src/process.rs).
+- `lemonade-installs-09` (Linux) plants a tree of the pinned Lemonade in the
+  data folder, reads the pinned version from a first refused run, and re-runs
+  the install on the old-host hooks. It checks that the refusal says the
+  installed copy stays as it is rather than "Nothing was downloaded.", and that
+  every file of the planted tree is unchanged.
 - `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
   and checks `rocm storage report` lists both and flags the unused one.
 - `lemonade-installs-04` uninstalls that runtime and checks the install record
@@ -2528,6 +2553,30 @@ has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
 lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
+
+Lemonade backend selection and alignment focused tests (reading the
+`llamacpp` rows out of `lemonade backends` when other recipes have indented
+rows of their own, and the second alignment attempt choosing the newest
+`lemonade-sdk/llama.cpp` release that ships the archive for the active ROCm
+version rather than the newest release, and reading Lemonade's
+`update_required`/`update_available` backend states, and skipping a warning
+line inside the table, even one with a state word in it):
+
+```bash
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::parse
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::another_recipes_backend
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::update_states
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_warning
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_field_wider
+cargo test -p rocm-engine-lemonade backend_alignment::tests::tier2
+cargo test -p rocm-engine-lemonade backend_alignment::tests::align_falls_through_to_tier2
+cargo test -p rocm-engine-lemonade backend_alignment::tests::llamacpp_asset_name
+```
+
+They run on fixtures: the `lemonade backends` table Lemonade 2026.44.1 prints,
+and a release listing shaped like the real one. The live paths (a real
+`lemond`, the GitHub listing, a real backend install) run only on the gated
+Lemonade GPU lanes.
 
 Engine recipe adapter contract focused tests:
 
@@ -3270,6 +3319,64 @@ is registered for Linux, Windows and WSL and only adds to that score.
 `a_library_load_error_alone_raises_the_wheel_mismatch_on_every_family` in
 [host.rs](../crates/rocm-core/src/diagnose/host.rs) holds that for all three
 families.
+
+When a fix's own command does not succeed, `rocm fix` exits 4 and prints one
+line on stderr, built from how the command ended
+(`Step` in [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs)):
+
+| How the command ended | What the line says |
+|---|---|
+| exited non-zero, or could not be started | it exited `N` (or could not be started), and the change was NOT made |
+| timed out (60s for a change), or was stopped by a signal or a failed wait | it was stopped, the change may or may not have been made, how to check it (`Check with` a shell command on Linux, `Check in PowerShell with` an expression on Windows), and the `rocm fix` command to re-run |
+| a Windows read of the current value did not complete (8s) | it could not read the current value, and nothing was changed; the runner stops before its preview of the change or any prompt, under `--dry-run` too; the catalog entry printed before it still appears |
+
+Each row for each runner is unit-tested with an injected command runner in
+[fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) and
+[fix/consent.rs](../crates/rocm-core/src/fix/consent.rs), on every host. The
+scenarios in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-68`
+(it never finishes) stand a fake `sudo` on a restricted `PATH` that records the
+arguments it was given, and assert the line together with the exit code, that
+the helper was asked to add the user to the groups, and that the success line is
+absent. Both are `@requires-os:linux @requires-bare-metal`. `diagnose-68`
+waits out the real one-minute bound; there is no switch to shorten it. The step
+waits for the CLI on a blocking thread (`run_rocm_with_scenario_env_off_executor`
+in [e2e.rs](../tests/e2e-cucumber/tests/e2e.rs)): the whole suite is polled on
+one thread, so a synchronous wait would stall every concurrent scenario for that
+minute and push the TUI scenarios past their wall-clock caps.
+
+On Windows, `diagnose-39` (fix-6), `diagnose-69` (fix-2) and `diagnose-70`
+(fix-9 with `--device-index 1`, run as a `--dry-run`) give the CLI an empty
+`PATH`, so its PowerShell read cannot start. They assert exit 4 and the
+read-failure line, and that the runner went no further: no `Plan: ...` preview
+of the change for fix-6 and fix-9, and no report that fix-2's variable is
+absent. The catalog entry `rocm fix` prints before the runner still appears. The
+empty `PATH` denies PowerShell only: Rust's `Command` looks for a bare program
+name in the CLI's own directory, System32 and the Windows directory before
+`PATH`, so `setx.exe` (in System32) is still found, while `powershell.exe` (in a
+System32 subdirectory) is not. None of the three can write the runner's real
+User environment even if the read guard regressed: fix-6 writes through
+PowerShell, which cannot start; fix-2 would read both scopes as unset and find
+nothing to clear, so it never reaches its `setx`; and `diagnose-70` is a dry
+run, which never runs `setx`. The fix-9 path that does write is held by the unit
+tests. These three run only on the self-hosted Strix Halo Windows lanes, neither
+of which is a required check: `E2E tests (Strix Halo, Windows, <sdk>)`
+(`e2e-gpu-strix-windows` in
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), on a pull request
+that touches its `serve` paths, on pushes and in the merge queue) and `E2E tests
+(Strix Halo, Windows, incl. nightly-only)` (`e2e-gpu-nightly-strix-windows` in
+[nightly.yml](../.github/workflows/nightly.yml)). The required hosted Windows
+lane (`windows-release` in [ci.yml](../.github/workflows/ci.yml), behind
+`windows-build-and-test`) runs only `@lifecycle` scenarios and the ids in its
+`E2E_ALSO_RUN_IDS`, which do not include them. The Linux lanes compile them. No
+scenario times out a Windows `setx` or PowerShell write: those rows are covered
+by the unit tests. To run the two Linux scenarios on a bare-metal Linux host
+(`-n` skips the tag gates, so on WSL2 they fail at the platform refusal
+instead):
+
+```bash
+cargo xtask e2e -- -n '(diagnose-15|diagnose-68) '
+```
 
 Provider audit focused test:
 

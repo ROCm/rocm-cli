@@ -220,6 +220,39 @@ against mistakes, not evasion. The runner is registered to this repository
 alone, so no runner group reaches it. See
 [nightly-on-the-queue.md](nightly-on-the-queue.md).
 
+`e2e-gpu` starts with a stale-run guard (`pull_request` only). Once the job
+has a runner it asks the API for the PR's state and current head. If the PR is
+closed, or its head differs from the event's head sha, it records `stale` and
+skips every remaining step without failing the job, so the MI300X is free
+within seconds. It is a step because a job-level `if` is evaluated before the
+job is queued. The guard only reads (`pull-requests: read`); it holds no write
+token, because the job runs PR code on a persistent runner. A second job,
+`cancel-stale-run`, on a GitHub-hosted runner with no checkout and
+`actions: write`, then cancels the run, which frees the PR's concurrency group
+and stops its other stale lanes. That follows the split this document already
+draws between internal and external contributors: only a same-repo PR is sent a
+cancel, while a fork PR (an external contributor, whose hardware lanes are held
+for approval where the repository setting requires it, with a read-only token) just has `e2e-gpu`
+skip its steps and the rest of its run continue. A failed cancel is tolerated.
+The consolidated report does not count a lane that skipped itself as a missing
+report, and says so in its summary. `e2e-report` is gated on `always()`, so it
+still runs after the cancel, but its missing-report check is gated on
+`!cancelled()` and is skipped in a cancelled run. The exemption is therefore for
+runs that are not cancelled: a fork PR (no cancel is sent), or a cancel that
+fails or loses a race with the check. If the PR cannot be read, the job runs as
+before. Only the MI300X lane is guarded: a stale run whose MI300X job already
+finished, or never gets to run, keeps its queued Strix jobs until something else
+cancels them. A consequence: a re-run of an older run, or of a PR's run after it
+merged, cancels itself at this step; to test a specific commit on MI300X, push a
+branch or tag at it and use `workflow_dispatch` on that.
+
+The guard treats any API head that differs from the event's as newer, so a read
+that lags a fresh push can end a current run and, for a same-repo PR, cancel all
+of it, non-blocking lanes included. To recover, re-run the cancelled run from the
+Actions tab ("Re-run all jobs"): by then the API reports the current head, so the
+guard passes. If the PR has moved on or merged since, a re-run would cancel
+itself again; use `workflow_dispatch` on the branch instead.
+
 `e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
@@ -460,7 +493,9 @@ listed `pull_request` activity type) that joins that PR's group and runs only a
 no-op job, so it supersedes the PR's earlier run and frees runners where the
 cancel completes. A run whose job is still queued for a runner may not finish
 cancelling, so it can keep its place in the queue until the runner picks the
-job up.
+job up. For a same-repo PR whose MI300X job is that one, its stale-run guard
+(see Platforms) ends the job as its first step and a hosted job cancels the run;
+the Strix lanes carry no guard.
 
 On a release-branch push, every self-hosted GPU job additionally expands into
 a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three
@@ -621,7 +656,8 @@ it reports. They run with `continue-on-error: false`, so a real
 regression shows red instead of always green. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
-job, naming the lane, rather than silently dropping out of the grid; on a
+job, naming the lane, rather than silently dropping out of the grid (a lane that
+skipped itself as stale is the exception); on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
 
@@ -663,9 +699,14 @@ required list.
 
 Self-hosted runners are not used for untrusted fork pull requests: GitHub
 does not dispatch self-hosted-runner jobs from an external fork's
-`pull_request` event without explicit approval. The hardware jobs only run
+`pull_request` event without approval (see the repository setting below). The hardware jobs only run
 against branches and PRs within the repository (and on `workflow_dispatch`,
-which requires write access to trigger).
+which requires write access to trigger), unless a maintainer approves a fork
+run (see below). A same-repo PR's token can be granted write scopes, and only the
+GitHub-hosted `cancel-stale-run` job holds one (`actions: write`) in
+`e2e-selfhosted.yml`; the self-hosted jobs, which run PR code, hold read scopes
+only. Whether GitHub requires approval for every fork run or only a first-time
+contributor's is a repository setting, not something these workflows control.
 
 That holds for every self-hosted runner here, and so does its limit: approval
 does not change what an approved fork job may do, and labels do not restrict
