@@ -1653,6 +1653,77 @@ mod tests {
         }
     }
 
+    /// A shared pool is compared against, and said to be shared.
+    ///
+    /// `Unified` is the one memory state that both carries a figure and is not
+    /// a dedicated allocation, so it is the one state where a bare `FITS` would
+    /// mislead: the number compared against is a ceiling on memory the
+    /// operating system draws from too. Three things are pinned here, because
+    /// each can break on its own:
+    ///
+    /// - the comparison happens at all (`Unified` must not fall into the
+    ///   `measured_gib() == None` arm and be declined),
+    /// - it is made against the pool, not the carve-out beside it -- the
+    ///   carve-out here is far below the model's own weights, so a `Fits`
+    ///   proves the figure used was the pool,
+    /// - and the note that says the figure is shared is present for `Unified`
+    ///   and absent for a dedicated card and for an unreadable one.
+    ///
+    /// The last is why the non-`Unified` half is here: deleting the
+    /// `is_shared_pool()` block outright left every test in this file green
+    /// before this one existed, and a test that only asserted presence would
+    /// still pass against a block that pushed the note unconditionally.
+    #[test]
+    fn a_shared_pool_is_compared_against_its_ceiling_and_said_to_be_shared() {
+        const SHARED: &str = "shares with the operating system";
+        let (header, size) = llama(GIB_U as usize / 1024);
+
+        let shared = estimate(
+            &header,
+            size,
+            4096,
+            KvCacheType::F16,
+            AcceleratorMemory::Unified {
+                gtt_total_gib: 24.0,
+                // Far below the model's own weights: were THIS the figure
+                // compared against, the outcome below could not be `Fits`.
+                vram_carveout_gib: Some(0.5),
+            },
+        );
+        assert_eq!(
+            shared.outcome,
+            EstimateOutcome::Fits,
+            "a readable pool is a measurement, so the estimate must be made, not declined: {:?}",
+            shared.detail
+        );
+        assert_eq!(
+            shared.available_gib,
+            Some(24.0),
+            "the estimate was compared against the carve-out, not the pool the engine allocates \
+             from"
+        );
+        assert!(
+            shared.notes.iter().any(|note| note.contains(SHARED)),
+            "a bare FITS against a shared ceiling reads as memory set aside for the model: {:?}",
+            shared.notes
+        );
+
+        // The other two states that reach this code with the same model: one
+        // with a real dedicated pool, one with no figure at all. Neither may
+        // carry the note.
+        for memory in [
+            AcceleratorMemory::Dedicated(24.0),
+            AcceleratorMemory::Unknown,
+        ] {
+            let result = estimate(&header, size, 4096, KvCacheType::F16, memory);
+            assert!(
+                !result.notes.iter().any(|note| note.contains(SHARED)),
+                "{memory:?} was told its memory is shared with the operating system: {:?}",
+                result.notes
+            );
+        }
+    }
+
     #[test]
     fn suggestions_name_a_quantized_kv_cache_only_when_it_would_fit() {
         let (header, size) = llama(GIB_U as usize / 1024);
