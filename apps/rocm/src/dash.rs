@@ -212,9 +212,11 @@ fn runtime_summaries(paths: &AppPaths, config: &RocmCliConfig) -> Vec<RuntimeSum
     let active_key = config.active_runtime_key.as_deref();
     let prev_key = config.previous_runtime_key.as_deref();
     let default_id = config.default_runtime_id.as_deref();
-    // Mirror `render_runtimes_text`: a runtime is active by an explicit
-    // active_runtime_key, or — absent one — by being the single manifest whose
-    // runtime_id matches the configured default_runtime_id.
+    // The dash matches exactly: a runtime is active when its key equals
+    // active_runtime_key, or, with no active_runtime_key, when it is the single
+    // runtime whose id equals default_runtime_id; it is the rollback target
+    // when its key equals previous_runtime_key. docs/json-output.md compares
+    // these rules with what `rocm runtimes list` marks.
     let default_matches: Vec<&str> = manifests
         .iter()
         .filter(|m| Some(m.runtime_id.as_str()) == default_id)
