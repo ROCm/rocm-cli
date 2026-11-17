@@ -180,7 +180,7 @@ async fn assert_lemonade_install_refused_for_host_libraries(world: &mut E2eWorld
         "the install must fail on a host too old for the pinned Lemonade server:\n{output}"
     );
     for expected in [
-        format!("or newer (this host has glibc {OLD_HOST_GLIBC})"),
+        format!("or newer (this host's libc.so.6 provides up to GLIBC_{OLD_HOST_GLIBC})"),
         "or newer (this host's loader cache has no libssl.so.3)".to_owned(),
         "it needs glibc ".to_owned(),
         "Nothing was downloaded.".to_owned(),
@@ -223,7 +223,7 @@ async fn assert_host_library_warning(world: &mut E2eWorld) {
          the `rocm/e2e-test-hooks` feature, which `cargo xtask e2e` enables:\n{output}"
     );
     for expected in [
-        format!("or newer (this host has glibc {OLD_HOST_GLIBC})"),
+        format!("or newer (this host's libc.so.6 provides up to GLIBC_{OLD_HOST_GLIBC})"),
         "going ahead because ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK is set.".to_owned(),
     ] {
         assert!(
@@ -310,7 +310,7 @@ async fn assert_refused_and_installed_copy_kept(world: &mut E2eWorld) {
         runtime_dir.display()
     );
     for expected in [
-        format!("or newer (this host has glibc {OLD_HOST_GLIBC})"),
+        format!("or newer (this host's libc.so.6 provides up to GLIBC_{OLD_HOST_GLIBC})"),
         "Nothing was changed: the Lemonade ".to_owned(),
         expected,
     ] {

@@ -180,10 +180,11 @@ pub(crate) fn ensure_best_llamacpp_backend_with_parent(
 /// `src/cpp/server/backend_manager.cpp` at that tag). The other state Lemonade defines, `action_required`
 /// (used by other recipes), leaves the row out.
 ///
-/// A row that starts in the first column and carries a state names its recipe;
-/// an indented row continues the recipe above it with another backend. A
-/// first-column line with no state, such as a warning, is skipped and leaves
-/// the current recipe as it was. The recipe is read from
+/// A row that starts in the first column and has a state in its Status column
+/// names its recipe; an indented row continues the recipe above it with another
+/// backend. Any other line, such as a warning, is skipped and leaves the current
+/// recipe as it was, even when its text contains a state word: the state is read
+/// at the column the header names, not from anywhere in the line. The recipe is read from
 /// the layout rather than matched against a list of known recipe names: each
 /// Lemonade release adds recipes (`llamacpp-hrx`, `ds4`, `thenoise` in
 /// 2026.44), and a row for a recipe missing from such a list used to be read as
@@ -210,41 +211,83 @@ fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
             _ => None,
         }
     }
+    // A recipe name as Lemonade spells one: lower case, digits, `-` and `_`.
+    // Rules out a warning's first word (`Warning:`) in a table with no header.
+    fn is_recipe_name(token: &str) -> bool {
+        token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+    // Each whitespace-separated token with the byte offset it starts at.
+    fn tokens_at(line: &str) -> Vec<(usize, &str)> {
+        let mut tokens = Vec::new();
+        let mut start = None;
+        for (index, ch) in line.char_indices() {
+            match (ch.is_whitespace(), start) {
+                (true, Some(from)) => {
+                    tokens.push((from, &line[from..index]));
+                    start = None;
+                }
+                (false, None) => start = Some(index),
+                _ => {}
+            }
+        }
+        if let Some(from) = start {
+            tokens.push((from, &line[from..]));
+        }
+        tokens
+    }
+    // Where the header puts the Status column, once the header is read.
+    let mut status_column: Option<usize> = None;
     let mut current_recipe = String::new();
     let mut result = Vec::new();
     for line in output.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = tokens.first() else {
+        let tokens = tokens_at(line);
+        let Some(&(_, first)) = tokens.first() else {
             continue;
         };
-        if first == "Recipe" || first.starts_with("---") {
+        if first == "Recipe" {
+            status_column = line.find("Status");
+            continue;
+        }
+        if first.starts_with("---") {
             continue;
         }
         let continues_recipe = line.starts_with(char::is_whitespace);
-        let (backend, rest) = if continues_recipe {
-            (first, &tokens[1..])
-        } else {
-            let (Some(backend), Some(rest)) = (tokens.get(1), tokens.get(2..)) else {
-                continue;
-            };
-            // Only a row with a state in it names a recipe. Any other
-            // first-column line (a warning Lemonade printed mid-table) is
-            // skipped without ending the recipe above it, so the indented
-            // rows that follow still count for that recipe.
-            if !rest.iter().any(|token| is_state(token)) {
-                continue;
-            }
-            first.clone_into(&mut current_recipe);
-            (*backend, rest)
+        let backend_index = usize::from(!continues_recipe);
+        let Some(&(_, backend)) = tokens.get(backend_index) else {
+            continue;
         };
+        // The row's state: with a header, the first token that starts at or
+        // after the Status column (a field wider than its column pushes the
+        // status right, never left); without one, the first state word after
+        // the backend. A line whose state slot holds no state is not a row,
+        // such as a warning Lemonade printed mid-table, even one with a state
+        // word in its text, and is skipped without ending the recipe above it,
+        // so the indented rows that follow still count for that recipe.
+        let state = match status_column {
+            Some(column) => tokens
+                .iter()
+                .skip(backend_index + 1)
+                .find(|(offset, _)| *offset >= column)
+                .map(|(_, token)| *token)
+                .filter(|token| is_state(token)),
+            None if continues_recipe || is_recipe_name(first) => tokens
+                .iter()
+                .skip(backend_index + 1)
+                .map(|(_, token)| *token)
+                .find(|token| is_state(token)),
+            None => None,
+        };
+        let Some(state) = state else {
+            continue;
+        };
+        if !continues_recipe {
+            first.clone_into(&mut current_recipe);
+        }
         if current_recipe != LLAMACPP_RECIPE {
             continue;
         }
-        // The first state token is the Status column; a state word later in
-        // the row is message text.
-        let Some(state) = rest.iter().find(|token| is_state(token)) else {
-            continue;
-        };
         if let Some(status) = usable_status(state) {
             result.push((backend.to_owned(), status.to_owned()));
         }
@@ -505,8 +548,10 @@ thinksound          rocm        experimental  native     installable     Backend
         );
     }
 
-    /// A first-column line with no state between a `llamacpp` row and its
-    /// indented rows is not a recipe: the rows after it are still `llamacpp`'s.
+    /// Lines that are not rows between a `llamacpp` row and its indented rows
+    /// do not end the `llamacpp` rows: a warning with no state word, one whose
+    /// text contains a state word (`installed`), and one whose first word looks
+    /// like a recipe name. With a header the state is read at its Status column.
     #[test]
     fn a_warning_line_inside_the_table_does_not_end_the_llamacpp_rows() {
         let table = "\
@@ -514,10 +559,32 @@ Recipe              Backend     Tier          Format     Status          Message
 ---------------------------------------------------------------------------------------------------------------
 llamacpp            cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:cpu
 Warning: could not reach GitHub to check for updates
+Warning: llamacpp:rocm is installed but outdated
+lemonade is installed but update_required for llamacpp:rocm
                     rocm        core          native     update_required Backend update is required before use.         lemonade backends install llamacpp:rocm
                     vulkan      core          native     installed       b11580
 sd-cpp              cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:cpu
                     rocm        core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:rocm
+";
+        let expected = vec![
+            ("cpu".to_owned(), "installable".to_owned()),
+            ("rocm".to_owned(), "installable".to_owned()),
+            ("vulkan".to_owned(), "installed".to_owned()),
+        ];
+        assert_eq!(parse_llamacpp_backend_statuses(table), expected);
+    }
+
+    /// Without a header there is no Status column to read, so a first-column
+    /// line names a recipe only if its first word is shaped like one: a
+    /// `Warning:` line with a state word in it is still skipped.
+    #[test]
+    fn a_warning_with_a_state_word_does_not_end_the_llamacpp_rows_without_a_header() {
+        let table = "\
+llamacpp            cpu         installable     Backend is supported but not installed.
+Warning: llamacpp:rocm is installed but outdated
+                    rocm        update_required Backend update is required before use.
+                    vulkan      installed       b11580
+sd-cpp              cpu         installable     Backend is supported but not installed.
 ";
         assert_eq!(
             parse_llamacpp_backend_statuses(table),
@@ -526,6 +593,20 @@ sd-cpp              cpu         core          native     installable     Backend
                 ("rocm".to_owned(), "installable".to_owned()),
                 ("vulkan".to_owned(), "installed".to_owned()),
             ]
+        );
+    }
+
+    /// A field wider than its column pushes the Status column right; the state
+    /// is still the first token at or after the header's Status column.
+    #[test]
+    fn a_field_wider_than_its_column_still_finds_the_state() {
+        let table = "\
+Recipe              Backend     Tier          Format     Status          Message/Version
+llamacpp            rocm        core          native-overflowing installed  b11580
+";
+        assert_eq!(
+            parse_llamacpp_backend_statuses(table),
+            vec![("rocm".to_owned(), "installed".to_owned())]
         );
     }
 

@@ -478,7 +478,8 @@ use a build with the `rocm/e2e-test-hooks` feature and set `ROCM_E2E_LEMONADE_HO
 `ROCM_E2E_LEMONADE_HOST_OPENSSL=missing` first. Expected result:
 
 - It fails with `this host's libraries are too old for the Lemonade <version>
-  server: it needs glibc 2.38 or newer (this host has glibc <version>)`, followed
+  server: it needs glibc 2.38 or newer (this host's libc.so.6 provides up to
+  GLIBC_<version>)`, followed
   on a host without OpenSSL 3 by `and OpenSSL 3.0.0 or newer (this host's loader
   cache has no libssl.so.3)`, then `Nothing was downloaded.`, and ends by
   naming `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1` as the way to skip

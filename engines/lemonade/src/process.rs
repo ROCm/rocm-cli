@@ -1009,7 +1009,10 @@ mod tests {
             .to_string();
         let needs = &crate::install::LINUX_LEMOND_NEEDS;
         for expected in [
-            format!("glibc {} or newer (this host has glibc 2.31)", needs.glibc),
+            format!(
+                "glibc {} or newer (this host's libc.so.6 provides up to GLIBC_2.31)",
+                needs.glibc
+            ),
             format!(
                 "OpenSSL {} or newer (this host's loader cache has no libssl.so.3)",
                 needs.openssl
