@@ -540,7 +540,7 @@ Feature: GPU detection and system inspection
     And the inspection's driver detail says the library is missing from the linker cache
 
   # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
-  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # name and searches its own `$ORIGIN` directory, so the loader finds it from the runtime's own
   # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
   # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
   # control is `examine-33`, the same machine with the library alone.
@@ -732,6 +732,57 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
+
+  # A ROCm wheel ships `librocdxg.so.1` beside `libhsa-runtime64`, but the HSA
+  # runtime opens `librocdxg.so`, a name the wheel does not ship, so on WSL2 it
+  # loads the host's librocdxg and never the copy it was built with. A 10.2 or
+  # newer nightly runtime then fails at first GPU use against a host
+  # `rocdxg-roct` 1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`), while
+  # `driver_status` still reads `wsl_rocdxg_ready`. The inspection lists such a
+  # copy; the control is the same runtime with `librocdxg.so` beside it. The
+  # install side of the same change (`rocm install sdk` linking the name) needs a
+  # real wheel download and is covered by unit tests only.
+  @id:examine-lists-a-runtime-librocdxg-its-runtime-does-not-load @requires-os:linux
+  Scenario: examine-49 - The inspection lists a managed runtime's librocdxg that its own runtime does not load
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection lists that runtime's librocdxg as one its own runtime does not load
+
+  @id:examine-lists-no-runtime-librocdxg-when-the-runtime-loads-its-own @requires-os:linux
+  Scenario: examine-50 - The inspection lists nothing when the runtime has librocdxg.so beside its own copy
+    Given a WSL machine with a managed runtime that has librocdxg.so beside its own copy
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The advice names a command: it has to exist and has to clear the finding.
+  @id:examine-runtime-librocdxg-advice-clears-the-finding @requires-os:linux
+  Scenario: examine-51 - Running the command the inspection advises clears the runtime librocdxg finding
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The finding is advice about the WSL loader path; a native host with the same
+  # runtime gets none.
+  @id:examine-lists-no-runtime-librocdxg-off-wsl @requires-os:linux
+  Scenario: examine-52 - The inspection lists no runtime librocdxg on a machine that is not WSL
+    Given a machine that is not WSL with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # A broken `librocdxg.so` link is as bad as none: the loader's open() fails on
+  # it as on a missing file and the runtime loads the host's copy (observed with
+  # LD_DEBUG=libs on the 10.2 nightly, which still exited 139). The inspection
+  # lists it, and the advised command (which must replace a dangling link, so a
+  # plain `ln -s` is not enough) leaves the name reading as the runtime's own copy.
+  @id:examine-lists-a-dangling-runtime-librocdxg-link-and-the-advice-clears-it @requires-os:linux
+  Scenario: examine-53 - A dangling librocdxg.so link is listed and the advised command replaces it
+    Given a WSL machine with a managed runtime whose librocdxg.so is a link to a missing file
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists that runtime's librocdxg as one its own runtime does not load
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
   # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
   # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
   # mock lane included, not only the Vulkan-only hosts the ticket started from.
@@ -747,7 +798,7 @@ Feature: GPU detection and system inspection
   # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
   # fails here.
   @id:examine-reports-this-hosts-rocm-support-level
-  Scenario: examine-49 - System inspection says whether this machine's GPU is supported by ROCm
+  Scenario: examine-54 - System inspection says whether this machine's GPU is supported by ROCm
     When the user inspects the system
     Then the inspection states this host's ROCm support level
     And the support level agrees with the GPU the inspection detected
@@ -764,7 +815,7 @@ Feature: GPU detection and system inspection
   # machine nobody has looked at, and the three scenarios are what keep those
   # answers distinguishable.
   @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
-  Scenario: examine-50 - A GPU the official stack rejects is told which way it can still run models
+  Scenario: examine-55 - A GPU the official stack rejects is told which way it can still run models
     Given a machine whose GPU has no official support but has a working Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -779,7 +830,7 @@ Feature: GPU detection and system inspection
   # why a failing probe must not be promoted to one), and this scenario covers
   # that narrower claim rather than the driverless host.
   @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
-  Scenario: examine-51 - A machine with no way to run models is not told it has one
+  Scenario: examine-56 - A machine with no way to run models is not told it has one
     Given a machine whose GPU has no official support and no Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -791,7 +842,7 @@ Feature: GPU detection and system inspection
   # reporting a GPU path - the one outcome the no-fallback rule exists to
   # prevent, reached through a backend rather than a policy change.
   @id:examine-does-not-count-a-software-renderer-as-a-gpu-path @requires-os:linux
-  Scenario: examine-52 - A software renderer does not count as a way to run on the GPU
+  Scenario: examine-57 - A software renderer does not count as a way to run on the GPU
     Given a machine whose GPU has no official support and only a software renderer
     When the user inspects that machine
     Then the inspection does not claim models can run through Vulkan
@@ -810,7 +861,7 @@ Feature: GPU detection and system inspection
   # examine-51's. Telling "no drivers" apart from "the tool is broken" needs the
   # loader's own message, which the shared capture discards.
   @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
-  Scenario: examine-53 - A machine that cannot be checked for Vulkan is not told either way
+  Scenario: examine-58 - A machine that cannot be checked for Vulkan is not told either way
     Given a machine whose GPU has no official support and no way to check Vulkan
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
