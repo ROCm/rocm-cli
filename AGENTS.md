@@ -106,6 +106,8 @@ definitions when no existing scenario already covers it:
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
+Run the scenarios with `cargo xtask e2e` (§8).
+
 **A message about the CLI's own behavior is asserted together with the behavior.** When a
 change adds or edits a line the CLI prints about what it just did, what it will do next,
 or what the user must do to recover, the covering test asserts the message *and* the
@@ -432,10 +434,19 @@ frontmatter a published skill needs would end up inside that prompt.
 Minimum quality gate before upstream-ready status:
 
 ```bash
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
 cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+prek run --all-files
+cargo xtask tpn --check
+cargo xtask e2e
 cargo xtask smoke
 ```
+
+- `cargo test` skips the scenarios §3 requires: the `e2e` target of [`tests/e2e-cucumber`](tests/e2e-cucumber/Cargo.toml) sets `test = false`. The same setting leaves the harness out of the workspace clippy run, hence the separate `-p e2e-cucumber` line. CI runs both clippy invocations.
+- A green `cargo xtask e2e` does not show that a gated scenario ran (§3 says what to put in the PR text); after a plain run, `tests/e2e-cucumber/results/platform.json` (written from `PlatformManifest` in [`expectation.rs`](tests/e2e-cucumber/src/expectation.rs)) lists each skipped scenario with its reason. A filtered `-n` or `--tags` run is not the minimum quality gate, and neither is a run with `ROCM_CLI_BINARY` set, which tests that prebuilt binary instead of building the change (`e2e_binaries_from` in [`e2e.rs`](xtask/src/e2e.rs)).
+- `prek run --all-files` rewrites files in some hooks, so start from a clean working tree, read the diff it leaves, and re-run the lines above it if it rewrote anything. Some hooks need a tool installed locally (see [CONTRIBUTING.md](CONTRIBUTING.md)); a hook that skips, or fails for want of its tool, is a check that did not run, so say exactly what was not run (below). prek shows a skipped hook as passed unless the hook is `verbose` in [`.pre-commit-config.yaml`](.pre-commit-config.yaml): `powershell-script-analyzer` skips on a non-Windows host that way.
+- `cargo xtask tpn --check` is the `third-party-notices` CI job's command. It is a separate line because the `cargo-tpn` hook inside prek skips silently without the pinned `cargo-about`; run directly, the command fails loudly without it (`run` in [`tpn.rs`](xtask/src/tpn.rs)), which is a check that did not run (below).
 
 Deleting or weakening a test is a change in its own right: every crate has a committed
 coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops

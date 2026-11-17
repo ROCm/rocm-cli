@@ -10,22 +10,12 @@ This page collects developer verification commands. The README stays focused on 
 
 ## Local Verification
 
-Run the Rust test suite:
+The minimum quality gate is in [AGENTS.md](../AGENTS.md) section 8.
 
-```bash
-cargo test --workspace --all-targets
-```
-
-Note that `cargo test` runs every test as a thread in **one process**, which is
+`cargo test` runs every test as a thread in **one process**, which is
 also what the `windows-debug` job of the required `windows-build-and-test` lane
 does. See [Tests that touch the environment](#tests-that-touch-the-environment)
 before writing a test that sets an environment variable.
-
-Run clippy with warnings as errors:
-
-```bash
-cargo clippy --workspace --all-targets -- -D warnings
-```
 
 ### Source file size
 
@@ -1080,9 +1070,9 @@ file, the workspace root manifest, CI config, or a doc an xtask test reads —
 the proptest seed guard and which no other crate depends on: a changed file under
 a `proptest-regressions` directory, and a changed Rust file whose diff adds or
 removes a line containing `proptest!` (found with `git diff -G`). On `main`
-and in the merge queue the full workspace always runs. For a full local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
-narrows the local pre-push hooks (next section).
+and in the merge queue the full workspace always runs. The minimum quality gate in
+[AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
+that also narrows the local pre-push hooks (next section).
 
 ### Pre-push hook scope
 
