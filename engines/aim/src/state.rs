@@ -17,8 +17,19 @@ const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
 
 pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckResponse> {
     require_nonempty(&request.service_id, "service_id")?;
-    let state_path = state_path(&request.service_id);
-    let state = read_service_state(&state_path).ok();
+    healthcheck_service_at(&state_path(&request.service_id))
+}
+
+/// [`healthcheck_service`] against an explicit state path.
+///
+/// Split out for the same reason `engines/lemonade`'s `healthcheck_service_at`
+/// is: [`state_path`] resolves through the caller's real `AppPaths`, so the
+/// RPC handler itself could not be driven from a test, and the `device` field
+/// it answers with was only ever covered by calling [`reported_device`]
+/// directly — a test that stays green if this handler stops consulting it at
+/// all (see `healthcheck_rpc_answers_with_the_device_the_state_file_describes`).
+pub(crate) fn healthcheck_service_at(state_path: &Path) -> Result<HealthcheckResponse> {
+    let state = read_service_state(state_path).ok();
 
     let endpoint_url = state
         .as_ref()
@@ -42,7 +53,7 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
         && query_loaded_model_endpoint(&endpoint_url, model_ref.as_deref()).unwrap_or(false);
     let ready = listed
         && model_ref.as_deref().is_some_and(|model_ref| {
-            inference_verified(&state_path, state.as_ref(), &endpoint_url, model_ref)
+            inference_verified(state_path, state.as_ref(), &endpoint_url, model_ref)
         });
 
     Ok(HealthcheckResponse::for_readiness(
@@ -55,22 +66,38 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
 
 /// The device string reported once state exists for the service.
 ///
-/// AIM only ever runs on ROCm, so the backend half is fixed, and the shape is
-/// whatever [`rocm_engine_protocol::format_reported_device`] renders — the same
-/// one `engines/lemonade` and `engines/vllm` use, because `rocm serve`'s
-/// `device:` row and `rocm services list` print whichever engine answered
-/// verbatim and must not change format per engine.
+/// The shape is whatever [`rocm_engine_protocol::format_reported_device`]
+/// renders — the same one `engines/lemonade` and `engines/vllm` use, because
+/// `rocm serve`'s `device:` row and `rocm services list` print whichever engine
+/// answered verbatim and must not change format per engine. The ordinal comes
+/// from [`rocm_engine_protocol::first_gpu_index_from_state`], the same read
+/// those two make of the same `gpu_indices` key.
 ///
-/// No ordinal: unlike the other two this state file records no `gpu_indices`
-/// (the container gets the device list, see `docker::RunSpec`), so claiming one
-/// would be inventing it. That is exactly why the name matters here — without
-/// it this engine's row would be the bare backend on every host.
+/// The backend is **not** fixed. AIM's images run on ROCm, but
+/// [`rocm_engine_protocol::DevicePolicy::CpuOnly`] is a real variant of this
+/// crate's own launch path (`process::resolve_use_gpu`) and
+/// `docker::RunSpec` then hands the container no `/dev/kfd`, no `/dev/dri` and
+/// no `HIP_VISIBLE_DEVICES` at all. Claiming `rocm`, let alone naming a card,
+/// for a container that was given no GPU is exactly the invented device row
+/// ROCMAI-550 exists to remove, so the policy the launch recorded decides:
+/// `cpu_only` reports `cpu` and names nothing. A state file from before this
+/// key was written has no policy, and ROCm is the right assumption there —
+/// `cpu_only` could not be reached through `rocm serve` then either.
 fn reported_device(state: &Value) -> String {
+    if recorded_device_policy(state) == Some(DevicePolicy::CpuOnly) {
+        return rocm_engine_protocol::format_reported_device("cpu", None, None);
+    }
     rocm_engine_protocol::format_reported_device(
         "rocm",
-        None,
+        rocm_engine_protocol::first_gpu_index_from_state(state),
         value_string(state, "gpu_name").as_deref(),
     )
+}
+
+/// The `device_policy` the launch recorded, or `None` when the state file
+/// predates the key or holds something that is not one of the three policies.
+fn recorded_device_policy(state: &Value) -> Option<DevicePolicy> {
+    serde_json::from_value(state.get("device_policy")?.clone()).ok()
 }
 
 pub(crate) fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
@@ -131,9 +158,13 @@ pub(crate) fn write_running_state(
     host: &str,
     port: u16,
     device_policy: DevicePolicy,
+    gpu_indices: &[u32],
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<()> {
     let endpoint = endpoint_url(host, port);
+    // No GPU was attached, so there is no device to probe for or name. See
+    // [`reported_device`] for why this is gated rather than probed anyway.
+    let uses_gpu = device_policy != DevicePolicy::CpuOnly;
     // `extra_env` can carry secrets (e.g. an HF token passed via `--engine-env`);
     // this state file is status/introspection only (never read back to relaunch
     // the container, see `crate::process::launch_service`), so redact values
@@ -152,16 +183,23 @@ pub(crate) fn write_running_state(
             "port": port,
             "endpoint_url": endpoint,
             "device_policy": device_policy,
+            // The ordinals `process::plan_gpus` resolved and `docker::RunSpec`
+            // narrowed the container to with `HIP_VISIBLE_DEVICES` — the same
+            // key, read the same way, as `engines/lemonade` and
+            // `engines/vllm`, so one multi-GPU host does not report
+            // `rocm gpu 1 (…)` for those two and a bare `rocm` for this one.
+            // Empty for a CPU-only launch, and for a container this call found
+            // already running (that launch pinned it, and this one cannot know
+            // what it chose).
+            "gpu_indices": gpu_indices,
             // The host's GPU name, so the `device:` row names a device and not
-            // only a backend (ROCMAI-550). This engine records no GPU ordinal,
-            // so without it its row would be the bare word `rocm` on every
-            // host. Captured once here rather than probed per healthcheck:
-            // `rocm services list` healthchecks every ready service on its
-            // render path. The empty ordinal list is the literal truth — the
-            // container is handed a device list, not an ordinal — and
-            // `rocm_core::pinned_gpu_name` still declines on any host where
-            // more than one AMD GPU could be the one that answered.
-            "gpu_name": rocm_core::pinned_gpu_name(&[]),
+            // only a backend (ROCMAI-550). Captured once here rather than
+            // probed per healthcheck: `rocm services list` healthchecks every
+            // ready service on its render path. `rocm_core::pinned_gpu_name`
+            // declines on any host where more than one AMD GPU could be the
+            // one that answered, and is not asked at all when no GPU was
+            // attached.
+            "gpu_name": uses_gpu.then(|| rocm_core::pinned_gpu_name(gpu_indices)).flatten(),
             "engine_recipe": engine_recipe,
             "started_at_unix_ms": current_unix_millis(),
         }),
@@ -182,24 +220,26 @@ pub(crate) fn read_status(state_path: &Path) -> Option<String> {
     value_string(&read_service_state(state_path).ok()?, "status")
 }
 
+/// Patch one key into the service's state file under the state directory's
+/// lock ([`rocm_core::merge_json_state_file`]) — the same lock the
+/// inference-verification latch and `rocmd`'s Anthropic-endpoint publish take,
+/// so no writer drops a key another writer recorded.
+///
+/// It used to read, patch and `fs::write` with no lock at all, which could
+/// drop either of those. A state file that is empty, torn or not a JSON object
+/// is now an error and left as it was, rather than replaced wholesale.
 fn merge_state_field(state_path: &Path, key: &str, value: Value) -> Result<()> {
-    let mut state = read_service_state(state_path).unwrap_or_else(|_| json!({}));
-    if let Some(object) = state.as_object_mut() {
-        object.insert(key.to_owned(), value);
-    }
-    write_state(state_path, &state)
+    rocm_core::merge_json_state_file(state_path, &json!({ key: value }))
 }
 
 pub(crate) fn write_terminal_state(state_path: &Path, status: &str) -> Result<()> {
-    let mut state = read_service_state(state_path).unwrap_or_else(|_| json!({}));
-    if let Some(object) = state.as_object_mut() {
-        object.insert("status".to_owned(), json!(status));
-        object.insert(
-            "stopped_at_unix_ms".to_owned(),
-            json!(current_unix_millis()),
-        );
-    }
-    write_state(state_path, &state)
+    rocm_core::merge_json_state_file(
+        state_path,
+        &json!({
+            "status": status,
+            "stopped_at_unix_ms": current_unix_millis(),
+        }),
+    )
 }
 
 pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
@@ -208,22 +248,20 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-/// Serializes `value` to `path` as pretty JSON, creating the parent directory
-/// if needed. The low-level primitive [`write_running_state`],
-/// [`merge_state_field`] and [`write_terminal_state`] all go through — it is
-/// not the only way this module's state files are written:
-/// inference-verification latches go through
-/// `rocm_core::merge_json_state_file` instead (see [`inference_verified`]),
-/// which patches the file under the state directory's lock rather than
-/// routing through here. This function takes no such lock and writes in
-/// place, so the lock does not order it against those latches.
+/// Replace the service's state file whole, under the state directory's lock
+/// and published atomically ([`rocm_core::write_json_state_file`]).
+///
+/// [`write_running_state`] is the only caller; the status writers patch
+/// ([`merge_state_field`]) instead. It used to be a lock-free `fs::write`,
+/// which is a problem this PR's own change made reachable: the document being
+/// written now includes a host GPU probe (`rocm_core::pinned_gpu_name`, up to
+/// seconds on Windows), and `rocmd`'s Anthropic-proxy thread — a thread of
+/// *this* process — publishes its endpoint into the same file in that window.
+/// Going through `write_json_state_file` both orders this against every merge
+/// and carries that publication through the rewrite, the way
+/// `engines/lemonade`'s `write_state` does.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("failed to write {}", path.display()))
+    rocm_core::write_json_state_file(path, value)
 }
 
 pub(crate) fn endpoint_url(host: &str, port: u16) -> String {
@@ -389,6 +427,7 @@ mod tests {
             "127.0.0.1",
             8000,
             DevicePolicy::GpuPreferred,
+            &[0],
             Some(&hint),
         )
         .unwrap();
@@ -410,8 +449,8 @@ mod tests {
     /// is covered by
     /// `healthcheck_reports_unknown_for_a_service_with_no_state_file`).
     ///
-    /// Reverting the string to `"rocm_gpu"`, or dropping the `gpu_name` field
-    /// from the state write, fails this.
+    /// Reverting the string to `"rocm_gpu"`, dropping the `gpu_name` field or
+    /// dropping the `gpu_indices` field from the state write fails this.
     #[test]
     fn reported_device_for_existing_state_matches_the_shared_engine_shape() {
         let dir = tempfile::tempdir().unwrap();
@@ -424,39 +463,176 @@ mod tests {
             "127.0.0.1",
             8000,
             DevicePolicy::GpuRequired,
+            &[1],
             None,
         )
         .unwrap();
 
         // The probed name is whatever the test host has, so assert the shape
-        // rather than a value: `rocm`, optionally followed by `(<name>)`, and
-        // never the old `rocm_gpu` or a `gpu` noun with no ordinal behind it.
+        // rather than a value: `rocm gpu 1`, optionally followed by
+        // `(<name>)`, and never the old `rocm_gpu`.
         let state = read_service_state(&path).unwrap();
         let device = reported_device(&state);
         assert!(
-            device == "rocm" || (device.starts_with("rocm (") && device.ends_with(')')),
-            "AIM must report the shared `<backend> [(<name>)]` shape: {device}"
+            device == "rocm gpu 1" || (device.starts_with("rocm gpu 1 (") && device.ends_with(')')),
+            "AIM must report the shared `<backend> gpu <n> [(<name>)]` shape, with the \
+             ordinal the container was narrowed to: {device}"
         );
         assert!(
             !device.contains("rocm_gpu"),
             "the pre-ROCMAI-550 literal must not come back: {device}"
         );
-        assert!(
-            !device.split_whitespace().any(|word| word == "gpu"),
-            "this engine pins no ordinal, so a bare `gpu` noun would name \
-             nothing: {device}"
-        );
-        // The state file must actually carry the key the row is built from,
+        // The state file must actually carry both keys the row is built from,
         // even when the host probe found no name.
         assert!(
             state.get("gpu_name").is_some(),
             "write_running_state must record gpu_name: {state}"
         );
+        assert_eq!(
+            state.get("gpu_indices"),
+            Some(&json!([1])),
+            "write_running_state must record the ordinals the container was \
+             given, the way lemonade and vLLM do: {state}"
+        );
 
         // And the name, when the host has one, reaches the row.
         assert_eq!(
+            reported_device(&json!({ "gpu_indices": [0], "gpu_name": "AMD Instinct MI300X" })),
+            "rocm gpu 0 (AMD Instinct MI300X)"
+        );
+    }
+
+    /// A `cpu_only` launch attaches no GPU at all (`process::resolve_use_gpu`
+    /// returns `false`, and `docker::RunSpec` then passes no `/dev/kfd`, no
+    /// `/dev/dri` and no `HIP_VISIBLE_DEVICES`), so neither the `rocm` backend
+    /// nor a GPU name is a fact about it. Before ROCMAI-550's fix this path
+    /// still probed the host and rendered e.g.
+    /// `rocm (AMD Instinct MI300X)` for a container that used no GPU — the
+    /// invented claim the whole ticket exists to remove.
+    ///
+    /// Drops to red if `write_running_state` probes for a name regardless of
+    /// the policy, or if `reported_device` goes back to hardcoding `rocm`.
+    #[test]
+    fn a_cpu_only_launch_claims_neither_rocm_nor_a_gpu_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-cpu.json");
+        write_running_state(
+            &path,
+            "svc-cpu",
+            "some/model",
+            Some("Org/Served"),
+            "127.0.0.1",
+            8000,
+            DevicePolicy::CpuOnly,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let state = read_service_state(&path).unwrap();
+        assert_eq!(
+            state.get("gpu_name"),
+            Some(&Value::Null),
+            "a cpu-only launch must not have the host GPU probed for it: {state}"
+        );
+        assert_eq!(reported_device(&state), "cpu");
+
+        // And the rendering is driven by the recorded policy, not by the
+        // absence of a name: a state file that somehow carries both still
+        // reports `cpu`.
+        assert_eq!(
+            reported_device(&json!({
+                "device_policy": "cpu_only",
+                "gpu_indices": [0],
+                "gpu_name": "AMD Instinct MI300X",
+            })),
+            "cpu"
+        );
+        // A state file written before the key existed keeps the old reading.
+        assert_eq!(
             reported_device(&json!({ "gpu_name": "AMD Instinct MI300X" })),
             "rocm (AMD Instinct MI300X)"
+        );
+    }
+
+    /// The `device` the Healthcheck RPC *itself* answers with, not the private
+    /// formatter it is supposed to call.
+    ///
+    /// Every other device test in the three engines calls `reported_device`
+    /// directly, so reverting the handler's `Some(state) => reported_device`
+    /// wiring to a hardcoded literal kept the whole suite green. This drives
+    /// the handler.
+    ///
+    /// The planted state carries no endpoint, so no HTTP probe is made and
+    /// `listed`/`ready` are false — which is the point: this engine reports
+    /// the device as soon as it has state, independently of readiness (see
+    /// `apps/rocm/src/engine_ipc.rs`'s `device_worth_reporting`).
+    #[test]
+    fn healthcheck_rpc_answers_with_the_device_the_state_file_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-rpc.json");
+        write_state(
+            &path,
+            &json!({
+                "service_id": "svc-rpc",
+                "status": "running",
+                "device_policy": "gpu_required",
+                "gpu_indices": [2],
+                "gpu_name": "AMD Instinct MI300X",
+            }),
+        )
+        .unwrap();
+
+        let response = healthcheck_service_at(&path).unwrap();
+        assert_eq!(response.device, "rocm gpu 2 (AMD Instinct MI300X)");
+        assert_eq!(response.status, "running");
+        assert!(!response.model_loaded);
+
+        // And a service with no state on disk is the `"unknown"` the CLI
+        // filters out rather than prints.
+        let response = healthcheck_service_at(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(response.device, "unknown");
+    }
+
+    /// The post-spawn whole-file rewrite must not drop the Anthropic endpoint
+    /// a sibling thread of this same process published moments earlier.
+    ///
+    /// `rocm`'s `run_builtin_engine_serve_http` runs `rocmd`'s Anthropic proxy
+    /// as a thread of the process running this adapter, and ROCMAI-550 put a
+    /// host GPU probe (seconds, on Windows) inside the rewrite — wide enough
+    /// for the publish to land inside it. Routing [`write_state`] through
+    /// `rocm_core::write_json_state_file` is what carries it through; putting
+    /// the raw `fs::write` back drops the key and fails this.
+    #[test]
+    fn a_running_state_write_keeps_the_anthropic_endpoint_this_process_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-anthropic.json");
+        rocm_core::publish_anthropic_endpoint(
+            &path,
+            "http://127.0.0.1:9931",
+            rocm_core::AnthropicEndpointMode::Proxy,
+        )
+        .unwrap();
+
+        write_running_state(
+            &path,
+            "svc-anthropic",
+            "some/model",
+            None,
+            "127.0.0.1",
+            8000,
+            DevicePolicy::GpuRequired,
+            &[0],
+            None,
+        )
+        .unwrap();
+
+        let state = read_service_state(&path).unwrap();
+        assert_eq!(
+            value_string(&state, rocm_core::ANTHROPIC_ENDPOINT_URL_STATE_KEY).as_deref(),
+            Some("http://127.0.0.1:9931"),
+            "the whole-file rewrite dropped the endpoint the proxy thread \
+             published: {state}"
         );
     }
 

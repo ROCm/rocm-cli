@@ -70,8 +70,9 @@ pub fn json_state_lock_path(path: &Path) -> PathBuf {
 /// run under one cross-process lock ([`json_state_lock_path`]) and no merge
 /// can drop a key another merge recorded. The lock orders writers rather than
 /// combining them: a full rewrite through [`write_json_state_file`] still
-/// replaces every key merged before it, and a writer that bypasses both
-/// functions (the vLLM and AIM engines' own state writes) takes no lock at all.
+/// replaces every key merged before it. Every built-in engine adapter's state
+/// writes go through one of the two; a writer that bypasses both (an
+/// out-of-tree engine plugin writing the file itself) takes no lock at all.
 ///
 /// The result is published atomically
 /// ([`crate::atomic_write::write_file_atomically`]), so a reader that takes no
