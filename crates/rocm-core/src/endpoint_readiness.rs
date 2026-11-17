@@ -124,6 +124,16 @@ fn merge_json_state_file_with(
 /// Takes the same lock as [`merge_json_state_file`] and publishes the same
 /// atomic way, so a full rewrite cannot land in the middle of another
 /// writer's merge.
+///
+/// It replaces every key merged before it — that is what a full rewrite is for,
+/// and how a new run of a service clears what the previous run recorded — with
+/// one exception: an Anthropic endpoint *this process* published
+/// (`crate::publish_anthropic_endpoint`) is carried into the document first.
+/// The publisher is a thread of the same process as the engine adapter calling
+/// this, it publishes exactly once, and since ROCMAI-550 the adapter's
+/// post-spawn rewrite spends a multi-second host GPU probe building its
+/// document — wide enough for the publication to land inside it and be lost.
+/// See `anthropic_endpoint::carry_published_anthropic_endpoint`.
 pub fn write_json_state_file(path: &Path, value: &serde_json::Value) -> Result<()> {
     write_json_state_file_with(path, value, || {})
 }
@@ -137,8 +147,15 @@ fn write_json_state_file_with(
     before_publish: impl FnOnce(),
 ) -> Result<()> {
     let _lock = FileLock::acquire(json_state_lock_path(path))?;
+    // Read inside the file lock, which leaves no gap: a publisher notes the
+    // endpoint before it asks for this lock, so one that is waiting here has
+    // already been noted and is carried, and one that has not noted yet merges
+    // after this rewrite and lands on its own. `publish_anthropic_endpoint`
+    // releases its in-memory note before taking the file lock, so the two locks
+    // are never held in both orders.
+    let carried = crate::anthropic_endpoint::carry_published_anthropic_endpoint(path, value);
     before_publish();
-    publish_json_state(path, value)
+    publish_json_state(path, carried.as_ref().unwrap_or(value))
 }
 
 /// Why [`merge_json_state_file`] refused an existing state file.
