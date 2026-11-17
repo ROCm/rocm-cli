@@ -617,6 +617,19 @@ jobs:
             echo "::error::the branch name is not one the queue takes"
             exit 1
           fi
+          # A dispatch runs the workflow as it is on main. The pull request that
+          # adds queue-pr-run.yml cannot dispatch it until it is merged: that is a
+          # skip, said so, not a failure. Any other error from the check stays red.
+          if ! out=$(gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=main" --jq .name 2>&1); then
+            if [[ "$out" == *"HTTP 404"* ]]; then
+              echo "skipped=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::queue-pr-run.yml is not on main yet: the queue lane cannot run"
+              echo "The queue lane does not run: queue-pr-run.yml is not on main yet, and a dispatch uses main's copy." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::could not check main for queue-pr-run.yml: ${out}"
+            exit 1
+          fi
           caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh workflow run queue-pr-run.yml --ref main -f "branch=${HEAD_REF}" -f "caller=${caller}"
 
