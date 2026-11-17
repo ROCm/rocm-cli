@@ -1844,6 +1844,17 @@ and `config set-engine --runtime-id` store a selector without resolving it. For
 `runtimes activate`, `@id:runtime-lifecycle-case-twin-selector-refused` also
 checks that nothing became active and that naming one key exactly then works.
 
+Runtimes installed before and after the ROCm 10 layout stay usable side by
+side: `@id:runtime-lifecycle-side-by-side-across-packaging-change` lists and
+activates a ROCm 7 runtime, a ROCm 10 release runtime and a ROCm 10 nightly
+runtime without rewriting their install records,
+`@id:runtime-lifecycle-side-by-side-uninstall-keeps-the-others` uninstalls one
+and checks the others keep their folders and records, and
+`@id:runtime-lifecycle-side-by-side-shared-name-refused` checks that the runtime
+id the two release runtimes share is refused with both keys named.
+Uninstalling a runtime that is the rollback target clears it as the rollback
+target in both the config and the active-runtime marker.
+
 Developer-only previous-runtime regression check:
 
 ```bash
@@ -1930,6 +1941,43 @@ cargo test -p rocm --bin rocm extra_env
 cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
+
+## vLLM Tensorizer Check
+
+vLLM's wheel pins a tensorizer release that cannot be imported under Python 3.14,
+and `rocm engines install vllm` checks that it imports and upgrades it when it
+does not (see [vllm.md](vllm.md)). The `vllm-tensorizer-NN` E2E scenarios
+([vllm_tensorizer.feature](../tests/e2e-cucumber/features/vllm_tensorizer.feature);
+gated only on `@requires-os:linux`, with no GPU, network or nightly tag, so the
+Linux e2e jobs run them) run that command against a planted managed runtime
+whose Python cannot import the pinned tensorizer. They check the upgrade
+warning, `dependency_check: expected_divergence`, the note's tensorizer release
+and the release the runtime ends up holding in the same scenario; that a second
+install neither upgrades again nor reinstalls vLLM; that an upgrade which does
+not help warns with the `KeyError` shown when this run did not install vLLM and
+refuses, saying the install ran, when it did (`--reinstall`); that a coloured traceback and a
+`PYTHONPATH` only the server's launch environment provides are judged correctly;
+that a missing library, or a non-library exception raised below tensorizer, is
+left alone; that an upgrade which cannot be fetched warns when this run did not
+install vLLM but fails when it did (a first install or `--reinstall`; a repair takes
+the same path); and
+that repairing a genuine violation beside the upgraded tensorizer clears it and
+upgrades tensorizer again. Unit tests in [install.rs](../engines/vllm/src/install.rs) and
+[repair.rs](../engines/vllm/src/repair.rs) cover the classification (with Unix and Windows paths), the probe
+command, the probe and upgrade timeouts and the repair decision
+(`cargo test -p rocm-engine-vllm -- install::tests repair::tests`, which also
+runs the other tests of those two modules; a `tensorizer` name filter would miss
+the probe-command, timeout and hung-child tests). The shared rule that decides what
+counts as vLLM's own unmet tensorizer pin is tested in `rocm-core`
+(`cargo test -p rocm-core tensorizer_override`), and its use in the dependency
+check report in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs)
+(`cargo test -p rocm --bin rocm runtime_install_finalize`).
+To run just these locally: `cargo xtask e2e -- -n 'vllm-tensorizer'`. The `-n` form
+selects by scenario name and bypasses the harness's own gating, so it needs a Linux
+host for these scenarios.
+The scenarios are Linux only; the real Python 3.14 import is only exercised by
+hand ([manual-testing.md](manual-testing.md#6c-the-tensorizer-upgrade-on-python-314)).
 
 ## Lemonade Installs On Disk
 
@@ -3363,11 +3411,12 @@ The user-visible side is `serve-55` (`@id:serve-small-assistant-short-name`):
 It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
-the queue nightly only) and the vLLM half falls to the Instinct lane. Of those,
-MI300X and the Strix Halo Windows and WSL2 lanes run on pull requests
-([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when the `serve`
-path filter matches; W7900 has no lane there any more) but none of their check names is a required status check,
-so the two unit tests above are the blocking per-PR coverage. The scenario
+the queue nightly only) and the vLLM half falls to the Instinct lane. Of all
+these lanes only MI300X and the Strix Halo Windows and WSL2 lanes run on pull
+requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
+the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
+on the queue nightly), and none of their check names is a required status
+check, so the two unit tests above are the blocking per-PR coverage. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
 unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
 their known serve failure there has not been observed, and a row claiming a
@@ -3565,6 +3614,15 @@ python scripts/nightly_canary.py --self-test
 What the scheduled canary checks, who is told and how to rerun it are in
 [ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
 
+The vLLM route check (advisory) has a self-test of the same kind:
+
+```bash
+python scripts/vllm_route_check.py --self-test
+```
+
+What it checks and why it is not a required check are in
+[ci-hardware-testing.md](ci-hardware-testing.md#vllm-route-check-advisory).
+
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
 as a whole string — so a change to its quoting, spacing or field order fails
 the test rather than slipping past a substring assertion — and then runs that
@@ -3718,25 +3776,27 @@ needs a non-root runner. `@id:lifecycle-linux-uninstall-keep-binaries-keeps-path
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios and the native-Windows vLLM refusal scenarios
-`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
-comma-separated list of `@id`s:
+scenarios, the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35`, and the side-by-side runtime scenarios
+`runtime-lifecycle-19`/`runtime-lifecycle-20`/`runtime-lifecycle-21` (none of
+them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,runtime-lifecycle-side-by-side-across-packaging-change,runtime-lifecycle-side-by-side-uninstall-keeps-the-others,runtime-lifecycle-side-by-side-shared-name-refused"
 cargo xtask e2e
 ```
 
-These three were made hermetic and Windows-portable without being tagged
-`@lifecycle` — they're ComfyUI install scenarios, not release packaging/
-install/uninstall ones, and tagging them `@lifecycle` would drop them out of
-the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`, neither of
-which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them into this
-lane instead, so this is the one required lane that guarantees Windows
-coverage for them; the self-hosted Windows lane that otherwise runs them is
-optional.
+All nine are hermetic (planted fixture binaries or runtimes, no GPU, no
+network) and Windows-portable without being tagged `@lifecycle` — they are
+ComfyUI install, vLLM refusal and runtime-selection scenarios, not release
+packaging/install/uninstall ones, and tagging them `@lifecycle` would drop
+them out of the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`,
+neither of which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them
+into this lane instead, so this is the one required lane that guarantees
+Windows coverage for them; the self-hosted Windows lane that otherwise runs
+them is optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
@@ -4204,7 +4264,8 @@ whether a scenario may run at all (see the comment at
 a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
-name on that route. Note also that `-n` matches the scenario *name*
+name on that route, nor any other `@requires-oom-fault-injection` scenario
+(`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
@@ -4215,14 +4276,16 @@ passing an id to it silently selects nothing.
 
 ### The OOM fault-injection capability
 
-serve-41 needs a managed launch that really failed on VRAM, which a GPU-less CI
+The `@id:serve-oom-launch-memory-guidance` scenario needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
-log it owns, and never became ready. No process is spawned, and the seam
-compiles out entirely without the feature, so a build that does not enable it
-behaves exactly as the shipped binary does.
+log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
+ready, so a mock engine can then fail its smoke test. No process is spawned, and
+the seam compiles out entirely without the feature, so a build that does not
+enable it behaves exactly as the shipped binary does.
 
 Only `cargo xtask e2e` enables it, by building the binary under test with
 `--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and it is the
@@ -4235,7 +4298,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-41 to a reported **skip**, not a silent pass. It
+compiled out and resolves both of those scenarios to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -4245,10 +4308,98 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-41 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
-the scenario carries `@requires-os:linux`. On the GPU lanes it is
+both scenarios are never selected there at all: that lane runs
+`E2E_ONLY_LIFECYCLE` and the scenarios carry `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
+
+## Serve Smoke Test Failure
+
+After a fresh launch becomes ready, the `rocm serve` interactive summary sends
+one small chat request. When that request cannot complete the summary is headed
+`Deployment summary (smoke test failed)`, shows the status as
+`started, smoke test failed` instead of `ready`, and a hedged note gives the
+reason and names `rocm logs --service <id>`. See
+[the README](../README.md#model-serving) for the user-facing contract. The
+launch itself stays best-effort: exit code and service record do not change, and
+`--no-smoke-test` and an already-running service are unchanged.
+
+What is detected, and what is not:
+
+- Detected (the summary says the smoke test failed): a transport error or timeout,
+  an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
+  stream cut short.
+- Not detected (no failure is reported and the status reads `ready`): an engine
+  error sent as a `data:` payload inside a `200` stream; a `200` answer with no
+  `data:` line at all (HTML, plain JSON, an empty body); a close-delimited stream
+  cut after a token; and a complete stream with no `content` token, which is
+  deliberately not a failure (a reasoning model can spend its whole small budget
+  first, as the readiness probe also allows for). The metric rows read `n/a` when
+  no content token arrived first; tokens that did arrive (the close-delimited cut,
+  or an in-band `data:` error after content) are measured.
+- Known limitation: the reason shown is whatever the provider call reported, and
+  some of its errors are not the engine's, for example the `/v1/models` re-list
+  before the request ("no ready managed service"), an unreadable services-directory
+  entry, a rejected endpoint URL, and the audit event written after the stream is
+  consumed. Each turns into a failed smoke test, which is why the note says the
+  smoke test could not complete and only that the server may not be able to serve
+  requests.
+- Known limitation: the smoke request is routed by model name, not to the launched
+  service. The newest ready service serving the model is used, so normally the one
+  just launched. If the new service fails the 2 s `/v1/models` listing probe (for
+  example the engine was killed just as it became ready) it is filtered out: an
+  older ready service with the same model then answers, and the summary shows
+  `ready` with that service's metrics and no note, a false pass on a dead launch.
+  With no older service the reason shown is rocm's "no ready managed service", not
+  the engine's.
+
+Focused unit coverage:
+
+```bash
+cargo test -p rocm --bin rocm serve_smoke_test
+cargo test -p rocm --bin rocm a_failed_smoke_test_is_not_presented_as_ready_and_says_why
+cargo test -p rocm --bin rocm a_passing_or_skipped_smoke_test_adds_no_failure_note
+cargo test -p rocm --bin rocm an_already_running_summary_ignores_a_smoke_failure
+cargo test -p rocm --bin rocm failure_reason_
+cargo test -p rocm --bin rocm the_commands_the_failure_note_names_exist_and_parse
+```
+
+The `serve_smoke_test` tests in [providers.rs](../apps/rocm/src/providers.rs)
+run the real smoke test against a local mock engine over a socket (an engine that
+dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, a
+complete stream with no content, a close-delimited stream cut after a token). Only
+the mid-stream-death test goes on to render the summary from the real outcome; the
+others assert on the outcome the smoke test returns.
+
+- `@id:serve-smoke-failure-summary` (serve-60) — a launch that becomes ready
+  whose engine fails its first chat request is shown as a failed smoke test, with
+  the engine's own reason and the full `rocm logs --service <id>` command, and
+  the engine received exactly one chat request. It carries `@requires-no-gpu`,
+  `@requires-os:linux` and `@requires-oom-fault-injection`: it uses the same
+  test-only hook as `@id:serve-oom-launch-memory-guidance` (see [Serve OOM Guidance](#serve-oom-guidance)) in its
+  `ready` mode, a ready record pointing at a mock engine whose chat requests all
+  fail with HTTP 500, so it has that scenario's gates: against a prebuilt
+  `ROCM_CLI_BINARY` the hook is compiled out and the harness reports it as a skip,
+  unless it is selected with `-n` or `--tags`, which bypasses that skip and makes
+  it fail for the wrong reason. Some of its steps are not checks of the fix, so say
+  plainly what they prove:
+  - The exit code 0 is asserted in the `When` step (`wait_for_exit`), not in a
+    `Then` step.
+  - "the engine received exactly one chat request" passes with the fix reverted
+    (the smoke request was already sent); it shows the request was not retried.
+  - "the engine's own reason" matches rocm's wording of the status line around the
+    engine's HTTP status, so it pins that phrasing as well.
+  - "the launch's service record is left as ready" passes with the fix reverted;
+    it is the only assertion behind the "ROCm CLI does not stop the server"
+    promise in the README and `rocm serve --help`.
+  - "no background automation daemon was left behind" is hygiene only: it records
+    that no daemon was started but does not discriminate the
+    `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs`, because no watcher is
+    enabled in the isolated config and the helper starts only when one is.
+
+```bash
+cargo xtask e2e -- -n "serve-60"
+```
 
 ## Windows Tool Notes
 

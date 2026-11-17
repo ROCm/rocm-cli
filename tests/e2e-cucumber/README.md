@@ -145,10 +145,10 @@ Scenarios carry stable-id and capability tags:
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
-| `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch that runs out of GPU memory so the OOM guidance can be verified without a GPU. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
+| `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch so `rocm serve`'s summary can be verified without a GPU: one that runs out of GPU memory (the OOM guidance), or, in its `ready` mode, one that becomes ready and then fails its smoke test. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
-| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM refusal scenarios serve-33/34/35. |
+| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios, the native-Windows vLLM refusal scenarios serve-33/34/35, and the side-by-side runtime scenarios runtime-lifecycle-19/20/21. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
@@ -194,18 +194,16 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow covers a strict superset of the hardware in the table
-above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
-`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-w7900`, `e2e-gpu-nightly-strix`,
+The nightly workflow runs the MI300X and the Strix Halo hardware from the
+table above as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
-counterpart — both were demoted from per-PR to nightly-only per ROCMAI-125 —
-so nightly is where their regression coverage now lives. The shared
-large-model scenario follows each lane's serve engine: it serves
-`Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P), and the
-`unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint (hardware-verified on
-Strix Halo) through Lemonade on every other lane (Strix Halo, R9700, W7900).
+grid. R9700, MI350P and W7900 no longer have a self-hosted nightly lane in
+`nightly.yml`: they run on the queue ([nightly-on-the-queue.md](../../docs/nightly-on-the-queue.md)),
+and the nightly report adds the queue's lanes to that grid. The shared large-model scenario follows each lane's serve engine: it
+serves `Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P),
+and the `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint (hardware-verified
+on Strix Halo) through Lemonade on every other lane (Strix Halo, R9700, W7900).
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on

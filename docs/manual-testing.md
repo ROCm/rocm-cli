@@ -1467,6 +1467,32 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
+### 6c. The tensorizer upgrade on Python 3.14
+
+Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only
+published vLLM build for that line). On a fresh runtime:
+
+```bash
+rocm install sdk --channel release --version 10.1.0 --yes
+rocm engines install vllm --runtime-id <that runtime>
+```
+
+The install output carries a warning that vLLM's pinned tensorizer cannot be
+imported and was upgraded, then `dependency_check: expected_divergence` with a
+`note:` naming the tensorizer release the runtime holds and `action: none`, not
+`dependency_check: violated`. Confirm with
+`<runtime>/bin/python -c "import tensorizer.serialization"`, which must import
+cleanly. Run the install a second time: no upgrade warning, the same
+`expected_divergence` block, and vLLM is not reinstalled. `rocm serve` must then
+get past engine start-up (it no longer fails with
+`KeyError: 'crypto_stream_salsa20_NONCEBYTES'`).
+
+On some GPU families `rocm install sdk` installs vLLM itself
+(`maybe_auto_install_sdk_preferred_engine`), so the same upgrade warning and the
+`expected_divergence` block appear at the end of that command, a step earlier;
+the `rocm engines install vllm` that follows then shows the block without the
+warning, and nothing more needs doing.
+
 ## 7. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
@@ -1941,3 +1967,47 @@ Expected result:
   read (N of M tokens). Try a more specific question, or a model with a larger
   context.` — and `rocm-cli.log` should still carry the provider's own body
   with `exceed_context_size_error` in it.
+
+## 16. Serve Smoke Test Failure
+
+Needs any engine `rocm serve` can start (the behaviour is not vLLM-specific) and
+an interactive terminal: the smoke test and its summary run only there. The
+behaviour under test is described in
+[the README](../README.md#model-serving); the automated coverage is listed in
+[testing.md](testing.md#serve-smoke-test-failure).
+
+The repeatable route is the E2E scenario, which needs no GPU but runs on Linux
+and WSL only (`@requires-os:linux`):
+
+```bash
+cargo xtask e2e -- -n "serve-60"
+```
+
+(`@id:serve-smoke-failure-summary`.)
+
+By hand, a failing first chat request is hard to provoke (the engine has to pass
+its readiness probe and then fail or die on the first chat request), so check the
+points below when you see it, for example after an engine is killed right as it
+becomes ready:
+
+- The heading reads `Deployment summary (smoke test failed)`, not
+  `Deployment summary`.
+- The `status` row reads `started, smoke test failed`, not `ready`.
+- `time to first token` and `throughput (approx)` read `n/a`, and a `note:` line
+  gives a one-line reason and names `rocm logs --service <id>`.
+- The command exits 0 and ROCm CLI does not stop the server. If the engine died
+  there is no server left: `rocm logs --service <id>` still shows its output, and
+  the next `rocm services list` finds the engine gone and records the service as
+  `stopped` (or `failed` for AIM), so it drops out of the default list and shows only under
+  `rocm services list --all`. If the engine is still up and only the chat request
+  failed, the service stays listed and its recorded status stays `ready`.
+- `rocm serve <model> --no-smoke-test` prints the plain `Deployment summary` with
+  no smoke-test note, and re-running against an already-running service prints
+  the `(already running)` summary with no smoke-test note.
+- Some failures are deliberately not detected and still read as `ready` (an error
+  sent as a `data:` payload inside a `200` stream, a `200` answer with no `data:`
+  line, a close-delimited stream cut after a token); the full list is in
+  [testing.md](testing.md#serve-smoke-test-failure).
+- A reasoning model that spends its small token budget before emitting any
+  content is not a failure: the summary stays `ready` with the two metric rows
+  `n/a` and no smoke-test note.

@@ -32,7 +32,9 @@ const SMOKE_PROMPT: &str = "Reply with a short one-sentence greeting.";
 const SMOKE_MAX_TOKENS: u32 = 32;
 
 /// Best-effort metrics measured against a freshly-started server. Every field is
-/// optional: any probe failure leaves it `None` and the summary renders `n/a`.
+/// optional: `None` renders as `n/a`. They are empty when the smoke test was
+/// skipped, failed (see [`SmokeOutcome::Failed`]), or completed without a content
+/// token (a reasoning model can spend its whole token budget before emitting any).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SmokeMetrics {
     /// Time from request send to the first streamed content token.
@@ -62,12 +64,81 @@ pub(crate) struct DeploymentSummary {
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,
     pub metrics: SmokeMetrics,
+    /// Why the post-launch smoke test failed, as one sanitised line. `None` when
+    /// the test passed or was not run. When `Some` (and `already_running` is
+    /// false, which the renderer checks) the summary is not presented as ready;
+    /// an already-running service never ran a smoke test and ignores it.
+    pub smoke_failure: Option<String>,
     /// The endpoint API key for a freshly launched *public* server, shown once as
     /// secure client configuration. `None` for loopback binds (no auth) and for an
     /// already-running service (whose key was delivered at its own launch).
     pub api_key: Option<String>,
     /// GPU/device warnings folded in from the serve plan.
     pub notes: Vec<String>,
+}
+
+/// Result of the post-launch smoke test.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SmokeOutcome {
+    /// The request completed with no transport error, no HTTP error status and
+    /// no truncated stream; the metrics are what was measured. They are empty
+    /// when no content token arrived, which is not a failure: a reasoning model
+    /// can spend its small token budget before emitting any, as
+    /// `openai_chat_completion_probe` also allows for readiness. The status check
+    /// is deliberately stricter than that probe's (any non-200 fails here, where
+    /// the probe accepts anything below 500). Not detected here, and so
+    /// `Measured`: an error reported inside a 200 stream as a `data:` payload, a
+    /// 200 answer with no `data:` line at all (HTML, plain JSON, an empty body),
+    /// and a close-delimited stream cut after a token.
+    Measured(SmokeMetrics),
+    /// The smoke test could not complete: a transport error, an HTTP error
+    /// status, a parse error, a chunked or `Content-Length` stream cut short, or
+    /// a failure in the provider plumbing around the request (finding the ready
+    /// service, writing the audit event after the stream). Carries a one-line
+    /// reason. It does not by itself prove the engine failed.
+    Failed(String),
+}
+
+impl SmokeOutcome {
+    /// Splits the outcome into the summary's `metrics` and `smoke_failure` fields.
+    pub(crate) fn into_parts(self) -> (SmokeMetrics, Option<String>) {
+        match self {
+            Self::Measured(metrics) => (metrics, None),
+            Self::Failed(reason) => (SmokeMetrics::default(), Some(reason)),
+        }
+    }
+}
+
+/// Longest failure reason kept for display.
+const SMOKE_FAILURE_MAX_CHARS: usize = 200;
+
+/// Reduces an error message to one printable line. On the smoke-test path the
+/// engine-controlled text in it is the HTTP status line, reason phrase included
+/// (the local provider reports `local provider returned {status_line}`, not the
+/// response body), and the chunk-size line it quotes when a chunked body is
+/// malformed (`invalid local provider chunk size`), so it is untrusted. Terminal
+/// escape sequences and any control or Unicode format character (a bidi override,
+/// a zero-width mark) are dropped, line breaks and runs of whitespace become a
+/// single space, backticks become apostrophes (the note quotes its own command in
+/// backticks, and the reason must not add a second one), and the result is
+/// length-capped.
+fn one_line_reason(raw: &str) -> String {
+    // The escape scanner, not this function, decides where a line break falls:
+    // turning breaks into spaces first would let a cut-off escape sequence take
+    // the next real character as an intermediate byte and swallow it.
+    let collapsed = rocm_core::terminal::rendered_lines(raw)
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('`', "'");
+    if collapsed.chars().count() > SMOKE_FAILURE_MAX_CHARS {
+        let mut cut: String = collapsed.chars().take(SMOKE_FAILURE_MAX_CHARS).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        collapsed
+    }
 }
 
 /// Render `Some(ttft)` as a human duration, or `n/a` when the probe did not
@@ -102,8 +173,11 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     // note must make that visibly different from a healthy deployment so the
     // summary is never mistaken for success.
     let ready = summary.status == "ready";
+    let smoke_failed = summary.smoke_failure.is_some() && !summary.already_running;
     let heading = if summary.already_running {
         "Deployment summary (already running)"
+    } else if smoke_failed {
+        "Deployment summary (smoke test failed)"
     } else if ready {
         "Deployment summary"
     } else {
@@ -132,7 +206,14 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         .collect();
     let rows: Vec<(&str, String)> = [
         vec![
-            ("status", summary.status.clone()),
+            (
+                "status",
+                if smoke_failed {
+                    "started, smoke test failed".to_owned()
+                } else {
+                    summary.status.clone()
+                },
+            ),
             ("engine", summary.engine.clone()),
         ],
         model_rows,
@@ -187,6 +268,16 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             out,
             "  note: {explanation} - follow `rocm logs --service {} --follow` or check `rocm services list`",
             summary.service_id
+        );
+    }
+    if let (true, Some(reason)) = (smoke_failed, summary.smoke_failure.as_deref()) {
+        // The server answered its health check, but the smoke test could not
+        // complete, so it is not known to serve. Say why the metrics rows are
+        // empty, hedged: the reason may be rocm's own plumbing, not the engine.
+        let _ = writeln!(
+            out,
+            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `rocm logs --service {id}`",
+            id = summary.service_id
         );
     }
     for note in &summary.notes {
@@ -280,10 +371,18 @@ pub(crate) fn oom_memory_note(
 }
 
 /// Run a single small chat completion against the just-started local server and
-/// measure time-to-first-token and generation throughput. Best-effort: any error
-/// (server not OpenAI-compatible, refused, timed out) yields empty metrics rather
-/// than failing the launch.
-pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeMetrics {
+/// measure time-to-first-token and generation throughput. Best-effort: a request
+/// that errors (refused, an HTTP error status other than 200, timed out) or
+/// whose stream is a chunked or `Content-Length` body cut short yields
+/// [`SmokeOutcome::Failed`] with the reason, rather than failing the launch. So
+/// does any other error from the provider call, including two that are not the
+/// engine's fault: no ready service found when it re-lists `/v1/models`, and the
+/// audit-log write after the stream. A request that completes without a content
+/// token is `Measured` with empty metrics, not a failure. Also `Measured`, and so
+/// not detected: an error `data:` payload inside a 200 stream, a 200 answer with
+/// no `data:` line at all, and a close-delimited stream cut after a token (it has
+/// no framing to cut short).
+pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeOutcome {
     let request = ChatRequest {
         model: Some(api_model.to_owned()),
         messages: vec![ChatMessage {
@@ -316,11 +415,16 @@ pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeMetrics 
         },
     );
 
-    if result.is_err() {
-        return SmokeMetrics::default();
+    if let Err(err) = result {
+        return SmokeOutcome::Failed(one_line_reason(&format!("{err:#}")));
     }
 
-    compute_metrics(start, first_token, last_token, token_chunks)
+    SmokeOutcome::Measured(compute_metrics(
+        start,
+        first_token,
+        last_token,
+        token_chunks,
+    ))
 }
 
 /// Pure metric math, split out so it can be unit-tested without a live server.
@@ -466,6 +570,7 @@ mod tests {
                 ttft: Some(Duration::from_millis(180)),
                 gen_tps: Some(42.15),
             },
+            smoke_failure: None,
             api_key: None,
             notes: Vec::new(),
         }
@@ -1159,5 +1264,175 @@ mod tests {
             notes.is_empty(),
             "an OOM line beyond the shared tail budget must not surface the note: {notes:?}"
         );
+    }
+
+    fn failed_summary(reason: &str) -> DeploymentSummary {
+        let mut summary = base_summary();
+        summary.metrics = SmokeMetrics::default();
+        summary.smoke_failure = Some(reason.to_owned());
+        summary
+    }
+
+    #[test]
+    fn a_failed_smoke_test_is_not_presented_as_ready_and_says_why() {
+        let rendered = render_summary(&failed_summary("connection closed mid-response"));
+        assert!(rendered.starts_with("Deployment summary (smoke test failed)\n"));
+        assert!(rendered.contains("status               started, smoke test failed"));
+        assert!(!rendered.contains("status               ready"));
+        assert!(rendered.contains("time to first token  n/a"));
+        assert!(rendered.contains("throughput (approx)  n/a"));
+        assert!(rendered.contains("connection closed mid-response"));
+        // That the named commands exist and parse is
+        // `the_commands_the_failure_note_names_exist_and_parse`.
+        assert!(rendered.contains("check `rocm logs --service vllm-qwen-1720000000`"));
+        // The hedge: the note must not claim the server is broken, only that it
+        // may be unable to serve.
+        assert!(rendered.contains("; the server may not be able to serve requests"));
+    }
+
+    #[test]
+    fn a_passing_or_skipped_smoke_test_adds_no_failure_note() {
+        let passed = render_summary(&base_summary());
+        assert!(passed.starts_with("Deployment summary\n"));
+        assert!(!passed.contains("smoke test"));
+        // `--no-smoke-test`: default metrics, no failure recorded.
+        let mut skipped = base_summary();
+        skipped.metrics = SmokeMetrics::default();
+        let skipped = render_summary(&skipped);
+        assert!(skipped.starts_with("Deployment summary\n"));
+        assert!(!skipped.contains("smoke test"));
+        assert!(skipped.contains("status               ready"));
+    }
+
+    #[test]
+    fn an_already_running_summary_ignores_a_smoke_failure() {
+        let mut summary = failed_summary("boom");
+        summary.already_running = true;
+        let rendered = render_summary(&summary);
+        assert!(rendered.starts_with("Deployment summary (already running)\n"));
+        assert!(!rendered.contains("smoke test"));
+    }
+
+    #[test]
+    fn smoke_outcome_splits_into_summary_fields() {
+        let metrics = SmokeMetrics {
+            ttft: Some(Duration::from_millis(5)),
+            gen_tps: None,
+        };
+        assert_eq!(
+            SmokeOutcome::Measured(metrics.clone()).into_parts(),
+            (metrics, None)
+        );
+        assert_eq!(
+            SmokeOutcome::Failed("x".to_owned()).into_parts(),
+            (SmokeMetrics::default(), Some("x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn failure_reason_is_one_line_without_control_characters_and_capped() {
+        let reason = one_line_reason("HTTP 500\r\n{\"error\":\t\"boom\"}\u{1b}[31m red\u{7}\n\n");
+        assert!(
+            !reason.chars().any(char::is_control),
+            "a control character survived"
+        );
+        assert_eq!(reason, "HTTP 500 {\"error\": \"boom\"} red");
+        let long = one_line_reason(&"x".repeat(5000));
+        assert_eq!(long.chars().count(), SMOKE_FAILURE_MAX_CHARS + 3);
+        assert!(long.ends_with("..."));
+        assert_eq!(one_line_reason("short"), "short");
+    }
+
+    #[test]
+    fn failure_reason_cap_holds_at_its_boundary() {
+        // Exactly the cap is kept whole; one more is cut and marked.
+        let at_cap = "y".repeat(SMOKE_FAILURE_MAX_CHARS);
+        assert!(
+            one_line_reason(&at_cap) == at_cap,
+            "a reason of exactly the cap must be kept unchanged"
+        );
+        let over = "y".repeat(SMOKE_FAILURE_MAX_CHARS + 1);
+        assert!(
+            one_line_reason(&over) == format!("{at_cap}..."),
+            "a reason one character over the cap must be cut to the cap plus an ellipsis"
+        );
+    }
+
+    #[test]
+    fn failure_reason_cannot_add_a_backtick_quoted_command_to_the_note() {
+        // A chunk-size line the engine sent is quoted in the provider's error.
+        let reason = one_line_reason("invalid local provider chunk size `run `rocm stop` now`");
+        assert!(!reason.contains('`'));
+        assert_eq!(
+            reason,
+            "invalid local provider chunk size 'run 'rocm stop' now'"
+        );
+        let rendered = render_summary(&failed_summary(&reason));
+        let note = rendered
+            .lines()
+            .find(|line| line.contains("the smoke test could not complete"))
+            .expect("failure note present");
+        // Constant message: `note` derives from a type that carries an API key.
+        assert!(
+            note.split('`').skip(1).step_by(2).count() == 1,
+            "the note must hold exactly one backtick-quoted command"
+        );
+    }
+
+    #[test]
+    fn failure_reason_keeps_the_text_after_a_cut_off_escape_sequence() {
+        // A capture cut mid-sequence must not eat the first real character after
+        // it: the line break has to reach the escape scanner as a break, not as
+        // a space it would read as part of the sequence.
+        for (raw, expected) in [
+            ("\u{1b}[31\nHTTP 500", "HTTP 500"),
+            ("\u{1b}\nHTTP 500", "HTTP 500"),
+            ("\u{1b}[31mHTTP 500", "HTTP 500"),
+            ("\u{1b}[31m\nHTTP 500", "HTTP 500"),
+            ("HTTP\r\n500", "HTTP 500"),
+        ] {
+            assert!(
+                one_line_reason(raw) == expected,
+                "an escape sequence in the engine's message ate or kept the wrong text"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_reason_drops_unicode_format_characters() {
+        // U+202E (right-to-left override) reorders how the rest of the line
+        // renders; U+200B and U+FEFF are invisible; U+2028 breaks the row. None
+        // is matched by `char::is_control`.
+        let reason = one_line_reason("evil\u{202e}txt\u{200b}.\u{feff}exe\u{2028}next");
+        assert_eq!(reason, "eviltxt.exe next");
+        assert!(
+            !reason
+                .chars()
+                .any(rocm_core::terminal::is_control_or_format)
+        );
+    }
+
+    #[test]
+    fn the_commands_the_failure_note_names_exist_and_parse() {
+        use clap::Parser as _;
+        let rendered = render_summary(&failed_summary("boom"));
+        let note = rendered
+            .lines()
+            .find(|line| line.contains("the smoke test could not complete"))
+            .expect("failure note present");
+        let commands: Vec<&str> = note.split('`').skip(1).step_by(2).collect();
+        // Constant messages only: `commands` is derived from `render_summary`,
+        // whose input type carries an API key field, and echoing that output
+        // trips CodeQL's `rust/cleartext-logging`.
+        assert!(
+            commands == ["rocm logs --service vllm-qwen-1720000000"],
+            "the failure note must name exactly the log command"
+        );
+        for command in commands {
+            assert!(
+                crate::Cli::try_parse_from(command.split_whitespace()).is_ok(),
+                "a command named in the failure note is not one rocm accepts"
+            );
+        }
     }
 }
