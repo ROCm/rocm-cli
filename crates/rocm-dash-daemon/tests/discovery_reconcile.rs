@@ -964,13 +964,66 @@ fn lemonade_responder(path: &str) -> String {
     }
 }
 
+fn two_model_responder(path: &str) -> String {
+    match path {
+        "/api/v1/health" => http(
+            200,
+            "application/json",
+            r#"{"status":"ok","model_loaded":"Mock-Lemonade-1B","all_models_loaded":[{"model_name":"Mock-Lemonade-1B"},{"model_name":"Mock-Lemonade-2B"}]}"#,
+        ),
+        "/api/v1/stats" => http(200, "application/json", r#"{"tokens_per_second":33.5}"#),
+        _ => http(404, "text/plain", ""),
+    }
+}
+
+/// An endpoint with two models loaded is two rows: one id per model, each
+/// spelled out here (endpoint, then the model's UTF-8 bytes in hex) so that
+/// collapsing them into one row per endpoint fails this test.
+#[tokio::test]
+async fn each_loaded_lemonade_model_is_announced_as_its_own_row() {
+    let server = spawn_server(two_model_responder).await;
+    let ids = [
+        format!(
+            "lemonade-127.0.0.1-{}-model-4d6f636b2d4c656d6f6e6164652d3142",
+            server.port
+        ),
+        format!(
+            "lemonade-127.0.0.1-{}-model-4d6f636b2d4c656d6f6e6164652d3242",
+            server.port
+        ),
+    ];
+    let (mut rx, _runner) = spawn_runner(lemonade_opts(server.port));
+    let mut announced = Vec::new();
+    while announced.len() < 2 {
+        let inst = next_event(&mut rx, |ev| match ev {
+            Event::InstanceDiscovered(inst) => Some(inst.clone()),
+            _ => None,
+        })
+        .await;
+        announced.push((inst.container_id, inst.model_name));
+    }
+    announced.sort();
+    assert_eq!(
+        announced,
+        [
+            (ids[0].clone(), "Mock-Lemonade-1B".to_string()),
+            (ids[1].clone(), "Mock-Lemonade-2B".to_string()),
+        ]
+    );
+}
+
 /// A reachable Lemonade endpoint is announced once with its health-reported
 /// model, scraped for its rate, and announced gone when the endpoint stops
 /// answering, after which it leaves the snapshots.
 #[tokio::test]
 async fn lemonade_endpoint_is_announced_scraped_and_announced_gone() {
     let server = spawn_server(lemonade_responder).await;
-    let id = format!("lemonade-127.0.0.1-{}", server.port);
+    // The identity is spelled out, not derived from the production function,
+    // so a change to it fails here: endpoint, then the model's UTF-8 bytes in hex.
+    let id = format!(
+        "lemonade-127.0.0.1-{}-model-4d6f636b2d4c656d6f6e6164652d3142",
+        server.port
+    );
     let (mut rx, _runner) = spawn_runner(lemonade_opts(server.port));
 
     let announced = next_event(&mut rx, |ev| match ev {

@@ -79,14 +79,11 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
-  # bypasses Lemonade's model router and runs a packaged llama-server directly
-  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
-  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
-  # managed-lemonade fallback would mask the identical failure behind the
-  # ROCMAI-898 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
-  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
-  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  # Explicit HF-checkpoint canary: `owner/repo:variant` runs the selected GPU
+  # llama-server directly and fails if that backend binary is missing. Named
+  # catalog entries can also serve directly on Linux when their metadata is
+  # simple enough; other registered entries use Lemonade's router. Both canaries
+  # use the same small checkpoint, sharing the cache without another download.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
@@ -376,8 +373,8 @@ Feature: Model serving
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
   # On a host without Docker both skip (the nightly job logs whether Docker is
-  # reachable). serve-27's known failure on Strix Halo Ubuntu is an xfail row in
-  # expectations.toml, tracked in rocm-cli#1058.
+  # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
+  # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -906,3 +903,63 @@ Feature: Model serving
     And the user is told the model needs an explicit GGUF variant
     And no quantization is suggested for a repo the CLI has not inspected
     And no local server was recorded
+  # The pinned Lemonade catalog's smallest vision GGUF needs its mmproj file.
+  # Serving its registered name must retain the router, not flatten the entry
+  # into a single-checkpoint direct serve. Use a scenario-owned port and service;
+  # the additional model download stays off the ordinary per-PR path.
+  # Linux only: registered names take the router on Windows both with and
+  # without the direct llama-server route, so a Windows run cannot tell the
+  # two behaviours apart.
+  # No expectations row is added for this scenario. The flaky Linux rows cover
+  # the direct llama-server route, and this scenario takes the router route, so
+  # those rows' failure mode does not describe it. It is nightly-only.
+  @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
+  Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
+    Given a managed runtime is active
+    And a registered vision GGUF is being served on lemonade on its own port
+    Then the managed engine state confirms the Lemonade router loaded the registered model
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # Which runtime a registered name takes is user-observable: a simple catalog
+  # entry (one checkpoint with a variant, no extra files) is served directly by
+  # the selected GPU llama-server on Linux, while
+  # `serve-lemonade-complex-registered-inference` covers the router route for an
+  # entry that needs more. The endpoint answering would not tell the
+  # two apart, so this reads the engine state's method and backend.
+  @id:serve-lemonade-simple-registered-direct-route @requires-gpu @requires-os:linux @requires-engine:lemonade
+  Scenario: serve-58 - A simple registered GGUF name is served directly by the selected GPU backend
+    Given a managed runtime is active
+    And a simple registered GGUF is being served on lemonade on its own port
+    Then the managed engine state records direct serving by the selected GPU backend
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # A served endpoint's API key sits in `<data>/services/<id>.endpoint-key`, and
+  # nobody but the user who started the server may read it. Here: a loopback
+  # serve with `--require-api-key` (so no public port is opened on the GPU box),
+  # then the key file's mode is checked to be exactly 0600. The file is replaced
+  # by a freshly created owner-only one on every store, so a mode loosened in
+  # place is tightened again; that re-store case is covered by the unit tests in
+  # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
+  # the key before a restart writes it back. The check does not depend on
+  # readiness: the serve waits a fixed 45 seconds for the engine
+  # (`READINESS_WAIT` in `service_launch/readiness.rs`) and then exits 0,
+  # reporting a server still loading as `starting`; the key is written before
+  # the engine starts, and the scenario's teardown stops the service.
+  # Linux-only: on Windows the key is protected by an owner-only DACL
+  # instead, but the Windows GPU lane serves with Lemonade, which refuses a
+  # key-protected bind there (`ensure_public_bind_engine_supported` in
+  # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the
+  # `rocm-core` unit tests that read the DACL back on the Windows build job.
+  @id:serve-endpoint-key-readable-by-owner-only @requires-gpu @requires-os:linux
+  Scenario: serve-59 - Only the user who started a key-protected server can read its key
+    Given a managed runtime is active
+    When the user serves a model that requires an API key
+    Then the server's API key is kept where only that user can read it

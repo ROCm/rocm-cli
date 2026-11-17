@@ -5856,15 +5856,21 @@ fi
         );
     }
 
-    /// The hermetic comfyui-01/02/03 scenarios (no GPU, no network, no
-    /// `e2e-test-hooks` dependency, Windows-portable since #637) must stay
-    /// explicitly selected into this otherwise-`@lifecycle`-only Windows lane
-    /// (#689) — it is required CI, unlike the self-hosted lane that otherwise
-    /// runs them. This checks the whole step (not just the `run: |` body, since
-    /// the selection lives in `env:`), so dropping the env var — or narrowing
-    /// its id list — fails here rather than silently reopening the coverage gap.
+    /// The hermetic non-`@lifecycle` scenarios this otherwise-`@lifecycle`-only
+    /// Windows lane selects through `E2E_ALSO_RUN_IDS` (#689): comfyui-01/02/03
+    /// (Windows-portable since #637), the native-Windows vLLM refusal
+    /// serve-33/34/35, and the side-by-side runtime scenarios
+    /// runtime-lifecycle-19/20/21. None needs a GPU, the network or
+    /// `e2e-test-hooks`, and this is required CI, unlike the self-hosted lane
+    /// that otherwise runs them. This checks the whole step (not just the
+    /// `run: |` body, since the selection lives in `env:`) and pins the id list
+    /// exactly, so dropping the env var, narrowing the list or growing it
+    /// without updating this test fails here. It also holds the PowerShell
+    /// copy of the list in docs/testing.md equal to the ci.yml one; the
+    /// "19/20/21"-style shorthand in docs/testing.md's prose and in
+    /// tests/e2e-cucumber/README.md is not checked.
     #[test]
-    fn ci_windows_lifecycle_lane_also_selects_the_hermetic_comfyui_and_vllm_refusal_scenarios() {
+    fn ci_windows_lifecycle_lane_also_selects_exactly_the_hermetic_non_lifecycle_scenarios() {
         let ci = read_workflow("ci.yml");
         let windows = job_block(&ci, "windows-release");
         let lines: Vec<&str> = windows.lines().collect();
@@ -5883,24 +5889,62 @@ fi
             also_run_ids.len(),
             1,
             "the Windows lifecycle lane must set env.E2E_ALSO_RUN_IDS exactly \
-             once to additionally select the hermetic comfyui and vLLM-refusal scenarios, so \
-             they get required-CI Windows coverage (#689):\n{step}"
+             once to additionally select the hermetic comfyui, vLLM-refusal and \
+             side-by-side runtime scenarios, so they get required-CI Windows \
+             coverage (#689):\n{step}"
         );
-        for id in [
-            "comfyui-uv-install-failure-names-log",
-            "comfyui-uv-install-progress-streamed",
-            "comfyui-ambiguous-runtime-actionable",
-            // The native-Windows vLLM refusal (serve-33/34/35) is
-            // `@requires-os:windows` and hermetic, so this is its required lane.
-            "serve-vllm-refused-on-native-windows",
-            "serve-vllm-install-refused-on-native-windows",
-            "serve-vllm-install-with-runtime-refused-on-native-windows",
-        ] {
-            assert!(
-                also_run_ids[0].contains(id),
-                "the Windows lifecycle lane must select {id} via env.E2E_ALSO_RUN_IDS:\n{step}"
-            );
-        }
+        let selected: Vec<&str> = also_run_ids[0]
+            .trim_matches('"')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            selected,
+            [
+                "comfyui-uv-install-failure-names-log",
+                "comfyui-uv-install-progress-streamed",
+                "comfyui-ambiguous-runtime-actionable",
+                // The native-Windows vLLM refusal (serve-33/34/35) is
+                // `@requires-os:windows` and hermetic, so this is its required lane.
+                "serve-vllm-refused-on-native-windows",
+                "serve-vllm-install-refused-on-native-windows",
+                "serve-vllm-install-with-runtime-refused-on-native-windows",
+                // runtime-lifecycle-19/20/21: planted side-by-side runtimes,
+                // hermetic, whose Windows paths only this lane exercises.
+                "runtime-lifecycle-side-by-side-across-packaging-change",
+                "runtime-lifecycle-side-by-side-uninstall-keeps-the-others",
+                "runtime-lifecycle-side-by-side-shared-name-refused",
+            ],
+            "the Windows lifecycle lane's env.E2E_ALSO_RUN_IDS must select exactly the \
+             hermetic comfyui-01/02/03, serve-33/34/35 and runtime-lifecycle-19/20/21 \
+             scenarios; update this list, docs/testing.md and \
+             tests/e2e-cucumber/README.md together with ci.yml:\n{step}"
+        );
+
+        // docs/testing.md shows the same selection as a PowerShell line to run
+        // the lane locally; it must not drift from what CI selects.
+        let testing = std::fs::read_to_string(repo_root().join("docs/testing.md"))
+            .expect("docs/testing.md must be readable")
+            .replace("\r\n", "\n");
+        let documented: Vec<&str> = testing
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("$env:E2E_ALSO_RUN_IDS = "))
+            .collect();
+        assert_eq!(
+            documented.len(),
+            1,
+            "docs/testing.md must show the Windows lane's E2E_ALSO_RUN_IDS once"
+        );
+        let documented: Vec<&str> = documented[0]
+            .trim_matches('"')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            documented, selected,
+            "docs/testing.md's $env:E2E_ALSO_RUN_IDS line must list exactly the ids \
+             ci.yml's Windows lifecycle lane selects, in the same order"
+        );
     }
 
     /// Every job in `ci.yml` as `(id, block)`, in file order. Unlike [`job_block`]

@@ -47,8 +47,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rocm_core::{
     ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
-    format_http_base_url, http_get_with_auth, http_post_json_with_auth, merge_json_state_file,
-    openai_models_endpoint_has_model,
+    JsonStateFileRefused, format_http_base_url, http_get_with_auth, http_post_json_with_auth,
+    merge_json_state_file, openai_models_endpoint_has_model,
 };
 use serde_json::{Value, json};
 
@@ -146,20 +146,66 @@ fn wait_for_engine_listing(config: &AnthropicProxyConfig, upstream: &str) -> any
     anyhow::bail!("the engine did not list a model in time")
 }
 
+/// How many times [`publish`] tries to record the endpoint before it gives up.
+const PUBLISH_ATTEMPTS: usize = 5;
+/// The pause between two of [`publish`]'s attempts.
+const PUBLISH_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// Record the endpoint in the engine's state file.
+///
+/// `merge_json_state_file` refuses a state file it cannot merge into rather
+/// than replace it. The vLLM and AIM engines still rewrite their state files
+/// in place, so a file refused as empty or not valid JSON can be one caught
+/// mid-write and whole again a moment later: that refusal is tried again, up
+/// to [`PUBLISH_ATTEMPTS`] attempts [`PUBLISH_RETRY_PAUSE`] apart. Any other
+/// failure (a whole document that is not an object, or failing to lock, read
+/// or write the file) is returned at once.
 fn publish(
     config: &AnthropicProxyConfig,
     url: &str,
     mode: AnthropicEndpointMode,
 ) -> anyhow::Result<()> {
+    publish_with_pause(config, url, mode, std::thread::sleep)
+}
+
+/// [`publish`] with the pause between attempts supplied by the caller, so a
+/// test can see each pause and change the file between attempts.
+fn publish_with_pause(
+    config: &AnthropicProxyConfig,
+    url: &str,
+    mode: AnthropicEndpointMode,
+    mut pause: impl FnMut(Duration),
+) -> anyhow::Result<()> {
     // The listener URL carries no `/v1`: Anthropic SDKs append `/v1/messages`.
     let base = url.trim_end_matches('/').trim_end_matches("/v1");
-    merge_json_state_file(
-        &config.state_path,
-        &json!({
-            ANTHROPIC_ENDPOINT_URL_STATE_KEY: base,
-            ANTHROPIC_ENDPOINT_MODE_STATE_KEY: mode.as_str(),
-        }),
-    )
+    let patch = json!({
+        ANTHROPIC_ENDPOINT_URL_STATE_KEY: base,
+        ANTHROPIC_ENDPOINT_MODE_STATE_KEY: mode.as_str(),
+    });
+    let mut attempt = 1;
+    loop {
+        let error = match merge_json_state_file(&config.state_path, &patch) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let may_be_mid_write = error
+            .downcast_ref::<JsonStateFileRefused>()
+            .is_some_and(|refused| refused.refusal.may_be_mid_write());
+        if may_be_mid_write && attempt < PUBLISH_ATTEMPTS {
+            attempt += 1;
+            pause(PUBLISH_RETRY_PAUSE);
+            continue;
+        }
+        let attempts = if attempt == 1 {
+            "1 attempt".to_owned()
+        } else {
+            format!("{attempt} attempts")
+        };
+        return Err(error.context(format!(
+            "could not publish the Anthropic endpoint to {} after {attempts}",
+            config.state_path.display()
+        )));
+    }
 }
 
 #[derive(Clone)]
@@ -2266,6 +2312,140 @@ mod tests {
         assert_eq!(
             (status, message["content"][0]["text"].as_str()),
             (200, Some("pong"))
+        );
+    }
+
+    fn publish_config(dir: &std::path::Path) -> AnthropicProxyConfig {
+        std::fs::create_dir_all(dir).unwrap();
+        AnthropicProxyConfig {
+            host: "127.0.0.1".to_owned(),
+            engine_port: 1,
+            served_model: MODEL.to_owned(),
+            state_path: dir.join("state.json"),
+            probe_api_key: None,
+        }
+    }
+
+    /// A state file caught mid-write by an engine that rewrites it in place is
+    /// refused, and the publish tries again, after the production pause, once
+    /// it is whole.
+    #[test]
+    fn publish_retries_a_state_file_caught_mid_write() {
+        let dir = unique_temp_dir("publish-retry");
+        let config = publish_config(&dir);
+        std::fs::write(&config.state_path, b"").unwrap();
+        let mut pauses = Vec::new();
+
+        let result = publish_with_pause(
+            &config,
+            "http://127.0.0.1:8000/v1",
+            AnthropicEndpointMode::Proxy,
+            |pause| {
+                pauses.push(pause);
+                std::fs::write(&config.state_path, br#"{"status": "ready"}"#).unwrap();
+            },
+        );
+
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        result.expect("the second attempt publishes");
+        assert_eq!(pauses, [Duration::from_millis(200)]);
+        assert_eq!(state["status"], "ready", "{state}");
+        assert_eq!(state["anthropic_endpoint_url"], "http://127.0.0.1:8000");
+        assert_eq!(state["anthropic_endpoint_mode"], "proxy");
+    }
+
+    /// The production `publish`, against a state file that stays torn: five
+    /// attempts with a real 200 ms pause between each, so it cannot give up
+    /// in less than 800 ms; then an error naming the file, which is left as
+    /// it was.
+    #[test]
+    fn publish_gives_up_on_a_state_file_that_stays_torn() {
+        let dir = unique_temp_dir("publish-gives-up");
+        let config = publish_config(&dir);
+        let torn = br#"{"status": "ready", "server_pid": 4"#;
+        std::fs::write(&config.state_path, torn).unwrap();
+        let started = std::time::Instant::now();
+
+        let result = publish(
+            &config,
+            "http://127.0.0.1:8000/v1",
+            AnthropicEndpointMode::Proxy,
+        );
+
+        let elapsed = started.elapsed();
+        let after = std::fs::read(&config.state_path).unwrap();
+        let error = format!("{:#}", result.expect_err("a torn file is refused"));
+        assert!(
+            error.starts_with(&format!(
+                "could not publish the Anthropic endpoint to {} after 5 attempts: ",
+                config.state_path.display()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("is not valid JSON"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "four 200 ms pauses between five attempts, took {elapsed:?}"
+        );
+        assert_eq!(after, torn, "the refused file is left as it was");
+    }
+
+    /// A failure a mid-write cannot explain is returned at once, without a
+    /// pause: a whole document that is not an object, and a state file whose
+    /// lock cannot be taken.
+    #[test]
+    fn publish_does_not_retry_a_failure_a_mid_write_cannot_explain() {
+        let dir = unique_temp_dir("publish-no-retry");
+        let config = publish_config(&dir);
+        std::fs::write(&config.state_path, b"[1, 2]").unwrap();
+        // A regular file where the state directory should be, so the lock file
+        // beside the state file cannot be created.
+        let blocked = AnthropicProxyConfig {
+            state_path: dir.join("not-a-dir").join("state.json"),
+            ..publish_config(&dir)
+        };
+        std::fs::write(dir.join("not-a-dir"), b"").unwrap();
+
+        let mut pauses = Vec::new();
+        let not_an_object = publish_with_pause(
+            &config,
+            "http://127.0.0.1:8000/v1",
+            AnthropicEndpointMode::Proxy,
+            |pause| pauses.push(pause),
+        );
+        let unlockable = publish_with_pause(
+            &blocked,
+            "http://127.0.0.1:8000/v1",
+            AnthropicEndpointMode::Proxy,
+            |pause| pauses.push(pause),
+        );
+
+        let after = std::fs::read(&config.state_path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(pauses.is_empty(), "no retry: {pauses:?}");
+        let error = format!("{:#}", not_an_object.expect_err("an array is refused"));
+        assert!(
+            error.starts_with(&format!(
+                "could not publish the Anthropic endpoint to {} after 1 attempt: ",
+                config.state_path.display()
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("holds a JSON array, not an object"),
+            "{error}"
+        );
+        assert_eq!(after, b"[1, 2]", "the refused file is left as it was");
+        let error = format!("{:#}", unlockable.expect_err("the lock cannot be taken"));
+        assert!(
+            error.starts_with(&format!(
+                "could not publish the Anthropic endpoint to {} after 1 attempt: ",
+                blocked.state_path.display()
+            )),
+            "{error}"
         );
     }
 

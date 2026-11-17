@@ -100,10 +100,14 @@ pub(crate) enum Command {
         /// A shell reads this text before `rocm` does, so quotes, `$(...)`
         /// and a leading `-` in a pasted error can be changed, run, or taken
         /// as a flag. Use `--symptom-file` to hand over a paste untouched.
+        ///
+        /// Each match then says whether this text contributed to it
+        /// (`symptom_matched` in --json).
         #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
         /// Read the error text from a file instead, or from standard input
-        /// when PATH is `-`, so no shell quoting is needed.
+        /// when PATH is `-`, so no shell quoting is needed. A file named `-`
+        /// is passed as `./-`.
         ///
         /// The text that arrives is matched as `--symptom` would match it,
         /// with one trailing line break removed (shells and editors add one).
@@ -250,6 +254,11 @@ pub(crate) enum Command {
         #[arg(long)]
         device_index: Option<i64>,
         /// Emit the catalog as JSON for tooling. Only valid without a fix id.
+        ///
+        /// It also names each exit code and says what it means. Exit 2 is
+        /// both an unknown fix id (a stderr line starting `Unknown fix-id:`)
+        /// and a malformed command line (a stderr line starting `error:`);
+        /// read the message to tell them apart.
         #[arg(long)]
         json: bool,
     },
@@ -692,6 +701,11 @@ rocm logs --search error timeout")]
         status: bool,
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    ///
+    /// On Linux/WSL, discovers loaded models from local Lemonade at 127.0.0.1:13305
+    /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
+    /// lemonade_port in config.json. External models have no Services stop/restart
+    /// controls; discovery is read-only and quitting leaves external servers running.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -1218,9 +1232,9 @@ pub(crate) enum ServicesCommand {
     ///
     /// Only works on a record that is not running: stop the server first (on
     /// Windows a process `rocm` cannot query counts as running). The record's
-    /// details file, log, engine state file, and endpoint key file are all
-    /// deleted, so its log can no longer be read and it can no longer be
-    /// restarted.
+    /// details file, log, engine state file, and endpoint key file (with any
+    /// copy of the key an interrupted save left beside it) are all deleted, so
+    /// its log can no longer be read and it can no longer be restarted.
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -1231,9 +1245,9 @@ pub(crate) enum ServicesCommand {
         ///
         /// Only when a stop was requested, no recorded process is confirmed
         /// running, and at least one could not be queried (on Windows, a live
-        /// process the account may not open). Deletes the record, log, engine
-        /// state and endpoint key, and says which process; if it is still
-        /// running it keeps running. Refused for a process confirmed running.
+        /// process the account may not open). Deletes the same files as a
+        /// plain `remove`, and says which process; if it is still running it
+        /// keeps running. Refused for a process confirmed running.
         #[arg(long)]
         force: bool,
     },
@@ -1490,6 +1504,30 @@ mod tests {
         assert_eq!(
             FrameworkProbe::from(FrameworkArg::Skip),
             FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn dash_help_scopes_lemonade_discovery_to_linux_and_wsl() {
+        // The embedded daemon that does the discovery is Unix-only, so the help
+        // must not promise it on every platform. README.md says the same.
+        let help = Cli::command()
+            .find_subcommand_mut("dash")
+            .expect("dash subcommand")
+            .render_long_help()
+            .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("On Linux/WSL, discovers loaded models from local Lemonade"),
+            "{help}"
+        );
+        // This pins the wording only. Scenario
+        // `@id:dash-lemonade-external-protocol-discovery` proves the claim: the
+        // external server receives no request beyond reads after the dashboard
+        // quits.
+        assert!(
+            flat.contains("quitting leaves external servers running"),
+            "{help}"
         );
     }
 

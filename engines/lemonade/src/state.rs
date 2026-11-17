@@ -56,6 +56,24 @@ pub(crate) fn write_running_state(
     server_pid: Option<u32>,
     status: &str,
 ) -> Result<()> {
+    write_running_state_for_model(
+        request,
+        runtime,
+        pid,
+        server_pid,
+        status,
+        &request.model_ref,
+    )
+}
+
+pub(crate) fn write_running_state_for_model(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    pid: u32,
+    server_pid: Option<u32>,
+    status: &str,
+    served_model_ref: &str,
+) -> Result<()> {
     write_state(
         &request.state_path,
         &json!({
@@ -65,7 +83,7 @@ pub(crate) fn write_running_state(
             "pid": pid,
             "server_pid": server_pid,
             "model_ref": request.model_ref,
-            "canonical_model_id": request.model_ref,
+            "canonical_model_id": served_model_ref,
             "host": request.host,
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),
@@ -118,26 +136,24 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Replace the service's state file whole. Shares the state directory's lock
+/// with every merge (`rocm_core::write_json_state_file`), so a full rewrite
+/// never lands inside another writer's merge, and publishes atomically, so a
+/// lock-free reader such as `rocm services list` never sees half a document.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("failed to write {}", path.display()))
+    rocm_core::write_json_state_file(path, value)
 }
 
+/// Merge `patch` into the service's state file under the lock the healthcheck's
+/// inference latch and `rocmd`'s endpoint publish also take
+/// (`rocm_core::merge_json_state_file`), so no merge drops a key another merge
+/// wrote — `server_pid` above all, which a later stop needs. A full rewrite
+/// ([`write_state`]) is ordered by the same lock but replaces every key.
+///
+/// A state file that is empty, torn or not a JSON object is an error and left
+/// as it was.
 pub(crate) fn merge_json_state(path: &Path, patch: &Value) -> Result<()> {
-    let mut value = read_service_state(path).unwrap_or_else(|_| json!({}));
-    if !value.is_object() {
-        value = json!({});
-    }
-    let object = value.as_object_mut().expect("object checked above");
-    if let Some(patch) = patch.as_object() {
-        for (key, value) in patch {
-            object.insert(key.clone(), value.clone());
-        }
-    }
-    write_state(path, &value)
+    rocm_core::merge_json_state_file(path, patch)
 }
 
 pub(crate) fn mark_json_status(path: &Path, status: &str) -> Result<()> {
@@ -446,5 +462,141 @@ mod tests {
             parse_http_endpoint("http://[::1]:11435/v1"),
             Some(("::1".to_owned(), 11435))
         );
+    }
+
+    /// A wrapper merge into a torn state file — the half-written document the
+    /// old non-atomic writers could leave — fails and keeps the file as it
+    /// was, rather than replacing it with the patch and losing `server_pid`.
+    #[test]
+    fn a_merge_into_a_torn_state_file_fails_and_keeps_it() {
+        let dir = scratch_dir("torn-state");
+        let path = dir.join("svc.json");
+        let torn = br#"{"status": "running", "server_pid": 4242, "server_st"#;
+        fs::write(&path, torn).unwrap();
+
+        let merge = merge_json_state(&path, &json!({ "status": "ready" }));
+        let mark = mark_json_status(&path, "stopped");
+
+        let after = fs::read(&path).unwrap();
+        fs::remove_dir_all(&dir).ok();
+        for result in [merge, mark] {
+            let error = format!(
+                "{:#}",
+                result.expect_err("a torn state file must be refused")
+            );
+            assert!(error.contains("is not valid JSON"), "{error}");
+            assert!(
+                error.contains("left it untouched and recorded nothing"),
+                "{error}"
+            );
+        }
+        assert_eq!(after, torn, "the torn file must be left as it was");
+    }
+
+    /// The race behind the lost `server_pid`: the wrapper merging into its own
+    /// state file while a healthcheck latches its inference probe into the same
+    /// file. Both must keep the server's identity, so a later stop still
+    /// targets the server rather than the wrapper.
+    #[test]
+    fn wrapper_and_healthcheck_merges_keep_the_server_identity() {
+        // Few rounds: the race itself is carried by rocm-core's cross-process
+        // merge test; this one shows the wrapper's own writers take part in it.
+        const ROUNDS: u64 = 20;
+        let dir = scratch_dir("merge-race");
+        let path = dir.join("svc.json");
+        write_state(
+            &path,
+            &json!({
+                "status": "running",
+                "pid": 100,
+                "start_ticks": 111_u64,
+                "server_pid": 4242,
+                "server_start_ticks": 99_u64,
+            }),
+        )
+        .unwrap();
+
+        let (wrapper, healthcheck) = std::thread::scope(|scope| {
+            let wrapper = scope.spawn(|| -> Result<()> {
+                for round in 0..ROUNDS {
+                    merge_json_state(&path, &json!({ "backend_state": "ready", "round": round }))?;
+                    mark_json_status(&path, "ready")?;
+                }
+                Ok(())
+            });
+            let healthcheck = scope.spawn(|| -> Result<()> {
+                for round in 0..ROUNDS {
+                    rocm_core::merge_json_state_file(
+                        &path,
+                        &json!({ rocm_core::INFERENCE_PROBE_ATTEMPTED_STATE_KEY: round }),
+                    )?;
+                }
+                Ok(())
+            });
+            (
+                wrapper.join().expect("wrapper thread"),
+                healthcheck.join().expect("healthcheck thread"),
+            )
+        });
+
+        let state = read_service_state(&path);
+        fs::remove_dir_all(&dir).ok();
+        wrapper.expect("every wrapper merge succeeds");
+        healthcheck.expect("every healthcheck merge succeeds");
+        let state = state.expect("the state file is still a whole document");
+        let identity = identity_from_state(&state).expect("an identity to stop");
+        assert_eq!(identity.pid, 4242, "a stop must target the server: {state}");
+        assert_eq!(identity.start_ticks, Some(99), "{state}");
+        assert_eq!(state["round"], ROUNDS - 1, "{state}");
+        assert_eq!(
+            state[rocm_core::INFERENCE_PROBE_ATTEMPTED_STATE_KEY],
+            ROUNDS - 1,
+            "{state}"
+        );
+    }
+
+    /// Whether `dir` holds the state directory lock file that only the shared
+    /// locked writers create.
+    fn has_state_lock_file(dir: &Path) -> bool {
+        dir.join(rocm_core::JSON_STATE_LOCK_FILE_NAME).is_file()
+    }
+
+    /// A full rewrite goes through the shared locked writer (whose locking
+    /// rocm-core's own tests pin): it leaves the directory's lock file behind,
+    /// which a write of its own would not.
+    #[test]
+    fn a_state_rewrite_goes_through_the_shared_locked_writer() {
+        let dir = scratch_dir("rewrite-lock");
+        let path = dir.join("svc.json");
+
+        let result = write_state(&path, &json!({ "status": "starting" }));
+
+        let locked = has_state_lock_file(&dir);
+        let state = read_service_state(&path);
+        fs::remove_dir_all(&dir).ok();
+        result.expect("the rewrite succeeds");
+        assert!(locked, "the rewrite must take the state directory's lock");
+        assert_eq!(
+            state.expect("the rewrite was published"),
+            json!({ "status": "starting" })
+        );
+    }
+
+    #[test]
+    fn a_state_merge_goes_through_the_shared_locked_writer() {
+        let dir = scratch_dir("merge-lock");
+        let path = dir.join("svc.json");
+        fs::write(&path, br#"{"server_pid": 4242}"#).unwrap();
+
+        let result = mark_json_status(&path, "ready");
+
+        let locked = has_state_lock_file(&dir);
+        let state = read_service_state(&path);
+        fs::remove_dir_all(&dir).ok();
+        result.expect("the merge succeeds");
+        assert!(locked, "the merge must take the state directory's lock");
+        let state = state.expect("the merge was published");
+        assert_eq!(state["server_pid"], 4242, "{state}");
+        assert_eq!(state["status"], "ready", "{state}");
     }
 }
