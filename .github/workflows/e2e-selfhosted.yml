@@ -663,9 +663,14 @@ jobs:
             [ "$status" = completed ] && break
             sleep 60
           done
-          conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) ||
-            conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) ||
+          # The run has finished: a failed call is asked again, a few times and
+          # a while apart, so two API errors in a row do not turn a passing run red.
+          conclusion=unknown
+          for attempt in 1 2 3 4 5; do
+            conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) && [ -n "$conclusion" ] && break
             conclusion=unknown
+            sleep $((attempt * 10))
+          done
           echo "queue run concluded: ${conclusion}"
 
           # What the run published: the lanes' files, one directory per lane,
@@ -701,14 +706,26 @@ jobs:
           # which scenarios; the job follows the run's verdict.
           [ "$conclusion" = success ]
 
-      # A push that supersedes this one cancels the job, which would otherwise
-      # leave its queue run holding the runner it waits on: cancel that run too.
-      # The queue side's lanes are left to their own budgets.
+      # A push that supersedes this one cancels the job, and a job that fails
+      # after the dispatch (the run never appeared in the list) ends too; either
+      # would otherwise leave its queue run holding the runner it waits on: cancel
+      # that run too. Cancelling a run that has finished is harmless. The queue
+      # side's lanes are left to their own budgets.
       - name: Cancel the queue run this job started
-        if: cancelled()
+        if: failure() || cancelled()
         run: |
-          [ -f "${RUNNER_TEMP}/queue-run-id" ] || exit 0
-          gh run cancel "$(cat "${RUNNER_TEMP}/queue-run-id")" || true
+          run_id=""
+          [ -f "${RUNNER_TEMP}/queue-run-id" ] && run_id=$(cat "${RUNNER_TEMP}/queue-run-id")
+          # The run was dispatched but its id was never found: look once more,
+          # by the same title.
+          if [ -z "$run_id" ]; then
+            caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+              --limit 50 --json databaseId,displayTitle |
+              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+          fi
+          [ -n "$run_id" ] || exit 0
+          gh run cancel "$run_id" || true
 
       # A report is uploaded whatever the verdict, as the self-hosted lane's is:
       # a failing run's report is what the consolidated grid is for.

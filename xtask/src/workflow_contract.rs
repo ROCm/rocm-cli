@@ -10037,8 +10037,8 @@ permissions:
             "the gate's `if` must not hold `always()`: {condition}"
         );
         assert!(
-            gate.contains("if: cancelled()") && gate.contains("gh run cancel"),
-            "the gate must cancel the queue run it started when it is cancelled"
+            gate.contains("if: failure() || cancelled()") && gate.contains("gh run cancel"),
+            "the gate must cancel the queue run it started when it fails or is cancelled"
         );
         // From main, never from the pull request's own copy of the workflow: the
         // runner runs only the file as it is on main.
