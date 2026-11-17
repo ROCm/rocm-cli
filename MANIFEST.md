@@ -93,7 +93,7 @@ repository.
 | bytes | 1.12.0 | MIT |
 | castaway | 0.2.4 | MIT |
 | cbc | 0.1.2 | MIT OR Apache-2.0 |
-| cc | 1.11.0 | MIT OR Apache-2.0 |
+| cc | 1.11.1 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
 | cfg_aliases | 0.1.1 | MIT |
 | cfg_aliases | 0.2.1 | MIT |
@@ -114,6 +114,7 @@ repository.
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT |
 | console | 0.16.4 | MIT |
 | const-oid | 0.9.6 | Apache-2.0 OR MIT |
+| constant_time_eq | 0.6.1 | CC0-1.0 OR MIT-0 OR Apache-2.0 |
 | convert_case | 0.10.0 | MIT |
 | core-foundation | 0.9.4 | MIT OR Apache-2.0 |
 | core-foundation | 0.10.1 | MIT OR Apache-2.0 |
@@ -179,7 +180,7 @@ repository.
 | find-msvc-tools | 0.1.15 | MIT OR Apache-2.0 |
 | finl_unicode | 1.4.0 | (MIT OR Apache-2.0) AND Unicode-DFS-2016 |
 | fixedbitset | 0.4.2 | MIT/Apache-2.0 |
-| flate2 | 1.1.10 | MIT OR Apache-2.0 |
+| flate2 | 1.1.11 | MIT OR Apache-2.0 |
 | fnv | 1.0.7 | Apache-2.0 / MIT |
 | foldhash | 0.2.0 | Zlib |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
@@ -464,7 +465,7 @@ repository.
 | symlink | 0.1.0 | MIT/Apache-2.0 |
 | syn | 1.0.109 | MIT OR Apache-2.0 |
 | syn | 2.0.119 | MIT OR Apache-2.0 |
-| syn | 3.0.9 | MIT OR Apache-2.0 |
+| syn | 3.0.10 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
 | synthez | 0.4.0 | BlueOak-1.0.0 |
@@ -497,7 +498,7 @@ repository.
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-tungstenite | 0.28.0 | MIT |
 | tokio-util | 0.7.20 | MIT |
-| toml | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml | 1.2.1+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_datetime | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 |
@@ -621,10 +622,11 @@ repository.
 | zerofrom | 0.1.8 | Unicode-3.0 |
 | zerofrom-derive | 0.1.7 | Unicode-3.0 |
 | zeroize | 1.9.0 | Apache-2.0 OR MIT |
+| zeroize_derive | 1.5.0 | Apache-2.0 OR MIT |
 | zerotrie | 0.2.4 | Unicode-3.0 |
 | zerovec | 0.11.6 | Unicode-3.0 |
 | zerovec-derive | 0.11.3 | Unicode-3.0 |
-| zip | 9.3.0 | MIT |
+| zip | 9.5.0 | MIT |
 | zlib-rs | 0.6.7 | Zlib |
 | zmij | 1.0.21 | MIT |
 | zopfli | 0.8.3 | Apache-2.0 |
