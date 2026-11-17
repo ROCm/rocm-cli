@@ -270,8 +270,10 @@ impl RouterSteps for LemondRouterSteps<'_> {
         if let Some(mut child) = self.child.take() {
             // The whole tree: a router that failed to load a model can leave a
             // backend process holding the device memory, and the fallback starts
-            // a second server on the same device and port straight after.
-            let _ = rocm_core::terminate_process_tree(child.id());
+            // a second server on the same device and port straight after. The
+            // stop escalates to SIGKILL after the grace period, so the wait below
+            // returns even for a server that ignores SIGTERM.
+            let _ = crate::state::terminate_pid(child.id(), true);
             let _ = child.wait();
         }
     }
@@ -790,6 +792,95 @@ mod tests {
             "stop_server must terminate and reap the spawned lemond"
         );
         assert!(steps.child.is_none());
+    }
+
+    /// A `lemond` that ignores SIGTERM, with a backend child that ignores it
+    /// too, is still stopped and reaped: `stop_server` escalates to SIGKILL for
+    /// the whole tree after the stop grace instead of waiting on the server
+    /// forever. A watchdog kills both if the stop does not return in time, so a
+    /// regression fails the test instead of hanging it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_router_stop_kills_a_server_tree_that_ignores_sigterm() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let request = request(dir);
+        let env = LemonadeProcessEnvironment::default();
+        let manifest = crate::test_http::fake_runtime::manifest(dir, 0, None);
+        // The backend child writes its PID once it runs, which is after the
+        // trap is set in the parent and inherited (`SIG_IGN` survives `exec`).
+        let backend_pid_file = dir.join("backend.pid");
+        crate::test_http::fake_runtime::write_executable(
+            &manifest.lemond,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM\nsh -c 'echo $$ > \"{}\"; exec sleep 300' &\nwait\n",
+                backend_pid_file.display()
+            ),
+        );
+        let mut steps = LemondRouterSteps {
+            runtime: LemonadeRuntime { manifest },
+            request: &request,
+            process_env: &env,
+            log_path: None,
+            parent: ParentRuntimeEnvironment::rooted_at(dir),
+            child: None,
+        };
+        let server_pid = steps.spawn_server().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let backend_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&backend_pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake lemond never started its backend"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let backend = rocm_core::ProcessIdentity::capture(backend_pid);
+
+        let bound = crate::STOP_GRACE * 2 + Duration::from_secs(10);
+        let (watchdog_cancel, stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if stopped.recv_timeout(bound).is_ok() {
+                return false;
+            }
+            for pid in [backend_pid, server_pid] {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            true
+        });
+        steps.stop_server();
+        let _ = watchdog_cancel.send(());
+        let watchdog_fired = watchdog.join().unwrap();
+        let backend_state = rocm_core::identity_state(&backend);
+        if backend_state == rocm_core::IdentityState::Matches {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &backend_pid.to_string()])
+                .status();
+        }
+
+        assert!(
+            !watchdog_fired,
+            "stop_server did not return within {bound:?} for a server ignoring SIGTERM"
+        );
+        assert!(steps.child.is_none());
+        assert!(
+            !Path::new(&format!("/proc/{server_pid}")).exists(),
+            "the server must be killed and reaped"
+        );
+        assert!(
+            matches!(
+                backend_state,
+                rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
+            ),
+            "the backend under the server must be killed too, got {backend_state:?}"
+        );
     }
 
     /// Backend selection runs `lemonade backends` through the serve request's

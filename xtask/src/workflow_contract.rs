@@ -1718,6 +1718,150 @@ jobs:
         }
     }
 
+    /// Self-hosted E2E lanes that declare no usable GPU, each with the reason.
+    /// Every other self-hosted lane must declare one.
+    const NO_GPU_LANES: [(&str, &str); 2] = [
+        (
+            "e2e-wsl",
+            "the WSL distro is deliberately left without ROCm's WSL driver bridge, \
+             which `rocm install driver` installs under test",
+        ),
+        (
+            "e2e-wsl-nightly",
+            "the nightly twin of e2e-wsl, set up the same way",
+        ),
+    ];
+
+    /// Whether a step's `run:` body invokes the E2E suite itself
+    /// (`cargo xtask e2e`, not `e2e-prewarm` or `e2e-report`).
+    fn runs_the_e2e_suite(step: &str) -> bool {
+        run_block(step).is_some_and(|body| {
+            body.iter().any(|line| {
+                line.match_indices("cargo xtask e2e").any(|(at, m)| {
+                    line[at + m.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(char::is_whitespace)
+                })
+            })
+        })
+    }
+
+    /// Every self-hosted E2E lane declares whether it has a GPU, so the harness
+    /// can fail a GPU lane whose probe found none instead of passing it with
+    /// every GPU scenario (`@requires-gpu` or `@requires-multi-gpu`) skipped.
+    ///
+    /// Derived from the workflows like the GPU-preflight check above, so a new
+    /// lane is held to it the day it lands. The declaration is read from the
+    /// job-level `env:` mapping: a step-level one would leave the other steps,
+    /// and a reader of the job header, without it, and one on the step that
+    /// runs the suite would override it there. A lane that runs the suite
+    /// inside WSL must name the variable in every `WSLENV` it sets, and in one
+    /// on the step that runs the suite, since `wsl.exe` passes nothing else
+    /// into the guest.
+    #[test]
+    fn every_self_hosted_lane_declares_whether_it_has_a_gpu() {
+        let name = e2e_report::EXPECT_GPU_ENV;
+        let mut no_gpu_seen = Vec::new();
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, _) in self_hosted_e2e_jobs(&text) {
+                let block = job_block(&text, &job);
+                let env = job_mapping(block, "env");
+                let exempt = NO_GPU_LANES.iter().any(|(lane, _)| *lane == job);
+                match env.get(name).map(String::as_str) {
+                    Some("1") => assert!(
+                        !exempt,
+                        "{workflow} job `{job}` is listed in NO_GPU_LANES but declares \
+                         {name}: \"1\"; drop it from the list"
+                    ),
+                    Some("0") => {
+                        assert!(
+                            exempt,
+                            "{workflow} job `{job}` declares {name}: \"0\" but is not in \
+                             NO_GPU_LANES; a self-hosted lane without a GPU needs its reason \
+                             recorded there"
+                        );
+                        no_gpu_seen.push(job.clone());
+                    }
+                    other => panic!(
+                        "{workflow} job `{job}` runs on self-hosted hardware but its job-level \
+                         `env:` sets {name} to {other:?}; it must be \"1\" (a GPU lane) or \
+                         \"0\" (listed in NO_GPU_LANES)"
+                    ),
+                }
+                let why = NO_GPU_LANES
+                    .iter()
+                    .find(|(lane, _)| *lane == job)
+                    .map_or_else(String::new, |(_, reason)| {
+                        format!(" (a NO_GPU_LANES lane: {reason})")
+                    });
+                let names_it = |wslenv: &str| {
+                    wslenv
+                        .trim_matches(|c| c == '\'' || c == '"')
+                        .split(':')
+                        .any(|var| var.split('/').next() == Some(name))
+                };
+                for wslenv in block
+                    .lines()
+                    .filter_map(|line| line.trim().strip_prefix("$env:WSLENV = "))
+                {
+                    assert!(
+                        names_it(wslenv),
+                        "{workflow} job `{job}`{why} sets WSLENV without {name}, so the suite \
+                         inside WSL reads the lane as undeclared: {wslenv}"
+                    );
+                }
+                // The step that runs the suite is where the declaration has
+                // to arrive: a step-level override there would replace the
+                // job's value, and a WSL step that names it in no WSLENV of
+                // its own leaves the guest without it, whatever other steps do.
+                let steps = job_steps(block)
+                    .unwrap_or_else(|| panic!("{workflow} job `{job}` has no `steps:` list"));
+                let harness: Vec<&(String, String)> = steps
+                    .iter()
+                    .filter(|(_, step)| runs_the_e2e_suite(step))
+                    .collect();
+                assert!(
+                    !harness.is_empty(),
+                    "{workflow} job `{job}` has no step that runs `cargo xtask e2e`"
+                );
+                for (step_name, step) in harness {
+                    assert!(
+                        !step_env(step).contains_key(name),
+                        "{workflow} job `{job}`{why}: step `{step_name}` sets {name} itself, \
+                         overriding the job-level declaration"
+                    );
+                    if step.contains("Invoke-WslBash.ps1") {
+                        assert!(
+                            step.lines()
+                                .filter_map(|line| line.trim().strip_prefix("$env:WSLENV = "))
+                                .any(names_it),
+                            "{workflow} job `{job}`{why}: step `{step_name}` runs the suite in \
+                             WSL but sets no WSLENV naming {name}, so the guest reads the lane \
+                             as undeclared"
+                        );
+                    }
+                }
+            }
+        }
+        for (lane, _) in NO_GPU_LANES {
+            assert!(
+                no_gpu_seen.iter().any(|seen| seen == lane),
+                "NO_GPU_LANES lists `{lane}`, which no self-hosted workflow declares \
+                 {name}: \"0\"; drop the stale entry"
+            );
+        }
+        // The queue lanes run through this script, not a workflow job; every
+        // queue lane is given a GPU.
+        let script = std::fs::read_to_string(repo_root().join("scripts/run-e2e-lane.sh"))
+            .expect("reading the lane script");
+        let export = format!("export {name}=\"${{{name}-1}}\"");
+        assert!(
+            script.lines().any(|line| line.trim() == export),
+            "scripts/run-e2e-lane.sh must declare its lanes' GPU with `{export}`"
+        );
+    }
+
     #[test]
     fn only_e2e_gpu_may_carry_the_stale_gate_on_its_preflight() {
         let workflow = |job: &str| {
@@ -5736,14 +5880,16 @@ fi
 
         let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
             .expect("read hardware testing docs");
-        let documented: Vec<Vec<String>> =
-            markdown_table_rows(&docs, "| Job | Workflow | Platform | Runner labels |")
-                .into_iter()
-                .filter(|row| {
-                    row.get(1)
-                        .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
-                })
-                .collect();
+        let documented: Vec<Vec<String>> = markdown_table_rows(
+            &docs,
+            "| Job | Workflow | Platform | Runner labels | GPU declared (`E2E_EXPECT_GPU`) |",
+        )
+        .into_iter()
+        .filter(|row| {
+            row.get(1)
+                .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
+        })
+        .collect();
 
         let documented_jobs: Vec<String> = documented.iter().map(|row| row[0].clone()).collect();
         let declared_jobs: Vec<String> = lanes.iter().map(|(job, _)| format!("`{job}`")).collect();
@@ -5770,6 +5916,15 @@ fi
                 flattened_list_items(&quoted[0]),
                 flattened_list_items(runs_on),
                 "the documented runner labels for `{job}` must match its actual runs-on"
+            );
+            let declared = job_mapping(job_block(&self_hosted, job), "env")
+                .get(e2e_report::EXPECT_GPU_ENV)
+                .map(|value| format!("`{value}`"));
+            assert_eq!(
+                row.get(4),
+                declared.as_ref(),
+                "the GPU declared cell for `{job}` must match its job-level {}",
+                e2e_report::EXPECT_GPU_ENV
             );
         }
 

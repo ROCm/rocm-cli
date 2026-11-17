@@ -1005,6 +1005,21 @@ Feature: Model serving
     When the client repeats those calls with the key
     Then every one of those calls succeeds
 
+  # A vLLM wheel built against a different torch installs and reports a version,
+  # so the inventory called it `runtime: ready` and `serve` then died deep in
+  # engine start-up. The inventory now says it is installed but not usable and
+  # names the extension (read-only, so a host whose torch needs a compat shim
+  # nobody has written yet can still read `ready`). Hermetic: a stand-in interpreter answers the probe, so
+  # no GPU, network or real vLLM is needed. The matching refusal in `serve` is
+  # covered at unit level (`serve_refuses_a_vllm_whose_extensions_do_not_import`)
+  # because reaching it end to end needs a GPU lane.
+  @id:serve-vllm-broken-extensions-reported-not-usable @requires-os:linux
+  Scenario: serve-62 - A vLLM install whose compiled extensions do not import is not reported as ready
+    Given a vLLM install whose compiled extensions do not import
+    When the user lists the engines of that install
+    Then vLLM is reported as installed but not usable
+    And the report names the extension that failed to import
+
   # ROCMAI-1058: when one of vLLM's compiled extensions fails to load (typically
   # built against a newer glibc than the host has), vLLM logs a warning, carries
   # on, and dies later on the first op that extension registers. `rocm serve`
@@ -1022,7 +1037,7 @@ Feature: Model serving
   # that the process died; every sentence asserted below is computed from that
   # log by the engine, so breaking the hint fails this scenario.
   @id:serve-vllm-extension-load-hint @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-62 - A launch that died on a vLLM compiled extension that did not load says so and points at diagnose
+  Scenario: serve-63 - A launch that died on a vLLM compiled extension that did not load says so and points at diagnose
     Given a managed vLLM launch whose compiled extension will fail to load
     When the user serves a model on that launch
     Then the startup failure names the vLLM compiled extension that did not load
