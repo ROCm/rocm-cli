@@ -37,6 +37,7 @@ pub(crate) fn with_registry_probe(
         ManagedRegistrySnapshot {
             has_live_service,
             managed_ids: managed_ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
         },
     )));
 }

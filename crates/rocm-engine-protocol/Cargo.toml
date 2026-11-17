@@ -22,6 +22,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The leftover a killed owner-only key store leaves, for the tests of the
+# cleanups that remove it (`atomic_write::stage_owner_only_file_unpublished`).
+rocm-core = { path = "../rocm-core", features = ["test-support"] }
 # Property tests for the engine protocol decoders (`tests/protocol_properties.rs`).
 proptest = { version = "1", default-features = false, features = ["std"] }
 

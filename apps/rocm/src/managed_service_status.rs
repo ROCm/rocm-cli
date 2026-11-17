@@ -230,7 +230,7 @@ pub(crate) fn container_stop_unresolved(record: &ManagedServiceRecord) -> bool {
 /// operator never asked for it to go away and will want it back: dropping the
 /// key there would make `rocm services restart` and daemon recovery refuse it
 /// permanently — fail-closed guards have no way to re-mint a key. The cost of
-/// this choice is that a crashed public service's 0600 key file outlives the
+/// this choice is that a crashed public service's owner-only key file outlives the
 /// process until the service is stopped or successfully restarted.
 ///
 /// Called before the liveness gate in

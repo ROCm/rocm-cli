@@ -31,16 +31,17 @@ for Lemonade and vLLM.
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory but not the serving-instance registry; no vLLM |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
-Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory —
-the serving-instance registry view needs the `rocmdashd` unix socket, so it's
-Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
+Live dashboard telemetry works on Windows too: GPU/CPU/memory and the managed
+servers `rocm services list` reports. Per-server throughput and Docker-discovered
+instances need the `rocmdashd` unix socket, so they're Linux/WSL2 only (see
+[Interactive interfaces](#interactive-interfaces)). vLLM
 serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
@@ -79,7 +80,8 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 ## Installation
 
-The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
+The installer downloads a prebuilt bundle, verifies its SHA-256 checksum and
+its detached signature against the release public key pinned in the installer,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
 `PATH`, or fish's config folder already exists), the installer also adds that
@@ -247,9 +249,10 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
-Live mode works on Windows too, but shows only GPU/CPU/memory — the
-serving-instance registry needs the Unix domain socket telemetry, so that view
-is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
+Live mode works on Windows too, showing GPU/CPU/memory and the managed servers
+`rocm services list` reports. Per-server throughput and Docker-discovered
+instances need the Unix domain socket telemetry, so they are Linux/WSL2 only.
+Use `rocm dash --demo` for a synthetic session that runs
 anywhere without a GPU or daemon.
 
 On Linux and WSL, the embedded daemon also discovers loaded models from a
@@ -407,14 +410,15 @@ position.
   reads that text first: quotes, `$(...)` and a leading `-` in a pasted error
   can be changed, run, or taken as a flag.
 - `--symptom-file PATH` reads the same text from a file instead, or from
-  standard input when PATH is `-`, so no quoting is needed. It cannot be
-  combined with `--symptom`. The text that arrives is matched as `--symptom`
-  would match it, minus one trailing line break. A UTF-8 byte-order mark is
-  dropped and a UTF-16 file with a byte-order mark (what Windows PowerShell's
-  `>` writes) is decoded; anything else must be UTF-8. A file that cannot be
-  read, input that is not text, or input larger than 16 MiB is a usage error
-  (exit code 2). With nothing piped in, paste the error at the terminal and
-  end it with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+  standard input when PATH is `-`, so no quoting is needed (a file named `-`
+  is passed as `./-`). It cannot be combined with `--symptom`. The text that
+  arrives is matched as `--symptom` would match it, minus one trailing line
+  break. A UTF-8 byte-order mark is dropped and a UTF-16 file with a
+  byte-order mark (what Windows PowerShell's `>` writes) is decoded; anything
+  else must be UTF-8. A file that cannot be read, input that is not text, or
+  input larger than 16 MiB is a usage error (exit code 2). With nothing piped
+  in, paste the error at the terminal and end it with Ctrl-D at the start of
+  a line (Ctrl-Z then Enter on Windows).
 
   ```bash
   # bash (Linux, WSL): the quoted 'EOF' keeps the shell out of the paste
@@ -435,6 +439,16 @@ position.
   :: cmd.exe: save the error to a file first
   rocm diagnose --symptom-file error.txt
   ```
+- With either flag, a finding about the examined host can still outrank the
+  entry the text added to, so each match says whether the text contributed to
+  its score or evidence: `symptom_matched` in `--json` (always present, `false`
+  when neither `--symptom` nor `--symptom-file` was given). Any keyword hit
+  counts, however weak, so `true` means the text contributed, not that the
+  match explains the error. In the human-readable output, a `source: the
+  examined host's state alone` line marks each shown match the text did not
+  contribute to, once the text contributed to any match in the report. That
+  includes one past `--top`, so all the rows shown can carry the line when the
+  only match the text contributed to was cut off.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
@@ -722,7 +736,12 @@ always right: the index has published a CPU-only torchaudio under the same
 requested version publishes no torchaudio for this Python and platform.
 
 It then asks `uv` to resolve Torch and torchvision from their published
-dependency metadata alongside the pinned torchaudio. Before it creates or
+dependency metadata alongside the pinned torchaudio. For a ROCm line the vLLM
+ROCm 10.x install also supports (10.0 and 10.1), the request is bounded to the
+Torch and torchvision series that install pairs for that line (for 10.1, torch
+2.13 and torchvision 0.28), because the newest torch on the index can pair with
+a torchvision that fails to import. The `version_resolution_specs:` line in the
+plan shows the bound. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
@@ -1214,7 +1233,8 @@ the memory fraction when a small model shouldn't reserve most of a large card.
 
 `--require-api-key` makes a loopback endpoint require an API key too, which
 matters when something else republishes the port. A public bind generates a key
-automatically unless you supply one. Set `ROCM_SERVE_API_KEY` rather than
+automatically unless you supply one. The key is kept in a file under the data
+directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather than
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
@@ -1542,7 +1562,8 @@ bound by another process, it refuses and the service stays stopped
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
-its engine state file, and its endpoint key file; a running server is refused,
+its engine state file, its endpoint key file and any copy of that key an
+interrupted save left behind; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
 alone, and additionally clears leftover files whose record is already gone. A
 server counts as running while any process it recorded may be running, which on
@@ -1632,9 +1653,10 @@ For `rocm dash`:
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
-- Live mode works on Windows too, but shows only GPU/CPU/memory — there's no
-  `rocmdashd` unix socket to connect to there, so the serving-instance
-  registry view stays empty (Linux and WSL2 get the full live view).
+- Live mode works on Windows too, showing GPU/CPU/memory and the managed
+  servers `rocm services list` reports. There's no `rocmdashd` unix socket
+  there, so per-server throughput and Docker-discovered instances are missing
+  (Linux and WSL2 get the full live view).
 
 ### Bench
 
