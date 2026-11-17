@@ -2732,9 +2732,9 @@ mod tests {
     /// Sibling of `every_help_text_in_the_command_tree_is_ascii`, for the same
     /// reason one level down: clap renders a doc comment verbatim, with no
     /// markdown processing anywhere in its pipeline, so `**every**` written in
-    /// a doc comment reaches the user's terminal as literal asterisks. Review
-    /// on #678 caught exactly that on `Examine`, which the ASCII test could
-    /// not see because `*` and `_` are ASCII.
+    /// a doc comment reaches the user's terminal as literal asterisks. That had
+    /// already happened on `Examine`, where the ASCII test could not see it
+    /// because `*` and `_` are ASCII.
     ///
     /// Only `**` and `__` are rejected, and only those: they have no honest
     /// use in plain help text. A single `*` does (`gfx110*`, a glob in an
