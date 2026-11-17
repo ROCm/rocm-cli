@@ -1419,9 +1419,11 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
     inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
 }
 
-/// Discover the scenario's served model over `/models` (`world.model_name`, so a
-/// router listing several models is not chatted with at its first entry) and POST
-/// one chat completion to it, returning the decoded response.
+/// POST one chat completion to the scenario's served model, returning the
+/// decoded response.
+///
+/// The model is discovered over `/models` from `world.model_name`, so a router
+/// listing several models is not chatted with at its first entry.
 ///
 /// `tools` is merged into the request body for the tool-definitions scenario.
 /// The exchange itself lives in [`e2e_cucumber::chat_request`], which runs it
