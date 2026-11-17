@@ -2026,3 +2026,63 @@ becomes ready:
 - A reasoning model that spends its small token budget before emitting any
   content is not a failure: the summary stays `ready` with the two metric rows
   `n/a` and no smoke-test note.
+
+## 17. `rocm fix` When A Step Does Not Finish Or A Read Fails
+
+The automated scenarios (`diagnose-15`, `diagnose-68` on bare-metal Linux;
+`diagnose-39`, `diagnose-69`, `diagnose-70` on Windows) cover these; repeat
+them by hand on a release build.
+
+Linux, a helper that never finishes. Stand a hanging `sudo` in for the real
+one, on a `PATH` that holds nothing else (so the run is not as root and changes
+no group):
+
+```bash
+ROCM=$(command -v rocm)
+FAKE=$(mktemp -d)
+printf '#!/bin/sh\nexec /bin/sleep 600\n' > "$FAKE/sudo"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE/usermod"
+chmod +x "$FAKE/sudo" "$FAKE/usermod"
+PATH="$FAKE" "$ROCM" fix fix-4-render-group --yes; echo "exit $?"
+```
+
+Expected result:
+
+- After about a minute, stderr says ``sudo usermod timed out after 60s and was
+  stopped; group membership may or may not have changed. Check with
+  `id -nG <user>`, then re-run `rocm fix fix-4-render-group` if it did not.``
+- The exit code is 4. Nothing says `NOT changed`, and there is no
+  `Added <user> to render,video.` line.
+- `pgrep -f 'sleep 600'` finds nothing afterwards.
+
+Windows, a read that fails. In a PowerShell window, empty `PATH` for that window
+only and start `rocm.exe` by its full path:
+
+```powershell
+$rocm = (Get-Command rocm).Source
+$env:Path = ''
+& $rocm fix fix-2-unset-override --yes; "exit $LASTEXITCODE"
+& $rocm fix fix-9-igpu-dgpu --device-index 1 --dry-run; "exit $LASTEXITCODE"
+& $rocm fix fix-2-unset-override --dry-run; "exit $LASTEXITCODE"
+& $rocm fix fix-6-path --dry-run; "exit $LASTEXITCODE"
+```
+
+Expected result:
+
+- fix-2 prints `Could not read the current User HSA_OVERRIDE_GFX_VERSION:
+  PowerShell could not be started: it was not found; nothing was changed.` on
+  stderr and exits 4. It does not print `No persistent HSA_OVERRIDE_GFX_VERSION
+  found` or `You're done`.
+- fix-9, a dry run here, prints the same line for `HIP_VISIBLE_DEVICES`, exits
+  4, and prints no `Plan: persist HIP_VISIBLE_DEVICES` line (the catalog entry
+  that starts `Fix:` is still printed before it). It is run as a dry
+  run because the empty `PATH` hides PowerShell but not `setx.exe`: a fix-9 that
+  wrongly went on would set your real User-scope value.
+- The fix-2 dry run stops the same way: exit 4 and the read-failure line, after
+  the catalog entry, with no `The CLI runs (arguments, not a line to paste)`
+  line.
+- fix-6 (needs a HIP SDK install; without one it exits 3 before reading)
+  prints `Could not read the current User PATH: PowerShell
+  could not be started: it was not found; nothing was changed.`, exits 4, and
+  prints no `Plan: prepend` line.
+- Close the window afterwards; the empty `PATH` was only that window's.
