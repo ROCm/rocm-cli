@@ -126,7 +126,8 @@ torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`), checks them
 against the row's series and the SDK's ROCm line, and realigns to those exact
 builds from the index the SDK was installed from (the one its runtime manifest
 records, so a nightly SDK uses the nightly index and a release SDK the release
-one; the row's nightly index when a manifest recorded none). A series match
+one; the row's nightly index when a manifest recorded none or the registry could
+not be read, and the install output says which). A series match
 would not work there: the nightly index serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
 `+rocm10.3` build. The staging host's `+rocm10.2.0rcN` torch is not used: it
 requires `rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that
