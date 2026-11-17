@@ -982,6 +982,30 @@ Feature: Model serving
     And the launch's service record is left as ready
     And no background automation daemon was left behind
 
+  # An API key on a vLLM endpoint (`--require-api-key`, a public bind, or
+  # `rocm remote serve`) has to cover the whole server, not only the OpenAI `/v1`
+  # API: vLLM's own key check guards a fixed set of path prefixes, while the
+  # server also answers inference and tokenizer routes outside them. rocm-cli
+  # starts vLLM with a middleware that demands the key on every route except
+  # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
+  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
+  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # serve, so `@nightly` rather than per-PR: it runs after merge in the nightly
+  # runs on Instinct GPUs, which serve with vLLM: the MI300X job in
+  # `nightly.yml` and the shared GPU queue's Instinct lanes (MI350P among them).
+  # Not `@merge-queue`: the merge queue runs no lane where vLLM is the engine
+  # (the MI300X lane does not run on `merge_group`), so under that tag it
+  # skipped everywhere.
+  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @nightly
+  Scenario: serve-61 - A key-protected vLLM endpoint refuses keyless requests outside the OpenAI API
+    Given a managed runtime is active
+    And a model is being served on GPU behind an API key
+    When a client calls the server's routes without the key
+    Then every route outside the OpenAI API refuses the call as unauthorized
+    And the health check answers without the key
+    When the client repeats those calls with the key
+    Then every one of those calls succeeds
+
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the
@@ -998,7 +1022,7 @@ Feature: Model serving
   # specifically — the only possible outcome of a scripted/CI `--verbose`
   # session, per that function's own doc comment.
   @id:serve-scripted-death-after-startup @requires-no-gpu
-  Scenario: serve-61 - A managed engine that dies after startup fails loudly
+  Scenario: serve-62 - A managed engine that dies after startup fails loudly
     Given the scripted engine is armed to die shortly after startup
     When the user serves a model expecting the engine to crash after startup
     Then serving fails with a non-zero exit and names the crash
@@ -1012,9 +1036,9 @@ Feature: Model serving
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
   # Before ROCMAI-541 this made a clean, intentional, externally-triggered
-  # stop fail exactly like serve-61's crash.
+  # stop fail exactly like serve-62's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
-  Scenario: serve-62 - An externally stopped attached serve exits cleanly, not as a crash
+  Scenario: serve-63 - An externally stopped attached serve exits cleanly, not as a crash
     Given the scripted engine is armed to run until stopped
     When the user attaches to the scripted serve in the background
     And another shell stops that service while it is attached

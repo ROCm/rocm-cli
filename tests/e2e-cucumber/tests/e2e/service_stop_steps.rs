@@ -4,7 +4,8 @@
 
 //! Steps for stopping a managed service: `rocm services stop <id> --yes`
 //! (confirmed, and unconfirmed through the `ROCM_E2E_STOP_OUTCOME` seam), and
-//! `rocmd sandbox-tool stop_server`.
+//! `rocmd sandbox-tool stop_server`; and for `engine_ipc.feature`, the steps
+//! that run `rocm __engine-stdio vllm` with a request and read its answer.
 //!
 //! Black-box: plants a managed-service record as plain JSON in its own isolated
 //! data dir — the same on-disk shape `rocm serve --managed` writes — then runs
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cucumber::{given, then, when};
+use rocm_engine_protocol::ENGINE_PROTOCOL_VERSION;
 
 use crate::E2eWorld;
 
@@ -201,6 +203,15 @@ async fn managed_server_with_a_recycled_pid(world: &mut E2eWorld) {
 /// the process: it was not signalled, so it is still running.
 #[then("the process now holding the recorded process id is still running")]
 async fn process_holding_the_pid_still_runs(world: &mut E2eWorld) {
+    assert_recorded_process_still_running(
+        world,
+        "the stop signalled a process that is not the recorded server",
+    );
+}
+
+/// The process the scenario recorded has not exited; `failure` says what it
+/// means if it has.
+fn assert_recorded_process_still_running(world: &mut E2eWorld, failure: &str) {
     let process = world
         .recorded_process
         .as_mut()
@@ -210,7 +221,7 @@ async fn process_holding_the_pid_still_runs(world: &mut E2eWorld) {
             .try_wait()
             .expect("failed to check the recorded process")
             .is_none(),
-        "the stop signalled a process that is not the recorded server"
+        "{failure}"
     );
 }
 
@@ -450,6 +461,75 @@ async fn engine_prints_garbage_and_fails(world: &mut E2eWorld) {
     );
 }
 
+/// The version a stand-in engine names when it answers in a protocol this
+/// release cannot use: a later major, which no caret rule accepts.
+const INCOMPATIBLE_PROTOCOL: &str = "9.0.0";
+
+/// This release's engine protocol with its patch raised by one: a newer
+/// protocol that only adds to this release's, which the caret rule accepts.
+fn next_patch_version() -> String {
+    let (rest, patch) = ENGINE_PROTOCOL_VERSION
+        .rsplit_once('.')
+        .expect("the engine protocol version is MAJOR.MINOR.PATCH");
+    let patch: u64 = patch.parse().expect("the patch is a number");
+    format!("{rest}.{}", patch + 1)
+}
+
+/// The stop answer every stand-in below gives, with `version` as its
+/// `protocol_version` (none at all for `None`, as an engine older than the
+/// field writes it).
+fn stop_answer(version: Option<&str>) -> String {
+    let mut answer = serde_json::json!({"ok": true, "data": {"stopped": true, "graceful": true}});
+    if let Some(version) = version {
+        answer["protocol_version"] = serde_json::Value::from(version);
+    }
+    answer.to_string()
+}
+
+#[given("the engine answers the stop request in an engine protocol this release cannot use")]
+async fn engine_answers_in_an_incompatible_protocol(world: &mut E2eWorld) {
+    install_standalone_daemon(
+        world,
+        &format!("echo '{}'", stop_answer(Some(INCOMPATIBLE_PROTOCOL))),
+    );
+}
+
+#[given("the engine writes a log line on stdout before its answer to the stop request")]
+async fn engine_logs_on_stdout_before_answering(world: &mut E2eWorld) {
+    install_standalone_daemon(
+        world,
+        &format!(
+            "echo 'stand-in engine: loading model'\necho '{}'",
+            stop_answer(Some(ENGINE_PROTOCOL_VERSION))
+        ),
+    );
+}
+
+/// An answer in this release's protocol, in a newer one that only added to it
+/// (the next patch: same minor, so the caret rule accepts it), or with no
+/// version, as an engine from before the field writes it. The newer one carries
+/// the addition too: a field this release does not know, in the envelope and
+/// in the stop's data, which it must ignore.
+#[given(
+    regex = r"^the engine answers the stop request in (this release's engine protocol|a newer engine protocol that only adds to this release's|no named engine protocol)$"
+)]
+async fn engine_answers_in_a_usable_protocol(world: &mut E2eWorld, protocol: String) {
+    let next_patch = next_patch_version();
+    let version = match protocol.as_str() {
+        "this release's engine protocol" => Some(ENGINE_PROTOCOL_VERSION),
+        "a newer engine protocol that only adds to this release's" => Some(next_patch.as_str()),
+        "no named engine protocol" => None,
+        other => panic!("no stand-in for {other:?}"),
+    };
+    let mut answer: serde_json::Value =
+        serde_json::from_str(&stop_answer(version)).expect("the stop answer is JSON");
+    if protocol == "a newer engine protocol that only adds to this release's" {
+        answer["hint"] = serde_json::Value::from("a field added after this release");
+        answer["data"]["drained_requests"] = serde_json::Value::from(0);
+    }
+    install_standalone_daemon(world, &format!("echo '{answer}'"));
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 /// Runs the pinned, directly-runnable form `serve_summary.rs`'s `stop` row
@@ -595,9 +675,9 @@ async fn engine_answered_the_stop(world: &mut E2eWorld) {
     );
 }
 
-/// The stop report `rocmd sandbox-tool stop_server` printed, with the tool's own
-/// exit status checked first: both engine endings below leave the stop itself
-/// succeeding.
+/// The stop report `rocmd sandbox-tool stop_server` printed, parsed as JSON,
+/// after asserting that the tool exited 0: in every scenario that reads the
+/// report this way, the stop itself succeeds whatever the engine answered.
 fn tool_report(world: &E2eWorld) -> serde_json::Value {
     let stdout = world.cli_output.as_deref().unwrap_or_default();
     assert_eq!(
@@ -634,12 +714,23 @@ async fn engine_received_one_stop_request(world: &mut E2eWorld) {
         .unwrap_or_else(|error| panic!("the request is not JSON ({error}): {requests:?}"));
     assert_eq!(request["method"], "stop", "{request}");
     assert_eq!(request["payload"]["service_id"], SERVICE_ID, "{request}");
+    // The daemon writes its request in its own engine protocol.
+    assert_eq!(
+        request["protocol_version"], ENGINE_PROTOCOL_VERSION,
+        "{request}"
+    );
 }
 
 /// What the engine printed before it exited non-zero is what the report carries:
 /// a stop it answered, with no error taken from the exit status.
 #[then("the tool reports the engine's answer to the stop, not the status it exited with")]
 async fn engine_answer_survives_a_failing_exit(world: &mut E2eWorld) {
+    assert_engine_answered_the_stop(world);
+}
+
+/// The report carries the stand-in's stop answer as the engine's result, and
+/// the stop itself completed.
+fn assert_engine_answered_the_stop(world: &E2eWorld) {
     let report = tool_report(world);
     assert_eq!(
         report["result"]["engine_stop"],
@@ -661,11 +752,59 @@ async fn unreadable_answer_reported_with_stderr(world: &mut E2eWorld) {
     assert_eq!(
         engine_stop["error"],
         "failed to parse engine response envelope \
-         (engine stdio process exited with code 1); \
+         (engine stdio process exited with code 1): the engine's stdout is not JSON \
+         (expected ident at line 1 column 2), starting with `this is not an answer` \
+         (an engine writes only its JSON answer to stdout; logs go to stderr); \
          stderr: engine exploded: no container runtime",
         "{report}"
     );
     assert!(engine_stop.get("stopped").is_none(), "{report}");
+}
+
+/// An answer in a protocol this release cannot use is not taken as the stop's
+/// result, even though it says the engine stopped: the report carries the
+/// refusal, naming both versions, and nothing from the answer.
+#[then(
+    "the tool reports the engine's answer refused, naming the engine's protocol and this release's"
+)]
+async fn incompatible_answer_refused(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    let engine_stop = &report["result"]["engine_stop"];
+    assert_eq!(
+        *engine_stop,
+        serde_json::json!({
+            "attempted": true,
+            "error": format!(
+                "engine answered in engine protocol {INCOMPATIBLE_PROTOCOL}, which this \
+                 release (engine protocol {ENGINE_PROTOCOL_VERSION}) cannot use"
+            ),
+        }),
+        "{report}"
+    );
+}
+
+/// An answer with a log line before it on stdout is refused, and the error says
+/// what the engine did wrong, quoting the line it wrote before its answer.
+#[then("the tool reports the engine's answer refused for the log line the engine wrote before it")]
+async fn contaminated_answer_refused(world: &mut E2eWorld) {
+    let report = tool_report(world);
+    assert_eq!(
+        report["result"]["engine_stop"],
+        serde_json::json!({
+            "attempted": true,
+            "error": "failed to parse engine response envelope: the engine wrote other \
+                      output to stdout before its answer, starting with `stand-in engine: \
+                      loading model` (an engine writes only its JSON answer to stdout; logs go \
+                      to stderr)",
+        }),
+        "{report}"
+    );
+}
+
+/// The engine's own answer is the stop's engine result.
+#[then("the tool reports the engine's answer to the stop")]
+async fn engine_answer_reported(world: &mut E2eWorld) {
+    assert_engine_answered_the_stop(world);
 }
 
 /// For a `vllm` server the engine's `Stop` is advisory: the recorded process
@@ -899,4 +1038,205 @@ fn assert_succeeded(world: &E2eWorld) {
         "expected success, got rc={rc}:\n{}",
         combined_output(world)
     );
+}
+
+// ── An engine reading a request (engine-ipc-08 to -12) ─────────────
+
+/// The `vllm` engine's own record of a server (`<data>/engines/vllm/state/`),
+/// as the engine writes it when it starts one.
+fn vllm_engine_state_path(world: &E2eWorld) -> PathBuf {
+    engine_state_dir(world).join(format!("{SERVICE_ID}.json"))
+}
+
+/// A process the `vllm` engine recorded as a server it started: a real `sleep`,
+/// named in the engine's state file with the start-time token `/proc` gives it,
+/// so a `stop` the engine served would find and end it.
+#[given("an engine server whose process the vllm engine recorded is running")]
+async fn vllm_engine_recorded_a_running_server(world: &mut E2eWorld) {
+    let process = Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start the process to record");
+    let state = serde_json::json!({
+        "service_id": SERVICE_ID,
+        "status": "ready",
+        "pid": process.id(),
+        "start_ticks": start_ticks(process.id()),
+    });
+    world.recorded_process = Some(process);
+    std::fs::create_dir_all(engine_state_dir(world)).expect("failed to create engine state dir");
+    std::fs::write(
+        vllm_engine_state_path(world),
+        serde_json::to_vec_pretty(&state).expect("failed to serialize engine state"),
+    )
+    .expect("failed to write the engine's state");
+}
+
+/// Runs `rocm __engine-stdio vllm`, the command the daemon reaches an engine
+/// through, sends it `request` on stdin and records what it printed and how it
+/// exited.
+fn send_to_vllm_over_stdio(world: &mut E2eWorld, request: &str) {
+    use std::io::Write as _;
+    let mut command = Command::new(crate::rocm_binary());
+    command
+        .args(["__engine-stdio", ENGINE])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    world.isolate_cmd(&mut command);
+    let mut child = command.spawn().expect("failed to run rocm __engine-stdio");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(format!("{request}\n").as_bytes())
+        .expect("failed to send the request");
+    let output = child.wait_with_output().expect("failed to wait for rocm");
+    world.cli_output = Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    world.cli_stderr = Some(String::from_utf8_lossy(&output.stderr).into_owned());
+    world.cli_rc = Some(output.status.code().unwrap_or(-1));
+}
+
+/// A `stop` request for the server, written for [`INCOMPATIBLE_PROTOCOL`].
+#[when(
+    "the vllm engine is asked over stdio to stop that server, in an engine protocol it cannot serve"
+)]
+async fn ask_vllm_to_stop_in_an_incompatible_protocol(world: &mut E2eWorld) {
+    let request = serde_json::json!({
+        "protocol_version": INCOMPATIBLE_PROTOCOL,
+        "method": "stop",
+        "payload": {"service_id": SERVICE_ID, "force": true},
+    });
+    send_to_vllm_over_stdio(world, &request.to_string());
+}
+
+/// The requests the engine-side scenarios send. `frobnicate` is a method no
+/// engine has, so in an incompatible protocol the only answer that names the
+/// protocol is one given before the method is decoded; the stop whose
+/// version is the number `9` is likewise refused only if the version is read
+/// before the envelope is decoded as a whole.
+#[when(
+    regex = r"^the vllm engine is sent over stdio (a request for a method it does not have, in an engine protocol it cannot serve|a stop request for that server whose protocol version is not text|a request for a method it does not have, in its own engine protocol|something that is not a request)$"
+)]
+async fn send_vllm_a_request(world: &mut E2eWorld, request: String) {
+    let text = match request.as_str() {
+        "a request for a method it does not have, in an engine protocol it cannot serve" => {
+            serde_json::json!({
+                "protocol_version": INCOMPATIBLE_PROTOCOL,
+                "method": "frobnicate",
+                "payload": {},
+            })
+            .to_string()
+        }
+        "a stop request for that server whose protocol version is not text" => serde_json::json!({
+            "protocol_version": 9,
+            "method": "stop",
+            "payload": {"service_id": SERVICE_ID, "force": true},
+        })
+        .to_string(),
+        "a request for a method it does not have, in its own engine protocol" => {
+            serde_json::json!({
+                "protocol_version": ENGINE_PROTOCOL_VERSION,
+                "method": "frobnicate",
+                "payload": {},
+            })
+            .to_string()
+        }
+        "something that is not a request" => "this is not a request".to_owned(),
+        other => panic!("no request for {other:?}"),
+    };
+    send_to_vllm_over_stdio(world, &text);
+}
+
+/// The answer `rocm __engine-stdio` printed, checked to be exactly an error
+/// envelope with `code` and `message`, in this release's protocol, after a
+/// clean exit: every refusal is an answer the daemon can report, not a crash.
+fn assert_engine_error_answer(world: &E2eWorld, code: &str, message: &str) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "rocm __engine-stdio failed:\n{stdout}\n{}",
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    let answer: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|error| panic!("{error}: {stdout}"));
+    assert_eq!(
+        answer,
+        serde_json::json!({
+            "protocol_version": ENGINE_PROTOCOL_VERSION,
+            "ok": false,
+            "error": {"code": code, "message": message},
+        }),
+        "{answer}"
+    );
+}
+
+#[then(
+    "the engine answers that it cannot serve that engine protocol, naming its own and the request's"
+)]
+async fn engine_refused_the_protocol(world: &mut E2eWorld) {
+    assert_engine_error_answer(
+        world,
+        "incompatible_protocol",
+        &format!(
+            "this engine speaks engine protocol {ENGINE_PROTOCOL_VERSION}; the request was made \
+             for protocol {INCOMPATIBLE_PROTOCOL}, which it cannot serve"
+        ),
+    );
+}
+
+#[then("the engine answers that it cannot read the request's protocol version")]
+async fn engine_refused_an_unreadable_version(world: &mut E2eWorld) {
+    assert_engine_error_answer(
+        world,
+        "incompatible_protocol",
+        &format!(
+            "this engine speaks engine protocol {ENGINE_PROTOCOL_VERSION}; the request named \
+             protocol version \"9\", which is not a MAJOR.MINOR.PATCH version, so it cannot be \
+             served"
+        ),
+    );
+}
+
+#[then("the engine answers that it has no such method")]
+async fn engine_has_no_such_method(world: &mut E2eWorld) {
+    assert_engine_error_answer(
+        world,
+        "unknown_method",
+        &format!(
+            "this engine (engine protocol {ENGINE_PROTOCOL_VERSION}) has no method \"frobnicate\""
+        ),
+    );
+}
+
+#[then("the engine answers that what it was sent is not a request")]
+async fn engine_says_not_a_request(world: &mut E2eWorld) {
+    assert_engine_error_answer(
+        world,
+        "invalid_request",
+        "the request is not JSON: expected ident at line 1 column 2",
+    );
+}
+
+#[then("the engine server's process is still running")]
+async fn engine_server_still_running(world: &mut E2eWorld) {
+    assert_recorded_process_still_running(
+        world,
+        "the engine refused the stop but its server's process exited",
+    );
+}
+
+#[then("the vllm engine's record of that server still names its process")]
+async fn vllm_engine_record_unchanged(world: &mut E2eWorld) {
+    let pid = recorded_pid(world);
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(vllm_engine_state_path(world)).expect("the engine's state is gone"),
+    )
+    .expect("the engine's state is not JSON");
+    assert_eq!(state["pid"], pid, "{state}");
+    assert_eq!(state["status"], "ready", "{state}");
 }

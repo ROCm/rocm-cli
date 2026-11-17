@@ -461,12 +461,7 @@ fn plan_runtime_update(
 /// a base can be overridden or rehosted, and the recorded generation is the only
 /// statement about the stream that survives that.
 fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceLayout> {
-    SourceLayout::from_generation(manifest.source_layout_generation.as_deref().or_else(|| {
-        manifest
-            .wheel_composition
-            .as_ref()
-            .map(|composition| composition.source_layout_generation.as_str())
-    }))
+    SourceLayout::from_generation(manifest.recorded_source_layout_generation())
 }
 
 /// The family override to re-resolve a wheel manifest's update *plan* with.

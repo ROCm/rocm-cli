@@ -74,6 +74,10 @@ url = "2"
 vt100 = "0.18"
 
 [dev-dependencies]
+# `ENGINE_PROTOCOL_VERSION`, so the engine protocol scenarios name this
+# release's version from the constant the binaries stamp rather than a copy of
+# it. A dev edge, which `xtask check-crate-edges` exempts.
+rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 # Reads a printed command line back the way a POSIX shell splits words, so a
 # scenario can assert what a `tool_call:` line denotes rather than one spelling
 # of it.

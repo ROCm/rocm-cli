@@ -29,6 +29,9 @@ mod backend_alignment;
 mod device_policy;
 mod direct_llama;
 mod footprint;
+// Linux only: Windows `lemond` has no glibc or OpenSSL floor to check.
+#[cfg(any(target_os = "linux", test))]
+mod host_libraries;
 mod install;
 mod llamacpp_backend;
 mod process;
@@ -189,8 +192,7 @@ pub fn run_cli() -> Result<()> {
             gpu_selection: crate::device_policy::parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
-            let envelope = read_request()?;
-            print_json(&handle_envelope(envelope))?;
+            print_json(&answer_stdio(&read_request()?))?;
         }
         CommandKind::ServeHttp {
             service_id,
@@ -255,6 +257,11 @@ pub fn builtin_serve_http(
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    // Refuse a request made for a protocol this engine cannot serve before its
+    // payload is read: in another protocol the payload may mean something else.
+    if let Some(refusal) = rocm_engine_protocol::incompatible_request_response(&envelope) {
+        return refusal;
+    }
     match envelope.method {
         EngineMethod::Detect => {
             deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |_| {
@@ -299,7 +306,10 @@ where
             Ok(response) => EngineResponseEnvelope::success(response),
             Err(error) => EngineResponseEnvelope::failure("request_failed", format_error(&error)),
         },
-        Err(error) => EngineResponseEnvelope::failure("invalid_payload", error.to_string()),
+        Err(error) => EngineResponseEnvelope::failure(
+            rocm_engine_protocol::INVALID_PAYLOAD_CODE,
+            error.to_string(),
+        ),
     }
 }
 
@@ -412,6 +422,22 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
+    // Refused before anything is downloaded: a `lemond` built against a newer
+    // glibc or OpenSSL than the host has exits at once with a loader error,
+    // which used to reach the user only as "did not become ready".
+    // The line saying what the refusal left undone follows the branch: an
+    // install whose pinned tree is already in place would have downloaded
+    // nothing anyway.
+    #[cfg(target_os = "linux")]
+    crate::host_libraries::refuse_if_host_too_old(
+        rocm_deps::LEMONADE_VERSION,
+        &crate::install::LINUX_LEMOND_NEEDS,
+        &crate::host_libraries::probe_host_libraries(),
+        &crate::footprint::host_refusal_outcome(
+            crate::footprint::pinned_tree_in_place(&paths, env_root.as_deref()).as_deref(),
+        ),
+        crate::host_libraries::host_library_check_disabled(),
+    )?;
     // Announced and space-checked before anything is downloaded: a fresh tree
     // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
     if let Some(preflight) = crate::footprint::plan_install_preflight(
@@ -848,12 +874,21 @@ pub(crate) fn current_unix_millis() -> u128 {
         .as_millis()
 }
 
-fn read_request() -> Result<EngineRequestEnvelope> {
+/// The request text on stdin, read to its end. It is decoded by
+/// [`answer_stdio`], which judges its protocol version first.
+fn read_request() -> Result<String> {
     let mut buffer = String::new();
     std::io::stdin()
         .read_to_string(&mut buffer)
         .context("failed to read stdin for engine request")?;
-    serde_json::from_str(&buffer).context("failed to parse engine request envelope")
+    Ok(buffer)
+}
+
+/// The answer to the request `text` read on stdin: its protocol version is
+/// judged before its method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), then it is handled.
+fn answer_stdio(text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle_envelope)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -1605,5 +1640,16 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{model_ref} must still resolve: {error}"));
             assert_eq!(response.canonical_model_id, DEFAULT_MODEL);
         }
+    }
+
+    /// The engine protocol contract, the same check every engine runs: see
+    /// [`rocm_engine_protocol::engine_contract`].
+    #[test]
+    fn stdio_answers_hold_the_engine_protocol_contract() {
+        rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+            "lemonade",
+            answer_stdio,
+            handle_envelope,
+        );
     }
 }
