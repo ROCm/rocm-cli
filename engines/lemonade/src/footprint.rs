@@ -135,6 +135,40 @@ pub(crate) fn plan_install_preflight(
     })
 }
 
+/// The runtime folder of a tree of the pinned Lemonade already extracted where
+/// this install goes, or `None` when the install would download and extract one.
+///
+/// Linux only outside tests, like its one caller, the host-library refusal
+/// ([`crate::host_libraries`]): Windows has no such check.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn pinned_tree_in_place(paths: &AppPaths, env_root: Option<&Path>) -> Option<PathBuf> {
+    let runtime_dir = runtime_dir_in(&lemonade_root(paths, env_root));
+    let extraction = needs_extraction(
+        false,
+        installed_runtime_version(&runtime_dir).as_deref(),
+        rocm_deps::LEMONADE_VERSION,
+        lemond_path_in(&runtime_dir).is_file(),
+    );
+    (!extraction).then_some(runtime_dir)
+}
+
+/// What a host-library refusal of an install left undone, for the branch the
+/// install was on: a fresh install had a download ahead of it, while a tree of
+/// the pinned version already in place had nothing to fetch and is left as it
+/// is, though it cannot start either.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn host_refusal_outcome(installed_tree: Option<&Path>) -> String {
+    match installed_tree {
+        None => "Nothing was downloaded.".to_owned(),
+        Some(tree) => format!(
+            "Nothing was changed: the Lemonade {} already installed in {} stays as it is, \
+             but its server cannot start on this host either.",
+            rocm_deps::LEMONADE_VERSION,
+            tree.display()
+        ),
+    }
+}
+
 /// Total size of the files under `dir`, best effort: symlinks are not followed
 /// and anything unreadable counts as zero, because this only sizes the space an
 /// install is about to free.
@@ -490,6 +524,48 @@ mod tests {
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The host-library refusal's last line follows the install's branch: no
+    /// tree, or a tree of another version, would have been downloaded, so
+    /// "Nothing was downloaded."; a tree of the pinned version would not, so
+    /// the line says it was left in place instead.
+    #[test]
+    fn the_host_refusal_outcome_follows_whether_the_pinned_tree_is_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let base = install_tree_root(&paths, None);
+
+        let fresh = pinned_tree_in_place(&paths, None);
+        assert_eq!(fresh, None, "an empty folder has no tree in place");
+        assert_eq!(
+            host_refusal_outcome(fresh.as_deref()),
+            "Nothing was downloaded."
+        );
+
+        plant_current_tree(&base);
+        let runtime_dir = runtime_dir_in(&base);
+        crate::install::record_runtime_version(&runtime_dir, "0.0.1").unwrap();
+        assert_eq!(
+            pinned_tree_in_place(&paths, None),
+            None,
+            "a tree of another version is replaced, so it counts as not in place"
+        );
+
+        crate::install::record_runtime_version(&runtime_dir, rocm_deps::LEMONADE_VERSION).unwrap();
+        let in_place = pinned_tree_in_place(&paths, None);
+        assert_eq!(in_place.as_deref(), Some(runtime_dir.as_path()));
+        let outcome = host_refusal_outcome(in_place.as_deref());
+        assert_eq!(
+            outcome,
+            format!(
+                "Nothing was changed: the Lemonade {} already installed in {} stays as it \
+                 is, but its server cannot start on this host either.",
+                rocm_deps::LEMONADE_VERSION,
+                runtime_dir.display()
+            )
+        );
+        assert!(!outcome.contains("downloaded"), "{outcome}");
+    }
 
     /// The release-test sequence: Lemonade installed into the data folder, then
     /// an SDK runtime activated, so the next install targets the runtime's own
