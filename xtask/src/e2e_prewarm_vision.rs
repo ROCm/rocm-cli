@@ -46,8 +46,13 @@ const TORCHVISION_PROBE: &str = "import importlib.util\n\
 if importlib.util.find_spec('torchvision') is None:\n    print('absent')\n\
 else:\n    import torchvision.ops\n";
 
-/// The text torchvision's failed operator registration puts in its error.
-const VISION_MISMATCH_SIGNATURE: &str = "torchvision::";
+/// Whether `text` carries torchvision's operator-mismatch error, such as
+/// `operator torchvision::nms does not exist`. Both parts are required: this
+/// decides whether a runtime is deleted, so an unrelated error that merely
+/// mentions a `torchvision::` name must not match.
+fn is_vision_mismatch(text: &str) -> bool {
+    text.contains("torchvision::") && text.contains("does not exist")
+}
 
 /// Read what the probe did from its exit status and output.
 fn classify_vision_import(success: bool, stdout: &str, stderr: &str) -> VisionImport {
@@ -60,12 +65,8 @@ fn classify_vision_import(success: bool, stdout: &str, stderr: &str) -> VisionIm
         // The mismatch error is not always in the last lines (a chained
         // traceback ends on the outer exception), and the callers read the
         // signature from the tail, so keep the first line that carries it.
-        if !tail
-            .iter()
-            .any(|line| line.contains(VISION_MISMATCH_SIGNATURE))
-            && let Some(line) = lines
-                .iter()
-                .find(|line| line.contains(VISION_MISMATCH_SIGNATURE))
+        if !tail.iter().any(|line| is_vision_mismatch(line))
+            && let Some(line) = lines.iter().find(|line| is_vision_mismatch(line))
         {
             tail.insert(0, line);
         }
@@ -315,7 +316,7 @@ fn repair_torchvision_mismatch_within(
     let Ok(ImportCheck::Broken { key, tail }) = check_runtime_imports(prewarm_dir, timeout) else {
         return Ok(());
     };
-    if !tail.contains(VISION_MISMATCH_SIGNATURE) {
+    if !is_vision_mismatch(&tail) {
         return Ok(());
     }
     println!(
@@ -367,7 +368,7 @@ pub(crate) fn verify_runtime_imports(
              torchvision check and records no library directories to supply ({tail}); skipping it"
         ),
         ImportCheck::Broken { key, tail } => {
-            let mismatch = if tail.contains(VISION_MISMATCH_SIGNATURE) {
+            let mismatch = if is_vision_mismatch(&tail) {
                 " Its torch and torchvision do not match."
             } else {
                 ""
@@ -702,6 +703,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     const MISMATCH: &str =
         "echo 'RuntimeError: operator torchvision::nms does not exist' >&2; exit 1";
 
@@ -780,11 +782,16 @@ mod tests {
         let _serial = serial();
         // Another import error, a hang, a working runtime, a runtime without
         // torchvision and a Lemonade lane are all left alone.
-        let cases: [(&str, &str, &str); 5] = [
+        let cases: [(&str, &str, &str); 6] = [
             (
                 "vllm",
                 "echo 'ImportError: boom' >&2; exit 1",
                 "another import error",
+            ),
+            (
+                "vllm",
+                "echo 'ImportError: torchvision::nms failed to load' >&2; exit 1",
+                "an error that names a torchvision operator without saying it is missing",
             ),
             ("vllm", "exit 0", "a working runtime"),
             ("vllm", "echo absent", "no torchvision"),
@@ -829,7 +836,7 @@ mod tests {
                       ImportError: could not import torchvision.ops\n";
         match classify_vision_import(false, "", stderr) {
             VisionImport::Broken(tail) => {
-                assert!(tail.contains(VISION_MISMATCH_SIGNATURE), "{tail}");
+                assert!(is_vision_mismatch(&tail), "{tail}");
                 assert!(tail.ends_with("could not import torchvision.ops"), "{tail}");
             }
             other => panic!("expected Broken, got {other:?}"),
