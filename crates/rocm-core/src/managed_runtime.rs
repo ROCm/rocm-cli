@@ -279,6 +279,30 @@ pub(crate) fn managed_therock_environment_records(
         .collect()
 }
 
+/// Every library entry the environment builder produces for each managed runtime
+/// in the registry (`managed_therock_environment_from_record`): the recorded
+/// library paths, each root's `lib`, `lib64` and `lib/rocm_sysdeps/lib` (and, as
+/// the builder collects them, its `bin`), over the SDK root, runtime roots and
+/// install root, plus, on Linux, the host's `/usr/lib/wsl/lib` when it exists
+/// (that one is not a runtime's own). A directory shared by two runtimes appears
+/// twice.
+///
+/// `rocm install sdk` links the probe's `library_paths`, which the registry record
+/// keeps and this list includes (pinned by
+/// `runtime_rocdxg::tests::examine_scans_every_directory_the_install_would_link`),
+/// so examine scans at least every directory the install links; the two lists are
+/// computed separately.
+///
+/// For checks that look at what a runtime ships on disk, such as
+/// [`crate::runtime_rocdxg`], rather than at the one runtime that is active.
+pub(crate) fn managed_runtime_library_dirs(paths: &AppPaths) -> Vec<PathBuf> {
+    let registry_dir = paths.data_dir.join("runtimes").join("registry");
+    managed_therock_environment_records(&registry_dir)
+        .iter()
+        .flat_map(|(_, record)| managed_therock_environment_from_record(record).library_entries)
+        .collect()
+}
+
 fn managed_therock_environment_from_record(
     record: &TheRockFamilyManifest,
 ) -> ManagedRuntimeEnvironment {
