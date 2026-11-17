@@ -3682,11 +3682,29 @@ fn parse_device_row(value: &str) -> Option<(&str, Option<u32>)> {
 /// this step flake on timing rather than on behavior.
 const DEVICE_ROW_DEADLINE: Duration = Duration::from_secs(90);
 
-/// The value of the first `device:` row in `text`, trimmed.
+/// The value of the first row labelled `device` in `text`, trimmed.
+///
+/// Two renderers, two shapes, and this has to read both: `services_text.rs`
+/// writes `device: <value>`, while `serve_summary.rs`'s `render_summary`
+/// writes a column of padded labels and no colon at all
+/// (`  device        <value>` — pinned by its own
+/// `device_row_shown_only_when_known` test, which asserts
+/// `starts_with("device")`). An earlier revision looked only for `"device:"`,
+/// so it could never have matched a deployment summary even when one carried
+/// the row.
+///
+/// The label has to end where it ends: `rocm serve`'s non-interactive plan
+/// prints a `device_policy:` row, and matching that here would compare a
+/// policy against a device.
 fn device_row_value(text: &str) -> Option<&str> {
-    text.lines()
-        .find_map(|line| line.trim_start().strip_prefix("device:"))
-        .map(str::trim)
+    text.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("device")?;
+        let rest = rest.strip_prefix(':').unwrap_or(rest);
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.trim()).filter(|value| !value.is_empty())
+    })
 }
 
 /// ROCMAI-550: `rocm services list` must show the backend/device the engine
@@ -3706,7 +3724,11 @@ fn device_row_value(text: &str) -> Option<&str> {
 /// 3. it equals what the `rocm serve` deployment summary printed for the same
 ///    service — *when* that summary printed a device row at all, which is a
 ///    documented maybe rather than a promise (see the comment at that
-///    comparison, and `serve_summary::DeploymentSummary::device`).
+///    comparison, and `serve_summary::DeploymentSummary::device`). Facts 1 and
+///    2 are what discriminate on today's lanes; fact 3 does not run, because
+///    the summary these scenarios capture is pipe-redirected and therefore the
+///    row-less plain form. The comment at that comparison says so in full
+///    rather than letting the name of this step imply coverage it has not got.
 /// The row is polled rather than read once: see [`DEVICE_ROW_DEADLINE`] for
 /// the window in which a correct implementation legitimately has no row yet.
 /// Running out of that window is an assertion naming what was last seen, not a
@@ -3795,6 +3817,22 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
     // that scenario in model_serving.feature). What remains asserted is the
     // half that is a real invariant: the two surfaces read one engine over one
     // RPC, so where both speak they must say the same thing.
+    //
+    // **State plainly what this cannot do today.** On every current lane the
+    // comparison below does not run at all, and not for the reason above:
+    // `world.serve_summary` is `rocm serve`'s stdout captured by
+    // `run_rocm_bounded`, which redirects it to a file, so
+    // `serve_cmd.rs`'s `summary_mode` (`background && stdout().is_terminal()`)
+    // is false and the CLI takes `print_managed_launch_plain`, which renders no
+    // device row in any state. The device row is an interactive-summary
+    // feature. So this is a cross-check that is *armed* — `device_row_value`
+    // reads both renderers' shapes, and it fires for any Given that captures a
+    // summary through a PTY — but today nothing drives these two scenarios
+    // that way, and the backend assertion above is what actually discriminates
+    // for serve-05 and serve-07. Making it live means driving the vLLM and
+    // Lemonade per-PR serve canaries through a `TuiSession` (as serve-28/41/60
+    // do for their mock launches), which is a change to the canaries' own
+    // harness and is tracked separately rather than smuggled in here.
     // And only when a summary was recorded at all. The backend assertion above
     // is this step's real invariant and has already run; the cross-surface
     // comparison is an extra that needs a Given which captured `rocm serve`'s
