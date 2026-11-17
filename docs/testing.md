@@ -2502,12 +2502,15 @@ Lemonade backend selection and alignment focused tests (reading the
 rows of their own, and the second alignment attempt choosing the newest
 `lemonade-sdk/llama.cpp` release that ships the archive for the active ROCm
 version rather than the newest release, and reading Lemonade's
-`update_required`/`update_available` backend states):
+`update_required`/`update_available` backend states, and skipping a warning
+line inside the table, even one with a state word in it):
 
 ```bash
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::parse
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::another_recipes_backend
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::update_states
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_warning
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_field_wider
 cargo test -p rocm-engine-lemonade backend_alignment::tests::tier2
 cargo test -p rocm-engine-lemonade backend_alignment::tests::align_falls_through_to_tier2
 cargo test -p rocm-engine-lemonade backend_alignment::tests::llamacpp_asset_name

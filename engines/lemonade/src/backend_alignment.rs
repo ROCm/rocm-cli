@@ -559,9 +559,9 @@ const fn llamacpp_backend_alignment_succeeded(
 const LLAMACPP_ROCM_STABLE_REPO: &str = "lemonade-sdk/llama.cpp";
 
 /// How many of [`LLAMACPP_ROCM_STABLE_REPO`]'s newest releases Tier 2 searches
-/// for one that ships the archive it needs. The repository publishes a build
-/// about twice a day, so this covers roughly the last two weeks; one listing page
-/// of this size is about 2 MB.
+/// for one that ships the archive it needs: one page of GitHub's release listing,
+/// so a single request. How far back that reaches depends on how often the
+/// repository publishes, which this repo does not control.
 const LLAMACPP_RELEASES_SEARCHED: usize = 30;
 
 /// The `llamacpp:rocm-stable` archive Lemonade downloads for build `tag` paired

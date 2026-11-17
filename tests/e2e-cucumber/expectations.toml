@@ -275,7 +275,9 @@ flaky = true
 # (b11580) ships a ROCm 7.14 archive. So both rows may now XPASS. That has not
 # been observed yet: both scenarios are `@nightly`, which pull-request lanes do
 # not run. A stale XPASS on the first Windows nightly run after the 2026.44.1 pin
-# lands means the cause is gone, and the row is deleted then.
+# lands means the cause is gone, and the row is deleted then, in a follow-up by
+# the author of the 2026.44.1 pin. ROCMAI-899 is already closed; the row stays
+# until that nightly shows the XPASS.
 [["runtime-lemonade-backend-alignment-reported"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-899"
