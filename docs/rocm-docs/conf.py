@@ -86,7 +86,7 @@ exclude_patterns = []
 ROCM_CORE_SDK_URL = "https://rocm.docs.amd.com/en/latest/"
 
 
-def _point_core_sdk_link_to_latest(app, pagename, templatename, context, doctree):
+def _point_core_sdk_link_to_latest(app, pagename, templatename, context, doctree):  # noqa: ARG001
     # On docs-X.Y.Z branches rocm-docs-core resolves every sister project to
     # that same version, but the ROCm Core SDK has no docs-0.3.0 build.
     context["projects"] = {**context["projects"], "rocm": ROCM_CORE_SDK_URL}
