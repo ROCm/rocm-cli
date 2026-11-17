@@ -1334,9 +1334,12 @@ mod tests {
         // `run_builtin_engine_serve_http`'s `other => bail!(...)` arm, after
         // `launch_managed_engine_child_locked` has already set
         // `record.engine_pid` — so cleanup must terminate (already-dead) the
-        // child, keep the record and log for inspection, mark the record
-        // `stopped` (a `failed` one would be respawned by rocmd recovery), and
-        // clear only the endpoint key.
+        // child, keep the record and log for inspection, keep the `failed`
+        // its own crash path recorded (this used to be forced to `stopped` to
+        // keep rocmd recovery from respawning it; whether a `failed` record
+        // should be a recovery candidate is the open question this PR's
+        // "Known limitations" records, and the assertion below pins what it
+        // does today, not what it should do), and clear only the endpoint key.
         //
         // The child always dies near-instantly, but `spawn_managed_engine_child`
         // only reports that within a fixed startup-check window. On a loaded or
