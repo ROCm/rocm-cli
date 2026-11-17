@@ -20,6 +20,18 @@ runtime check, download, or launch; `rocm engines list` shows the same decision
 as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
 serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
+On Linux and WSL, an installed vLLM is also checked by importing its compiled
+extensions (`vllm._C`, `vllm._rocm_C`, `vllm._C_stable_libtorch`) after `torch`,
+in the runtime's own Python. A wheel built against a different torch than the
+one beside it fails that import: `rocm engines list` then shows
+`runtime: installed, not usable` with the failing module, and
+`rocm serve --engine vllm` starts no server: the engine process exits before starting
+vLLM, and `rocm logs` for the service shows the same guidance. The check is
+best-effort and reports nothing when it cannot run (a vLLM found through
+`ROCM_CLI_VLLM_COMMAND` or on `PATH`, where no Python interpreter is known, a
+`torch` that does not import, a probe that fails for another reason
+or exceeds one minute); an extension absent from the wheel is not a failure.
+
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
