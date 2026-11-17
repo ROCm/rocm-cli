@@ -173,9 +173,9 @@ pool).
 
 The last column is the lane's declaration of whether it has a GPU. On a lane
 that declares `1`, the harness fails before any scenario runs if its capability
-probe finds no usable AMD GPU, and after the run if no `@requires-gpu` scenario
-executed; on every lane it fails if the probe could not read the binary under
-test or if no scenario executed at all. `nightly.yml`'s self-hosted lanes
+probe finds no usable AMD GPU, and after the run if no `@requires-gpu` (or
+`@requires-multi-gpu`) scenario executed; on every lane it fails if the probe
+could not read the binary under test or if no scenario executed at all. `nightly.yml`'s self-hosted lanes
 declare the same way (`0` only for `e2e-wsl-nightly`), as does every lane of
 [`run-e2e-lane.sh`](../scripts/run-e2e-lane.sh). `every_self_hosted_lane_declares_whether_it_has_a_gpu`
 in [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) fails when a
@@ -642,9 +642,9 @@ job, naming the lane, rather than silently dropping out of the grid; on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
 
-A lane the harness failed after its run (no scenario executed, or no
-`@requires-gpu` scenario on an `E2E_EXPECT_GPU=1` lane) records the reason in
-its `platform.json`, and its row reads FAIL with the reason under "Needs
+A lane the harness failed after its run (no scenario executed, or no GPU
+scenario, `@requires-gpu` or `@requires-multi-gpu`, on an `E2E_EXPECT_GPU=1`
+lane) records the reason in its `platform.json`, and its row reads FAIL with the reason under "Needs
 attention: platforms" (step summary and HTML report alike), even when every
 scenario it resolved was a skip.
 

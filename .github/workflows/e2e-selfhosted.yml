@@ -255,7 +255,7 @@ jobs:
     continue-on-error: false
     env:
       # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
-      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
       E2E_EXPECT_GPU: "1"
       # Bound serve readiness below the 35-min job cap so a serve that never comes
       # ready fails the scenario with a real error instead of hanging until the
@@ -519,7 +519,7 @@ jobs:
             sdk_version: n-2
     env:
       # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
-      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
       E2E_EXPECT_GPU: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       # A pool host can be busy with other CI work between GPU preflight and
@@ -676,7 +676,7 @@ jobs:
     continue-on-error: false
     env:
       # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
-      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
       E2E_EXPECT_GPU: "1"
       # A pool host can be busy with other CI work between GPU preflight and
       # the TUI checks, so a frame that renders well inside the 30s default on
@@ -740,8 +740,10 @@ jobs:
       # available so a wedged/held GPU fails fast instead of hanging to the cap.
       # BEST-EFFORT because the Windows ROCm GPU query tool isn't verified here —
       # if no rocm-smi is found we WARN and continue rather than false-fail a
-      # working runner. When rocm-smi IS present we poll free memory the same way
-      # as the Linux jobs and fail only after the ceiling.
+      # working runner; the harness's E2E_EXPECT_GPU=1 check is the backstop
+      # that fails the lane if `rocm examine` reports no usable GPU at all.
+      # When rocm-smi IS present we poll free memory the same way as the Linux
+      # jobs and fail only after the ceiling.
       #
       # WHAT THIS DOES NOT CATCH, and the Linux lanes now do. This is a
       # free-memory floor ONLY. A fixed 8 GiB against a whole ~62 GiB gfx1151

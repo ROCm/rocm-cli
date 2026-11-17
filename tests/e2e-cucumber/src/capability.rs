@@ -2387,27 +2387,6 @@ Local model engines
         );
     }
 
-    /// Stderr written after the kill still reaches the caller: the drain runs
-    /// after a timeout too. A grandchild that inherited stderr writes `late`
-    /// half a second after the 1 s deadline killed its parent, and the grace
-    /// leaves time to collect it.
-    #[cfg(unix)]
-    #[test]
-    fn stderr_written_after_the_kill_is_drained_into_the_timeout() {
-        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
-        let result = run_probe_bounded(
-            std::ffi::OsStr::new("sh"),
-            tmp.path(),
-            &["-c", "(sleep 1.5; echo late >&2) & exec sleep 30"],
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(10),
-        );
-        let Err(ProbeError::Timeout { stderr_tail, .. }) = &result else {
-            panic!("a probe past its deadline must be ProbeError::Timeout, got {result:?}");
-        };
-        assert_eq!(stderr_tail, "late");
-    }
-
     /// Windows half of the test above: the deadline and the stderr kept from
     /// before it. `cmd` is killed but the `ping` it started holds the pipe, so
     /// the bytes reach the caller only through the shared buffer. The reaping
@@ -2430,6 +2409,85 @@ Local model engines
             panic!("a probe past its deadline must be ProbeError::Timeout, got {result:?}");
         };
         assert_eq!(stderr_tail.trim(), "early-err");
+    }
+
+    /// Stderr written after the kill still reaches the caller: the drain runs
+    /// after a timeout too. A grandchild that inherited stderr writes `late`
+    /// half a second after the 1 s deadline killed its parent, and the grace
+    /// leaves time to collect it.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_written_after_the_kill_is_drained_into_the_timeout() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let result = run_probe_bounded(
+            std::ffi::OsStr::new("sh"),
+            tmp.path(),
+            &["-c", "(sleep 1.5; echo late >&2) & exec sleep 30"],
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+        );
+        let Err(ProbeError::Timeout { stderr_tail, .. }) = &result else {
+            panic!("a probe past its deadline must be ProbeError::Timeout, got {result:?}");
+        };
+        assert_eq!(stderr_tail, "late");
+    }
+
+    /// A child that reads stdin gets EOF at once rather than blocking until the
+    /// deadline: `output_within` replaces whatever stdin the command carried
+    /// with an empty one. The command is handed a pipe whose write end this
+    /// test holds open, so only that replacement lets the read finish (the
+    /// same arrangement as `a_child_that_reads_stdin_is_given_an_empty_one` in
+    /// rocm-core's `process/bounded.rs`).
+    ///
+    /// Like that sibling, it catches a missing stdin setting but does not pin
+    /// `null` against `inherit`: an `inherit` mutant passes whenever the test
+    /// process's own stdin is already at EOF.
+    #[test]
+    fn a_probe_that_reads_stdin_is_given_an_empty_one() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "read line || echo stdin-eof"]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            // `set /p` leaves the variable as it was when its read hits EOF.
+            let script = tmp.path().join("stdin.bat");
+            std::fs::write(
+                &script,
+                "@echo off\r\nset \"LINE=stdin-eof\"\r\nset /p LINE=\r\necho %LINE%\r\n",
+            )
+            .expect("write script");
+            let mut command = std::process::Command::new("cmd");
+            command.arg("/C").arg(&script);
+            command
+        };
+        let (stdin_reader, stdin_writer) = std::io::pipe().expect("stdin pipe");
+        command.stdin(stdin_reader);
+
+        let started = std::time::Instant::now();
+        let finished = output_within(
+            command,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("spawns");
+        let elapsed = started.elapsed();
+        // Dropped only now: closing the write end earlier would give the child
+        // EOF whatever stdin `output_within` set.
+        drop(stdin_writer);
+        drop(tmp);
+
+        let Finished::Exited { output, .. } = finished else {
+            panic!("a child given an empty stdin must exit, not time out: {finished:?}");
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "stdin-eof");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the read must hit EOF at once, but took {elapsed:?}"
+        );
     }
 
     /// A probe that exited 0 while a process it started still holds its

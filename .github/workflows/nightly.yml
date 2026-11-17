@@ -417,7 +417,7 @@ jobs:
         channel: [release, nightly]
     env:
       # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
-      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
       E2E_EXPECT_GPU: "1"
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
       E2E_INCLUDE_NIGHTLY: "1"
@@ -534,7 +534,7 @@ jobs:
         channel: [release, nightly]
     env:
       # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
-      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
       E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -624,7 +624,7 @@ jobs:
         channel: [release, nightly]
     env:
       # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
-      # or no @requires-gpu scenario runs (see tests/e2e-cucumber/README.md).
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
       E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -1342,7 +1342,10 @@ jobs:
           # a failed step there does not turn the lane's check red. Only the
           # WSL lanes need this guard: every other lane writes report.json
           # directly in-job, with no guest-to-host copy step that can fail on
-          # its own.
+          # its own. A harness preflight refusal is not one of those: it
+          # leaves an empty report.json that uploads fine, so the missing-report
+          # check does not catch it; its EMPTY row in the report is the signal
+          # (a post-run lane failure shows as a FAIL row with lane_failure).
           if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
@@ -1517,11 +1520,14 @@ jobs:
           fi
           cat consolidated/support-matrix.md >> "$GITHUB_STEP_SUMMARY"
 
-      # A lane that dies before writing report.json (preflight, build, a crash
-      # before results exist) uploads nothing, and `discover()` can only render
-      # the reports that arrived, so that lane would drop out of the grid with
-      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
-      # either. So check it here: every lane that ran (any `needs` result but
+      # A lane that dies before writing report.json (the GPU preflight step, a
+      # build failure, a crash before results exist) uploads nothing. The
+      # harness's own preflight refusal is different: it leaves an empty
+      # report.json that does upload, and shows as an EMPTY row (a post-run
+      # lane failure as a FAIL row with lane_failure), not as missing.
+      # `discover()` can only render the reports that arrived, so a lane that
+      # uploads nothing would drop out of the grid with no row and no FAIL. On
+      # a `continue-on-error` lane nothing else is red either. So check it here: every lane that ran (any `needs` result but
       # `skipped`) must have uploaded its report artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also

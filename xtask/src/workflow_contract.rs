@@ -1732,16 +1732,33 @@ jobs:
         ),
     ];
 
+    /// Whether a step's `run:` body invokes the E2E suite itself
+    /// (`cargo xtask e2e`, not `e2e-prewarm` or `e2e-report`).
+    fn runs_the_e2e_suite(step: &str) -> bool {
+        run_block(step).is_some_and(|body| {
+            body.iter().any(|line| {
+                line.match_indices("cargo xtask e2e").any(|(at, m)| {
+                    line[at + m.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(char::is_whitespace)
+                })
+            })
+        })
+    }
+
     /// Every self-hosted E2E lane declares whether it has a GPU, so the harness
     /// can fail a GPU lane whose probe found none instead of passing it with
-    /// every `@requires-gpu` scenario skipped.
+    /// every GPU scenario (`@requires-gpu` or `@requires-multi-gpu`) skipped.
     ///
     /// Derived from the workflows like the GPU-preflight check above, so a new
     /// lane is held to it the day it lands. The declaration is read from the
-    /// job-level `env:` mapping only: a step-level one would leave the other
-    /// steps, and a reader of the job header, without it. A lane that runs the
-    /// suite inside WSL must also name the variable in every `WSLENV` it sets,
-    /// since `wsl.exe` passes nothing else into the guest.
+    /// job-level `env:` mapping: a step-level one would leave the other steps,
+    /// and a reader of the job header, without it, and one on the step that
+    /// runs the suite would override it there. A lane that runs the suite
+    /// inside WSL must name the variable in every `WSLENV` it sets, and in one
+    /// on the step that runs the suite, since `wsl.exe` passes nothing else
+    /// into the guest.
     #[test]
     fn every_self_hosted_lane_declares_whether_it_has_a_gpu() {
         let name = e2e_report::EXPECT_GPU_ENV;
@@ -1772,23 +1789,58 @@ jobs:
                          \"0\" (listed in NO_GPU_LANES)"
                     ),
                 }
-                let wslenvs: Vec<&str> = block
+                let why = NO_GPU_LANES
+                    .iter()
+                    .find(|(lane, _)| *lane == job)
+                    .map_or_else(String::new, |(_, reason)| {
+                        format!(" (a NO_GPU_LANES lane: {reason})")
+                    });
+                let names_it = |wslenv: &str| {
+                    wslenv
+                        .trim_matches(|c| c == '\'' || c == '"')
+                        .split(':')
+                        .any(|var| var.split('/').next() == Some(name))
+                };
+                for wslenv in block
                     .lines()
                     .filter_map(|line| line.trim().strip_prefix("$env:WSLENV = "))
-                    .collect();
-                assert!(
-                    !block.contains("Invoke-WslBash.ps1") || !wslenvs.is_empty(),
-                    "{workflow} job `{job}` runs commands in WSL but sets no WSLENV, so \
-                     {name} never reaches the suite"
-                );
-                for wslenv in wslenvs {
-                    let vars = wslenv.trim_matches(|c| c == '\'' || c == '"');
+                {
                     assert!(
-                        vars.split(':')
-                            .any(|var| var.split('/').next() == Some(name)),
-                        "{workflow} job `{job}` sets WSLENV without {name}, so the suite \
+                        names_it(wslenv),
+                        "{workflow} job `{job}`{why} sets WSLENV without {name}, so the suite \
                          inside WSL reads the lane as undeclared: {wslenv}"
                     );
+                }
+                // The step that runs the suite is where the declaration has
+                // to arrive: a step-level override there would replace the
+                // job's value, and a WSL step that names it in no WSLENV of
+                // its own leaves the guest without it, whatever other steps do.
+                let steps = job_steps(block)
+                    .unwrap_or_else(|| panic!("{workflow} job `{job}` has no `steps:` list"));
+                let harness: Vec<&(String, String)> = steps
+                    .iter()
+                    .filter(|(_, step)| runs_the_e2e_suite(step))
+                    .collect();
+                assert!(
+                    !harness.is_empty(),
+                    "{workflow} job `{job}` has no step that runs `cargo xtask e2e`"
+                );
+                for (step_name, step) in harness {
+                    assert!(
+                        !step_env(step).contains_key(name),
+                        "{workflow} job `{job}`{why}: step `{step_name}` sets {name} itself, \
+                         overriding the job-level declaration"
+                    );
+                    if step.contains("Invoke-WslBash.ps1") {
+                        assert!(
+                            step.lines()
+                                .filter_map(|line| line.trim().strip_prefix("$env:WSLENV = "))
+                                .any(names_it),
+                            "{workflow} job `{job}`{why}: step `{step_name}` runs the suite in \
+                             WSL but sets no WSLENV naming {name}, so the guest reads the lane \
+                             as undeclared"
+                        );
+                    }
                 }
             }
         }

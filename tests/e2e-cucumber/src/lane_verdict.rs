@@ -8,8 +8,9 @@
 //! resolves to skip never reach `report.json`, so a run in which every scenario
 //! was skipped, or none was selected, has no failure to report and passes.
 //! That is what a GPU lane does when its probe cannot read the binary under
-//! test, or when the GPU is not visible: every `@requires-gpu` scenario
-//! resolves to skip, and the lane is green without having tested a GPU.
+//! test, or when the GPU is not visible: every GPU scenario (`@requires-gpu` or
+//! `@requires-multi-gpu`) resolves to skip, and the lane is green without
+//! having tested a GPU.
 //!
 //! Two checks close that gap, both pure so every row of their state matrix is a
 //! unit test:
@@ -18,8 +19,8 @@
 //!   fatal on every lane, and so is a lane that declares a GPU (`1` in
 //!   [`EXPECT_GPU_ENV`]) where the probe found none.
 //! - [`post_run_verdict`], after the run: a run that executed no scenario is
-//!   fatal on every lane, and so is a GPU-declaring lane on which no
-//!   `@requires-gpu` scenario executed.
+//!   fatal on every lane, and so is a GPU-declaring lane on which no GPU
+//!   scenario (`@requires-gpu` or `@requires-multi-gpu`) executed.
 //!
 //! The module also holds the decisions `tests/e2e.rs` takes around those two
 //! checks, so they are unit-tested too: [`preflight`] (the declaration plus
@@ -122,8 +123,8 @@ pub fn preflight_verdict(
     verdict
 }
 
-/// How many `@requires-gpu` scenarios the run resolved and how many of those
-/// executed.
+/// How many GPU scenarios (`@requires-gpu` or `@requires-multi-gpu`) the run
+/// resolved and how many of those executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuScenarioCounts {
     /// Scenarios tagged `@requires-gpu` or `@requires-multi-gpu` that the
@@ -160,13 +161,14 @@ pub fn post_run_verdict(
     match declaration {
         GpuDeclaration::Expected if gpu.executed == 0 => {
             verdict.fatal = Some(format!(
-                "this lane declares a GPU ({EXPECT_GPU_ENV}=1) but no @requires-gpu scenario \
-                 executed ({} resolved, none ran)",
+                "this lane declares a GPU ({EXPECT_GPU_ENV}=1) but no @requires-gpu (or \
+                 @requires-multi-gpu) scenario executed ({} resolved, none ran)",
                 gpu.resolved
             ));
         }
         GpuDeclaration::NotExpected => verdict.notes.push(format!(
-            "{} of {} @requires-gpu scenario(s) did not run on this lane ({EXPECT_GPU_ENV}=0)",
+            "{} of {} GPU scenario(s) (@requires-gpu or @requires-multi-gpu) did not run on this \
+             lane ({EXPECT_GPU_ENV}=0)",
             gpu.resolved.saturating_sub(gpu.executed),
             gpu.resolved
         )),
@@ -340,10 +342,9 @@ pub fn note_line(note: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPECT_GPU_ENV, GpuDeclaration, GpuScenarioCounts, Preflight, ResolvedRun, Verdict,
-        failure_lines, finish_run, gpu_scenario_counts, needs_gpu, note_line,
-        parse_gpu_declaration, post_run_verdict, preflight, preflight_verdict, run_failed,
-        workflow_command,
+        GpuDeclaration, GpuScenarioCounts, Preflight, ResolvedRun, Verdict, failure_lines,
+        finish_run, gpu_scenario_counts, needs_gpu, note_line, parse_gpu_declaration,
+        post_run_verdict, preflight, preflight_verdict, run_failed, workflow_command,
     };
     use std::ffi::OsStr;
 
@@ -356,11 +357,6 @@ mod tests {
         GpuDeclaration::NotExpected,
         GpuDeclaration::Undeclared,
     ];
-
-    #[test]
-    fn the_variable_name_is_the_one_the_workflows_set() {
-        assert_eq!(EXPECT_GPU_ENV, "E2E_EXPECT_GPU");
-    }
 
     #[test]
     fn only_one_zero_and_unset_or_empty_are_declarations() {
@@ -534,8 +530,8 @@ mod tests {
         assert_eq!(
             verdict.fatal.as_deref(),
             Some(
-                "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu scenario \
-                 executed (7 resolved, none ran)"
+                "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                 @requires-multi-gpu) scenario executed (7 resolved, none ran)"
             )
         );
     }
@@ -557,8 +553,8 @@ mod tests {
             verdict,
             Verdict {
                 fatal: Some(
-                    "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu scenario \
-                     executed (0 resolved, none ran)"
+                    "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                     @requires-multi-gpu) scenario executed (0 resolved, none ran)"
                         .to_owned()
                 ),
                 notes: vec![],
@@ -607,7 +603,26 @@ mod tests {
         assert_eq!(verdict.fatal, None);
         assert_eq!(
             verdict.notes,
-            ["7 of 7 @requires-gpu scenario(s) did not run on this lane (E2E_EXPECT_GPU=0)"]
+            [
+                "7 of 7 GPU scenario(s) (@requires-gpu or @requires-multi-gpu) did not run on \
+                 this lane (E2E_EXPECT_GPU=0)"
+            ]
+        );
+        // Some ran: the note counts only the ones that did not.
+        let verdict = post_run_verdict(
+            12,
+            Some(GpuScenarioCounts {
+                resolved: 7,
+                executed: 3,
+            }),
+            GpuDeclaration::NotExpected,
+        );
+        assert_eq!(
+            verdict.notes,
+            [
+                "4 of 7 GPU scenario(s) (@requires-gpu or @requires-multi-gpu) did not run on \
+                 this lane (E2E_EXPECT_GPU=0)"
+            ]
         );
     }
 
@@ -776,8 +791,8 @@ mod tests {
     #[test]
     fn a_note_prints_as_an_escaped_notice() {
         assert_eq!(
-            note_line("7 of 7 @requires-gpu scenario(s) did not run (100%)"),
-            "::notice::E2E lane: 7 of 7 @requires-gpu scenario(s) did not run (100%25)"
+            note_line("7 of 7 GPU scenario(s) did not run (100%)"),
+            "::notice::E2E lane: 7 of 7 GPU scenario(s) did not run (100%25)"
         );
     }
 
@@ -891,8 +906,8 @@ mod tests {
 
         // Every cell is pass or skip, so only the recorded lane failure can
         // make this row FAIL.
-        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu \
-                      scenario executed (1 resolved, none ran)";
+        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                      @requires-multi-gpu) scenario executed (1 resolved, none ran)";
         let (verdict, failed, mapping) = status_of(&resolved_with(&skip), &["examine-version"]);
         assert_eq!(verdict.fatal.as_deref(), Some(reason));
         assert_eq!(

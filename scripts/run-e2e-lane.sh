@@ -24,7 +24,9 @@
 #   LANE_OUT       where reported files go (default /out)
 #   E2E_EXPECT_GPU whether the lane has a GPU (default 1: every queue lane is
 #                  given one); the suite fails rather than passing with every
-#                  GPU scenario skipped. See tests/e2e-cucumber/README.md.
+#                  GPU scenario skipped. Set but empty, it leaves the lane
+#                  undeclared, which switches that check off. See
+#                  tests/e2e-cucumber/README.md.
 
 set -euo pipefail
 

@@ -981,12 +981,13 @@ mod tests {
     }
 
     /// The regression: a GPU lane on which every scenario resolved to skip
-    /// was failed by the harness ("no @requires-gpu scenario executed"), yet
+    /// was failed by the harness ("no @requires-gpu (or @requires-multi-gpu)
+    /// scenario executed"), yet
     /// its row read PASS, since a skip cell is not a problem.
     #[test]
     fn an_all_skip_lane_the_harness_failed_reads_fail_with_its_reason() {
-        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu \
-                      scenario executed (1 resolved, none ran)";
+        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                      @requires-multi-gpu) scenario executed (1 resolved, none ran)";
         let (_dir, report) = write_platform("[]", &all_skip_platform(Some(reason)));
         let r = PlatformReport::load("e2e-gpu-report".into(), &report);
         assert!(!r.ok());
@@ -1069,6 +1070,15 @@ mod tests {
             ),
             "{md}"
         );
+        // A CRLF, or any run of whitespace, folds to one space too. Defensive:
+        // no current producer of `lane_failure` emits CR or LF.
+        let (_crlf_dir, crlf_report) =
+            write_platform("[]", &all_skip_platform(Some("first\r\n  second")));
+        let crlf_md = markdown::consolidated_summary_markdown(&load_platform_reports(&[(
+            "e2e-gpu-report".to_owned(),
+            crlf_report,
+        )]));
+        assert!(crlf_md.contains("Linux_: first second\n"), "{crlf_md}");
 
         let html_out = dir.path().join("out.html");
         html::generate_consolidated(&bundle, &html_out, &html::RunMeta::default())
@@ -1112,12 +1122,13 @@ mod tests {
     }
 
     /// A lane on which scenarios ran and passed, but which the harness still
-    /// failed (on a GPU lane, no `@requires-gpu` scenario among them): its row
+    /// failed (on a GPU lane, no GPU scenario among them): its row
     /// reads FAIL with a Fail count of 0, since no cell failed. Rows of exactly
     /// this shape are what `total_e2e_failures` in xtask counts as failures.
     #[test]
     fn a_lane_that_ran_scenarios_and_was_failed_reads_fail_with_zero_failed_cells() {
-        let reason = "no @requires-gpu scenario executed (3 resolved, none ran)";
+        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                      @requires-multi-gpu) scenario executed (3 resolved, none ran)";
         let platform = format!(
             r#"{{"platform_slug":"mi300x","lane_failure":{},"expectations":[
                 {{"id":"examine-a","feature":"F","expected":"pass"}}]}}"#,
@@ -2031,8 +2042,8 @@ mod tests {
     #[test]
     fn renderers_take_the_pr_gating_phrases_from_the_shared_constants() {
         // What this proves, and what it does not. The rendered text is pinned
-        // verbatim by `summary_explanation_paragraphs_are_unchanged` (markdown)
-        // and `legend_mock_and_other_platform_items_are_unchanged` (HTML), and
+        // verbatim by `summary_explanation_paragraphs_are_pinned` (markdown)
+        // and `legend_mock_and_other_platform_items_are_pinned` (HTML), and
         // each of those also asserts that the rendered output contains
         // `MOCK_GATES_PR` and `OTHER_LANES_NON_BLOCKING`; together they catch a
         // renderer that hardcodes the words while a constant's value moves on.

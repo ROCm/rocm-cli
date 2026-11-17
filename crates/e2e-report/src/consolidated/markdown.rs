@@ -124,10 +124,14 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
     let mut notes = Vec::new();
     for r in reports {
         if let Some(reason) = r.lane_failure() {
+            // Written by the harness's `finish_run` from `post_run_verdict`'s
+            // fixed strings, so not escaped; folded onto the bullet's line.
+            // Carrying a pre-run reason (which quotes probe stderr) into the
+            // report would need escaping here.
             notes.push(format!(
                 "- **Lane check failed** in _{}_: {}",
                 r.label,
-                reason.replace('\n', " ")
+                reason.split_whitespace().collect::<Vec<_>>().join(" ")
             ));
         }
         for name in &r.xfail.xpass {
@@ -377,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_explanation_paragraphs_are_unchanged() {
+    fn summary_explanation_paragraphs_are_pinned() {
         // Pins the explanatory text under the summary table byte for byte, so
         // building it from shared fragments (see `MOCK_GATES_PR`) cannot
         // change a character of what the step summary shows. This pins the text

@@ -357,7 +357,7 @@ mod tests {
     use crate::consolidated::{load_platform_reports, load_reports};
 
     #[test]
-    fn legend_mock_and_other_platform_items_are_unchanged() {
+    fn legend_mock_and_other_platform_items_are_pinned() {
         // Pins the two gating items byte for byte, so building them from shared
         // fragments (see `MOCK_GATES_PR`) cannot change what the HTML
         // report's legend says. Text only: that Mock is the required check and

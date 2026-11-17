@@ -127,8 +127,8 @@ suite left on the GPU is reclaimed first; the lane log shows it. Both always
 run, so a failing channel does not hide the other, and the lane fails if either
 did. The default command also declares that every lane has a GPU
 (`E2E_EXPECT_GPU`, default `1`), so a channel whose suite finds no usable AMD
-GPU, or runs no `@requires-gpu` scenario, fails instead of passing with every
-GPU scenario skipped; see "Lane verdict" in the
+GPU, or runs no GPU scenario (`@requires-gpu` or `@requires-multi-gpu`), fails
+instead of passing with every GPU scenario skipped; see "Lane verdict" in the
 [E2E README](../tests/e2e-cucumber/README.md).
 
 A lane starts cold, so its first steps fetch from the network: the build

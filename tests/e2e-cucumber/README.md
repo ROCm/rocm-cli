@@ -125,7 +125,11 @@ scenarios:
   consolidated report shows it as EMPTY.
 - **After the run**, it fails when no scenario executed (for example a `-n`
   filter that matches nothing), and on an `E2E_EXPECT_GPU=1` lane when no
-  `@requires-gpu` scenario executed. The reason is also recorded as
+  `@requires-gpu` (or `@requires-multi-gpu`) scenario executed. GPU scenarios
+  the run's own configuration leaves out (`@nightly`, `@merge-queue`, or
+  anything outside an `E2E_ONLY_LIFECYCLE` selection) still count as resolved
+  but never as executed, so `E2E_EXPECT_GPU=1` with `E2E_ONLY_LIFECYCLE=1` and
+  no GPU scenario selected fails by design. The reason is also recorded as
   `lane_failure` in `platform.json`, so the consolidated report shows the lane
   as FAIL, even when every scenario it resolved was a skip, and gives the reason
   under "Needs attention: platforms" (in both the step summary and the HTML

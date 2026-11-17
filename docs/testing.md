@@ -971,7 +971,11 @@ reporting it green:
 
 `E2E_EXPECT_GPU` declares whether the host has a GPU. With `1`, the run also
 fails before any scenario if the probe found no usable AMD GPU, and after the
-run if no `@requires-gpu` scenario executed. With `0`, it only notes that GPU
+run if no `@requires-gpu` (or `@requires-multi-gpu`) scenario executed. GPU
+scenarios the run's own configuration leaves out (`@nightly`, `@merge-queue`,
+or anything outside an `E2E_ONLY_LIFECYCLE` selection) still count as resolved
+but never as executed, so `E2E_EXPECT_GPU=1` with `E2E_ONLY_LIFECYCLE=1` and no
+GPU scenario selected fails by design. With `0`, it only notes that GPU
 scenarios are not applicable (and that the declaration is stale if a GPU is
 found). Unset, as on a local run, it makes no GPU claim. Every self-hosted CI
 lane sets it; see "Lane verdict" in the [E2E README](../tests/e2e-cucumber/README.md)
