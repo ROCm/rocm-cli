@@ -247,6 +247,9 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
+    /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
+    /// can show a refused install left that tree exactly as it was.
+    pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -417,6 +420,7 @@ impl Default for E2eWorld {
             recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,
+            planted_tree_snapshot: None,
         }
     }
 }
@@ -1184,6 +1188,37 @@ pub fn run_rocm_without_data_dir_override(
 /// Run `rocm` with the behavioral fixture established by a Given step, then
 /// consume it so it cannot leak into a later action in the same scenario.
 pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let (mut cmd, binary) = scenario_command(world, args);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    scenario_command_result(world, args, &output)
+}
+
+/// [`run_rocm_with_scenario_env`] for a run that may take long, waited for on
+/// a blocking thread instead of the one the whole suite is polled on.
+///
+/// The cucumber run is one future under `block_on` (see `main`), so a
+/// synchronous wait inside a step stops every other concurrent scenario for as
+/// long as it lasts. A fix that waits out its one-minute timeout (diagnose-68)
+/// stalled the TUI scenarios running beside it past their own wall-clock caps
+/// ("the harness left this step unpolled"). The same reason
+/// `probe_device_memory` in `serving_steps.rs` runs on `spawn_blocking`.
+pub async fn run_rocm_with_scenario_env_off_executor(
+    world: &mut E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let (mut cmd, binary) = scenario_command(world, args);
+    let output = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .unwrap_or_else(|e| panic!("the thread running {binary} failed: {e}"))
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    scenario_command_result(world, args, &output)
+}
+
+/// The `rocm` command [`run_rocm_with_scenario_env`] runs, with the scenario's
+/// fixture moved into it, and the binary's name for messages.
+fn scenario_command(world: &mut E2eWorld, args: &[&str]) -> (std::process::Command, String) {
     let binary = rocm_binary();
     // A binary given as a relative path was meant relative to this process's
     // directory, not to the scenario's, so it is made absolute before the child
@@ -1205,9 +1240,16 @@ pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (Strin
     if let Some(dir) = world.command_dir.take() {
         cmd.current_dir(dir);
     }
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    (cmd, binary)
+}
+
+/// `(stdout, stderr, rc)` of a finished scenario command, recorded for the
+/// command-coverage report.
+fn scenario_command_result(
+    world: &E2eWorld,
+    args: &[&str],
+    output: &std::process::Output,
+) -> (String, String, i32) {
     let rc = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     record_command(world.current_scenario.as_deref(), args, rc, &stdout);

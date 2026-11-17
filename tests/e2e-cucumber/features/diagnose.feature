@@ -215,6 +215,11 @@ Feature: Diagnosing failures and listing fixes
   # `fix-4-render-group`'s `applies_on` does not include `wsl`, so on a WSL2
   # host the CLI refuses it as the wrong platform before ever invoking the
   # (faked) `usermod` — there is no command-failure branch to reach there.
+  #
+  # The Then step also holds the claim against the state: the stand-in records
+  # that it was asked to add the user to the groups, and the success line is
+  # absent, so "NOT changed" is said about a change that was attempted and
+  # refused, not about one that never ran or quietly went through.
   @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux @requires-bare-metal
   Scenario: diagnose-15 - A fix whose helper command fails explains why, on stderr, with exit code 4
     Given a user who has approved a fix whose helper command will fail
@@ -610,7 +615,8 @@ Feature: Diagnosing failures and listing fixes
   # `ps_env_scope`'s doc comment names -- "PowerShell missing") rather than
   # faking the read failing, so the abort this proves is a real one, not a
   # simulated one, and it never touches the real User PATH at all, so no
-  # capture/restore is needed here.
+  # capture/restore is needed here. diagnose-69 and diagnose-70 hold fix-2 and
+  # fix-9 to the same rule.
   @id:diagnose-fix-path-aborts-on-unreadable-user-path @requires-os:windows
   Scenario: diagnose-39 - A fix-6-path run that cannot read the real User PATH aborts instead of wiping it
     Given a Windows host with a HIP SDK install and no way to resolve PowerShell
@@ -997,6 +1003,57 @@ Feature: Diagnosing failures and listing fixes
     When the user diagnoses this machine with a ROCm runtime library load failure
     Then the wheel mismatch cause and its plan name the X.Y release, not the major version
 
+  # The sibling of diagnose-15 the reported bug was about: the helper command
+  # never finishes. The CLI stops it at the fix's one-minute bound, but it can
+  # only stop the command it started (`sudo`), so the change may still have
+  # been made. Before ROCMAI-345 this was reported as "usermod exited 124;
+  # group membership NOT changed." -- naming no timeout and claiming a state
+  # nobody had checked. The stand-in records its arguments and then sleeps far
+  # past the bound, so the scenario waits out the real minute: there is no
+  # test-only way to shorten it, on purpose, so the bound under test is the one
+  # users get. Same lane as diagnose-15, for the same reasons.
+  @id:diagnose-fix-command-timeout-says-change-may-be-partial @requires-os:linux @requires-bare-metal
+  Scenario: diagnose-68 - A fix whose helper command never finishes says the change may be partial and how to check it
+    Given a user who has approved a fix whose helper command never finishes
+    When the user asks the CLI to apply the approved fix
+    Then the CLI reports on stderr, with exit code 4, that the helper was stopped after a minute, how to check the change and which fix to re-run
+    And the CLI claims neither that the change was made nor that nothing changed
+    And the helper was asked to add the user to the render and video groups
+
+  # A User-scope read that cannot complete used to be taken as "not set": with
+  # nothing in the Machine scope either, fix-2 printed that no persistent
+  # override was found and the user was done, and exited 0, on a machine that
+  # may still carry it. Same real "PowerShell missing" cause as diagnose-39.
+  # Applied for real: should the guard regress, both reads would read as unset
+  # and fix-2 would find nothing to clear, so the runner's User environment is
+  # never written.
+  @id:diagnose-fix-override-aborts-on-unreadable-user-scope @requires-os:windows
+  Scenario: diagnose-69 - Clearing the GPU override stops when the saved value cannot be read, instead of calling it gone
+    Given a Windows host where PowerShell cannot be found
+    And a user who has chosen the fix for the GPU override
+    When the user asks the CLI to apply the approved fix
+    Then the CLI stops with exit code 4, saying it could not read the saved override and that nothing was changed
+    And the CLI does not report the override as already gone
+
+  # The same failed read made fix-9 skip its "already set" guard and overwrite
+  # a User-scope device setting the user may have chosen on purpose. Previewed
+  # rather than applied: the empty PATH hides PowerShell but not setx.exe, so
+  # an applied fix-9 whose guard regressed would set HIP_VISIBLE_DEVICES on the
+  # runner itself, with nothing to restore it. The preview reads the setting
+  # before planning, the same way the apply does, and a preview never runs
+  # setx. So this holds the stop and what the preview prints: the catalog entry
+  # still appears, the change it would make does not. That an applied fix-9
+  # writes nothing after a failed read is held by the unit tests in
+  # fix/runners.rs (`pin_device_read_timeout_stops_before_setx`,
+  # `a_read_that_exits_non_zero_stops_every_windows_fix_without_writing`).
+  @id:diagnose-fix-igpu-aborts-on-unreadable-user-scope @requires-os:windows
+  Scenario: diagnose-70 - A dry run of the discrete-GPU pin that cannot read the saved device setting stops with exit code 4 and previews no change
+    Given a Windows host where PowerShell cannot be found
+    And a user who has chosen the fix that hides the integrated GPU
+    When the user previews that fix for the second GPU
+    Then the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed
+    And the fix's catalog entry is printed, but not the device setting it would save
+
   # ROCMAI-912. An APU has no private VRAM: every adapter query reports the
   # fixed BIOS carve-out as the device's memory (512 MiB on a Ryzen 7 4700U,
   # ~4 GiB on a Strix Halo) while the engine allocates out of system memory the
@@ -1014,7 +1071,7 @@ Feature: Diagnosing failures and listing fixes
   # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
   # it can have (see the PR text).
   @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
-  Scenario: diagnose-68 - An integrated GPU is judged on the pool it allocates from, not its carve-out
+  Scenario: diagnose-71 - An integrated GPU is judged on the pool it allocates from, not its carve-out
     Given a machine whose only GPU shares system memory, with the pool it may use readable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1030,7 +1087,7 @@ Feature: Diagnosing failures and listing fixes
   # `amd-smi` already answered here, with the wrong pool, and would answer
   # identically forever.
   @id:diagnose-model-an-unreadable-shared-pool-is-said-not-guessed @requires-os:linux
-  Scenario: diagnose-69 - An integrated GPU whose pool cannot be read is told so, not given a number
+  Scenario: diagnose-72 - An integrated GPU whose pool cannot be read is told so, not given a number
     Given a machine whose only GPU shares system memory, with the pool it may use unreadable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1045,7 +1102,7 @@ Feature: Diagnosing failures and listing fixes
   # planted machine carries a large aperture beside a small VRAM figure, so a
   # verdict reached on either wrong number is visible in the report.
   @id:diagnose-model-a-discrete-card-is-never-credited-with-the-aperture @requires-os:linux
-  Scenario: diagnose-70 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
+  Scenario: diagnose-73 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
     Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1069,7 +1126,7 @@ Feature: Diagnosing failures and listing fixes
   # premise it rests on is diagnose-68: the same APU with the same readable
   # 60 GiB aperture, alone, does get a figure.
   @id:diagnose-model-two-amd-cards-leave-the-pool-unattributable @requires-os:linux
-  Scenario: diagnose-71 - An integrated GPU beside a second AMD card is credited with neither pool
+  Scenario: diagnose-74 - An integrated GPU beside a second AMD card is credited with neither pool
     Given a machine whose integrated GPU shares system memory beside a second AMD card
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
