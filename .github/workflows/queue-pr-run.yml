@@ -32,8 +32,10 @@ on:
 # token GitHub issues to every job regardless of these permissions.
 permissions: {}
 
-# One at a time per branch: a run is never cancelled for a newer one, and the
-# queue side limits how many go at once.
+# One at a time per branch: a run that has started is never cancelled for a
+# newer one, but GitHub still cancels an older run that is only pending when a
+# newer one joins the group, and the gate reports that run as having left no
+# report. The queue side limits how many go at once.
 concurrency:
   group: queue-pr-run-${{ inputs.branch }}
   cancel-in-progress: false

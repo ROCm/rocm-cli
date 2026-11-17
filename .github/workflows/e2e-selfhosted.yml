@@ -9,9 +9,11 @@ name: E2E self-hosted
 # THIS workflow's supersession, never the required checks in ci.yml. Only
 # pull_request runs are superseded (see `concurrency:` below).
 #
-# Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
-# MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
-# pool (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
+# Per-PR scope: a pull request runs one Linux GPU silicon, MI300X, as two checks
+# (`e2e-gpu-queue`, the primary, on the shared GPU queue, and `e2e-gpu`, the
+# second, on a self-hosted runner; vLLM is the effective engine on both, and no
+# other silicon here runs it) and one Windows GPU pool (the Strix Halo pool:
+# `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
 # Ubuntu lane keeps its push / dispatch triggers; it does not start on
 # pull_request or merge_group. There is no W7900 lane here: W7900 is covered only
 # by the scheduled queue nightly's `w7900-dual` lane (docs/nightly-on-the-queue.md),
@@ -614,20 +616,24 @@ jobs:
           set -euo pipefail
           # The branch name is the PR author's: checked before it goes anywhere.
           if ! [[ "$HEAD_REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then
-            echo "::error::the branch name is not one the queue takes"
+            echo "::error::the branch name is not one the queue takes: it must start with a letter, a digit or an underscore, hold only letters, digits and . _ / -, and be at most 200 characters"
             exit 1
           fi
           # A dispatch runs the workflow as it is on main. The pull request that
           # adds queue-pr-run.yml cannot dispatch it until it is merged: that is a
-          # skip, said so, not a failure. Any other error from the check stays red.
+          # skip, said so, not a failure. It is a skip only when the branch itself
+          # carries the file; a file gone from main and from the branch (renamed or
+          # removed) stays red, as does any other error from either check. Drop
+          # this once queue-pr-run.yml is on main.
           if ! out=$(gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=main" --jq .name 2>&1); then
-            if [[ "$out" == *"HTTP 404"* ]]; then
+            if [[ "$out" == *"HTTP 404"* ]] &&
+              gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=${HEAD_REF}" --jq .name > /dev/null 2>&1; then
               echo "skipped=true" >> "$GITHUB_OUTPUT"
               echo "::notice::queue-pr-run.yml is not on main yet: the queue lane cannot run"
-              echo "The queue lane does not run: queue-pr-run.yml is not on main yet, and a dispatch uses main's copy." >> "$GITHUB_STEP_SUMMARY"
+              echo "The queue lane does not run: this branch adds queue-pr-run.yml and a dispatch uses main's copy." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            echo "::error::could not check main for queue-pr-run.yml: ${out}"
+            echo "::error::queue-pr-run.yml is not on main, or main could not be checked: ${out}"
             exit 1
           fi
           caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -762,8 +768,9 @@ jobs:
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
-    # Not on pull_request: a PR gets exactly one Linux GPU node (MI300X, the only
-    # lane where vLLM runs) and one Windows pool (Strix Halo). Not on
+    # Not on pull_request: a PR gets one Linux GPU silicon (MI300X, the only
+    # silicon where vLLM runs, as `e2e-gpu-queue` and `e2e-gpu`) and one Windows
+    # pool (Strix Halo). Not on
     # merge_group either: over 7 days 35% of its merge-queue jobs (98 of 281) were
     # cancelled at the 45 min cap, and the queue does not wait for this
     # non-required check. Still runs on push (main, release/**), dispatch and

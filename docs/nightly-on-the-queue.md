@@ -65,8 +65,9 @@ GitHub-hosted runner, holds no queue credential and needs only `actions: write`:
 it dispatches [`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) on
 `main` with the pull request's branch, waits for that run, and publishes the
 release-channel report of the MI300X lane as `e2e-gpu-report`, the MI300X cell
-of the consolidated report. `queue-pr-run.yml` uploads
-`queue-pr-run-results` from `queue-pr-run.yml`, as `queue-run.yml` does its own.
+of the consolidated report. The run's files are the artifact
+`queue-pr-run-results` from `queue-pr-run.yml`, as `queue-run-results` is
+`queue-run.yml`'s.
 The self-hosted MI300X lane of the same pull request uploads
 `e2e-gpu-selfhosted-report`, shown beside it as "MI300X (self-hosted)": the queue
 run is the primary MI300X check and the self-hosted one the second.
@@ -88,6 +89,24 @@ its token cannot dispatch and the queue only checks out branches of this
 repository. `e2e-selfhosted.yml` is the only workflow that may name
 `queue-pr-run.yml`; the runner is set up to run `queue-pr-run.yml` only as it is
 on `main`, never the pull request's own copy of any workflow.
+
+The gate and the queue side agree on two things, and the queue side is not in
+this repository, so the gate's tests pin the gate's half only (the
+`queue_gate_script_*` tests in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs), whose fixtures use
+the same two constants the script is checked against):
+
+- **A refusal.** A run the queue did not take publishes `refused.txt` in
+  `queue-pr-run-results`, whose first line is the reason. A reason that starts
+  with `nightly:` is the nightly window and skips the gate; any other reason
+  fails it.
+- **The report.** The MI300X lane's release-channel report is
+  `mi300x/release/results/report.json` in that artifact, and its whole
+  `results` directory is the job's report. A run with none fails the gate.
+
+GitHub cancels an older run of a branch that is still pending when a newer run
+of the same branch is dispatched; the gate of the older run then sees a run
+that left no report, and fails with that message.
 
 ## Publishing a finished run
 
