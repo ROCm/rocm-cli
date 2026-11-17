@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::e2e_prewarm::{StatusOk, default_engine, rocm_command};
+use crate::e2e_prewarm::{StatusOk, default_engine, probe, rocm_command, runtime_ahead_of_index};
 
 /// What importing torchvision's operators did in the active runtime's Python.
 #[derive(Debug, PartialEq, Eq)]
@@ -131,7 +131,21 @@ fn probe_vision_import(
         let joined = std::env::join_paths(entries).map_err(std::io::Error::other)?;
         command.env(rocm_core::RUNTIME_LIBRARY_PATH_ENV, joined);
     }
-    let mut child = command.spawn()?;
+    // A script written an instant ago can be refused with `ETXTBSY` while another
+    // thread's fork still holds the write handle; that clears within
+    // milliseconds, so a few tries are made before giving up.
+    let mut attempts = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            spawned => break spawned?,
+        }
+    };
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -298,26 +312,59 @@ fn engine_imports_torch(engine: &str) -> bool {
 ///
 /// Best effort until the uninstall itself: a tree whose engine or runtime state
 /// cannot be read here is left for the fatal check after the engine install.
-pub(crate) fn repair_torchvision_mismatch(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
-    repair_torchvision_mismatch_within(rocm, prewarm_dir, PROBE_TIMEOUT)
+///
+/// Not done for a runtime the pre-warm must not replace: when the run is pinned
+/// to an exact version, or the report says the runtime is `ahead_of_index` (see
+/// `decide`: a reinstall could only roll it back). Those, and a report that
+/// cannot be read, are declined: the runtime stays, this returns `true`, and
+/// [`verify_runtime_imports`] fails after the engine check with the manual advice.
+///
+/// Returns whether a mismatch was found and left in place.
+pub(crate) fn repair_torchvision_mismatch(
+    rocm: &Path,
+    prewarm_dir: &Path,
+    pinned: bool,
+) -> Result<bool> {
+    repair_torchvision_mismatch_within(rocm, prewarm_dir, PROBE_TIMEOUT, pinned)
 }
 
 fn repair_torchvision_mismatch_within(
     rocm: &Path,
     prewarm_dir: &Path,
     timeout: Duration,
-) -> Result<()> {
+    pinned: bool,
+) -> Result<bool> {
     let Ok(engine) = default_engine(rocm, prewarm_dir) else {
-        return Ok(());
+        return Ok(false);
     };
     if !engine_imports_torch(&engine) {
-        return Ok(());
+        return Ok(false);
     }
     let Ok(ImportCheck::Broken { key, tail }) = check_runtime_imports(prewarm_dir, timeout) else {
-        return Ok(());
+        return Ok(false);
     };
     if !is_vision_mismatch(&tail) {
-        return Ok(());
+        return Ok(false);
+    }
+    let declined = if pinned {
+        Some("this pre-warm is pinned to an exact version".to_owned())
+    } else {
+        match probe(rocm, prewarm_dir) {
+            Ok(report) if runtime_ahead_of_index(&report, &key) => Some(
+                "it is ahead of the channel index, so a reinstall would roll it back".to_owned(),
+            ),
+            Ok(_) => None,
+            Err(error) => Some(format!(
+                "`rocm update` could not say whether it is ahead of the index ({error:#})"
+            )),
+        }
+    };
+    if let Some(why) = declined {
+        println!(
+            "::warning::pre-warm: runtime {key} cannot `import torchvision.ops` ({tail}), so its \
+             torch and torchvision do not match; it is not removed because {why}."
+        );
+        return Ok(true);
     }
     println!(
         "::warning::pre-warm: removing the shared runtime {key} — it cannot `import \
@@ -325,7 +372,8 @@ fn repair_torchvision_mismatch_within(
     );
     rocm_command(rocm, prewarm_dir)
         .args(["runtimes", "uninstall", &key, "--yes"])
-        .status_ok("rocm runtimes uninstall")
+        .status_ok("rocm runtimes uninstall")?;
+    Ok(false)
 }
 
 /// Fail the pre-warm when the active runtime cannot import torchvision's operators
@@ -350,6 +398,7 @@ pub(crate) fn verify_runtime_imports(
     prewarm_dir: &Path,
     installed_this_run: bool,
     engine: &str,
+    repair_declined: bool,
 ) -> Result<()> {
     match check_runtime_imports(prewarm_dir, PROBE_TIMEOUT)? {
         ImportCheck::NoRuntime => println!(
@@ -385,7 +434,7 @@ pub(crate) fn verify_runtime_imports(
                 "This run installed the runtime, so the installer produced the broken pair and \
                  a reinstall would reproduce it; fix the install."
                     .to_owned()
-            } else if mismatch.is_empty() {
+            } else if mismatch.is_empty() || repair_declined {
                 format!(
                     "To reinstall it, set ROCM_CLI_CONFIG_DIR={dir}/config, \
                      ROCM_CLI_DATA_DIR={dir}/data and ROCM_CLI_CACHE_DIR={dir}/cache, run \
@@ -519,7 +568,9 @@ mod tests {
         // A marker that exists but is not JSON.
         std::fs::write(runtimes.join("active.json"), "not json").expect("corrupt marker");
         assert!(active_runtime(tree.path()).is_err());
-        assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm").is_err());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false).is_err()
+        );
         // A marker naming a runtime whose manifest is gone.
         std::fs::write(
             runtimes.join("active.json"),
@@ -612,7 +663,7 @@ mod tests {
         let tree = tree_with_python(&python);
         let reused = format!(
             "{:#}",
-            verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm")
+            verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false)
                 .expect_err("fails")
         );
         assert!(
@@ -625,7 +676,7 @@ mod tests {
         );
         let fresh = format!(
             "{:#}",
-            verify_runtime_imports(Path::new("rocm"), tree.path(), true, "vllm")
+            verify_runtime_imports(Path::new("rocm"), tree.path(), true, "vllm", false)
                 .expect_err("fails")
         );
         assert!(fresh.contains("This run installed the runtime"), "{fresh}");
@@ -644,7 +695,10 @@ mod tests {
              *) echo \"loader path was: $LD_LIBRARY_PATH\" >&2; exit 3 ;; esac",
         );
         let with_libs = tree_with_runtime(&python, &[Path::new("/sdk/lib")]);
-        assert!(verify_runtime_imports(Path::new("rocm"), with_libs.path(), false, "vllm").is_ok());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), with_libs.path(), false, "vllm", false)
+                .is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -659,7 +713,7 @@ mod tests {
             "echo 'libroctx64.so.4: cannot open shared object file' >&2; exit 1",
         );
         let tree = tree_with_runtime(&python, &[Path::new("/sdk/lib")]);
-        let error = verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm")
+        let error = verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false)
             .expect_err("must fail");
         assert!(
             format!("{error:#}").contains("libroctx64.so.4"),
@@ -681,7 +735,9 @@ mod tests {
             check_runtime_imports(tree.path(), PROBE_TIMEOUT).expect("runs"),
             ImportCheck::Unconfigured { .. }
         ));
-        assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm").is_ok());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false).is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -713,14 +769,20 @@ mod tests {
         let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let tree = tree_with_python(&fake_python(scripts.path(), MISMATCH));
-        assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false, "lemonade").is_ok());
-        assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm").is_err());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), tree.path(), false, "lemonade", false)
+                .is_ok()
+        );
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false).is_err()
+        );
     }
 
     /// A stand-in `rocm`: `engines list` marks `engine` as the default, every call
     /// is appended to `calls`, and `runtimes uninstall <key>` removes that
     /// runtime's registry entry and the active marker from the tree the call is
-    /// scoped to, as the CLI does.
+    /// scoped to, as the CLI does. `update` prints the `update_report` file in `dir`
+    /// and fails when `update_fails` exists.
     #[cfg(unix)]
     fn fake_rocm(dir: &Path, engine: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -731,10 +793,14 @@ mod tests {
             format!(
                 "#!/bin/sh\necho \"$*\" >> {calls}\n\
                  [ \"$1 $2\" = \"engines list\" ] && echo '* {engine}  default'\n\
+                 if [ \"$1\" = update ]; then\n\
+                 [ -e {dir}/update_fails ] && exit 1\n\
+                 cat {dir}/update_report 2>/dev/null\nexit 0\nfi\n\
                  if [ \"$1 $2\" = \"runtimes uninstall\" ]; then\n\
                  rm -f \"$ROCM_CLI_DATA_DIR/runtimes/registry/$3.json\" \
                  \"$ROCM_CLI_DATA_DIR/runtimes/active.json\"\nfi\nexit 0\n",
-                calls = calls.display()
+                calls = calls.display(),
+                dir = dir.display()
             ),
         )
         .expect("script");
@@ -763,7 +829,7 @@ mod tests {
             .path()
             .join("data/runtimes/registry/release-wheel-test.json");
         assert!(manifest.exists());
-        repair_torchvision_mismatch(&rocm, tree.path()).expect("repairs");
+        repair_torchvision_mismatch(&rocm, tree.path(), false).expect("repairs");
         assert_eq!(
             uninstalls(&calls),
             "runtimes uninstall release-wheel-test --yes"
@@ -774,6 +840,73 @@ mod tests {
         // pinned by `no_managed_runtime_installs` in `e2e_prewarm.rs`.
         assert!(!manifest.exists());
         assert_eq!(active_runtime(tree.path()).expect("reads"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_the_pre_warm_must_not_replace_is_not_uninstalled() {
+        let _serial = serial();
+        let line =
+            |status: &str| format!("runtime release-wheel-test channel=release status={status}\n");
+        // (pinned, `rocm update` report, `rocm update` fails, why)
+        let cases: [(bool, String, bool, &str); 3] = [
+            (true, line("update_available"), false, "a pinned run"),
+            (
+                false,
+                line("ahead_of_index"),
+                false,
+                "a runtime ahead of the index",
+            ),
+            (false, String::new(), true, "a report that cannot be read"),
+        ];
+        for (pinned, report, fails, why) in cases {
+            let scripts = tempfile::tempdir().expect("tempdir");
+            let (rocm, calls) = fake_rocm(scripts.path(), "vllm");
+            std::fs::write(scripts.path().join("update_report"), report).expect("report");
+            if fails {
+                std::fs::write(scripts.path().join("update_fails"), "").expect("marker");
+            }
+            let tree = tree_with_python(&fake_python(scripts.path(), MISMATCH));
+            let declined = repair_torchvision_mismatch(&rocm, tree.path(), pinned).expect("runs");
+            assert!(declined, "{why}: the mismatch is reported as left in place");
+            assert_eq!(uninstalls(&calls), "", "{why}");
+        }
+        // The same mismatch, with the index ahead of the runtime, is removed.
+        let scripts = tempfile::tempdir().expect("tempdir");
+        let (rocm, calls) = fake_rocm(scripts.path(), "vllm");
+        std::fs::write(
+            scripts.path().join("update_report"),
+            line("update_available"),
+        )
+        .expect("report");
+        let tree = tree_with_python(&fake_python(scripts.path(), MISMATCH));
+        assert!(!repair_torchvision_mismatch(&rocm, tree.path(), false).expect("runs"));
+        assert_eq!(
+            uninstalls(&calls),
+            "runtimes uninstall release-wheel-test --yes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_advice_for_a_mismatch_depends_on_whether_the_repair_was_declined() {
+        let _serial = serial();
+        let scripts = tempfile::tempdir().expect("tempdir");
+        let tree = tree_with_python(&fake_python(scripts.path(), MISMATCH));
+        let message = |declined| {
+            format!(
+                "{:#}",
+                verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", declined)
+                    .expect_err("fails")
+            )
+        };
+        assert!(message(false).contains("Run the pre-warm again"));
+        let declined = message(true);
+        assert!(
+            declined.contains("runtimes uninstall release-wheel-test --yes")
+                && !declined.contains("Run the pre-warm again"),
+            "{declined}"
+        );
     }
 
     #[cfg(unix)]
@@ -803,8 +936,13 @@ mod tests {
             let scripts = tempfile::tempdir().expect("tempdir");
             let (rocm, calls) = fake_rocm(scripts.path(), engine);
             let tree = tree_with_python(&fake_python(scripts.path(), body));
-            repair_torchvision_mismatch_within(&rocm, tree.path(), Duration::from_millis(300))
-                .expect("runs");
+            repair_torchvision_mismatch_within(
+                &rocm,
+                tree.path(),
+                Duration::from_millis(300),
+                false,
+            )
+            .expect("runs");
             assert_eq!(uninstalls(&calls), "", "{why}");
         }
     }
@@ -853,7 +991,7 @@ mod tests {
             "echo 'RuntimeError: operator torchvision::nms does not exist' >&2; exit 1",
         );
         let tree = tree_with_python(&python);
-        let error = verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm")
+        let error = verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false)
             .expect_err("must fail");
         let message = format!("{error:#}");
         assert!(
@@ -884,15 +1022,21 @@ mod tests {
         let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let working = tree_with_python(&fake_python(scripts.path(), "exit 0"));
-        assert!(verify_runtime_imports(Path::new("rocm"), working.path(), false, "vllm").is_ok());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), working.path(), false, "vllm", false).is_ok()
+        );
 
         let scripts = tempfile::tempdir().expect("tempdir");
         let absent = tree_with_python(&fake_python(scripts.path(), "echo absent"));
-        assert!(verify_runtime_imports(Path::new("rocm"), absent.path(), false, "vllm").is_ok());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), absent.path(), false, "vllm", false).is_ok()
+        );
 
         // No active runtime recorded: skipped, not failed.
         let empty = tempfile::tempdir().expect("tempdir");
-        assert!(verify_runtime_imports(Path::new("rocm"), empty.path(), false, "vllm").is_ok());
+        assert!(
+            verify_runtime_imports(Path::new("rocm"), empty.path(), false, "vllm", false).is_ok()
+        );
     }
 
     #[test]
@@ -900,7 +1044,7 @@ mod tests {
         // The manifest names a Python that is not there: the runtime is not
         // usable, which is the same verdict as one that cannot import.
         let tree = tree_with_python(Path::new("/nonexistent/runtime/bin/python"));
-        let error = verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm")
+        let error = verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm", false)
             .expect_err("must fail");
         assert!(
             format!("{error:#}").contains("failed to run the Python of runtime release-wheel-test")
@@ -919,9 +1063,12 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok_and(|output| output.status.success());
-        // Not skipped quietly: a test that returns early reports `ok`, and this is
-        // the only one that runs the probe text itself.
-        assert!(usable, "this test needs a working python3 on PATH");
+        // Skipped, and said so, on an image without `python3`: the probe is run
+        // by the runtime's own interpreter in the pre-warm, not by this one.
+        if !usable {
+            eprintln!("skipping: no working python3 on PATH");
+            return;
+        }
         let write_package = |ops: &str| {
             let dir = tempfile::tempdir().expect("tempdir");
             let package = dir.path().join("torchvision");

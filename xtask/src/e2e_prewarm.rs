@@ -339,6 +339,19 @@ pub fn assess(runtimes_list_report: &str, runtimes_dir: &Path) -> Vec<PoisonedRu
     poisoned
 }
 
+/// Whether the `rocm update` report says the runtime `runtime_key` is
+/// `ahead_of_index`: newer than anything the index offers, so a reinstall could
+/// only roll it back (see [`decide`]).
+#[must_use]
+pub(crate) fn runtime_ahead_of_index(update_report: &str, runtime_key: &str) -> bool {
+    update_report
+        .lines()
+        .filter_map(RuntimeLine::parse)
+        .any(|line| {
+            line.runtime_key == runtime_key && line.status.as_deref() == Some("ahead_of_index")
+        })
+}
+
 /// One `  {marker} <key> runtime_id=… format=… mode=… status=…` line from
 /// `rocm runtimes list`.
 ///
@@ -666,7 +679,7 @@ pub fn run(
     // Likewise a runtime whose torch and torchvision no longer match: remove it so
     // `decide` below reads a registry without it. Before the dangling-pointer
     // repair, which cleans up after this removal as it does after the one above.
-    repair_torchvision_mismatch(&rocm, prewarm_dir)?;
+    let repair_declined = repair_torchvision_mismatch(&rocm, prewarm_dir, pin.is_some())?;
 
     // And point the tree at something that exists before anything resolves the
     // active runtime. Must run after the repair above, which can itself remove
@@ -805,7 +818,13 @@ pub fn run(
 
     // Also unconditional and before the reuse return, for the same reason: a
     // persisted runtime can be current by version and still unusable.
-    verify_runtime_imports(&rocm, prewarm_dir, runtime_changed(&decision), &engine)?;
+    verify_runtime_imports(
+        &rocm,
+        prewarm_dir,
+        runtime_changed(&decision),
+        &engine,
+        repair_declined,
+    )?;
 
     if !runtime_changed(&decision) {
         return Ok(());
@@ -1070,7 +1089,7 @@ fn list_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
 
 /// Ask the CLI whether the installed runtimes are current. Check-only: plain
 /// `rocm update` without `--apply` never mutates state.
-fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+pub(crate) fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
     let output = rocm_command(rocm, prewarm_dir)
         .arg("update")
         .output()
@@ -2047,6 +2066,15 @@ message=connect timed out after 30 s";
     /// the freshness decision and the dangling-pointer repair; the check comes
     /// after the engine check and before the reuse return, which a warm tree
     /// takes every time. Formatting and unrelated edits do not move these.
+    #[test]
+    fn ahead_of_index_is_read_for_the_named_runtime_only() {
+        let report = "runtime a channel=release status=ahead_of_index\n\
+                      runtime b channel=release status=up_to_date\n";
+        assert!(runtime_ahead_of_index(report, "a"));
+        assert!(!runtime_ahead_of_index(report, "b"));
+        assert!(!runtime_ahead_of_index(report, "c"));
+    }
+
     #[test]
     fn the_import_checks_run_where_their_comments_say() {
         // A Windows checkout may use CRLF line endings.
