@@ -298,10 +298,12 @@ passes — the GPU is AMD or no vendor was named.
    - On Windows such a CLI takes a failed read for an unset variable, so a
      clean result is not proof. `fix-2-unset-override` can say
      `No persistent HSA_OVERRIDE_GFX_VERSION found` and that the user is done,
-     and exit 0, with the override still set; `fix-9-igpu-dgpu --device-index N`
-     can run `setx` over a value the user set on purpose. Have the user run
-     that PowerShell check for fix-2 before calling it done, and for fix-9
-     before applying it.
+     and exit 0, with the override still set in either scope;
+     `fix-9-igpu-dgpu --device-index N` can run `setx` over a value the user
+     set on purpose. Its output looks the same as a current CLI's, so on
+     Windows always have the user run that PowerShell check: for fix-2 before
+     calling it done, with `'User'` and again with `'Machine'` (both must come
+     back empty), and for fix-9 before applying it.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 

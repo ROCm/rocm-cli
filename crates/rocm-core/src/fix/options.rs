@@ -155,6 +155,7 @@ pub mod exit {
         // command that does not finish); and
         // `windows_path_read_failure_aborts_before_plan_or_write`,
         // `unset_override_user_read_timeout_stops_before_anything_is_reported_or_cleared`,
+        // `unset_override_machine_read_failure_stops_before_clearing_the_user_scope`,
         // `pin_device_read_timeout_stops_before_setx` and
         // `pin_device_dry_run_with_a_failed_read_stops_without_a_plan` (a failed
         // read, under `--dry-run` too). Those runners take an injected command
@@ -166,10 +167,11 @@ pub mod exit {
                           not be started, a file it wrote could not be written, or a read of \
                           state it needed before planning did not complete (on Windows, the \
                           current User value that fix-2, fix-6, and fix-9 with a device index \
-                          read first, even under `--dry-run`). The change that step was to \
-                          make was not made. If a command instead did not finish (it timed \
-                          out or was stopped), the change may or may not have been made: \
-                          stderr says how to check it and which `rocm fix` to re-run.",
+                          read first, and for fix-2 the Machine value too, even under \
+                          `--dry-run`). The change that step was to make was not made. If a \
+                          command instead did not finish (it timed out or was stopped), the \
+                          change may or may not have been made: stderr says how to check it \
+                          and which `rocm fix` to re-run.",
         },
         // Proved in `fix/runners.rs` by `declining_consent_returns_5_and_writes_nothing`,
         // `windows_decline_on_user_scope_returns_5` and

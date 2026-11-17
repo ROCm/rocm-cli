@@ -16,11 +16,11 @@
 //! place.
 //!
 //! This file is the module root. The exit codes, [`FixOptions`] and [`FixClass`]
-//! live in `fix/options.rs`. `fix/consent.rs` holds the consent decision, the
-//! timeouts, the `fail!` helper, and the one way a runner runs a host command
-//! and reports how it ended (`run_step`, `Step`, `CheckIn`, `StepFailure`,
-//! `read_failure`); the names are re-exported from here, so
-//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving. The
+//! live in `fix/options.rs` and are re-exported from here, so
+//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving.
+//! `fix/consent.rs` holds the consent decision, the timeouts, the `fail!`
+//! helper, and the one way a runner runs a host command and reports how it
+//! ended (`run_step`, `Step`, `CheckIn`, `StepFailure`, `read_failure`). The
 //! runners, one per auto-applicable fix, are in `fix/runners.rs`. The closed
 //! catalog (`RECIPES`, `FixRecipe`, the lookups by fix-id and the test-only
 //! oracles) is in `fix/catalog.rs`, its rendering in `fix/render.rs` and its
