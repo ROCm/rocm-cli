@@ -54,7 +54,12 @@ Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides glibc
 2.39, `GLIBCXX_3.4.33` and OpenSSL 3.0.13. On an older host,
 `rocm engines install lemonade` stops before downloading anything and says what
 falls short: the glibc version Lemonade needs and the one the host has, or that
-the host has no `libssl.so.3`, the library of OpenSSL 3.
+the host has no `libssl.so.3`, the library of OpenSSL 3. Where Lemonade is
+already installed, the same check refuses to reinstall it or start it, and says
+the installed copy was left as it is. The check reads the `ldconfig` cache, so a
+host that provides these libraries some other way (`LD_LIBRARY_PATH`, a Nix or
+Guix profile) can set `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`: the
+shortfall is then printed as a warning and Lemonade goes ahead.
 
 > [!IMPORTANT]
 > **Tech Preview:** This software is provided as-is, without warranty or

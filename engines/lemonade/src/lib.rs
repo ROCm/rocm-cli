@@ -418,12 +418,18 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     // Refused before anything is downloaded: a `lemond` built against a newer
     // glibc or OpenSSL than the host has exits at once with a loader error,
     // which used to reach the user only as "did not become ready".
+    // The line saying what the refusal left undone follows the branch: an
+    // install whose pinned tree is already in place would have downloaded
+    // nothing anyway.
     #[cfg(target_os = "linux")]
     crate::host_libraries::refuse_if_host_too_old(
         rocm_deps::LEMONADE_VERSION,
         &crate::install::LINUX_LEMOND_NEEDS,
         &crate::host_libraries::probe_host_libraries(),
-        "Nothing was downloaded.",
+        &crate::footprint::host_refusal_outcome(
+            crate::footprint::pinned_tree_in_place(&paths, env_root.as_deref()).as_deref(),
+        ),
+        crate::host_libraries::host_library_check_disabled(),
     )?;
     // Announced and space-checked before anything is downloaded: a fresh tree
     // is a multi-gigabyte install, and `rocm serve` reaches this on its own.

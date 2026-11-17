@@ -205,6 +205,135 @@ async fn assert_lemonade_install_refused_for_host_libraries(world: &mut E2eWorld
     );
 }
 
+#[given("the user has turned off the Lemonade host-library check")]
+async fn host_library_check_turned_off(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK", "1".into()));
+}
+
+/// The warning names the shortfall and the variable that let the install past
+/// it; the next Then shows the install really went on (to the space check).
+#[then("the user is warned that the host's libraries are too old and the install went ahead")]
+async fn assert_host_library_warning(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert!(
+        output.contains("warning: this host's libraries are too old for the Lemonade "),
+        "no host-library warning: the binary under test was probably built without \
+         the `rocm/e2e-test-hooks` feature, which `cargo xtask e2e` enables:\n{output}"
+    );
+    for expected in [
+        format!("or newer (this host has glibc {OLD_HOST_GLIBC})"),
+        "going ahead because ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK is set.".to_owned(),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "missing `{expected}`:\n{output}"
+        );
+    }
+    assert!(
+        !output.contains("to skip this check."),
+        "the install was refused for the host's libraries despite the opt-out:\n{output}"
+    );
+}
+
+/// The Lemonade version this build pins, read black-box from the refusal the
+/// old-host hooks produce on an empty data folder (lemonade-installs-07 shows
+/// that run changes nothing): "... too old for the Lemonade <version> server".
+///
+/// A run consumes the scenario's environment, so the old-host hooks the Given
+/// before this one set are put back for the When.
+fn pinned_lemonade_version(world: &mut E2eWorld) -> String {
+    let scenario_env = world.command_env.clone();
+    let (stdout, stderr, _) =
+        crate::run_rocm_with_scenario_env(world, &["engines", "install", "lemonade", "--yes"]);
+    world.command_env = scenario_env;
+    let output = format!("{stdout}\n{stderr}");
+    output
+        .split("too old for the Lemonade ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| {
+            panic!(
+                "no host-library refusal to read the pinned version from; the binary under \
+                 test was probably built without the `rocm/e2e-test-hooks` feature:\n{output}"
+            )
+        })
+        .to_owned()
+}
+
+/// What the planted tree holds, file by file, so the Then can show it was left
+/// exactly as it was.
+fn tree_files(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("failed to list the planted tree") {
+            let path = entry.expect("failed to read a tree entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("failed to read a tree file");
+                files.push((path, bytes));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[given("the pinned Lemonade is already installed in the data folder")]
+async fn plant_pinned_lemonade_install(world: &mut E2eWorld) {
+    let version = pinned_lemonade_version(world);
+    let tree = data_folder_tree(world);
+    plant_lemonade_tree(&tree, DATA_FOLDER_TREE_BYTES);
+    // The marker `prepare_embeddable` writes after a complete extraction.
+    std::fs::write(tree.join("runtime").join("runtime-version.txt"), &version)
+        .expect("failed to write the runtime version marker");
+    world.planted_tree_snapshot = Some(tree_files(&tree));
+}
+
+#[then(
+    "the Lemonade install is refused for the host's libraries and the installed copy is left as it is"
+)]
+async fn assert_refused_and_installed_copy_kept(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the install must fail on a host too old for the pinned Lemonade server:\n{output}"
+    );
+    let tree = data_folder_tree(world);
+    let runtime_dir = tree.join("runtime");
+    let expected = format!(
+        "already installed in {} stays as it is",
+        runtime_dir.display()
+    );
+    for expected in [
+        format!("or newer (this host has glibc {OLD_HOST_GLIBC})"),
+        "Nothing was changed: the Lemonade ".to_owned(),
+        expected,
+    ] {
+        assert!(
+            output.contains(&expected),
+            "missing `{expected}`:\n{output}"
+        );
+    }
+    assert!(
+        !output.contains("Nothing was downloaded."),
+        "the refusal describes a download the re-run would never have made:\n{output}"
+    );
+    // "Nothing was changed" is checked against the disk.
+    let before = world
+        .planted_tree_snapshot
+        .as_ref()
+        .expect("no planted tree snapshot - did the Given run?");
+    assert!(
+        &tree_files(&tree) == before,
+        "the installed tree changed despite the refusal:\n{output}"
+    );
+}
+
 #[then("the user is told what the Lemonade install needs and where it would go")]
 async fn assert_lemonade_install_notice(world: &mut E2eWorld) {
     let output = combined_output(world);

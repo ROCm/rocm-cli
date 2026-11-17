@@ -167,18 +167,74 @@ pub(crate) fn host_shortfall(
     ))
 }
 
-/// Fail with [`host_shortfall`]'s message plus `outcome`, which says what the
-/// refusal left undone ("Nothing was downloaded.").
+/// Set (to any value, empty included) to start the pinned `lemond` even where
+/// [`host_shortfall`] says the host falls short: the shortfall is then printed
+/// as a warning instead of refusing. For a host that provides glibc or OpenSSL 3
+/// outside the loader cache the probe reads (`LD_LIBRARY_PATH`, a Nix or Guix
+/// profile, a user prefix, a stale cache). Presence is the signal, as for
+/// [`crate::backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV`].
+pub const LEMONADE_HOST_LIBRARY_CHECK_DISABLED_ENV: &str =
+    "ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK";
+
+/// Whether the user has turned the host-library check off.
+#[cfg(target_os = "linux")]
+pub(crate) fn host_library_check_disabled() -> bool {
+    std::env::var_os(LEMONADE_HOST_LIBRARY_CHECK_DISABLED_ENV).is_some()
+}
+
+/// What the host-library check decided.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostCheck {
+    /// Nothing short of the needs was found.
+    Pass,
+    /// The host falls short, but the check is turned off: go ahead and say so.
+    Warn(String),
+    /// The host falls short: stop, with this message.
+    Refuse(String),
+}
+
+/// Decide from [`host_shortfall`]: refuse with its message, then `outcome`
+/// (what the refusal left undone, such as "Nothing was downloaded."), then how
+/// to turn the check off; or, when `check_disabled`, warn instead.
+pub(crate) fn host_check(
+    lemonade_version: &str,
+    needs: &LemondHostNeeds,
+    host: &HostLibraries,
+    outcome: &str,
+    check_disabled: bool,
+) -> HostCheck {
+    let Some(shortfall) = host_shortfall(lemonade_version, needs, host) else {
+        return HostCheck::Pass;
+    };
+    if check_disabled {
+        return HostCheck::Warn(format!(
+            "warning: {shortfall}; going ahead because \
+             {LEMONADE_HOST_LIBRARY_CHECK_DISABLED_ENV} is set."
+        ));
+    }
+    HostCheck::Refuse(format!(
+        "{shortfall}. {outcome} If this host provides these libraries outside the \
+         loader cache (LD_LIBRARY_PATH, a Nix or Guix profile), set \
+         {LEMONADE_HOST_LIBRARY_CHECK_DISABLED_ENV}=1 to skip this check."
+    ))
+}
+
+/// Apply [`host_check`]: fail on a refusal, print a warning to stderr.
 pub(crate) fn refuse_if_host_too_old(
     lemonade_version: &str,
     needs: &LemondHostNeeds,
     host: &HostLibraries,
     outcome: &str,
+    check_disabled: bool,
 ) -> Result<()> {
-    if let Some(shortfall) = host_shortfall(lemonade_version, needs, host) {
-        bail!("{shortfall}. {outcome}");
+    match host_check(lemonade_version, needs, host, outcome, check_disabled) {
+        HostCheck::Pass => Ok(()),
+        HostCheck::Warn(warning) => {
+            eprintln!("{warning}");
+            Ok(())
+        }
+        HostCheck::Refuse(message) => bail!(message),
     }
-    Ok(())
 }
 
 /// The newest numeric version among `names` that start with `prefix`
@@ -403,20 +459,76 @@ mod tests {
     }
 
     #[test]
-    fn refusal_appends_what_it_left_undone_and_passes_a_new_enough_host() {
-        let error = refuse_if_host_too_old(
+    fn refusal_appends_what_it_left_undone_and_how_to_skip_the_check() {
+        let HostCheck::Refuse(message) = host_check(
             "9.9.9",
             &NEEDS,
             &host(Some("2.35"), None),
             "Nothing was downloaded.",
-        )
-        .unwrap_err()
-        .to_string();
+            false,
+        ) else {
+            panic!("a host short of glibc was not refused");
+        };
         assert!(
-            error.ends_with("(this host has glibc 2.35). Nothing was downloaded."),
-            "{error}"
+            message.contains("(this host has glibc 2.35). Nothing was downloaded. If this host"),
+            "{message}"
         );
-        refuse_if_host_too_old("9.9.9", &NEEDS, &host(Some("2.39"), Some("3.0.13")), "x").unwrap();
+        assert!(
+            message.ends_with(
+                "set ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1 to skip this check."
+            ),
+            "{message}"
+        );
+        assert!(
+            refuse_if_host_too_old("9.9.9", &NEEDS, &host(Some("2.35"), None), "x", false).is_err()
+        );
+        assert_eq!(
+            host_check(
+                "9.9.9",
+                &NEEDS,
+                &host(Some("2.39"), Some("3.0.13")),
+                "x",
+                false
+            ),
+            HostCheck::Pass
+        );
+        refuse_if_host_too_old(
+            "9.9.9",
+            &NEEDS,
+            &host(Some("2.39"), Some("3.0.13")),
+            "x",
+            false,
+        )
+        .unwrap();
+    }
+
+    /// With the check turned off, a host that falls short is let through, and
+    /// the warning still names what it falls short of and why it went ahead.
+    #[test]
+    fn a_disabled_check_warns_instead_of_refusing() {
+        let missing_ssl = host(Some("2.31"), Some("missing"));
+        let HostCheck::Warn(warning) = host_check("9.9.9", &NEEDS, &missing_ssl, "x", true) else {
+            panic!("a disabled check did not warn");
+        };
+        assert_eq!(
+            warning,
+            "warning: this host's libraries are too old for the Lemonade 9.9.9 server: it \
+             needs glibc 2.38 or newer (this host has glibc 2.31) and OpenSSL 3.0.0 or newer \
+             (this host's loader cache has no libssl.so.3); going ahead because \
+             ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK is set."
+        );
+        refuse_if_host_too_old("9.9.9", &NEEDS, &missing_ssl, "x", true).unwrap();
+        // A host that meets the needs prints nothing either way.
+        assert_eq!(
+            host_check(
+                "9.9.9",
+                &NEEDS,
+                &host(Some("2.39"), Some("3.0.13")),
+                "x",
+                true
+            ),
+            HostCheck::Pass
+        );
     }
 
     const LIBC_LINE: &str =
@@ -515,7 +627,12 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
     #[test]
     fn the_running_hosts_glibc_defines_a_readable_version() {
-        let cache = rocm_core::ldconfig_cache().expect("ldconfig -p");
+        // A host without `ldconfig` (a minimal container, NixOS) has no cache
+        // to read; the probe reads that as unknown, which other tests cover.
+        let Some(cache) = rocm_core::ldconfig_cache() else {
+            eprintln!("skipped: `ldconfig -p` could not be run on this host");
+            return;
+        };
         let path = x86_64_library_path(&cache, "libc.so.6").expect("libc.so.6 listed");
         let found = library_version(path, "GLIBC_").expect("GLIBC_ version nodes");
         assert!(found >= LibVersion::parse("2.17").unwrap(), "{found}");

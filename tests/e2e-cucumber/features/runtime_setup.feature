@@ -342,7 +342,8 @@ Feature: Runtime configuration
   # packaged pin (ROCm 7.14 against 2026.44.1's 10.1.0) is aligned, and the CLI
   # says so; an SDK that already is the packaged pin (ROCm 10.1) needs no
   # alignment and gets none; a nightly SDK is never aligned and keeps the
-  # packaged pin. The Then accepts each route and fails a revert:
+  # packaged pin. The Then accepts each route and fails a revert, or an
+  # alignment the install does not report:
   # it reads the pin the installed runtime tree holds and compares it with the
   # active runtime's version. `--reinstall` re-extracts the packaged embeddable,
   # resetting `backend_versions.json` to its pinned defaults, so this does not

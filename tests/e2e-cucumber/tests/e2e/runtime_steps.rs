@@ -691,7 +691,10 @@ async fn assert_lemonade_backend_paired_with_active_sdk(world: &mut E2eWorld) {
         pinned_version, active_version,
         "the installed backend_versions.json does not pin the active ROCm SDK:\nstdout:\n{output}\nstderr:\n{stderr}"
     );
-    if pinned_version == packaged_therock_pin(output) {
+    let packaged_version = packaged_therock_pin(output);
+    let reported_aligned = output
+        .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK");
+    if pinned_version == packaged_version {
         // The active SDK is the packaged pin (ROCm 10.1 against Lemonade
         // 2026.44.1), so the comparison above holds whatever the CLI did. The
         // llama.cpp tag paired with that pin is a second signal: an alignment
@@ -701,16 +704,22 @@ async fn assert_lemonade_backend_paired_with_active_sdk(world: &mut E2eWorld) {
             packaged_backend_pin(output, "llamacpp", "rocm-stable"),
             "the active SDK is the packaged pin, yet the llama.cpp ROCm tag was rewritten:\nstdout:\n{output}\nstderr:\n{stderr}"
         );
-    }
-    let reported_aligned = output
-        .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK");
-    if !reported_aligned {
-        // Only right when the packaged pin already was the active SDK: then no
-        // alignment is attempted at all.
+        // No alignment is attempted at all then, so none may be reported or
+        // logged.
         assert!(
-            !stderr.contains("Aligned Lemonade's ROCm backend to")
+            !reported_aligned
+                && !stderr.contains("Aligned Lemonade's ROCm backend to")
                 && !stderr.contains("could not align Lemonade's ROCm backend to"),
-            "an alignment ran but the install did not report it:\n{stderr}"
+            "the active SDK is the packaged pin, yet an alignment ran:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+    } else {
+        // The pin moved from the packaged {packaged_version} to the active SDK,
+        // so an alignment ran, and the install must say so: a CLI that aligns
+        // silently fails here.
+        assert!(
+            reported_aligned,
+            "the pin moved from the packaged {packaged_version} to {pinned_version}, but the \
+             install did not report the alignment:\nstdout:\n{output}\nstderr:\n{stderr}"
         );
     }
 }

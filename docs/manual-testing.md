@@ -480,9 +480,19 @@ use a build with the `rocm/e2e-test-hooks` feature and set `ROCM_E2E_LEMONADE_HO
 - It fails with `this host's libraries are too old for the Lemonade <version>
   server: it needs glibc 2.38 or newer (this host has glibc <version>)`, followed
   on a host without OpenSSL 3 by `and OpenSSL 3.0.0 or newer (this host's loader
-  cache has no libssl.so.3)`, and ends `Nothing was downloaded.`.
+  cache has no libssl.so.3)`, then `Nothing was downloaded.`, and ends by
+  naming `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1` as the way to skip
+  the check.
 - The data folder's `engines/lemonade` has no `downloads` or `runtime`
   subfolder, and `rocm storage report` lists no Lemonade install.
+- Run it again with `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`: it prints
+  the same shortfall as a `warning:` ending `going ahead because
+  ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK is set.` and goes on to install
+  (on a real older host the server then fails to start).
+- Where the pinned Lemonade is already installed, the refusal ends `Nothing was
+  changed: the Lemonade <version> already installed in <folder> stays as it is,
+  but its server cannot start on this host either.` instead, and that folder is
+  unchanged.
 - On Ubuntu 24.04 or newer the same command installs Lemonade as usual.
 
 With room to spare, on Windows from an interactive console: install Lemonade

@@ -91,6 +91,7 @@ pub(crate) fn spawn_lemond_with_parent(
     #[cfg(target_os = "linux")]
     return spawn_lemond_on(
         &crate::host_libraries::probe_host_libraries(),
+        crate::host_libraries::host_library_check_disabled(),
         manifest,
         host,
         port,
@@ -111,12 +112,14 @@ pub(crate) fn spawn_lemond_with_parent(
     )
 }
 
-/// [`spawn_lemond_with_parent`] on Linux, with the host's libraries given so a
-/// test can drive the refusal on a host whose libraries are new.
+/// [`spawn_lemond_with_parent`] on Linux, with the host's libraries and the
+/// opt-out given so a test can drive the refusal on a host whose libraries are
+/// new.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_lemond_on(
     host_libraries: &crate::host_libraries::HostLibraries,
+    check_disabled: bool,
     manifest: &LemonadeInstallManifest,
     host: &str,
     port: u16,
@@ -125,7 +128,7 @@ fn spawn_lemond_on(
     parent: &ParentRuntimeEnvironment,
     log_mode: LogMode,
 ) -> Result<LemondChild> {
-    refuse_lemond_on_too_old_host(manifest, host_libraries)?;
+    refuse_lemond_on_too_old_host(manifest, host_libraries, check_disabled)?;
     spawn_lemond_unchecked(
         manifest,
         host,
@@ -148,6 +151,7 @@ fn spawn_lemond_on(
 fn refuse_lemond_on_too_old_host(
     manifest: &LemonadeInstallManifest,
     host_libraries: &crate::host_libraries::HostLibraries,
+    check_disabled: bool,
 ) -> Result<()> {
     if manifest.version != rocm_deps::LEMONADE_VERSION {
         return Ok(());
@@ -157,6 +161,7 @@ fn refuse_lemond_on_too_old_host(
         &crate::install::LINUX_LEMOND_NEEDS,
         host_libraries,
         "Lemonade was not started.",
+        check_disabled,
     )
 }
 
@@ -941,12 +946,14 @@ mod tests {
     fn start_on(
         manifest: &LemonadeInstallManifest,
         host_libraries: &crate::host_libraries::HostLibraries,
+        check_disabled: bool,
     ) -> Result<()> {
         let mut attempts = 0;
         let parent_root = tempfile::tempdir().unwrap();
         let mut child = loop {
             match spawn_lemond_on(
                 host_libraries,
+                check_disabled,
                 manifest,
                 "127.0.0.1",
                 1,
@@ -997,7 +1004,7 @@ mod tests {
     #[test]
     fn the_pinned_lemond_is_not_started_on_a_host_with_too_old_libraries() {
         let (_dir, manifest, marker) = marker_lemond(rocm_deps::LEMONADE_VERSION);
-        let error = start_on(&manifest, &libraries("2.31", "missing"))
+        let error = start_on(&manifest, &libraries("2.31", "missing"), false)
             .expect_err("a host older than the pinned lemond needs is refused")
             .to_string();
         let needs = &crate::install::LINUX_LEMOND_NEEDS;
@@ -1011,7 +1018,10 @@ mod tests {
         ] {
             assert!(error.contains(&expected), "missing `{expected}`: {error}");
         }
-        assert!(error.ends_with("Lemonade was not started."), "{error}");
+        assert!(
+            error.contains("Lemonade was not started. If this host provides"),
+            "{error}"
+        );
         assert!(!marker.exists(), "lemond ran despite the refusal");
     }
 
@@ -1022,17 +1032,31 @@ mod tests {
     fn lemond_starts_on_a_new_enough_host_and_for_a_tree_of_another_version() {
         let needs = &crate::install::LINUX_LEMOND_NEEDS;
         let (_dir, manifest, marker) = marker_lemond(rocm_deps::LEMONADE_VERSION);
-        start_on(&manifest, &libraries(needs.glibc, needs.openssl)).unwrap();
+        start_on(&manifest, &libraries(needs.glibc, needs.openssl), false).unwrap();
         assert!(
             marker.exists(),
             "lemond did not start on a host meeting its needs"
         );
 
         let (_dir, manifest, marker) = marker_lemond("0.0.1");
-        start_on(&manifest, &libraries("2.31", "missing")).unwrap();
+        start_on(&manifest, &libraries("2.31", "missing"), false).unwrap();
         assert!(
             marker.exists(),
             "a tree of another version was refused by this pin's needs"
+        );
+    }
+
+    /// With `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK` set, the pinned
+    /// `lemond` starts on a host the check would refuse, as the refusal's own
+    /// advice promises.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_disabled_check_starts_the_pinned_lemond_on_a_host_it_would_refuse() {
+        let (_dir, manifest, marker) = marker_lemond(rocm_deps::LEMONADE_VERSION);
+        start_on(&manifest, &libraries("2.31", "missing"), true).unwrap();
+        assert!(
+            marker.exists(),
+            "the disabled check still kept lemond from starting"
         );
     }
 

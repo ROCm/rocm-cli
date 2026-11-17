@@ -155,7 +155,14 @@ library that falls short, the message names the version needed and what the
 host has: its version, read from the library the `ldconfig` cache lists, or
 that the cache has no such library at all. A host with only OpenSSL 1.1 has no
 `libssl.so.3`, so it reads that way. A host whose cache cannot be read, or
-whose library does not parse, is not refused. Lemonade
+whose library does not parse, is not refused. A refused install says what it
+left undone: "Nothing was downloaded." for a fresh install, or that the
+Lemonade already installed there stays as it is. Because only the `ldconfig`
+cache is read, a host that provides OpenSSL 3 or glibc outside it
+(`LD_LIBRARY_PATH`, a Nix or Guix profile, a user prefix, a stale cache) is
+refused although `lemond` could load there; setting
+`ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK` (any value) turns both refusals
+into a warning, and the refusal message names it. Lemonade
 2026.44.1, the current pin, needs glibc 2.38 and OpenSSL 3.0.0, which Ubuntu
 24.04 meets; 2026.45.3's `lemond` needs glibc 2.43 and OpenSSL 3.2.0, which it
 does not.

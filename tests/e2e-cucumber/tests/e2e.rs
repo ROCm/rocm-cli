@@ -240,6 +240,9 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
+    /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
+    /// can show a refused install left that tree exactly as it was.
+    pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -409,6 +412,7 @@ impl Default for E2eWorld {
             recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,
+            planted_tree_snapshot: None,
         }
     }
 }
