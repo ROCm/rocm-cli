@@ -105,6 +105,7 @@
 //! and no assistant model running, which the CLI answers from its own
 //! read-only `comfyui status` call, and read its "ROCm CLI summary".
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1907,7 +1908,7 @@ async fn comfyui_logs_show_the_run_log(world: &mut E2eWorld) {
         comfyui_run_log_path(world).display()
     );
     for line in COMFYUI_RUN_LOG.lines() {
-        expected.push_str(&format!("    {line}\n"));
+        let _ = writeln!(expected, "    {line}");
     }
     assert!(
         stdout.contains(&expected),
