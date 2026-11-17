@@ -980,3 +980,26 @@ Feature: Model serving
     And the deployment summary names the logs command for that service
     And the launch's service record is left as ready
     And no background automation daemon was left behind
+
+  # ROCMAI-1058: when one of vLLM's compiled extensions fails to load (typically
+  # built against a newer glibc than the host has), vLLM logs a warning, carries
+  # on, and dies later on the first op that extension registers. `rocm serve`
+  # then prints the startup-failure message, which names what it detected and
+  # points at a `rocm diagnose --symptom` command. That message is built by
+  # `startup_log_context`/`extension_load_failure_hint` in the vLLM engine, which
+  # @id:diagnose-recognises-a-vllm-extension-load-failure cannot reach: that one
+  # drives `rocm diagnose` directly and never `rocm serve`.
+  #
+  # Same test-only hook as @id:serve-oom-launch-memory-guidance, in its
+  # `extension-load` mode, so @requires-oom-fault-injection skips this on the
+  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane.
+  # @requires-no-gpu because the fabricated launch stands in for the GPU the mock
+  # lane does not have. The hook plants only the raw startup log and the fact
+  # that the process died; every sentence asserted below is computed from that
+  # log by the engine, so breaking the hint fails this scenario.
+  @id:serve-vllm-extension-load-hint @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-61 - A launch that died on a vLLM compiled extension that did not load says so and points at diagnose
+    Given a managed vLLM launch whose compiled extension will fail to load
+    When the user serves a model on that launch
+    Then the startup failure names the vLLM compiled extension that did not load
+    And the startup failure points at a diagnose command that reports a cause

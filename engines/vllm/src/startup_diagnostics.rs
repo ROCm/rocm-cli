@@ -87,6 +87,21 @@ pub(crate) fn startup_log_context(log_path: Option<&Path>) -> String {
     )
 }
 
+/// The whole message a vLLM launch that exited before becoming ready fails
+/// with: the bail line, then [`startup_log_context`] for the log it left.
+///
+/// One copy, because two surfaces produce it. The readiness wait raises it for
+/// real, and the e2e fault-injection hook in `rocm serve` raises it for a
+/// planted log on a host with no GPU (`@id:serve-vllm-extension-load-hint`).
+/// Were the hook to spell the message itself, the scenario could keep passing
+/// against text the real failure no longer prints.
+pub(crate) fn exited_before_ready_message(status: &str, log_path: Option<&Path>) -> String {
+    format!(
+        "vLLM server process exited before becoming ready (status: {status}){}",
+        startup_log_context(log_path)
+    )
+}
+
 /// Appends [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] when the startup-log
 /// tail shows an out-of-memory failure, and nothing otherwise so healthy
 /// failures are not cluttered with an irrelevant memory hint. Shares its wording
@@ -236,9 +251,18 @@ fn import_failure_line(log_tail: &str) -> Option<&str> {
 /// must not be pointed here.
 ///
 /// The quoted symptom follows the rule the other two hints use: the user's own
-/// line when the checker scores it and it is one intact single-quoted argument,
-/// the canonical symptom otherwise. The real line quotes its namespace and op
-/// name, so in practice it is the canonical symptom.
+/// line when the checker scores it *on its own* and it is one intact
+/// single-quoted argument, the canonical symptom otherwise. The real line quotes
+/// its namespace and op name, so in practice it is the canonical symptom.
+///
+/// "On its own" is the load-bearing half here, and it is a stricter test than
+/// the one that decides whether to print a hint at all. [`is_extension_op_missing`]
+/// may read a row as this failure on provenance — the log belongs to the vLLM
+/// launch that just failed — but the command printed below is one the *user*
+/// runs later, with nothing but the quoted text, so a row whose only vLLM
+/// identification was its provenance would print a command that reports
+/// nothing. Such a row is echoed as the detected line and the canonical symptom
+/// is quoted instead.
 fn extension_load_failure_hint(window: &str) -> String {
     let rows: Vec<String> = window
         .lines()
@@ -257,7 +281,9 @@ fn extension_load_failure_hint(window: &str) -> String {
                 .contains("failed to import from vllm.")
         })
         .unwrap_or(op_missing);
-    let symptom = if rocm_core::quotable_in_single_quotes(op_missing) {
+    let symptom = if rocm_core::quotable_in_single_quotes(op_missing)
+        && rocm_core::vllm_extension_load_symptom_is_diagnosable(op_missing)
+    {
         op_missing.as_str()
     } else {
         rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
@@ -272,11 +298,23 @@ fn extension_load_failure_hint(window: &str) -> String {
 /// raises. The substring test is a cheap filter, so the catalog only scores the
 /// few rows that pass it; the catalog decides, so this hint and `rocm diagnose`
 /// cannot disagree about which namespaces count.
+///
+/// The row is offered to the catalog with a `vllm` token in front of it, and
+/// that is not a way of forcing a match. `_C` is the ordinary name for a
+/// compiled extension across the PyTorch ecosystem, so the catalog refuses to
+/// read the namespace shape as vLLM's unless the text identifies vLLM — a user
+/// pasting an `xformers` error into `rocm diagnose --symptom` must not get
+/// vLLM's plan. Here the text is not a paste: it is a line out of the startup
+/// log of the vLLM launch that just failed, so vLLM's identity is established by
+/// provenance rather than by the line's own wording. Supplying it keeps the hint
+/// firing on a log that writes the error without vLLM's `(EngineCore pid=…)`
+/// prefix, while *which namespaces count* stays the catalog's decision alone —
+/// the drift this call exists to prevent.
 fn is_extension_op_missing(row: &str) -> bool {
     let lower = row.to_ascii_lowercase();
     lower.contains("_opnamespace")
         && lower.contains("object has no attribute")
-        && rocm_core::vllm_extension_load_symptom_is_diagnosable(row)
+        && rocm_core::vllm_extension_load_symptom_is_diagnosable(&format!("vllm {row}"))
 }
 
 /// Reads the last N lines from a log file and returns them as a formatted string.
@@ -1270,6 +1308,32 @@ WARNING Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot
         let line = "AttributeError: _OpNamespace _rocm_C object has no attribute paged_attention";
         let hint = extension_load_failure_hint(line);
         assert_eq!(quoted_symptom_argument(&hint), line, "{hint}");
+        assert!(rocm_core::vllm_extension_load_symptom_is_diagnosable(
+            quoted_symptom_argument(&hint)
+        ));
+    }
+
+    #[test]
+    fn extension_load_hint_fires_on_a_row_whose_only_vllm_identification_is_the_log_it_came_from() {
+        // The catalog will not read a bare `_C` namespace error as vLLM's: `_C`
+        // is what torchvision, xformers and the rest call their extension too,
+        // so a paste of this line into `rocm diagnose --symptom` gets nothing.
+        let bare = "AttributeError: _OpNamespace _C object has no attribute reshape_and_cache";
+        assert!(
+            !rocm_core::vllm_extension_load_symptom_is_diagnosable(bare),
+            "the catalog must not take a bare `_C` error for vLLM's"
+        );
+        // Here the same text is a line of the failed vLLM launch's own startup
+        // log, so the hint still fires...
+        let hint = extension_load_failure_hint(bare);
+        assert!(hint.contains(&format!("failed to load ({bare})")), "{hint}");
+        // ...and the command it prints quotes the canonical symptom, not the
+        // row, because the user runs that command with the provenance gone.
+        assert_eq!(
+            quoted_symptom_argument(&hint),
+            rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+            "the printed command must report a cause when run on its own: {hint}"
+        );
         assert!(rocm_core::vllm_extension_load_symptom_is_diagnosable(
             quoted_symptom_argument(&hint)
         ));

@@ -12,9 +12,14 @@
 
 use super::scoring::{
     KEYWORDS_COMGR_CONFLICT, KEYWORDS_SHM_TOO_SMALL, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT,
-    KEYWORDS_VLLM_EXTENSION_LOAD, KEYWORDS_VLLM_OOM, finalize, keyword_score,
-    keyword_score_collapsing_overlaps, zero,
+    KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, symptom_matches,
+    vllm_extension_load_keywords, zero,
 };
+// Only `check_23_vllm_extension_load`'s tests reach for the whole table; the
+// check itself goes through `vllm_extension_load_keywords`, which is what
+// applies the anchor rule.
+#[cfg(test)]
+use super::scoring::KEYWORDS_VLLM_EXTENSION_LOAD;
 use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH};
 use crate::examine::Examination;
 use regex::Regex;
@@ -534,14 +539,60 @@ pub(super) fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosi
 }
 
 /// A canonical `--symptom` string for a vLLM compiled extension that failed to
-/// load, guaranteed to clear [`MIN_SCORE_FOR_MATCH`] against
-/// [`KEYWORDS_VLLM_EXTENSION_LOAD`].
+/// load.
+///
+/// Guaranteed to clear [`MIN_SCORE_FOR_MATCH`] against
+/// [`KEYWORDS_VLLM_EXTENSION_LOAD`](super::scoring::KEYWORDS_VLLM_EXTENSION_LOAD).
 ///
 /// The real line quotes the namespace and the op name, and a `'` cannot sit
 /// inside a single-quoted shell argument, so the engine's hint always falls back
 /// to this. It is the real line with those quotes removed.
+///
+/// The leading `vllm:` is load-bearing, not decoration. The `_OpNamespace` shape
+/// is only scored behind [`VLLM_EXTENSION_ANCHOR_PATTERN`], and the real line's
+/// own anchor is its `(EngineCore pid=…)` prefix, which this stripped-down
+/// rendering does not carry — without the token the command the engine prints
+/// for the user to paste would report nothing. It is spelled with no quote
+/// characters for the same reason the rest of the string is: this constant
+/// exists precisely because a `'` cannot sit inside a single-quoted shell
+/// argument (`canonical_vllm_extension_load_symptom_is_diagnosable` asserts
+/// both halves).
 pub const VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM: &str =
-    "AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor";
+    "vllm: AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor";
+
+/// A required anchor before the `_OpNamespace` keyword in
+/// [`KEYWORDS_VLLM_EXTENSION_LOAD`](super::scoring::KEYWORDS_VLLM_EXTENSION_LOAD)
+/// is scored at all.
+///
+/// `_C` is the ordinary name for a compiled extension across the whole PyTorch
+/// ecosystem — torchvision, xformers, bitsandbytes, apex, detectron2 and mmcv
+/// all ship one, and all raise the identical
+/// `AttributeError: '_OpNamespace' '_C' object has no attribute '<op>'` when
+/// theirs fails to load. Without an anchor that single line cleared
+/// [`MIN_SCORE_FOR_MATCH`] by itself, so `rocm diagnose --symptom` handed any of
+/// them vLLM's plan. The entries beyond that one need no anchor: each either
+/// spells `vllm` in its own pattern or is sub-threshold on its own (see
+/// [`vllm_extension_load_keywords`]).
+///
+/// **This is gated over the whole symptom, unlike [`check_16_vllm_oom`], which
+/// scores only [`vllm_anchored_lines`].** The difference is in what is being
+/// anchored. There the keywords are generic OOM text that another framework
+/// emits verbatim, so a stray `vllm` elsewhere in a paste is enough to
+/// misattribute a `llama.cpp` OOM, and the anchor has to hold line by line.
+/// Here the keyword is a specific namespace shape, and in a genuine report
+/// vLLM's identity is on *neighbouring* frames (`vllm/_custom_ops.py`), never on
+/// the `AttributeError` line itself — a per-line rule zeroes the real failure
+/// and stops diagnosing it. The cost of the looser rule is bounded in the same
+/// direction: another framework's `_C` error pasted inside a log that also names
+/// vLLM can still reach this entry, which is a far rarer paste than the bare
+/// error this now rejects.
+///
+/// The module names are anchors in their own right (`_rocm_C`, `_moe_C`,
+/// `_C_cache_ops`, `_C_stable_libtorch` are vLLM's and nobody else's), and so is
+/// `EngineCore`, vLLM's own process name — which is what admits the real log
+/// line, whose only vLLM token is that prefix. `_C` alone is deliberately absent.
+const VLLM_EXTENSION_ANCHOR_PATTERN: &str =
+    r"vllm|enginecore|_rocm_c|_moe_c|_c_cache_ops|_c_stable_libtorch";
 
 /// A vLLM compiled extension failed to load, so an op it registers is missing
 /// from `torch.ops` (ROCMAI-1058).
@@ -559,7 +610,13 @@ pub(super) fn check_23_vllm_extension_load(_e: &Examination, symptom: &str) -> D
     const ID: &str = "fix-23-vllm-extension-load";
     const TITLE: &str = "vLLM compiled extension failed to load, so an op it registers is missing";
 
-    let (score, evidence) = keyword_score(symptom, KEYWORDS_VLLM_EXTENSION_LOAD);
+    // Which keywords may be scored depends on whether anything in the paste
+    // identifies vLLM; see `VLLM_EXTENSION_ANCHOR_PATTERN` for why the gate
+    // selects a subset of the table rather than refusing to score at all. The
+    // weak signals stay scoreable either way, so a bare glibc error still
+    // surfaces as the sub-threshold noise it is instead of disappearing.
+    let anchored = symptom_matches(symptom, VLLM_EXTENSION_ANCHOR_PATTERN);
+    let (score, evidence) = keyword_score(symptom, vllm_extension_load_keywords(anchored));
     if score <= 0 {
         return zero(ID, TITLE);
     }
@@ -1725,6 +1782,17 @@ mod tests {
                 .any(|e| e.contains("missing from torch.ops")),
             "the namespace line itself has to carry the match: {evidence:?}"
         );
+        // ...and that keyword is only scored behind the anchor, so the constant
+        // has to carry a vLLM token of its own. The real line's anchor is its
+        // `(EngineCore pid=…)` prefix, which this stripped-down rendering drops.
+        assert!(
+            symptom_matches(
+                VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+                VLLM_EXTENSION_ANCHOR_PATTERN
+            ),
+            "the printed command would find nothing without an anchor: \
+             {VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM}"
+        );
     }
 
     #[test]
@@ -1748,16 +1816,92 @@ mod tests {
                 report.matched
             );
         }
-        // Each of vLLM's own namespaces is.
+        // Each of vLLM's own namespaces is, read in a vLLM traceback. The frame
+        // above the error is where vLLM's name actually sits in a real report,
+        // and it is what supplies the anchor; the namespace spelling is still
+        // what this loop varies, so breaking the namespace pattern fails here.
         for ns in ["_C", "_rocm_C", "_moe_C", "_C_cache_ops"] {
-            let line =
-                format!("AttributeError: '_OpNamespace' '{ns}' object has no attribute 'op'");
+            let line = format!(
+                "  File \"/opt/rt/site-packages/vllm/_custom_ops.py\", line 42, in \
+                 reshape_and_cache\nAttributeError: '_OpNamespace' '{ns}' object has no \
+                 attribute 'op'"
+            );
             assert_eq!(
                 diagnose(&linux_base(), &line).matched[0].id,
                 "fix-23-vllm-extension-load",
                 "{ns}"
             );
         }
+    }
+
+    /// The same `_C` error, with and without anything that says vLLM. These two
+    /// are a pair on purpose: the first alone would pass if the entry simply
+    /// stopped firing, and the second alone would pass if the anchor were
+    /// dropped. Both together pin the anchor itself.
+    const BARE_OP_NAMESPACE_ERROR: &str =
+        "AttributeError: '_OpNamespace' '_C' object has no attribute 'roi_align'";
+
+    #[test]
+    fn an_op_namespace_error_with_no_vllm_context_is_not_this_entry() {
+        // `_C` is what torchvision, xformers, bitsandbytes, apex, detectron2 and
+        // mmcv all call their compiled extension, and each raises this exact
+        // line when theirs fails to load. Unanchored, the 50-point namespace
+        // keyword cleared the match threshold by itself, so `rocm diagnose
+        // --symptom` handed any of them vLLM's plan.
+        for line in [
+            BARE_OP_NAMESPACE_ERROR,
+            "AttributeError: '_OpNamespace' '_xformers_C' object has no attribute 'efficient_attention_forward'",
+            "AttributeError: '_OpNamespace' '_bnb_C' object has no attribute 'gemv_4bit_inference'",
+        ] {
+            for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+                let report = diagnose(&host, line);
+                assert!(
+                    report
+                        .matched
+                        .iter()
+                        .all(|d| d.id != "fix-23-vllm-extension-load"
+                            || d.score < MIN_SCORE_FOR_MATCH),
+                    "{family}: {line}\n{:?}",
+                    report.matched
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_op_namespace_error_inside_a_vllm_traceback_still_is() {
+        // The other half of the pair: the anchor must not cost the real report
+        // its diagnosis. In a genuine traceback the `AttributeError` line itself
+        // carries no vLLM token -- vLLM's name is on the neighbouring frames --
+        // which is why this entry gates over the whole symptom and not per line
+        // the way `check_16_vllm_oom` does.
+        let traceback = format!(
+            "  File \"/opt/rt/site-packages/vllm/_custom_ops.py\", line 42, in reshape_and_cache\n\
+                 return torch.ops._C.reshape_and_cache(...)\n\
+             {BARE_OP_NAMESPACE_ERROR}"
+        );
+        for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+            let report = diagnose(&host, &traceback);
+            assert_eq!(
+                report.matched[0].id, "fix-23-vllm-extension-load",
+                "{family}: {:?}",
+                report.matched
+            );
+            assert!(report.matched[0].score >= MIN_SCORE_FOR_MATCH, "{family}");
+        }
+        // `EngineCore` is vLLM's own process name, and on the real log line it
+        // is the *only* vLLM token there is. Dropping it from the anchor set
+        // would silently stop diagnosing the report this entry was written for.
+        // The score, not just the id: an unanchored paste still *lists* fix-23
+        // as sub-threshold noise, so asserting the id alone passes with the
+        // anchor broken (measured).
+        let real = &diagnose(&linux_base(), EXTENSION_OP_MISSING).matched[0];
+        assert_eq!(real.id, "fix-23-vllm-extension-load");
+        assert!(
+            real.score >= MIN_SCORE_FOR_MATCH,
+            "the real log line scored {}",
+            real.score
+        );
     }
 
     #[test]

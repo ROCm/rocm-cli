@@ -359,10 +359,16 @@ start of the reply, before relaying a multi-step plan.
 - **An op missing from `torch.ops` at engine start** (`fix-23-vllm-extension-load`,
   Linux and WSL2): `AttributeError: '_OpNamespace' '_C' object has no attribute
   '...'`. One of vLLM's compiled extensions did not load, often because it needs
-  a newer glibc than the host has. Pass that error line, or the command
-  `rocm serve` printed; the warning `Failed to import from vllm._...` that names
-  the cause also matches. Relay the plan: it finds which extension fails and why,
-  inside `rocm engines shell vllm`. Do not suggest an engine reinstall, which
+  a newer glibc than the host has. Pass that error line **with its log context**,
+  or the command `rocm serve` printed; the warning `Failed to import from
+  vllm._...` that names the cause also matches. The context matters: every
+  PyTorch-ecosystem library with a `_C` extension raises the identical line, so
+  the entry needs the text to identify vLLM somewhere (the word `vllm`, the
+  `(EngineCore pid=...)` prefix the real line carries, or a vLLM extension name
+  such as `_rocm_C`). If a bare `AttributeError` line gets no match, ask for the
+  surrounding log lines rather than concluding there is nothing to find. Relay
+  the plan: it finds which extension fails and why, inside
+  `rocm engines shell vllm`. Do not suggest an engine reinstall, which
   fetches the same wheel, or group edits.
 - **Native Windows** gets no match from any of them, which is correct because
   the vLLM engine does not run there. Do not route that user to an issue tracker.

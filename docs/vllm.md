@@ -485,7 +485,27 @@ For conditional remediation, run `rocm diagnose --symptom '<symptom>'`.
   is one intact single-quoted argument that `rocm diagnose` recognises. The real
   line quotes its namespace and op name, so in practice the command quotes the
   canonical symptom,
-  `AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor`.
+  `vllm: AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor`.
+
+### What `rocm diagnose` needs to see
+
+`_C` is the ordinary name for a compiled extension across the PyTorch ecosystem
+— torchvision, xformers, bitsandbytes, apex, detectron2 and mmcv all ship one,
+and all raise the same `AttributeError: '_OpNamespace' '_C' object has no
+attribute '...'` when theirs fails to load. `rocm diagnose` therefore scores that
+line only when the text also identifies vLLM: the word `vllm`, vLLM's
+`EngineCore` process prefix, or one of its own extension names (`_rocm_C`,
+`_moe_C`, `_C_cache_ops`, `_C_stable_libtorch`). A real log line carries one of
+those — the error arrives as
+`(EngineCore pid=629513) ERROR ... AttributeError: '_OpNamespace' '_C' ...` — and
+so does the command the startup hint prints. A bare `AttributeError` line copied
+out on its own does not: paste the surrounding log lines with it, or run the
+command the startup failure printed.
+
+The other signals this entry scores (`Failed to import from vllm._...`, a
+`vllm/_*.abi3.so` path, `GLIBC_2.NN' not found`) need no such context; a glibc
+error on its own stays a weak signal, well below the match threshold, because
+any binary can print one.
 
 On Linux and WSL that command matches `fix-23-vllm-extension-load`. The fix is
 print-only: `rocm fix` prints a plan that imports each extension inside

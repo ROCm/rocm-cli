@@ -361,9 +361,14 @@ pub(super) const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
 /// so the process carries on and dies at the first call to an op that extension
 /// registers: `AttributeError: '_OpNamespace' '_C' object has no attribute
 /// '<op>'`. That line is worth exactly [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH)
-/// on its own. The namespace pattern takes vLLM's own op libraries (`_C`,
-/// `_rocm_C`, `_moe_C`, `_C_cache_ops`) and not torch's (`_c10d_functional`),
-/// so an op missing from torch itself is not read as this.
+/// on its own — but **only behind an anchor**, which is why it is the first
+/// entry and why [`vllm_extension_load_keywords`] exists. The namespace pattern
+/// takes vLLM's own op libraries (`_C`, `_rocm_C`, `_moe_C`, `_C_cache_ops`) and
+/// not torch's (`_c10d_functional`), so an op missing from torch itself is not
+/// read as this — but `_C` is the ordinary name for a compiled extension right
+/// across the PyTorch ecosystem (torchvision, xformers, bitsandbytes, apex,
+/// detectron2, mmcv all ship one and all raise this exact `AttributeError`
+/// shape), so the namespace alone says "some extension", not "vLLM's".
 ///
 /// The other entries are the cause as the loader states it, from the warning
 /// vLLM logs or from importing the extension by hand. A glibc version error is
@@ -396,6 +401,30 @@ pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
         "the host's glibc is older than the one the extension was built against",
     ),
 ];
+
+/// The part of [`KEYWORDS_VLLM_EXTENSION_LOAD`] that may be scored against
+/// `symptom` text which carries no vLLM-identifying token (`anchored == false`).
+///
+/// Only the first entry — the `_OpNamespace` namespace shape — is withheld, and
+/// withholding exactly that one is the whole point. It is the only entry that
+/// both clears [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) on its own
+/// *and* names nothing that is vLLM's; every other entry either spells `vllm`
+/// in its own pattern or is worth less than the threshold by itself. So
+/// dropping the first entry is sufficient to stop an unanchored paste reaching
+/// a verdict, and dropping no more than it is what keeps the weak signals —
+/// notably a bare `GLIBC_2.NN' not found`, which must stay *present and
+/// sub-threshold* rather than vanish (`a_glibc_error_alone_stays_below_the_match_threshold`).
+///
+/// A whole-table gate returning nothing was tried and is wrong for that reason.
+/// `the_only_unanchored_keyword_is_the_one_this_withholds` pins the property the
+/// split relies on, so a new entry cannot quietly reopen the hole.
+pub(super) fn vllm_extension_load_keywords(anchored: bool) -> KeywordTable {
+    if anchored {
+        KEYWORDS_VLLM_EXTENSION_LOAD
+    } else {
+        &KEYWORDS_VLLM_EXTENSION_LOAD[1..]
+    }
+}
 
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
 ///
@@ -557,6 +586,40 @@ pub(super) const KEYWORDS_WSL_LOADER: KeywordTable = &[
 mod tests {
     use super::*;
     use crate::diagnose::{HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH};
+
+    #[test]
+    fn the_only_unanchored_keyword_is_the_one_this_withholds() {
+        // `vllm_extension_load_keywords(false)` drops exactly the first entry.
+        // That is only safe while every *remaining* entry is self-identifying:
+        // it either spells `vllm` in its own pattern, or is worth less than the
+        // match threshold on its own and so cannot carry a verdict. A new entry
+        // that is neither would clear the threshold against text that never
+        // mentions vLLM — the hole this split closes — so it has to fail here
+        // and be placed ahead of the boundary instead.
+        let withheld = vllm_extension_load_keywords(true);
+        let unanchored = vllm_extension_load_keywords(false);
+        assert_eq!(
+            unanchored.len() + 1,
+            withheld.len(),
+            "exactly one entry is withheld without an anchor"
+        );
+        assert!(
+            withheld[0].2.contains("missing from torch.ops"),
+            "the withheld entry must be the `_OpNamespace` one: {:?}",
+            withheld[0]
+        );
+        assert!(
+            withheld[0].1 >= MIN_SCORE_FOR_MATCH,
+            "the withheld entry is the one that clears the threshold alone"
+        );
+        for (pattern, weight, label) in unanchored {
+            assert!(
+                pattern.contains("vllm") || *weight < MIN_SCORE_FOR_MATCH,
+                "`{label}` is scored with no vLLM anchor, names no vLLM token of \
+                 its own, and clears {MIN_SCORE_FOR_MATCH} by itself"
+            );
+        }
+    }
 
     #[test]
     fn overlap_dedup_does_not_demote_other_catalog_keyword_tables() {

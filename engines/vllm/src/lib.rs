@@ -48,6 +48,22 @@ pub fn verified_torch_stack_series(rocm_sdk_version: &str) -> Option<(&'static s
     wheel_builds::verified_torch_stack_series(rocm_sdk_version)
 }
 
+/// Test-only: the message this engine fails a launch with when the vLLM server
+/// process exits before becoming ready.
+///
+/// Behind `e2e-test-hooks`, so it is compiled out of shipped binaries. The
+/// message is computed for a startup log the caller planted.
+///
+/// `rocm serve`'s e2e fault injection calls this so a GPU-less lane can drive
+/// the real startup-failure text — including the diagnostic hints the engine
+/// derives from that log — without a vLLM runtime or a GPU to fail on. The
+/// failure condition and the log contents are fabricated; everything read out of
+/// the log, and the whole message built around it, is the production path.
+#[cfg(feature = "e2e-test-hooks")]
+pub fn e2e_exited_before_ready_message(status: &str, log_path: &std::path::Path) -> String {
+    startup_diagnostics::exited_before_ready_message(status, Some(log_path))
+}
+
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 
 #[derive(Parser, Debug)]
