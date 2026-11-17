@@ -127,8 +127,10 @@ pub(crate) enum Command {
     ///
     /// The step runs over the whole workspace whenever the affected crates
     /// cannot be determined, and prints why. It is skipped only when the
-    /// selection is known and has nothing for the step to check. CI always
-    /// checks the whole workspace.
+    /// selection is known and has nothing for the step to check. On a pull
+    /// request CI's Windows debug job tests the whole workspace (its Linux
+    /// coverage job every crate but `e2e-cucumber`), and the merge queue and
+    /// `main` always do.
     ///
     /// A step that already passed on this exact tree (same cargo command,
     /// toolchain and environment, clean working tree) is skipped, and a pass is

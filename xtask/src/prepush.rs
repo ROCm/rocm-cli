@@ -330,13 +330,15 @@ fn banner(check: Check, push: &Push, selection: &Selection, fallback: Option<&st
              checking the whole workspace",
             check.label()
         ),
-        // The claim about CI is backed by `.github/workflows/ci.yml`: the
-        // `windows-debug` job runs `cargo test --workspace --all-targets` on every
-        // Rust change (its `heavy` filter matches every `.rs` file), and the
-        // `test` job selects `--workspace` for every event but
+        // The claim about CI rests on `.github/workflows/ci.yml`: the
+        // `windows-debug` job runs `cargo test --workspace --all-targets`, and
+        // the `test` job selects `--workspace` for every event but
         // `pull_request` (the merge queue and pushes to main). The test
-        // `the_banner_claim_about_ci_matches_the_workflow` fails if either stops
-        // being true, so change the text and that test together.
+        // `the_banner_claim_about_ci_matches_the_workflow` fails if either of
+        // those two stops being true, so change the text and that test
+        // together. Not checked by that test: the `windows-debug` step runs
+        // only when the `heavy` path filter matches, which every `.rs` file
+        // change does.
         None => format!(
             "pre-push-check {}: {} for the changes in {range}; CI's Windows job, merge queue \
              and main still check the whole workspace",
