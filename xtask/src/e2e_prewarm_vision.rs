@@ -52,13 +52,23 @@ const VISION_MISMATCH_SIGNATURE: &str = "torchvision::";
 /// Read what the probe did from its exit status and output.
 fn classify_vision_import(success: bool, stdout: &str, stderr: &str) -> VisionImport {
     if !success {
-        let mut tail: Vec<&str> = stderr
+        let lines: Vec<&str> = stderr
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .rev()
-            .take(3)
             .collect();
-        tail.reverse();
+        let mut tail: Vec<&str> = lines.iter().rev().take(3).rev().copied().collect();
+        // The mismatch error is not always in the last lines (a chained
+        // traceback ends on the outer exception), and the callers read the
+        // signature from the tail, so keep the first line that carries it.
+        if !tail
+            .iter()
+            .any(|line| line.contains(VISION_MISMATCH_SIGNATURE))
+            && let Some(line) = lines
+                .iter()
+                .find(|line| line.contains(VISION_MISMATCH_SIGNATURE))
+        {
+            tail.insert(0, line);
+        }
         let tail = if tail.is_empty() {
             "the interpreter printed nothing to stderr".to_owned()
         } else {
@@ -73,16 +83,25 @@ fn classify_vision_import(success: bool, stdout: &str, stderr: &str) -> VisionIm
     }
 }
 
+/// How long to wait for a pipe's reader once the probe has ended. A grandchild
+/// that inherited the pipe can hold it open after the probe is gone, and the
+/// pre-warm must not wait on it.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
 /// Read a child's pipe to its end on its own thread, so a full pipe cannot stall
-/// the child while the caller waits on its deadline.
-fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+/// the child while the caller waits on its deadline. The bytes come back over a
+/// channel so the caller can bound its wait; a reader still blocked on a pipe
+/// something else holds is left running (detached) and ends when that closes.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut bytes);
         }
-        bytes
-    })
+        let _ = sender.send(bytes);
+    });
+    receiver
 }
 
 /// Run [`TORCHVISION_PROBE`] with `python`, with `library_paths` (the runtime's
@@ -120,16 +139,19 @@ fn probe_vision_import(
             break Some(status);
         }
         if Instant::now() >= deadline {
-            // The probe starts no child of its own, so killing it closes both
-            // pipes and the readers below return.
+            // Killing the probe closes its own ends of the pipes; a process it
+            // spawned may still hold them, which `PIPE_GRACE` below bounds.
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    let read = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+        String::from_utf8_lossy(&receiver.recv_timeout(PIPE_GRACE).unwrap_or_default()).into_owned()
+    };
+    let stdout = read(stdout);
+    let stderr = read(stderr);
     let Some(status) = status else {
         return Ok(VisionImport::Broken(format!(
             "`import torchvision.ops` did not finish within {}s and was killed",
@@ -276,14 +298,21 @@ fn engine_imports_torch(engine: &str) -> bool {
 /// Best effort until the uninstall itself: a tree whose engine or runtime state
 /// cannot be read here is left for the fatal check after the engine install.
 pub(crate) fn repair_torchvision_mismatch(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    repair_torchvision_mismatch_within(rocm, prewarm_dir, PROBE_TIMEOUT)
+}
+
+fn repair_torchvision_mismatch_within(
+    rocm: &Path,
+    prewarm_dir: &Path,
+    timeout: Duration,
+) -> Result<()> {
     let Ok(engine) = default_engine(rocm, prewarm_dir) else {
         return Ok(());
     };
     if !engine_imports_torch(&engine) {
         return Ok(());
     }
-    let Ok(ImportCheck::Broken { key, tail }) = check_runtime_imports(prewarm_dir, PROBE_TIMEOUT)
-    else {
+    let Ok(ImportCheck::Broken { key, tail }) = check_runtime_imports(prewarm_dir, timeout) else {
         return Ok(());
     };
     if !tail.contains(VISION_MISMATCH_SIGNATURE) {
@@ -382,7 +411,17 @@ pub(crate) fn verify_runtime_imports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e_prewarm::{Decision, decide};
+
+    /// Tests that write a script and then run it hold this lock for their whole
+    /// body. Writing an executable and exec'ing it fails with `ETXTBSY` when
+    /// another thread forks while the write handle is still open, and these
+    /// tests fork constantly.
+    #[cfg(unix)]
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn vision_probe_is_read_from_exit_status_and_output() {
@@ -550,6 +589,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_probe_is_passed_to_the_interpreter_with_dash_c() {
+        let _serial = serial();
         // Succeeds only when its first argument is `-c`, as the probe passes it.
         let scripts = tempfile::tempdir().expect("tempdir");
         let python = fake_python(
@@ -565,6 +605,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_advice_depends_on_whether_this_run_installed_the_runtime() {
+        let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let python = fake_python(scripts.path(), "echo 'ImportError: boom' >&2; exit 1");
         let tree = tree_with_python(&python);
@@ -593,6 +634,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_runtimes_library_directories_reach_the_probe() {
+        let _serial = serial();
         // Exits 0 only when its loader path starts with the recorded directory.
         let scripts = tempfile::tempdir().expect("tempdir");
         let python = fake_python(
@@ -607,6 +649,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_library_that_will_not_load_fails_when_directories_were_supplied() {
+        let _serial = serial();
         // The runtime's own directories were on the path and the load still
         // failed: that is a broken runtime, not an unconfigured probe.
         let scripts = tempfile::tempdir().expect("tempdir");
@@ -626,6 +669,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_library_that_will_not_load_is_skipped_only_when_nothing_could_be_supplied() {
+        let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let python = fake_python(
             scripts.path(),
@@ -642,6 +686,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_probe_that_never_finishes_is_killed_and_reported() {
+        let _serial = serial();
         // `exec` so the killed process is the sleeper itself and holds the pipes.
         let scripts = tempfile::tempdir().expect("tempdir");
         let python = fake_python(scripts.path(), "exec sleep 60");
@@ -663,14 +708,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_runtime_the_engine_does_not_need_torch_for_only_warns() {
+        let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let tree = tree_with_python(&fake_python(scripts.path(), MISMATCH));
         assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false, "lemonade").is_ok());
         assert!(verify_runtime_imports(Path::new("rocm"), tree.path(), false, "vllm").is_err());
     }
 
-    /// A stand-in `rocm`: `engines list` marks `engine` as the default and every
-    /// call is appended to `calls`.
+    /// A stand-in `rocm`: `engines list` marks `engine` as the default, every call
+    /// is appended to `calls`, and `runtimes uninstall <key>` removes that
+    /// runtime's registry entry and the active marker from the tree the call is
+    /// scoped to, as the CLI does.
     #[cfg(unix)]
     fn fake_rocm(dir: &Path, engine: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -680,7 +728,10 @@ mod tests {
             &path,
             format!(
                 "#!/bin/sh\necho \"$*\" >> {calls}\n\
-                 [ \"$1 $2\" = \"engines list\" ] && echo '* {engine}  default'\nexit 0\n",
+                 [ \"$1 $2\" = \"engines list\" ] && echo '* {engine}  default'\n\
+                 if [ \"$1 $2\" = \"runtimes uninstall\" ]; then\n\
+                 rm -f \"$ROCM_CLI_DATA_DIR/runtimes/registry/$3.json\" \
+                 \"$ROCM_CLI_DATA_DIR/runtimes/active.json\"\nfi\nexit 0\n",
                 calls = calls.display()
             ),
         )
@@ -702,29 +753,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_torch_and_torchvision_mismatch_is_uninstalled_so_the_next_decision_installs() {
+        let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let (rocm, calls) = fake_rocm(scripts.path(), "vllm");
         let tree = tree_with_python(&fake_python(scripts.path(), MISMATCH));
+        let manifest = tree
+            .path()
+            .join("data/runtimes/registry/release-wheel-test.json");
+        assert!(manifest.exists());
         repair_torchvision_mismatch(&rocm, tree.path()).expect("repairs");
         assert_eq!(
             uninstalls(&calls),
             "runtimes uninstall release-wheel-test --yes"
         );
-        // What the uninstall leaves behind, per `repair_poisoned_runtimes`, is a
-        // registry with no runtime for the channel, and that resolves to a fresh
-        // install (`no_managed_runtime_installs`).
-        assert_eq!(
-            decide("runtimes:\n", "release", None),
-            Decision::Install,
-            "an empty registry installs"
-        );
+        // Red if the uninstall is not requested for this runtime: the stand-in
+        // removes the registry entry only for the key it is given. That the
+        // emptied registry then installs afresh is `decide`'s own behavior,
+        // pinned by `no_managed_runtime_installs` in `e2e_prewarm.rs`.
+        assert!(!manifest.exists());
+        assert_eq!(active_runtime(tree.path()).expect("reads"), None);
     }
 
     #[cfg(unix)]
     #[test]
     fn only_a_real_mismatch_on_a_torch_engine_is_uninstalled() {
-        // Another import error, a hang's wording, a working runtime, a runtime
-        // without torchvision and a Lemonade lane are all left alone.
+        let _serial = serial();
+        // Another import error, a hang, a working runtime, a runtime without
+        // torchvision and a Lemonade lane are all left alone.
         let cases: [(&str, &str, &str); 5] = [
             (
                 "vllm",
@@ -734,20 +789,57 @@ mod tests {
             ("vllm", "exit 0", "a working runtime"),
             ("vllm", "echo absent", "no torchvision"),
             ("lemonade", MISMATCH, "an engine that does not import torch"),
-            ("vllm", "exec sleep 0", "a runtime that imports"),
+            // `exec` so the killed process is the sleeper itself.
+            ("vllm", "exec sleep 60", "a probe that never finishes"),
         ];
         for (engine, body, why) in cases {
             let scripts = tempfile::tempdir().expect("tempdir");
             let (rocm, calls) = fake_rocm(scripts.path(), engine);
             let tree = tree_with_python(&fake_python(scripts.path(), body));
-            repair_torchvision_mismatch(&rocm, tree.path()).expect("runs");
+            repair_torchvision_mismatch_within(&rocm, tree.path(), Duration::from_millis(300))
+                .expect("runs");
             assert_eq!(uninstalls(&calls), "", "{why}");
         }
     }
 
     #[cfg(unix)]
     #[test]
+    fn a_grandchild_holding_the_pipes_cannot_stall_the_probe() {
+        let _serial = serial();
+        // The probe starts a background process that inherits its pipes, then
+        // becomes a sleeper. Killing the probe leaves the grandchild holding
+        // both pipes open, so the readers never see the end of the stream.
+        let scripts = tempfile::tempdir().expect("tempdir");
+        let python = fake_python(scripts.path(), "sleep 60 &\nexec sleep 60");
+        let started = Instant::now();
+        let verdict = probe_vision_import(&python, &[], Duration::from_millis(300)).expect("runs");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the wait on the readers is bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(verdict, VisionImport::Broken(ref t) if t.contains("did not finish")));
+    }
+
+    #[test]
+    fn a_mismatch_error_above_the_last_lines_is_still_recognised() {
+        let stderr = "RuntimeError: operator torchvision::nms does not exist\n\
+                      During handling of the above exception, another exception occurred:\n\
+                      Traceback (most recent call last):\n  File \"x.py\", line 1\n\
+                      ImportError: could not import torchvision.ops\n";
+        match classify_vision_import(false, "", stderr) {
+            VisionImport::Broken(tail) => {
+                assert!(tail.contains(VISION_MISMATCH_SIGNATURE), "{tail}");
+                assert!(tail.ends_with("could not import torchvision.ops"), "{tail}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_runtime_that_cannot_import_torchvision_ops_fails_the_pre_warm() {
+        let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let python = fake_python(
             scripts.path(),
@@ -782,6 +874,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn working_and_torchvision_free_runtimes_pass_the_pre_warm() {
+        let _serial = serial();
         let scripts = tempfile::tempdir().expect("tempdir");
         let working = tree_with_python(&fake_python(scripts.path(), "exit 0"));
         assert!(verify_runtime_imports(Path::new("rocm"), working.path(), false, "vllm").is_ok());
@@ -813,6 +906,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_probe_imports_torchvision_ops_in_a_real_interpreter() {
+        let _serial = serial();
         let python = Path::new("python3");
         let usable = Command::new(python)
             .arg("--version")

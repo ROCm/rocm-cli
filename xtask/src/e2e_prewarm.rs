@@ -2041,36 +2041,34 @@ message=connect timed out after 30 s";
         assert_eq!(decide(EMPTY, "release", None), Decision::Install);
     }
 
-    /// `run` is never called by a test, so what keeps the check where the
-    /// comment on it says (after the engine check, before the reuse return, which
-    /// a warm tree takes every time) is this reading of `run`'s own code: comment
-    /// lines are ignored, and the call must be an unconditional statement at the
-    /// top level of the function.
+    /// `run` is never called by a test, so what keeps the checks where the
+    /// comments on them say is this reading of `run`'s own code: comment lines
+    /// are dropped, and each call must appear in order. The repair comes before
+    /// the freshness decision and the dangling-pointer repair; the check comes
+    /// after the engine check and before the reuse return, which a warm tree
+    /// takes every time. Formatting and unrelated edits do not move these.
     #[test]
-    fn the_import_check_runs_before_the_reuse_return() {
+    fn the_import_checks_run_where_their_comments_say() {
         // A Windows checkout may use CRLF line endings.
         let source = include_str!("e2e_prewarm.rs").replace("\r\n", "\n");
         let start = source.find("pub fn run(").expect("run exists");
         let end = source[start..].find("\n}\n").expect("run ends") + start;
-        let code: Vec<&str> = source[start..end]
+        let code: String = source[start..end]
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
+            .collect::<Vec<_>>()
+            .join("\n");
         let position = |needle: &str| {
-            code.iter()
-                .position(|line| *line == needle)
-                .unwrap_or_else(|| panic!("`{needle}` is not a top-level statement of run"))
+            code.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is not called in run"))
         };
-        let engine = position("    let engine = ensure_default_engine(&rocm, prewarm_dir)?;");
-        let check = position(
-            "    verify_runtime_imports(&rocm, prewarm_dir, runtime_changed(&decision), &engine)?;",
-        );
-        let reuse_return = position("    if !runtime_changed(&decision) {");
-        assert!(engine < check && check < reuse_return);
-        // The repair runs before `decide` reads the registry and before the
-        // dangling-pointer repair that cleans up after it.
-        let repair = position("    repair_torchvision_mismatch(&rocm, prewarm_dir)?;");
-        let dangling = position("    repair_dangling_active_runtime(&rocm, prewarm_dir)?;");
-        assert!(repair < dangling && dangling < engine);
+        let repair = position("repair_torchvision_mismatch(");
+        let dangling = position("repair_dangling_active_runtime(");
+        let decision = position("let decision =");
+        let engine = position("ensure_default_engine(");
+        let check = position("verify_runtime_imports(");
+        let reuse_return = position("if !runtime_changed(&decision)");
+        assert!(repair < dangling && dangling < decision);
+        assert!(decision < engine && engine < check && check < reuse_return);
     }
 }
