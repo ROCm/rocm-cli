@@ -467,9 +467,36 @@ fn detect_icds() -> VulkanEvidence<String> {
 /// otherwise a flaky PowerShell on a host with a working AMD driver reads
 /// identically to a host with no driver at all — the conflation the device
 /// side's "did it answer" exists to prevent.
+///
+/// Everything this does beyond starting the process lives in
+/// [`windows_icds_through`], which is compiled and tested on every platform.
 #[cfg(windows)]
 fn detect_icds() -> VulkanEvidence<String> {
-    windows_icds_from_capture(capture_optional_command(
+    windows_icds_through(capture_optional_command)
+}
+
+/// The Windows ICD lookup with the subprocess as an argument: which program is
+/// run, with which arguments, and what its capture is turned into.
+///
+/// Split out from [`detect_icds`] so that the whole of the Windows registry
+/// path except the `CreateProcess` call itself can be driven from a Linux lane.
+/// The argv is the part that had no test at all: `windows_icds_from_capture`
+/// was tested over hand-written captures, but nothing checked that the capture
+/// handed to it came from PowerShell running
+/// [`WINDOWS_VULKAN_ICD_SCRIPT`] — so dropping `-Command`, or pointing the
+/// lookup at a program that is not on a stock Windows install, would have
+/// compiled and shipped, failing only on real hardware as a silent
+/// [`VulkanStatus::Inconclusive`]. `the_windows_registry_lookup_runs_the_khronos_script_through_powershell`
+/// pins it.
+///
+/// `-NonInteractive` and `-NoProfile` are not decoration: a profile that
+/// prompts turns this probe into a 1.5 s timeout on every `examine`, and a
+/// timeout is one of the `None`s that must not read as an empty registry key.
+#[cfg(any(windows, test))]
+fn windows_icds_through(
+    capture: impl FnOnce(&str, &[&str]) -> Option<String>,
+) -> VulkanEvidence<String> {
+    windows_icds_from_capture(capture(
         "powershell",
         &[
             "-NoLogo",
@@ -493,11 +520,23 @@ const fn detect_icds() -> VulkanEvidence<String> {
 /// The pure half of the Windows [`detect_icds`]: the manifests the capture
 /// named, and whether PowerShell actually **answered**.
 ///
-/// Compiled on every platform, not just Windows, so the Linux lanes can test the
-/// failure path at all — the registry read itself has no gate but CI's
-/// `windows-build-and-test` job. `Some` means the script exited 0 and its stdout
-/// is in hand, so an empty list from it is a real "the key holds no ICD"; `None`
+/// Compiled on every platform, not just Windows, so the Linux lanes can test
+/// the failure path at all. `Some` means the script exited 0 and its stdout is
+/// in hand, so an empty list from it is a real "the key holds no ICD"; `None`
 /// is the un-run lookup that must not be reported as one.
+///
+/// **What is and is not covered**, stated exactly, because an overstated claim
+/// here is what leaves a gap nobody goes looking for. This function and the
+/// argv around it ([`windows_icds_through`]) are unit-tested on every platform.
+/// The one step no test executes is starting the PowerShell process: no test in
+/// this repository runs `detect_icds` on Windows, so CI's
+/// `windows-build-and-test` job *compiles* that call and never runs it. What
+/// could still break there and nowhere else is the behaviour of PowerShell
+/// itself on a real host — the script's output encoding, a policy that blocks
+/// it, a cold start slower than `OPTIONAL_COMMAND_TIMEOUT`. Each of those
+/// arrives as a `None`, which this function routes to the hedged
+/// [`VulkanStatus::Inconclusive`] rather than to a claim about the machine, so
+/// the untested step cannot produce a false statement — only a less useful one.
 #[must_use]
 pub fn windows_icds_from_capture(captured: Option<String>) -> VulkanEvidence<String> {
     captured.map_or_else(VulkanEvidence::unanswered, |output| {
@@ -1571,10 +1610,91 @@ GPU0:
         );
     }
 
-    /// The Windows seam itself, at the only level a Linux lane can reach it: the
-    /// pure half of `detect_icds`. The registry read behind it is exercised
-    /// nowhere but CI's `windows-build-and-test`, so the failure and timeout
-    /// paths — all of which arrive here as `None` — are covered through this.
+    /// The Windows registry lookup, driven from a Linux lane through the one
+    /// seam `detect_icds` leaves: the subprocess as an argument.
+    ///
+    /// This is the half that had no test. `windows_icds_from_capture` was
+    /// exercised over captures written by hand, which says nothing about where
+    /// a real capture comes from — the program name, the flags, and the script
+    /// were only ever read by a human. Asserting the argv *here*, against the
+    /// same `WINDOWS_VULKAN_ICD_SCRIPT` the parser's own test reads, is what
+    /// ties the two halves together: an argv that no longer runs the script,
+    /// or runs it interactively, fails here rather than on a user's machine as
+    /// a permanently inconclusive Vulkan line.
+    ///
+    /// What it still does not reach is `CreateProcess` itself, and no test in
+    /// this repository does — see `windows_icds_from_capture` for exactly what
+    /// that leaves uncovered and why the residue is bounded.
+    #[test]
+    fn the_windows_registry_lookup_runs_the_khronos_script_through_powershell() {
+        let mut argv = None;
+        let icds = windows_icds_through(|program, args| {
+            argv = Some((
+                program.to_owned(),
+                args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            ));
+            // What a real AMD Adrenalin host prints: both the 64-bit and the
+            // 32-bit registration, one `ICD<tab><path>` row each.
+            Some(
+                "ICD\tC:\\Windows\\System32\\DriverStore\\FileRepository\\u0397342.inf_amd64_x\\amdvlk64.json\n\
+                 ICD\tC:\\Windows\\SysWOW64\\amdvlk32.json\n"
+                    .to_owned(),
+            )
+        });
+
+        let (program, args) = argv.expect("the lookup must actually run a command");
+        assert_eq!(
+            program, "powershell",
+            "the program has to be the one a stock Windows install has"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(WINDOWS_VULKAN_ICD_SCRIPT),
+            "the script that is run must be the one the parser's test reads, or the two halves \
+             can drift apart while each looks right: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "-Command"),
+            "without it PowerShell treats the script as a file name: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "-NonInteractive")
+                && args.iter().any(|arg| arg == "-NoProfile"),
+            "a profile that prompts turns this probe into a 1.5s timeout on every `examine`, and \
+             a timeout reads as `Inconclusive`: {args:?}"
+        );
+
+        // End to end: the capture became evidence that answered, and the
+        // classifier made the right thing of it.
+        assert!(icds.did_answer());
+        assert_eq!(icds.found().len(), 2, "{icds:?}");
+        assert_eq!(amd_icd_driver_label(&icds.found()[0]), Some("AMDVLK"));
+        let support = classify_vulkan_support(icds, VulkanEvidence::unanswered(), true);
+        assert_eq!(
+            support.status,
+            VulkanStatus::DriverPresentDevicesUnverified,
+            "a registry that named an AMD driver has an installed driver behind it, even with no \
+             `vulkaninfo` to enumerate a device: {support:?}"
+        );
+
+        // The other end of the same wiring: a PowerShell that never answered
+        // must come out of the whole path as "could not look", not as a host
+        // with an empty registry key.
+        let unread = windows_icds_through(|_program, _args| None);
+        assert!(
+            !unread.did_answer() && unread.found().is_empty(),
+            "{unread:?}"
+        );
+        assert_eq!(
+            classify_vulkan_support(unread, VulkanEvidence::unanswered(), true).status,
+            VulkanStatus::Inconclusive
+        );
+    }
+
+    /// The capture-to-evidence half on its own: what each shape of PowerShell
+    /// output becomes. The failure and timeout paths all arrive here as one
+    /// `None`, so this is where they are covered; the test above covers the
+    /// argv that produces it.
     #[test]
     fn a_powershell_that_never_answered_is_not_an_empty_registry_key() {
         // Missing `powershell`, a non-zero exit, or a timeout: all one `None`.
