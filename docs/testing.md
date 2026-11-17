@@ -1788,6 +1788,63 @@ List registered managed or read-only runtimes and their exact side-by-side keys:
 rocm runtimes list
 ```
 
+Each runtime's row is followed by its `install_root:` and a `provenance:` line
+naming the `channel`, the package `source` (the wheel index, or the downloaded
+archive for a tarball install), the `source_layout_generation` and the exact
+`device_target` its manifest recorded, for example:
+
+```text
+      provenance: channel=nightly source=<wheel-index-url> source_layout_generation=next-v1 device_target=gfx1201
+```
+
+The values are the ones the manifest recorded: the package index, else the
+artifact URL (never the marker an adopted runtime keeps there); the layout
+field, else the wheel composition's; the recorded target, else the
+`device-<target>` extra in the package specs. For the layout and target this
+chooses the same recorded field `rocm update` uses, through the same accessors;
+`rocm update` then uses the value as recorded, while the listing trims it and
+prints a blank one as `unrecorded`. Each step moves on only when a field is
+absent, so a blank field is not skipped in favour of the next one, and a fact
+recorded nowhere also prints `unrecorded`. Nothing is guessed from other
+facts: a family-wide or tarball install shows `device_target=unrecorded` rather
+than a target guessed from its family, and a runtime registered with
+`rocm runtimes adopt` shows `source=unrecorded`. The chains, their precedence,
+the blank and trimming rules are pinned by
+`runtime_list_reads_each_provenance_fact_from_where_it_was_recorded`; blank or
+padded values are not what `rocm install sdk` writes, but can come from a
+hand-edited manifest or one brought in with `rocm runtimes import`. An adopted
+runtime's channel is the one adoption recorded: the channel `--channel` or
+`--runtime-id` named, `release` when neither names one. All three paths
+(neither flag, `--channel nightly`, and `--runtime-id therock-nightly:<family>`
+with no `--channel`) are pinned by
+`adopted_runtime_lists_its_channel_and_its_source_as_unrecorded` in
+[runtime_adopt.rs](../apps/rocm/src/runtime_adopt.rs). The marker adoption
+writes in place of an artifact URL is persisted manifest format. Code in the
+crate refers to it only through its constant, so two checks pin the literal
+value: `adoption_marker_keeps_its_persisted_value` in
+[runtime_registry.rs](../apps/rocm/src/runtime_registry.rs), and
+`runtime-lifecycle-22` (below), which plants it in an adopted runtime's
+manifest.
+`rocm examine` prints the same four facts for the active runtime as
+`active_runtime_channel`, `active_runtime_source`,
+`active_runtime_source_layout_generation` and `active_runtime_device_target`,
+from the same fields. The unit tests
+`runtime_list_names_where_each_runtime_came_from` and
+`examine_names_the_active_runtime_provenance_the_listing_shows` in
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pin the values, the
+latter for an active nightly runtime and an active adopted one;
+`@id:runtime-lifecycle-list-names-runtime-provenance` (`runtime-lifecycle-22`)
+checks the listing end to end with a planted nightly runtime, an older one
+that recorded neither its layout nor an exact target, and an adopted one whose
+manifest holds the adoption marker as earlier releases wrote it, which must
+list `source=unrecorded`; and
+`@id:examine-reports-where-the-active-runtime-came-from` (`examine-54`) checks
+the `examine` lines. Both plant read-only manifests and run on the mock lane:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-22 |examine-54 '
+```
+
 Activate one validated runtime:
 
 ```bash
@@ -4393,12 +4450,12 @@ by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
 levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, or unknown.
 Unknown covers both "nothing detected" and "a target this build's catalog does
 not recognise" — conflating the latter with "confirmed to have no ROCm build"
-would turn a detection gap into a claim about the hardware. `examine-54` holds
+would turn a detection gap into a claim about the hardware. `examine-55` holds
 the line against the `detected_gfx_target` and `compatible_therock_family` the
 same report prints, so every lane checks the level its own hardware implies:
 
 ```bash
-cargo xtask e2e -- -n '(examine-54)'
+cargo xtask e2e -- -n '(examine-55)'
 ```
 
 Vulkan-only here is inferred from the gfx table, not probed: this change has
