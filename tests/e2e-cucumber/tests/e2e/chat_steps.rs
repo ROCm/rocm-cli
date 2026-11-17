@@ -200,3 +200,101 @@ async fn assert_model_generated_reply(world: &mut E2eWorld) {
         .unwrap_or("");
     assert!(!content.is_empty(), "empty reply in chat response: {resp}");
 }
+
+// ── Direct tool calls through `rocm mcp-call` ──────────────────────
+
+/// A directory that exists wherever the suite runs: this crate's own.
+const EXISTING_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+fn missing_path() -> String {
+    std::path::Path::new(EXISTING_DIR)
+        .join("e2e-no-such-path")
+        .display()
+        .to_string()
+}
+
+fn run_path_exists(world: &mut E2eWorld, arguments: &serde_json::Value) {
+    let arguments = arguments.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["mcp-call", "path_exists", "--arguments-json", &arguments],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("a tool-using client hands the CLI a whole tool-call request to check a path that exists")]
+async fn mcp_call_with_a_params_envelope(world: &mut E2eWorld) {
+    // An MCP `tools/call` request's params, as a client received them: the
+    // tool's name, its arguments, and the protocol's optional `_meta`.
+    run_path_exists(
+        world,
+        &serde_json::json!({
+            "name": "path_exists",
+            "arguments": { "path": EXISTING_DIR },
+            "_meta": { "progressToken": 1 },
+        }),
+    );
+}
+
+#[when(
+    "a tool-using client asks the CLI to check a path with a second set of arguments nested inside the first"
+)]
+async fn mcp_call_with_nested_arguments(world: &mut E2eWorld) {
+    // The outer path exists and the nested one does not, so a result for
+    // either would show which set ran.
+    run_path_exists(
+        world,
+        &serde_json::json!({
+            "path": EXISTING_DIR,
+            "arguments": { "path": missing_path() },
+        }),
+    );
+}
+
+#[then("the tool reports that path as an existing directory")]
+async fn path_reported_as_existing_directory(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "rocm mcp-call failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("rocm mcp-call printed no JSON tool result ({e}):\n{stdout}"));
+    let text = value["content"][0]["text"].as_str().unwrap_or_default();
+    // The tool's own report, for the path inside the request's arguments.
+    assert!(
+        text.contains(&format!("path: {EXISTING_DIR}\n"))
+            && text.contains("exists: true")
+            && text.contains("kind: directory"),
+        "the tool did not report the requested directory:\n{text}"
+    );
+}
+
+#[then("the CLI refuses the request for its nested arguments")]
+async fn mcp_call_refused_for_nested_arguments(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the request was not refused:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("must not contain a nested `arguments` field"),
+        "the refusal does not name the nested arguments field:\n{stderr}"
+    );
+}
+
+#[then("no tool result is printed")]
+async fn no_tool_result_printed(world: &mut E2eWorld) {
+    // The tool prints its result on stdout only when it ran; neither path's
+    // report may appear.
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    assert!(
+        stdout.trim().is_empty(),
+        "a tool result was printed for a refused request:\n{stdout}"
+    );
+}
