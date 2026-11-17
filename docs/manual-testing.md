@@ -1773,8 +1773,12 @@ Expected result:
 
 ## 12. Context-Size Estimate for a GGUF Model
 
-Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
-by design) and network access to Hugging Face. The point is to check the
+Needs a host with a Radeon GPU and network access to Hugging Face. A discrete
+card is what the figures below were calibrated on; an APU is also estimated,
+but against the shared memory pool its engine allocates from, so its report
+carries a note that the figure compared with is a ceiling the operating system
+draws on too, and only an APU whose pool could not be read answers
+`undetermined`. The point is to check the
 estimate against what a real load uses: the compute buffer and runtime reserve
 were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
 so a different GPU or build can differ. How close the estimate came on them is
@@ -1791,8 +1795,8 @@ Expected result:
   and the header read finishes in seconds.
 - The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
   at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
-  and the total, with this GPU's dedicated VRAM and the largest context that
-  fits.
+  and the total, with this GPU's dedicated VRAM (on an APU, its shared pool) and
+  the largest context that fits.
 - Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
   about 53% and 28% of the `f16` one.
 - Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
