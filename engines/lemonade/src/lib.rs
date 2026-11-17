@@ -29,6 +29,9 @@ mod backend_alignment;
 mod device_policy;
 mod direct_llama;
 mod footprint;
+// Linux only: Windows `lemond` has no glibc or OpenSSL floor to check.
+#[cfg(any(target_os = "linux", test))]
+mod host_libraries;
 mod install;
 mod llamacpp_backend;
 mod process;
@@ -412,6 +415,22 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
+    // Refused before anything is downloaded: a `lemond` built against a newer
+    // glibc or OpenSSL than the host has exits at once with a loader error,
+    // which used to reach the user only as "did not become ready".
+    // The line saying what the refusal left undone follows the branch: an
+    // install whose pinned tree is already in place would have downloaded
+    // nothing anyway.
+    #[cfg(target_os = "linux")]
+    crate::host_libraries::refuse_if_host_too_old(
+        rocm_deps::LEMONADE_VERSION,
+        &crate::install::LINUX_LEMOND_NEEDS,
+        &crate::host_libraries::probe_host_libraries(),
+        &crate::footprint::host_refusal_outcome(
+            crate::footprint::pinned_tree_in_place(&paths, env_root.as_deref()).as_deref(),
+        ),
+        crate::host_libraries::host_library_check_disabled(),
+    )?;
     // Announced and space-checked before anything is downloaded: a fresh tree
     // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
     if let Some(preflight) = crate::footprint::plan_install_preflight(

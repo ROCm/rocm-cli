@@ -43,7 +43,9 @@ on:
     # every GPU lane skips because `changes` skips. This frees runners only where
     # the cancel completes: a job queued for a runner that is not picking it up
     # (a lane whose runner is busy) may not finish cancelling, so this
-    # does NOT clear such queued runs.
+    # does NOT clear such queued runs. Where the MI300X job is the one that
+    # reaches its runner, its stale-run guard ends it and `cancel-stale-run`
+    # cancels the run (same-repo PRs only); the Strix lanes carry no guard.
     types: [opened, synchronize, reopened, closed]
   merge_group:
     branches: [main]
@@ -205,7 +207,9 @@ jobs:
   # Exists only to start a run in the PR's concurrency group when the PR is
   # merged or closed: that run cancels the PR's older run. A GPU job of that run
   # which is queued for a runner that is not picking it up may not finish
-  # cancelling (observed on queued runs).
+  # cancelling (observed on queued runs). A same-repo PR's run whose MI300X job
+  # reaches its runner is then cancelled by `e2e-gpu`'s stale-run guard and
+  # `cancel-stale-run`.
   pr-closed:
     name: Supersede runs of a closed PR
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
@@ -224,6 +228,10 @@ jobs:
     # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
+    # Read by `e2e-report`: a run that skipped itself as stale uploads nothing,
+    # which is not a missing report.
+    outputs:
+      stale: ${{ steps.stale.outputs.stale }}
     strategy:
       fail-fast: false
       # n-1/n-2 (ROCMAI-430) only fan out on a release-branch push — see the
@@ -253,6 +261,14 @@ jobs:
           && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
       )
     continue-on-error: false
+    # Job-level, so it replaces the workflow's `contents: read`: that is
+    # restated. `pull-requests: read` is for the stale-run guard's PR lookup.
+    # No write scope: this job builds and runs PR code on a persistent runner,
+    # and untrusted code and a write-scoped token do not share a job here (the
+    # cancel lives in `cancel-stale-run`, which runs none).
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       # Bound serve readiness below the 35-min job cap so a serve that never comes
       # ready fails the scenario with a real error instead of hanging until the
@@ -265,7 +281,63 @@ jobs:
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
+      # Stale-run guard: a run whose PR was closed or merged, or whose head has
+      # moved on, has no use for the MI300X. `concurrency` cancels superseded
+      # runs, but a job already waiting for a self-hosted runner does not always
+      # leave the queue (see `pr-closed`), so the job checks the PR the moment it
+      # gets a runner, before the ~45 min of build + serve work, and ends without
+      # running anything. It only reads and records `stale`; `cancel-stale-run`
+      # (a hosted job, no checkout) then cancels the run.
+      #
+      # This has to be a step: a job-level `if` is evaluated before the job is
+      # queued, when the PR may still be open and current, and cannot be
+      # re-evaluated later. Every later step is gated on `steps.stale.outputs`
+      # so the job ends without running them, and without failing; `e2e-report`
+      # reads the `stale` job output so that is not reported as a lane that ran
+      # without uploading its report.
+      #
+      # Fails open: if the PR cannot be read (or `gh` is missing), the job runs
+      # as before. One assumption: any API head that differs from the event's
+      # counts as newer. A read that lags a fresh push could show an older head
+      # and wrongly end a current run (and, for a same-repo PR, cancel it); that
+      # costs the run's non-blocking lanes (the cancel ends the whole run), which a
+      # re-run recovers, so it is accepted.
+      - name: Skip a stale run (closed PR or superseded head)
+        id: stale
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! command -v gh >/dev/null; then
+            echo "::warning::gh is not installed on this runner; the stale-run guard did not run"
+            exit 0
+          fi
+          if ! pr=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" \
+            --jq '[.state, .head.sha] | @tsv'); then
+            echo "::warning::could not read PR #${PR_NUMBER}; running the job unchecked"
+            exit 0
+          fi
+          IFS=$'\t' read -r state head_sha <<<"$pr"
+          if [ -z "$state" ] || [ -z "$head_sha" ]; then
+            echo "::warning::PR #${PR_NUMBER} came back without a state or head sha; running the job unchecked"
+            exit 0
+          fi
+          if [ "$state" = closed ]; then
+            reason="PR #${PR_NUMBER} is closed"
+          elif [ "$head_sha" != "$EVENT_HEAD_SHA" ]; then
+            reason="PR #${PR_NUMBER} head moved from ${EVENT_HEAD_SHA} to ${head_sha}"
+          else
+            exit 0
+          fi
+          echo "stale=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::${reason}; skipping this job"
+          echo "- :no_entry_sign: \`e2e-gpu\` skipped itself: ${reason}" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.stale.outputs.stale != 'true'
         with:
           persist-credentials: false
 
@@ -276,6 +348,7 @@ jobs:
       # also names an E2E root — see the exposure documented in
       # scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
+        if: steps.stale.outputs.stale != 'true'
         run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
@@ -288,6 +361,7 @@ jobs:
       # floor stays for the case the process gate cannot see: a non-E2E tenant
       # exhausting a shared host. See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        if: steps.stale.outputs.stale != 'true'
         env:
           GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
@@ -299,6 +373,7 @@ jobs:
       # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
       # the local target.
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        if: steps.stale.outputs.stale != 'true'
         with:
           cache: false
 
@@ -308,6 +383,7 @@ jobs:
       # the checkout's parent — untouched by git clean and persistent between jobs
       # on a self-hosted runner), so cargo rebuilds incrementally.
       - name: Run E2E tests on GPU hardware
+        if: steps.stale.outputs.stale != 'true'
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           # Share heavy immutable artifacts (TheRock runtimes ~3.3GB, HF weights,
@@ -432,25 +508,59 @@ jobs:
       # `current` leg's name is UNCHANGED from before this matrix existed — it's
       # also what a single-element (non-release-branch) matrix always uploads.
       - name: Upload E2E report (current)
-        if: always() && matrix.sdk_version == 'current'
+        if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-report
           path: tests/e2e-cucumber/results/
 
       - name: Upload E2E report (n-1)
-        if: always() && matrix.sdk_version == 'n-1'
+        if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'n-1'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-n-1-report
           path: tests/e2e-cucumber/results/
 
       - name: Upload E2E report (n-2)
-        if: always() && matrix.sdk_version == 'n-2'
+        if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'n-2'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-n-2-report
           path: tests/e2e-cucumber/results/
+
+  # Cancels a run `e2e-gpu` found stale. A separate job, on a GitHub-hosted
+  # runner with no checkout, so the `actions: write` token never shares a job
+  # with PR code (`e2e-gpu` runs it on a persistent runner). It is the internal
+  # half of this workflow's split: only a same-repo PR is sent a cancel. A fork
+  # PR (external; GitHub holds its self-hosted lanes for approval where the
+  # repository setting requires it, and gives it a read-only token) just has
+  # `e2e-gpu`'s steps skipped. Cancelling the whole run frees the PR's
+  # concurrency group and stops its other stale lanes; the MI300X itself was
+  # already freed when `e2e-gpu` skipped itself. A failed cancel (e.g. a token
+  # without `actions: write`) is tolerated. `e2e-report` is gated on `always()`,
+  # so it still runs after the cancel, but its missing-report check is gated on
+  # `!cancelled()` and is skipped in a cancelled run. The check's `stale`
+  # exemption is therefore for runs that are not cancelled: a fork PR (no
+  # cancel is sent), or a cancel that fails or loses a race with the check.
+  cancel-stale-run:
+    name: Cancel a stale run
+    needs: [e2e-gpu]
+    if: >-
+      always()
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && needs.e2e-gpu.outputs.stale == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run cancel "$GITHUB_RUN_ID" || echo "::warning::could not cancel run ${GITHUB_RUN_ID}; its other lanes keep running"
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
   # Dispatch ephemeral pool, opt-in only via the `devlab-dispatch` label (see
@@ -1663,7 +1773,8 @@ jobs:
       # the reports that arrived, so that lane would drop out of the grid with
       # no row and no FAIL. On a `continue-on-error` lane nothing else is red
       # either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # `skipped`, and not self-skipped as `stale`) must have uploaded its report
+      # artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1701,6 +1812,15 @@ jobs:
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
+            # A lane that publishes `stale=true` skipped its uploads by design
+            # and is not a missing report. Only e2e-selfhosted.yml's `e2e-gpu`
+            # stale-run guard publishes it; the line is inert in nightly.yml and
+            # is there because a contract test keeps the two copies of this script
+            # identical. Say so in the summary rather than dropping the lane silently.
+            if [ "$(jq -r --arg job "$job" '.[$job].outputs.stale // ""' <<<"$NEEDS")" = true ]; then
+              echo "- :no_entry_sign: \`$job\` skipped itself as stale; it has no column in the grid above" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             IFS=',' read -ra wanted <<<"$artifacts"
             for artifact in "${wanted[@]}"; do
               if ! grep -qxF "$artifact" <<<"$uploaded"; then

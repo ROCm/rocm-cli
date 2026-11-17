@@ -1874,8 +1874,10 @@ jobs:
   # e2e-gpu-strix-windows). They live there — not here — so a job queued on an
   # offline self-hosted runner (which GitHub cannot cancel) can never hold this
   # workflow's concurrency group and stall its merge-required checks (EAI-7548).
-  # They are non-blocking (continue-on-error) and fork-safe (self-hosted runners
-  # do not execute untrusted fork PRs). See docs/ci-hardware-testing.md.
+  # They are non-blocking (none is a required check) and fork-restricted: GitHub does
+  # not start self-hosted jobs from an external fork's pull_request run without
+  # approval (whether that is every fork run or only a first-time contributor's
+  # is a repository setting). See docs/ci-hardware-testing.md.
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
   #

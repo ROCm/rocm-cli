@@ -46,10 +46,22 @@ serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
-`GLIBCXX_3.4.32`: that is what the Lemonade engine is linked against, and every
-published build of it needs those versions, so there is no older release to fall
-back to. Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides
-glibc 2.39 and `GLIBCXX_3.4.33`.
+`GLIBCXX_3.4.32`, and OpenSSL 3.0.0 or newer (`libssl.so.3`): that is what the
+Lemonade engine is linked against. Every stable Lemonade release from 11.5.1
+through 2026.44.1, the one rocm-cli pins, needs those versions; the newest,
+2026.45.3, needs glibc 2.43 and OpenSSL 3.2.0, which is why it is not pinned.
+Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides glibc
+2.39, `GLIBCXX_3.4.33` and OpenSSL 3.0.13. On an older host,
+`rocm engines install lemonade` stops before downloading anything and says what
+falls short: the glibc version Lemonade needs and the newest the host's
+`libc.so.6` provides, or that
+the host has no `libssl.so.3`, the library of OpenSSL 3. That check reads glibc
+and OpenSSL only; `GLIBCXX_3.4.32` (libstdc++) is not checked. Where Lemonade is
+already installed, the same check refuses to reinstall it or start it, and says
+the installed copy was left as it is. The check reads the `ldconfig` cache, so a
+host that provides these libraries some other way (`LD_LIBRARY_PATH`, a Nix or
+Guix profile) can set `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`: the
+shortfall is then printed as a warning and Lemonade goes ahead.
 
 > [!IMPORTANT]
 > **Tech Preview:** This software is provided as-is, without warranty or
@@ -591,7 +603,13 @@ hardware, not something an install or a setting can put right.
 
 `rocm fix` takes these flags:
 
-- `--dry-run` shows any fix's plan without changing anything.
+- `--dry-run` shows a fix's plan without changing anything. On Windows,
+  `fix-2-unset-override`, `fix-6-path` and `fix-9-igpu-dgpu --device-index N`
+  read the current value of the variable they change before planning, so a dry
+  run whose read fails stops with exit 4 and shows no plan. It still prints the
+  fix's catalog entry, which describes the fix in general terms (for
+  `fix-9-igpu-dgpu`, a `setx HIP_VISIBLE_DEVICES <dGPU-index>` template) and is
+  not a preview of the change on this machine.
 - `--yes` skips the interactive confirmation once you've reviewed it. Without
   it, a fix that changes files or settings asks `[y/N]` (default: no). When
   stdin is not a terminal it prints the plan and refuses with exit code 5,
@@ -616,6 +634,16 @@ which happened reads the message, not the code. A negative device index depends
 on how it is written: `--device-index=-1` is accepted by the parser and the fix
 refuses it with exit 3, while `--device-index -1` (with a space) is read as an
 unknown option `-1`, a usage error that exits 2.
+
+A fix that runs a command and fails exits 4 and says why on stderr. That
+includes a command that does not finish within its time limit (one minute):
+the CLI stops it and exits 4, but the change may have been made in part or may
+still finish, so the message says how to check it (on Windows, an expression
+to run in PowerShell) and names the `rocm fix` command to re-run if it was not
+made. On Windows, when one of those three fixes cannot read the current value
+of the variable it changes, it stops before changing anything, also with exit 4;
+under `--dry-run` it stops the same way, before showing the change it would
+make.
 
 ### ROCm installation
 
@@ -862,7 +890,7 @@ old date is a hint to look at the driver, not a finding that it is broken. See
 Manage multiple side-by-side ROCm runtimes:
 
 ```
-rocm runtimes list
+rocm runtimes list [--json]
 rocm runtimes activate <runtime-key> [--restart-services [--yes]]
 rocm runtimes rollback [--restart-services [--yes]]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
@@ -895,6 +923,13 @@ Runtimes are told apart by the packages they were installed from, not by
 version alone, so one version can appear more than once: a `--devel` install
 and a plain one of the same version are two separate runtimes, as are two
 installs that resolved different GPU device payloads.
+
+`list --json` prints the same listing as one JSON document on stdout for
+scripts: each runtime with its key, version, mode, status and toolchain, its
+`provenance` as an object with the same four facts, and `active` and
+`rollback_target` flags in place of the `*` and `-` markers. Unset values,
+including a provenance fact the text shows as `unrecorded`, are `null`. Fields
+may be added in later releases; existing ones are not renamed or removed.
 
 `activate` and `rollback` change which runtime the next install or server
 picks up. A server that is already running is not moved: it keeps serving on
