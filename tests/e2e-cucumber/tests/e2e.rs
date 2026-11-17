@@ -754,11 +754,13 @@ impl E2eWorld {
         let lemonade = runtime_dir.join(e2e_cucumber::fixture_binary::fixture_target_name(
             "lemonade",
         ));
-        install_fixture_binary("fake-lemonade", &lemond);
-        install_fixture_binary("fake-lemonade", &lemonade);
+        install_fixture_binary_as("fake-lemonade", &[&lemond, &lemonade]);
 
         let version = e2e_cucumber::runtime_pins::pinned_version("lemonade");
         let manifest = serde_json::json!({
+            // Mirrors `rocm_deps::lemonade_env_id`, which the engine and `rocm`
+            // both use; the suite cannot import it. A drift sends `serve` to
+            // the real install, which serve-18's refusal count catches.
             "env_id": format!("lemonade-embeddable-{version}"),
             "version": version,
             "runtime_dir": runtime_dir,
@@ -1035,18 +1037,25 @@ pub fn rocmd_binary() -> PathBuf {
 /// and `rocm-core` is a dev-dependency this crate's library target cannot
 /// reach, only this test binary.
 pub fn install_fixture_binary(name: &str, dest: &Path) {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
-    }
+    install_fixture_binary_as(name, &[dest]);
+}
+
+/// [`install_fixture_binary`] under several names, reading the fixture once.
+pub fn install_fixture_binary_as(name: &str, dests: &[&Path]) {
     let contents = std::fs::read(e2e_cucumber::fixture_binary::fixture_binary(name))
         .unwrap_or_else(|e| panic!("failed to read the {name} stand-in: {e}"));
-    rocm_core::fake_executable::write_fake_executable(dest, contents).unwrap_or_else(|e| {
-        panic!(
-            "failed to install the {name} stand-in at {}: {e}",
-            dest.display()
-        )
-    });
+    for dest in dests {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
+        }
+        rocm_core::fake_executable::write_fake_executable(dest, &contents).unwrap_or_else(|e| {
+            panic!(
+                "failed to install the {name} stand-in at {}: {e}",
+                dest.display()
+            )
+        });
+    }
 }
 
 /// Spawn the real `rocm` binary with the scenario's isolated env.
