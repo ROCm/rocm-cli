@@ -19,7 +19,7 @@ does not close, edit or comment on an issue except for one `needs-info` comment
 | `needs-info` plus one comment | a bug report with no reproduction steps or no `rocm --version` output |
 | type (`bug`, `enhancement`, `question`, `documentation`) | model, only when the issue has no type label yet; the template's own label is never overridden |
 | area (`area:cli`, `area:dash-tui`, `area:rocmd`, `area:assistant`, `engines`, `installation`, `documentation`) | model |
-| `priority:P0` to `priority:P3` | model, against the rubric in the script |
+| `priority:P0` to `priority:P3` | model, against the rubric in [issue-triage.txt](../.github/prompts/issue-triage.txt) |
 | assignee | round-robin over [triage-maintainers.txt](../.github/triage-maintainers.txt): the issue number modulo the list length, skipping the reporter |
 
 Missing labels are created on first use. An issue that already has a priority
@@ -28,27 +28,41 @@ the workflow does not stack labels or reassign.
 
 ## Trust model
 
-The issue title and body are untrusted. The model is asked for a JSON object
-and nothing else; the script keeps only values from fixed lists
-(`validate_classification`) and decides itself which labels exist and who is
-assigned. The model has no tools and sees no repository content. The job's
-token can write issues and call GitHub Models, nothing else, and only the issue
-number from the event reaches the script, so no issue text is interpolated into
-a shell command. If the model call fails, the platform label, `needs-info` and
-the assignment are still applied and a warning is logged.
+The issue title and body are untrusted, and a model that followed them could be
+talked into using whatever credential its job holds. So the workflow is three
+jobs, and the credential that reaches the model is never one that can write
+issues:
 
-The model is called through GitHub Models with the job's `GITHUB_TOKEN`
-(`models: read`), so there is no secret to provision. GitHub Models is
-rate-limited; an issue that hits the limit is still labelled and assigned,
-just without type, area and priority.
+| Job | Token | Does |
+| --- | --- | --- |
+| `prepare` | `issues: read` | fetches the issue and builds the size-capped prompt; a bot or pull request produces no prompt and the rest is skipped |
+| `classify` | `COPILOT_PAT` only | the model call, with no write scope on `GITHUB_TOKEN` |
+| `apply` | `issues: write` | reduces the reply to values from fixed lists (`validate_classification`), then labels, assigns and comments |
+
+The script, not the model, decides which labels exist and who is assigned. Only
+the issue number from the event reaches a script, and the model reply reaches
+`apply` through an environment variable, so no issue text is interpolated into a
+shell command. If the model call fails, is rate-limited or returns something
+unparseable, the platform label, `needs-info` and the assignment are still
+applied and a warning is logged.
+
+The model call is the one the release-readiness narrative in
+[nightly.yml](../.github/workflows/nightly.yml) makes: `actions/ai-inference`
+with the Copilot provider, authenticated by the Copilot-licensed PAT in the
+`COPILOT_PAT` secret. Each triaged issue spends Copilot requests on that PAT's
+owner. If the PAT is revoked or its seat lapses, triage degrades to the
+deterministic steps without failing. GitHub Models (`models: read`) is not used:
+it is retired and its endpoint no longer returns completions.
 
 ## Changing it
 
 - **Maintainers:** edit [triage-maintainers.txt](../.github/triage-maintainers.txt).
   Order matters, and inserting a name shifts who the next issue goes to.
-- **Rubric, areas, model:** edit `SYSTEM_PROMPT`, `AREAS` and `MODEL` in the script.
-  A new label also needs an entry in `NEW_LABELS`; the self-test fails if an
-  area or priority label has no way to be created.
+- **Rubric and model:** edit [issue-triage.txt](../.github/prompts/issue-triage.txt)
+  and the `model:` input in the workflow. The script's `AREAS`, `TYPES` and
+  `PRIORITIES` hold the same values; the self-test fails if one is missing from
+  the prompt. A new label also needs an entry in `NEW_LABELS`, which the
+  self-test also checks.
 
 ## Running it by hand
 
@@ -57,9 +71,13 @@ to on and prints the plan without touching the issue. Locally:
 
 ```bash
 GH_TOKEN="$(gh auth token)" python scripts/triage_issue.py --repo ROCm/rocm-cli --issue 123 --dry-run
+TRIAGE_MODEL_RESPONSE='{"type":"bug","area":"engines","priority":"P2"}' \
+  GH_TOKEN="$(gh auth token)" python scripts/triage_issue.py --repo ROCm/rocm-cli --issue 123 --dry-run
 python scripts/triage_issue.py --self-test
 ```
 
-The self-test runs in the CI `python`/script step. It covers parsing,
-round-robin selection, enum validation, idempotence and the needs-info comment.
-It does not call the model.
+The first form shows the deterministic part alone; the second supplies a model
+reply by hand. The self-test runs in the CI `python`/script step. It covers
+parsing, reply parsing, round-robin selection, enum validation, the prompt cap,
+idempotence and the needs-info comment. It does not call the model, which is
+exercised by running the workflow itself.

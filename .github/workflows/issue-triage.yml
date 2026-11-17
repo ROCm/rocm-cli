@@ -2,11 +2,20 @@
 # SPDX-License-Identifier: MIT
 #
 # First-pass triage of a newly opened issue: labels (type, area, platform,
-# priority, needs-info) and a round-robin maintainer assignee. The model call
-# goes to GitHub Models with the job's own GITHUB_TOKEN, so no secret is
-# involved. The issue text is untrusted: the model's reply is checked against
-# fixed enums and this job's token can only write issues. See
+# priority, needs-info) and a round-robin maintainer assignee. See
 # scripts/triage_issue.py and docs/issue-triage.md.
+#
+# Three jobs, so the credential that reaches the model is never one that can
+# write issues. The issue text is untrusted, and a model that obeyed it could
+# otherwise be talked into using whatever the job holds:
+#
+#   prepare   issues: read   fetch the issue, build the model prompt
+#   classify  no GITHUB_TOKEN  the model call, holding COPILOT_PAT only
+#   apply     issues: write  validate the reply, label, assign, comment
+#
+# The model call uses the same Copilot path as the release-readiness narrative
+# in nightly.yml (a Copilot-licensed PAT in `COPILOT_PAT`). It is allowed to
+# fail: `apply` still adds the platform label, `needs-info` and the assignee.
 
 name: Issue triage
 
@@ -24,40 +33,120 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.issue.number || inputs.issue }}
   cancel-in-progress: false
 
 jobs:
-  triage:
-    name: Triage issue
-    runs-on: ubuntu-latest
+  prepare:
+    name: Build prompt
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
-      issues: write
-      models: read
+      issues: read
+    outputs:
+      prompt: ${{ steps.prompt.outputs.prompt }}
     steps:
       # The default branch only: an `issues` event never runs a branch's copy of
       # this workflow, and no issue-controlled value is used as a ref.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          sparse-checkout: scripts/triage_issue.py
+          sparse-checkout-cone-mode: false
+
+      # Only the issue number comes from the event; the script fetches the title
+      # and body itself. The prompt reaches the output through a random
+      # delimiter because it embeds untrusted issue text. No file means the
+      # issue is skipped (a bot or a pull request) and the later jobs do nothing.
+      - name: Build prompt
+        id: prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
+        run: |
+          python3 scripts/triage_issue.py --repo "$GITHUB_REPOSITORY" \
+            --issue "$ISSUE_NUMBER" --emit-prompt "$RUNNER_TEMP/prompt.txt"
+          if [ -f "$RUNNER_TEMP/prompt.txt" ]; then
+            delimiter="$(openssl rand -hex 8)"
+            {
+              echo "prompt<<${delimiter}"
+              cat "$RUNNER_TEMP/prompt.txt"
+              echo "${delimiter}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  classify:
+    name: Classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: prepare
+    if: ${{ needs.prepare.outputs.prompt != '' }}
+    # An outage or a revoked PAT must not stop the rest of the triage.
+    continue-on-error: true
+    # No GITHUB_TOKEN scopes beyond reading this public repo for the prompt
+    # file; the only credential of value is COPILOT_PAT.
+    permissions:
+      contents: read
+    outputs:
+      response: ${{ steps.draft.outputs.response }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/prompts/issue-triage.txt
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install GitHub Copilot CLI
+        run: npm install -g @github/copilot@1.0.97
+
+      - name: Classify issue
+        id: draft
+        # Same pinned commit as the release-readiness narrative in nightly.yml
+        # (the v3 tag). `provider: copilot` is explicit there for the same reason.
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          provider: copilot
+          model: claude-sonnet-5.5
+          system-prompt-file: .github/prompts/issue-triage.txt
+          prompt: ${{ needs.prepare.outputs.prompt }}
+
+  apply:
+    name: Apply labels and assignee
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [prepare, classify]
+    # `classify` may have failed or been skipped; `prepare` must have a prompt.
+    if: ${{ !cancelled() && needs.prepare.outputs.prompt != '' }}
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
           sparse-checkout: |
             scripts/triage_issue.py
             .github/triage-maintainers.txt
+            .github/prompts/issue-triage.txt
           sparse-checkout-cone-mode: false
 
-      - name: Triage
+      # The model reply is untrusted: it goes in through env, never the command
+      # line, and the script reduces it to values from fixed lists.
+      - name: Apply
         env:
           GH_TOKEN: ${{ github.token }}
-          # Only the issue number reaches the script from the event; it fetches
-          # the title and body itself, so no issue text is ever interpolated
-          # into a shell command line.
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
+          TRIAGE_MODEL_RESPONSE: ${{ needs.classify.outputs.response }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           args=(--repo "$GITHUB_REPOSITORY" --issue "$ISSUE_NUMBER")
