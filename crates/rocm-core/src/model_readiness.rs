@@ -1871,6 +1871,81 @@ mod tests {
     /// gate a few dozen lines above already consults `requires_gpu`; this one
     /// did not.
     ///
+    /// A host softened by the system-RAM check first keeps that check's own
+    /// remediation when the shared-pool gate fires afterwards.
+    ///
+    /// The gate sets a `fix` only `if was_ready`, precisely so it cannot speak
+    /// over a remediation an earlier check already wrote -- its own `Degraded`
+    /// has no `verify`, because nothing here reads free memory, so replacing a
+    /// system-RAM fix with it would take away the one actionable step the user
+    /// had. Nothing combined the two before: every shared-pool test had ample
+    /// RAM, and every system-RAM test had a dedicated card.
+    #[test]
+    fn a_host_already_softened_for_system_ram_keeps_that_remediation() {
+        let registry = builtin_model_recipe_registry();
+        let recipe = registry
+            .recipes
+            .iter()
+            .find(|recipe| recipe.matches_ref(SMALL_MODEL_REF))
+            .expect("the smallest curated recipe");
+        let recommended = f64::from(
+            recipe
+                .recommended_system_ram_gb
+                .expect("premise: this recipe must recommend system RAM"),
+        );
+        let minimum = f64::from(
+            recipe
+                .min_gpu_mem_gb
+                .expect("premise: this recipe must declare a GPU minimum"),
+        );
+
+        let catalog = ModelCatalogSource::Available(&registry);
+        let readiness = assess_model_readiness(
+            SMALL_MODEL_REF,
+            &catalog,
+            &HostFacts {
+                // Ample for the recipe, so the GPU comparison itself passes and
+                // the shared-pool gate is the only thing that could soften it.
+                accelerator_memory: AcceleratorMemory::Unified {
+                    gtt_total_gib: minimum * 4.0,
+                    vram_carveout_gib: Some(0.5),
+                },
+                // Below the recommendation, so the system-RAM check softens
+                // first and writes the remediation this test is about.
+                system_ram_gib: Some(recommended / 2.0),
+            },
+            &engine_choice,
+        );
+
+        assert_eq!(
+            readiness.verdict,
+            ModelVerdict::Degraded,
+            "premise: both softenings must fire, or this asserts nothing: {:?}",
+            readiness.evidence
+        );
+        let fix = readiness
+            .fix
+            .as_ref()
+            .expect("the system-RAM remediation must survive the shared-pool gate");
+        assert!(
+            fix.summary.contains("system RAM"),
+            "the shared-pool gate overwrote the system-RAM remediation with its own: {fix:?}"
+        );
+        assert!(
+            !fix.verify.is_empty(),
+            "the system-RAM fix has a verify the user can run; the gate's own Degraded has \
+             none, so an empty one means it was replaced: {fix:?}"
+        );
+        assert!(
+            readiness
+                .evidence
+                .iter()
+                .any(|line| line.contains("no dedicated VRAM")),
+            "premise: the shared-pool gate must also have fired: {:?}",
+            readiness.evidence
+        );
+    }
+
     /// `cpu_only` is a schema-validated `device_policy`
     /// (`validate_model_device_policy`), so this is reachable through the
     /// public `assess_model_readiness`. No shipped recipe pairs it with an

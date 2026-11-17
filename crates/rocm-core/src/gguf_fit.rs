@@ -5,8 +5,10 @@
 //! Will this GGUF model fit in GPU memory at this context size?
 //!
 //! Weights plus KV cache plus a compute buffer plus a runtime reserve, compared
-//! against the dedicated VRAM the readiness check already reads. Pure
-//! arithmetic over a [`GgufHeader`]: nothing here reads a file or the network.
+//! against the memory the engine allocates from, as the readiness check already
+//! reads it: a discrete card's dedicated VRAM, or an integrated GPU's ceiling on
+//! the pool it shares with the operating system. Pure arithmetic over a
+//! [`GgufHeader`]: nothing here reads a file or the network.
 //!
 //! The KV-cache formula is exact for a plain full-attention model (it is how
 //! llama.cpp lays the cache out), and the weights are the file's own size from
