@@ -16,7 +16,7 @@
 //! changes engine support, so the unit tests below guard it.
 //!
 //! The AMD GPU *count* is re-implemented for the same reason (see
-//! [`probe_amd_gpu_count`]): no `rocm` command reports one, so a scenario whose
+//! `probe_amd_gpu_count`): no `rocm` command reports one, so a scenario whose
 //! premise is a multi-GPU host has nothing else to gate on.
 //!
 //! `examine`'s `default_engine` now reports the host's real engine rather than the
@@ -28,10 +28,12 @@
 
 use std::sync::OnceLock;
 
-/// Name of the `rocm` binary under test (mirrors the test binary's
-/// `rocm_binary()`): `ROCM_CLI_BINARY` or plain `rocm`.
-fn rocm_binary() -> String {
-    std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
+/// Name of the `rocm` binary under test: `ROCM_CLI_BINARY` or plain `rocm`,
+/// read through `env` so a test can supply it without a process-wide variable.
+/// Like the test binary's `rocm_binary()`, except that a value that is not
+/// UTF-8 is used as given here rather than replaced by `rocm`.
+fn rocm_binary(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> std::ffi::OsString {
+    env("ROCM_CLI_BINARY").unwrap_or_else(|| "rocm".into())
 }
 
 /// Whether a container runtime is usable here.
@@ -132,11 +134,11 @@ pub struct HostCapability {
     pub gfx_target: Option<String>,
     /// Whether an AMD GPU is present AND usable here, so `@requires-gpu`
     /// scenarios can run. A real `detected_gfx_target`, plus a ready ROCm
-    /// driver path on WSL — see [`host_has_usable_gpu`].
+    /// driver path on WSL — see `host_has_usable_gpu`.
     pub has_amd_gpu: bool,
     /// How many AMD GPUs are PRESENT on this host, before any visibility mask.
     /// `None` where the count could not be determined (non-Linux, unreadable
-    /// sysfs). Gates `@requires-multi-gpu`; see [`probe_amd_gpu_count`].
+    /// sysfs). Gates `@requires-multi-gpu`; see `probe_amd_gpu_count`.
     pub amd_gpu_count: Option<usize>,
     /// Engine adapters the binary reports as present. Both builtins are always
     /// "built-in", so this is NOT the same as "can start here" — use
@@ -154,16 +156,27 @@ pub struct HostCapability {
     /// exposes it), so `xtask e2e` reports it via the [`OOM_FAULT_INJECTION_ENV`]
     /// environment variable — set only when xtask built the binary itself with
     /// the feature, and absent for a prebuilt `ROCM_CLI_BINARY` (the self-hosted
-    /// lanes' shipping release build). See [`probe_host_capability`].
+    /// lanes' shipping release build). See `probe_host_capability`.
     pub oom_fault_injection: bool,
     /// Whether two file names differing only in letter case are two files under
     /// the temp root the scenarios' isolated roots are created in. Gates
-    /// `@requires-case-sensitive-fs`; see [`probe_case_sensitive_fs`].
+    /// `@requires-case-sensitive-fs`; see `probe_case_sensitive_fs`.
     pub case_sensitive_fs: bool,
     /// Whether a directory made read-only refuses new files to the user
     /// running the suite. Gates `@requires-dir-permissions`; see
-    /// [`probe_dir_permissions_bind`].
+    /// `probe_dir_permissions_bind`.
     pub dir_permissions_bind: bool,
+    /// `examine`'s `driver_status:` line, empty when it printed none. Only
+    /// decides GPU usability on WSL (see `host_has_usable_gpu`); kept so a
+    /// lane whose GPU went missing can say why.
+    pub driver_status: String,
+    /// Why the probe could not read the binary under test, if it could not:
+    /// the first failure of `rocm examine` or `rocm engines list` (see
+    /// [`ProbeError`]). When set, the rest of this struct holds the same
+    /// no-GPU values an empty `examine` would give, so callers never panic, and
+    /// the harness refuses to run (see `lane_verdict::preflight_verdict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
 }
 
 /// Environment variable `xtask e2e` sets to `1` when it compiled the binary
@@ -258,7 +271,11 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // OS distro from `examine` — ALWAYS collected (every platform, incl. mock and
     // hosts without a shared runtime dir). Isolated throwaway root reads the host.
     if let Ok(tmp) = tempfile::TempDir::with_prefix("rocm-e2e-ver-") {
-        let examine = run_probe(tmp.path(), &["examine"]);
+        // Best-effort, unlike the capability probe: a failed `examine` here
+        // only leaves the report heading's OS blank. The capability probe ran
+        // the same command before any scenario and already refused the run if
+        // it failed.
+        let examine = run_probe(tmp.path(), &["examine"]).unwrap_or_default();
         v.os = examine
             .lines()
             .find_map(|l| l.trim().strip_prefix("distro:"))
@@ -486,6 +503,29 @@ fn probe_host_capability() -> HostCapability {
     // what the scenarios see.
     let examine = run_probe(root, &["examine"]);
     let engines = run_probe(root, &["engines", "list"]);
+    capability_from_probes(examine, engines, root)
+}
+
+/// Build a [`HostCapability`] from the two probes' results; `root` is the
+/// throwaway directory the filesystem probes write under.
+///
+/// Split from [`probe_host_capability`] so a test can hand it a failed probe
+/// without a binary to run.
+fn capability_from_probes(
+    examine: Result<String, ProbeError>,
+    engines: Result<String, ProbeError>,
+    root: &std::path::Path,
+) -> HostCapability {
+    // The first failure is the one reported; either one means the facts below
+    // were not read from the binary, so they fall back to the no-GPU values an
+    // empty dump parses to.
+    let probe_error = examine
+        .as_ref()
+        .err()
+        .or_else(|| engines.as_ref().err())
+        .map(ToString::to_string);
+    let examine = examine.unwrap_or_default();
+    let engines = engines.unwrap_or_default();
 
     let ExamineFacts {
         os_family,
@@ -516,6 +556,8 @@ fn probe_host_capability() -> HostCapability {
         oom_fault_injection,
         case_sensitive_fs,
         dir_permissions_bind,
+        driver_status,
+        probe_error,
     }
 }
 
@@ -581,18 +623,453 @@ fn probe_case_sensitive_fs(dir: &std::path::Path) -> bool {
     probe().unwrap_or(false)
 }
 
-/// Run `rocm <args>` with an isolated config/data/cache root, returning stdout
-/// (empty string on any failure — the probe must never panic the suite).
-fn run_probe(root: &std::path::Path, args: &[&str]) -> String {
-    let mut cmd = std::process::Command::new(rocm_binary());
+/// Why a probe of the binary under test produced nothing the harness can read.
+///
+/// Every variant is fatal to the run unless the caller ignores it, as
+/// `collect_versions` does: an unreadable probe parses as a host with no GPU,
+/// so every capability-gated scenario would resolve to skip and the run would
+/// pass without testing them. `command` is the binary and arguments as
+/// run, so the message names exactly what failed.
+#[derive(Debug)]
+pub enum ProbeError {
+    /// The binary could not be started at all (wrong path, not executable).
+    Spawn {
+        command: String,
+        source: std::io::Error,
+    },
+    /// It ran and exited non-zero: the CLI exits 0 for every finding, so this
+    /// means it could not examine the host at all.
+    Exit {
+        command: String,
+        status: std::process::ExitStatus,
+        stderr_tail: String,
+    },
+    /// It exited 0 but printed nothing on stdout.
+    EmptyOutput { command: String },
+    /// It was still running when the deadline ([`PROBE_TIMEOUT_ENV`]) passed,
+    /// so it was killed and reaped. `stderr_tail` is what it had written to
+    /// stderr by then.
+    Timeout {
+        command: String,
+        after: std::time::Duration,
+        stderr_tail: String,
+    },
+    /// It started, but waiting for it to exit failed.
+    Wait {
+        command: String,
+        source: std::io::Error,
+    },
+    /// It exited 0, but its stdout was still open `grace` later: a process it
+    /// started is holding the pipe, so what it printed cannot be read in full.
+    OutputNotClosed {
+        command: String,
+        grace: std::time::Duration,
+        stderr_tail: String,
+    },
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn { command, source } => write!(
+                f,
+                "could not start `{command}`: {source}. Set ROCM_CLI_BINARY to the rocm binary \
+                 under test, or run the suite through `cargo xtask e2e`, which builds it and \
+                 sets ROCM_CLI_BINARY"
+            ),
+            Self::Exit {
+                command,
+                status,
+                stderr_tail,
+            } => write!(
+                f,
+                "`{command}` exited with {status}\n{}",
+                crate::section("stderr (last lines)", stderr_tail)
+            ),
+            Self::Timeout {
+                command,
+                after,
+                stderr_tail,
+            } => write!(
+                f,
+                "`{command}` was still running after {after:?}, so it was killed; set \
+                 {PROBE_TIMEOUT_ENV} to allow it longer\n{}",
+                crate::section("stderr (last lines)", stderr_tail)
+            ),
+            Self::Wait { command, source } => write!(
+                f,
+                "`{command}` was started, but waiting for it to exit failed: {source}"
+            ),
+            Self::OutputNotClosed {
+                command,
+                grace,
+                stderr_tail,
+            } => write!(
+                f,
+                "`{command}` exited 0, but its stdout was still open {grace:?} later (a \
+                 process it started may be holding it), so what it printed cannot be read \
+                 in full\n{}",
+                crate::section("stderr (last lines)", stderr_tail)
+            ),
+            Self::EmptyOutput { command } => {
+                write!(f, "`{command}` exited 0 but produced no output on stdout")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn { source, .. } | Self::Wait { source, .. } => Some(source),
+            Self::Exit { .. }
+            | Self::EmptyOutput { .. }
+            | Self::Timeout { .. }
+            | Self::OutputNotClosed { .. } => None,
+        }
+    }
+}
+
+/// How many trailing stderr lines a [`ProbeError`] keeps.
+const PROBE_STDERR_TAIL_LINES: usize = 20;
+
+/// The last [`PROBE_STDERR_TAIL_LINES`] lines of a probe's stderr.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    lines[lines.len().saturating_sub(PROBE_STDERR_TAIL_LINES)..].join("\n")
+}
+
+/// Turn one probe's spawn result into its stdout, or the reason it has none.
+///
+/// Pure, so each outcome is unit-tested without a binary to run. Stdout that is
+/// only whitespace counts as empty: no `examine` field can be parsed from it.
+pub fn classify_probe_output(
+    command: &str,
+    result: std::io::Result<std::process::Output>,
+) -> Result<String, ProbeError> {
+    let out = result.map_err(|source| ProbeError::Spawn {
+        command: command.to_owned(),
+        source,
+    })?;
+    if !out.status.success() {
+        return Err(ProbeError::Exit {
+            command: command.to_owned(),
+            status: out.status,
+            stderr_tail: stderr_tail(&out.stderr),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if stdout.trim().is_empty() {
+        return Err(ProbeError::EmptyOutput {
+            command: command.to_owned(),
+        });
+    }
+    Ok(stdout)
+}
+
+/// How a bounded probe run ended (see `output_within`).
+#[derive(Debug)]
+pub enum Finished {
+    /// The child exited. `stdout_drained` is false when its stdout was still
+    /// open after the drain grace; `output` then holds what had been read by
+    /// then. Stderr is read the same way, but one left open does not fail the
+    /// probe: it carries only diagnostics.
+    Exited {
+        output: std::process::Output,
+        stdout_drained: bool,
+    },
+    /// The child was still running at the deadline and has been killed and
+    /// reaped; `stderr` is what it had written by then.
+    TimedOut { stderr: Vec<u8> },
+    /// Waiting for the child failed; it has been killed.
+    WaitFailed(std::io::Error),
+}
+
+/// [`classify_probe_output`] for a bounded run: a timeout and an output pipe
+/// left open are errors of their own, never read as "no output".
+pub fn classify_finished(
+    command: &str,
+    result: std::io::Result<Finished>,
+    timeout: std::time::Duration,
+    grace: std::time::Duration,
+) -> Result<String, ProbeError> {
+    match result {
+        Err(source) => classify_probe_output(command, Err(source)),
+        Ok(Finished::TimedOut { stderr }) => Err(ProbeError::Timeout {
+            command: command.to_owned(),
+            after: timeout,
+            stderr_tail: stderr_tail(&stderr),
+        }),
+        Ok(Finished::WaitFailed(source)) => Err(ProbeError::Wait {
+            command: command.to_owned(),
+            source,
+        }),
+        Ok(Finished::Exited {
+            output,
+            stdout_drained: false,
+        }) if output.status.success() => Err(ProbeError::OutputNotClosed {
+            command: command.to_owned(),
+            grace,
+            stderr_tail: stderr_tail(&output.stderr),
+        }),
+        Ok(Finished::Exited { output, .. }) => classify_probe_output(command, Ok(output)),
+    }
+}
+
+/// Run `rocm <args>` with an isolated config/data/cache root and return its
+/// stdout, or why there is none. Never panics: the caller decides whether a
+/// failure is fatal.
+fn run_probe(root: &std::path::Path, args: &[&str]) -> Result<String, ProbeError> {
+    run_probe_using(root, args, |name| std::env::var_os(name))
+}
+
+/// `run_probe` with the environment lookup passed in.
+///
+/// The binary comes from `ROCM_CLI_BINARY` and the deadline from
+/// [`PROBE_TIMEOUT_ENV`], both read through `env`, so a test can drive both
+/// without a process-wide variable.
+pub fn run_probe_using(
+    root: &std::path::Path,
+    args: &[&str],
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<String, ProbeError> {
+    run_probe_with(
+        &rocm_binary(&env),
+        root,
+        args,
+        probe_timeout_from_env(env(PROBE_TIMEOUT_ENV).as_deref()),
+    )
+}
+
+/// Environment variable that overrides how long one probe command may run,
+/// in whole seconds.
+pub const PROBE_TIMEOUT_ENV: &str = "E2E_PROBE_TIMEOUT_SECS";
+
+/// How long one probe command may run when [`PROBE_TIMEOUT_ENV`] is unset.
+///
+/// `rocm examine` normally answers in seconds; this is generous so a loaded
+/// runner does not fail a good probe, while a wedged one still fails the lane
+/// with a named reason long before the job's own timeout.
+pub const DEFAULT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// The probe deadline from [`PROBE_TIMEOUT_ENV`]'s value.
+///
+/// Accepts any whole number of seconds of at least 1, with surrounding
+/// whitespace ignored; a value too large to add to the current time is waited
+/// on without a deadline (see `output_within`). Anything else (unset, empty,
+/// zero, negative, a fraction, a non-number, a number past `u64`, or a value
+/// that is not UTF-8) gives [`DEFAULT_PROBE_TIMEOUT`] rather than an error.
+#[must_use]
+pub fn probe_timeout_from_env(value: Option<&std::ffi::OsStr>) -> std::time::Duration {
+    value
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs >= 1)
+        .map_or(DEFAULT_PROBE_TIMEOUT, std::time::Duration::from_secs)
+}
+
+/// `run_probe` with the binary and deadline passed in, so a test can name
+/// them without setting process-wide environment variables.
+pub fn run_probe_with(
+    binary: &std::ffi::OsStr,
+    root: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, ProbeError> {
+    run_probe_bounded(binary, root, args, timeout, PROBE_DRAIN_GRACE)
+}
+
+/// [`run_probe_with`] with the drain grace passed in too, for tests.
+fn run_probe_bounded(
+    binary: &std::ffi::OsStr,
+    root: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    grace: std::time::Duration,
+) -> Result<String, ProbeError> {
+    let mut cmd = std::process::Command::new(binary);
     cmd.args(args);
     cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
     cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
     cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
-    match cmd.output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
-        Err(_) => String::new(),
+    let command = std::iter::once(binary.to_string_lossy().into_owned())
+        .chain(args.iter().map(|a| (*a).to_owned()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    classify_finished(&command, output_within(cmd, timeout, grace), timeout, grace)
+}
+
+/// How often [`output_within`] checks whether the child has exited.
+const PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long [`output_within`] waits, after the child exited or was killed, for
+/// its output pipes to close. Only a process it started that inherited a pipe
+/// and outlives it can hold one open past this.
+const PROBE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A pipe being read on its own thread into a buffer the caller can read at any
+/// time, so bytes read before a timeout or a stuck drain are not lost.
+struct PipeReader {
+    bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeReader {
+    fn spawn(pipe: Option<impl std::io::Read + Send + 'static>) -> Self {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, done) = std::sync::mpsc::channel();
+        let sink = std::sync::Arc::clone(&bytes);
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => sink
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .extend_from_slice(&chunk[..n]),
+                    }
+                }
+            }
+            let _ = sender.send(());
+        });
+        Self { bytes, done }
     }
+
+    /// Wait until the pipe closes or `deadline` passes; whether it closed.
+    fn wait_closed(&self, deadline: std::time::Instant) -> bool {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        self.done.recv_timeout(left).is_ok()
+    }
+
+    /// What has been read so far.
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// `command.output()`, bounded by `timeout`: a child still running then is
+/// killed and reaped. Either way the output pipes get `grace` to close, and
+/// whatever was read by then is kept.
+///
+/// std-only, polling `try_wait`, so it behaves the same on Linux and Windows,
+/// with each output pipe read on its own thread so a chatty child cannot block
+/// on a full pipe. It repeats the spawn, poll, kill and reap steps of
+/// `device_memory::bounded_stdout`; a change to the kill or drain behaviour of
+/// one should look at the other. It differs in three ways:
+///
+/// - it keeps stderr and the exit status, which the probe reports;
+/// - it drains after a kill too, where `bounded_stdout` gives up at once,
+///   because the stderr written before the deadline is the only evidence of
+///   why `rocm examine` hung;
+/// - its grace is 5 s (`PROBE_DRAIN_GRACE`) rather than 2 s, because it runs
+///   a handful of times per suite: each probe runs once (the capability
+///   probes in `probe_host_capability`, cached by `host_capability`, and the
+///   version probe in `collect_versions`, whose `rocm examine` repeats the
+///   capability probe's), not once per sample, so a generous wait for a
+///   loaded runner to hand over the bytes costs little.
+///
+/// Only the direct child is killed: a process it started that inherited a pipe
+/// can keep that pipe open past the grace. The reader thread for that pipe is
+/// then left detached until the pipe closes, and the bytes it had read are
+/// used as they are. A leaked thread per stuck probe is accepted in a test
+/// harness that runs a handful of probes, each once, and exits.
+fn output_within(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+    grace: std::time::Duration,
+) -> std::io::Result<Finished> {
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = PipeReader::spawn(child.stdout.take());
+    let stderr = PipeReader::spawn(child.stderr.take());
+
+    // `None` only for a deadline too far off to represent: wait without one.
+    let deadline = std::time::Instant::now().checked_add(timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) => {
+                std::thread::sleep(PROBE_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(Finished::WaitFailed(error));
+            }
+        }
+    };
+    let drained_by = std::time::Instant::now() + grace;
+    let stdout_closed = stdout.wait_closed(drained_by);
+    // Waited for so the tail is complete when it can be, but not required.
+    let _ = stderr.wait_closed(drained_by);
+    Ok(match status {
+        None => Finished::TimedOut {
+            stderr: stderr.snapshot(),
+        },
+        Some(status) => Finished::Exited {
+            output: std::process::Output {
+                status,
+                stdout: stdout.snapshot(),
+                stderr: stderr.snapshot(),
+            },
+            stdout_drained: stdout_closed,
+        },
+    })
+}
+
+/// One line naming the probe facts that decide GPU usability, for a lane whose
+/// declared GPU the probe did not find.
+///
+/// Reads the visibility masks from the environment the way
+/// `host_has_usable_gpu` does; [`probe_facts_summary_with_mask`] is the pure
+/// form.
+#[must_use]
+pub fn probe_facts_summary(cap: &HostCapability) -> String {
+    let hip = std::env::var_os("HIP_VISIBLE_DEVICES");
+    let rocr = std::env::var_os("ROCR_VISIBLE_DEVICES");
+    probe_facts_summary_with_mask(cap, hip.as_deref(), rocr.as_deref())
+}
+
+/// Pure form of [`probe_facts_summary`]. Names the mask that is in force by the
+/// same precedence as `selected_visibility_mask`: HIP wins when set, even
+/// empty.
+#[must_use]
+pub fn probe_facts_summary_with_mask(
+    cap: &HostCapability,
+    hip: Option<&std::ffi::OsStr>,
+    rocr: Option<&std::ffi::OsStr>,
+) -> String {
+    let mask = match (hip, rocr) {
+        (Some(v), _) => format!("HIP_VISIBLE_DEVICES={:?}", v.to_string_lossy()),
+        (None, Some(v)) => format!("ROCR_VISIBLE_DEVICES={:?}", v.to_string_lossy()),
+        (None, None) => "no visibility mask".to_owned(),
+    };
+    let driver_status = if cap.driver_status.is_empty() {
+        "<none>"
+    } else {
+        cap.driver_status.as_str()
+    };
+    format!(
+        "detected_gfx_target={}, wsl={}, driver_status={driver_status}, {mask}",
+        cap.gfx_target.as_deref().unwrap_or("<none>"),
+        cap.is_wsl,
+    )
 }
 
 /// The `examine` fields the capability probe reads.
@@ -992,6 +1469,8 @@ mod tests {
             oom_fault_injection: false,
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -1009,6 +1488,8 @@ mod tests {
             oom_fault_injection: false,
             case_sensitive_fs: true,
             dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -1502,5 +1983,668 @@ Local model engines
         let refused = std::fs::File::create(direct.join("file")).is_err();
         std::fs::set_permissions(&direct, std::fs::Permissions::from_mode(0o755)).expect("restore");
         assert_eq!(probe_dir_permissions_bind(tmp.path()), refused);
+    }
+
+    /// An exit status that reports failure with code 1, built the way each
+    /// platform encodes it, so the non-zero-exit row runs on both CI gates.
+    fn failed_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // A wait status: the exit code sits in the second byte.
+            std::process::ExitStatus::from_raw(1 << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1)
+        }
+    }
+
+    fn succeeded_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+    }
+
+    fn output(
+        status: std::process::ExitStatus,
+        stdout: &str,
+        stderr: &str,
+    ) -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// The regression: a probe that exits non-zero is an error even when it
+    /// printed something, rather than stdout parsed as a GPU-less host.
+    #[test]
+    fn a_probe_that_exits_non_zero_is_an_error_with_its_stderr_tail() {
+        let result = classify_probe_output(
+            "rocm examine",
+            Ok(output(
+                failed_status(),
+                "rocm examine\n  os: linux\n",
+                "warning: early\nError: could not read the host\n",
+            )),
+        );
+        let Err(error @ ProbeError::Exit { .. }) = result else {
+            panic!("a non-zero exit must be ProbeError::Exit, got {result:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`rocm examine` exited with {}\n--- stderr (last lines) ---\n\
+                 warning: early\nError: could not read the host",
+                failed_status()
+            )
+        );
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_only_the_last_lines() {
+        let stderr = (1..=30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Err(ProbeError::Exit { stderr_tail, .. }) =
+            classify_probe_output("rocm examine", Ok(output(failed_status(), "", &stderr)))
+        else {
+            panic!("a non-zero exit must be ProbeError::Exit");
+        };
+        let expected: Vec<String> = (11..=30).map(|i| format!("line {i}")).collect();
+        assert_eq!(stderr_tail, expected.join("\n"));
+    }
+
+    #[test]
+    fn a_probe_that_exits_zero_with_output_returns_its_stdout() {
+        let stdout = "rocm examine\n  os: linux\n  detected_gfx_target: gfx1151\n";
+        assert_eq!(
+            classify_probe_output("rocm examine", Ok(output(succeeded_status(), stdout, "")))
+                .expect("exit 0 with output is a reading"),
+            stdout
+        );
+    }
+
+    #[test]
+    fn a_probe_that_exits_zero_with_no_output_is_an_error() {
+        for stdout in ["", "  \n\n"] {
+            let result =
+                classify_probe_output("rocm examine", Ok(output(succeeded_status(), stdout, "")));
+            let Err(error @ ProbeError::EmptyOutput { .. }) = result else {
+                panic!("empty stdout {stdout:?} must be ProbeError::EmptyOutput, got {result:?}");
+            };
+            assert_eq!(
+                error.to_string(),
+                "`rocm examine` exited 0 but produced no output on stdout"
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_whose_binary_does_not_exist_is_a_spawn_error_naming_it() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let missing = tmp.path().join("no-such-rocm");
+        let result = run_probe_with(
+            missing.as_os_str(),
+            tmp.path(),
+            &["examine"],
+            DEFAULT_PROBE_TIMEOUT,
+        );
+        let Err(error @ ProbeError::Spawn { .. }) = result else {
+            panic!("a missing binary must be ProbeError::Spawn, got {result:?}");
+        };
+        let ProbeError::Spawn { command, source } = &error else {
+            unreachable!()
+        };
+        assert_eq!(command, &format!("{} examine", missing.display()));
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "could not start `{} examine`: {source}. Set ROCM_CLI_BINARY to the rocm binary \
+                 under test, or run the suite through `cargo xtask e2e`, which builds it and \
+                 sets ROCM_CLI_BINARY",
+                missing.display()
+            )
+        );
+    }
+
+    const GPU_EXAMINE: &str = "rocm examine\n  os: linux\n  detected_gfx_target: gfx1151\n  wsl: false\n  driver_status: ok\n";
+
+    /// A failed probe records why, and leaves the struct at the no-GPU values
+    /// so no caller panics.
+    #[test]
+    fn a_failed_examine_records_the_error_and_falls_back_to_no_gpu() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Err(ProbeError::EmptyOutput {
+                command: "rocm examine".to_owned(),
+            }),
+            Ok("lemonade\n".to_owned()),
+            tmp.path(),
+        );
+        assert_eq!(
+            cap.probe_error.as_deref(),
+            Some("`rocm examine` exited 0 but produced no output on stdout")
+        );
+        assert!(!cap.has_amd_gpu);
+        assert_eq!(cap.gfx_target, None);
+        assert_eq!(cap.platform_slug, "mock");
+    }
+
+    /// The `engines list fails, examine OK` row: the GPU facts were read, but
+    /// the probe still failed, so the run must not proceed on them.
+    #[test]
+    fn a_failed_engines_list_is_recorded_even_when_examine_succeeded() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Ok(GPU_EXAMINE.to_owned()),
+            Err(ProbeError::Exit {
+                command: "rocm engines list".to_owned(),
+                status: failed_status(),
+                stderr_tail: "boom".to_owned(),
+            }),
+            tmp.path(),
+        );
+        assert_eq!(
+            cap.probe_error,
+            Some(format!(
+                "`rocm engines list` exited with {}\n--- stderr (last lines) ---\nboom",
+                failed_status()
+            ))
+        );
+        assert!(cap.available_engines.is_empty());
+    }
+
+    #[test]
+    fn the_first_failure_is_the_one_recorded() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Err(ProbeError::EmptyOutput {
+                command: "rocm examine".to_owned(),
+            }),
+            Err(ProbeError::EmptyOutput {
+                command: "rocm engines list".to_owned(),
+            }),
+            tmp.path(),
+        );
+        assert_eq!(
+            cap.probe_error.as_deref(),
+            Some("`rocm examine` exited 0 but produced no output on stdout")
+        );
+    }
+
+    #[test]
+    fn successful_probes_record_no_error_and_keep_the_driver_status() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let cap = capability_from_probes(
+            Ok(GPU_EXAMINE.to_owned()),
+            Ok("lemonade\nvllm\n".to_owned()),
+            tmp.path(),
+        );
+        assert_eq!(cap.probe_error, None);
+        assert_eq!(cap.gfx_target.as_deref(), Some("gfx1151"));
+        assert_eq!(cap.driver_status, "ok");
+        // `probe_error` is left out of platform.json when there is none.
+        let json = serde_json::to_value(&cap).expect("serializes");
+        assert!(json.get("probe_error").is_none(), "{json}");
+    }
+
+    #[test]
+    fn the_probe_facts_summary_names_the_mask_in_force() {
+        let cap = HostCapability {
+            os_family: "linux".to_owned(),
+            is_wsl: true,
+            gfx_target: Some("gfx1151".to_owned()),
+            has_amd_gpu: false,
+            amd_gpu_count: None,
+            available_engines: vec![],
+            effective_serve_engine: "lemonade".to_owned(),
+            platform_slug: "mock".to_owned(),
+            oom_fault_injection: false,
+            case_sensitive_fs: true,
+            dir_permissions_bind: true,
+            driver_status: "wsl_rocdxg_missing".to_owned(),
+            probe_error: None,
+        };
+        let base = "detected_gfx_target=gfx1151, wsl=true, driver_status=wsl_rocdxg_missing";
+        assert_eq!(
+            probe_facts_summary_with_mask(&cap, None, None),
+            format!("{base}, no visibility mask")
+        );
+        assert_eq!(
+            probe_facts_summary_with_mask(
+                &cap,
+                Some(std::ffi::OsStr::new("")),
+                Some(std::ffi::OsStr::new("0"))
+            ),
+            format!("{base}, HIP_VISIBLE_DEVICES=\"\"")
+        );
+        assert_eq!(
+            probe_facts_summary_with_mask(&cap, None, Some(std::ffi::OsStr::new("1"))),
+            format!("{base}, ROCR_VISIBLE_DEVICES=\"1\"")
+        );
+        let none = HostCapability {
+            gfx_target: None,
+            is_wsl: false,
+            driver_status: String::new(),
+            ..cap
+        };
+        assert_eq!(
+            probe_facts_summary_with_mask(&none, None, None),
+            "detected_gfx_target=<none>, wsl=false, driver_status=<none>, no visibility mask"
+        );
+    }
+
+    /// A shell command line, run as `(binary, args)` on each CI gate.
+    fn shell_line(line: &str) -> (std::ffi::OsString, Vec<String>) {
+        #[cfg(unix)]
+        {
+            ("sh".into(), vec!["-c".to_owned(), line.to_owned()])
+        }
+        #[cfg(windows)]
+        {
+            ("cmd".into(), vec!["/C".to_owned(), line.to_owned()])
+        }
+    }
+
+    fn arg_refs(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    /// Prints `done` after about two seconds.
+    fn two_second_command() -> (std::ffi::OsString, Vec<String>) {
+        #[cfg(unix)]
+        {
+            shell_line("sleep 2; echo done")
+        }
+        #[cfg(windows)]
+        {
+            shell_line("ping -n 3 127.0.0.1 >nul & echo done")
+        }
+    }
+
+    /// The env lookup `run_probe` would get, with only the given variables set.
+    fn env_of(
+        vars: Vec<(&'static str, std::ffi::OsString)>,
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// `E2E_PROBE_TIMEOUT_SECS` reaches the probe through the same lookup
+    /// `run_probe` uses (no process-wide variable), and the Timeout message's
+    /// advice holds: the same command that timed out at 1 second completes when
+    /// the variable allows it longer.
+    #[test]
+    fn the_probe_timeout_variable_sets_the_deadline_and_raising_it_clears_the_timeout() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let (binary, args) = two_second_command();
+        let command = format!("{} {}", binary.to_string_lossy(), args.join(" "));
+
+        let short = run_probe_using(
+            tmp.path(),
+            &arg_refs(&args),
+            env_of(vec![
+                ("ROCM_CLI_BINARY", binary.clone()),
+                (PROBE_TIMEOUT_ENV, "1".into()),
+            ]),
+        );
+        let Err(error @ ProbeError::Timeout { .. }) = short else {
+            panic!("a 1 s deadline on a 2 s command must time out, got {short:?}");
+        };
+        let ProbeError::Timeout { after, .. } = &error else {
+            unreachable!()
+        };
+        assert_eq!(*after, std::time::Duration::from_secs(1));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`{command}` was still running after 1s, so it was killed; set \
+                 E2E_PROBE_TIMEOUT_SECS to allow it longer\n--- stderr (last lines): (empty) ---"
+            )
+        );
+
+        // Following that advice clears the condition.
+        let longer = run_probe_using(
+            tmp.path(),
+            &arg_refs(&args),
+            env_of(vec![
+                ("ROCM_CLI_BINARY", binary),
+                (PROBE_TIMEOUT_ENV, "5".into()),
+            ]),
+        )
+        .expect("with 5 s allowed, the 2 s command completes");
+        assert_eq!(longer.trim(), "done");
+    }
+
+    /// The regression: a probe that never finishes must become an error at its
+    /// deadline, carrying what it had written to stderr, and be killed AND
+    /// reaped. A zombie still answers `kill -0`, so a failing `kill -0` shows
+    /// the child was reaped, not merely signalled.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_still_running_at_its_deadline_is_killed_reaped_and_keeps_its_stderr() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let pid_file = tmp.path().join("pid");
+        let script = format!(
+            "echo $$ > '{}'; echo early-err >&2; exec sleep 30",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let result = run_probe_bounded(
+            std::ffi::OsStr::new("sh"),
+            tmp.path(),
+            &["-c", &script],
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "returned after {:?}: it waited for the child instead of killing it",
+            started.elapsed()
+        );
+        let Err(ProbeError::Timeout { stderr_tail, .. }) = &result else {
+            panic!("a probe past its deadline must be ProbeError::Timeout, got {result:?}");
+        };
+        assert_eq!(stderr_tail, "early-err");
+        // The shell creates the file and then writes the pid; give a loaded
+        // runner a moment to finish the write rather than read it half-done.
+        let mut pid = String::new();
+        for _ in 0..100 {
+            pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            if !pid.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !pid.trim().is_empty(),
+            "the child wrote its pid before the deadline"
+        );
+        let still_there = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("kill runs")
+            .success();
+        assert!(
+            !still_there,
+            "child {} was left running or unreaped",
+            pid.trim()
+        );
+    }
+
+    /// Windows half of the test above: the deadline and the stderr kept from
+    /// before it. `cmd` is killed but the `ping` it started holds the pipe, so
+    /// the bytes reach the caller only through the shared buffer. The reaping
+    /// check needs `kill -0` and runs on Unix only.
+    #[cfg(windows)]
+    #[test]
+    fn a_probe_still_running_at_its_deadline_is_reported_with_its_stderr() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let (binary, args) = shell_line("echo early-err 1>&2 & ping -n 10 127.0.0.1 >nul");
+        let started = std::time::Instant::now();
+        let result = run_probe_bounded(
+            &binary,
+            tmp.path(),
+            &arg_refs(&args),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let Err(ProbeError::Timeout { stderr_tail, .. }) = &result else {
+            panic!("a probe past its deadline must be ProbeError::Timeout, got {result:?}");
+        };
+        assert_eq!(stderr_tail.trim(), "early-err");
+    }
+
+    /// Stderr written after the kill still reaches the caller: the drain runs
+    /// after a timeout too. A grandchild holding only stderr (its stdout goes
+    /// to `/dev/null`) writes `late` half a second after the 1 s deadline
+    /// killed its parent. Stdout is closed by then, so only the wait on stderr
+    /// can collect it; the 10 s grace leaves time for that.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_written_after_the_kill_is_drained_into_the_timeout() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let result = run_probe_bounded(
+            std::ffi::OsStr::new("sh"),
+            tmp.path(),
+            &[
+                "-c",
+                "(sleep 1.5; echo late >&2) >/dev/null & exec sleep 30",
+            ],
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+        );
+        let Err(ProbeError::Timeout { stderr_tail, .. }) = &result else {
+            panic!("a probe past its deadline must be ProbeError::Timeout, got {result:?}");
+        };
+        assert_eq!(stderr_tail, "late");
+    }
+
+    /// A child that reads stdin gets EOF at once rather than blocking until the
+    /// deadline: `output_within` replaces whatever stdin the command carried
+    /// with an empty one. The command is handed a pipe whose write end this
+    /// test holds open, so only that replacement lets the read finish (the
+    /// same arrangement as `a_child_that_reads_stdin_is_given_an_empty_one` in
+    /// rocm-core's `process/bounded.rs`).
+    ///
+    /// Like that sibling, it catches a missing stdin setting but does not pin
+    /// `null` against `inherit`: an `inherit` mutant passes whenever the test
+    /// process's own stdin is already at EOF.
+    #[test]
+    fn a_probe_that_reads_stdin_is_given_an_empty_one() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "read line || echo stdin-eof"]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            // `set /p` leaves the variable as it was when its read hits EOF.
+            let script = tmp.path().join("stdin.bat");
+            std::fs::write(
+                &script,
+                "@echo off\r\nset \"LINE=stdin-eof\"\r\nset /p LINE=\r\necho %LINE%\r\n",
+            )
+            .expect("write script");
+            let mut command = std::process::Command::new("cmd");
+            command.arg("/C").arg(&script);
+            command
+        };
+        let (stdin_reader, stdin_writer) = std::io::pipe().expect("stdin pipe");
+        command.stdin(stdin_reader);
+
+        let started = std::time::Instant::now();
+        let finished = output_within(
+            command,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("spawns");
+        let elapsed = started.elapsed();
+        // Dropped only now: closing the write end earlier would give the child
+        // EOF whatever stdin `output_within` set.
+        drop(stdin_writer);
+        drop(tmp);
+
+        let Finished::Exited { output, .. } = finished else {
+            panic!("a child given an empty stdin must exit, not time out: {finished:?}");
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "stdin-eof");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the read must hit EOF at once, but took {elapsed:?}"
+        );
+    }
+
+    /// A probe that exited 0 while a process it started still holds its
+    /// stdout is reported as such, not as "produced no output". Unix only: it
+    /// needs a background process that inherits the pipe, which `sh` gives
+    /// reliably; the classification itself is tested on both gates below.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_whose_output_stays_open_is_reported_as_that_not_as_no_output() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let result = run_probe_bounded(
+            std::ffi::OsStr::new("sh"),
+            tmp.path(),
+            &["-c", "echo real-output; echo warn >&2; sleep 3 &"],
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(300),
+        );
+        let Err(error @ ProbeError::OutputNotClosed { .. }) = &result else {
+            panic!("an output left open must be ProbeError::OutputNotClosed, got {result:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            "`sh -c echo real-output; echo warn >&2; sleep 3 &` exited 0, but its stdout was \
+             still open 300ms later (a process it started may be holding it), so what it \
+             printed cannot be read in full\n--- stderr (last lines) ---\nwarn"
+        );
+    }
+
+    /// Only stdout carries the reading: a process that keeps just stderr open
+    /// does not fail the probe. Unix only, like the test above.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_whose_stderr_alone_stays_open_still_returns_its_stdout() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let result = run_probe_bounded(
+            std::ffi::OsStr::new("sh"),
+            tmp.path(),
+            &["-c", "echo real-output; sleep 3 >/dev/null &"],
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(300),
+        );
+        assert_eq!(
+            result.expect("stdout closed, so a reading").trim(),
+            "real-output"
+        );
+    }
+
+    #[test]
+    fn an_undrained_exit_is_classified_by_its_status() {
+        let grace = std::time::Duration::from_secs(5);
+        let undrained = |status| {
+            Ok(Finished::Exited {
+                output: output(status, "partial", "err"),
+                stdout_drained: false,
+            })
+        };
+        let ok = classify_finished("rocm examine", undrained(succeeded_status()), grace, grace);
+        assert!(
+            matches!(&ok, Err(ProbeError::OutputNotClosed { stderr_tail, .. }) if stderr_tail == "err"),
+            "{ok:?}"
+        );
+        // A non-zero exit is reported as one, with what stderr had by then.
+        let failed = classify_finished("rocm examine", undrained(failed_status()), grace, grace);
+        assert!(
+            matches!(&failed, Err(ProbeError::Exit { stderr_tail, .. }) if stderr_tail == "err"),
+            "{failed:?}"
+        );
+        // A drained exit is classified as before.
+        let drained = classify_finished(
+            "rocm examine",
+            Ok(Finished::Exited {
+                output: output(succeeded_status(), "rocm examine\n", "partial err"),
+                stdout_drained: true,
+            }),
+            grace,
+            grace,
+        );
+        // Stdout closed but stderr may not have: the reading is used.
+        assert_eq!(drained.expect("a reading"), "rocm examine\n");
+        let wait_failed = classify_finished(
+            "rocm examine",
+            Ok(Finished::WaitFailed(std::io::Error::other("no child"))),
+            grace,
+            grace,
+        );
+        let Err(error @ ProbeError::Wait { .. }) = &wait_failed else {
+            panic!("a failed wait must be ProbeError::Wait, got {wait_failed:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            "`rocm examine` was started, but waiting for it to exit failed: no child"
+        );
+        let timed_out = classify_finished(
+            "rocm examine",
+            Ok(Finished::TimedOut {
+                stderr: b"a\nb\n".to_vec(),
+            }),
+            grace,
+            grace,
+        );
+        assert!(
+            matches!(&timed_out, Err(ProbeError::Timeout { stderr_tail, after, .. })
+                if stderr_tail == "a\nb" && *after == grace),
+            "{timed_out:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_finishes_in_time_returns_its_stdout() {
+        let tmp = tempfile::TempDir::with_prefix("rocm-e2e-probe-test-").expect("temp dir");
+        let (binary, args) = shell_line("echo probe-ok");
+        let stdout = run_probe_with(&binary, tmp.path(), &arg_refs(&args), DEFAULT_PROBE_TIMEOUT)
+            .expect("a quick command is a reading");
+        assert_eq!(stdout.trim(), "probe-ok");
+        // A deadline too far off to add to the current time must not panic.
+        let stdout = run_probe_with(
+            &binary,
+            tmp.path(),
+            &arg_refs(&args),
+            std::time::Duration::MAX,
+        )
+        .expect("an unbounded deadline still reads");
+        assert_eq!(stdout.trim(), "probe-ok");
+    }
+
+    #[test]
+    fn the_probe_deadline_reads_whole_positive_seconds_else_the_default() {
+        assert_eq!(probe_timeout_from_env(None), DEFAULT_PROBE_TIMEOUT);
+        assert_eq!(DEFAULT_PROBE_TIMEOUT.as_secs(), 120);
+        for value in ["5", " 5 ", "5\n"] {
+            assert_eq!(
+                probe_timeout_from_env(Some(std::ffi::OsStr::new(value))),
+                std::time::Duration::from_secs(5),
+                "{value:?}"
+            );
+        }
+        // No upper bound: a huge value is honoured, and `output_within`'s
+        // `checked_add` keeps it from overflowing (see the `Duration::MAX` run
+        // in `a_probe_that_finishes_in_time_returns_its_stdout`).
+        for secs in [86_401, u64::MAX] {
+            assert_eq!(
+                probe_timeout_from_env(Some(std::ffi::OsStr::new(&secs.to_string()))),
+                std::time::Duration::from_secs(secs)
+            );
+        }
+        for value in ["", "0", "-3", "1.5", "soon", "18446744073709551616"] {
+            assert_eq!(
+                probe_timeout_from_env(Some(std::ffi::OsStr::new(value))),
+                DEFAULT_PROBE_TIMEOUT,
+                "{value:?}"
+            );
+        }
     }
 }
