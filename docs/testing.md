@@ -1022,6 +1022,45 @@ export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3
   --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
+## E2E runs that test nothing fail
+
+`cargo xtask e2e` fails a run whose result could not mean anything, instead of
+reporting it green:
+
+- before any scenario runs, when the capability probe could not read the binary
+  under test: `rocm examine` or `rocm engines list` could not be started (check
+  `ROCM_CLI_BINARY`), or could not be waited on, exited non-zero, printed
+  nothing, was still running after `E2E_PROBE_TIMEOUT_SECS` (whole seconds ≥ 1;
+  anything else uses 120), or exited but left its output open. The post-run
+  version probe (`collect_versions`) uses the same deadline but fails quietly,
+  only blanking the version columns, and does not refuse the run;
+- after the run, when no scenario executed, which includes a
+  `cargo xtask e2e -- -n <regex>` whose regex matches no scenario name. The
+  reason is written into `platform.json`, so `cargo xtask e2e-report` shows that
+  lane as FAIL with the reason under "Needs attention: platforms", in both its
+  markdown summary and its HTML report.
+
+`E2E_EXPECT_GPU` declares whether the host has a GPU. With `1`, the run also
+fails before any scenario if the probe found no usable AMD GPU, and after the
+run if no `@requires-gpu` (or `@requires-multi-gpu`) scenario executed. GPU
+scenarios the run's own configuration leaves out (`@nightly`, `@merge-queue`,
+or anything outside an `E2E_ONLY_LIFECYCLE` selection) still count as resolved
+but never as executed, so `E2E_EXPECT_GPU=1` with `E2E_ONLY_LIFECYCLE=1` and no
+GPU scenario selected fails by design. With `0`, it only notes that GPU
+scenarios are not applicable (and that the declaration is stale if a GPU is
+found). Unset, as on a local run, it makes no GPU claim. Every self-hosted CI
+lane sets it; see "Lane verdict" in the [E2E README](../tests/e2e-cucumber/README.md)
+and the Platforms table in [ci-hardware-testing.md](ci-hardware-testing.md). The
+checks are unit-tested in [lane_verdict.rs](../tests/e2e-cucumber/src/lane_verdict.rs)
+and, for each way a probe can fail, in
+[capability.rs](../tests/e2e-cucumber/src/capability.rs):
+
+```bash
+cargo test -p e2e-cucumber --lib lane_verdict
+cargo test -p e2e-cucumber --lib capability::tests
+cargo test -p xtask every_self_hosted_lane_declares_whether_it_has_a_gpu
+```
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
@@ -4532,7 +4571,8 @@ to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
 the harness and the product agree the host has no usable GPU, which is what the
 mock lane has.) Note also that `-n` matches the scenario *name* (`serve-28 -
 Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
-silently selects nothing.
+selects nothing and the run fails with `0 scenarios executed` (see
+[E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
 
 - serve-28, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
   matches an already-running vLLM service on a GPU-less host is not refused: it
@@ -4683,7 +4723,8 @@ for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
 (`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
-passing an id to it silently selects nothing.
+passing an id to it selects nothing and the run fails with
+`0 scenarios executed` (see [E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
 
 - serve-41, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
   GPU memory blames this launch, names the knobs, and quotes the engine's own
