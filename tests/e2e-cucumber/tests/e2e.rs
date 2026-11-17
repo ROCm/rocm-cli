@@ -181,6 +181,9 @@ pub struct E2eWorld {
     /// from. Consumed by [`run_rocm_with_scenario_env`] like `command_env`; `None`
     /// leaves the harness's own working directory.
     pub command_dir: Option<PathBuf>,
+    /// `(request, HTTP status)` for each server route a step called directly,
+    /// in call order, for a later Then step to judge.
+    pub route_statuses: Vec<(String, u16)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -414,6 +417,7 @@ impl Default for E2eWorld {
             expect_xfail: false,
             command_env: Vec::new(),
             command_dir: None,
+            route_statuses: Vec::new(),
             tui: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
@@ -995,6 +999,18 @@ pub fn run_rocm_bounded(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> (String, String, i32) {
+    run_rocm_bounded_with_env(world, args, &[], timeout)
+}
+
+/// Like [`run_rocm_bounded`], but sets `envs` on the child on top of the
+/// scenario's isolated env, for a value that must not appear in the recorded
+/// argv (an endpoint API key).
+pub fn run_rocm_bounded_with_env(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
     use std::process::Stdio;
 
     let binary = rocm_binary();
@@ -1004,6 +1020,7 @@ pub fn run_rocm_bounded(
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    cmd.envs(envs.iter().copied());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(
         std::fs::File::create(&out_path).expect("stdout file"),

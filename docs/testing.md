@@ -2388,9 +2388,11 @@ audit log. Only the serving user can read the key file: it is mode 0600 on Unix
 and has a protected DACL granting only that user on Windows, and every store
 replaces it with a freshly created owner-only file, so permissions loosened in
 place do not survive a re-store. Verifying that the running server actually
-*rejects* an unauthenticated request requires a live engine; that end-to-end
-assertion is a deferred follow-up and is **not yet** exercised by the GPU
-acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
+*rejects* an unauthenticated request requires a live engine. For vLLM that is
+the `@nightly` GPU scenario `serve-vllm-key-guards-every-route` (serve-61),
+which runs in the nightly runs on Instinct GPUs (see "vLLM endpoint-key
+coverage" below). For the other engines, AIM included, no test yet asserts that
+the running server refuses a keyless request. The unit tests cover
 key policy, generation, the owner-only key file (including one whose
 permissions were loosened before a re-store, and on the Windows build job the
 DACL read back from disk), and key-file resolution. The tests that fail
@@ -2528,8 +2530,9 @@ via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
 reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
 closed** on that exact combination (public bind + `--engine lemonade` + Windows)
-and directs the user to `--engine vllm` or a loopback host. vLLM (all platforms,
-via `VLLM_API_KEY`), direct llama-server serving (via `--api-key-file`),
+and directs the user to `--engine vllm` or a loopback host. vLLM (Linux and WSL,
+via `VLLM_API_KEY` plus the `rocm_cli_vllm_auth` middleware described below),
+direct llama-server serving (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
@@ -2553,6 +2556,60 @@ has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
 lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
+
+vLLM endpoint-key coverage: `VLLM_API_KEY` on its own makes vLLM check the key
+only under a fixed set of path prefixes (`/v1` and a few others), while the
+server also answers routes such as `/invocations`, `/tokenize` and `/metrics`.
+So a keyed vLLM launch also passes `--middleware
+rocm_cli_vllm_auth.RequireEndpointApiKey`, an ASGI middleware compiled into the
+engine adapter
+([rocm_cli_vllm_auth.py](../engines/vllm/src/rocm_cli_vllm_auth.py)), written
+under the engine's data directory at launch and put on the server's
+`PYTHONPATH`. It
+requires the key on every route except `GET`/`HEAD /health` and CORS
+preflights, and raises instead of constructing when the key is empty, so a
+server that loaded it never answers a request unchecked.
+
+```bash
+cargo test -p rocm-engine-vllm endpoint_auth
+cargo test -p rocm-engine-vllm vllm_serve_args
+```
+
+The `endpoint_auth` tests run the shipped middleware under `python3` with a
+standard-library ASGI harness (they fail, rather than skip, when `python3` is
+missing on Linux), so the per-route behavior is covered on every PR without a
+GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
+gets the `--middleware` argument, `VLLM_API_KEY`, and the middleware directory
+at the front of `PYTHONPATH` ahead of the runtime's own entry, together, and
+that an unkeyed launch gets none of them:
+
+```bash
+cargo test -p rocm-engine-vllm vllm_server_command
+```
+
+What no unit test covers is the call in `spawn_vllm_server` that hands the
+resolved endpoint key to `vllm_server_command`: that spawn path probes the host
+(OpenMPI, libatomic, libnuma) before it builds the command, so only a real
+launch exercises it.
+
+That a real vLLM server loads the middleware and refuses keyless calls is
+covered by the `@nightly` GPU scenario `serve-vllm-key-guards-every-route`
+([model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)),
+which runs in the scheduled nightly runs on Instinct GPUs, where vLLM is the
+serving engine: the MI300X job in [nightly.yml](../.github/workflows/nightly.yml)
+and the shared GPU queue's Instinct lanes, MI350P among them
+([nightly-on-the-queue.md](nightly-on-the-queue.md)). Those run after merge, not
+per PR. It is not tagged `@merge-queue`:
+the merge queue runs no lane where vLLM is the engine (the MI300X lane does not
+run on `merge_group`), so under that tag it would run nowhere. To run it on a
+branch before merge, dispatch `e2e-selfhosted.yml` on the MI300X lane with a
+`name_filter`, which bypasses the harness's tag gates (`@nightly` included), so
+the scenario runs without `include_nightly`:
+
+```bash
+gh workflow run e2e-selfhosted.yml --ref <branch> \
+  -f platform=app-dev-gpu -f name_filter='^serve-61 '
+```
 
 Lemonade backend selection and alignment focused tests (reading the
 `llamacpp` rows out of `lemonade backends` when other recipes have indented
@@ -3562,8 +3619,9 @@ It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
 the queue nightly only) and the vLLM half falls to the Instinct lane. Of all
-these lanes only MI300X and the Strix Halo Windows and WSL2 lanes run on pull
-requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
+these lanes only MI300X (two checks, `e2e-gpu-queue` on the shared GPU queue
+and `e2e-gpu` on a self-hosted runner, the same silicon) and the Strix Halo
+Windows and WSL2 lanes run on pull requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
 the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
 on the queue nightly), and none of their check names is a required status
 check, so the two unit tests above are the blocking per-PR coverage. The scenario
@@ -5200,9 +5258,9 @@ hold the behaviour end to end, GPU or not:
   runs only the bash half, on Linux, and ci.yml's Windows lane does not run
   this scenario.
 - `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
-  scenario here; the Windows key is checked by hand in
-  [manual-testing.md](manual-testing.md) section 13) runs
-  `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
+  scenario here; the Windows key is checked by hand in the "Pasting An Error
+  Into `rocm diagnose`" section of [manual-testing.md](manual-testing.md))
+  runs `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
   the whole exchange on screen (it has no scrollback), requires the hint
   telling the user how to end the paste, then types the paste and Ctrl-D, the
   Linux end-of-input key the hint names, and requires the screen, which also

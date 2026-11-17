@@ -291,6 +291,13 @@ Set the gate and the specific base variable together, and only in tests or
 deliberate manual QA against a fixture server. The `therock-next` E2E scenarios
 use exactly this pairing to exercise next-layout dispatch hermetically.
 
+A wheel install records the pip index it resolved from, including an overridden
+base, in the runtime's manifest as `index_url`. `rocm engines install vllm` reads
+that value back for a ROCm 10.2 runtime and fetches the SDK's own torch stack from
+it, without checking its scheme or host, so an override used for one install keeps
+being used for that runtime's later vLLM installs, after the override is unset.
+Remove and reinstall the runtime, or edit its manifest, to stop that.
+
 ## ComfyUI Source Archive Override
 
 rocm-cli hardcodes the URL it downloads the ComfyUI source archive from. It

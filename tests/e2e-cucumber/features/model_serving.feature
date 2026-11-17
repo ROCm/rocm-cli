@@ -992,6 +992,30 @@ Feature: Model serving
     And the launch's service record is left as ready
     And no background automation daemon was left behind
 
+  # An API key on a vLLM endpoint (`--require-api-key`, a public bind, or
+  # `rocm remote serve`) has to cover the whole server, not only the OpenAI `/v1`
+  # API: vLLM's own key check guards a fixed set of path prefixes, while the
+  # server also answers inference and tokenizer routes outside them. rocm-cli
+  # starts vLLM with a middleware that demands the key on every route except
+  # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
+  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
+  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # serve, so `@nightly` rather than per-PR: it runs after merge in the nightly
+  # runs on Instinct GPUs, which serve with vLLM: the MI300X job in
+  # `nightly.yml` and the shared GPU queue's Instinct lanes (MI350P among them).
+  # Not `@merge-queue`: the merge queue runs no lane where vLLM is the engine
+  # (the MI300X lane does not run on `merge_group`), so under that tag it
+  # skipped everywhere.
+  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @nightly
+  Scenario: serve-61 - A key-protected vLLM endpoint refuses keyless requests outside the OpenAI API
+    Given a managed runtime is active
+    And a model is being served on GPU behind an API key
+    When a client calls the server's routes without the key
+    Then every route outside the OpenAI API refuses the call as unauthorized
+    And the health check answers without the key
+    When the client repeats those calls with the key
+    Then every one of those calls succeeds
+
   # ROCMAI-550, and the evidence that the Vulkan remediation is not a dead end.
   # `rocm install sdk` on a gfx90c APU refuses and tells the user to run `rocm
   # serve <model> --engine lemonade`; AGENTS.md section 3 only allows that if
@@ -1011,7 +1035,7 @@ Feature: Model serving
   # ROCM_CLI_TEST_HOST_ROOT (an `e2e-test-hooks` build), so the GPU-less mock
   # lane is where this runs.
   @id:serve-accepts-an-apu-the-kernel-gives-no-compute-node @requires-os:linux
-  Scenario: serve-61 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
+  Scenario: serve-62 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
     Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
     When the user is told to serve on Lemonade because this GPU has no ROCm build
     Then serving got past the no-GPU pre-flight and reported this host's usable GPU
