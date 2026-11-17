@@ -630,20 +630,31 @@ pub enum GpuSupportLevel {
 /// classifier that decides when it is true rather than being retyped at each
 /// site.
 ///
-/// `rocm examine`'s `rocm_support` line deliberately does **not** interpolate
-/// this. It is the one surface that pays for the Vulkan probe, so it grades the
-/// second half of the claim by what the probe established — an enumerated
-/// device is named, an installed-but-unenumerated driver gets a weaker
-/// sentence, an unprobed platform admits it — and the unconditional "can still
-/// be used" is exactly the promise this PR exists to stop making. See
-/// `rocm_support_line` in `host_gpu/render.rs`. The two install refusals keep
-/// it because they are asked of a *target*, before and without any host probe
-/// (they classify with [`VulkanStatus::Unknown`]), so the graded wording has no
-/// evidence to grade on there.
+/// **This constant is the claim, not the decision to make it.** Who may say it
+/// is settled by whether the speaker has a host to grade it against, and the
+/// three surfaces differ:
+///
+/// - `unsupported_requested_target_message` says it unconditionally, and that
+///   is correct: it is about a target the *user named*, which may not be the
+///   GPU in this machine, so no probe of this host bears on it. It classifies
+///   with [`VulkanStatus::Unknown`] for the same reason.
+/// - `unsupported_host_gpu_message` is about the GPU that was *detected here*,
+///   so it classifies with this host's real [`VulkanStatus`] and interpolates
+///   this constant only at [`GpuSupportLevel::VulkanOnly`]. At
+///   `VulkanUnconfirmed` it says [`VULKAN_UNCONFIRMED_CLAIM`] instead, and at
+///   `NoGpuBackend` it says neither. Saying it unconditionally there put `rocm
+///   install sdk` and `rocm examine` in flat contradiction about the same
+///   machine in the same session.
+/// - `rocm examine`'s `rocm_support` line does not interpolate it at all. It
+///   grades the second half of the claim finer than three tiers — an
+///   enumerated device is *named*, so the reader can check it rather than take
+///   it — and the unconditional "can still be used" is exactly the promise this
+///   work exists to stop making. See `rocm_support_line` in
+///   `host_gpu/render.rs`.
 ///
 /// Deliberately just the claim, with no leading subject and no trailing
-/// punctuation: a caller supplies both. Changing the wording here changes both
-/// refusals together, which is the point.
+/// punctuation: a caller supplies both. Changing the wording here changes every
+/// site that makes it, which is the point.
 pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
     "not supported by ROCm; the Vulkan backend can still be used";
 
@@ -871,11 +882,12 @@ mod tests {
     /// refusals, so its wording is pinned here rather than only asserted as
     /// "whatever the constant says".
     ///
-    /// Both refusals interpolate [`VULKAN_ONLY_SUPPORT_CLAIM`], which is what
-    /// stops them drifting — but it also means a careless edit to the constant
-    /// silently rewords both at once, and their own tests would still pass
-    /// because they assert containment of the same constant. This test is the
-    /// one place that has to be changed deliberately.
+    /// Both refusals interpolate [`VULKAN_ONLY_SUPPORT_CLAIM`] — one
+    /// unconditionally, one only at [`GpuSupportLevel::VulkanOnly`] — which is
+    /// what stops them drifting. But it also means a careless edit to the
+    /// constant silently rewords both at once, and their own tests would still
+    /// pass because they assert containment of the same constant. This test is
+    /// the one place that has to be changed deliberately.
     #[test]
     fn the_vulkan_only_claim_is_pinned_word_for_word() {
         assert_eq!(
