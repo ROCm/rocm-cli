@@ -283,7 +283,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scratch_dir;
+    use crate::test_support::{proptest_cases, scratch_dir};
     use std::io::Write;
     use std::process::{Command as ProcessCommand, Stdio};
 
@@ -297,6 +297,144 @@ mod tests {
         verify_sha256(&archive, &expected).unwrap();
         let error = verify_sha256(&archive, &"0".repeat(64)).unwrap_err();
         assert!(error.to_string().contains("SHA-256 mismatch"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Whether `error` is the digest check's own rejection, so a failure to
+    /// read the archive cannot pass as one.
+    fn is_digest_mismatch(error: &anyhow::Error) -> bool {
+        error.to_string().contains("SHA-256 mismatch")
+    }
+
+    /// A runner with a fixed seed, so a failure reproduces as-is, running at
+    /// least `cases` cases. `TestRunner::deterministic` alone takes its case
+    /// count from `PROPTEST_CASES` unchecked, so `PROPTEST_CASES=0` would pass
+    /// these properties without running one.
+    fn deterministic_runner(cases: u32) -> proptest::test_runner::TestRunner {
+        let config = proptest::test_runner::Config {
+            cases: proptest_cases(cases),
+            ..proptest::test_runner::Config::default()
+        };
+        let rng = proptest::test_runner::TestRng::deterministic_rng(config.rng_algorithm);
+        proptest::test_runner::TestRunner::new_with_rng(config, rng)
+    }
+
+    /// Property: the archive digest check accepts the pinned digest and nothing
+    /// else.
+    ///
+    /// The generator targets near misses rather than random strings, because a
+    /// random 64-character candidate is rejected by any implementation —
+    /// correct, prefix-matching, or truncating alike. What separates them is a
+    /// candidate that shares most of the real digest: one nibble changed, the
+    /// correct prefix with a wrong tail, a truncated prefix, or the real digest
+    /// with whitespace or an extra character attached.
+    ///
+    /// Note the comparison is byte-exact, so an upper-case spelling of the
+    /// *correct* digest is also rejected. That is fail-closed (an upper-case
+    /// pin would break installs, not admit a bad archive) but it differs from
+    /// `rocm_core`'s download gate, which folds ASCII case.
+    #[test]
+    fn archive_digest_check_accepts_only_the_exact_pinned_digest() {
+        use proptest::prelude::*;
+
+        let dir = scratch_dir("archive-digest-properties");
+        let archive = dir.join("archive");
+        let content = b"pinned embeddable archive";
+        fs::write(&archive, content).unwrap();
+        let truth = format!("{:x}", Sha256::digest(content));
+
+        assert!(verify_sha256(&archive, &truth).is_ok());
+
+        let mut runner = deterministic_runner(256);
+        let near_miss = {
+            let truth = truth.clone();
+            (0usize..64, 1usize..64, 0u8..7).prop_map(move |(position, keep, kind)| match kind {
+                0 => {
+                    let mut out: Vec<char> = truth.chars().collect();
+                    out[position] = if out[position] == 'a' { 'b' } else { 'a' };
+                    out.into_iter().collect::<String>()
+                }
+                1 => format!("{}{}", &truth[..keep], "0".repeat(64 - keep)),
+                2 => truth[..keep].to_owned(),
+                3 => format!("{truth}\n"),
+                4 => format!(" {truth} "),
+                5 => format!("{truth}0"),
+                _ => truth.to_ascii_uppercase(),
+            })
+        };
+
+        runner
+            .run(&near_miss, |candidate| {
+                prop_assert_ne!(
+                    &candidate,
+                    &truth,
+                    "the generator must only produce near misses"
+                );
+                prop_assert!(
+                    verify_sha256(&archive, &candidate)
+                        .is_err_and(|error| is_digest_mismatch(&error)),
+                    "the archive digest check accepted {:?} for an archive whose digest is {:?}",
+                    candidate,
+                    truth
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // An empty pin is the one near miss the generator above cannot produce
+        // (it keeps at least one character); it must not read as "no check".
+        assert!(
+            verify_sha256(&archive, "").is_err_and(|error| is_digest_mismatch(&error)),
+            "an empty pinned digest accepted the archive"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Property: flipping a bit of the archive — at sampled positions, and in
+    /// the last byte — invalidates it against the pinned digest: the
+    /// tampered-download case. The archive is longer
+    /// than any single read buffer, and the intact archive must still be
+    /// accepted: a check that hashed only a prefix would reject the intact
+    /// archive and miss flips near the end.
+    #[test]
+    fn archive_digest_check_rejects_a_single_bit_of_tampering() {
+        use proptest::prelude::*;
+
+        let dir = scratch_dir("archive-digest-tamper");
+        let archive = dir.join("archive");
+        let content: Vec<u8> = (0..=255_u8).cycle().take(64 * 1024 + 1).collect();
+        let truth = format!("{:x}", Sha256::digest(&content));
+
+        fs::write(&archive, &content).unwrap();
+        assert!(
+            verify_sha256(&archive, &truth).is_ok(),
+            "the intact multi-buffer archive must be accepted"
+        );
+        // The last byte is checked explicitly: random positions would almost
+        // never land on it.
+        let mut tail_flipped = content.clone();
+        *tail_flipped.last_mut().unwrap() ^= 1;
+        fs::write(&archive, &tail_flipped).unwrap();
+        assert!(
+            verify_sha256(&archive, &truth).is_err_and(|error| is_digest_mismatch(&error)),
+            "a flip in the last byte was accepted"
+        );
+
+        let mut runner = deterministic_runner(256);
+        runner
+            .run(&(0usize..content.len(), 0u8..8), |(position, bit)| {
+                let mut tampered = content.clone();
+                tampered[position] ^= 1 << bit;
+                fs::write(&archive, &tampered).unwrap();
+                prop_assert!(
+                    verify_sha256(&archive, &truth).is_err_and(|error| is_digest_mismatch(&error)),
+                    "an archive differing by one bit was accepted"
+                );
+                Ok(())
+            })
+            .unwrap();
+
         fs::remove_dir_all(&dir).ok();
     }
 

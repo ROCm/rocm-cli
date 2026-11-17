@@ -6,13 +6,14 @@
 //!
 //! Simulates a single 8× AMD Instinct MI355X node serving inference traffic
 //! through three vLLM containers. Output is the same `PersistedEntry` NDJSON
-//! the daemon writes when `--persist-dir` is set, so `rocm replay` (and
-//! `rocm demo`) play it back unmodified.
+//! the daemon's session writer produces, so `rocm dash --replay` plays it back
+//! unmodified.
 //!
 //! Deterministic: the same [`DemoOptions`] always produce byte-identical
 //! output (seeded xorshift jitter + a fixed wallclock anchor), which the
-//! tests below pin as a hard invariant. `rocm gen-demo`, `rocm demo`, and the
-//! marketing screenshot/cast examples all consume this one generator.
+//! tests below pin as a hard invariant. `rocm dash --demo` is the consumer: it
+//! writes a session to a private file under the user data directory with
+//! [`generate_file`] and replays it.
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
@@ -557,7 +558,6 @@ fn build_sysinfo() -> GpuSystemInfo {
         memory_partition_mode: MemoryPartitionMode::Nps1,
         compute_partition_mode: ComputePartitionMode::Spx,
         vram_per_logical_gpu_mb: VRAM_TOTAL_MB,
-        lemond_version: None,
         llama_server_build: None,
         ccr_version: None,
         llamacpp_backend: None,
@@ -613,6 +613,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
             };
 
             Instance {
+                managed: false,
                 container_id: c.container_id.into(),
                 container_name: c.container_name.into(),
                 status: InstanceStatus::Running,
@@ -629,6 +630,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 waiting_reqs: Some(waiting),
                 gen_tps: Some(gen_tps),
                 gen_tps_observation: None,
+                gen_tps_last_request: false,
                 tokens_per_watt: None,
                 power_w: None,
                 ttft_ms,

@@ -8,14 +8,14 @@
 //!
 //! Owns the pinned metadata trust root,
 //! which `cargo xtask verify-pinned-keys` checks against the canonical
-//! published key. Depends on the sibling `io` module for atomic writes and on
-//! `slugify` in the parent for cache file names.
+//! published key. Depends on `rocm_core::atomic_write` for atomic writes and
+//! on `slugify` in the parent for cache file names.
 
-#[cfg(test)]
-use super::io::{publish_temp_file, write_file_atomically_with_publish};
-use super::io::{stage_file_for_atomic_publish, write_file_atomically};
 use super::slugify;
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use rocm_core::atomic_write::{publish_temp_file, write_file_atomically_with_publish};
+use rocm_core::atomic_write::{stage_file_for_atomic_publish, write_file_atomically};
 use rocm_core::{AppPaths, disk_space, unix_time_millis, verify_rsa_pkcs1_sha256_signature};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]

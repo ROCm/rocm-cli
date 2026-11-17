@@ -2,13 +2,19 @@
 //
 // SPDX-License-Identifier: MIT
 
+pub mod binary_path;
 pub mod capability;
 pub mod chat_request;
+pub mod dash_screen;
+pub mod device_memory;
 pub mod expectation;
 pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
+pub mod lemonade_backend;
+pub mod lemonade_diagnostics;
+pub mod lemonade_protocol;
 pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;
@@ -16,6 +22,7 @@ pub mod monotonic_clock;
 pub mod paced_download;
 pub mod palette_rows;
 pub mod panic_capture;
+pub mod planted_path;
 pub mod polled_deadline;
 pub mod powershell_text_rule;
 pub mod quit_and_wait;
@@ -25,7 +32,11 @@ pub mod send_until;
 pub mod serve_log;
 pub mod serve_plan;
 pub mod shared_runtime;
+pub mod stand_in_uname;
+pub mod stray_process;
+pub mod tasklist;
 pub mod terminal_size;
+pub mod torch_alignment_outcome;
 
 use std::path::{Path, PathBuf};
 

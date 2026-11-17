@@ -143,6 +143,44 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The leading version `rocm version` must print for a resolved `reference`,
+/// derived here from the ref alone rather than read back from the binary, so a
+/// build that reports the wrong version for its ref fails instead of agreeing
+/// with itself. Mirrors `release_version` in `apps/rocm/build.rs`: an exact
+/// `vX.Y.Z` tag, with an optional non-empty pre-release (`-rc.1`) or build
+/// (`+meta`) suffix of ASCII letters, digits, `.`, `-` and `+`, and at most 64
+/// characters after the `v` (`RELEASE_TAG_PATTERN` and
+/// `RELEASE_VERSION_MAX_LEN` there), is that version without its leading `v`; any other
+/// resolved ref (`main`, a feature branch, `vllm`, `v0.2`) is `0.0.0-dev`.
+/// The `unknown` ref is not covered: both callers reject it first.
+pub(crate) fn expected_leading_version(reference: &str) -> &str {
+    const NON_RELEASE: &str = "0.0.0-dev";
+    let Some(rest) = reference.strip_prefix('v') else {
+        return NON_RELEASE;
+    };
+    if rest.len() > 64 {
+        return NON_RELEASE;
+    }
+    let core = match rest.split_once(['-', '+']) {
+        Some((core, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) =>
+        {
+            core
+        }
+        Some(_) => return NON_RELEASE,
+        None => rest,
+    };
+    let components: Vec<&str> = core.split('.').collect();
+    let is_release = components.len() == 3
+        && components
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if is_release { rest } else { NON_RELEASE }
+}
+
 #[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let outputs = world.cli_outputs.as_ref().expect("no commands were run");
@@ -184,6 +222,11 @@ async fn assert_version_returned(world: &mut E2eWorld) {
     assert!(
         !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "version hash is not hexadecimal: {output}"
+    );
+    assert_eq!(
+        version,
+        expected_leading_version(reference),
+        "the leading version does not follow from the ref: {output}"
     );
 
     // `rocm version`'s own two lines beyond the build string. Both are printed
@@ -1444,6 +1487,27 @@ async fn os_release_with_a_command(world: &mut E2eWorld) {
 const RUNS_A_COMMAND_ON_LINE_3: &str =
     "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n";
 
+/// Writes each `(name, script)` as an executable in the isolated root's
+/// `fake-bin` and puts that directory first on the scenario's `PATH`.
+fn put_fake_executables_on_path(world: &mut E2eWorld, executables: &[(&str, &str)]) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    for (name, script) in executables {
+        rocm_core::fake_executable::write_fake_executable(&bin.join(name), script)
+            .unwrap_or_else(|e| panic!("failed to write the fake {name}: {e}"));
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
 /// One GPU node in the kernel topology: a gfx1101 with no PCI address, so it
 /// matches no `lspci` entry and is listed from the topology alone. Plus an
 /// `lspci` that lists an empty bus, ahead of any real one, so the PCI probe
@@ -1465,15 +1529,7 @@ fn plant_gpu_fixtures(world: &mut E2eWorld) {
         "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
     )
     .expect("failed to write planted KFD node properties");
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
-        .expect("failed to write the fake lspci");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(world, &[("lspci", "#!/bin/sh\nexit 0\n")]);
 }
 
 #[given("a GPU machine whose release file runs a command on line 3")]
@@ -1500,6 +1556,152 @@ async fn gpu_machine_with_unreadable_release_file(world: &mut E2eWorld) {
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
     plant_gpu_fixtures(world);
+}
+
+/// A simulated host root, plus a `lsmod` on `PATH` that lists `amdgpu` and no
+/// `amdkfd`, so the module list never answers for kfd. `with_kfd` plants the
+/// `/dev/kfd` node.
+fn plant_machine_without_amdkfd_module(world: &mut E2eWorld, with_kfd: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    if with_kfd {
+        std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    }
+    put_fake_executables_on_path(
+        world,
+        &[(
+            "lsmod",
+            "#!/bin/sh\nprintf 'Module Size Used by\\namdgpu 1 0\\ndrm 1 1 amdgpu\\n'\n",
+        )],
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[given("a machine whose kernel exposes kfd but lists no amdkfd module")]
+async fn machine_with_built_in_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, true);
+}
+
+#[given("a machine whose kernel has no kfd and lists no amdkfd module")]
+async fn machine_without_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, false);
+}
+
+/// A simulated host root with `/dev/kfd`, no `/proc/modules`, and a `lsmod`
+/// on `PATH` that fails: no module list can be read at all.
+#[given("a machine whose kernel exposes kfd but whose module list cannot be read")]
+async fn machine_with_kfd_and_no_module_list(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    put_fake_executables_on_path(world, &[("lsmod", "#!/bin/sh\nexit 1\n")]);
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[then("the inspection reports kfd as loaded")]
+async fn assert_kfd_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the inspection reports kfd as not loaded")]
+async fn assert_kfd_not_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(false), "{json:#}");
+}
+
+/// A simulated host root with `/sys/bus/pci/drivers/amdgpu` and a `lsmod` that lists
+/// neither `amdgpu` nor `amdkfd`: amdgpu built into the kernel. A ROCm install
+/// (`ROCM_PATH`) and a `mokutil` reporting Secure Boot enabled are planted too,
+/// so the three `rocm diagnose` evidence lines that read `amdgpu_loaded` have
+/// everything else they need to fire.
+#[given("a machine whose kernel has amdgpu built in and lists no amdgpu module")]
+async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("sys/bus/pci/drivers/amdgpu"))
+        .expect("failed to plant /sys/bus/pci/drivers/amdgpu");
+    world.plant_unmanaged_rocm();
+    put_fake_executables_on_path(
+        world,
+        &[
+            (
+                "lsmod",
+                "#!/bin/sh\nprintf 'Module Size Used by\\ndrm 1 0\\n'\n",
+            ),
+            ("mokutil", "#!/bin/sh\necho 'SecureBoot enabled'\n"),
+        ],
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+/// Both commands read the same planted machine, so the scenario environment
+/// (the host root and the fake executables on `PATH`) is restored between
+/// them: `run_rocm_with_scenario_env` consumes it.
+#[when("the user inspects and diagnoses that machine")]
+async fn user_inspects_and_diagnoses_planted_machine(world: &mut E2eWorld) {
+    let env = world.command_env.clone();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    world.command_env = env;
+    let (diagnosis, _, diagnose_rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--json"]);
+    assert_eq!(diagnose_rc, 0, "diagnose is a query and exits 0");
+    world.cli_outputs = Some(vec![diagnosis]);
+}
+
+#[then("the inspection reports amdgpu as loaded")]
+async fn assert_amdgpu_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdgpu_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence")]
+async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
+    let diagnosis = &world.cli_outputs.as_ref().expect("no diagnosis was run")[0];
+    let report: serde_json::Value = serde_json::from_str(diagnosis)
+        .unwrap_or_else(|e| panic!("diagnose --json is not JSON ({e}):\n{diagnosis}"));
+    let evidence: Vec<&str> = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("diagnose --json has no matched array:\n{report:#}"))
+        .iter()
+        .flat_map(|m| m["evidence"].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for line in evidence {
+        assert!(
+            !rocm_core::diagnose::AMDGPU_MISSING_EVIDENCE
+                .iter()
+                .any(|p| line.contains(p)),
+            "amdgpu was reported missing though the amdgpu PCI driver is registered: {line}"
+        );
+    }
 }
 
 #[when("the user inspects that machine in machine-readable form")]
@@ -2186,5 +2388,797 @@ async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
     assert!(
         expected == "unknown" || age.contains("not established"),
         "{age}"
+    );
+}
+
+// ── ROCDXG reachable through LD_LIBRARY_PATH ───────────────────────
+
+/// Plant a WSL machine under the simulated host root: `/dev/dxg`, DXCore, and
+/// `librocdxg.so` under `/opt/rocm`, plus a stand-in `ldconfig` first on PATH
+/// whose cache does not list the library. `LD_LIBRARY_PATH` is set explicitly
+/// (to `loader_path`, possibly empty) so the runner's own value, which may name
+/// a real `/opt/rocm/lib`, cannot decide the scenario.
+fn plant_wsl_machine_with_unregistered_rocdxg(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/dxg"), "").expect("failed to plant /dev/dxg");
+    std::fs::create_dir_all(host.join("usr/lib/wsl/lib"))
+        .expect("failed to create planted WSL lib");
+    std::fs::write(host.join("usr/lib/wsl/lib/libdxcore.so"), "")
+        .expect("failed to plant libdxcore.so");
+    std::fs::create_dir_all(host.join("opt/rocm/lib")).expect("failed to create planted ROCm lib");
+    std::fs::write(host.join("opt/rocm/lib/librocdxg.so"), "")
+        .expect("failed to plant librocdxg.so");
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    // A readable cache that simply lacks the library: `None` (ldconfig could not
+    // run) would be a different case, and one the verdict must not read as "no".
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("ldconfig"),
+        "#!/bin/sh\necho '\tlibc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6'\n",
+    )
+    .expect("failed to write the fake ldconfig");
+    push_planted_wsl_machine_env(world, loader_path);
+}
+
+/// Hand the planted WSL machine to the next `rocm` invocation. Separate from the
+/// planting so a scenario that runs a second command on the same machine can give
+/// it the same environment: the scenario env is consumed by each run.
+fn push_planted_wsl_machine_env(world: &mut E2eWorld, loader_path: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let path = std::env::join_paths(std::iter::once(root.join("fake-bin")).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("LD_LIBRARY_PATH", loader_path.into()));
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
+}
+
+#[given("a WSL machine whose ROCDXG library is on LD_LIBRARY_PATH but not in the linker cache")]
+async fn wsl_machine_with_rocdxg_on_the_loader_path(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "/opt/rocm/lib");
+}
+
+#[given("a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH")]
+async fn wsl_machine_with_rocdxg_nowhere_the_loader_looks(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+}
+
+#[given(
+    "a WSL machine whose ROCDXG library sits beside the ROCm runtime but is in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn wsl_machine_with_rocdxg_beside_the_runtime(world: &mut E2eWorld) {
+    // The same machine as the control above, plus the runtime that opens the
+    // library: the only difference between the two scenarios, so the verdict can
+    // only turn on it.
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let lib = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root/opt/rocm/lib");
+    std::fs::write(lib.join("libhsa-runtime64.so.1"), "")
+        .expect("failed to plant libhsa-runtime64.so.1");
+}
+
+#[then(expr = "the inspection reports the ROCDXG driver status {string}")]
+async fn assert_rocdxg_driver_status(world: &mut E2eWorld, status: String) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        status,
+        "{json:#}"
+    );
+}
+
+fn assert_rocdxg_sources(
+    world: &E2eWorld,
+    in_cache: bool,
+    on_loader_path: bool,
+    beside_runtime: bool,
+) {
+    let json = parsed_json(world);
+    let flag = |pointer: &str| {
+        json.pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| panic!("`examine --json` has no boolean at {pointer}:\n{json:#}"))
+    };
+    // The library itself is on disk in every scenario, so the verdict turns on
+    // the loader sources alone.
+    assert!(flag("/summary/wsl/librocdxg"), "{json:#}");
+    assert_eq!(
+        flag("/summary/wsl/ldconfig_librocdxg"),
+        in_cache,
+        "{json:#}"
+    );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_on_ld_library_path"),
+        on_loader_path,
+        "{json:#}"
+    );
+    assert_eq!(
+        flag("/summary/wsl/librocdxg_beside_runtime"),
+        beside_runtime,
+        "{json:#}"
+    );
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as on LD_LIBRARY_PATH and not in the linker cache"
+)]
+async fn assert_rocdxg_only_on_the_loader_path(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, true, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_in_neither_source(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, false);
+}
+
+#[then(
+    "the inspection reports the ROCDXG library as beside the runtime and in neither the linker cache nor LD_LIBRARY_PATH"
+)]
+async fn assert_rocdxg_only_beside_the_runtime(world: &mut E2eWorld) {
+    assert_rocdxg_sources(world, false, false, true);
+}
+
+/// The `driver_detail` line is the CLI's own advice about what is wrong. It is
+/// asserted beside the status so that a message naming a registration the
+/// workload does not need cannot ride along with a verdict that says ready.
+fn rocdxg_driver_detail(world: &E2eWorld) -> String {
+    let json = parsed_json(world);
+    inspection_str(&json, "/summary/driver/detail").to_owned()
+}
+
+#[then(
+    "the inspection's driver detail does not send the user to register the library with ldconfig"
+)]
+async fn assert_rocdxg_detail_asks_for_no_registration(world: &mut E2eWorld) {
+    let detail = rocdxg_driver_detail(world);
+    assert!(
+        !detail.contains("ldconfig"),
+        "the library loads through LD_LIBRARY_PATH, so the detail must not name the cache: {detail}"
+    );
+}
+
+#[then("the inspection's driver detail says the library is missing from the linker cache")]
+async fn assert_rocdxg_detail_names_the_cache(world: &mut E2eWorld) {
+    let detail = rocdxg_driver_detail(world);
+    assert!(
+        detail.contains("ldconfig:librocdxg.so"),
+        "nothing lets the loader find the library, so the detail must say so: {detail}"
+    );
+}
+
+// ── Both reports agree whether `rocminfo` is installed ─────────────
+
+/// Plant a stand-in `rocminfo` in `dir`. It prints nothing and succeeds, so the
+/// probe finds the tool installed and, having seen no agent in its output, does
+/// not claim the GPU works: the scenarios turn on whether it is found, not on
+/// what it says.
+fn plant_stand_in_rocminfo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("failed to create the stand-in rocminfo directory");
+    rocm_core::fake_executable::write_fake_executable(&dir.join("rocminfo"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the stand-in rocminfo");
+}
+
+/// Replace the `PATH` the planted WSL machine gives the next `rocm` run with
+/// `entries`, then the machine's `fake-bin` (its stand-in `ldconfig`), then the
+/// runner's own entries that hold no `rocminfo`, so a runner with ROCm installed
+/// cannot be the reason the tool reads as found. How the runner's entries are
+/// resolved and filtered is [`e2e_cucumber::planted_path::planted_path_entries`].
+///
+/// An entry that is an empty path is how a test writes the empty `PATH` entry
+/// the shell reads as the current directory.
+fn set_planted_wsl_path(world: &mut E2eWorld, entries: &[PathBuf]) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // The runner's relative entries are resolved from this process's directory
+    // before they are checked, because the child may run from another one.
+    let path = std::env::join_paths(e2e_cucumber::planted_path::planted_path_entries(
+        entries,
+        &root.join("fake-bin"),
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &std::env::current_dir().expect("the harness has a working directory"),
+        e2e_cucumber::planted_path::dir_holds_tool,
+    ))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a WSL machine whose rocminfo is in a PATH directory")]
+async fn wsl_machine_with_rocminfo_on_path(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let tools = root.join("rocminfo-bin");
+    plant_stand_in_rocminfo(&tools);
+    set_planted_wsl_path(world, &[tools]);
+}
+
+/// The machine of `examine-36` and `examine-38`: the only `rocminfo` is in
+/// `work`, the directory `rocm` is started from, and `path_entry` is the first
+/// entry of its `PATH`. The two scenarios differ in nothing else, so the answer
+/// can only turn on whether that entry names the working directory: `.` does,
+/// and an empty entry does not (the lookup skips it). That is also what shows
+/// `command_dir` reaches the `rocm` child: with `.` the stand-in is found only
+/// if `rocm` really runs from `work`.
+fn plant_wsl_machine_with_rocminfo_only_in_the_working_directory(
+    world: &mut E2eWorld,
+    path_entry: PathBuf,
+) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let work = root.join("work");
+    plant_stand_in_rocminfo(&work);
+    set_planted_wsl_path(world, &[path_entry]);
+    // A "not installed" answer would also come out if the stand-in could not be
+    // reached at all, so show it can: started by bare name from `work` with this
+    // PATH, it must run, which only an entry that names `work` (or the empty
+    // entry, which `execvp` reads as `work`) makes possible.
+    let path = world
+        .command_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (*key == "PATH").then(|| value.clone()))
+        .expect("the planted PATH was just set");
+    let reached = std::process::Command::new("rocminfo")
+        .env("PATH", path)
+        .current_dir(&work)
+        .status()
+        .expect("the stand-in must resolve through the first PATH entry");
+    assert!(reached.success(), "the stand-in rocminfo failed: {reached}");
+    world.command_dir = Some(work);
+}
+
+#[given(
+    "a WSL machine whose only rocminfo is in the directory the command runs from, with an empty entry on PATH"
+)]
+async fn wsl_machine_with_rocminfo_only_behind_an_empty_path_entry(world: &mut E2eWorld) {
+    plant_wsl_machine_with_rocminfo_only_in_the_working_directory(world, PathBuf::new());
+}
+
+#[given(
+    "a WSL machine whose only rocminfo is in the directory the command runs from, with that directory named on PATH"
+)]
+async fn wsl_machine_with_rocminfo_only_on_a_path_entry_naming_the_working_directory(
+    world: &mut E2eWorld,
+) {
+    plant_wsl_machine_with_rocminfo_only_in_the_working_directory(world, PathBuf::from("."));
+}
+
+/// A directory name that is not valid Unicode: the byte 0xff is never UTF-8.
+#[cfg(unix)]
+fn directory_name_that_is_not_unicode() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    std::ffi::OsStr::from_bytes(b"rocminfo-bin-\xff").to_owned()
+}
+
+/// Windows file names are UTF-16 and a lone surrogate would stand in for the
+/// byte; the scenario that asks for this name is `@requires-os:linux`, so
+/// reaching this is a harness mistake.
+#[cfg(not(unix))]
+fn directory_name_that_is_not_unicode() -> std::ffi::OsString {
+    panic!("a directory name that is not valid Unicode is planted on Linux only")
+}
+
+#[given(
+    "a WSL machine whose rocminfo sits in a PATH directory with a name that is not valid Unicode"
+)]
+async fn wsl_machine_with_rocminfo_in_a_directory_that_is_not_unicode(world: &mut E2eWorld) {
+    plant_wsl_machine_with_unregistered_rocdxg(world, "");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let tools = root.join(directory_name_that_is_not_unicode());
+    plant_stand_in_rocminfo(&tools);
+    set_planted_wsl_path(world, &[tools]);
+}
+
+/// Both reports of one `rocm examine --json` run say whether `rocminfo` is
+/// installed: `summary.wsl.rocminfo` from the host summary and `wsl.rocminfo`
+/// from the examination. Asked together so the pair cannot disagree unseen.
+fn rocminfo_answers(world: &E2eWorld) -> (bool, bool) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let answer = |pointer: &str| {
+        json.pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| panic!("`examine --json` has no boolean at {pointer}:\n{json:#}"))
+    };
+    (answer("/summary/wsl/rocminfo"), answer("/wsl/rocminfo"))
+}
+
+#[then("both reports say rocminfo is installed")]
+async fn assert_rocminfo_installed_in_both_reports(world: &mut E2eWorld) {
+    assert_eq!(
+        rocminfo_answers(world),
+        (true, true),
+        "(host summary, examination)"
+    );
+}
+
+#[then("both reports say rocminfo is not installed")]
+async fn assert_rocminfo_not_installed_in_either_report(world: &mut E2eWorld) {
+    assert_eq!(
+        rocminfo_answers(world),
+        (false, false),
+        "(host summary, examination)"
+    );
+}
+
+// ── Both reports read the kernel release from one `uname -r` ───────
+
+/// The release the stand-in `uname` reports, chosen so no real host has it.
+const STAND_IN_KERNEL_RELEASE: &str = "6.8.0-stand-in-kernel";
+
+/// Where the stand-in `uname` logs the arguments of every call, one line each,
+/// so a scenario can count the reads. Inside the isolated root.
+fn stand_in_uname_log(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-calls.log")
+}
+
+/// Plant a `uname` first on the `PATH` of the next `rocm` run. `-r` runs
+/// `release_body` (a shell fragment); `-v` answers a fixed string, so the
+/// examination's other `uname` read has nothing to wait for. Every call appends
+/// its arguments to [`stand_in_uname_log`]. Nothing else on the
+/// machine is planted: the stand-in is what `rocm examine` reads on any Linux
+/// host, native or WSL, because both stacks run `uname -r` there.
+fn plant_stand_in_uname(world: &mut E2eWorld, release_body: &str) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in uname directory");
+    let log = stand_in_uname_log(world);
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(release_body, &log),
+    )
+    .expect("failed to write the stand-in uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[given("a machine whose uname reports a kernel release")]
+async fn machine_whose_uname_reports_a_release(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}"));
+}
+
+#[given("a machine whose uname prints a kernel release and then fails")]
+async fn machine_whose_uname_prints_a_release_and_fails(world: &mut E2eWorld) {
+    plant_stand_in_uname(world, &format!("echo {STAND_IN_KERNEL_RELEASE}; exit 3"));
+}
+
+/// The `probe_failures` entries of an `examine --json` document, whatever they
+/// say.
+fn probe_failures(json: &serde_json::Value) -> Vec<String> {
+    json.get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `probe_failures` of the same machine with a `uname` that works, for a
+/// baseline: entries this machine legitimately has for other reasons are not
+/// the kernel read's, and a failure the failing `uname` adds, however worded,
+/// is.
+fn probe_failures_with_a_working_uname(world: &E2eWorld) -> Vec<String> {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("uname-baseline-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the baseline uname directory");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("uname"),
+        e2e_cucumber::stand_in_uname::stand_in_uname_script(
+            &format!("echo {STAND_IN_KERNEL_RELEASE}"),
+            &world
+                .isolated_root
+                .as_ref()
+                .expect("no isolated root")
+                .path()
+                .join("uname-baseline-calls.log"),
+        ),
+    )
+    .expect("failed to write the baseline uname");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited)))
+        .expect("PATH entries cannot hold a separator");
+    let path = path.to_str().expect("PATH is UTF-8").to_owned();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["examine", "--framework", "skip", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        rc, 0,
+        "the baseline `rocm examine --json` failed:\n{stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("the baseline run emitted JSON");
+    probe_failures(&json)
+}
+
+#[then("the summary and the examination report that kernel release")]
+async fn assert_both_report_the_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/kernel"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, "/kernel_release"),
+        STAND_IN_KERNEL_RELEASE,
+        "{json:#}"
+    );
+}
+
+/// One `rocm examine --json` run asks `uname` for the release once, for the
+/// examination and the summary together: the stand-in logged a single `-r`. A
+/// second read would show as a second line, and it is what lets a transient
+/// failure make the two fields disagree.
+#[then("that run asked uname for the kernel release once")]
+async fn assert_uname_was_asked_for_the_release_once(world: &mut E2eWorld) {
+    let log = std::fs::read_to_string(stand_in_uname_log(world))
+        .expect("the stand-in uname was never called");
+    let release_reads = log.lines().filter(|line| line.trim() == "-r").count();
+    assert_eq!(release_reads, 1, "calls of the stand-in uname:\n{log}");
+}
+
+#[then(
+    "neither the summary nor the examination reports a kernel release, and neither calls it a failure"
+)]
+async fn assert_neither_reports_a_kernel_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert!(
+        json.pointer("/summary/kernel")
+            .is_some_and(serde_json::Value::is_null),
+        "the summary must read no kernel from a uname that failed:\n{json:#}"
+    );
+    assert_eq!(inspection_str(&json, "/kernel_release"), "", "{json:#}");
+    // No `probe_failures` entry beyond what the same machine has with a working
+    // `uname`, so a failure worded in any way cannot slip through.
+    let baseline = probe_failures_with_a_working_uname(world);
+    let new_failures: Vec<String> = probe_failures(&json)
+        .into_iter()
+        .filter(|failure| !baseline.contains(failure))
+        .collect();
+    assert_eq!(new_failures, Vec::<String>::new(), "{json:#}");
+}
+
+// ── Both reports read the CPU from one reader ──────────────────────
+
+/// The model a planted AMD `/proc/cpuinfo` names, spelled as `/proc/cpuinfo`
+/// does, with runs of spaces inside it.
+const PLANTED_AMD_CPUINFO: &str = "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 26\nmodel name\t: AMD  Ryzen 9   9950X 16-Core Processor  \nprocessor\t: 1\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD  Ryzen 9   9950X 16-Core Processor  \n";
+
+/// The same model with its whitespace collapsed: what both reports show.
+const PLANTED_AMD_CPU_MODEL: &str = "AMD Ryzen 9 9950X 16-Core Processor";
+
+/// An Arm board's cpuinfo: a `Hardware` line, no `model name` and no `vendor_id`.
+const PLANTED_HARDWARE_ONLY_CPUINFO: &str =
+    "processor\t: 0\nBogoMIPS\t: 38.40\nCPU implementer\t: 0x41\nHardware\t: BCM2835\n";
+
+/// Plant `cpuinfo` as `/proc/cpuinfo` under a simulated host root inside the
+/// scenario's isolated tree, with a `/dev/dxg` when `wsl`, and hand that root to
+/// the next `rocm` invocation. The root holds nothing else, so the machine reads
+/// as WSL only when asked to and every other re-rooted probe sees an empty one.
+fn plant_cpuinfo_machine(world: &mut E2eWorld, cpuinfo: &str, wsl: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(root.join("proc")).expect("failed to create planted /proc");
+    std::fs::write(root.join("proc").join("cpuinfo"), cpuinfo)
+        .expect("failed to write planted cpuinfo");
+    if wsl {
+        std::fs::create_dir_all(root.join("dev")).expect("failed to create planted /dev");
+        std::fs::write(root.join("dev").join("dxg"), "").expect("failed to plant /dev/dxg");
+    }
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
+}
+
+#[given(
+    "a machine that is not WSL whose cpuinfo names an AMD CPU with repeated spaces in its model"
+)]
+async fn machine_with_an_amd_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_AMD_CPUINFO, false);
+}
+
+#[given("a machine that is not WSL whose cpuinfo has a Hardware line and no model name")]
+async fn machine_with_a_hardware_only_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_HARDWARE_ONLY_CPUINFO, false);
+}
+
+#[given("a WSL machine whose cpuinfo names an AMD CPU")]
+async fn wsl_machine_with_an_amd_cpuinfo(world: &mut E2eWorld) {
+    plant_cpuinfo_machine(world, PLANTED_AMD_CPUINFO, true);
+}
+
+/// `summary.cpu`, `cpu_model`, `cpu_vendor` and `is_wsl` of one `rocm examine
+/// --json` run.
+fn cpu_answers(world: &E2eWorld) -> (Option<String>, String, String, bool) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let summary = json
+        .pointer("/summary/cpu")
+        .unwrap_or_else(|| panic!("`examine --json` has no summary.cpu:\n{json:#}"))
+        .as_str()
+        .map(str::to_owned);
+    let is_wsl = json
+        .pointer("/is_wsl")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("`examine --json` has no boolean is_wsl:\n{json:#}"));
+    (
+        summary,
+        inspection_str(&json, "/cpu_model").to_owned(),
+        inspection_str(&json, "/cpu_vendor").to_owned(),
+        is_wsl,
+    )
+}
+
+#[then(
+    "the summary and the examination report that CPU model, and the examination reports its vendor as amd"
+)]
+async fn assert_both_report_the_planted_amd_cpu(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some(PLANTED_AMD_CPU_MODEL.to_owned()),
+            PLANTED_AMD_CPU_MODEL.to_owned(),
+            "amd".to_owned(),
+            false
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+#[then(
+    "the summary and the examination report that CPU model, and the examination reports its vendor as unknown"
+)]
+async fn assert_both_report_the_hardware_line_cpu(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some("BCM2835".to_owned()),
+            "BCM2835".to_owned(),
+            "unknown".to_owned(),
+            false
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+#[then(
+    "the summary reports that CPU model, and the examination reports no CPU model and an unknown vendor"
+)]
+async fn assert_only_the_summary_reports_the_cpu_on_wsl(world: &mut E2eWorld) {
+    assert_eq!(
+        cpu_answers(world),
+        (
+            Some(PLANTED_AMD_CPU_MODEL.to_owned()),
+            String::new(),
+            "unknown".to_owned(),
+            true
+        ),
+        "(summary.cpu, cpu_model, cpu_vendor, is_wsl)"
+    );
+}
+
+// ── A probe tool that leaves a background process behind ───────────────────
+
+/// How long the stand-in `lspci`'s background process keeps the pipes it
+/// inherited open, which is how long a probe that waits for end of output waits.
+const LEFTOVER_PROCESS_SECONDS: u64 = 30;
+
+/// An inspection that finishes within this did not wait for that process. Half
+/// its life, so a loaded runner has the whole of the other half to be slow in.
+const INSPECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The PCI address and the line the stand-in `lspci` prints for its one GPU. The
+/// bus number is one no real machine's first adapter has, so the line cannot be
+/// mistaken for a card of the runner's own.
+const LEFTOVER_LSPCI_ADDRESS: &str = "0000:fe:00.0";
+const LEFTOVER_LSPCI_LINE: &str = "0000:fe:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX] [1002:744c] (rev c8)";
+
+#[given(
+    "a machine whose lspci prints a GPU and leaves a background process holding its output open"
+)]
+async fn machine_whose_lspci_leaves_a_background_process(world: &mut E2eWorld) {
+    // A simulated native Linux root: the PCI probe is skipped on WSL, so a runner
+    // that is a WSL host would otherwise never reach the stand-in.
+    plant_os_release(world, "ID=ubuntu\nVERSION_ID=\"24.04\"\n");
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("leftover-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in lspci's directory");
+    // The `sleep` starts in the background of the script, so it inherits the
+    // script's stdout and stderr, the pipes `rocm` reads the listing from, and
+    // outlives the script, which exits 0 straight after printing.
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("lspci"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{LEFTOVER_LSPCI_LINE}'\nsleep {LEFTOVER_PROCESS_SECONDS} &\n"
+        ),
+    )
+    .expect("failed to write the stand-in lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.retain(|(key, _)| *key != "PATH");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user inspects that machine in machine-readable form and the time it takes is measured")]
+async fn user_times_an_inspection_of_the_planted_machine(world: &mut E2eWorld) {
+    let started = std::time::Instant::now();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_elapsed = Some(started.elapsed());
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the inspection finishes long before the background process does")]
+async fn assert_the_inspection_did_not_wait_for_the_background_process(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let elapsed = world.cli_elapsed.expect("the inspection was not timed");
+    assert!(
+        elapsed < INSPECTION_BUDGET,
+        "the inspection took {elapsed:?}, so it waited for the {LEFTOVER_PROCESS_SECONDS}s \
+         background process that held `lspci`'s output open"
+    );
+}
+
+#[then("the inspection lists the GPU that lspci printed")]
+async fn assert_the_gpu_lspci_printed_is_listed(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let listed = json
+        .pointer("/gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no `gpus` array:\n{json:#}"))
+        .iter()
+        .find(|gpu| {
+            gpu.pointer("/pci_id").and_then(serde_json::Value::as_str)
+                == Some(LEFTOVER_LSPCI_ADDRESS)
+        })
+        .unwrap_or_else(|| {
+            panic!("the GPU `lspci` printed at {LEFTOVER_LSPCI_ADDRESS} is not listed:\n{json:#}")
+        });
+    assert_eq!(
+        listed
+            .pointer("/is_amd")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "{listed:#}"
+    );
+}
+
+// ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
+
+#[when("the user serves a model under the GPU-required default on that machine")]
+async fn user_serves_on_the_planted_wsl_machine(world: &mut E2eWorld) {
+    // The pre-flight refuses before any engine is prepared, so the model and
+    // engine named here are never fetched.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+            "--engine",
+            "lemonade",
+            "--gpu",
+            "auto",
+            "--no-smoke-test",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the refusal points the user at the WSL driver status instead of /dev/kfd")]
+async fn assert_wsl_refusal_advice(world: &mut E2eWorld) {
+    let output = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(
+        !output.contains("/dev/kfd is present"),
+        "WSL has no /dev/kfd, so advice to confirm it cannot clear the condition:\n{output}"
+    );
+    assert!(
+        output.contains("`driver_status` is `wsl_rocdxg_ready`"),
+        "the refusal must name the status `rocm examine` reports as ready:\n{output}"
+    );
+}
+
+#[then(
+    "inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check"
+)]
+async fn assert_inspection_agrees_with_the_refusal(world: &mut E2eWorld) {
+    // The refusal says to run `rocm examine` and compare `driver_status` with the
+    // ready value. Run it on the same planted machine: it must exist, accept
+    // those arguments, and show the condition the refusal is about.
+    push_planted_wsl_machine_env(world, "");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(
+        inspection_str(&json, "/summary/driver/status"),
+        "wsl_rocdxg_missing",
+        "{json:#}"
     );
 }

@@ -38,12 +38,12 @@ use crate::service_hints::{
     service_action_verb,
 };
 use crate::service_records::{
-    prune_managed_service_records, remove_managed_service_record, service_prune_min_age_hours,
+    prune_managed_service_records, remove_managed_service_record_with, service_prune_min_age_hours,
 };
 use crate::services_text::{
-    render_service_action_result, render_service_action_result_with_helper_note,
-    render_service_logs_text, render_services_json, render_services_text, service_stop_unconfirmed,
-    validate_service_id,
+    follow_service_logs, render_service_action_result,
+    render_service_action_result_with_helper_note, render_service_logs_text, render_services_json,
+    render_services_text, service_stop_unconfirmed, validate_service_id,
 };
 
 pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
@@ -60,9 +60,13 @@ pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
             }
             Ok(())
         }
-        ServicesCommand::Logs { service_id } => {
-            print!("{}", render_service_logs_text(&paths, &service_id)?);
-            Ok(())
+        ServicesCommand::Logs { service_id, follow } => {
+            if follow {
+                follow_service_logs(&paths, &service_id)
+            } else {
+                print!("{}", render_service_logs_text(&paths, &service_id)?);
+                Ok(())
+            }
         }
         ServicesCommand::Stop { service_id, yes } => {
             run_approved_service_action(&paths, "stop_server", &service_id, yes)
@@ -70,17 +74,32 @@ pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
         ServicesCommand::Restart { service_id, yes } => {
             run_approved_service_action(&paths, "restart_server", &service_id, yes)
         }
-        ServicesCommand::Remove { service_id, yes } => {
-            print!(
-                "{}",
-                remove_managed_service_record(&paths, &service_id, yes)?
-            );
+        ServicesCommand::Remove {
+            service_id,
+            yes,
+            force,
+        } => {
+            let removed = remove_managed_service_record_with(
+                &paths,
+                &service_id,
+                yes,
+                force,
+                rocm_core::probe_process,
+            )?;
+            print!("{}", removed.text);
+            let message = if removed.forced {
+                format!(
+                    "removed local server record {service_id} (--force: a recorded process could not be queried)"
+                )
+            } else {
+                format!("removed local server record {service_id}")
+            };
             record_cli_audit_event(
                 &paths,
                 "service",
                 "remove_record",
                 "info",
-                format!("removed local server record {service_id}"),
+                message,
                 Some(&service_id),
             );
             Ok(())
@@ -222,5 +241,32 @@ mod tests {
         assert!(rendered.contains("service: svc-qwen"));
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("stopped processes: 2"));
+    }
+
+    /// The stop report production hands the renderer is the one
+    /// `stop_internal_managed_service` builds: `service_id` and `status` sit
+    /// directly on `result`, not under `result.service`. Scenario
+    /// `@id:serve-lemonade-simple-registered-direct-route` asserts the service id
+    /// in the stop output, so the renderer must print it for this shape.
+    #[test]
+    fn service_stop_render_prints_the_in_process_stop_report_shape() {
+        let rendered = crate::services_text::render_service_action_result(
+            "stop_server",
+            &serde_json::json!({
+                "output": {
+                    "result": {
+                        "service_id": "svc-qwen",
+                        "status": "stopped",
+                        "engine_stop": {"attempted": true, "stopped": true, "graceful": true},
+                        "signaled_pids": [1234]
+                    }
+                }
+            }),
+        );
+
+        assert!(rendered.contains("Local server stopped"));
+        assert!(rendered.contains("service: svc-qwen"), "{rendered}");
+        assert!(rendered.contains("status: stopped"), "{rendered}");
+        assert!(rendered.contains("stopped processes: 1"));
     }
 }

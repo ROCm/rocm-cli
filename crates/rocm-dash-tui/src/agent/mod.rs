@@ -62,9 +62,34 @@ pub use tools::{
     UpdateCheckRocmTool, WatcherDisableRocmTool, WatcherEnableRocmTool,
 };
 
-/// One-shot request budget. A hung backend becomes a timeout error turn, never
-/// a frozen pane.
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// Default one-shot request budget. A hung backend becomes a timeout error
+/// turn, never a frozen pane.
+///
+/// Sized for a locally served model on modest hardware: the first message
+/// prefills the whole system prompt plus tool schemas on a cold prompt cache
+/// (about 22 s for roughly 3k tokens on an integrated GPU), and the budget
+/// covers every tool-calling turn of the request, not just that prefill.
+pub const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// Environment variable that overrides [`DEFAULT_REQUEST_TIMEOUT`], in whole
+/// seconds.
+pub const REQUEST_TIMEOUT_ENV: &str = "ROCM_DASH_CHAT_TIMEOUT_SECS";
+
+/// Longest budget an override may set, so a typo cannot park a chat turn for
+/// hours.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 3600;
+
+/// The request budget in effect: [`REQUEST_TIMEOUT_ENV`] when it holds a whole
+/// number of seconds in `1..=3600`, otherwise [`DEFAULT_REQUEST_TIMEOUT`].
+pub fn request_timeout() -> std::time::Duration {
+    parse_request_timeout(std::env::var(REQUEST_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_request_timeout(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| (1..=MAX_REQUEST_TIMEOUT_SECS).contains(secs))
+        .map_or(DEFAULT_REQUEST_TIMEOUT, std::time::Duration::from_secs)
+}
 
 /// Optional sampling controls forwarded to the chat backend.
 ///
@@ -94,8 +119,8 @@ pub enum AgentError {
     Build(String),
     #[error("chat sign-in failed: {0}")]
     Auth(String),
-    #[error("request timed out after {}s", REQUEST_TIMEOUT.as_secs())]
-    Timeout,
+    #[error("request timed out after {0}s (set {REQUEST_TIMEOUT_ENV} to allow longer)")]
+    Timeout(u64),
     #[error("chat request failed: {0}")]
     Request(String),
 }
@@ -185,5 +210,84 @@ fn fixture_snapshot() -> StateSnapshot {
         latest: Some(snap),
         instances: vec![inst],
         bench_rows: vec![row],
+    }
+}
+
+#[cfg(test)]
+mod request_timeout_tests {
+    use std::time::Duration;
+
+    use super::{
+        AgentError, DEFAULT_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT_SECS, REQUEST_TIMEOUT_ENV,
+        parse_request_timeout,
+    };
+
+    #[test]
+    fn an_unset_override_leaves_the_default_budget() {
+        assert_eq!(parse_request_timeout(None), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    // Pins the two numbers the rest of this module only compares against
+    // themselves. Without these, restoring the 45 s budget this change exists
+    // to replace leaves every other test green. Both values are published in
+    // README.md, docs/testing.md and docs/manual-testing.md section 4d; change
+    // them together or the docs drift silently.
+    #[test]
+    fn the_budget_and_its_upper_bound_are_the_values_the_docs_promise() {
+        assert_eq!(
+            DEFAULT_REQUEST_TIMEOUT.as_secs(),
+            120,
+            "the default budget is 2 minutes; 45 s is the cut-off this change removed"
+        );
+        assert_eq!(
+            MAX_REQUEST_TIMEOUT_SECS, 3600,
+            "an override may reach one hour"
+        );
+    }
+
+    #[test]
+    fn a_whole_number_of_seconds_overrides_the_default() {
+        assert_eq!(parse_request_timeout(Some("300")), Duration::from_mins(5));
+        assert_eq!(
+            parse_request_timeout(Some(" 90 ")),
+            Duration::from_secs(90),
+            "surrounding whitespace from a shell is not a reason to reject it"
+        );
+        assert_eq!(
+            parse_request_timeout(Some(&MAX_REQUEST_TIMEOUT_SECS.to_string())),
+            Duration::from_secs(MAX_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn an_unusable_override_falls_back_to_the_default_instead_of_disabling_the_budget() {
+        for bad in [
+            "",
+            "0",
+            "-5",
+            "abc",
+            "1.5",
+            "99999",
+            &(MAX_REQUEST_TIMEOUT_SECS + 1).to_string(),
+        ] {
+            assert_eq!(
+                parse_request_timeout(Some(bad)),
+                DEFAULT_REQUEST_TIMEOUT,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timeout_message_names_the_budget_and_the_variable_that_changes_it() {
+        let msg = AgentError::Timeout(120).to_string();
+        assert!(msg.contains("after 120s"), "{msg}");
+        // `parse_request_timeout` is what `request_timeout()` feeds
+        // `REQUEST_TIMEOUT_ENV` into, and the unit tests above prove it
+        // honours a valid value; this pins that the message advertises that
+        // same variable. That the request path really reads it is proven by
+        // `the_request_path_honours_the_chat_timeout_environment_variable`
+        // in `clients.rs`.
+        assert!(msg.contains(REQUEST_TIMEOUT_ENV), "{msg}");
     }
 }

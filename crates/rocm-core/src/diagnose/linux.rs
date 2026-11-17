@@ -13,6 +13,27 @@ use super::scoring::{
 use super::{Diagnosis, Fix};
 use crate::examine::Examination;
 
+/// The phrase `check_3_rocm_kernel_unsupported` puts in its evidence when
+/// `amdgpu_loaded` is `Some(false)` and ROCm is installed.
+const AMDGPU_KERNEL_MODULE_NOT_LOADED: &str = "the amdgpu kernel module is not loaded";
+/// The evidence line `check_5_amdgpu_blacklisted` adds when `amdgpu_loaded` is
+/// `Some(false)`.
+const AMDGPU_MODULE_NOT_LOADED: &str = "amdgpu module is not loaded";
+/// The start of the evidence line `check_5_amdgpu_blacklisted` adds when Secure
+/// Boot is enabled and `amdgpu_loaded` is `Some(false)`.
+const SECURE_BOOT_BLOCKED_AMDGPU: &str = "Secure Boot is enabled and amdgpu didn't load";
+
+/// One phrase per evidence line that only `amdgpu_loaded == Some(false)` produces.
+///
+/// The checks build their lines from these same constants, so a test that asserts
+/// a diagnosis cites none of them (the e2e scenario for a built-in `amdgpu`)
+/// cannot drift from the wording and pass vacuously.
+pub const AMDGPU_MISSING_EVIDENCE: [&str; 3] = [
+    AMDGPU_KERNEL_MODULE_NOT_LOADED,
+    AMDGPU_MODULE_NOT_LOADED,
+    SECURE_BOOT_BLOCKED_AMDGPU,
+];
+
 pub(super) fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
@@ -24,7 +45,7 @@ pub(super) fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) ->
     if !rocm_version.is_empty() && e.amdgpu_loaded == Some(false) {
         score += 30;
         evidence.push(format!(
-            "ROCm {rocm_version} is installed but the amdgpu kernel module is not loaded; this is typical when DKMS failed against an unsupported kernel."
+            "ROCm {rocm_version} is installed but {AMDGPU_KERNEL_MODULE_NOT_LOADED}; this is typical when DKMS failed against an unsupported kernel."
         ));
     }
 
@@ -115,7 +136,7 @@ pub(super) fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis 
         needs_sudo: true,
         needs_relogin: true,
         fix_id: "fix-4-render-group".to_owned(),
-        verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && ls -l /dev/kfd && rocminfo | head -n 5".to_owned(),
+        verify: crate::fix::RENDER_GROUP_VERIFY.to_owned(),
         notes: vec![
             "Group membership only takes effect after a full re-login (or reboot). `newgrp render` will give the current shell access but not other terminals or services.".to_owned(),
         ],
@@ -140,7 +161,7 @@ pub(super) fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diag
     }
     if e.amdgpu_loaded == Some(false) {
         score += 35;
-        evidence.push("amdgpu module is not loaded".to_owned());
+        evidence.push(AMDGPU_MODULE_NOT_LOADED.to_owned());
     }
     if e.rocminfo_status == "not-loaded" {
         score += 25;
@@ -148,7 +169,7 @@ pub(super) fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diag
     }
     if e.secure_boot == "enabled" && e.amdgpu_loaded == Some(false) {
         score += 10;
-        evidence.push("Secure Boot is enabled and amdgpu didn't load -- DKMS modules are often blocked until you sign them or disable Secure Boot.".to_owned());
+        evidence.push(format!("{SECURE_BOOT_BLOCKED_AMDGPU} -- DKMS modules are often blocked until you sign them or disable Secure Boot."));
     }
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_MODULE_NOT_LOADED);
     score += kw_score;
@@ -646,8 +667,50 @@ pub(super) fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Dia
 mod tests {
     use super::*;
     use crate::diagnose::test_support::linux_base;
+    #[cfg(unix)]
+    use crate::diagnose::test_support::{run_in_sh, stub_bin_dir};
     use crate::diagnose::{HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH, diagnose, render_report_text};
     use crate::examine::{Device, Gpu};
+
+    #[test]
+    fn every_amdgpu_missing_phrase_is_in_the_evidence_the_checks_produce() {
+        let mut e = linux_base();
+        e.rocm_version = "7.1.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        e.secure_boot = "enabled".to_owned();
+        let lines: Vec<String> = [
+            check_3_rocm_kernel_unsupported(&e, ""),
+            check_5_amdgpu_blacklisted(&e, ""),
+        ]
+        .into_iter()
+        .flat_map(|d| d.evidence)
+        .collect();
+        for phrase in AMDGPU_MISSING_EVIDENCE {
+            assert!(
+                lines.iter().any(|l| l.contains(phrase)),
+                "no evidence line contains {phrase:?}: {lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_amdgpu_produces_none_of_the_amdgpu_missing_phrases() {
+        let mut e = linux_base();
+        e.rocm_version = "7.1.0".to_owned();
+        e.amdgpu_loaded = Some(true);
+        e.secure_boot = "enabled".to_owned();
+        for d in [
+            check_3_rocm_kernel_unsupported(&e, ""),
+            check_5_amdgpu_blacklisted(&e, ""),
+        ] {
+            for line in &d.evidence {
+                assert!(
+                    !AMDGPU_MISSING_EVIDENCE.iter().any(|p| line.contains(p)),
+                    "{line}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn render_group_missing_is_diagnosed() {
@@ -688,6 +751,93 @@ mod tests {
         let top = &report.matched[0];
         assert_eq!(top.id, "fix-4-render-group");
         assert_eq!(top.score, 60); // 35 render + 25 kfd
+    }
+
+    /// fix-4's verify line is printed by `rocm diagnose` (from this check's
+    /// `Fix`) and by `rocm fix fix-4-render-group` (from the recipe). The two
+    /// copies drifted once, with only this one listing `/dev/kfd`. Both now read
+    /// `crate::fix::RENDER_GROUP_VERIFY`, and this keeps either side from going
+    /// back to a literal of its own. The check builds its verify line without
+    /// looking at the host, so one host that fires it is enough.
+    #[test]
+    fn the_render_group_fix_verify_matches_the_catalog_copy() {
+        let (catalog_verify, _, _) =
+            crate::fix::recipe_verify_notes_and_run_commands("fix-4-render-group")
+                .expect("fix-4-render-group is in the recipe catalog");
+        let not_in_render = Examination {
+            in_render_group: Some(false),
+            ..linux_base()
+        };
+        let fix = check_4_render_group(&not_in_render, "")
+            .fix
+            .expect("check 4 builds a Fix when the user is not in render");
+        assert_eq!(
+            fix.verify, catalog_verify,
+            "the verify line for fix-4-render-group diverged between `diagnose` and `rocm fix`"
+        );
+        // The owning group is in the line, as it is in the command the check
+        // tells the user to run; `ls -l` prints it for the user to read.
+        // `the_render_group_verify_accepts_the_group_that_owns_kfd` runs it.
+        assert!(
+            catalog_verify.contains("stat -c %G /dev/kfd")
+                && catalog_verify.contains("ls -l /dev/kfd"),
+            "{catalog_verify}"
+        );
+    }
+
+    /// fix-4's verify line, run in `/bin/sh` with stand-ins for `groups`,
+    /// `stat`, `ls` and `rocminfo`. The check tells the user to join the group
+    /// that owns `/dev/kfd`, which need not be `render`, so a member of that
+    /// group alone must pass, and a user in none of the groups must fail,
+    /// including when `stat` fails or names no group (`UNKNOWN`).
+    #[cfg(unix)]
+    #[test]
+    fn the_render_group_verify_accepts_the_group_that_owns_kfd() {
+        fn real(tool: &str) -> String {
+            ["/usr/bin", "/bin"]
+                .iter()
+                .map(|dir| format!("{dir}/{tool}"))
+                .find(|path| std::path::Path::new(path).exists())
+                .unwrap_or_else(|| panic!("{tool} is installed"))
+        }
+        let passes = |groups: &str, owner: Option<&str>| {
+            let groups = format!("echo '{groups}'");
+            let stat = owner.map_or_else(
+                || "echo 'stat: cannot stat' >&2; exit 1".to_owned(),
+                |owner| format!("echo '{owner}'"),
+            );
+            let tr = format!("exec {} \"$@\"", real("tr"));
+            let grep = format!("exec {} \"$@\"", real("grep"));
+            let head = format!("exec {} \"$@\"", real("head"));
+            let bin = stub_bin_dir(&[
+                ("groups", groups.as_str()),
+                ("stat", stat.as_str()),
+                ("ls", "echo 'crw-rw---- 1 root kfd 235, 0 /dev/kfd'"),
+                ("rocminfo", "echo agent"),
+                ("tr", tr.as_str()),
+                ("grep", grep.as_str()),
+                ("head", head.as_str()),
+            ]);
+            let (ok, _, _) = run_in_sh(crate::fix::RENDER_GROUP_VERIFY, bin.path(), &[]);
+            ok
+        };
+        assert!(
+            passes("user kfd", Some("kfd")),
+            "a member of the group that owns /dev/kfd must pass"
+        );
+        assert!(passes("user render", Some("kfd")), "render still counts");
+        assert!(
+            !passes("user", Some("kfd")),
+            "a user in none of them must fail"
+        );
+        assert!(
+            !passes("user", Some("UNKNOWN")),
+            "an owner with no name must not let a user in none of them pass"
+        );
+        assert!(
+            !passes("user", None),
+            "a failing stat leaves an empty alternative that must match nothing"
+        );
     }
 
     #[test]

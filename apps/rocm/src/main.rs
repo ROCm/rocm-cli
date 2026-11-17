@@ -10,12 +10,14 @@ mod advised_commands;
 #[path = "../../../crates/rocm-core/src/archive_props.rs"]
 mod archive_props;
 mod automations;
+mod background_helper;
 mod bootstrap;
 mod bridge_snapshot;
 mod chat;
 mod chat_cmd;
 mod chat_host_facts;
 mod cli;
+mod cli_args;
 mod cli_audit;
 mod cli_progress;
 mod cli_report;
@@ -23,6 +25,7 @@ mod comfyui;
 mod config_cmd;
 mod dash;
 mod dash_seam;
+mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
 #[cfg(all(test, unix))]
 mod deletion_properties;
@@ -57,6 +60,7 @@ mod runtime_services;
 mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
+mod serve_port;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;
@@ -68,6 +72,7 @@ mod services_text;
 mod setup_cmd;
 mod shell_quote;
 mod storage;
+mod symptom_input;
 mod system_packages;
 #[cfg(test)]
 mod test_support;
@@ -92,7 +97,7 @@ mod update_cmd;
 // for other root-level commands outside `dispatch()` that call it directly.
 // `select_runtime_manifest` is no longer needed here:
 // `single_ready_runtime_key`/`resolve_runtime_selector_to_exact_key` moved out
-// to `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
+// to `engine_runtime_select.rs`, reaching it via that
 // module's own grouped `use crate::runtimes_cmd::{...}` import instead.
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
@@ -101,17 +106,18 @@ mod update_cmd;
 // `managed_service_process_command`, and
 // `ensure_public_service_has_endpoint_key` are no longer needed here either:
 // their only caller outside `dispatch()`, `restart_internal_managed_service`
-// (and the endpoint-key check inside it), moved out to `services_text.rs` in
-// ROCMAI-209 (Phase 6f) and has since moved on to `service_control.rs`, which
-// reaches them via its own imports instead.
+// (and the endpoint-key check inside it), moved out to `services_text.rs` and
+// has since moved on to `service_control.rs`, which reaches them via its own
+// imports instead.
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
-// `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
+// `crate::<name>`.
 // `therock_install_version_selector` (from `install_cmd.rs`) is re-imported for
-// the same reason: `chat.rs` reaches it as `crate::therock_install_version_selector`.
+// the same reason: `chat/mcp_bridge.rs` reaches it as
+// `crate::therock_install_version_selector`.
 // `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
-// (from `bridge_snapshot.rs`) are re-imported only so `chat.rs` keeps reaching
-// them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
+// (from `bridge_snapshot.rs`) are re-imported only so `chat/mcp_bridge.rs` keeps
+// reaching them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
 // `dispatch()` as well.
 // The clap command tree and its value enums (from `cli.rs`) are re-imported so
 // every module keeps reaching them as `crate::Command`, `crate::Provider` and so
@@ -123,9 +129,9 @@ use crate::bridge_snapshot::{
 };
 use crate::chat_cmd::run_chat_command;
 use crate::cli::{
-    AutomationsCommand, BenchCommand, Cli, ComfyuiCommand, Command, ConfigCommand, DevicePolicyArg,
-    EnginesCommand, InstallFormat, InstallTarget, Provider, RuntimesCommand, SandboxToolArg,
-    ServicesCommand, SetupCommand, StorageCommand,
+    AutomationsCommand, BenchCommand, Cli, Command, ConfigCommand, DevicePolicyArg, EnginesCommand,
+    InstallFormat, InstallTarget, Provider, RuntimesCommand, SandboxToolArg, ServicesCommand,
+    SetupCommand, StorageCommand,
 };
 // Reached only as `super::SUPPORTED_ENGINES` from `advised_commands.rs`'s test,
 // so a non-test build does not carry it.
@@ -169,7 +175,7 @@ use crate::service_control::run_internal_sandbox_tool;
 use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
-    render_internal_status_text, render_logs_browser_text, render_logs_text,
+    follow_service_logs, render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
@@ -187,10 +193,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(all(test, not(windows)))]
-use std::process::Stdio;
-#[cfg(all(test, not(windows)))]
-use std::process::{Command as ProcessCommand, ExitStatus};
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -218,33 +220,6 @@ fn reset_sigpipe() {
 // `missing_const_for_fn` onto every caller in turn.
 #[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
-
-/// Run `f` with SIGPIPE temporarily ignored, restoring the previous
-/// disposition afterwards.
-///
-/// [`reset_sigpipe`] sets `SIG_DFL` process-wide so stdout/stderr pipe writes
-/// terminate the process conventionally. But a write to a spawned child's stdin
-/// whose reader has already exited would then kill `rocm` with SIGPIPE before
-/// the caller can turn the resulting `EPIPE` into a diagnostic. Wrap such writes
-/// in this helper so the failure surfaces as an `io::Error` (`BrokenPipe`)
-/// instead of a signal.
-#[cfg(unix)]
-#[allow(unsafe_code)] // libc FFI
-fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: reading/installing a signal disposition is always safe.
-    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    let result = f();
-    // SAFETY: restoring the disposition captured above is always safe.
-    unsafe {
-        libc::signal(libc::SIGPIPE, previous);
-    }
-    result
-}
-
-#[cfg(not(unix))]
-fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
-    f()
-}
 
 /// Marker error carrying `rocm fix`'s exit code back through `main()`'s
 /// ordinary return path, instead of calling `std::process::exit` mid-stack
@@ -330,14 +305,15 @@ fn run() -> Result<()> {
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
     // rather than a startup failure.
-    let _log_guard = AppPaths::discover()
-        .ok()
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let _log_guard = logging::is_enabled_for(&raw_args)
+        .then(AppPaths::discover)
+        .and_then(Result::ok)
         .and_then(|paths| logging::init(&paths));
 
     maybe_migrate_legacy_dashboard_config();
     maybe_notice_legacy_uv_cache();
 
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
         return launch_default();
     }
@@ -410,17 +386,24 @@ fn parse_cli() -> Result<Cli> {
 }
 
 /// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
-/// the MCP in-process handler) prints: the semantic version Cargo built, plus
-/// the git ref and commit hash [`build.rs`] embedded, additively — never a
-/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
-/// still reports a real version number rather than none at all.
+/// the MCP in-process handler) prints. `format_cli_version` in `build.rs`
+/// computes this once from the ref and commit hash it already resolves and
+/// exports it as `ROCM_CLI_VERSION`, so these surfaces cannot disagree.
+///
+/// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A branch,
+/// including `main`, is shown as `0.0.0-dev (<ref>, <hash>)`. Only an
+/// unresolved ref falls back to the workspace package version, which is not
+/// bumped per release (see the module docs in `build.rs`).
 fn cli_version_string() -> String {
-    format!(
-        "{} ({}, {})",
-        env!("CARGO_PKG_VERSION"),
-        env!("ROCM_CLI_VERSION_REF"),
-        env!("ROCM_CLI_GIT_HASH")
-    )
+    env!("ROCM_CLI_VERSION").to_owned()
+}
+
+/// The leading version of [`cli_version_string`], without the parenthetical
+/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`
+/// and a problem report's `cli_version`. `build.rs` exports it beside the full
+/// string, from the same function, so nothing here parses that string.
+fn cli_version_number() -> String {
+    env!("ROCM_CLI_VERSION_NUMBER").to_owned()
 }
 
 /// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
@@ -677,13 +660,23 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose {
             symptom,
+            symptom_file,
             top,
             json,
             distro,
             model,
+            context_size,
+            kv_cache_type,
             report,
             send,
-        }) => diagnose(symptom, top, json, distro, model, report, send),
+        }) => {
+            let symptom = symptom_input::resolve(symptom, symptom_file.as_deref())
+                .map_err(|error| clap_exit_code(symptom_input::usage_error(&error)))?;
+            let model = model.map(|model_ref| {
+                diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            diagnose(symptom, top, json, distro, model, report, send)
+        }
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -822,6 +815,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -844,6 +838,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -856,13 +851,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             api_key,
             engine_env,
         }),
-        Some(Command::Comfyui { command }) => comfyui(command),
+        Some(Command::Comfyui { command }) => comfyui::run(command),
         Some(Command::Services { command }) => services(command),
         Some(Command::Remote { command }) => remote::run(command),
         Some(Command::Automations { command }) => automations(command),
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
             service,
+            follow,
             search,
             query,
         }) => {
@@ -878,7 +874,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
             if let Some(service_id) = service {
-                print!("{}", render_service_logs_text(&paths, &service_id)?);
+                if follow {
+                    follow_service_logs(&paths, &service_id)?;
+                } else {
+                    print!("{}", render_service_logs_text(&paths, &service_id)?);
+                }
             } else {
                 let query = if search.is_empty() {
                     (!query.is_empty()).then(|| query.join(" "))
@@ -936,15 +936,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             keep_data,
             keep_cache,
             force_dev_binaries,
-        }) => uninstall(UninstallOptions {
-            yes,
-            dry_run,
-            keep_binaries,
-            keep_config,
-            keep_data,
-            keep_cache,
-            force_dev_binaries,
-        }),
+            force,
+        }) => {
+            uninstall::reject_force(force.is_some())?;
+            uninstall(UninstallOptions {
+                yes,
+                dry_run,
+                keep_binaries,
+                keep_config,
+                keep_data,
+                keep_cache,
+                force_dev_binaries,
+            })
+        }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();
             clap_complete::generate(shell, &mut cmd, "rocm", &mut std::io::stdout());
@@ -1086,169 +1090,6 @@ fn platform_refusal(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Op
         PlatformRuleOut::Allowed
         | PlatformRuleOut::NativeWindowsAim
         | PlatformRuleOut::AimDockerUnavailable => None,
-    }
-}
-
-fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let config = RocmCliConfig::load(&paths).unwrap_or_default();
-    match command.unwrap_or(ComfyuiCommand::Status) {
-        ComfyuiCommand::Status => {
-            print!("{}", comfyui::render_status(&paths, &config)?);
-            record_cli_audit_event(
-                &paths,
-                "app",
-                "comfyui_status",
-                "info",
-                "rendered ComfyUI status",
-                None,
-            );
-            Ok(())
-        }
-        ComfyuiCommand::ModelsPath => {
-            print!("{}", comfyui::render_models_path(&paths)?);
-            record_cli_audit_event(
-                &paths,
-                "app",
-                "comfyui_models_path",
-                "info",
-                "rendered ComfyUI models path",
-                None,
-            );
-            Ok(())
-        }
-        ComfyuiCommand::Logs { lines } => {
-            print!("{}", comfyui::render_logs(&paths, lines)?);
-            record_cli_audit_event(
-                &paths,
-                "app",
-                "comfyui_logs",
-                "info",
-                "rendered ComfyUI logs",
-                None,
-            );
-            Ok(())
-        }
-        ComfyuiCommand::Install {
-            runtime_id,
-            reinstall,
-            dry_run,
-            yes: _,
-        } => {
-            match comfyui::install(
-                &paths,
-                &config,
-                comfyui::ComfyUiInstallOptions {
-                    runtime_id: runtime_id.clone(),
-                    reinstall,
-                    dry_run,
-                },
-            ) {
-                Ok(text) => {
-                    print!("{text}");
-                    record_cli_audit_event(
-                        &paths,
-                        "app",
-                        if dry_run {
-                            "comfyui_install_dry_run"
-                        } else {
-                            "comfyui_install"
-                        },
-                        "info",
-                        format!(
-                            "ComfyUI install completed runtime={} reinstall={} dry_run={}",
-                            runtime_id.as_deref().unwrap_or("<selected>"),
-                            reinstall,
-                            dry_run
-                        ),
-                        None,
-                    );
-                    Ok(())
-                }
-                Err(error) => {
-                    record_cli_audit_event(
-                        &paths,
-                        "app",
-                        if dry_run {
-                            "comfyui_install_dry_run"
-                        } else {
-                            "comfyui_install"
-                        },
-                        "error",
-                        format!(
-                            "ComfyUI install failed runtime={} reinstall={} dry_run={}: {error}",
-                            runtime_id.as_deref().unwrap_or("<selected>"),
-                            reinstall,
-                            dry_run
-                        ),
-                        None,
-                    );
-                    Err(error)
-                }
-            }
-        }
-        ComfyuiCommand::Start {
-            host,
-            port,
-            no_open_browser,
-            yes: _,
-        } => match comfyui::start(
-            &paths,
-            comfyui::ComfyUiStartOptions {
-                host,
-                port,
-                no_open_browser,
-            },
-        ) {
-            Ok(text) => {
-                print!("{text}");
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_start",
-                    "info",
-                    "ComfyUI start requested",
-                    None,
-                );
-                Ok(())
-            }
-            Err(error) => {
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_start",
-                    "error",
-                    format!("ComfyUI start failed: {error}"),
-                    None,
-                );
-                Err(error)
-            }
-        },
-        ComfyuiCommand::Stop { yes: _ } => match comfyui::stop(&paths) {
-            Ok(text) => {
-                print!("{text}");
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_stop",
-                    "info",
-                    "ComfyUI stop requested",
-                    None,
-                );
-                Ok(())
-            }
-            Err(error) => {
-                record_cli_audit_event(
-                    &paths,
-                    "app",
-                    "comfyui_stop",
-                    "error",
-                    format!("ComfyUI stop failed: {error}"),
-                    None,
-                );
-                Err(error)
-            }
-        },
     }
 }
 
@@ -1433,6 +1274,134 @@ pub(crate) mod tests {
         );
     }
 
+    /// The catalog manifest tells a caller that exit 2 is shared between an
+    /// unknown fix-id and a malformed command line. That claim is about clap,
+    /// which only this crate links, so it is proved here: a bad `rocm fix`
+    /// command line really exits with the code published for `unknown_id`,
+    /// through the same `clap_exit_code -> exit_code_for` chain `main` uses,
+    /// and the refusal has a line starting with the `error:` the description
+    /// tells a caller to look for (not `Usage:`, which a missing value does not
+    /// print). The
+    /// description's own wording is pinned in
+    /// `rocm-core` (`the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`).
+    #[test]
+    fn a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id() {
+        let manifest = rocm_core::catalog_manifest();
+        let published = manifest.exit_codes["unknown_id"];
+        for argv in [
+            &["rocm", "fix", "--no-such-option"][..],
+            &["rocm", "fix", "fix-9-igpu-dgpu", "--device-index"][..],
+            &[
+                "rocm",
+                "fix",
+                "fix-9-igpu-dgpu",
+                "--device-index",
+                "not-a-number",
+            ][..],
+        ] {
+            let err = super::cli_command()
+                .try_get_matches_from(argv)
+                .expect_err("a malformed command line must be a parse error");
+            let rendered = err.render().to_string();
+            assert!(
+                rendered.lines().any(|line| line.starts_with("error:"))
+                    && !rendered.contains(rocm_core::fix_exit::UNKNOWN_ID_PREFIX),
+                "{argv:?}: the description promises `error:` and no unknown-id message:\n{rendered}"
+            );
+            let result: Result<()> = Err(super::clap_exit_code(err));
+            assert_eq!(
+                super::exit_code_for(result),
+                ExitCode::from(published as u8),
+                "{argv:?}: a usage error must exit with the code the manifest names for it"
+            );
+        }
+        assert!(
+            manifest.exit_code_descriptions["unknown_id"].contains("malformed command line"),
+            "the published description must warn that a usage error exits {published} too"
+        );
+    }
+
+    /// A negative device index exits with one of two published codes, and the
+    /// catalog says which by how it is written: `--device-index=-1` reaches the
+    /// fix, which refuses it as `not_applicable`; `--device-index -1` never gets
+    /// past the parser, which reads `-1` as an unknown option, a usage error that
+    /// exits with the `unknown_id` code. Both go through the real parser and
+    /// the same exit path `main` uses, the first through `dispatch` as well.
+    /// Under `--dry-run`, so a lost guard in the runner would only preview.
+    ///
+    /// "Reaches the fix" holds on Windows and Linux, where fix-9 applies. On
+    /// WSL it does not apply, so `apply` returns 3 from the platform gate before
+    /// the runner, and the `=-1` half cannot notice a lost runner guard there;
+    /// `a_negative_device_index_is_not_applicable_and_nothing_runs` in
+    /// `rocm-core`'s `fix/runners.rs` holds the guard on every host.
+    #[test]
+    fn a_negative_device_index_reaches_the_fix_only_when_written_with_equals() {
+        let manifest = rocm_core::catalog_manifest();
+        let not_applicable = manifest.exit_codes["not_applicable"];
+        let unknown_id = manifest.exit_codes["unknown_id"];
+
+        let cli = super::Cli::try_parse_from([
+            "rocm",
+            "fix",
+            "fix-9-igpu-dgpu",
+            "--device-index=-1",
+            "--dry-run",
+        ])
+        .expect("`--device-index=-1` must parse: the fix, not the parser, refuses it");
+        assert!(
+            matches!(
+                cli.command,
+                Some(super::Command::Fix {
+                    device_index: Some(-1),
+                    ..
+                })
+            ),
+            "the parsed value must be -1"
+        );
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        let result = super::dispatch(cli);
+        drop(env);
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(not_applicable as u8),
+            "`--device-index=-1` must exit with the code published as not_applicable"
+        );
+
+        let err = super::cli_command()
+            .try_get_matches_from([
+                "rocm",
+                "fix",
+                "fix-9-igpu-dgpu",
+                "--device-index",
+                "-1",
+                "--dry-run",
+            ])
+            .expect_err("`--device-index -1` must be a usage error");
+        let rendered = err.render().to_string();
+        assert!(
+            rendered.lines().any(|line| line.starts_with("error:"))
+                && !rendered.contains(rocm_core::fix_exit::UNKNOWN_ID_PREFIX),
+            "`--device-index -1` must be refused as a usage error:\n{rendered}"
+        );
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(unknown_id as u8),
+            "`--device-index -1` must exit with the code published as unknown_id"
+        );
+
+        for (name, spelling) in [
+            ("not_applicable", "`--device-index=-1`"),
+            ("unknown_id", "`--device-index -1`"),
+        ] {
+            assert!(
+                manifest.exit_code_descriptions[name].contains(spelling),
+                "the {name} description must name {spelling}"
+            );
+        }
+    }
+
     /// Any other error must still fail with exit 1, matching what
     /// `Result<(), anyhow::Error>`'s `Termination` impl already does today for
     /// every subcommand other than `fix`.
@@ -1598,89 +1567,6 @@ pub(crate) mod tests {
                 "the update path must name itself as the approval source: {line}"
             );
         }
-    }
-
-    /// Regression test for the engine child-stdin write under the process-wide
-    /// `SIG_DFL` that `main` installs via [`reset_sigpipe`]. If an engine child
-    /// exits before reading its stdin, the parent's write to that pipe must
-    /// surface as a `BrokenPipe` error — handled by the caller's diagnostics —
-    /// rather than killing `rocm` with SIGPIPE before those diagnostics run.
-    ///
-    /// The bug only reproduces under `SIG_DFL`; the test harness leaves SIGPIPE
-    /// at Rust's default `SIG_IGN`, and flipping it process-wide would race
-    /// sibling tests. So this re-execs itself in fresh processes that install
-    /// `SIG_DFL` first, and checks BOTH directions:
-    /// - unguarded write to a dead child's stdin is fatal (killed by SIGPIPE) —
-    ///   this is the regression the plain `SIG_DFL` reset introduced;
-    /// - the same write wrapped in [`with_sigpipe_ignored`] survives and returns
-    ///   an error instead — this is the fix.
-    ///
-    /// Each child reaps its short-lived grandchild before writing, so the read
-    /// end is closed deterministically and the outcome does not race.
-    #[cfg(unix)]
-    #[test]
-    fn engine_stdin_write_under_sig_dfl_is_guarded_not_fatal() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        // Grandchild helper: reproduce main()'s SIG_DFL, spawn a process that
-        // exits immediately, reap it, then write to its now-closed stdin. The
-        // "guarded" arm wraps the write; the "unguarded" arm does not.
-        if let Some(mode) = std::env::var_os("ROCM_TEST_SIGPIPE_ARM") {
-            reset_sigpipe();
-            let mut grandchild = ProcessCommand::new("true")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn a process that exits immediately");
-            let mut stdin = grandchild.stdin.take().expect("grandchild stdin");
-            grandchild.wait().expect("reap grandchild");
-            // Heap-allocated so the buffer doesn't trip clippy::large-stack-arrays;
-            // it must exceed the pipe buffer so the write actually reaches the
-            // closed read end rather than being swallowed by kernel buffering.
-            let payload = vec![b'x'; 64 * 1024];
-            if mode == "guarded" {
-                let result = with_sigpipe_ignored(|| stdin.write_all(&payload));
-                assert!(
-                    result.is_err(),
-                    "guarded write to a dead pipe should return BrokenPipe, not succeed"
-                );
-            } else {
-                // Unguarded: under SIG_DFL this write delivers SIGPIPE and never
-                // returns. If the process somehow survives, exit 0 so the parent's
-                // "should have been signalled" assertion fails loudly.
-                let _ = stdin.write_all(&payload);
-            }
-            return;
-        }
-
-        let exe = std::env::current_exe().expect("current test executable");
-        let run_arm = |mode: &str| -> ExitStatus {
-            ProcessCommand::new(&exe)
-                .args([
-                    "tests::engine_stdin_write_under_sig_dfl_is_guarded_not_fatal",
-                    "--exact",
-                    "--nocapture",
-                ])
-                .env("ROCM_TEST_SIGPIPE_ARM", mode)
-                .status()
-                .expect("re-exec the test arm in a child process")
-        };
-
-        let unguarded = run_arm("unguarded");
-        assert_eq!(
-            unguarded.signal(),
-            Some(libc::SIGPIPE),
-            "sanity check: an unguarded stdin write under SIG_DFL must be killed by \
-             SIGPIPE (got {unguarded:?}); if not, the test no longer proves the guard matters"
-        );
-
-        let guarded = run_arm("guarded");
-        assert!(
-            guarded.success(),
-            "guarded child-stdin write was fatal under SIG_DFL ({guarded:?}) — \
-             SIGPIPE reached the process instead of surfacing as an error"
-        );
     }
 
     #[test]
@@ -2007,7 +1893,7 @@ pub(crate) mod tests {
         Ok(record)
     }
 
-    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// Everything [`plant_service_record`] writes *except* the owner-only endpoint
     /// key: the manifest, the log, and the engine state file.
     ///
     /// Split out for the launch-lock test below, which writes the key itself —

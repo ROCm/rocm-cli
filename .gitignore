@@ -20,6 +20,10 @@ __pycache__/
 /plans/
 /workspace/
 /e2e-consolidated-report.md
+# Default outputs of the rocm-dash-tui gen_cast and gen_screenshots examples when
+# run from the repository root.
+/rocm-dash.cast
+/screenshots/
 
 # Sphinx docs: _toc.yml is generated from _toc.yml.in at build time
 docs/rocm-docs/sphinx/_toc.yml

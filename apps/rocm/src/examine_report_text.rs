@@ -9,7 +9,7 @@
 //! Relocated from `main.rs` with no behavior change (see
 //! `docs/architecture.md`). The `rocm model` catalog renderer used to live
 //! here too; it moved to `model_catalog_text.rs`, which this module does not
-//! call into outside its own tests.
+//! call into.
 //!
 //! This module owns: the launch-summary/examine text surfaces
 //! (`render_launch_summary`, `render_examine_text`,
@@ -29,8 +29,8 @@
 //! `launch_default` calls `render_launch_summary`, re-imported there.
 //! `render_examine_text`, `render_examine_text_with_paths` and
 //! `render_engine_inventory_text_with_paths` are `pub(crate)`, read from
-//! [`chat.rs`](../apps/rocm/src/chat.rs)'s deterministic tool-output
-//! summaries; `render_engine_inventory_text_with_paths` is also read from
+//! [`chat/mcp_bridge.rs`](../apps/rocm/src/chat/mcp_bridge.rs)'s read-only
+//! command runner; `render_engine_inventory_text_with_paths` is also read from
 //! [`engines_cmd.rs`](../apps/rocm/src/engines_cmd.rs)'s
 //! `render_engine_inventory_text`. `append_examine_runtime_state` is also
 //! `pub(crate)`, read only from
@@ -49,11 +49,9 @@
 //! The regression tests for these surfaces live in this module's own
 //! `mod tests`, reaching the shared `test_paths` fixture through
 //! `crate::tests::` and `write_test_pip_runtime` through
-//! `crate::test_support::`. One of them,
-//! `linux_only_engine_runtime_status_is_explicit_on_native_windows`, also
-//! calls `model_catalog_text.rs`'s `model_registry_adapter_availability_note`,
-//! which is `pub(crate)` for that reason; its primary subject is
-//! `engine_runtime_status_label`, so it stays here.
+//! `crate::test_support::`. The note the `rocm model --verbose` listing prints
+//! for a rule-out engine is tested in `model_catalog_text.rs`, next to the
+//! renderer that prints it.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -578,7 +576,6 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::model_catalog_text::model_registry_adapter_availability_note;
     use crate::runtimes_cmd::runtime_manifest_path;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::test_paths;
@@ -891,13 +888,8 @@ mod tests {
                 engine_runtime_status_label("vllm", &detect),
                 "unsupported_native_windows"
             );
-            assert!(
-                model_registry_adapter_availability_note("vllm", &|| true)
-                    .is_some_and(|note| note.contains("unsupported_native_windows"))
-            );
         } else {
             assert_eq!(engine_runtime_status_label("vllm", &detect), "not found");
-            assert!(model_registry_adapter_availability_note("vllm", &|| true).is_none());
         }
     }
 

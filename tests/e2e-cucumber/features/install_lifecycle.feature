@@ -309,9 +309,11 @@ Feature: Release install lifecycle
     And the record of the installer's PATH change is gone
 
   @id:lifecycle-linux-uninstall-keep-binaries-keeps-path @lifecycle @requires-os:linux
-  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change
+  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change and the fish completions
     Given a freshly built release tree
     And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
     And a signed bundle installed with the shell profile updated
     And the installed binary has isolated XDG directories with state
     When the user uninstalls from the installed binary keeping the binaries
@@ -319,6 +321,7 @@ Feature: Release install lifecycle
     And uninstall reports keeping the PATH change with the binaries
     And the installed rocm and rocmd binaries are present
     And the shell profile still adds the install directory to PATH
+    And the fish completions are still in place
     And the record of the installer's PATH change is still in the install directory
 
   @id:lifecycle-linux-uninstall-path-failure-keeps-binaries @lifecycle @requires-os:linux
@@ -406,10 +409,117 @@ Feature: Release install lifecycle
     And the installer next-step hint names the installed rocm binary
     And the installer output has no ANSI escapes
 
+  @id:lifecycle-linux-fish-configured-from-bash @lifecycle @requires-os:linux
+  Scenario: lifecycle-32 - Linux - a bash login shell on a machine with fish also gets fish's PATH and completions, and uninstall undoes both
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And the shell profile already holds the user's own settings
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    Then the fish config adds the install directory to PATH once
+    And the fish completions for the installed rocm are in place
+    When the signed bundle is reinstalled with the shell profile updated
+    Then the fish config adds the install directory to PATH once
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the shell profile is back to the user's own settings
+    And the fish config is back to the user's own settings
+    And the fish completions for the uninstalled rocm are gone
+    And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-fish-completions-not-ours-kept @lifecycle @requires-os:linux
+  Scenario: lifecycle-33 - Linux - uninstall leaves fish completions the installer did not write, and says so
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    And the user has replaced the fish completions with their own
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And uninstall leaves the user's own fish completions in place and says why
+
+  @id:lifecycle-linux-fish-completions-removal-failure-warns @lifecycle @requires-os:linux
+  Scenario: lifecycle-34 - Linux - fish completions that cannot be removed are a warning, and the rest of the uninstall still happens
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    And the fish completions folder cannot be written to
+    When the user uninstalls from the installed binary
+    Then uninstall warns that the fish completions could not be removed and still finishes
+    And the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-fish-existing-completions-left-alone @lifecycle @requires-os:linux
+  Scenario: lifecycle-35 - Linux - the installer leaves a rocm.fish it did not write, says so, and uninstall leaves it too
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And the user already has their own fish completions
+    And a signed bundle installed with the shell profile updated
+    Then the installer leaves the user's own fish completions and says why
+    And the fish config adds the install directory to PATH once
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the user's own fish completions are untouched
+
+  # ── Default trust: the pinned release key with no signature requested ──
+  #
+  # Every other install here asks for a signature (ROCM_CLI_REQUIRE_SIGNATURE=1),
+  # so lifecycle-03 and -06 stay green under a regression that only bites when
+  # nobody asked. These two run as a user does, without asking:
+  #
+  # - lifecycle-36 installs a specific version with the variable set to 0, so
+  #   only the pinned-key fallback is left to force the check (the release
+  #   channel's own signature requirement does not apply). It catches an
+  #   installer that verifies only when ROCM_CLI_REQUIRE_SIGNATURE is set, and
+  #   one that verifies only when a signature is required, not merely when a
+  #   key resolves.
+  # - lifecycle-37 is a release install with the variable unset and no .sig. It
+  #   catches an installer that verifies only when ROCM_CLI_REQUIRE_SIGNATURE is
+  #   set, and one that tolerates a missing .sig unless that variable is set,
+  #   which lifecycle-36 (the .sig is there) and lifecycle-06 (the variable is
+  #   set) both miss. It does not catch an installer that verifies only when a
+  #   signature is required: the release channel's signature floor requires one,
+  #   which masks that regression here.
+  #
+  # Neither can detect removal of the release channel's signature floor: while a
+  # release key is pinned, a resolved key already forces the check. Nor does
+  # lifecycle-36 check that the harness passes its channel through: if the step
+  # silently ran a release install instead, the floor would force the same
+  # rejection, and the second regression above would go unnoticed.
+
+  @id:lifecycle-linux-default-rejects-untrusted-signer @lifecycle @requires-os:linux
+  Scenario: lifecycle-36 - Linux - installing a specific version with the signature requirement turned off still checks the pinned release key and rejects an untrusted signer
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the user has turned the installer's signature requirement off
+    When the release is packaged and signed with the private key file
+    And a specific version of the signed bundle is installed with no public key supplied
+    Then the install fails reporting signature verification failed
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-default-rejects-missing-signature @lifecycle @requires-os:linux
+  Scenario: lifecycle-37 - Linux - a release install that asks for nothing still rejects a bundle with no signature
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the user has not asked the installer to require a signature
+    When the release is packaged and signed with the private key file
+    And the bundle signature sidecar is removed
+    And the signed bundle is installed with no public key supplied
+    Then the install fails reporting the required signature is missing
+    And no binaries are activated in the target directory
+
   # ── Download progress rendering ────────────────────────────────────────
 
   @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
-  Scenario: lifecycle-32 - Linux - a download draws one progress bar that stays inside the terminal
+  Scenario: lifecycle-38 - Linux - a download draws one progress bar that stays inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -419,7 +529,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-33 - Linux - a terminal too narrow for a bar downloads quietly and says why
+  Scenario: lifecycle-39 - Linux - a terminal too narrow for a bar downloads quietly and says why
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -428,7 +538,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
-  Scenario: lifecycle-34 - Linux - the wget fallback keeps its progress bar inside the terminal
+  Scenario: lifecycle-40 - Linux - the wget fallback keeps its progress bar inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -438,7 +548,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-piped-into-shell @lifecycle @requires-os:linux
-  Scenario: lifecycle-35 - Linux - piping the installer into a shell still sizes the bar from the terminal
+  Scenario: lifecycle-41 - Linux - piping the installer into a shell still sizes the bar from the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -448,7 +558,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-unsized-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-36 - Linux - a terminal reporting no size still gets a progress bar
+  Scenario: lifecycle-42 - Linux - a terminal reporting no size still gets a progress bar
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -458,7 +568,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-zero-padded-columns @lifecycle @requires-os:linux
-  Scenario: lifecycle-37 - Linux - a zero-padded COLUMNS does not abort the install
+  Scenario: lifecycle-43 - Linux - a zero-padded COLUMNS does not abort the install
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file

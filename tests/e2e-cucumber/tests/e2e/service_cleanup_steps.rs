@@ -18,14 +18,14 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 
 /// Id of the record every scenario here plants.
-const SERVICE_ID: &str = "vllm-e2e-cleanup";
+pub(crate) const SERVICE_ID: &str = "vllm-e2e-cleanup";
 /// Engine name, which also picks the engine state directory the record's third
 /// file lives in (`<data>/engines/vllm/state/`).
 const ENGINE: &str = "vllm";
 /// A record whose manifest a user already deleted by hand, leaving its engine
 /// state file stranded — the state this feature has to be able to clean up.
 const ORPHAN_ID: &str = "vllm-e2e-hand-deleted";
-/// A service whose `rocm serve` has written its 0600 endpoint key but not yet
+/// A service whose `rocm serve` has written its owner-only endpoint key but not yet
 /// its record — the launch-in-progress shape the leftover sweep must not
 /// mistake for something to delete.
 const STARTING_ID: &str = "vllm-e2e-still-starting";
@@ -62,7 +62,7 @@ fn data_dir(world: &E2eWorld) -> PathBuf {
         .join("data")
 }
 
-fn services_dir(world: &E2eWorld) -> PathBuf {
+pub(crate) fn services_dir(world: &E2eWorld) -> PathBuf {
     data_dir(world).join("services")
 }
 
@@ -96,7 +96,7 @@ fn record_files(world: &E2eWorld) -> Vec<PathBuf> {
 ///
 /// The engine state file must agree with `status`: the CLI adopts whatever that
 /// file says before it decides anything else.
-fn plant_record(world: &E2eWorld, status: &str) {
+pub(crate) fn plant_record(world: &E2eWorld, status: &str) {
     let services = services_dir(world);
     let states = engine_state_dir(world);
     std::fs::create_dir_all(&services).expect("failed to create services dir");
@@ -166,6 +166,31 @@ fn lists_live_server_row(listed: &str) -> bool {
         .any(|line| line.trim_end().strip_prefix("- ") == Some(SERVICE_ID))
 }
 
+/// Where a `rocm` save of `id`'s endpoint key that was killed between writing
+/// the key and putting it in place leaves its copy: the shared atomic writer's
+/// staged file, `{key file}.tmp-{pid}-{millis}-{attempt}`.
+fn leftover_key_copy(world: &E2eWorld, id: &str) -> PathBuf {
+    services_dir(world).join(format!("{id}.endpoint-key.tmp-4242-1700000000000-0"))
+}
+
+/// Plant that leftover copy, after checking the CLI's own reader takes the
+/// name for a staged copy of `id`'s key — so a change to the writer's naming
+/// fails here, as a premise, rather than as a mysterious survivor later.
+fn plant_leftover_key_copy(world: &E2eWorld, id: &str) {
+    let copy = leftover_key_copy(world, id);
+    let name = copy
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 name");
+    assert_eq!(
+        rocm_core::atomic_write::staged_destination_name(name),
+        Some(format!("{id}.endpoint-key").as_str()),
+        "premise: {name} must read as a staged copy of {id}'s key"
+    );
+    std::fs::create_dir_all(services_dir(world)).expect("failed to create services dir");
+    std::fs::write(&copy, "e2e-endpoint-key").expect("failed to write the leftover key copy");
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a local server record that is no longer running")]
@@ -230,6 +255,16 @@ async fn engine_state_cannot_be_deleted(world: &mut E2eWorld) {
     );
 }
 
+#[given("an interrupted save left a second copy of that server's API key")]
+async fn leftover_copy_of_the_record_key(world: &mut E2eWorld) {
+    plant_leftover_key_copy(world, SERVICE_ID);
+}
+
+#[given("an interrupted save left a copy of the API key of the record deleted by hand")]
+async fn leftover_copy_of_the_orphan_key(world: &mut E2eWorld) {
+    plant_leftover_key_copy(world, ORPHAN_ID);
+}
+
 #[given("an engine state file whose local server record was deleted by hand")]
 async fn orphaned_engine_state(world: &mut E2eWorld) {
     let states = engine_state_dir(world);
@@ -242,7 +277,7 @@ async fn orphaned_engine_state(world: &mut E2eWorld) {
 }
 
 /// A managed launch caught between its two writes, staged exactly as `rocm
-/// serve` stages it: the 0600 endpoint key is on disk, the record is not, and
+/// serve` stages it: the owner-only endpoint key is on disk, the record is not, and
 /// the managed-launch lock is held across the whole of that interval.
 ///
 /// The lock is taken with the production [`rocm_core::FileLock`] on the real
@@ -547,7 +582,7 @@ async fn prune_did_not_return_before_the_hold(world: &mut E2eWorld) {
     );
 }
 
-/// The scenario's discriminating assertion: the 0600 key of a launch that has
+/// The scenario's discriminating assertion: the owner-only key of a launch that has
 /// not published its record yet must survive the sweep.
 ///
 /// It discriminates only while `rocm`'s startup is shorter than the staged hold.
@@ -579,6 +614,53 @@ async fn starting_key_present(world: &mut E2eWorld) {
     assert!(
         services.join(format!("{STARTING_ID}.json")).exists(),
         "premise: the staged launch must have published its record:\n{}",
+        combined_output(world)
+    );
+}
+
+#[then("the second copy of that server's API key is gone")]
+async fn record_key_copy_gone(world: &mut E2eWorld) {
+    let copy = leftover_key_copy(world, SERVICE_ID);
+    assert!(
+        !copy.exists(),
+        "{} holds the key and must be deleted with the record:\n{}",
+        copy.display(),
+        combined_output(world)
+    );
+}
+
+/// The four planted files plus the leftover copy: the summary's count is how
+/// the user learns that more than the four usual files went.
+#[then("the CLI counts that copy among the files it removed")]
+async fn counts_the_key_copy(world: &mut E2eWorld) {
+    let combined = combined_output(world);
+    assert!(
+        combined.contains("files removed: 5"),
+        "the removal must count the leftover key copy (4 record files + 1):\n{combined}"
+    );
+}
+
+#[then("the preview lists the leftover copy of the API key")]
+async fn preview_lists_the_key_copy(world: &mut E2eWorld) {
+    let copy = leftover_key_copy(world, ORPHAN_ID);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&copy.display().to_string()),
+        "the preview must name the leftover key copy {}:\n{combined}",
+        copy.display()
+    );
+    assert!(
+        copy.exists(),
+        "a preview must not delete the leftover key copy"
+    );
+}
+
+#[then("the leftover copy of the API key is gone")]
+async fn orphan_key_copy_gone(world: &mut E2eWorld) {
+    let copy = leftover_key_copy(world, ORPHAN_ID);
+    assert!(
+        !copy.exists(),
+        "the leftover key copy of a deleted record must be swept:\n{}",
         combined_output(world)
     );
 }
@@ -694,5 +776,203 @@ fn assert_succeeded(world: &E2eWorld) {
         0,
         "expected success, got rc={rc}:\n{}",
         combined_output(world)
+    );
+}
+
+// ── A record held by a process `rocm` cannot query ─────────────────
+
+/// A PID no host is using, which the `e2e-test-hooks` build is told to read as
+/// "cannot be queried" (`ROCM_E2E_UNQUERYABLE_PIDS`).
+const UNQUERYABLE_PID: u32 = 2_000_000_001;
+
+/// Rewrite fields of the planted manifest.
+fn set_manifest_fields(world: &E2eWorld, fields: &[(&str, serde_json::Value)]) {
+    let manifest = services_dir(world).join(format!("{SERVICE_ID}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest).expect("failed to read the planted manifest"),
+    )
+    .expect("failed to parse the planted manifest");
+    for (key, value) in fields {
+        record[*key] = value.clone();
+    }
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to rewrite the planted manifest");
+}
+
+/// Make the next `rocm` invocation read [`UNQUERYABLE_PID`] as unqueryable.
+fn script_unqueryable(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_E2E_UNQUERYABLE_PIDS",
+        UNQUERYABLE_PID.to_string().into(),
+    ));
+}
+
+#[given("a local server record whose recorded process cannot be queried")]
+async fn record_with_unqueryable_process(world: &mut E2eWorld) {
+    plant_record(world, "ready");
+    set_manifest_fields(
+        world,
+        &[("supervisor_pid", serde_json::json!(UNQUERYABLE_PID))],
+    );
+}
+
+#[given("a local server record whose recorded process is running and whose stop was requested")]
+async fn record_with_running_process(world: &mut E2eWorld) {
+    plant_record(world, "ready");
+    // A real process the scenario owns, so the teardown (which stops every
+    // record left behind) ends it rather than the harness.
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start the recorded process");
+    set_manifest_fields(
+        world,
+        &[
+            ("supervisor_pid", serde_json::json!(child.id())),
+            ("stop_requested_unix_ms", serde_json::json!(1)),
+        ],
+    );
+    world.recorded_process = Some(child);
+}
+
+#[when("the user stops that local server while its process cannot be queried")]
+async fn stop_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "stop", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user removes that local server record while its process cannot be queried")]
+async fn remove_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "remove", SERVICE_ID, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user force-removes that local server record while its process cannot be queried")]
+async fn force_remove_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["services", "remove", SERVICE_ID, "--force", "--yes"],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user prunes every record whatever its age while its process cannot be queried")]
+async fn prune_unqueryable(world: &mut E2eWorld) {
+    script_unqueryable(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "prune", "--any-age", "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI leaves the record alone and names the forced removal")]
+async fn prune_leaves_and_names_force(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&format!(
+            "{SERVICE_ID} is "
+        )) && combined.contains(&format!(
+            "process {UNQUERYABLE_PID} it recorded could not be queried - remove it with `rocm services remove {SERVICE_ID} --force --yes`"
+        )),
+        "{combined}"
+    );
+}
+
+#[when("the user force-removes that local server record")]
+async fn force_remove(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["services", "remove", SERVICE_ID, "--force", "--yes"],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI reports the stop as not confirmed because the process could not be queried")]
+async fn stop_not_confirmed_unverified(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(rc, 0, "an unverified stop must exit non-zero:\n{combined}");
+    assert!(
+        combined.contains("Local server stop not confirmed"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!("not signaled: process {UNQUERYABLE_PID}")),
+        "{combined}"
+    );
+    // The check the stop names is the host's own command, and names the PID.
+    assert!(
+        combined.contains(&format!("ps -p {UNQUERYABLE_PID} -o pid,args"))
+            || combined.contains(&format!("tasklist /FI \"PID eq {UNQUERYABLE_PID}\"")),
+        "{combined}"
+    );
+    // What the stop says it kept is what is on disk: the record names the
+    // process and the stop request is recorded.
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(services_dir(world).join(format!("{SERVICE_ID}.json")))
+            .expect("the record must still be there"),
+    )
+    .expect("the record must parse");
+    assert_eq!(manifest["supervisor_pid"], UNQUERYABLE_PID, "{manifest}");
+    assert!(manifest["stop_requested_unix_ms"].is_u64(), "{manifest}");
+}
+
+#[then("the CLI refuses the removal and names the forced removal")]
+async fn refuses_and_names_force(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(rc, 0, "{combined}");
+    assert!(
+        combined.contains(&format!(
+            "process {UNQUERYABLE_PID} it recorded could not be queried"
+        )),
+        "{combined}"
+    );
+    // The command the refusal names is the one the next step runs.
+    assert!(
+        combined.contains(&format!("rocm services remove {SERVICE_ID} --force --yes")),
+        "{combined}"
+    );
+}
+
+#[then("the CLI removes the record and says its process could not be queried")]
+async fn force_removed(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains(&format!(
+            "--force: process {UNQUERYABLE_PID} could not be queried"
+        )),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("Local server record removed"),
+        "{combined}"
+    );
+}
+
+#[then("the CLI refuses the forced removal because the record does not qualify")]
+async fn refuses_force(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert_ne!(rc, 0, "{combined}");
+    assert!(
+        combined.contains("--force removes a record only when"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!("rocm services stop {SERVICE_ID} --yes")),
+        "{combined}"
     );
 }

@@ -7,13 +7,14 @@
 //!
 //! Split out of `agent.rs` to keep the `AgentClient` seam focused. The shared
 //! seam types (`StateSnapshot`, `AgentError`, `AgentClient`, `InferenceParams`,
-//! `REQUEST_TIMEOUT`) stay in `agent/mod.rs`; the rig `Tool` registration these
+//! `request_timeout`) stay in `agent/mod.rs`; the rig `Tool` registration these
 //! backends call into lives in `agent::tools`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use rocm_dash_core::chat_template::local_model_should_disable_thinking;
 use tracing::{error, info, warn};
 
 use crate::app::{ChatRole, ChatTurn};
@@ -26,7 +27,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::tools::{
     FiredLog, register_rocm_mutating_tools, register_rocm_read_tools, register_telemetry_tools,
 };
-use super::{AgentClient, AgentError, InferenceParams, REQUEST_TIMEOUT, StateSnapshot};
+use super::{AgentClient, AgentError, InferenceParams, StateSnapshot, request_timeout};
 
 /// Max tool-calling turns the model may take before producing a final answer.
 const MAX_TOOL_TURNS: usize = 5;
@@ -37,17 +38,31 @@ const MAX_TOOL_TURNS: usize = 5;
 /// Used as the fallback when no explicit `--max-tokens` is configured.
 const MAX_AGENT_TOKENS: u64 = 1024;
 
-/// Apply the optional sampling controls to a fresh Rig `AgentBuilder`.
+/// Apply the optional sampling controls, plus any chat-template defaults the
+/// named model needs, to a fresh Rig `AgentBuilder`.
 ///
 /// `max_tokens` always resolves to a concrete value (the CLI override or the
 /// shared [`MAX_AGENT_TOKENS`] default). `temperature` maps to the builder's
-/// native `.temperature()`; `top_p` has no dedicated builder method in
-/// rig-core, so it rides in `.additional_params({"top_p": ..})`, which the
-/// provider merges into the request body. Both are set only when supplied, so
-/// an unset knob leaves the request untouched.
+/// native `.temperature()`. The rest have no dedicated builder method in
+/// rig-core and ride in `.additional_params(..)`, which the provider flattens
+/// into the request body:
+///
+/// - `top_p`, when supplied;
+/// - `chat_template_kwargs.enable_thinking = false`, when `model` names a
+///   model whose chat template would otherwise reason without a budget (see
+///   [`local_model_should_disable_thinking`]). `model` is `Some` only for the
+///   OpenAI-compatible backend, which is the one that can be pointed at a
+///   locally served model.
+///
+/// Both are collected into ONE object and set with a single
+/// `.additional_params(..)` call, because rig-core 0.38.1's builder *replaces*
+/// that field rather than merging into it — calling it twice silently drops
+/// whatever the first call set. An empty object is not sent at all, so a
+/// request with neither knob set stays byte-for-byte what it was.
 fn apply_inference_params<M, P>(
     builder: rig::agent::AgentBuilder<M, P>,
     params: &InferenceParams,
+    model: Option<&str>,
 ) -> rig::agent::AgentBuilder<M, P>
 where
     M: rig::completion::CompletionModel,
@@ -57,8 +72,18 @@ where
     if let Some(temperature) = params.temperature {
         builder = builder.temperature(f64::from(temperature));
     }
+    let mut additional = serde_json::Map::new();
     if let Some(top_p) = params.top_p {
-        builder = builder.additional_params(serde_json::json!({ "top_p": top_p }));
+        additional.insert("top_p".to_string(), serde_json::json!(top_p));
+    }
+    if model.is_some_and(local_model_should_disable_thinking) {
+        additional.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({ "enable_thinking": false }),
+        );
+    }
+    if !additional.is_empty() {
+        builder = builder.additional_params(serde_json::Value::Object(additional));
     }
     builder
 }
@@ -166,7 +191,8 @@ pub fn annotate_reply(reply: String, fired: &[String]) -> String {
 }
 
 /// Drive a built rig prompt request to completion under the shared
-/// [`REQUEST_TIMEOUT`], then annotate the reply with the tools that fired.
+/// [`request_timeout`] budget, then annotate the reply with the tools that
+/// fired.
 ///
 /// The shared `complete()` tail, called from [`run_agent_request`] — the one
 /// call site all three backends (RigAgentClient, ChatGptAgentClient,
@@ -192,16 +218,31 @@ where
     F: std::future::IntoFuture<Output = Result<String, E>>,
     E: std::fmt::Display,
 {
+    finish_agent_request_within(request_timeout(), backend, req, fired).await
+}
+
+/// [`finish_agent_request`] with the budget passed in, so a test can drive the
+/// timeout path without touching the process environment.
+async fn finish_agent_request_within<F, E>(
+    budget: std::time::Duration,
+    backend: &'static str,
+    req: F,
+    fired: &FiredLog,
+) -> Result<String, AgentError>
+where
+    F: std::future::IntoFuture<Output = Result<String, E>>,
+    E: std::fmt::Display,
+{
     let started = Instant::now();
     info!(backend, "chat request start");
-    let reply = match tokio::time::timeout(REQUEST_TIMEOUT, req.into_future()).await {
+    let reply = match tokio::time::timeout(budget, req.into_future()).await {
         Err(_) => {
             warn!(
                 backend,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "chat request timed out"
             );
-            return Err(AgentError::Timeout);
+            return Err(AgentError::Timeout(budget.as_secs()));
         }
         Ok(Err(e)) => {
             error!(
@@ -240,9 +281,17 @@ where
 /// shared site. A backend with ordering constraints (ChatGPT's auth must not
 /// run on an empty history) does its own cheap `history.is_empty()` guard
 /// first — see `ChatGptAgentClient::complete` — without needing the split.
+///
+/// `model` carries the model id for the OpenAI-compatible backend, the one
+/// that can be pointed at a locally served model, so
+/// [`apply_inference_params`] can add the chat-template defaults such a model
+/// needs. The hosted backends pass `None`: their models are never served
+/// locally, and an unrecognised key on a hosted request is a needless risk.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_request<M, P>(
     agent: rig::agent::AgentBuilder<M, P>,
     params: &InferenceParams,
+    model: Option<&str>,
     executor: Option<&SharedRocmToolExecutor>,
     approval_tx: Option<&UnboundedSender<ClientMsg>>,
     history: &[ChatTurn],
@@ -262,7 +311,7 @@ where
     let snap = Arc::new(snapshot);
     let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
-    let agent = apply_inference_params(agent, params);
+    let agent = apply_inference_params(agent, params, model);
     // Telemetry tools (shared registration site).
     let agent = register_telemetry_tools(agent, &snap, &fired);
     // Read-only ROCm machine-inspection tools (forward across the seam).
@@ -373,6 +422,7 @@ where
         run_agent_request(
             agent,
             &self.params,
+            Some(self.model.as_str()),
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
             history,
@@ -627,6 +677,7 @@ where
         run_agent_request(
             agent,
             &self.params,
+            None,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
             history,
@@ -722,6 +773,7 @@ where
         run_agent_request(
             agent,
             &self.params,
+            None,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
             history,
@@ -851,6 +903,95 @@ mod tests {
     use crate::agent::{
         ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, TELEMETRY_TOOL_NAMES, fixture_snapshot,
     };
+
+    /// A request still running when its budget ends is reported as a timeout
+    /// that names the budget it was actually given, not a fixed number.
+    #[tokio::test]
+    async fn a_request_that_outlives_its_budget_times_out_naming_that_budget() {
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+        let never = std::future::pending::<Result<String, String>>();
+
+        let err =
+            finish_agent_request_within(std::time::Duration::from_secs(1), "test", never, &fired)
+                .await
+                .expect_err("a request that never answers must time out");
+
+        assert!(matches!(err, AgentError::Timeout(1)), "{err:?}");
+    }
+
+    /// The other half of the budget: a reply that arrives after a delay but
+    /// inside the budget reaches `annotate_reply` rather than the timeout arm.
+    /// The budget is passed in here, so this pins the in-budget branch, not the
+    /// default's size — `the_budget_and_its_upper_bound_are_the_values_the_docs_promise`
+    /// in `agent` is what holds the 2 minutes.
+    #[tokio::test]
+    async fn a_slow_reply_inside_its_budget_is_returned_not_cancelled() {
+        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok::<String, String>("hello".to_owned())
+        };
+
+        let reply =
+            finish_agent_request_within(std::time::Duration::from_secs(30), "test", slow, &fired)
+                .await
+                .expect("a reply inside the budget must be returned");
+
+        assert!(reply.contains("hello"), "{reply}");
+    }
+
+    /// Serializes the tests that write `ROCM_DASH_CHAT_TIMEOUT_SECS`, as the
+    /// repo's environment-mutation contract (`xtask`'s `env_mutation_contract`)
+    /// requires of any test that calls `set_var`.
+    static CHAT_TIMEOUT_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The wiring the two tests above cannot see: that the real request path
+    /// takes its budget from `ROCM_DASH_CHAT_TIMEOUT_SECS`. They hand
+    /// `finish_agent_request_within` a budget directly, and `parse_request_timeout`
+    /// is tested on its own, so a `finish_agent_request` that went back to a fixed
+    /// constant would pass every one of them. This drives `finish_agent_request`
+    /// itself, with a request that never answers, and expects the 1 s the
+    /// environment asked for, not the 2 minute default.
+    ///
+    /// A plain `#[test]` that builds its own runtime, rather than a
+    /// `#[tokio::test]`: the lock has to be held across the whole run, and a
+    /// `std` mutex guard held over an `.await` is what `clippy::await_holding_lock`
+    /// rejects.
+    #[test]
+    fn the_request_path_honours_the_chat_timeout_environment_variable() {
+        let _guard = CHAT_TIMEOUT_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized against the other writers by
+        // `CHAT_TIMEOUT_ENV_TEST_LOCK`. The tests that only read the variable,
+        // through `finish_agent_request`, are offline and finish in milliseconds,
+        // inside the 1 s it holds for.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(crate::agent::REQUEST_TIMEOUT_ENV, "1");
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+            let never = std::future::pending::<Result<String, String>>();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("build a runtime for the request");
+
+            let err = runtime
+                .block_on(finish_agent_request("test", never, &fired))
+                .expect_err("a request that never answers must time out");
+
+            assert!(matches!(err, AgentError::Timeout(1)), "{err:?}");
+        }));
+        // Restored before the result is surfaced, so a failed assertion cannot
+        // leave the override set for the rest of the test binary.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(crate::agent::REQUEST_TIMEOUT_ENV);
+        }
+        result.unwrap();
+    }
 
     /// A throwaway, never-pre-existing directory for
     /// `ChatGptAgentClient::new_in`'s OAuth token cache, so a test builds a
@@ -1782,6 +1923,7 @@ mod tests {
             &params,
             None,
             None,
+            None,
             &history,
             fixture_snapshot(),
             "mock-test",
@@ -1879,6 +2021,7 @@ mod tests {
             &params,
             None,
             None,
+            None,
             &history,
             fixture_snapshot(),
             "mock-test",
@@ -1972,6 +2115,7 @@ mod tests {
             &InferenceParams::default(),
             None,
             None,
+            None,
             &[],
             fixture_snapshot(),
             "mock-test",
@@ -2017,6 +2161,7 @@ mod tests {
         let reply = run_agent_request(
             agent,
             &InferenceParams::default(),
+            None,
             Some(&exec),
             Some(&tx),
             &history,
@@ -2249,6 +2394,56 @@ mod tests {
     /// if the test builds its client with `DEFAULT_PREAMBLE` itself.
     const TEST_PREAMBLE: &str = "test-only preamble, distinct from the production default";
 
+    /// Build a `RigAgentClient` whose HTTP client is a
+    /// [`rig::test_utils::RecordingHttpClient`] scripted with one successful
+    /// OpenAI chat completion, returning both so the caller can drive a real
+    /// `complete()` and then read the request that reached the wire.
+    ///
+    /// `RigAgentClient<H>`'s `H` (HTTP client) type parameter — defaulted to
+    /// the live `reqwest::Client` for production — exists for exactly this.
+    fn rig_client_over_recorded_response(
+        model: &str,
+        params: InferenceParams,
+    ) -> (
+        RigAgentClient<rig::test_utils::RecordingHttpClient>,
+        rig::test_utils::RecordingHttpClient,
+    ) {
+        use rig::test_utils::RecordingHttpClient;
+
+        let response_body = serde_json::to_vec(&json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": model,
+            "system_fingerprint": null,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "GPU 0 is healthy."},
+                "logprobs": null,
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "total_tokens": 2},
+        }))
+        .expect("serialize stub OpenAI completion response");
+        let http_client = RecordingHttpClient::new(response_body);
+        let rig_client = rig::providers::openai::CompletionsClient::builder()
+            .api_key("sk-test")
+            .base_url("http://rocm-dash-tui-test.invalid")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client over the recording HTTP double");
+
+        let client = RigAgentClient {
+            client: rig_client,
+            model: model.to_string(),
+            preamble: TEST_PREAMBLE.to_string(),
+            params,
+            executor: None,
+            approval_tx: None,
+        };
+        (client, http_client)
+    }
+
     /// Asserts the `model`/`temperature`/`max_tokens` fields a captured wire
     /// request carries, shared by the two forwards-params-to-the-wire tests
     /// below. Each caller separately asserts where its provider places the
@@ -2280,52 +2475,19 @@ mod tests {
     /// actually passes it `&self.params` rather than, say,
     /// `&InferenceParams::default()`, or the right tag — a swap at that one
     /// call site stays green under every other test in this file; only a
-    /// real `complete()` round-trip catches it.
-    ///
-    /// `RigAgentClient<H>`'s `H` (HTTP client) type parameter — defaulted to
-    /// the live `reqwest::Client` for production — exists for exactly this:
-    /// swap in `rig::test_utils::RecordingHttpClient` and drive the actual
-    /// `complete()` method over a scripted response instead of a live
-    /// endpoint.
+    /// real `complete()` round-trip catches it — over
+    /// [`rig_client_over_recorded_response`]'s scripted HTTP double rather
+    /// than a live endpoint.
     #[tokio::test]
     async fn rig_agent_client_complete_forwards_params_to_the_wire() {
-        use rig::test_utils::RecordingHttpClient;
-
-        let response_body = serde_json::to_vec(&json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "test-model",
-            "system_fingerprint": null,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "GPU 0 is healthy."},
-                "logprobs": null,
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": 1, "total_tokens": 2},
-        }))
-        .expect("serialize stub OpenAI completion response");
-        let http_client = RecordingHttpClient::new(response_body);
-        let rig_client = rig::providers::openai::CompletionsClient::builder()
-            .api_key("sk-test")
-            .base_url("http://rocm-dash-tui-test.invalid")
-            .http_client(http_client.clone())
-            .build()
-            .expect("build client over the recording HTTP double");
-
-        let client = RigAgentClient {
-            client: rig_client,
-            model: "test-model".to_string(),
-            preamble: TEST_PREAMBLE.to_string(),
-            params: InferenceParams {
+        let (client, http_client) = rig_client_over_recorded_response(
+            "test-model",
+            InferenceParams {
                 temperature: Some(0.4),
                 top_p: None,
                 max_tokens: Some(256),
             },
-            executor: None,
-            approval_tx: None,
-        };
+        );
 
         let history = [ChatTurn::user("check gpu 0")];
         let (reply, tags) = complete_capturing_backend_tags(&client, &history).await;
@@ -2354,6 +2516,88 @@ mod tests {
         assert!(
             !tags.is_empty() && tags.iter().all(|t| t == "rig-openai"),
             "complete() must tag its lifecycle trace events \"rig-openai\", got {tags:?}"
+        );
+    }
+
+    /// Drive one `RigAgentClient::complete` round-trip over a scripted
+    /// OpenAI-compatible response and hand back the JSON body that reached
+    /// the wire. The chat-template tests below care only about the body, so
+    /// they skip the reply/backend-tag assertions
+    /// `rig_agent_client_complete_forwards_params_to_the_wire` makes over the
+    /// same seam.
+    async fn rig_wire_request_body(model: &str, params: InferenceParams) -> serde_json::Value {
+        let (client, http_client) = rig_client_over_recorded_response(model, params);
+        let history = [ChatTurn::user("check gpu 0")];
+        complete_capturing_backend_tags(&client, &history).await;
+
+        let requests = http_client.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request should have been sent"
+        );
+        serde_json::from_slice(&requests[0].body).expect("request body is JSON")
+    }
+
+    /// A model whose chat template reasons without a budget must be told to
+    /// stop: the request body carries
+    /// `chat_template_kwargs.enable_thinking = false`, so the answer the
+    /// operator asked for is generated instead of an unbounded reasoning
+    /// trace that can consume the whole request deadline.
+    ///
+    /// The `top_p` half of this is not incidental. rig-core 0.38.1's
+    /// `AgentBuilder::additional_params` **replaces** rather than merges, so
+    /// adding the chat-template object as a second call would silently drop
+    /// `top_p` — a configured sampling knob vanishing off the wire, with
+    /// nothing else in this file to notice. Both must arrive together.
+    #[tokio::test]
+    async fn rig_agent_client_disables_unbounded_thinking_without_dropping_top_p() {
+        let body = rig_wire_request_body(
+            "unsloth/Qwen3-1.7B-GGUF:Q4_K_M",
+            InferenceParams {
+                temperature: Some(0.4),
+                top_p: Some(0.2),
+                max_tokens: Some(256),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"].as_bool(),
+            Some(false),
+            "a hybrid-thinking model must be sent enable_thinking=false: {body}"
+        );
+        assert_eq!(
+            body["top_p"].as_f64(),
+            Some(f64::from(0.2_f32)),
+            "top_p must survive alongside chat_template_kwargs, not be replaced by it: {body}"
+        );
+    }
+
+    /// The other half of the contract: every other model keeps the serving
+    /// endpoint's own chat-template defaults. The key is absent from the body
+    /// entirely — not sent as `true` — so a hosted backend that rejects an
+    /// unrecognised field is never handed one.
+    #[tokio::test]
+    async fn rig_agent_client_sends_no_chat_template_kwargs_for_other_models() {
+        let body = rig_wire_request_body(
+            "test-model",
+            InferenceParams {
+                temperature: Some(0.4),
+                top_p: Some(0.2),
+                max_tokens: Some(256),
+            },
+        )
+        .await;
+
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "a model with no hybrid thinking mode must get no chat_template_kwargs: {body}"
+        );
+        assert_eq!(
+            body["top_p"].as_f64(),
+            Some(f64::from(0.2_f32)),
+            "top_p must still reach the wire on its own: {body}"
         );
     }
 

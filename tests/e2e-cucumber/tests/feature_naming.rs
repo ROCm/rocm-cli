@@ -33,9 +33,13 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("diagnose.feature", "diagnose"),
     ("download_progress_pty.feature", "download-progress"),
     ("driver_install.feature", "driver-install"),
+    ("engine_ipc.feature", "engine-ipc"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
+    // Not `lemonade`: the file is about the copies Lemonade leaves on disk,
+    // not about serving with it, which `model_serving.feature` covers.
+    ("lemonade_installs.feature", "lemonade-installs"),
     // Not `records`: a key has to say what kind of record, and this file is
     // about the ones a managed `rocm serve` leaves behind.
     ("local_server_records.feature", "server-records"),
@@ -50,12 +54,14 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
     ("service_record_cleanup.feature", "service-cleanup"),
+    ("service_record_unqueryable.feature", "service-unqueryable"),
     ("service_stop.feature", "service-stop"),
     ("service_unknown_id.feature", "service-unknown"),
     ("storage.feature", "storage"),
     ("therock_next_generation.feature", "therock-next"),
     ("uninstall.feature", "uninstall"),
     ("update.feature", "update"),
+    ("vllm_tensorizer.feature", "vllm-tensorizer"),
 ];
 
 fn features_dir() -> PathBuf {

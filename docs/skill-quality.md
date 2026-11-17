@@ -152,9 +152,10 @@ review and may decline:
   mutates, routing upstream when nothing is established), not whether a diagnosis was
   correct. The exception is a case with a directory under
   [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/): it gets a replayed `rocm`
-  that answers `--version`, `fix --json` and `diagnose` from a recording, so it can
-  grade the version check or how an answer is read. The recording is of a host with no
-  GPU data, so even there a rise does not mean users get fixed faster. See
-  [Doctor Skill Eval Replays](testing.md#doctor-skill-eval-replays).
+  that answers `--version`, `fix --json` and `diagnose` (and `examine --json` for a case
+  that names a host) from a recording, so it can grade the version check, how an answer
+  is read, or the question the skill asks when the examination finds no AMD GPU. The
+  recording is of a host with no GPU data, so even there a rise does not mean users get
+  fixed faster. See [Doctor Skill Eval Replays](testing.md#doctor-skill-eval-replays).
 - **Editing the dataset moves the figures.** A changed content hash between two runs
   means the scenario set may have changed; look at that diff before comparing them.

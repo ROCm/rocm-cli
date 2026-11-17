@@ -28,16 +28,16 @@
 //! `parse_device_policy`, `parse_gpu_selection`,
 //! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
 //! and `validate_pinned_gpu_index` moved out of `main.rs` into
-//! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); `resolve_engine_selection` and
+//! `gpu_policy.rs`; `resolve_engine_selection` and
 //! `validate_engine_selection_runtime` moved out of `main.rs` into
-//! `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this file's `use`
+//! `engine_runtime_select.rs`; this file's `use`
 //! list below points to both now instead of at the crate root. The
 //! managed-service-spawning tail this file calls into — `start_managed_service`,
 //! `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,
 //! `drop_orphaned_endpoint_key_on_already_running`, `print_managed_launch_plain`,
 //! `validate_bind_host`, `ensure_background_helper_running_quiet` — was relocated
-//! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
+//! to `service_launch.rs`, along with its test module;
 //! this file's `use` list below points there now instead of at the crate root.
 
 use anyhow::{Context as _, Result, bail};
@@ -66,6 +66,7 @@ use crate::gpu_policy::{
     serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::serve_port;
 use crate::serve_recipe::{
     ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
     engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
@@ -73,15 +74,17 @@ use crate::serve_recipe::{
     parse_gpu_memory_utilization, protocol_engine_recipe_hint, render_serve_engine_recipe_lines,
 };
 use crate::serve_summary;
+use crate::service_control::run_internal_sandbox_tool;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
     managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
     resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
+    wait_begin_client_config,
 };
 use crate::{
-    GatedEngineAction, cli_progress, device_policy_name, ensure_engine_allowed_on_os,
-    ensure_engine_allowed_on_platform,
+    GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
+    ensure_engine_allowed_on_os, ensure_engine_allowed_on_platform,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -479,9 +482,10 @@ pub(crate) struct ServeArgs {
     pub(crate) runtime_id: Option<String>,
     pub(crate) env_id: Option<String>,
     pub(crate) host: String,
-    pub(crate) port: u16,
+    pub(crate) port: Option<u16>,
     pub(crate) foreground: bool,
     pub(crate) managed: bool,
+    pub(crate) wait: bool,
     pub(crate) verbose: bool,
     pub(crate) no_smoke_test: bool,
     pub(crate) allow_public_bind: bool,
@@ -507,6 +511,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         port,
         foreground,
         managed,
+        wait,
         verbose,
         no_smoke_test,
         allow_public_bind,
@@ -519,8 +524,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         api_key,
         engine_env,
     } = args;
+    let port_request = serve_port::PortRequest::from_flag(port);
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
+    serve_port::validate_port_request(&host, port_request)?;
     // Loopback stays credential-free; a public bind must be authenticated. Resolve
     // (or generate) the endpoint key now so every downstream path — engine spawn,
     // readiness probe, smoke test, and the client-config we print — shares one value.
@@ -859,8 +866,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
     // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
     // not have.
+    //
+    // The scripted free-space override opens the same waiver: it exists to refuse a
+    // Lemonade install on a drive that cannot hold it, which `rocm serve` only
+    // reaches past this bail.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
-        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+        && [
+            "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
+            "ROCM_E2E_LEMONADE_FREE_SPACE_BYTES",
+        ]
+        .iter()
+        .any(|variable| std::env::var_os(variable).is_some());
     if !cpu_only
         && !scripted_backend_failure
         && !e2e_simulate_oom_launch()
@@ -1036,7 +1052,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         println!("  engine: {selected_engine}");
         println!("{}", serve_engine_selection_line(&serve_engine));
         println!("  host: {host}");
-        println!("  port: {port}");
+        match port {
+            Some(port) => println!("  port: {port}"),
+            None => println!("  {}", serve_port::AUTOMATIC_PORT_DISCLOSURE),
+        }
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
             println!("  runtime_id: {runtime_id}");
         }
@@ -1105,7 +1124,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let managed_runtime_id = resolved_selection.runtime_id.clone();
     let managed_env_id = resolved_selection.env_id.clone();
 
-    // Persist the endpoint key (public bind only) in a 0600 file so the engine
+    // Persist the endpoint key (public bind only) in an owner-only file so the engine
     // child, the restart/recovery path, and inspection commands can retrieve it by
     // service id. Loopback binds resolve to `None` and store nothing.
     if let Some(key) = endpoint_auth.as_deref() {
@@ -1113,16 +1132,22 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let mut spinner =
-            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
-        spinner.tick();
-        let report = start_managed_service(
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
+            "Starting {model} on {selected_engine}…"
+        )));
+        spinner.borrow_mut().tick();
+        // The key is shown when the wait begins, since Ctrl-C or a failed wait
+        // would otherwise leave a running authenticated server whose key was never
+        // printed. It is then not repeated in the summary below.
+        let key_shown_before_wait = std::cell::Cell::new(false);
+        let launched = start_managed_service(
+            &paths,
             &selected_engine,
             &service_id,
             &model,
             &resolve,
             &host,
-            port,
+            port_request,
             &resolve.device_policy,
             &gpu_indices,
             managed_runtime_id.as_deref(),
@@ -1132,8 +1157,41 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             gpu_refusal_waived_for_reuse,
-            &mut |_elapsed| spinner.tick(),
-        )?;
+            wait,
+            // Named with the id the launch resolved to: an already-starting
+            // server keeps its own, not the one generated above. The spinner
+            // has no id on it, and a non-TTY stderr gets no spinner at all.
+            &mut |waiting_on, waiting_port| {
+                spinner.borrow_mut().clear();
+                eprintln!(
+                    "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
+                     Follow: rocm logs --service {waiting_on} --follow"
+                );
+                if let Some(config) = wait_begin_client_config(
+                    waiting_on,
+                    &service_id,
+                    &host,
+                    waiting_port,
+                    endpoint_auth.as_deref(),
+                ) {
+                    key_shown_before_wait.set(true);
+                    // Same intentional one-time key display as
+                    // `print_managed_launch_plain`; see its rationale.
+                    // codeql[rust/cleartext-logging]
+                    print!("{config}");
+                }
+            },
+            &mut |_elapsed| spinner.borrow_mut().tick(),
+        );
+        // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
+        let report = match launched {
+            Ok(report) => report,
+            Err(error) => {
+                spinner.borrow_mut().clear();
+                return Err(error);
+            }
+        };
+        let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
         // writes a `starting` record for a process that never existed, so the
         // helper would be left watching a pid that will never appear, with
@@ -1168,7 +1226,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         }
         // Safe to move `endpoint_auth` here: this branch always returns, so the
         // fall-through (attached) path below never observes it moved.
-        let launched_key = if report.already_running {
+        let launched_key = if report.already_running || key_shown_before_wait.get() {
             None
         } else {
             endpoint_auth
@@ -1181,7 +1239,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
                 spinner.set_label("Running smoke test…");
                 // The local provider resolves the endpoint key from the per-service
-                // 0600 key file by service id, so the smoke test authenticates
+                // owner-only key file by service id, so the smoke test authenticates
                 // against a protected public endpoint without threading the secret
                 // through here.
                 serve_summary::run_smoke_test(&paths, resolve.served_model_name())
@@ -1201,6 +1259,24 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 engine_serves_vllm,
             );
             notes.extend(engine_env_notes.iter().cloned());
+            // Published by the serving process shortly after the engine lists its
+            // model. A service that was already running published it long ago, so
+            // only a fresh launch is waited for.
+            let anthropic_endpoint = rocm_core::wait_for_published_anthropic_endpoint(
+                &paths.service_engine_state_path(&selected_engine, &report.service_id),
+                if report.already_running || report.status != "ready" {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_secs(5)
+                },
+            );
+            if anthropic_endpoint.is_none() && !report.already_running && report.status == "ready" {
+                notes.push(
+                    "the Anthropic-compatible endpoint was not published yet; it appears as \
+                     `anthropic endpoint:` in `rocm services list` once the engine lists its model"
+                        .to_owned(),
+                );
+            }
             // A managed serve that failed on VRAM lands here not-ready with the OOM
             // traceback only in its own log. Read that log tail so the summary can
             // name the memory knobs, since the pre-launch low-VRAM warning cannot
@@ -1233,6 +1309,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 requested_model: model,
                 api_model: resolve.served_model_name().to_owned(),
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
+                anthropic_endpoint,
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
                 already_running: report.already_running,
@@ -1241,7 +1318,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 notes,
             };
             // Same intentional one-time key display as `print_managed_launch_plain`
-            // in service_launch.rs; see its rationale for why the tag below is currently inert.
+            // in service_launch/start.rs; see its rationale for why the tag below is
+            // currently inert.
             // codeql[rust/cleartext-logging]
             print!("{}", serve_summary::render_summary(&summary));
         } else {
@@ -1252,12 +1330,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     run_attached_service(
+        &paths,
         &selected_engine,
         &service_id,
         &model,
         &resolve,
         &host,
-        port,
+        port_request,
         &gpu_indices,
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
@@ -1265,6 +1344,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         launch_lock,
         require_api_key,
         gpu_refusal_waived_for_reuse,
+        |paths, service_id| {
+            run_internal_sandbox_tool(
+                paths,
+                SandboxToolArg::StopServer,
+                Some(service_id.to_owned()),
+                true,
+            )
+        },
     )
 }
 
@@ -1573,6 +1660,94 @@ mod tests {
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
             "Qwen3-4B-Instruct-2507-GGUF"
+        );
+    }
+
+    #[test]
+    fn serve_small_assistant_resolves_the_gguf_build_on_lemonade() {
+        // The small assistant recipe is published as safetensors under its
+        // canonical id and as GGUF under a companion repo. Lemonade can only
+        // serve the latter, and only with a quantization variant pinned, so
+        // every way of naming the recipe has to arrive at that ref.
+        for model in [
+            "qwen2.5",
+            "qwen2.5-1.5b",
+            "qwen2.5-1.5b-instruct",
+            "qwen-small",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        ] {
+            let recipe = resolve_builtin_model_recipe(model)
+                .unwrap_or_else(|| panic!("{model} resolves to a recipe"));
+            // With no engine named and no GPU family preferring one, automatic
+            // selection follows the recipe. A host whose family prefers vLLM
+            // takes the earlier branch in `select_serve_engine` and is not
+            // covered here; the ref each engine resolves to is, below.
+            assert_eq!(
+                select_serve_engine(None, None, Some(&recipe), None),
+                ServeEngineSelection {
+                    engine: "lemonade".to_owned(),
+                    source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+                },
+                "{model}"
+            );
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "lemonade"),
+                "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M",
+                "{model}"
+            );
+            // vLLM keeps the safetensors repo the canonical id names.
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "vllm"),
+                "Qwen/Qwen2.5-1.5B-Instruct",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_lemonade_catalog_recipe_resolves_to_a_servable_ref() {
+        // Lemonade passes a Hugging Face `owner/repo` through untouched, and the
+        // engine then refuses it without a `:variant` -- on Windows from inside
+        // the detached engine process, where the user never sees the reason. The
+        // catalog is what has to supply the variant, so no recipe that lists
+        // Lemonade may resolve to a bare `owner/repo`. A bare registry name (no
+        // `/`) is a Lemonade model id, not a Hugging Face repo, and is fine.
+        //
+        // Scope: recipes that list Lemonade, and only those. Lemonade can still
+        // be reached for a recipe that does not -- an explicit `--engine
+        // lemonade`, a configured `default_engine`, or the platform default when
+        // nothing else fits -- and that recipe is handed its canonical id, which
+        // is what a recipe with no Lemonade build should get. Refusing a bare
+        // ref before the engine starts is the other half of that, and is not
+        // this test's job.
+        let offenders = rocm_core::builtin_model_recipes()
+            .into_iter()
+            .filter(|recipe| model_recipe_supports_engine(recipe, "lemonade"))
+            .map(|recipe| {
+                let resolved = serve_model_ref_for_engine(
+                    &recipe.canonical_model_id,
+                    Some(&recipe),
+                    "lemonade",
+                );
+                (recipe.canonical_model_id, resolved)
+            })
+            .filter(|(_, resolved)| {
+                // A trailing `:` is as unservable as no colon at all, so the
+                // variant has to be there, not merely the separator.
+                resolved.contains('/')
+                    && resolved
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.split_once(':'))
+                        .is_none_or(|(_, variant)| variant.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "these recipes hand Lemonade a Hugging Face repo with no `:variant`, which the \
+             engine refuses after it has already been launched; give each one a lemonade \
+             engine_recipes entry whose model_id_override names the GGUF repo and variant: \
+             {offenders:?}"
         );
     }
 

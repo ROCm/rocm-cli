@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Config + provider manager overlay (Phase 3 Wave 3).
+//! Config + provider manager overlay.
 //!
 //! Folds the frozen `config_manager` and `provider_manager` into one screen:
 //!

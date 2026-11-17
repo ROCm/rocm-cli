@@ -10,10 +10,9 @@
 //! --json`, with an amdgpu DRM sysfs fallback), and building the serve-plan
 //! low-VRAM warning from it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
-//! (ROCMAI-214) of the `main.rs` modularization (see
-//! `docs/architecture.md`). `dispatch()` calls directly into this module at
-//! one point — the `Command::EngineServeHttp` arm's
+//! Mechanically relocated from `main.rs` with no behavior change (the
+//! `relocation` class in `docs/architecture.md`). `dispatch()` calls directly
+//! into this module at one point — the `Command::EngineServeHttp` arm's
 //! `parse_gpu_indices_arg(gpu.as_deref())?` — re-imported via `use
 //! crate::gpu_policy::parse_gpu_indices_arg;`; `dispatch()`'s own body is
 //! otherwise unaffected.
@@ -32,8 +31,9 @@
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
 //! instead of moving: `const fn device_policy_name` sits immediately after
-//! `detect_gpu_count` and before the next cluster's (ROCMAI-215)
-//! `EngineSelection`/`resolve_engine_selection`, but it already had callers
+//! `detect_gpu_count` and before the engine-selection cluster's
+//! `EngineSelection`/`resolve_engine_selection` (now in
+//! `engine_runtime_select.rs`), but it already had callers
 //! outside this cluster — `engine_ipc.rs` and `service_launch.rs` reach it
 //! unqualified via `use crate::{...}`, same as `serve_cmd.rs` does — plus its
 //! own test, so it is not part of this cluster's relocation.
@@ -149,7 +149,7 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 ///
 /// That span is relied on by a second caller: because the guard outlives both
 /// `store_endpoint_api_key` and the first `record.write()`, it also covers the
-/// interval in which a launch's 0600 endpoint key sits on disk with no manifest
+/// interval in which a launch's owner-only endpoint key sits on disk with no manifest
 /// beside it. [`crate::service_records::prune_managed_service_records`] acquires the same lock so its
 /// leftover sweep cannot read the directory in that state. Shortening the
 /// guard's life — releasing it before the record is persisted — would silently

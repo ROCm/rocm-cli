@@ -132,31 +132,17 @@ fn label_for_root_report(dir: &Path) -> String {
                 .and_then(|s| s.as_str())
                 .map(str::to_owned)
         });
-    match slug.as_deref() {
-        Some("mock") => "e2e-report".to_owned(),
-        Some("mi300x") => "e2e-gpu-report".to_owned(),
-        Some("gfx1201") => "e2e-gpu-rad3-report".to_owned(),
-        Some("mi350p") => "e2e-gpu-mi350p-report".to_owned(),
-        // Like gfx1201 above, gfx1100 has no product-name mapping in
-        // `platform_hardware_slug` — the raw gfx target IS the slug — so the
-        // sidecar carries `gfx1100` for the W7900 lane.
-        Some("gfx1100") => "e2e-gpu-w7900-report".to_owned(),
-        Some("strix-halo-linux") => "e2e-gpu-strix-ubuntu-report".to_owned(),
-        Some("strix-halo-windows") => "e2e-gpu-strix-windows-report".to_owned(),
-        // This workflow is statically pinned to the Strix WSL runner. A bare
-        // `wsl` slug means the probe could not recover a gfx target; map it to
-        // the same identity the workflow's artifact directory carries so a
-        // flattened single-artifact download cannot change the report column.
-        Some("wsl" | "strix-halo-wsl") => "e2e-gpu-strix-wsl-report".to_owned(),
-        // Missing sidecar (e.g. a GPU run that errored before writing it) or an
-        // unrecognized slug → neutral identity, never a false "Mock".
-        _ => "e2e-unknown-report".to_owned(),
-    }
+    // The slug → artifact-name table lives beside `parse_descriptor`'s
+    // artifact-name → platform table, in the one `KNOWN_PLATFORMS` list, so the
+    // two directions cannot drift. A missing sidecar (e.g. a GPU run that
+    // errored before writing it) or an unrecognized slug → neutral
+    // `e2e-unknown-report`, never a false "Mock".
+    e2e_report::artifact_name_for_platform_slug(slug.as_deref()).to_owned()
 }
 
 /// Strips the literal `${{ matrix.channel }}` template segment a channel
 /// matrix inserts into its artifact names — nightly's six GPU lanes and, per
-/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s per-PR `[release, nightly]` leg — so
+/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s `[release, nightly]` leg — so
 /// a name like `e2e-gpu-${{ matrix.channel }}-report` compares as its
 /// canonical `e2e-gpu-report` base. This scan is text-based over the raw
 /// workflow source and does not simulate matrix expansion, so the template
@@ -221,8 +207,6 @@ mod tests {
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
         "e2e-gpu-w7900-report",
-        "e2e-gpu-w7900-n-1-report",
-        "e2e-gpu-w7900-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-ubuntu-n-1-report",
         "e2e-gpu-strix-ubuntu-n-2-report",

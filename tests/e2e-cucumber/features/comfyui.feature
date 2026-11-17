@@ -95,6 +95,11 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # label-truncation fix in `cli_progress::assemble_status_line` — the
   # tarball scenario in `download_progress_pty.feature` is the regression
   # test for that.
+  # The fixture also switches the CLI's startup update check off. The planted
+  # runtime would otherwise make the check run first, before the install
+  # reaches its download: it fetches `uv` and a managed Python from the network
+  # and prints that progress on this terminal, and on a slow network it
+  # outlasts the 30s wait for the intermediate frame.
   # Linux-only: this scenario drives `rocm` under a real PTY, the same
   # suite-wide limitation `dash.feature`'s header comment documents
   # (portable-pty compiles on Windows via ConPTY, but that path isn't yet
@@ -328,3 +333,86 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     And ComfyUI's dependencies were installed into the runtime
     And the runtime's torch stack is unchanged
     And no nvidia-* packages were added to the runtime
+
+  # With no runtime chosen, `rocm comfyui install` uses the one ready runtime,
+  # and it finds it the way `rocm serve` and `rocm engines install` do: it
+  # recovers the runtime `rocm setup` created first. A runtime whose registry
+  # entry was lost, but whose install tree still holds its own manifest and that
+  # setup names, therefore counts as the ready runtime, instead of the install
+  # refusing with "Install ROCm first" while setup has finished. The real run
+  # writes the lost registry entry back (comfyui-16); a `--dry-run` preview
+  # names the same runtime but leaves the registry as it found it, because it
+  # promises not to change files (this scenario). The preview prints the
+  # `--runtime-id` of the command it would run, which is how it shows the
+  # choice; comfyui-17 runs that command as printed. No GPU is needed: readiness
+  # is filesystem and manifest state.
+  @id:comfyui-install-finds-the-runtime-setup-created
+  Scenario: comfyui-15 - A ComfyUI install preview finds the runtime setup created without writing the registry
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    And the runtime registry still has no entry for it
+
+  # The real run of the same install: it uses the runtime setup created and
+  # writes its lost registry entry back, so the runtime it installed into is one
+  # `rocm runtimes list` shows afterwards. The ComfyUI checkout is already in
+  # place and asks for nothing beyond the torch stack the runtime provides, so
+  # the install needs no network and no package index.
+  @id:comfyui-install-restores-the-runtime-setup-created
+  Scenario: comfyui-16 - A ComfyUI install restores the registry entry of the runtime setup created
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    When the user installs ComfyUI without choosing a runtime
+    Then the install uses the runtime setup created
+    And the runtime registry has an entry for it again
+
+  # The preview's `install command:` line is how it shows the choice, so it has
+  # to be a command that works from the state the preview left, where the
+  # registry still has no entry for the runtime it named. Its `--runtime-id` is
+  # an explicit choice, which finds the runtime setup created the same way a
+  # missing choice does, instead of refusing with "Install ROCm first". Run as
+  # printed, the command installs into that runtime and writes the entry back.
+  @id:comfyui-install-preview-command-works-as-printed
+  Scenario: comfyui-17 - The install command a ComfyUI install preview prints works from the state the preview left
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the runtime registry still has no entry for it
+    When the user runs the install command the preview printed
+    Then the install uses the runtime setup created
+    And the runtime registry has an entry for it again
+
+  # The same printed command, when the registry cannot take the entry back (a
+  # file stands where its directory should be, which stops an administrator as
+  # well; a read-only directory would not). The preview writes nothing, so it
+  # still succeeds and names the runtime. The real run finds that runtime the
+  # same way, fails to restore its entry, and says so, rather than answering
+  # "Install ROCm first" as if setup had left no runtime. The registry is left as
+  # it was. A read-only registry directory with other runtimes in it, the other
+  # way to reach this, is covered by a unit test: the suite can run as root, for
+  # whom a read-only directory is writable.
+  @id:comfyui-install-reports-a-registry-it-cannot-write
+  Scenario: comfyui-18 - The install command a ComfyUI install preview prints reports a registry that cannot take the runtime back
+    Given a ready ROCm runtime that setup created and the registry has forgotten
+    And a ComfyUI checkout that needs nothing beyond the runtime's torch stack
+    And the runtime registry cannot be written
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects that runtime
+    When the user runs the install command the preview printed
+    Then the install is refused because the runtime's registry entry could not be restored
+    And the runtime registry is as it was
+
+  # With no runtime chosen, a setup folder whose runtime can no longer be used
+  # (here its interpreter is gone) is not a ready runtime and cannot change which
+  # runtimes are ready, so it does not stop an install that has exactly one ready
+  # runtime registered: the install uses that one, as a choice that names it
+  # does, and the unusable setup runtime is not written into the registry. Its
+  # own error is reported only when no registered runtime is ready (a unit
+  # test). No GPU is needed: readiness is filesystem and manifest state.
+  @id:comfyui-install-uses-the-ready-runtime-beside-an-unusable-setup-runtime
+  Scenario: comfyui-19 - A setup runtime that is no longer usable does not stop a ComfyUI install that has one ready runtime
+    Given a ready ROCm runtime in the registry
+    And a setup folder whose runtime is no longer usable
+    When the user previews a ComfyUI install without choosing a runtime
+    Then the preview selects the registered runtime
+    And the runtime registry holds only the registered runtime

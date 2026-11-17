@@ -41,7 +41,7 @@ use crate::engine_install_env::{
 };
 use crate::engine_ipc::{engine_request, engine_request_with_env_root};
 use crate::engine_runtime_select::{
-    apply_app_path_env, resolve_engine_selection, resolve_runtime_selector_to_exact_key,
+    resolve_engine_selection, resolve_runtime_selector_to_exact_key,
     validate_engine_selection_runtime,
 };
 use crate::runtime_install_finalize::{
@@ -469,7 +469,7 @@ fn engine_shell(
         .env("ROCM_CLI_ENV_ID", &resolved.env_id)
         .env("ROCM_CLI_RUNTIME_ID", &resolved.runtime_id)
         .env("ROCM_CLI_PYTHON", &resolved.python_executable);
-    apply_app_path_env(&mut command, &paths);
+    paths.apply_env(&mut command);
 
     let prompt = format!("(rocm:{engine}) ");
     let mut prompt_marked = false;
@@ -834,5 +834,73 @@ mod tests {
                 "{shell} should resolve to bash"
             );
         }
+    }
+
+    /// Several ready runtimes and none chosen: the engine path does not guess.
+    /// `resolve_engine_env` reports the gap in its own words, and each remedy
+    /// those words name must clear it: `rocm runtimes activate <runtime_key>`
+    /// (run here as `activate_runtime`, its implementation) and `--runtime-id`.
+    #[test]
+    fn engine_install_with_several_ready_runtimes_names_remedies_that_clear_it() -> Result<()> {
+        let (root, paths) = test_paths("engine-install-several-ready-runtimes");
+        let first = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-14-0",
+            "therock-release:gfx120X-all",
+            "7.14.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+
+        let message = resolve_engine_env(&paths, &config, "vllm", None, None)
+            .expect_err("several ready runtimes and no choice must not resolve")
+            .to_string();
+        assert!(
+            message.contains("no active ROCm runtime is configured")
+                && message.contains("rocm runtimes list")
+                && message.contains("rocm runtimes activate <runtime_key>")
+                && message.contains("--runtime-id"),
+            "unexpected refusal: {message}"
+        );
+
+        // `rocm runtimes activate <runtime_key>`: the choice is now made.
+        crate::runtimes_cmd::activate_runtime(&paths, &mut config, &first.runtime_key)?;
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(&config, "vllm", None, None),
+        )?;
+        assert_eq!(
+            selection.runtime_id.as_deref(),
+            Some(first.runtime_key.as_str())
+        );
+        assert_eq!(
+            selection.source.as_deref(),
+            Some("config_active_runtime_key")
+        );
+
+        // `--runtime-id <runtime_key>`: the same choice, for one invocation.
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(
+                &RocmCliConfig::default(),
+                "vllm",
+                Some(&first.runtime_key),
+                None,
+            ),
+        )?;
+        assert_eq!(
+            selection.runtime_id.as_deref(),
+            Some(first.runtime_key.as_str())
+        );
+        assert_eq!(selection.source.as_deref(), Some("cli_runtime_id"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 }

@@ -11,7 +11,7 @@
 //! `docs/architecture.md`. `SetupCommand`, the clap enum `setup` matches on,
 //! lives in `cli.rs` with the rest of the `Command`/`Cli` definition.
 //! `dispatch()` calls `setup` through the re-import `use
-//! crate::setup_cmd::{...};`, and `chat.rs`'s read-only handling of `rocm setup`
+//! crate::setup_cmd::{...};`, and `chat/mcp_bridge.rs`'s read-only handling of `rocm setup`
 //! and `rocm setup status` reaches `render_setup_status_text` as
 //! `crate::render_setup_status_text` through the same re-import; both are
 //! `pub(crate)`. `reset_setup_prompt_state` has no caller outside this module

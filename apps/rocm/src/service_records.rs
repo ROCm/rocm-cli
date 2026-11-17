@@ -11,8 +11,11 @@
 //! `prune_managed_service_records`) together with the age gate behind them
 //! (`DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`, `service_prune_min_age_hours`).
 //!
-//! Mechanically relocated from `main.rs` with no behavior change; see
-//! `docs/architecture.md`. This module reads record state through
+//! Mechanically relocated from `main.rs` with no behavior change at the time;
+//! see `docs/architecture.md`. Since then both commands also delete the copy
+//! of a record's endpoint key an interrupted save left beside it
+//! (`staged_endpoint_keys_by_service`), and prune sweeps such a copy whose
+//! record is gone. This module reads record state through
 //! `managed_service_status.rs` and `services_text.rs` (`load_managed_service`,
 //! `validate_service_id`) and builds its advice text with `service_hints.rs`;
 //! none of those modules depends on this one. `services_cmd.rs`'s `services()`
@@ -36,10 +39,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, ManagedServiceRecord, process_is_running};
+use rocm_core::{AppPaths, ManagedServiceRecord, ProcessProbe};
 
 use crate::managed_service_status::{
-    load_managed_services, managed_service_is_live, recorded_service_pids,
+    container_stop_unresolved, load_managed_services, managed_service_is_live,
+    recorded_pids_may_be_running, recorded_service_pids,
 };
 use crate::services_text::{load_managed_service, validate_service_id};
 use crate::{cli_progress, cli_report, endpoint_keys, service_hints};
@@ -71,17 +75,22 @@ struct ServiceRecordArtifacts {
     log: PathBuf,
     engine_state: PathBuf,
     endpoint_key: PathBuf,
+    /// Copies of the endpoint key a store killed between staging and
+    /// publishing left beside it, found when the artifacts are listed.
+    staged_endpoint_keys: Vec<PathBuf>,
 }
 
 impl ServiceRecordArtifacts {
     /// Every artifact, in the order they are reported and deleted.
-    fn paths(&self) -> [&Path; 4] {
+    fn paths(&self) -> impl Iterator<Item = &Path> {
         [
-            &self.manifest,
-            &self.log,
-            &self.engine_state,
-            &self.endpoint_key,
+            self.manifest.as_path(),
+            self.log.as_path(),
+            self.engine_state.as_path(),
+            self.endpoint_key.as_path(),
         ]
+        .into_iter()
+        .chain(self.staged_endpoint_keys.iter().map(PathBuf::as_path))
     }
 }
 
@@ -101,10 +110,14 @@ fn validate_engine_component(engine: &str) -> Result<()> {
     Ok(())
 }
 
+/// `staged_keys` is [`staged_endpoint_keys_by_service`], taken once by the
+/// caller: `prune` builds artifacts for every record, and listing the folder
+/// per record would make the plan quadratic in the number of records.
 fn service_record_artifacts(
     paths: &AppPaths,
     service_id: &str,
     engine: &str,
+    staged_keys: &HashMap<String, Vec<PathBuf>>,
 ) -> Result<ServiceRecordArtifacts> {
     validate_service_id(service_id)?;
     validate_engine_component(engine)?;
@@ -113,7 +126,38 @@ fn service_record_artifacts(
         log: paths.service_log_path(service_id),
         engine_state: paths.service_engine_state_path(engine, service_id),
         endpoint_key: endpoint_keys::endpoint_key_file_path(paths, service_id),
+        staged_endpoint_keys: staged_keys.get(service_id).cloned().unwrap_or_default(),
     })
+}
+
+/// The service a leftover staged copy of an endpoint key belongs to: `svc` for
+/// `svc.endpoint-key.tmp-<pid>-<millis>-<attempt>`, the name a store killed
+/// between staging and publishing leaves. `None` for any other file.
+fn staged_endpoint_key_owner(file_name: &str) -> Option<&str> {
+    rocm_core::atomic_write::staged_destination_name(file_name)?.strip_suffix(".endpoint-key")
+}
+
+/// Every leftover staged endpoint-key copy in the services folder, keyed by the
+/// service it belongs to, from one listing of the folder. Empty when the folder
+/// cannot be listed, in which case those copies are left in place.
+fn staged_endpoint_keys_by_service(paths: &AppPaths) -> HashMap<String, Vec<PathBuf>> {
+    let mut staged: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let Ok(entries) = fs::read_dir(paths.services_dir()) else {
+        return staged;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if let Some(owner) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(staged_endpoint_key_owner)
+        {
+            staged.entry(owner.to_owned()).or_default().push(path);
+        }
+    }
+    for copies in staged.values_mut() {
+        copies.sort();
+    }
+    staged
 }
 
 /// Delete every artifact that exists, collecting failures instead of stopping at
@@ -163,13 +207,74 @@ fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result
 /// state file, and `refresh_managed_service_runtime_liveness` then returns early
 /// for any non-live status without ever consulting the recorded pids — so a
 /// server whose engine reported failure while its process is still up reads as
-/// removable, and deleting it takes the log and the 0600 endpoint key out from
+/// removable, and deleting it takes the log and the owner-only endpoint key out from
 /// under a process that may still be serving.
-fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
+///
+/// A recorded process that could not be queried (on Windows, a live one this
+/// process may not open) counts as running: deleting the record and its key on
+/// the strength of a failed look is the mistake this guard exists to prevent.
+///
+/// The read of each recorded PID is supplied by the caller, so a test drives an
+/// unqueryable process on every host; production passes
+/// [`rocm_core::probe_process`].
+fn managed_service_record_is_in_use_with(
+    record: &ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> bool {
     managed_service_is_live(record)
-        || recorded_service_pids(record)
-            .iter()
-            .any(|pid| process_is_running(*pid))
+        || container_stop_unresolved(record)
+        || recorded_pids_may_be_running(record, probe)
+}
+
+/// The recorded processes `--force` may remove a record over: `Some` only when
+/// none of them is confirmed running, at least one could not be queried (so
+/// `rocm` cannot tell whether it is still running), and a stop was requested on
+/// the record, so the user has already tried to stop it. A process confirmed
+/// running is never forced past.
+fn forceable_unqueryable_pids(
+    record: &ManagedServiceRecord,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> Option<Vec<u32>> {
+    let probed: Vec<(u32, ProcessProbe)> = recorded_service_pids(record)
+        .into_iter()
+        .map(|pid| (pid, probe(pid)))
+        .collect();
+    if probed
+        .iter()
+        .any(|(_, probed)| *probed == ProcessProbe::Running)
+    {
+        return None;
+    }
+    let unqueryable: Vec<u32> = probed
+        .into_iter()
+        .filter(|(_, probed)| *probed == ProcessProbe::Unqueryable)
+        .map(|(pid, _)| pid)
+        .collect();
+    (!unqueryable.is_empty() && record.stop_requested_unix_ms.is_some()).then_some(unqueryable)
+}
+
+/// The recorded PIDs as the message names them: `process 4242`, or
+/// `processes 4242 and 4243`.
+fn named_processes(pids: &[u32]) -> String {
+    match pids {
+        [one] => format!("process {one}"),
+        many => format!(
+            "processes {}",
+            many.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+    }
+}
+
+/// What [`remove_managed_service_record`] did.
+pub(crate) struct RemovedRecord {
+    /// The text to print.
+    pub(crate) text: String,
+    /// The removal went ahead over a recorded process that could not be queried
+    /// (`--force`), rather than for a record that is not running.
+    pub(crate) forced: bool,
 }
 
 /// Remove one non-running local server record and everything it owns.
@@ -180,31 +285,78 @@ fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
 /// which has already been refreshed against the engine state file and the real
 /// processes — a manifest still saying `ready` for a dead PID has demoted to
 /// `stopped` by then, and must stay removable.
+///
+/// A recorded process that could not be queried (on Windows, a live one this
+/// process may not open) makes the record count as running, and nothing else
+/// `rocm` has can tell a dead server whose PID was reused from a live one. For
+/// that case only, `--force` removes the record anyway: when no recorded process
+/// is confirmed running, at least one could not be queried, and a stop was
+/// requested. The removal then says exactly that, since the process may still
+/// be serving and its endpoint key is deleted with the record.
+#[cfg(test)]
 pub(crate) fn remove_managed_service_record(
     paths: &AppPaths,
     service_id: &str,
     yes: bool,
 ) -> Result<String> {
+    remove_managed_service_record_with(paths, service_id, yes, false, rocm_core::probe_process)
+        .map(|removed| removed.text)
+}
+
+/// [`remove_managed_service_record`] with `--force` and the read of each
+/// recorded PID supplied by the caller.
+pub(crate) fn remove_managed_service_record_with(
+    paths: &AppPaths,
+    service_id: &str,
+    yes: bool,
+    force: bool,
+    probe: impl Fn(u32) -> ProcessProbe,
+) -> Result<RemovedRecord> {
     validate_service_id(service_id)?;
     let record = load_managed_service(paths, service_id)?;
+    let mut forced_over = None;
     // Checked before `--yes` on purpose: for a running server "stop it first" is
     // the actionable error, and repeating the command with --yes must not be the
     // advice a user takes away from it.
-    if managed_service_record_is_in_use(&record) {
-        bail!(
-            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
-            record.status,
-            service_hints::service_stop_hint(service_id)
-        );
+    if managed_service_record_is_in_use_with(&record, &probe) {
+        let forceable = forceable_unqueryable_pids(&record, &probe);
+        match (force, forceable) {
+            (true, Some(pids)) => forced_over = Some(pids),
+            (false, Some(pids)) => bail!(
+                "local server `{service_id}` cannot be removed: {} it recorded could not be queried, so `rocm` cannot tell whether it is still running.\n\nTry: {}",
+                named_processes(&pids),
+                service_hints::service_forced_remove_hint(service_id)
+            ),
+            (true, None) => bail!(
+                "--force removes a record only when none of its recorded processes is confirmed running, at least one could not be queried, and a stop was requested. Local server `{service_id}` is {} and does not meet that.\n\nTry: {}",
+                record.status,
+                service_hints::service_stop_hint(service_id)
+            ),
+            (false, None) => bail!(
+                "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
+                record.status,
+                service_hints::service_stop_hint(service_id)
+            ),
+        }
     }
     if !yes {
-        bail!(
-            "Removing local server record `{service_id}` requires --yes.\n\nTry: {}",
+        // The command that completes this removal, not a neighbour of it: a
+        // forced removal that is missing `--yes` is told to add it, not to drop
+        // the `--force` it asked for.
+        let hint = if forced_over.is_some() {
+            service_hints::service_forced_remove_hint(service_id)
+        } else {
             service_hints::service_action_hint("remove", service_id)
-        );
+        };
+        bail!("Removing local server record `{service_id}` requires --yes.\n\nTry: {hint}");
     }
 
-    let artifacts = service_record_artifacts(paths, &record.service_id, &record.engine)?;
+    let artifacts = service_record_artifacts(
+        paths,
+        &record.service_id,
+        &record.engine,
+        &staged_endpoint_keys_by_service(paths),
+    )?;
     let mut output = String::new();
     // Printed *before* the delete, because after it there is nothing left to
     // point at: this is the last moment the log path is useful.
@@ -213,6 +365,15 @@ pub(crate) fn remove_managed_service_record(
         "Removing local server record `{service_id}` (status: {}).",
         record.status
     );
+    if let Some(pids) = &forced_over {
+        // Said before the delete and in full: what is being risked is the user's
+        // to know, and after this there is no record left to ask about.
+        let _ = writeln!(
+            output,
+            "--force: {} could not be queried, so `rocm` cannot tell whether it is still running. If it is, it keeps running; this removes the record and the endpoint key it may still be serving with.",
+            named_processes(pids)
+        );
+    }
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
@@ -231,7 +392,10 @@ pub(crate) fn remove_managed_service_record(
         report = report.detail("removed", path.display());
     }
     let _ = write!(output, "{}", report.render());
-    Ok(output)
+    Ok(RemovedRecord {
+        text: output,
+        forced: forced_over.is_some(),
+    })
 }
 
 /// One record `rocm services prune` would delete.
@@ -349,27 +513,28 @@ fn describe_hours(hours: u64) -> String {
 /// reason.
 ///
 /// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
-/// like: `serve` writes the 0600 `<id>.endpoint-key` before
-/// `spawn_managed_engine_child` (in `service_launch.rs`) writes the first
+/// like: `serve` writes the owner-only `<id>.endpoint-key` before
+/// `spawn_managed_engine_child` (in `service_launch/spawn.rs`) writes the first
 /// `<id>.json`. Nothing about
 /// the file distinguishes the two cases — under `--any-age` there is no age gate
 /// left to ask — so this function does not try. It is only ever reached with the
 /// managed-launch lock held, which excludes that window outright; see
 /// [`prune_managed_service_records`].
 ///
+/// A staged copy of an endpoint key (`<id>.endpoint-key.tmp-…`, left by a store
+/// killed before it published) is judged the same way, by `<id>.json`: it holds
+/// the key in plaintext, and nothing else would ever remove it.
+///
 /// `services_dir` also holds `launch.lock`, which is shared by every managed
 /// launch rather than owned by one service (see
-/// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
-/// extensions are considered, so the lock is never a candidate — including the
-/// one this sweep is itself running under.
+/// [`AppPaths::managed_launch_lock_path`]). Only the per-service extensions and
+/// staged endpoint keys are considered, so the lock is never a candidate —
+/// including the one this sweep is itself running under.
 fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
     let services_dir = paths.services_dir();
     let mut orphans = Vec::new();
 
-    let push_if_orphaned = |path: &Path, orphans: &mut Vec<PathBuf>| {
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            return;
-        };
+    let push_if_orphaned = |path: &Path, stem: &str, orphans: &mut Vec<PathBuf>| {
         if services_dir.join(format!("{stem}.json")).exists() {
             return;
         }
@@ -384,7 +549,15 @@ fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime)
                 path.extension().and_then(|value| value.to_str()),
                 Some("log" | "endpoint-key")
             ) {
-                push_if_orphaned(&path, &mut orphans);
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    push_if_orphaned(&path, stem, &mut orphans);
+                }
+            } else if let Some(stem) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(staged_endpoint_key_owner)
+            {
+                push_if_orphaned(&path, stem, &mut orphans);
             }
         }
     }
@@ -400,8 +573,10 @@ fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime)
                 continue;
             };
             for path in states.flatten().map(|entry| entry.path()) {
-                if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                    push_if_orphaned(&path, &mut orphans);
+                if path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                {
+                    push_if_orphaned(&path, stem, &mut orphans);
                 }
             }
         }
@@ -416,6 +591,7 @@ fn build_service_prune_plan(
     min_age: Duration,
     hours: u64,
     now: SystemTime,
+    probe: &impl Fn(u32) -> ProcessProbe,
 ) -> Result<ServicePrunePlan> {
     let mut plan = ServicePrunePlan::default();
     // Taken first, because `load_managed_services` below rewrites the manifest of
@@ -426,24 +602,41 @@ fn build_service_prune_plan(
     // `load_managed_services` refreshes each record against the engine state and
     // the real processes before returning it, so liveness below is read from the
     // refreshed view, never from the manifest as it was on disk.
+    let staged_keys = staged_endpoint_keys_by_service(paths);
     for record in load_managed_services(paths)? {
-        if managed_service_record_is_in_use(&record) {
+        if managed_service_record_is_in_use_with(&record, probe) {
             plan.skipped_live += 1;
-            plan.skipped.push(format!(
-                "{} is {} - stop it first with `{}`",
-                record.service_id,
-                record.status,
-                service_hints::service_stop_hint(&record.service_id)
-            ));
+            // A record held only by a process `rocm` cannot query, after a stop
+            // was requested, is the one `remove --force` exists for: say so and
+            // name it, instead of advising a stop that can only report the same
+            // thing again. `prune` itself never forces.
+            let skipped = match forceable_unqueryable_pids(&record, probe) {
+                Some(pids) => format!(
+                    "{} is {} and {} it recorded could not be queried - remove it with `{}`",
+                    record.service_id,
+                    record.status,
+                    named_processes(&pids),
+                    service_hints::service_forced_remove_hint(&record.service_id)
+                ),
+                None => format!(
+                    "{} is {} - stop it first with `{}`",
+                    record.service_id,
+                    record.status,
+                    service_hints::service_stop_hint(&record.service_id)
+                ),
+            };
+            plan.skipped.push(skipped);
             continue;
         }
-        let artifacts = match service_record_artifacts(paths, &record.service_id, &record.engine) {
-            Ok(artifacts) => artifacts,
-            Err(error) => {
-                plan.skipped.push(format!("{}: {error}", record.service_id));
-                continue;
-            }
-        };
+        let artifacts =
+            match service_record_artifacts(paths, &record.service_id, &record.engine, &staged_keys)
+            {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    plan.skipped.push(format!("{}: {error}", record.service_id));
+                    continue;
+                }
+            };
         if !prunable_by_modified(
             manifest_times.get(&artifacts.manifest).copied(),
             min_age,
@@ -579,20 +772,32 @@ pub(crate) struct ServicePruneOutcome {
 /// was built. That window is the only reason the liveness re-check below exists,
 /// and no test driving `prune` end to end can open it: one call builds the plan
 /// and applies it, so a record is either live for both halves or dead for both.
+#[cfg(test)]
 fn apply_service_prune_plan(
     paths: &AppPaths,
     plan: &ServicePrunePlan,
     outcome: &mut ServicePruneOutcome,
 ) {
+    apply_service_prune_plan_with(paths, plan, outcome, &rocm_core::probe_process);
+}
+
+/// [`apply_service_prune_plan`] with the read of each recorded PID supplied by
+/// the caller.
+fn apply_service_prune_plan_with(
+    paths: &AppPaths,
+    plan: &ServicePrunePlan,
+    outcome: &mut ServicePruneOutcome,
+    probe: &impl Fn(u32) -> ProcessProbe,
+) {
     for entry in &plan.remove {
         // Liveness was snapshotted while the plan was built. A
         // `rocm services restart <id> --yes` landing in that window would have
-        // its log and 0600 endpoint key deleted out from under a live process,
+        // its log and owner-only endpoint key deleted out from under a live process,
         // so re-read the record immediately before touching its files —
         // `remove` narrows the same window by loading the record it deletes.
         // Neither closes it: the check and the delete are not atomic either way.
         if load_managed_service(paths, &entry.service_id)
-            .is_ok_and(|record| managed_service_record_is_in_use(&record))
+            .is_ok_and(|record| managed_service_record_is_in_use_with(&record, probe))
         {
             outcome.skipped_live += 1;
             let _ = writeln!(
@@ -631,11 +836,11 @@ fn apply_service_prune_plan(
 ///
 /// [`collect_service_orphans`] calls a file with no `<id>.json` beside it a
 /// leftover, and that is also what a launch looks like mid-flight: `serve`
-/// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
+/// writes the owner-only `<id>.endpoint-key` at the top of the managed path, and the
 /// first `<id>.json` only lands at `record.write()` inside
-/// `spawn_managed_engine_child` (in `service_launch.rs`). Between those two writes a live server's
-/// secret is indistinguishable from a leftover, and `--any-age` removes the age
-/// gate that used to hide the window, so a concurrent
+/// `spawn_managed_engine_child` (in `service_launch/spawn.rs`). Between those two
+/// writes a live server's secret is indistinguishable from a leftover, and
+/// `--any-age` removes the age gate that used to hide the window, so a concurrent
 /// `rocm services prune --any-age --yes` deleted it.
 ///
 /// `serve` already holds `managed_launch_lock_path` across the whole of that
@@ -719,6 +924,18 @@ pub(crate) fn prune_managed_service_records(
     dry_run: bool,
     yes: bool,
 ) -> Result<ServicePruneOutcome> {
+    prune_managed_service_records_with(paths, hours, dry_run, yes, &rocm_core::probe_process)
+}
+
+/// [`prune_managed_service_records`] with the read of each recorded PID supplied
+/// by the caller.
+fn prune_managed_service_records_with(
+    paths: &AppPaths,
+    hours: u64,
+    dry_run: bool,
+    yes: bool,
+    probe: &impl Fn(u32) -> ProcessProbe,
+) -> Result<ServicePruneOutcome> {
     if !dry_run && !yes {
         bail!(
             "Removing local server records requires --yes.\n\nTry: rocm services prune --dry-run\nThen: rocm services prune --yes"
@@ -742,7 +959,7 @@ pub(crate) fn prune_managed_service_records(
         rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?
     };
     let min_age = Duration::from_secs(hours.saturating_mul(3600));
-    let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now())?;
+    let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now(), probe)?;
     let mut outcome = ServicePruneOutcome {
         text: render_service_prune_plan(&plan, hours, dry_run),
         skipped_live: plan.skipped_live,
@@ -753,7 +970,7 @@ pub(crate) fn prune_managed_service_records(
         return Ok(outcome);
     }
 
-    apply_service_prune_plan(paths, &plan, &mut outcome);
+    apply_service_prune_plan_with(paths, &plan, &mut outcome, probe);
 
     let _ = writeln!(outcome.text);
     let _ = write!(
@@ -961,8 +1178,8 @@ mod tests {
         let (root, paths) = test_paths("services-remove-traversal");
         paths.ensure()?;
 
-        let by_engine = service_record_artifacts(&paths, "svc-ok", "../../../etc");
-        let by_id = service_record_artifacts(&paths, "../../etc/passwd", "vllm");
+        let by_engine = service_record_artifacts(&paths, "svc-ok", "../../../etc", &HashMap::new());
+        let by_id = service_record_artifacts(&paths, "../../etc/passwd", "vllm", &HashMap::new());
         let _ = fs::remove_dir_all(&root);
 
         assert!(
@@ -1021,6 +1238,145 @@ mod tests {
         Ok(())
     }
 
+    /// A store killed between staging the key and publishing it leaves a
+    /// second, plaintext copy beside the key. Removing the record takes it
+    /// too, and leaves another service's staged copy alone.
+    #[test]
+    fn services_remove_takes_a_staged_copy_of_the_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-staged-key");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-remove-me", "failed", 999_999_999)?;
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-remove-me");
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"secret")?;
+        let other_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-remove-me-too");
+        let other_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&other_key, b"other")?;
+
+        let rendered = remove_managed_service_record(&paths, "svc-remove-me", true);
+        let staged_exists = staged.exists();
+        let other_staged_exists = other_staged.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let rendered = rendered?;
+        assert!(!staged_exists, "the staged key copy must be deleted");
+        assert!(
+            other_staged_exists,
+            "another service's staged key must be left"
+        );
+        assert!(rendered.contains("  files removed: 5"), "{rendered}");
+        Ok(())
+    }
+
+    /// Pruning a record that is still on disk takes the staged key copy an
+    /// interrupted save left beside its key, as `remove` does.
+    #[test]
+    fn services_prune_takes_a_pruned_records_staged_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-record-staged-key");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-pruned", "failed", 999_999_999)?;
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-pruned");
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"secret")?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let record_exists = paths.service_manifest_path("svc-pruned").exists();
+        let staged_exists = staged.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let outcome = outcome?;
+        assert!(
+            !record_exists,
+            "premise: prune must remove the record:\n{}",
+            outcome.text
+        );
+        assert!(
+            !staged_exists,
+            "the pruned record's staged key copy must go with it:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// A staged key copy whose record is gone is an orphan like the key itself;
+    /// one whose record is still there is not.
+    #[test]
+    fn services_prune_sweeps_a_staged_endpoint_key_whose_record_is_gone() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-staged-key");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-orphaned", "failed", 999_999_999)?;
+        fs::remove_file(&record.manifest_path)?;
+        let orphan_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-orphaned");
+        let orphan_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&orphan_key, b"secret")?;
+        // A record whose server is still running keeps its staged copy: the
+        // sweep only takes what no record owns.
+        plant_service_record(&paths, "svc-kept", "ready", std::process::id())?;
+        let kept_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-kept");
+        let kept_staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&kept_key, b"kept")?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let orphan_staged_exists = orphan_staged.exists();
+        let kept_staged_exists = kept_staged.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let outcome = outcome?;
+        assert!(
+            !orphan_staged_exists,
+            "the orphaned staged key must be swept:\n{}",
+            outcome.text
+        );
+        assert!(
+            kept_staged_exists,
+            "a live record's staged key must be left"
+        );
+        Ok(())
+    }
+
+    /// The sweep takes only staged endpoint-key copies: a record that was
+    /// being rewritten when its writer died leaves `<id>.json.tmp-…`, which is
+    /// not a key and is not the sweep's to judge.
+    #[test]
+    fn the_orphan_sweep_leaves_a_half_written_manifest_alone() -> Result<()> {
+        let (root, paths) = test_paths("orphans-manifest-tmp");
+        paths.ensure()?;
+        let manifest = paths.service_manifest_path("svc-mid-write");
+        let staged_manifest =
+            rocm_core::atomic_write::stage_file_for_atomic_publish(&manifest, b"{}")?;
+
+        let orphans = collect_service_orphans(&paths, Duration::ZERO, SystemTime::now());
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !orphans.contains(&staged_manifest),
+            "a staged manifest was swept: {orphans:?}"
+        );
+        Ok(())
+    }
+
+    /// A staged key copy goes through the same age gate as every other
+    /// leftover: one written just now is kept under a non-zero age, and taken
+    /// once the gate is lifted.
+    #[test]
+    fn the_age_gate_applies_to_a_staged_endpoint_key() -> Result<()> {
+        let (root, paths) = test_paths("orphans-staged-key-age");
+        paths.ensure()?;
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-fresh");
+        let staged = rocm_core::atomic_write::stage_owner_only_file_unpublished(&key, b"secret")?;
+        let now = SystemTime::now();
+
+        let gated = collect_service_orphans(&paths, Duration::from_hours(24), now);
+        let ungated = collect_service_orphans(&paths, Duration::ZERO, now);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !gated.contains(&staged),
+            "a fresh staged key was swept: {gated:?}"
+        );
+        assert!(
+            ungated.contains(&staged),
+            "a staged orphan key was missed: {ungated:?}"
+        );
+        Ok(())
+    }
+
     /// The engine state file lives outside `services_dir`, so hand-deleting the
     /// manifest and log — the workaround this command replaces — leaves it
     /// behind forever. Prune has to sweep it.
@@ -1062,7 +1418,7 @@ mod tests {
     }
 
     /// The window the launch lock exists to close here: `serve` writes
-    /// the 0600 endpoint key *before* the first manifest, so between those two
+    /// the owner-only endpoint key *before* the first manifest, so between those two
     /// writes a live server's key has no `<id>.json` beside it — the exact shape
     /// the sweep calls a leftover, and `--any-age` leaves no age gate to hide it
     /// behind. `serve` holds the managed-launch lock across the whole of that
@@ -1501,7 +1857,7 @@ mod tests {
     /// adopts `failed` straight from the engine's own state file and the
     /// liveness refresh then returns early for a non-live status, so a server
     /// whose engine reported failure while its process is still up would be
-    /// removable — taking the log and the 0600 endpoint key of a live process.
+    /// removable — taking the log and the owner-only endpoint key of a live process.
     #[test]
     fn services_removal_refuses_a_failed_record_whose_process_is_still_alive() -> Result<()> {
         let (root, paths) = test_paths("services-remove-live-pid");
@@ -1623,7 +1979,7 @@ mod tests {
     /// The window the pre-delete liveness re-check exists to narrow: the plan is
     /// built from a snapshot, and a `rocm services restart <id> --yes` landing
     /// between that snapshot and the delete would otherwise have its log and its
-    /// 0600 endpoint key deleted out from under a serving process.
+    /// owner-only endpoint key deleted out from under a serving process.
     ///
     /// Driven through [`apply_service_prune_plan`] with a hand-built plan
     /// because the window cannot be opened from outside: `prune` builds and
@@ -1639,7 +1995,12 @@ mod tests {
         let record = plant_service_record(&paths, "svc-relaunched", "ready", std::process::id())?;
         // The entry a plan built moments earlier, while the record was still
         // stopped, would carry into the delete loop.
-        let artifacts = match service_record_artifacts(&paths, "svc-relaunched", "vllm") {
+        let artifacts = match service_record_artifacts(
+            &paths,
+            "svc-relaunched",
+            "vllm",
+            &staged_endpoint_keys_by_service(&paths),
+        ) {
             Ok(artifacts) => artifacts,
             Err(error) => {
                 let _ = fs::remove_dir_all(&root);
@@ -1675,7 +2036,7 @@ mod tests {
         );
         assert!(
             key_exists,
-            "the 0600 endpoint key of a live process must survive:\n{}",
+            "the owner-only endpoint key of a live process must survive:\n{}",
             outcome.text
         );
         assert_eq!(outcome.removed_records, 0);
@@ -1793,6 +2154,425 @@ mod tests {
             "the error must name the preview command: {message}"
         );
         assert!(manifest_exists, "a refused prune must delete nothing");
+        Ok(())
+    }
+
+    /// A record whose status is not live is still in use while a process it
+    /// recorded may be running, and a process that could not be queried (on
+    /// Windows, a live one this process may not open) may be. Only a confirmed
+    /// exit makes it removable.
+    #[test]
+    fn a_record_is_in_use_unless_every_recorded_process_is_confirmed_gone() -> Result<()> {
+        let (root, paths) = test_paths("services-in-use-probe");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-in-use", "failed", 999_999_999)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(managed_service_record_is_in_use_with(&record, |_| {
+            ProcessProbe::Unqueryable
+        }));
+        assert!(managed_service_record_is_in_use_with(&record, |_| {
+            ProcessProbe::Running
+        }));
+        assert!(!managed_service_record_is_in_use_with(&record, |_| {
+            ProcessProbe::Gone
+        }));
+        Ok(())
+    }
+
+    /// The by-hand way out, which still works alongside `--force`, for a record
+    /// whose process `rocm` cannot query: the record is refused while that process may be
+    /// running, and deleting its `<service-id>.json` by hand and running
+    /// `prune --any-age` leaves nothing behind (log, key and engine state all
+    /// swept), with the endpoint key among the files removed.
+    #[test]
+    fn a_record_held_by_an_unqueryable_process_can_be_cleared_by_hand_and_prune() -> Result<()> {
+        let (root, paths) = test_paths("services-unqueryable-way-out");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-stuck", "stopped", 999_999_999)?;
+        let refused = managed_service_record_is_in_use_with(&record, |_| ProcessProbe::Unqueryable);
+        let key = endpoint_keys::endpoint_key_file_path(&paths, "svc-stuck");
+        assert!(key.exists(), "the planted record has its key");
+
+        fs::remove_file(&record.manifest_path)?;
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let leftovers = [&record.log_path, &record.engine_state_path, &key]
+            .iter()
+            .filter(|path| path.exists())
+            .count();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            refused,
+            "a record whose process cannot be queried is in use"
+        );
+        assert_eq!(leftovers, 0, "prune swept every leftover file");
+        assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    /// A record the user already tried to stop, held by the test's own live PID,
+    /// so the real liveness read that loads it leaves it alone and only the
+    /// injected probe says the process cannot be queried.
+    fn held_record(paths: &AppPaths, service_id: &str, stop_requested: bool) -> Result<()> {
+        let mut record = plant_service_record(paths, service_id, "ready", std::process::id())?;
+        if stop_requested {
+            record.stop_requested_unix_ms = Some(1);
+            record.write()?;
+        }
+        Ok(())
+    }
+
+    fn files_left(paths: &AppPaths, service_id: &str) -> usize {
+        let manifest = paths.service_manifest_path(service_id).exists();
+        let log = paths.service_log_path(service_id).exists();
+        let key = endpoint_keys::endpoint_key_file_path(paths, service_id).exists();
+        usize::from(manifest) + usize::from(log) + usize::from(key)
+    }
+
+    /// Without `--force` the refusal names the forced removal, and everything the
+    /// record owns is still there: the advice and the state, together.
+    #[test]
+    fn a_record_held_by_an_unqueryable_process_is_refused_naming_the_forced_removal() -> Result<()>
+    {
+        let (root, paths) = test_paths("services-remove-unqueryable-refused");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+
+        let error = remove_managed_service_record_with(&paths, "svc-held", true, false, |_| {
+            ProcessProbe::Unqueryable
+        })
+        .map(|removed| removed.text)
+        .expect_err("a record held by an unqueryable process is refused");
+        let message = format!("{error:#}");
+        let left = files_left(&paths, "svc-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(message.contains("could not be queried"), "{message}");
+        assert!(
+            message.contains("rocm services remove svc-held --force --yes"),
+            "{message}"
+        );
+        assert_eq!(left, 3, "nothing was removed");
+        // The command the refusal names parses as printed.
+        let words: Vec<String> = service_hints::service_forced_remove_hint("svc-held")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            crate::advised_commands::rocm_verdict(&words[1..]),
+            crate::advised_commands::Verdict::Parses,
+            "{words:?}"
+        );
+        Ok(())
+    }
+
+    /// `--force` removes it and says what it risked; the audit-relevant flag is set.
+    #[test]
+    fn force_removes_a_record_held_by_an_unqueryable_process_and_says_so() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-unqueryable-forced");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+        let pid = std::process::id();
+
+        let removed = remove_managed_service_record_with(&paths, "svc-held", true, true, |_| {
+            ProcessProbe::Unqueryable
+        })?;
+        let left = files_left(&paths, "svc-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(removed.forced);
+        assert!(
+            removed.text.contains(&format!(
+                "--force: process {pid} could not be queried, so `rocm` cannot tell whether it is still running"
+            )),
+            "{}",
+            removed.text
+        );
+        assert!(removed.text.contains("endpoint key"), "{}", removed.text);
+        assert_eq!(left, 0, "every file the record owned is gone");
+        Ok(())
+    }
+
+    /// An `aim` stop whose engine `Stop` failed leaves the stop pending, and its
+    /// supervisor can be gone while the container still runs. Neither the liveness
+    /// refresh nor `remove` and `prune` may then treat the record as stopped and
+    /// delete it, with the key the container may still be enforcing: the refresh
+    /// leaves the status alone, `remove` refuses it, and `prune` skips it, all
+    /// with the supervisor confirmed gone. A process engine in the same state is
+    /// an ordinary stopped record that is removed.
+    #[test]
+    fn a_pending_container_stop_survives_refresh_remove_and_prune() -> Result<()> {
+        let gone = |_: u32| ProcessProbe::Gone;
+        let (root, paths) = test_paths("services-container-pending-stop");
+        paths.ensure()?;
+        // A record already reading `stopped` (an earlier reconciliation wrote it)
+        // is the case only the in-use guard protects.
+        for (engine, status, id, protected) in [
+            ("aim", "ready", "svc-container", true),
+            ("aim", "stopped", "svc-container-stopped", true),
+            ("vllm", "ready", "svc-process", false),
+        ] {
+            let mut record = plant_service_record(&paths, id, status, 999_999_999)?;
+            record.engine = engine.to_owned();
+            record.stop_requested_unix_ms = Some(1);
+            record.write()?;
+
+            let mut refreshed = record.clone();
+            let _ = crate::managed_service_status::refresh_managed_service_runtime_liveness_with(
+                &paths,
+                &mut refreshed,
+                gone,
+            );
+            let removal = remove_managed_service_record_with(&paths, id, true, false, gone);
+            let pruned = prune_managed_service_records_with(&paths, 0, false, true, &gone)?;
+            let left = files_left(&paths, id);
+
+            if protected {
+                assert_eq!(refreshed.status, status, "{engine}: refresh");
+                assert_eq!(refreshed.supervisor_pid, 999_999_999, "{engine}: refresh");
+                assert!(removal.is_err(), "{engine}: remove must refuse");
+                assert_eq!(pruned.removed_records, 0, "{engine}: prune");
+                assert_eq!(left, 3, "{engine}: nothing was deleted");
+            } else {
+                assert!(removal.is_ok() || pruned.removed_records == 1, "{engine}");
+                assert_eq!(left, 0, "{engine}: an ordinary stopped record goes");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A `ready` record whose dead server's PID is now held by a process this
+    /// account cannot open, and that nobody has tried to stop: `--force` is
+    /// refused (it never forces a record nobody tried to stop), and the refusal
+    /// names `services stop`. That stop cannot verify the process, reports it
+    /// unverified and records the request, after which `--force` removes the
+    /// record. So the record is not stuck: the way out is those two commands, and
+    /// this is the intended shape, not a gap.
+    #[test]
+    fn a_ready_record_held_by_an_unqueryable_process_is_cleared_by_stop_then_force() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-ready-unqueryable-chain");
+        paths.ensure()?;
+        held_record(&paths, "svc-ready-held", false)?;
+        let pid = std::process::id();
+
+        let first =
+            remove_managed_service_record_with(&paths, "svc-ready-held", true, true, |_| {
+                ProcessProbe::Unqueryable
+            })
+            .map(|removed| removed.text)
+            .expect_err("a record nobody tried to stop is not forced");
+        let report = crate::service_control::stop_internal_managed_service_with(
+            &paths,
+            "svc-ready-held",
+            |_| {
+                vec![rocm_core::RecordedPidStop {
+                    pid,
+                    role: "supervisor_and_engine",
+                    outcome: rocm_core::RecordedPidOutcome::Terminated(
+                        rocm_core::TerminationOutcome::Unverified,
+                    ),
+                }]
+            },
+        )?;
+        let second =
+            remove_managed_service_record_with(&paths, "svc-ready-held", true, true, |_| {
+                ProcessProbe::Unqueryable
+            })?;
+        let left = files_left(&paths, "svc-ready-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            format!("{first:#}").contains("rocm services stop svc-ready-held --yes"),
+            "{first:#}"
+        );
+        assert_eq!(report["stopped"], false, "{report}");
+        assert!(second.forced);
+        assert_eq!(left, 0, "the forced removal took the record and its files");
+        Ok(())
+    }
+
+    /// `--force` never goes past a process that is confirmed running, and it
+    /// needs a stop to have been requested: the refusal says which, and names the
+    /// stop that is the way forward.
+    #[test]
+    fn force_is_refused_for_a_running_process_and_without_a_requested_stop() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-refused");
+        paths.ensure()?;
+        held_record(&paths, "svc-running", true)?;
+        held_record(&paths, "svc-no-stop", false)?;
+
+        let running = remove_managed_service_record_with(&paths, "svc-running", true, true, |_| {
+            ProcessProbe::Running
+        })
+        .map(|removed| removed.text)
+        .expect_err("a confirmed running process is never forced past");
+        let no_stop = remove_managed_service_record_with(&paths, "svc-no-stop", true, true, |_| {
+            ProcessProbe::Unqueryable
+        })
+        .map(|removed| removed.text)
+        .expect_err("a record nobody tried to stop is not forced");
+        let left = files_left(&paths, "svc-running") + files_left(&paths, "svc-no-stop");
+        let _ = fs::remove_dir_all(root);
+
+        for error in [format!("{running:#}"), format!("{no_stop:#}")] {
+            assert!(
+                error.contains("--force removes a record only when"),
+                "{error}"
+            );
+        }
+        assert!(
+            format!("{running:#}").contains("rocm services stop svc-running --yes"),
+            "{running:#}"
+        );
+        assert_eq!(left, 6, "nothing was removed");
+        Ok(())
+    }
+
+    /// `--force` on a record that is simply not running changes nothing: it is
+    /// removed as usual and not reported as forced.
+    #[test]
+    fn force_on_a_record_that_is_not_running_is_an_ordinary_removal() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-unneeded");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-stopped", "stopped", 999_999_999)?;
+
+        let removed =
+            remove_managed_service_record_with(&paths, "svc-stopped", true, true, |_| {
+                ProcessProbe::Gone
+            })?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(!removed.forced);
+        assert!(!removed.text.contains("--force"), "{}", removed.text);
+        Ok(())
+    }
+
+    /// One recorded process that cannot be queried does not make a record
+    /// forceable while another is confirmed running: the running one is never
+    /// forced past, whichever role it has.
+    #[test]
+    fn force_is_refused_when_one_process_is_unqueryable_and_another_is_running() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-mixed");
+        paths.ensure()?;
+        let own = std::process::id();
+        let mut record = plant_service_record(&paths, "svc-mixed", "ready", own)?;
+        record.engine_pid = Some(999_999_997);
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+
+        let error = remove_managed_service_record_with(&paths, "svc-mixed", true, true, |pid| {
+            if pid == own {
+                ProcessProbe::Unqueryable
+            } else {
+                ProcessProbe::Running
+            }
+        })
+        .map(|removed| removed.text)
+        .expect_err("a record with a process confirmed running is never forced");
+        let left = files_left(&paths, "svc-mixed");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            format!("{error:#}").contains("--force removes a record only when"),
+            "{error:#}"
+        );
+        assert_eq!(left, 3, "nothing was removed");
+        Ok(())
+    }
+
+    /// A forced removal that is missing `--yes` is told to add `--yes`, not to
+    /// drop the `--force` it asked for: the command it names completes the
+    /// removal, which is asserted by running it.
+    #[test]
+    fn a_forced_removal_missing_yes_names_the_command_that_completes_it() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-force-needs-yes");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+        let unqueryable = |_: u32| ProcessProbe::Unqueryable;
+
+        let error =
+            remove_managed_service_record_with(&paths, "svc-held", false, true, unqueryable)
+                .map(|removed| removed.text)
+                .expect_err("a forced removal without --yes is refused");
+        let message = format!("{error:#}");
+        let left_before = files_left(&paths, "svc-held");
+        // The named command, run as named, removes the record.
+        let named = service_hints::service_forced_remove_hint("svc-held");
+        let completed =
+            remove_managed_service_record_with(&paths, "svc-held", true, true, unqueryable)?;
+        let left_after = files_left(&paths, "svc-held");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(message.contains("requires --yes"), "{message}");
+        assert!(message.contains(&format!("Try: {named}")), "{message}");
+        assert_eq!(left_before, 3, "the refusal removed nothing");
+        assert!(completed.forced);
+        assert_eq!(left_after, 0, "the command it named cleared the record");
+        // An ordinary removal still names the plain command.
+        let plain = service_hints::service_action_hint("remove", "svc-held");
+        assert!(
+            !named.eq(&plain) && named.contains("--force"),
+            "{named} / {plain}"
+        );
+        Ok(())
+    }
+
+    /// `prune` never forces, and says what does: a record held only by an
+    /// unqueryable process, after a stop was requested, is reported with the
+    /// exact `remove --force --yes` command, and that command, run, clears the
+    /// record. A record with a process confirmed running keeps the stop advice.
+    #[test]
+    fn prune_names_the_forced_removal_for_a_record_held_by_an_unqueryable_process() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-names-force");
+        paths.ensure()?;
+        held_record(&paths, "svc-held", true)?;
+        let unqueryable = |_: u32| ProcessProbe::Unqueryable;
+
+        let outcome = prune_managed_service_records_with(&paths, 0, false, true, &unqueryable)?;
+        let left_after_prune = files_left(&paths, "svc-held");
+        let named = service_hints::service_forced_remove_hint("svc-held");
+        // Run exactly what prune named.
+        let removed =
+            remove_managed_service_record_with(&paths, "svc-held", true, true, unqueryable)?;
+        let left_after_named = files_left(&paths, "svc-held");
+
+        held_record(&paths, "svc-running", true)?;
+        let running =
+            prune_managed_service_records_with(&paths, 0, true, false, &|_| ProcessProbe::Running)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            outcome.text.contains(&format!(
+                "svc-held is starting and process {} it recorded could not be queried - remove it with `{named}`",
+                std::process::id()
+            )),
+            "{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0, "prune itself never forces");
+        assert_eq!(left_after_prune, 3, "and left every file alone");
+        assert!(removed.forced);
+        assert_eq!(
+            left_after_named, 0,
+            "the command prune named clears the record"
+        );
+        assert!(
+            running.text.contains(
+                "svc-running is starting - stop it first with `rocm services stop svc-running --yes`"
+            ),
+            "{}",
+            running.text
+        );
+        assert!(!running.text.contains("--force"), "{}", running.text);
         Ok(())
     }
 }

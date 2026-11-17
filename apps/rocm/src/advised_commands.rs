@@ -640,6 +640,13 @@ fn split_shell_list(text: &str) -> Vec<String> {
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
+            // `<<` starts a heredoc, a redirection, not a `<placeholder>`:
+            // taken whole, so neither `<` opens one.
+            '<' if next == Some('<') => {
+                current.push_str("<<");
+                index += 2;
+                continue;
+            }
             // `<` opens a placeholder only at a word start and before a
             // non-space: ` < file` is a redirection.
             '<' if at_word_start && next.is_some_and(|c| !c.is_whitespace()) => closers.push('>'),
@@ -677,7 +684,7 @@ pub(crate) fn command_parts(raw: &str) -> Vec<String> {
         }
         let mut command = command.to_owned();
         for marker in [
-            " >> ", " > ", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
+            " >> ", " > ", " <<", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
         ] {
             if let Some(position) = command.find(marker) {
                 command.truncate(position);
@@ -1159,7 +1166,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the non-interactive launcher report",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/turn.rs",
         "rocm tools: {}",
         "`rocm tools: enabled` status row",
     ),
@@ -1169,32 +1176,32 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the model-readiness report, `<command>: <verdict>`, naming what was run",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm install folder",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm installed at",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm installed",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/intent.rs",
         "rocm please",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/mcp_bridge.rs",
         "rocm command requires at least one argument",
         "validation error naming the chat `rocm` tool",
     ),
     (
-        "apps/rocm/src/chat.rs",
+        "apps/rocm/src/chat/turn.rs",
         "rocm command",
         "fallback label for an unrenderable chat tool call",
     ),
@@ -1276,6 +1283,11 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "debug log line",
     ),
     (
+        "crates/rocm-core/src/host_gpu/capture.rs",
+        "rocm debug: command capture output from {} may be incomplete: {note}",
+        "debug log line",
+    ),
+    (
         "crates/rocm-dash-tui/src/ui/command_screen.rs",
         "rocm {}",
         "echo of whatever the user typed into the command runner",
@@ -1285,6 +1297,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "docs/manual-testing.md",
         "rocm services prune --any-age --older-than-hours 0",
         "the doc's expected result is that the parser rejects this combination",
+    ),
+    (
+        "docs/manual-testing.md",
+        "rocm fix --no-such-option; echo $?",
+        "the doc's expected result is that the parser rejects the unknown option \
+         with exit 2, the code the catalog publishes for an unknown fix-id",
     ),
 ];
 
@@ -2102,6 +2120,50 @@ fn every_command_in_a_shell_list_is_checked() {
         command_parts("rocm serve <a | b> [--x | --y] && rocm examine"),
         vec!["rocm serve <a | b> [--x | --y]", "rocm examine"]
     );
+}
+
+/// A heredoc is a redirection like ` < file`: `rocm diagnose --symptom-file -
+/// <<'EOF'` hands the command a paste on standard input, so the `<<` and its
+/// delimiter are not arguments.
+#[test]
+fn a_heredoc_ends_the_command() {
+    for raw in [
+        "rocm diagnose --symptom-file - <<'EOF'",
+        "rocm diagnose --symptom-file - <<\"EOF\"",
+        "rocm diagnose --symptom-file - << EOF",
+        "rocm diagnose --symptom-file - <<EOF",
+        // A here-string (`<<<`) ends it the same way.
+        "rocm diagnose --symptom-file - <<< \"text\"",
+        "rocm diagnose --symptom-file - <<<text",
+    ] {
+        assert_eq!(
+            command_parts(raw),
+            vec!["rocm diagnose --symptom-file -"],
+            "{raw}"
+        );
+        assert!(
+            findings(&[fixture(raw, Surface::CommandLine)]).is_empty(),
+            "{raw}"
+        );
+    }
+    // A heredoc's `<<` is not a `<placeholder>`, so a command after it in the
+    // same list is still split off and checked.
+    for raw in [
+        "rocm diagnose --symptom-file - <<'EOF' && rocm frobnicate --x",
+        "rocm diagnose --symptom-file - <<EOF; rocm frobnicate --x",
+        "rocm diagnose --symptom-file - << EOF || rocm frobnicate --x",
+        // A here-string (`<<<`) is a redirection too.
+        "rocm diagnose --symptom-file - <<< \"text\" && rocm frobnicate --x",
+    ] {
+        assert_eq!(
+            command_parts(raw),
+            vec!["rocm diagnose --symptom-file -", "rocm frobnicate --x"],
+            "{raw}"
+        );
+        let found = findings(&[fixture(raw, Surface::CommandLine)]);
+        assert_eq!(found.len(), 1, "{raw}: {}", render_findings(&found));
+        assert_eq!(found[0].argv[1], "frobnicate", "{raw}");
+    }
 }
 
 /// Prose may follow a command after an em dash, an en dash or an arrow

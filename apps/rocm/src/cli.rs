@@ -12,13 +12,14 @@
 //! the completion builder, and re-imports these types so every other module
 //! keeps reaching them as `crate::Command`, `crate::Provider` and so on.
 
+pub(crate) use crate::cli_args::{
+    DevicePolicyArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider, SandboxToolArg,
+    TelemetryModeArg, WatcherModeArg,
+};
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::{bootstrap, chat, comfyui, remote, storage};
-use clap::{Parser, Subcommand, ValueEnum};
-use rocm_core::{
-    DEFAULT_LOCAL_HOST, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode,
-};
+use clap::{Parser, Subcommand};
+use rocm_core::DEFAULT_LOCAL_HOST;
 use std::path::PathBuf;
 
 /// User-selectable serving engines, in the order shown in `--help` and shell
@@ -50,6 +51,9 @@ Commands marked [preview] work but are outside the Tech Preview's supported\n\
 scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
 Run `rocm <command> --help` for details and examples on any command."
 )]
+// No global flags, no subcommand aliases and no abbreviations: the logger gate in
+// `logging::is_enabled_for` reads the subcommand as `argv[1]` and relies on that
+// (guarded by `uninstall_stays_the_first_argument_the_logger_gate_reads`).
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -92,8 +96,33 @@ pub(crate) enum Command {
     /// takes the id, not the position.
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring.
-        #[arg(long)]
+        ///
+        /// A shell reads this text before `rocm` does, so quotes, `$(...)`
+        /// and a leading `-` in a pasted error can be changed, run, or taken
+        /// as a flag. Use `--symptom-file` to hand over a paste untouched.
+        ///
+        /// Each match then says whether this text contributed to it
+        /// (`symptom_matched` in --json).
+        #[arg(long, value_name = "TEXT")]
         symptom: Option<String>,
+        /// Read the error text from a file instead, or from standard input
+        /// when PATH is `-`, so no shell quoting is needed. A file named `-`
+        /// is passed as `./-`.
+        ///
+        /// The text that arrives is matched as `--symptom` would match it,
+        /// with one trailing line break removed (shells and editors add one).
+        /// A UTF-8 byte-order mark is dropped, and a file with a UTF-16
+        /// byte-order mark, as Windows PowerShell's `>` writes, is decoded;
+        /// anything else must be UTF-8. An unreadable file, input that is not
+        /// text, or input larger than 16 MiB is a usage error (exit code 2).
+        /// For example: `rocm diagnose --symptom-file error.txt`. In
+        /// PowerShell, save the clipboard first
+        /// (`Get-Clipboard -Raw > error.txt`): Windows PowerShell 5.1 pipes
+        /// text to a program as ASCII, turning any other character into `?`.
+        /// With nothing piped in, paste the text at the terminal and end it
+        /// with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+        #[arg(long, value_name = "PATH", conflicts_with = "symptom")]
+        symptom_file: Option<PathBuf>,
         /// Show at most this many matches (default 5).
         #[arg(long, default_value_t = 5)]
         top: usize,
@@ -108,21 +137,69 @@ pub(crate) enum Command {
         /// Also answer whether a model would run on this machine, before
         /// downloading it.
         ///
-        /// Takes a curated model name or alias (see `rocm model`). Nothing is
-        /// fetched: the answer comes from the recipe and this host's GPU. A
-        /// model the catalog does not carry is reported as undetermined rather
-        /// than blocked - `rocm serve` still accepts it, this just cannot say
-        /// in advance whether it fits.
+        /// Takes a curated model name or alias (see `rocm model`), or a GGUF
+        /// model: a local `.gguf` path, or `owner/repo:QUANT` on Hugging Face.
+        /// No weights are downloaded. A curated model is answered from its
+        /// recipe and this host's GPU. A GGUF outside the catalog is estimated
+        /// from its file header (for a remote file: one repository listing, a
+        /// `HEAD` request for a file the listing does not size, then a few MB by
+        /// range request; no token is sent, so a gated or private repository
+        /// cannot be read): weights plus KV cache at `--context-size` plus a
+        /// compute buffer and a runtime reserve, against the dedicated VRAM of
+        /// the GPU with the most of it, labelled ESTIMATED rather than READY or
+        /// BLOCKED. A device-visibility mask on a host whose GPUs differ in
+        /// memory is flagged in the report, since which card it selects is not
+        /// verified there. Any other model the
+        /// catalog does not carry is reported as undetermined rather than
+        /// blocked - `rocm serve` still accepts it, this just cannot say in
+        /// advance whether it fits.
+        ///
+        /// For example: `rocm diagnose --model Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
+        /// --context-size 32768 --kv-cache-type q8_0`. `HF_ENDPOINT` points the
+        /// header read at a Hugging Face mirror.
         ///
         /// A flag rather than a positional: `diagnose` takes no positional
         /// today, and one added now would be ambiguous against `--symptom`.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
+        /// Context size, in tokens, to estimate a GGUF model for (1 to
+        /// 16777216; default 4096).
+        ///
+        /// The largest context that fits (never more than the context the model
+        /// was trained for) is reported as well, but only when this machine's
+        /// GPU memory could be read; without a reading, the memory the model
+        /// needs is shown and nothing is compared, so no largest context is
+        /// given. The comparison is against the total dedicated VRAM of the GPU
+        /// with the most of it that ROCm can see, as for a curated model, not
+        /// what other processes have left free. Applies to a GGUF outside the
+        /// catalog (a curated model's memory minimum is fixed, and says so);
+        /// `rocm serve` has no context-size option yet, so this answers the
+        /// question without changing what serve does.
+        #[arg(
+            long,
+            value_name = "TOKENS",
+            requires = "model",
+            value_parser = clap::value_parser!(u64).range(1..=rocm_core::gguf_fit::MAX_CONTEXT_SIZE)
+        )]
+        context_size: Option<u64>,
+        /// KV cache element type to estimate for (default f16).
+        ///
+        /// A quantized cache is smaller. In llama.cpp a quantized V cache needs
+        /// flash attention (q8_0 and q4_0 here quantize both K and V), and the
+        /// estimate assumes flash attention is on. Applies to a GGUF outside the
+        /// catalog.
+        #[arg(long, value_enum, value_name = "TYPE", requires = "model")]
+        kv_cache_type: Option<crate::diagnose_model::KvCacheTypeArg>,
         /// Show the report this machine would contribute, and send nothing.
         ///
         /// Nothing leaves the machine: this prints the exact content so it can
         /// be read before any of it is shared. Hardware that is not on AMD's
         /// published compatibility matrix produces no report at all.
+        ///
+        /// `--model` is not consulted with `--report`: a report carries no model
+        /// verdict, so nothing is looked up for it and nothing is fetched. A
+        /// note on stderr says that `--model` (and `--context-size` and
+        /// `--kv-cache-type`, if given) were ignored.
         ///
         /// Not combinable with `--distro`: a report describes this machine, and
         /// a WSL distribution reached remotely is not fully examined (see
@@ -177,11 +254,19 @@ pub(crate) enum Command {
         #[arg(long)]
         device_index: Option<i64>,
         /// Emit the catalog as JSON for tooling. Only valid without a fix id.
+        ///
+        /// It also names each exit code and says what it means. Exit 2 is
+        /// both an unknown fix id (a stderr line starting `Unknown fix-id:`)
+        /// and a malformed command line (a stderr line starting `error:`);
+        /// read the message to tell them apart.
         #[arg(long)]
         json: bool,
     },
     /// Print the rocm-cli version, release tag or branch, and commit hash,
     /// plus the ROCm SDK and GPU driver this machine would use.
+    ///
+    /// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A build
+    /// from `main` is shown as `0.0.0-dev (main, <hash>)`.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -372,7 +457,9 @@ rocm model --verbose"
     },
     /// Start a local OpenAI-compatible model server.
     ///
-    /// Picks an engine and ROCm runtime automatically unless overridden. By default the
+    /// Picks an engine and ROCm runtime automatically unless overridden. An
+    /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
+    /// one (see `rocm services list`). By default the
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
@@ -443,9 +530,16 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Host address to bind.
         #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
         host: String,
-        /// TCP port to bind.
-        #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
-        port: u16,
+        /// TCP port to bind. Omit it to choose an available port automatically,
+        /// starting at 11435, on the default 127.0.0.1 host. Any other --host
+        /// requires an explicit --port: proactive collision detection is claimed
+        /// only for local 127.0.0.1 serving.
+        // `allow_hyphen_values` so a negative value such as `-1` reaches
+        // `parse_serve_port` and gets the domain error naming the valid range,
+        // instead of clap rejecting it as an unknown flag. Mirrors the same
+        // choice made for `--gpu-memory-utilization` below.
+        #[arg(long, value_parser = crate::serve_port::parse_serve_port, allow_hyphen_values = true)]
+        port: Option<u16>,
         /// Attach to the server in this terminal and stream its logs (Ctrl-D to
         /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
@@ -453,6 +547,15 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
+        /// Keep waiting until the server answers requests or its engine gives up
+        /// (vLLM and AIM after 5 minutes by default, raised with
+        /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
+        /// instead of returning `starting` after 45 seconds.
+        /// Also waits on a matching server that is already starting. Fails with a
+        /// pointer to the logs if the server exits first. Cannot be
+        /// combined with --foreground or --verbose, which already stay attached.
+        #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
+        wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
@@ -552,11 +655,16 @@ rocm serve qwen --verbose --device gpu_required")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm logs\n  \
 rocm logs --service <service-id>\n  \
+rocm logs --service <service-id> --follow\n  \
 rocm logs --search error timeout")]
     Logs {
         /// Show logs for a managed service id.
         #[arg(long)]
         service: Option<String>,
+        /// Keep printing new output for --service until the server stops (Ctrl-C ends the
+        /// follow and leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f', requires = "service")]
+        follow: bool,
         /// Search recent logs for one or more words.
         #[arg(long, num_args = 1.., value_name = "QUERY")]
         search: Vec<String>,
@@ -593,6 +701,11 @@ rocm logs --search error timeout")]
         status: bool,
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    ///
+    /// On Linux/WSL, discovers loaded models from local Lemonade at 127.0.0.1:13305
+    /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
+    /// lemonade_port in config.json. External models have no Services stop/restart
+    /// controls; discovery is read-only and quitting leaves external servers running.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -613,10 +726,16 @@ rocm logs --search error timeout")]
     /// Remove ROCm CLI-managed files from this computer.
     ///
     /// Removes the config, data, and cache directories and the installed
-    /// binaries, including the running rocm.exe on Windows. It also undoes the
-    /// PATH change the installer made (its marked shell-profile block, or the
-    /// user PATH entry it recorded adding on Windows), unless other programs
-    /// share the install folder.
+    /// binaries, including the running rocm.exe on Windows, and the fish
+    /// completion script the Linux installer wrote for them (a rocm.fish it
+    /// did not write is left in place, and one it cannot remove is only a
+    /// warning). It also undoes the PATH change the installer made (its marked
+    /// shell-profile block, or the user PATH entry it recorded adding on
+    /// Windows), unless other programs share the install folder.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm uninstall --dry-run\n  \
+rocm uninstall\n  \
+rocm uninstall --keep-data --yes")]
     Uninstall {
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
@@ -627,7 +746,8 @@ rocm logs --search error timeout")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries, and the installer's PATH change.
+        /// Keep installed rocm-cli binaries, the installer's PATH change, and the
+        /// fish completions it wrote.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -644,6 +764,11 @@ rocm logs --search error timeout")]
         /// Allow removing development binaries inside the current build tree.
         #[arg(long)]
         force_dev_binaries: bool,
+        /// Not an option; accepted only to say so. Without it clap answers a
+        /// mistyped `--force` (a likely guess for skipping the confirmation)
+        /// with `--force-dev-binaries`, which removes development binaries.
+        #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "")]
+        force: Option<String>,
     },
 }
 
@@ -694,11 +819,17 @@ pub(crate) enum InstallTarget {
     /// Install TheRock ROCm wheels into a Python folder managed by ROCm CLI.
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
-rocm install sdk --channel nightly --build-date 2025-01-15\n  \
-rocm install sdk --family gfx110X-all --dry-run\n  \
-rocm install sdk --devel")]
+rocm install sdk --channel nightly --build-date 2026-08-19\n  \
+rocm install sdk --family gfx1100 --dry-run\n  \
+rocm install sdk --version 7.14.1 --family gfx110X-all\n  \
+rocm install sdk --devel\n  \
+rocm install sdk --version 10.0.0 --python-version 3.12")]
     Sdk {
-        /// Package channel to install, such as release or nightly.
+        /// TheRock ROCm SDK channel to install from: `release` or `nightly`.
+        ///
+        /// This picks the ROCm SDK stream only. It is separate from the channel
+        /// the `rocm` binary itself was installed from (`install.sh`,
+        /// `install.ps1`); `rocm update` updates SDK runtimes, not the binary.
         #[arg(long, default_value = "release")]
         channel: String,
         /// Package format to install [possible values: wheel, tarball].
@@ -707,13 +838,20 @@ rocm install sdk --devel")]
         /// Full folder path where the ROCm Python environment should be created.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
-        /// Exact TheRock package version to install.
+        /// Exact TheRock package version to install; with none, the channel's
+        /// newest build. An earlier ROCm 7 release such as 7.14.1 is supported,
+        /// for a wheel install only.
         #[arg(long, conflicts_with = "build_date")]
         version: Option<String>,
-        /// Pick the TheRock package built on this date.
+        /// Pick the TheRock package built on this date; nightlies from before
+        /// 2026-08-23 are still installable, for a wheel install only.
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
-        /// TheRock GPU package family to install, such as gfx110X-all.
+        /// TheRock GPU package family to install, such as gfx1200.
+        ///
+        /// ROCm 10 and newer, which an install with no `--version` gets, need
+        /// an exact arch such as `gfx1200`; a label such as gfx110X-all is for
+        /// an earlier ROCm 7 (wheel installs only).
         ///
         /// A GPU target ROCm publishes no build for is refused rather than
         /// mapped to a near neighbour: `--family gfx90c` - the Vega iGPU in
@@ -722,6 +860,17 @@ rocm install sdk --devel")]
         /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
+        /// Python version for a ROCm 10 or newer install, one of 3.10 to 3.14.
+        ///
+        /// ROCm 10 installs use Python 3.14 unless you name another, because
+        /// vLLM, flash-attn and amd-aiter for ROCm 10 are published for 3.14
+        /// only. With another version the SDK and PyTorch install and run, but
+        /// the vLLM engine does not: the engine install that follows an SDK
+        /// install on a vLLM GPU is skipped, and `rocm engines install vllm`
+        /// refuses that runtime. Re-run without this flag to switch it to 3.14.
+        /// Wheel installs only; a ROCm 7 install is built for Python 3.12.
+        #[arg(long, value_name = "X.Y")]
+        python_version: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
         /// building GPU code. Roughly doubles the wheel download; already
         /// included by `--format tarball`.
@@ -735,6 +884,11 @@ rocm install sdk --devel")]
         #[arg(long)]
         devel: bool,
         /// Resolve the install plan without changing files.
+        ///
+        /// Downloads no uv and prepares no Python. For ROCm 10 and newer on a
+        /// host with no uv installed, the plan marks the package versions it
+        /// would need uv to choose, and everything made from them, as not
+        /// resolved.
         #[arg(long)]
         dry_run: bool,
         /// Approve replacing the current active default ROCm runtime (and
@@ -888,7 +1042,7 @@ left, so it cannot undo more than one activation."
         /// Python executable inside the existing ROCm environment.
         #[arg(long)]
         python: PathBuf,
-        /// Optional SDK root path.
+        /// Python environment folder. Taken from --python when that sits in a bin or Scripts folder; required otherwise.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Runtime id to assign.
@@ -1040,6 +1194,10 @@ pub(crate) enum ServicesCommand {
     Logs {
         /// Service id from `rocm services list`.
         service_id: String,
+        /// Keep printing new output until the server stops (Ctrl-C ends the follow and
+        /// leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Stop a local model server.
     ///
@@ -1047,9 +1205,10 @@ pub(crate) enum ServicesCommand {
     /// confirmed gone. Otherwise it reports on stderr that the stop was not
     /// confirmed and exits with an error, keeping the record, which still names
     /// the processes, and any endpoint key, which the server may still be
-    /// enforcing. It names each process that did not exit, and for one it could
-    /// not verify it signals nothing and names an operating-system command to
-    /// check on it. It does not suggest running the stop again.
+    /// enforcing. It names each process that did not exit (on Windows, also one
+    /// whose child processes may still be running), and for one it could not
+    /// verify it signals nothing and names an operating-system command to check
+    /// on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
@@ -1071,21 +1230,32 @@ pub(crate) enum ServicesCommand {
     },
     /// Delete one local server record and its files.
     ///
-    /// Only works on a record that is not running: stop the server first. The
-    /// record's details file, log, engine state file, and endpoint key file are
-    /// all deleted, so its log can no longer be read and it can no longer be
-    /// restarted.
+    /// Only works on a record that is not running: stop the server first (on
+    /// Windows a process `rocm` cannot query counts as running). The record's
+    /// details file, log, engine state file, and endpoint key file (with any
+    /// copy of the key an interrupted save left beside it) are all deleted, so
+    /// its log can no longer be read and it can no longer be restarted.
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
         /// Required; remove refuses without it.
         #[arg(long)]
         yes: bool,
+        /// Remove a record whose recorded process `rocm` cannot query.
+        ///
+        /// Only when a stop was requested, no recorded process is confirmed
+        /// running, and at least one could not be queried (on Windows, a live
+        /// process the account may not open). Deletes the same files as a
+        /// plain `remove`, and says which process; if it is still running it
+        /// keeps running. Refused for a process confirmed running.
+        #[arg(long)]
+        force: bool,
     },
     /// Delete local server records that are no longer running.
     ///
-    /// Running servers are always left alone. Leftover files whose record is
-    /// already gone are cleaned up too.
+    /// Running servers are always left alone; a record held only by a process
+    /// `rocm` cannot query (Windows) is listed with the `remove --force` command.
+    /// Leftover files whose record is already gone are cleaned up too.
     ///
     /// Waits for a managed launch already under way to publish its record
     /// before reading the directory, and waits as long as that launch takes.
@@ -1223,174 +1393,49 @@ pub(crate) enum SetupCommand {
     },
 }
 
-/// Which framework `rocm examine` should probe.
-///
-/// The CLI-facing mirror of [`rocm_core::FrameworkProbe`], which cannot derive
-/// `ValueEnum` itself without pulling clap into `rocm-core`. Every variant of
-/// that enum existed and was reachable in the library, but no caller ever passed
-/// anything but the default, so the choice could not be made from the command
-/// line at all.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum FrameworkArg {
-    /// Try PyTorch first, then llama.cpp (the default).
-    Auto,
-    /// Probe PyTorch only.
-    Pytorch,
-    /// Probe llama.cpp only.
-    #[value(name = "llama-cpp", alias = "llamacpp")]
-    LlamaCpp,
-    /// Probe no framework at all - fastest, and enough for GPU and driver questions.
-    Skip,
-}
-
-impl From<FrameworkArg> for rocm_core::FrameworkProbe {
-    fn from(value: FrameworkArg) -> Self {
-        match value {
-            FrameworkArg::Auto => Self::Auto,
-            FrameworkArg::Pytorch => Self::PyTorch,
-            FrameworkArg::LlamaCpp => Self::LlamaCpp,
-            FrameworkArg::Skip => Self::Skip,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum InstallFormat {
-    /// Python wheel packages (recommended; smaller, pip-installable).
-    Wheel,
-    /// Self-contained tarball archive of the ROCm SDK.
-    Tarball,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum Provider {
-    /// A local OpenAI-compatible server started via `rocm serve` (no API key).
-    Local,
-    /// Anthropic Claude API (requires an API key).
-    Anthropic,
-    /// OpenAI API or OpenAI-compatible endpoint (requires an API key).
-    Openai,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum WatcherModeArg {
-    /// Only report findings; never take action.
-    Observe,
-    /// Report findings and propose changes for you to approve.
-    Propose,
-    /// Apply changes automatically within a contained, reversible scope.
-    Contained,
-}
-
-impl From<WatcherModeArg> for WatcherMode {
-    fn from(value: WatcherModeArg) -> Self {
-        match value {
-            WatcherModeArg::Observe => Self::Observe,
-            WatcherModeArg::Propose => Self::Propose,
-            WatcherModeArg::Contained => Self::Contained,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum TelemetryModeArg {
-    /// Collect GPU telemetry on this machine only; nothing leaves the device.
-    Local,
-    /// Disable telemetry collection entirely.
-    Off,
-}
-
-/// User-facing `rocm serve --device` policy.
-///
-/// Modeled as a clap `ValueEnum` so invalid input is rejected by clap's usage
-/// validation (exit code 2, with the valid choices listed) rather than a generic
-/// application error (exit code 1) — matching how every other enum-style CLI
-/// argument behaves. The historical aliases (`auto`/`gpu` for `gpu_required`,
-/// `cpu` for `cpu_only`) stay accepted for backward compatibility but are hidden
-/// from the advertised list.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub(crate) enum DevicePolicyArg {
-    /// Require a ROCm GPU; fail if none is usable (the default).
-    #[value(alias = "auto", alias = "gpu")]
-    GpuRequired,
-    /// Accepted for compatibility; behaves identically to `gpu_required`
-    /// (rocm serve has no CPU fallback path).
-    GpuPreferred,
-    /// Accepted but always rejected: rocm serve has no CPU fallback path, so
-    /// this exits with an error. Hidden from `--help`, shell completions and the
-    /// invalid-value suggestion list so it is never advertised as usable, while
-    /// still parsing so the deliberate rejection message is preserved.
-    #[value(alias = "cpu", hide = true)]
-    CpuOnly,
-}
-
-impl DevicePolicyArg {
-    /// Canonical policy string understood by [`crate::gpu_policy::parse_device_policy`]. Routing the
-    /// parsed variant back through the string keeps `parse_device_policy` the
-    /// single choke point that enforces the `cpu_only` rejection across every
-    /// caller, rather than adding a second conversion path that could bypass it.
-    pub(crate) const fn as_policy_str(self) -> &'static str {
-        match self {
-            Self::GpuRequired => "gpu_required",
-            Self::GpuPreferred => "gpu_preferred",
-            Self::CpuOnly => "cpu_only",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub(crate) enum SandboxToolArg {
-    ListServers,
-    RestartServer,
-    StopServer,
-}
-
-impl SandboxToolArg {
-    pub(crate) const fn as_cli_value(self) -> &'static str {
-        match self {
-            Self::ListServers => "list_servers",
-            Self::RestartServer => "restart_server",
-            Self::StopServer => "stop_server",
-        }
-    }
-}
-
-impl TelemetryModeArg {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => TELEMETRY_MODE_LOCAL,
-            Self::Off => TELEMETRY_MODE_OFF,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum PermissionsModeArg {
-    FullAccess,
-    Ask,
-}
-
-impl PermissionsModeArg {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::FullAccess => PERMISSIONS_MODE_FULL_ACCESS,
-            Self::Ask => PERMISSIONS_MODE_ASK,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cli_command, device_policy_name, engine_inventory};
+    use crate::{cli_command, device_policy_name, engine_inventory, uninstall::reject_force};
     use clap::{CommandFactory, Parser};
     use rocm_engine_protocol::DevicePolicy;
 
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `cli_version_string` is `ROCM_CLI_VERSION`, the one string
+    /// `format_cli_version` in `build.rs` embeds, clap's `-V`/`--version` is
+    /// that same string, and `cli_version_number` leads it. This does not run
+    /// the binary: `@id:examine-version` compares the printed `rocm version`
+    /// and `-V`/`--version` lines. Tag, `main`, and unknown shapes are the
+    /// `format_cli_version_*` tests in `build.rs`; this checks only the shape
+    /// of the ref this checkout resolved, which is never a release tag in CI.
+    #[test]
+    fn version_surfaces_share_one_build_script_string() {
+        let full = crate::cli_version_string();
+        let number = crate::cli_version_number();
+        let reference = env!("ROCM_CLI_VERSION_REF");
+        let hash = env!("ROCM_CLI_GIT_HASH");
+        assert_eq!(full, env!("ROCM_CLI_VERSION"));
+        assert_eq!(
+            cli_command().get_version(),
+            Some(full.as_str()),
+            "-V/--version must print the same string as `rocm version`"
+        );
+        assert_eq!(full, format!("{number} ({reference}, {hash})"));
+        // A resolved ref whose text is not `v` plus the leading version is not
+        // a release tag. `main`, a feature branch, and a name such as `vllm`
+        // all land here, and none of them may report the workspace package
+        // version.
+        if reference != "unknown" && reference.strip_prefix('v') != Some(number.as_str()) {
+            assert_eq!(number, "0.0.0-dev", "{full}");
+            assert_ne!(number, env!("CARGO_PKG_VERSION"));
+        }
+        if reference == "unknown" {
+            assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,
@@ -1459,6 +1504,30 @@ mod tests {
         assert_eq!(
             FrameworkProbe::from(FrameworkArg::Skip),
             FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn dash_help_scopes_lemonade_discovery_to_linux_and_wsl() {
+        // The embedded daemon that does the discovery is Unix-only, so the help
+        // must not promise it on every platform. README.md says the same.
+        let help = Cli::command()
+            .find_subcommand_mut("dash")
+            .expect("dash subcommand")
+            .render_long_help()
+            .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("On Linux/WSL, discovers loaded models from local Lemonade"),
+            "{help}"
+        );
+        // This pins the wording only. Scenario
+        // `@id:dash-lemonade-external-protocol-discovery` proves the claim: the
+        // external server receives no request beyond reads after the dashboard
+        // quits.
+        assert!(
+            flat.contains("quitting leaves external servers running"),
+            "{help}"
         );
     }
 
@@ -1747,6 +1816,21 @@ mod tests {
             .collect()
     }
 
+    fn serve_arg_help(arg_id: &str) -> String {
+        let mut cli = Cli::command();
+        let serve = cli
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand exists");
+        let arg = serve
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == arg_id)
+            .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"));
+        arg.get_long_help()
+            .map(ToString::to_string)
+            .or_else(|| arg.get_help().map(ToString::to_string))
+            .unwrap_or_default()
+    }
+
     // Both `--engine` and `--device` restrict their input to a fixed set via a
     // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
     // error (exit code 2) with the accepted choices listed. Values are advertised
@@ -1849,6 +1933,143 @@ mod tests {
         }
     }
 
+    /// `rocm diagnose --model` tells the user that `rocm serve` takes no context
+    /// size, KV cache type or GPU layer count and passes none to the engine
+    /// (`SERVE_OPTIONS_NOTE` and `SERVE_CONTEXT_NOTE` in `gguf_fit.rs`). This
+    /// fails when `rocm serve` gains one of them, so the notes are updated with it.
+    #[test]
+    fn serve_takes_no_estimate_options_yet() {
+        let serve = |extra: &[&str]| {
+            let mut argv = vec!["rocm", "serve", "o/r:Q4_K_M"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        assert!(serve(&[]).is_ok(), "the model alone parses");
+        for option in [
+            &["--context-size", "4096"][..],
+            &["--ctx-size", "4096"][..],
+            &["--kv-cache-type", "q8_0"][..],
+            &["--n-gpu-layers", "20"][..],
+        ] {
+            assert!(serve(option).is_err(), "rocm serve now takes {option:?}");
+        }
+    }
+
+    fn parse_diagnose(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "diagnose"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    // `--symptom-file` exists because a pasted error does not survive the shell
+    // as an argument: one starting with `-` is not even accepted as
+    // `--symptom`'s value. The file form takes `-` (stdin) and any path, and
+    // the two sources cannot both be given.
+    #[test]
+    fn diagnose_takes_the_symptom_from_a_file_or_stdin_but_not_with_symptom() {
+        assert!(
+            parse_diagnose(&["--symptom", "-x HIP error"]).is_err(),
+            "a leading minus is read as a flag, which is what --symptom-file avoids"
+        );
+        for path in ["-", "error.txt"] {
+            match parse_diagnose(&["--symptom-file", path]) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Diagnose {
+                            symptom,
+                            symptom_file,
+                            ..
+                        }),
+                    ..
+                }) => {
+                    assert_eq!(symptom, None);
+                    assert_eq!(symptom_file, Some(PathBuf::from(path)));
+                }
+                other => panic!("expected diagnose for {path:?}, got {other:?}"),
+            }
+        }
+        let error = parse_diagnose(&["--symptom", "oom", "--symptom-file", "-"])
+            .expect_err("--symptom and --symptom-file are exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // The context options describe the model being asked about, so without
+    // `--model` they would be accepted and silently do nothing.
+    #[test]
+    fn diagnose_context_options_are_refused_without_a_model() {
+        for args in [
+            &["--context-size", "8192"][..],
+            &["--kv-cache-type", "q8_0"][..],
+        ] {
+            let error = parse_diagnose(args).expect_err("an option with nothing to apply to");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}"
+            );
+            assert!(error.to_string().contains("--model"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn diagnose_context_options_reach_the_request_and_bad_values_are_refused() {
+        let cli = parse_diagnose(&[
+            "--model",
+            "o/r:Q4_K_M",
+            "--context-size",
+            "32768",
+            "--kv-cache-type",
+            "q4_0",
+        ])
+        .expect("a model with both options parses");
+        match cli.command {
+            Some(Command::Diagnose {
+                context_size,
+                kv_cache_type,
+                ..
+            }) => {
+                assert_eq!(context_size, Some(32768));
+                assert_eq!(
+                    kv_cache_type.map(rocm_core::gguf_fit::KvCacheType::from),
+                    Some(rocm_core::gguf_fit::KvCacheType::Q4_0)
+                );
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        // The smallest size accepted, beside the 0 refused below.
+        assert!(parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", "1"]).is_ok());
+        for bad in [
+            &["--context-size", "0"][..],
+            &["--context-size", "-1"][..],
+            &["--context-size", "lots"][..],
+            &["--context-size", "18446744073709551615"][..],
+            &["--context-size", "16777217"][..],
+            &["--kv-cache-type", "q5_0"][..],
+        ] {
+            let mut args = vec!["--model", "o/r:Q4_K_M"];
+            args.extend_from_slice(bad);
+            assert!(parse_diagnose(&args).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    // The largest context size the flag takes is the one the estimate is made for,
+    // not a number of its own: a figure past it would print an absurd memory
+    // need, so clap refuses it before anything is estimated.
+    #[test]
+    fn the_largest_context_size_accepted_is_the_largest_the_estimate_makes() {
+        let largest = rocm_core::gguf_fit::MAX_CONTEXT_SIZE.to_string();
+        let cli = parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", &largest])
+            .expect("the cap itself parses");
+        match cli.command {
+            Some(Command::Diagnose { context_size, .. }) => {
+                assert_eq!(context_size, Some(rocm_core::gguf_fit::MAX_CONTEXT_SIZE));
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        let over = (rocm_core::gguf_fit::MAX_CONTEXT_SIZE + 1).to_string();
+        assert!(parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", &over]).is_err());
+    }
+
     // `--yes` approves a restart, so on its own it asks for something that was
     // never requested. Mutation: removing `requires = "restart_services"` from
     // either subcommand's `yes` makes that subcommand's argv parse and fails
@@ -1910,6 +2131,22 @@ mod tests {
     }
 
     #[test]
+    fn serve_wait_parses_and_conflicts_with_attached_modes() {
+        let cli = parse_serve(&["--wait"]).expect("--wait parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: true, .. })
+        ));
+        let cli = parse_serve(&[]).expect("default parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: false, .. })
+        ));
+        assert!(parse_serve(&["--wait", "--verbose"]).is_err());
+        assert!(parse_serve(&["--wait", "--foreground"]).is_err());
+    }
+
+    #[test]
     fn serve_parses_verbose_and_no_smoke_test_flags() {
         let cli = parse_serve(&["--verbose", "--no-smoke-test"]).expect("flags parse");
         match cli.command {
@@ -1927,6 +2164,77 @@ mod tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_without_port_flag_requests_automatic_selection() {
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve { port, host, .. }) => {
+                assert_eq!(port, None, "omitted --port must stay unresolved");
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+                assert!(crate::serve_port::PortRequest::from_flag(port).is_auto());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_with_explicit_port_keeps_it_concrete() {
+        let cli = parse_serve(&["--port", "8000"]).expect("explicit port parses");
+        match cli.command {
+            Some(Command::Serve { port, .. }) => {
+                assert_eq!(port, Some(8000));
+                assert_eq!(
+                    crate::serve_port::PortRequest::from_flag(port),
+                    crate::serve_port::PortRequest::Explicit(8000)
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_or_out_of_range_port() {
+        for bad in ["0", "65536", "-1", "auto"] {
+            let error = parse_serve(&["--port", bad]).expect_err("must be rejected");
+            assert!(
+                error.to_string().contains("between 1 and 65535"),
+                "unexpected error for --port {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_engine_serve_command_keeps_a_concrete_default_port() {
+        // Only the user-facing verb gained automatic selection; the direct engine
+        // entry point still requires (and defaults to) a concrete port.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "__engine-serve-http",
+            "lemonade",
+            "svc-1",
+            "qwen",
+            "--state-path",
+            "state.json",
+        ])
+        .expect("hidden engine command parses");
+        match cli.command {
+            Some(Command::EngineServeHttp { port, host, .. }) => {
+                assert_eq!(port, rocm_core::DEFAULT_LOCAL_PORT);
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+            }
+            other => panic!("expected EngineServeHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_port_help_documents_omission_and_the_custom_host_rule() {
+        let help = serve_arg_help("port");
+        assert!(help.contains("11435"), "{help}");
+        assert!(help.contains("automatically"), "{help}");
+        assert!(help.contains("127.0.0.1"), "{help}");
+        assert!(help.contains("explicit --port"), "{help}");
     }
 
     #[test]
@@ -2091,6 +2399,160 @@ mod tests {
         let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
             .expect_err("zero max-tokens is rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `logging::is_enabled_for` decides that `rocm uninstall` skips the client
+    /// log by looking at the first raw argument. That is only right while the
+    /// subcommand is always `argv[1]`: a global flag in front of it, an alias
+    /// for `uninstall`, or an abbreviated name would start the logger again and
+    /// a dry run would list a `logs` folder it had just made. The e2e scenario
+    /// `uninstall-06` proves the behaviour; this fails earlier, naming the cause.
+    #[test]
+    fn uninstall_stays_the_first_argument_the_logger_gate_reads() {
+        let command = Cli::command();
+        let global_args: Vec<_> = command
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str())
+            .filter(|id| !matches!(*id, "help" | "version"))
+            .collect();
+        assert!(
+            global_args.is_empty(),
+            "a top-level argument {global_args:?} can come before the subcommand, so \
+             logging::is_enabled_for no longer sees `uninstall` as the first argument"
+        );
+        let aliased: Vec<_> = command
+            .get_subcommands()
+            .filter(|sub| sub.get_all_aliases().any(|alias| alias == "uninstall"))
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(
+            aliased.is_empty(),
+            "{aliased:?} answers to `uninstall`, which logging::is_enabled_for does not check"
+        );
+        let uninstall = command
+            .find_subcommand("uninstall")
+            .expect("uninstall subcommand exists");
+        assert_eq!(uninstall.get_all_aliases().count(), 0);
+        Cli::try_parse_from(["rocm", "uninstal"])
+            .expect_err("an abbreviated subcommand name must not reach uninstall");
+    }
+
+    /// `--force` is a likely guess for "skip the confirmation", and without a
+    /// declared `--force` clap answers it, and every near miss of it, with
+    /// `--force-dev-binaries`, which removes the binaries of a development build.
+    /// The scenario `uninstall-mistyped-force-is-not-answered-with-a-destructive-flag`
+    /// proves the real binary's output; this pins the parse behind it.
+    #[test]
+    fn a_mistyped_force_never_reaches_the_dev_binaries_flag() {
+        // `--force` itself parses, so the handler can say what to use instead.
+        let cli = Cli::try_parse_from(["rocm", "uninstall", "--force"]).unwrap();
+        let Some(Command::Uninstall {
+            force,
+            force_dev_binaries,
+            ..
+        }) = cli.command
+        else {
+            panic!("not an uninstall command");
+        };
+        assert!(force.is_some() && !force_dev_binaries);
+        let refusal = reject_force(force.is_some()).unwrap_err().to_string();
+        assert!(refusal.contains("`--force` is not an option"), "{refusal}");
+        assert!(refusal.contains("--yes"), "{refusal}");
+        assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
+        assert!(reject_force(false).is_ok());
+        // `--force=x` is the same mistake, and gets the same answer rather than
+        // a usage line that lists every flag.
+        let cli = Cli::try_parse_from(["rocm", "uninstall", "--force=x"]).unwrap();
+        let Some(Command::Uninstall { force, .. }) = cli.command else {
+            panic!("not an uninstall command");
+        };
+        assert!(reject_force(force.is_some()).is_err());
+
+        // Near misses and the forms clap suggests from elsewhere in the command
+        // line never offer the destructive flag.
+        for args in [
+            vec!["uninstall", "--forc"],
+            vec!["uninstall", "--forcee"],
+            vec!["uninstall", "--keep-binaries", "--forc"],
+            vec!["uninstall", "-f"],
+            vec!["--force", "uninstall"],
+        ] {
+            let error = cli_command()
+                .try_get_matches_from(std::iter::once("rocm").chain(args.iter().copied()))
+                .unwrap_err();
+            let rendered = error.render().to_string();
+            assert!(
+                !rendered.contains("force-dev-binaries"),
+                "{args:?} was answered with the destructive flag:\n{rendered}"
+            );
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+
+        // The guard depends on clap offering the hidden `--force` as the
+        // suggestion for a near miss: its candidates are every declared long
+        // name, hidden or not. If a clap upgrade stopped suggesting hidden
+        // arguments, `--forc` would be answered with `--force-dev-binaries`
+        // again, so the near misses must name `--force` and not the
+        // destructive flag. The two checks together are independent of
+        // clap's wording around the suggestion.
+        for args in [
+            vec!["uninstall", "--forc"],
+            vec!["uninstall", "--keep-binaries", "--forc"],
+        ] {
+            let rendered = cli_command()
+                .try_get_matches_from(std::iter::once("rocm").chain(args.iter().copied()))
+                .unwrap_err()
+                .render()
+                .to_string();
+            assert!(
+                rendered.contains("--force") && !rendered.contains("force-dev-binaries"),
+                "{args:?} must be steered to the declared `--force`, not the destructive flag:\n{rendered}"
+            );
+        }
+
+        // The whole flag misspelled is still met with the flag it was meant to be.
+        let error = cli_command()
+            .try_get_matches_from(["rocm", "uninstall", "--force-dev-binary"])
+            .unwrap_err()
+            .render()
+            .to_string();
+        assert!(error.contains("--force-dev-binaries"), "{error}");
+
+        // It stays out of the help.
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("Not an option"), "{help}");
+    }
+
+    /// The help leads with the safe preview, then the real run, as the tip a
+    /// person reads before running a command that deletes things.
+    #[test]
+    fn uninstall_help_shows_a_dry_run_before_the_real_run() {
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .expect("uninstall subcommand")
+            .render_long_help()
+            .to_string();
+        let examples = help.split_once("EXAMPLES:").map_or_else(
+            || panic!("`rocm uninstall --help` has no examples:\n{help}"),
+            |(_, rest)| rest,
+        );
+        let rows: Vec<&str> = examples
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            rows.first().copied(),
+            Some("rocm uninstall --dry-run"),
+            "{examples}"
+        );
+        assert!(rows.contains(&"rocm uninstall"), "{examples}");
     }
 
     #[test]

@@ -4,9 +4,11 @@
 
 //! Chat tab — a TUI-local conversation surface.
 //!
-//! Phase 1 is render-only with a local echo backend; later phases wire a Rig-built agent behind the
-//! `AgentClient` trait. The transcript and input buffer are plain TUI state on
-//! `AppState` (`rocm-dash-core` carries no chat types).
+//! Until the user accepts the detected endpoint (`ChatConsent`), the tab shows a
+//! consent gate or an empty state; once accepted it draws the transcript and
+//! the input line of the real chat, whose backend sits behind the `AgentClient`
+//! trait. The transcript and input buffer are plain TUI state on `AppState`
+//! (`rocm-dash-core` carries no chat types).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -62,7 +64,7 @@ fn draw_consent(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (
             " Chat — detecting… ",
             vec![Line::from(Span::styled(
-                "Probing for a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…",
+                "Probing for a local engine (Lemonade :13305 / vLLM :8000 / a rocm serve service)…",
                 Style::default().fg(theme.fg),
             ))],
         )
@@ -211,7 +213,7 @@ fn consent_gate_lines<'a>(
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
-                    "  • or run a local endpoint (vLLM :8000, rocm serve :11435)",
+                    "  • or run a local endpoint (vLLM :8000, a rocm serve service)",
                     Style::default().fg(theme.muted),
                 )),
             ],
@@ -633,7 +635,10 @@ mod tests {
         assert!(render_str(&mut s).contains("detect a local engine"));
         // After a fruitless detect, the message shows.
         s.set_detect_result(None);
-        assert!(render_str(&mut s).contains("no local engine found"));
+        let out = render_str(&mut s);
+        assert!(out.contains("no local engine found"));
+        // `rocm serve` leases its port at launch, so no fixed one is promised.
+        assert!(!out.contains("11435"), "{out:?}");
     }
 
     #[test]
@@ -641,7 +646,9 @@ mod tests {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = crate::app::ActiveTab::Chat;
         s.request_detect();
-        assert!(render_str(&mut s).contains("Probing for a local engine"));
+        let out = render_str(&mut s);
+        assert!(out.contains("Probing for a local engine"));
+        assert!(!out.contains("11435"), "{out:?}");
     }
 
     #[test]

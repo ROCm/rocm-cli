@@ -10,10 +10,19 @@ Feature: Model serving
     When the user serves a model using its short name
     Then the output shows the full model name
 
+  # A short name is a catalog entry, and an entry can publish a different build
+  # of the same model per engine, so the names need not be identical -- what must
+  # hold is that each engine names the build it will serve.
+  #
+  # This discriminates nothing yet: the scenario is an expected failure on every
+  # host while its xfail row stands, and the vLLM run stops before printing a
+  # plan, so the step panics there whatever the lemonade half did. It becomes
+  # regression coverage when that row is narrowed. serve-55 and the unit tests in
+  # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
-  Scenario: serve-02 - Short name expansion is consistent across engines
+  Scenario: serve-02 - Every engine expands a short name rather than serving it
     When the user serves the same short name with different engines
-    Then all engines expand to the same full model name
+    Then every engine expands it to the full name of the model it will serve
 
   @id:serve-discoverable-by-name
   Scenario: serve-03 - A running model server is discoverable by name
@@ -70,14 +79,11 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
-  # bypasses Lemonade's model router and runs a packaged llama-server directly
-  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
-  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
-  # managed-lemonade fallback would mask the identical failure behind the
-  # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
-  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
-  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  # Explicit HF-checkpoint canary: `owner/repo:variant` runs the selected GPU
+  # llama-server directly and fails if that backend binary is missing. Named
+  # catalog entries can also serve directly on Linux when their metadata is
+  # simple enough; other registered entries use Lemonade's router. Both canaries
+  # use the same small checkpoint, sharing the cache without another download.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
@@ -307,7 +313,7 @@ Feature: Model serving
   # `--require-api-key` reuse refusal (#604). A running server's key is read once
   # at launch; reuse cannot retroactively satisfy a demand for auth the server
   # never got, so the idempotency guard refuses instead of upgrading the record
-  # in place (see `spawn_managed_engine_child` in `service_launch.rs`). This is the
+  # in place (see `spawn_managed_engine_child` in `service_launch/spawn.rs`). This is the
   # local-side proof that the printed stop hint is not just present but correct
   # and directly runnable: the scenario stops the service with it and checks the
   # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
@@ -318,10 +324,10 @@ Feature: Model serving
   # this guard without a live GPU, same as every other `@requires-gpu` scenario
   # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
   # bind, and the serve path's `ensure_public_bind_engine_supported` guard
-  # (defined in `service_launch.rs`, called from `serve_cmd.rs`) refuses that combination
-  # for Lemonade on Windows (its server can't receive the key through the
-  # Windows detached-spawn primitive), so this scenario cannot reach the
-  # refusal it exercises there.
+  # (defined in `service_launch/endpoint_auth.rs`, called from `serve_cmd.rs`)
+  # refuses that combination for Lemonade on Windows (its server can't receive the
+  # key through the Windows detached-spawn primitive), so this scenario cannot
+  # reach the refusal it exercises there.
   @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
   Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
     Given a managed runtime is active
@@ -359,14 +365,16 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
-  # image and a 9B checkpoint on a cold runner and may wait out the full
-  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. They run only when
+  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
+  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
+  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
-  # skip every night (the nightly job logs whether Docker is reachable).
+  # On a host without Docker both skip (the nightly job logs whether Docker is
+  # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
+  # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -662,6 +670,7 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
+
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -673,7 +682,6 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
-
   # The positive case for the OOM note (EAI-8059 review asked for it
   # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
@@ -698,3 +706,260 @@ Feature: Model serving
     # suppression was untested: deleting the guard left the scenario green and a
     # `rocm daemon` outliving the checkout.
     And no background automation daemon was left behind
+
+  # ROCMAI-873: on WSL the GPU is reached through /dev/dxg and ROCDXG, and there
+  # is no /dev/kfd. The no-usable-GPU refusal used to tell every user to "confirm
+  # /dev/kfd is present", which a WSL user cannot do. It now names the status
+  # `rocm examine` reports for the path the probe actually asked about, and the
+  # last step runs that command on the same machine to show it exists and reports
+  # the condition (`wsl_rocdxg_missing`).
+  #
+  # The planted root holds /dev/dxg, DXCore and the library, but a stand-in
+  # `ldconfig` whose cache lacks it and an empty LD_LIBRARY_PATH leave the loader
+  # no way to find it, so the pre-flight refuses on every Linux lane, WSL or not.
+  # The case where LD_LIBRARY_PATH does reach the library is examine-32 (the
+  # verdict) and the unit tests on the serve gate; there is no scenario for the
+  # launch that follows, because it would start preparing a real engine.
+  @id:serve-wsl-refusal-names-the-wsl-driver-status @requires-os:linux
+  Scenario: serve-42 - Serving on a WSL host whose ROCDXG library the loader cannot find is refused with WSL advice
+    Given a WSL machine whose ROCDXG library is in neither the linker cache nor LD_LIBRARY_PATH
+    When the user serves a model under the GPU-required default on that machine
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the refusal points the user at the WSL driver status instead of /dev/kfd
+    And inspecting that machine reports the driver status as missing, which is what the refusal sends the user to check
+
+  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
+  # so it cannot be combined with the attached modes, which already stay on the
+  # terminal. The waiting itself (a live server that becomes ready, one that
+  # exits first) is covered by `wait_past_readiness_budget_*` in
+  # `apps/rocm/src/service_launch/readiness.rs`, since a scenario would need a slow engine.
+  @id:serve-wait-conflicts-with-attached-modes
+  Scenario: serve-43 - Waiting for readiness cannot be combined with attached mode
+    When the user serves a model with both --wait and --verbose
+    Then the CLI refuses and names the conflicting flags
+
+  # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
+  # 65536 and non-numeric values share the same parser and message) is rejected
+  # before any engine or GPU work, so it needs no GPU and gates every PR
+  # (ungated), like its sibling serve-14.
+  @id:serve-invalid-port-rejected
+  Scenario: serve-44 - Serving with an out-of-range port is refused with a clear reason
+    When the user serves a model with an out-of-range port
+    Then serving is refused before any engine starts
+    And the user is told the port must be between 1 and 65535
+
+  # Collision-safe explicit ports (serve-port rewrite). An explicit `--port`
+  # equal to one a live managed service already holds must be refused before any
+  # bind is attempted, naming the service so the user can stop it or pick
+  # another port. Reaching this check needs a real GPU: `resolve_serve_port`
+  # only runs once `spawn_managed_engine_child` has a completed model/engine
+  # resolution in hand, and `serve` has no CPU fallback that gets there. The
+  # "stop the service holding that port" advice is checked here by its wording
+  # only; the advice is actually proven by
+  # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
+  # apps/rocm/src/service_launch/launch_transaction.rs, per AGENTS.md section 3.
+  # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
+  @id:serve-explicit-port-reserved @requires-gpu @merge-queue
+  Scenario: serve-45 - Serving on a port another managed service already holds is refused
+    Given a managed runtime is active
+    And another managed service already reserves the default serve port
+    When the user serves a model explicitly on the reserved port
+    Then serving is refused before any engine starts
+    And the user is told to stop the service holding that port
+
+  # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
+  # sibling of serve-45). No managed-service record exists here, so
+  # `resolve_serve_port` never reaches the "reserved by managed service" branch
+  # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
+  # routing to `explicit_bind_error`'s "already in use by another process"
+  # message. Needs the same `@requires-gpu` as serve-45 for the same reason:
+  # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
+  # completed model/GPU resolution in hand (GPU indices are selected earlier in
+  # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
+  # `serve` has no CPU fallback that gets there.
+  @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
+  Scenario: serve-46 - Serving on a port an untracked process already holds is refused
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model explicitly on the occupied port
+    Then serving is refused before any engine starts
+    And the user is told the port is already in use by another process
+
+  # Real CLI coverage for automatic port allocation. A loopback listener holds
+  # the legacy default while one real managed GPU serve starts; the reported
+  # endpoint must advance to the next candidate rather than failing late in the
+  # engine. Runs in the merge queue because it launches a real model server.
+  @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
+  Scenario: serve-47 - Automatic serving skips an occupied default port
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model with automatic port selection
+    Then the service uses the next automatic port
+
+  # An explicit --port is a demand: when an equivalent service (same engine and
+  # model) is already live on a different port, serve refuses instead of
+  # reporting success on the old port. Same planted record and lane as serve-24.
+  @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-48 - An explicit port that differs from a running equivalent service is refused
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again on an explicit port other than the running one
+    Then the CLI refuses and names the port the running service uses
+    And the CLI names the exact command to stop the existing service
+
+  # `rocm services restart` takes the launch lock and refuses a port another
+  # live managed service now holds, before it spawns anything. No GPU: the
+  # refusal comes from the on-disk records.
+  @id:serve-restart-refused-when-port-claimed @requires-os:linux
+  Scenario: serve-49 - Restarting a service whose port another service holds is refused
+    Given a managed runtime is active
+    And another managed service already reserves the default serve port
+    And a stopped managed service is recorded on the default serve port
+    When the user restarts the stopped service
+    Then the restart is refused naming the service that holds the port
+
+  # ROCMAI-597: a served model is also reachable from Anthropic-format clients.
+  # The serving process publishes an Anthropic-compatible `/v1/messages` endpoint
+  # beside the OpenAI one — the engine's own when it serves one, else a
+  # translation front on its own port — and `services list` shows it. Engine-
+  # agnostic like `serve-readiness-contract`: the served engine follows the host.
+  # Tool use is translated for non-streaming requests (serve-53); a streaming
+  # request that offers tools is refused, which only the unit tests cover.
+  @id:serve-anthropic-endpoint-advertised @requires-gpu
+  Scenario: serve-50 - A served model advertises an Anthropic-compatible endpoint
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user lists running services
+    Then the service details include an Anthropic-compatible messages endpoint
+    And the service details still include the existing OpenAI-compatible endpoint
+
+  @id:serve-anthropic-messages-inference @requires-gpu
+  Scenario: serve-51 - A served model responds to an Anthropic Messages API request
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a request to the Anthropic messages endpoint
+    Then the response is a valid Anthropic Messages API response
+    And the Anthropic response identifies the correct model
+
+  @id:serve-anthropic-endpoint-readiness @requires-gpu
+  Scenario: serve-52 - Readiness covers the Anthropic-compatible endpoint
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the CLI reports the service as ready
+    Then both the OpenAI-compatible and Anthropic-compatible endpoints are reported healthy
+
+  # ROCMAI-920: tool use is translated in both directions. A request offering
+  # one tool and requiring it gets a `tool_use` block back.
+  @id:serve-anthropic-messages-tool-use @requires-gpu
+  Scenario: serve-53 - A served model handles tool use via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a tool-use request to the Anthropic messages endpoint
+    Then the response contains a tool_use content block
+    And the tool_use block names a tool and arguments from the request
+
+  @id:serve-anthropic-messages-streaming @requires-gpu
+  Scenario: serve-54 - A served model streams responses via the Anthropic Messages API
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user sends a streaming request to the Anthropic messages endpoint
+    Then the response is delivered as Anthropic-style server-sent events
+    And the streamed content reassembles into a complete reply
+
+  # The catalog's recommended small assistant for a low-VRAM machine, asked for
+  # by its short name with no engine named. Whatever engine is chosen for the
+  # user has to be handed a build of that model it can actually load, so the
+  # short name alone must be enough. (The dash serve wizard fills the field with
+  # the recipe's canonical id rather than a short name; the unit tests cover that
+  # spelling, and it resolves through the same recipe.)
+  #
+  # Deliberately NOT tagged @requires-engine: the engine is the CLI's to pick
+  # here, and pinning one would make the harness attribute the run to an engine
+  # the scenario never asked for. The host's own default engine is what gates it.
+  @id:serve-small-assistant-short-name @requires-gpu
+  Scenario: serve-55 - The recommended small assistant serves from its short name alone
+    Given a managed runtime is active
+    And the recommended small assistant is being served by its short name
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # ROCMAI-863: a Hugging Face repo named without a quantization variant has no
+  # GGUF file to serve, but serving started an engine for it anyway and left the
+  # objection to the background process — where, on Windows, nothing the user can
+  # see ever reports it: an empty log, a success exit, and a server recorded as
+  # stopped. The refusal now comes before anything starts. It also names no
+  # quantization of its own: nothing on this path reads the repository's files, so
+  # a suggested label is a guess, and following a guess fails a second time on a
+  # repo that ships no GGUF at all. @requires-gpu because a host with no usable
+  # GPU is turned away earlier, for that reason instead, and never reaches this
+  # one. No @requires-os deliberately — Windows is the lane the failure was silent
+  # on, so it is the one most worth watching.
+  @id:serve-missing-gguf-variant-refused @requires-gpu @requires-engine:lemonade
+  Scenario: serve-56 - Serving a Hugging Face repo with no quantization variant is refused
+    When the user serves a Hugging Face repo with no quantization variant on Lemonade
+    Then serving is refused before any engine starts
+    And the user is told the model needs an explicit GGUF variant
+    And no quantization is suggested for a repo the CLI has not inspected
+    And no local server was recorded
+  # The pinned Lemonade catalog's smallest vision GGUF needs its mmproj file.
+  # Serving its registered name must retain the router, not flatten the entry
+  # into a single-checkpoint direct serve. Use a scenario-owned port and service;
+  # the additional model download stays off the ordinary per-PR path.
+  # Linux only: registered names take the router on Windows both with and
+  # without the direct llama-server route, so a Windows run cannot tell the
+  # two behaviours apart.
+  # No expectations row is added for this scenario. The flaky Linux rows cover
+  # the direct llama-server route, and this scenario takes the router route, so
+  # those rows' failure mode does not describe it. It is nightly-only.
+  @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
+  Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
+    Given a managed runtime is active
+    And a registered vision GGUF is being served on lemonade on its own port
+    Then the managed engine state confirms the Lemonade router loaded the registered model
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # Which runtime a registered name takes is user-observable: a simple catalog
+  # entry (one checkpoint with a variant, no extra files) is served directly by
+  # the selected GPU llama-server on Linux, while
+  # `serve-lemonade-complex-registered-inference` covers the router route for an
+  # entry that needs more. The endpoint answering would not tell the
+  # two apart, so this reads the engine state's method and backend.
+  @id:serve-lemonade-simple-registered-direct-route @requires-gpu @requires-os:linux @requires-engine:lemonade
+  Scenario: serve-58 - A simple registered GGUF name is served directly by the selected GPU backend
+    Given a managed runtime is active
+    And a simple registered GGUF is being served on lemonade on its own port
+    Then the managed engine state records direct serving by the selected GPU backend
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # A served endpoint's API key sits in `<data>/services/<id>.endpoint-key`, and
+  # nobody but the user who started the server may read it. Here: a loopback
+  # serve with `--require-api-key` (so no public port is opened on the GPU box),
+  # then the key file's mode is checked to be exactly 0600. The file is replaced
+  # by a freshly created owner-only one on every store, so a mode loosened in
+  # place is tightened again; that re-store case is covered by the unit tests in
+  # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
+  # the key before a restart writes it back. The check does not depend on
+  # readiness: the serve waits a fixed 45 seconds for the engine
+  # (`READINESS_WAIT` in `service_launch/readiness.rs`) and then exits 0,
+  # reporting a server still loading as `starting`; the key is written before
+  # the engine starts, and the scenario's teardown stops the service.
+  # Linux-only: on Windows the key is protected by an owner-only DACL
+  # instead, but the Windows GPU lane serves with Lemonade, which refuses a
+  # key-protected bind there (`ensure_public_bind_engine_supported` in
+  # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the
+  # `rocm-core` unit tests that read the DACL back on the Windows build job.
+  @id:serve-endpoint-key-readable-by-owner-only @requires-gpu @requires-os:linux
+  Scenario: serve-59 - Only the user who started a key-protected server can read its key
+    Given a managed runtime is active
+    When the user serves a model that requires an API key
+    Then the server's API key is kept where only that user can read it

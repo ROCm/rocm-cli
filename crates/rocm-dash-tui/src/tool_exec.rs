@@ -7,8 +7,8 @@
 //! Plain-data signatures ONLY (serde_json / std / serde). The bin (`apps/rocm`,
 //! which owns `rocm-core` and the tool engine) implements [`RocmToolExecutor`];
 //! the dash holds it as `Option<Arc<dyn RocmToolExecutor>>` and never depends on
-//! `rocm-core`. Phase 2 stored the seam; Phase 3 used it for read-only tools;
-//! Phase 4 adds the mutating "execute approved" path + the approval descriptor.
+//! `rocm-core`. The trait has a read-only `execute` and a mutating
+//! `execute_approved` path, plus the approval descriptor.
 
 use std::sync::Arc;
 
