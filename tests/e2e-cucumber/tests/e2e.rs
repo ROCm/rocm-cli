@@ -1419,8 +1419,9 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
     inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
 }
 
-/// Discover the served model id over `/models` and POST one chat completion to
-/// it, returning the decoded response.
+/// Discover the scenario's served model over `/models` (`world.model_name`, so a
+/// router listing several models is not chatted with at its first entry) and POST
+/// one chat completion to it, returning the decoded response.
 ///
 /// `tools` is merged into the request body for the tool-definitions scenario.
 /// The exchange itself lives in [`e2e_cucumber::chat_request`], which runs it
@@ -1457,7 +1458,14 @@ pub async fn request_chat_completion(
     } else {
         vec![first, retry]
     };
-    e2e_cucumber::chat_request::request_chat_completion(&endpoint, prompt, tools, &budgets).await
+    e2e_cucumber::chat_request::request_chat_completion(
+        &endpoint,
+        world.model_name.as_deref(),
+        prompt,
+        tools,
+        &budgets,
+    )
+    .await
 }
 
 pub async fn send_chat(world: &mut E2eWorld) {
