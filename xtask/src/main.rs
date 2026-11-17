@@ -313,9 +313,9 @@ pub(crate) enum Command {
             conflicts_with_all = ["version", "release_label"]
         )]
         build_date: Option<String>,
-        /// Pin the pre-warmed SDK to one of the official release list's three
-        /// most recent versions (see `rocm_releases`), for the self-hosted
-        /// sdk_version matrix. `current` tracks the channel's latest, same as
+        /// Pin the pre-warmed SDK to one of the three newest final releases
+        /// listed on the release channel's package indexes (see
+        /// `rocm_releases`), for the self-hosted sdk_version matrix. `current` tracks the channel's latest, same as
         /// omitting `--version`/`--build-date` entirely.
         #[arg(long, conflicts_with_all = ["version", "build_date"])]
         release_label: Option<rocm_releases::ReleaseLabel>,
@@ -490,7 +490,7 @@ fn run() -> Result<()> {
             release_label,
         } => {
             let resolved_version = match release_label {
-                Some(label) => label.pin().map(str::to_owned),
+                Some(label) => label.pin()?,
                 None => version,
             };
             e2e_prewarm::run(
