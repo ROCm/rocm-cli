@@ -215,6 +215,8 @@ const STYLE: &str = r#"
   .platform-row { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 1.05rem; }
   .platform-name { font-weight: 700; flex: 1; }
   .empty-note { color: #999; font-style: italic; padding: 8px 0; }
+  .lane-failure { color: #c62828; background: #ffebee; border-left: 4px solid #c62828;
+                  padding: 8px 12px; margin: 8px 0; white-space: pre-wrap; }
   .scenario { border: 1px solid #e0e0e0; border-top: none; padding: 12px; background: #fff; }
   .scenario:last-child { border-radius: 0 0 4px 4px; }
   .scenario-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
