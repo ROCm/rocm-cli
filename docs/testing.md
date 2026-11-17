@@ -1377,7 +1377,9 @@ with. `rocm update`, which has neither flag, is given a whole
 `rocm install sdk` command with the runtime's `--format` and `--devel`. Any
 other failure, such as an unknown device target, a `uv` that could not be
 fetched or an unreachable index, suggests no version, because no release can
-clear it.
+clear it. A nightly request that fails on the ROCm 10 layout gets no
+suggestion either: that layout publishes only prerelease builds for the
+nightly channel, which the stable-release list cannot name.
 
 Loopback-fixture scenarios in
 [therock_next_generation.feature](../tests/e2e-cucumber/features/therock_next_generation.feature)
@@ -1398,6 +1400,9 @@ cover this:
 - `therock-next-31`: an unpinned install where no build has an installable
   torchaudio fails with no version suggested, because another version would
   fail the same way.
+- `therock-next-32`: an update whose newest release has no installable package
+  set (a real `uv pip compile` reports no solution) suggests an install that
+  keeps the runtime's format and toolchain. The scenario runs that command.
 
 They run in the default e2e lane. `therock-next-26` and `therock-next-27` are
 Linux-only, because Windows refuses tarball installs.

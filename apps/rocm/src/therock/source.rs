@@ -846,6 +846,12 @@ mod tests {
             !line.matches_version("10.10.0"),
             "10.1 must not prefix-match 10.10"
         );
+        // Same minor, another major: only the major check rejects these.
+        assert!(
+            !line.matches_version("11.1.0"),
+            "10.1 must not match a later major's 1 line"
+        );
+        assert!(!line.matches_version("9.1.0"));
 
         let selected = select_rocm_version(
             TheRockChannel::Release,

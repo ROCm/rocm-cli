@@ -471,3 +471,18 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
     Then the install fails
     And the failure names the missing torchaudio without suggesting another version
+
+  # An update has no `--version` to change. When the newest release has every
+  # package listed but no installable set (`uv pip compile` finds no
+  # solution), the failure names a whole `rocm install sdk` command for the
+  # other release, keeping the runtime's format and toolchain extras. Running
+  # that command proves it exists, accepts those flags, and resolves.
+  @id:therock-next-32-failed-update-suggests-an-install-that-keeps-its-extras
+  Scenario: therock-next-32 - A ROCm 10 update with no installable package set suggests an install command that keeps the runtime's format and toolchain
+    Given a ROCm 10 pip index fixture whose newest build has no installable package set
+    And a registered ROCm 10 wheel runtime with a grouped family
+    When the user tries to preview applying the pending update to that runtime
+    Then the install fails
+    And the failure suggests installing the other published ROCm 10.0.0 as a wheel for arch gfx1200 with the toolchain
+    When the user previews the install command the failure suggested
+    Then the preview resolves ROCm 10.0.0 with the gfx1200 device extras and the toolchain

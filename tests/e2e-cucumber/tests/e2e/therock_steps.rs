@@ -401,6 +401,18 @@ fn arm_pip_fixture_env(world: &mut E2eWorld) {
 /// build. `torchaudio` lists the torchaudio builds the index publishes, each
 /// with its wheel tag.
 fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
+    serve_two_next_builds_where_newer_torch_requires(world, torchaudio, NEWER_NEXT_ROCM_VERSION);
+}
+
+/// [`serve_two_next_builds`], with the newer build's torch requiring
+/// `rocm=={newer_torch_rocm}` instead of its own `rocm` build. Naming a `rocm`
+/// the index does not publish leaves that build with every package listed but
+/// no installable set, which `uv pip compile` reports as "No solution found".
+fn serve_two_next_builds_where_newer_torch_requires(
+    world: &mut E2eWorld,
+    torchaudio: &[(&str, &str)],
+    newer_torch_rocm: &str,
+) {
     let served = root(world).join("therock-pip-fixtures").join("next");
     write_fixture(&served.join("index.html"), &aggregate_root_html());
     let builds = [
@@ -416,8 +428,14 @@ fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
         ),
     ];
     let rocm = builds.map(|(rocm, ..)| (rocm, ANY_WHEEL_TAG, Vec::new()));
-    let torch =
-        builds.map(|(rocm, torch, _)| (torch, ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]));
+    let torch = builds.map(|(rocm, torch, _)| {
+        let requires = if rocm == NEWER_NEXT_ROCM_VERSION {
+            newer_torch_rocm
+        } else {
+            rocm
+        };
+        (torch, ANY_WHEEL_TAG, vec![format!("rocm=={requires}")])
+    });
     let torchvision = builds.map(|(_, torch, torchvision)| {
         (torchvision, ANY_WHEEL_TAG, vec![format!("torch=={torch}")])
     });
@@ -538,19 +556,22 @@ async fn pip_index_fixture_with_canonical_line_builds(world: &mut E2eWorld) {
     serve_pip_fixtures(world);
 }
 
-/// The newer build's only torchaudio is a wheel this host cannot install, so
-/// for this Python and platform it publishes none; the older build publishes
-/// an installable one. The mirror of the fixture below.
-#[given(
-    "a ROCm 10 pip index fixture whose ROCm 10.1.0 torchaudio is only a wheel this host cannot install"
-)]
-async fn pip_index_fixture_without_newest_torchaudio(world: &mut E2eWorld) {
-    serve_two_next_builds(
+/// A `rocm` build no fixture publishes, so a torch that requires it cannot be
+/// installed.
+const UNPUBLISHED_NEXT_ROCM_VERSION: &str = "10.9.9";
+
+/// Both builds list every package, so an unpinned resolution takes the newer
+/// one, but its torch requires a `rocm` that is not published: `uv pip
+/// compile` finds no solution for it, and a different release (the older
+/// build) can still install.
+#[given("a ROCm 10 pip index fixture whose newest build has no installable package set")]
+async fn pip_index_fixture_with_unsolvable_newest_build(world: &mut E2eWorld) {
+    let mut torchaudio = vec![(NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG)];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds_where_newer_torch_requires(
         world,
-        &[
-            (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
-            (NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION, FOREIGN_WHEEL_TAG),
-        ],
+        &torchaudio,
+        UNPUBLISHED_NEXT_ROCM_VERSION,
     );
 }
 
@@ -2688,6 +2709,81 @@ async fn failure_names_missing_torchaudio_without_version_advice(world: &mut E2e
             "the refusal contains `{absent}`:\n{reported}"
         );
     }
+}
+
+/// The install command a failed update suggests for its runtime: a wheel with
+/// the toolchain extras the runtime had, at the exact arch it recorded.
+fn suggested_update_install(version: &str) -> String {
+    format!(
+        "rocm install sdk --channel release --format wheel --version {version} --family {RAW_ARCH} --devel"
+    )
+}
+
+#[then(
+    "the failure suggests installing the other published ROCm 10.0.0 as a wheel for arch gfx1200 with the toolchain"
+)]
+async fn failure_suggests_install_that_keeps_extras(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    // The real `uv pip compile` output: the CLI classifies the failure as one
+    // another release can clear by finding this phrase, so a `uv` that reworded
+    // it would fail this step instead of silently dropping the suggestion.
+    for expected in [
+        "published ROCm X package metadata is not jointly installable",
+        "No solution found",
+        UNPUBLISHED_NEXT_ROCM_VERSION,
+    ] {
+        assert!(
+            reported.contains(expected),
+            "the refusal did not carry `{expected}` from uv's failure:\n{reported}"
+        );
+    }
+    // 10.1.0 is the release that failed, so it is not offered again.
+    assert!(
+        reported.contains(&format!(
+            "Other stable releases it publishes: {NEXT_ROCM_VERSION}."
+        )),
+        "the refusal did not list only the release that was not tried:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!(
+            "Install one of them, for example `{}`.",
+            suggested_update_install(NEXT_ROCM_VERSION)
+        )),
+        "the refusal did not suggest an install that keeps the runtime's format and extras:\n{reported}"
+    );
+    for absent in ["Re-run with one of them", "nightly", "package_specs:"] {
+        assert!(
+            !reported.contains(absent),
+            "the refusal contains `{absent}`:\n{reported}"
+        );
+    }
+}
+
+/// Runs exactly the `rocm install sdk` command the previous failure printed, as
+/// a preview, so the scenario proves the command exists, accepts those flags
+/// and resolves.
+#[when("the user previews the install command the failure suggested")]
+async fn preview_suggested_install_command(world: &mut E2eWorld) {
+    let reported = reported_output(world);
+    let suggested = reported
+        .split('`')
+        .find(|chunk| chunk.starts_with("rocm install sdk "))
+        .unwrap_or_else(|| panic!("the failure suggested no install command:\n{reported}"))
+        .to_owned();
+    let mut args = suggested.split_whitespace().skip(1).collect::<Vec<_>>();
+    args.push("--dry-run");
+    arm_pip_fixture_env(world);
+    preview_ok(world, &args);
+}
+
+#[then("the preview resolves ROCm 10.0.0 with the gfx1200 device extras and the toolchain")]
+async fn preview_resolves_suggested_install(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {NEXT_ROCM_VERSION}\n"),
+        "suggested release",
+    );
+    assert_version_resolution_extras(world, true);
 }
 
 #[then("the failure asks for an exact GPU arch and names --family gfx1200")]
