@@ -716,7 +716,7 @@ fn therock_library_path_entries_inner(
         // (`Checked`), include the candidate exactly when
         // `ensure_therock_compat_shims` says a shim is needed this launch —
         // this is what keeps a leftover stub from an earlier run (the host
-        // has since gained a real `libmpi_cxx.so*`) from shadowing the loader
+        // has since gained a real `libmpi_cxx.so.40`) from shadowing the loader
         // path. On the running-state payload path (`Unchecked`), which never
         // calls that function, fall back to a read-only directory listing of
         // whatever is already there: not authoritative, but the best
@@ -776,11 +776,11 @@ pub(crate) fn ensure_therock_compat_shims(
     // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
     // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
     // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
-    // file`. When no real `libmpi_cxx.so*` exists, materialize an embedded
-    // `libmpi_cxx.so.40` stub (built at compile time, see rocm-core's
-    // build.rs) into this directory. The stub only *defines* the legacy C++
-    // binding symbols torch needs; they are never called in single-node
-    // serving, so this is safe.
+    // file`. When no real `libmpi_cxx.so.40` exists, materialize an embedded
+    // `libmpi_cxx.so.40` stub (compiled from C++ declarations at build time,
+    // see rocm-core's build.rs and mpi_cxx_stub.cpp) into this directory. The
+    // stub only *defines* the legacy C++ binding symbols torch needs; they are
+    // never called in single-node serving, so this is safe.
     let mpi_cxx_shim = ensure_mpi_cxx_compat(&compat_dir);
     // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with the
     // upstream `libnuma_1.2` symbol version. TheRock bundles numa only under
@@ -1125,7 +1125,7 @@ mod tests {
         // any caller reaches it with that runtime shape.
         //
         // Whether a write would otherwise happen on this host (a stub
-        // embedded at compile time, and no real `libmpi_cxx.so*` already
+        // embedded at compile time, and no real `libmpi_cxx.so.40` already
         // present) varies by host, so probe `ensure_mpi_cxx_compat` against a
         // throwaway directory first: when it would do nothing anyway, this
         // test cannot distinguish "guarded correctly" from "nothing to guard
