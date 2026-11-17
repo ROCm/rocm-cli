@@ -258,7 +258,8 @@ fn librocdxg_on_loader_path(ld_library_path: Option<&str>, exists: impl Fn(&Path
 /// a `libhsa-runtime64`.
 ///
 /// The runtime opens `librocdxg.so` by name, and TheRock builds it with
-/// `RUNPATH $ORIGIN`, so the loader looks in the runtime's own directory before it
+/// an `$ORIGIN` search path (a `DT_RPATH` in the wheel runtimes' `libhsa-runtime64`,
+/// per `readelf -d`), so the loader looks in the runtime's own directory before it
 /// asks the linker cache or `LD_LIBRARY_PATH`. A tarball under
 /// `/opt/rocm-<version>` keeps the two side by side and registers neither, which
 /// is why a working install read as missing while those were the only sources
