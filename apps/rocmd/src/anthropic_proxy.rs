@@ -834,13 +834,37 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
         .ok_or_else(|| ProxyError::invalid("messages: at least one message is required"))?;
 
     let mut messages = Vec::with_capacity(turns.len() + 1);
-    if let Some(system) = object.get("system").filter(|value| !value.is_null()) {
-        let text = text_of(system, "system")?;
+    // PROTOTYPE (ROCMAI-489): Claude Code also sends `system`-role turns inside
+    // `messages`, after the user turn. Many local chat templates refuse a
+    // system message that is not first, so their text joins the leading system
+    // prompt instead of keeping its place. A request still needs at least one
+    // user or assistant turn.
+    let is_system = |turn: &&Value| turn.get("role").and_then(Value::as_str) == Some("system");
+    let mut system_text = match object.get("system").filter(|value| !value.is_null()) {
+        Some(system) => text_of(system, "system")?,
+        None => String::new(),
+    };
+    for turn in turns.iter().filter(is_system) {
+        let content = turn
+            .get("content")
+            .ok_or_else(|| ProxyError::invalid("messages: each message needs `content`"))?;
+        let text = text_of(content, "system message")?;
         if !text.is_empty() {
-            messages.push(json!({ "role": "system", "content": text }));
+            if !system_text.is_empty() {
+                system_text.push_str("\n\n");
+            }
+            system_text.push_str(&text);
         }
     }
-    for turn in turns {
+    if !turns.iter().any(|turn| !is_system(&turn)) {
+        return Err(ProxyError::invalid(
+            "messages: needs at least one user or assistant turn",
+        ));
+    }
+    if !system_text.is_empty() {
+        messages.push(json!({ "role": "system", "content": system_text }));
+    }
+    for turn in turns.iter().filter(|turn| !is_system(turn)) {
         let role = turn
             .get("role")
             .and_then(Value::as_str)
@@ -1645,6 +1669,26 @@ mod tests {
                 .unwrap_err()
                 .status,
             502
+        );
+    }
+
+    #[test]
+    fn system_role_turns_join_the_leading_system_prompt() {
+        let out = translate(&json!({
+            "max_tokens": 8,
+            "system": "Be brief.",
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "system", "content": [{"type": "text", "text": "Reminder."}]},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            out["messages"],
+            json!([
+                {"role": "system", "content": "Be brief.\n\nReminder."},
+                {"role": "user", "content": "x"},
+            ])
         );
     }
 
