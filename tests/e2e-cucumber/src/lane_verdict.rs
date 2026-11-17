@@ -53,8 +53,9 @@ pub enum GpuDeclaration {
 
 /// Read [`EXPECT_GPU_ENV`]'s value.
 ///
-/// Anything other than `1`, `0`, empty or unset is an error rather than a guess, since a misspelt declaration that read
-/// as "undeclared" would switch the GPU check off without anyone noticing.
+/// Anything other than `1`, `0`, empty or unset is an error rather than a
+/// guess, since a misspelt declaration that read as "undeclared" would switch
+/// the GPU check off without anyone noticing.
 pub fn parse_gpu_declaration(value: Option<&OsStr>) -> Result<GpuDeclaration, String> {
     match value.map(OsStr::to_str) {
         None | Some(Some("")) => Ok(GpuDeclaration::Undeclared),

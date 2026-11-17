@@ -1343,10 +1343,13 @@ jobs:
           # a failed step there does not turn the lane's check red. Only the
           # WSL lanes need this guard: every other lane writes report.json
           # directly in-job, with no guest-to-host copy step that can fail on
-          # its own. A harness preflight refusal is not one of those: it
-          # leaves an empty report.json that uploads fine, so the missing-report
-          # check does not catch it; its EMPTY row in the report is the signal
-          # (a post-run lane failure shows as a FAIL row with lane_failure).
+          # its own. A harness preflight refusal is not one of those:
+          # `run_suite` in tests/e2e-cucumber/tests/e2e.rs creates report.json
+          # empty before it calls `lane_verdict::preflight`, and the
+          # `if: always()` copy-out above carries it to the host, so it uploads
+          # fine and the missing-report check does not catch it; its EMPTY row
+          # in the report is the signal (a post-run lane failure shows as a
+          # FAIL row with lane_failure).
           if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
@@ -1523,14 +1526,16 @@ jobs:
 
       # A lane that dies before writing report.json (the GPU preflight step, a
       # build failure, a crash before results exist) uploads nothing. The
-      # harness's own preflight refusal is different: it leaves an empty
-      # report.json that does upload, and shows as an EMPTY row (a post-run
-      # lane failure as a FAIL row with lane_failure), not as missing.
-      # `discover()` can only render the reports that arrived, so a lane that
-      # uploads nothing would drop out of the grid with no row and no FAIL. On
-      # a `continue-on-error` lane nothing else is red either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`, and not self-skipped as `stale`) must have uploaded its report
-      # artifact. This reads the run's
+      # harness's own preflight refusal is different: `run_suite` in
+      # tests/e2e-cucumber/tests/e2e.rs creates report.json empty before it
+      # calls `lane_verdict::preflight`, and each lane's `if: always()` upload
+      # step publishes it, so it shows as an EMPTY row (a post-run lane failure
+      # as a FAIL row with lane_failure), not as missing. `discover()` can only
+      # render the reports that arrived, so a lane that uploads nothing would
+      # drop out of the grid with no row and no FAIL. On a `continue-on-error`
+      # lane nothing else is red either. So check it here: every lane that ran
+      # (any `needs` result but `skipped`, and not self-skipped as `stale`)
+      # must have uploaded its report artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can

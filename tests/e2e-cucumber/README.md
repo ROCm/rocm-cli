@@ -121,8 +121,13 @@ scenarios:
   open, held by a process it started (with the stderr tail so far). On a lane
   that sets `E2E_EXPECT_GPU=1` it also fails when the probe found no usable AMD
   GPU, naming the detected gfx target, WSL flag, driver status and visibility
-  mask it decided from. A run refused here writes no `platform.json`, and the
-  consolidated report shows it as EMPTY.
+  mask it decided from. A run refused here writes no `platform.json`; its
+  `report.json` is already there, empty, because `run_suite` in
+  [`tests/e2e.rs`](tests/e2e.rs) creates it before calling
+  `lane_verdict::preflight`, and on every self-hosted lane that ran its suite
+  the results upload step is gated on `always()` (`e2e-gpu`'s also skips a
+  run that found itself stale, which never reaches the suite), so the
+  consolidated report shows the lane as EMPTY.
 - **After the run**, it fails when no scenario executed (for example a `-n`
   filter that matches nothing), and on an `E2E_EXPECT_GPU=1` lane when no
   `@requires-gpu` (or `@requires-multi-gpu`) scenario executed. GPU scenarios

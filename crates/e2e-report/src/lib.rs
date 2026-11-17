@@ -43,8 +43,9 @@ pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
 /// before any scenario runs when its capability probe finds no usable AMD GPU,
 /// and after the run when no `@requires-gpu` (or `@requires-multi-gpu`)
 /// scenario executed. `0` means the lane deliberately has no usable GPU (the
-/// WSL lanes, whose distro is left without ROCm's WSL driver bridge). Unset or empty leaves the lane undeclared,
-/// as on the GitHub-hosted lanes and local runs; any other value is an error.
+/// WSL lanes, whose distro is left without ROCm's WSL driver bridge). Unset or
+/// empty leaves the lane undeclared, as on the GitHub-hosted lanes and local
+/// runs; any other value is an error.
 ///
 /// Shared by the harness, which reads it, and xtask's workflow contract test,
 /// which checks that every self-hosted E2E lane sets it, so the two cannot name

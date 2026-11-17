@@ -968,15 +968,17 @@ impl PipeReader {
 ///   because the stderr written before the deadline is the only evidence of
 ///   why `rocm examine` hung;
 /// - its grace is 5 s (`PROBE_DRAIN_GRACE`) rather than 2 s, because it runs
-///   three times per suite (two capability probes and `collect_versions`)
-///   rather than once per sample, so a generous wait for a loaded runner to
-///   hand over the bytes costs little.
+///   a handful of times per suite: each probe runs once (the capability
+///   probes in `probe_host_capability`, cached by `host_capability`, and the
+///   version probe in `collect_versions`, whose `rocm examine` repeats the
+///   capability probe's), not once per sample, so a generous wait for a
+///   loaded runner to hand over the bytes costs little.
 ///
 /// Only the direct child is killed: a process it started that inherited a pipe
 /// can keep that pipe open past the grace. The reader thread for that pipe is
 /// then left detached until the pipe closes, and the bytes it had read are
 /// used as they are. A leaked thread per stuck probe is accepted in a test
-/// harness that runs three probes and exits.
+/// harness that runs a handful of probes, each once, and exits.
 fn output_within(
     mut command: std::process::Command,
     timeout: std::time::Duration,

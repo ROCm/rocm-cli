@@ -949,8 +949,12 @@ mod tests {
 
     /// The artifact a lane uploads when the harness's PRE-run check refuses to
     /// run (a failed capability probe, a declared GPU the probe did not find,
-    /// an invalid `E2E_EXPECT_GPU`): the harness creates `report.json` empty
-    /// before probing and exits before writing `platform.json`. That lane must
+    /// an invalid `E2E_EXPECT_GPU`): `run_suite` in
+    /// `tests/e2e-cucumber/tests/e2e.rs` creates `report.json` empty before it
+    /// calls `lane_verdict::preflight`, and exits there before writing
+    /// `platform.json`; on every self-hosted lane that ran its suite, the
+    /// report upload step (and the WSL lanes' copy-out from the guest) is
+    /// gated on `always()`, so that empty file is what arrives. That lane must
     /// read as needing attention, never green. A POST-run lane-check failure
     /// writes `platform.json` with `lane_failure` instead; see the tests below.
     ///
