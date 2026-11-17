@@ -5134,13 +5134,16 @@ fi
             "gh run download \"$candidate\"",
             "--name queue-run-results",
             // A run that started a day ago is not tonight's, whenever it ended.
-            "[ \"$started_at\" -ge \"$(date -u -d '24 hours ago' +%s)\" ]",
+            "[ \"$started_at\" -lt \"$(date -u -d '24 hours ago' +%s)\" ]",
             // Only a finished run: a run still going has a partial log.
-            "[ \"${run_info%%$'\\t'*}\" = \"completed\" ]",
+            "[ \"${run_info%%$'\\t'*}\" != \"completed\" ]",
             // The log says which branch the run tested and which lanes block;
             // the run may have several jobs, so every one is scanned.
             "actions/runs/${candidate}/jobs?per_page=100",
             "/logs\" > queue-results/job.log.part",
+            // A rejected run says why, on a line of its own: run 44002836099 was
+            // rejected and the log could not say which filter did it.
+            "::notice::queue run ${candidate} not imported: $1",
         ] {
             assert!(
                 fetch.contains(needed),
@@ -5151,6 +5154,12 @@ fi
             !fetch.contains("conclusion"),
             "a red queue run is still a run: its artifact is uploaded whatever it concluded"
         );
+        assert!(
+            !fetch.contains("2>/dev/null &&")
+                && !fetch.contains("logs\" > queue-results/job.log.part 2>"),
+            "the job-log read must not discard its error: that is what hid the reason"
+        );
+
         // No credential beyond the job's own read-only token.
         let fetch_step = &steps[position("Fetch the latest queue results")].1;
         let env = step_env(fetch_step);
@@ -5230,6 +5239,10 @@ fi
         for required in [
             "!cancelled()",
             "needs.e2e-report-nightly.result == 'success'",
+            // A failed report job is a broken nightly (a lane ran and uploaded
+            // nothing), when the grid is most worth reading; the page guard
+            // below keeps a report without one off the wiki.
+            "needs.e2e-report-nightly.result == 'failure'",
             "github.repository == 'ROCm/rocm-cli'",
             "github.ref == 'refs/heads/main'",
         ] {
@@ -5238,6 +5251,10 @@ fi
                 "the wiki job's `if:` must require `{required}`: {condition}"
             );
         }
+        assert!(
+            !condition.contains("!= 'skipped'") && !condition.contains("== 'skipped'"),
+            "a skipped report job has nothing to publish and must not reach the wiki: {condition}"
+        );
         assert!(
             !condition.contains("always()"),
             "always() would publish from a cancelled run: {condition}"
