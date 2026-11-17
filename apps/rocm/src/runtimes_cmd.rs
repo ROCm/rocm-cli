@@ -599,25 +599,36 @@ const ROLLBACK_RUNTIME_MARKER: &str = "-";
 pub(crate) struct RuntimesListing {
     /// `default_runtime_id` from the config, as configured; `null` when unset.
     /// Not necessarily the active runtime's `runtime_id`: an `active_runtime_key`
-    /// takes precedence, and the id may differ in letter case or match nothing.
-    active_runtime_id: Option<String>,
+    /// that names a runtime takes precedence, and the id may differ in letter
+    /// case or match nothing. The text form labels it `active_runtime_id:`, as
+    /// `rocm examine` does.
+    default_runtime_id: Option<String>,
     active_runtime_key: Option<String>,
     previous_runtime_key: Option<String>,
+    /// Paths are written with `to_string_lossy`, so a path that is not valid
+    /// UTF-8 is listed with U+FFFD in place of its bad bytes rather than
+    /// failing the whole document.
+    #[serde(serialize_with = "serialize_path_lossy")]
     registry: PathBuf,
+    #[serde(serialize_with = "serialize_path_lossy")]
     marker: PathBuf,
-    /// Why the configured active runtime cannot be resolved, or `null`.
+    /// What is wrong with the configured active runtime setting, or `null`.
+    /// See [`active_runtime_problem`] for when it is set beside an `active`
+    /// runtime.
     active_problem: Option<ActiveRuntimeProblem>,
     /// Newest install first, ties broken by `runtime_key`, as the registry
     /// loader sorts them (`sort_manifests_newest_install_first`).
     runtimes: Vec<RuntimeListingEntry>,
 }
 
-/// Why the configured active runtime does not resolve to one manifest. The
-/// text form prints it as the `active_status:` line.
+/// What is wrong with the configured active runtime setting. The text form
+/// prints it as the `active_status:` line.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ActiveRuntimeProblem {
-    /// `active_runtime_key` is set but no registered manifest has that key.
+    /// `active_runtime_key` is set but names no registered runtime, ASCII
+    /// letter case ignored. Reported even when `default_runtime_id` then
+    /// resolves a runtime, which the listing marks `active`.
     MissingManifestForKey { runtime_key: String },
     /// No `active_runtime_key`; `default_runtime_id` matches no manifest's id,
     /// ASCII letter case ignored.
@@ -644,11 +655,51 @@ struct RuntimeListingEntry {
     /// Serialized as the two JSON fields `status` and `unusable_reason`.
     #[serde(flatten)]
     usability: RuntimeUsability,
-    /// `included` or `excluded`, the words `toolchain_state_text` uses.
-    toolchain: &'static str,
+    toolchain: RuntimeToolchain,
+    /// The runtime `current_runtime_manifest` resolves for this config: the
+    /// one `rocm examine`, `rocm runtimes activate` and `rollback` treat as
+    /// the active runtime.
     active: bool,
+    /// The runtime `select_runtime_manifest` resolves `previous_runtime_key`
+    /// to, which is the runtime `rocm runtimes rollback` selects (and then
+    /// refuses if it is unusable).
     rollback_target: bool,
+    #[serde(serialize_with = "serialize_path_lossy")]
     install_root: PathBuf,
+}
+
+/// A path as a JSON string, through `to_string_lossy`. serde's own `Path`
+/// impl fails on a path that is not valid UTF-8, which would leave
+/// `rocm runtimes list --json` printing nothing for a listing the text form
+/// prints (with the same replacement, through `Path::display`).
+fn serialize_path_lossy<S: serde::Serializer>(
+    path: &std::path::Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
+/// Whether a runtime carries the compiler toolchain. The text and the JSON
+/// print the same word, the one `toolchain_state_text` gives `rocm examine`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum RuntimeToolchain {
+    Included,
+    Excluded,
+}
+
+impl RuntimeToolchain {
+    const fn from_includes_devel(includes_devel: bool) -> Self {
+        if includes_devel {
+            Self::Included
+        } else {
+            Self::Excluded
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        toolchain_state_text(matches!(self, Self::Included))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -723,57 +774,49 @@ pub(crate) fn runtimes_listing(
 ) -> Result<RuntimesListing> {
     recover_setup_runtime_registration(paths, config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
+    Ok(listing_from_manifests(
+        config,
+        manifests,
+        runtime_registry_dir(paths),
+        active_runtime_marker_path(paths),
+    ))
+}
 
-    // With no `active_runtime_key`, `default_runtime_id` is matched by one rule,
-    // `default_runtime_id_matches` (ASCII letter case ignored), for both the
-    // problem and the `active` flag below, so the listing cannot mark a runtime
-    // active and also report its manifest missing.
-    let default_runtime_matches = default_runtime_id_matches(config, &manifests);
-    let (active_problem, single_default_runtime_key) =
-        if let Some(active_runtime_key) = config.active_runtime_key.as_deref() {
-            let problem = (!manifests
-                .iter()
-                .any(|manifest| manifest.runtime_key == active_runtime_key))
-            .then(|| ActiveRuntimeProblem::MissingManifestForKey {
-                runtime_key: active_runtime_key.to_owned(),
-            });
-            (problem, None)
-        } else if let Some(default_runtime_id) = config.default_runtime_id.as_deref() {
-            match default_runtime_matches.as_slice() {
-                [] => (
-                    Some(ActiveRuntimeProblem::MissingManifestForId {
-                        runtime_id: default_runtime_id.to_owned(),
-                    }),
-                    None,
-                ),
-                [manifest] => (None, Some(manifest.runtime_key.clone())),
-                matches => (
-                    Some(ActiveRuntimeProblem::AmbiguousRuntimeId {
-                        runtime_id: default_runtime_id.to_owned(),
-                        runtime_keys: matches
-                            .iter()
-                            .map(|manifest| manifest.runtime_key.clone())
-                            .collect(),
-                    }),
-                    None,
-                ),
-            }
-        } else {
-            (None, None)
-        };
+/// The listing of `manifests`, in the order given, for `config`. Split from
+/// the registry read so every configuration can be tested in memory, including
+/// keys that differ only in letter case, which one registry folder cannot hold
+/// on a case-insensitive filesystem.
+///
+/// `active` and `rollback_target` are not decided by rules of the listing's
+/// own: they are the runtimes the commands themselves resolve, by the same
+/// functions, so the listing marks what those commands act on.
+fn listing_from_manifests(
+    config: &RocmCliConfig,
+    manifests: Vec<therock::InstalledRuntimeManifest>,
+    registry: PathBuf,
+    marker: PathBuf,
+) -> RuntimesListing {
+    // Compared by position, not by key: keys can differ only in letter case,
+    // and the resolver's choice between such twins is part of what is listed.
+    let position = |resolved: &therock::InstalledRuntimeManifest| {
+        manifests
+            .iter()
+            .position(|manifest| std::ptr::eq(manifest, resolved))
+    };
+    let active_index = current_runtime_manifest(config, &manifests).and_then(position);
+    // `rocm runtimes rollback` selects `previous_runtime_key` this way; a value
+    // it refuses (no match, or ambiguous) names no rollback target.
+    let rollback_index = config
+        .previous_runtime_key
+        .as_deref()
+        .and_then(|selector| select_runtime_manifest(&manifests, selector).ok())
+        .and_then(position);
+    let active_problem = active_runtime_problem(config, &manifests);
 
     let runtimes = manifests
         .into_iter()
-        .map(|manifest| {
-            let active = config
-                .active_runtime_key
-                .as_deref()
-                .is_some_and(|runtime_key| runtime_key == manifest.runtime_key)
-                || single_default_runtime_key.as_deref() == Some(manifest.runtime_key.as_str());
-            let rollback_target = config
-                .previous_runtime_key
-                .as_deref()
-                .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
+        .enumerate()
+        .map(|(index, manifest)| {
             // The manifest check `rocm runtimes activate` applies, so "ready"
             // here means the runtime passes that check, not that an activation
             // is sure to succeed (see `RuntimeUsability`).
@@ -791,7 +834,7 @@ pub(crate) fn runtimes_listing(
             // The compiler is opt-in and `rocm update` reinstalls whatever this
             // says, so an install missing it should not be silent about that.
             // `rocm examine` reports the same thing for the active runtime.
-            let toolchain = toolchain_state_text(manifest.includes_devel());
+            let toolchain = RuntimeToolchain::from_includes_devel(manifest.includes_devel());
             RuntimeListingEntry {
                 runtime_key: manifest.runtime_key,
                 runtime_id: manifest.runtime_id,
@@ -801,22 +844,64 @@ pub(crate) fn runtimes_listing(
                 mode,
                 usability,
                 toolchain,
-                active,
-                rollback_target,
+                active: active_index == Some(index),
+                rollback_target: rollback_index == Some(index),
                 install_root: manifest.install_root,
             }
         })
         .collect();
 
-    Ok(RuntimesListing {
-        active_runtime_id: config.default_runtime_id.clone(),
+    RuntimesListing {
+        default_runtime_id: config.default_runtime_id.clone(),
         active_runtime_key: config.active_runtime_key.clone(),
         previous_runtime_key: config.previous_runtime_key.clone(),
-        registry: runtime_registry_dir(paths),
-        marker: active_runtime_marker_path(paths),
+        registry,
+        marker,
         active_problem,
         runtimes,
-    })
+    }
+}
+
+/// What is wrong with the configured active runtime setting, by the matching
+/// `current_runtime_manifest` applies.
+///
+/// It reports the configuration, so it can disagree with `active` in exactly
+/// one case: an `active_runtime_key` that names no runtime is reported as
+/// `MissingManifestForKey` even when the resolver then falls back to
+/// `default_runtime_id` and finds one, which is marked active. The commands act
+/// on that runtime, so the listing marks it; the key is still dead, so the
+/// listing says so. With no `active_runtime_key`, the problem comes from the
+/// same `default_runtime_id_matches` the resolver falls back to, so it is set
+/// exactly when nothing is active.
+fn active_runtime_problem(
+    config: &RocmCliConfig,
+    manifests: &[therock::InstalledRuntimeManifest],
+) -> Option<ActiveRuntimeProblem> {
+    if let Some(runtime_key) = config.active_runtime_key.as_deref() {
+        // The resolver's key step on its own: the same call with the default
+        // id it would fall back to taken away.
+        let mut key_only = config.clone();
+        key_only.default_runtime_id = None;
+        return current_runtime_manifest(&key_only, manifests)
+            .is_none()
+            .then(|| ActiveRuntimeProblem::MissingManifestForKey {
+                runtime_key: runtime_key.to_owned(),
+            });
+    }
+    let runtime_id = config.default_runtime_id.as_deref()?;
+    match default_runtime_id_matches(config, manifests).as_slice() {
+        [] => Some(ActiveRuntimeProblem::MissingManifestForId {
+            runtime_id: runtime_id.to_owned(),
+        }),
+        [_] => None,
+        matches => Some(ActiveRuntimeProblem::AmbiguousRuntimeId {
+            runtime_id: runtime_id.to_owned(),
+            runtime_keys: matches
+                .iter()
+                .map(|manifest| manifest.runtime_key.clone())
+                .collect(),
+        }),
+    }
 }
 
 impl cli_report::JsonOrText for RuntimesListing {
@@ -827,7 +912,7 @@ impl cli_report::JsonOrText for RuntimesListing {
         let _ = writeln!(
             output,
             "  active_runtime_id: {}",
-            unset(&self.active_runtime_id)
+            unset(&self.default_runtime_id)
         );
         let _ = writeln!(
             output,
@@ -884,7 +969,9 @@ impl cli_report::JsonOrText for RuntimesListing {
         for runtime in &self.runtimes {
             // Active wins when a runtime is both. `rocm runtimes activate` and
             // `rollback` never record a runtime as its own rollback target, so
-            // only a config edited outside the CLI reaches this.
+            // only a change made outside the CLI reaches this: a hand-edited
+            // config, or the active runtime's registry entry deleted while the
+            // default id falls back to the rollback target.
             let marker = if runtime.active {
                 Some(ACTIVE_RUNTIME_MARKER)
             } else if runtime.rollback_target {
@@ -909,7 +996,7 @@ impl cli_report::JsonOrText for RuntimesListing {
                     runtime.family,
                     runtime.mode.as_str(),
                     status,
-                    runtime.toolchain
+                    runtime.toolchain.as_str()
                 ),
             );
             let _ = writeln!(
@@ -1502,7 +1589,7 @@ pub(crate) mod tests {
 
         assert_eq!(listing["runtimes"], serde_json::json!([]));
         for unset in [
-            "active_runtime_id",
+            "default_runtime_id",
             "active_runtime_key",
             "previous_runtime_key",
             "active_problem",
@@ -1585,7 +1672,7 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(runtime_keys_flagged(&listing, "active"), ["rt-gfx120x"]);
-        assert_eq!(listing["active_runtime_id"], "therock-release:gfx120X-all");
+        assert_eq!(listing["default_runtime_id"], "therock-release:gfx120X-all");
         assert_null_field(&listing, "active_runtime_key");
         assert_null_field(&listing, "active_problem");
         Ok(())
@@ -1795,6 +1882,607 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    // ── State matrix: what the listing marks, for every configuration ──
+    //
+    // Built in memory through `listing_from_manifests`, so keys that differ
+    // only in letter case are listed as they would be on a case-sensitive
+    // filesystem without writing them to one: on a case-insensitive one the
+    // second `<key>.json` would overwrite the first.
+
+    /// A registered runtime with just the fields the listing reads. Its
+    /// install root does not exist, so it is listed `unusable`, which no row
+    /// below depends on.
+    fn listed_runtime_manifest(
+        runtime_key: &str,
+        runtime_id: &str,
+    ) -> therock::InstalledRuntimeManifest {
+        serde_json::from_value(serde_json::json!({
+            "runtime_key": runtime_key,
+            "runtime_id": runtime_id,
+            "channel": "release",
+            "format": "wheel",
+            "family": "gfx120X-all",
+            "family_source": "test",
+            "version": "7.13.0",
+            "install_root": format!("/nonexistent/rocm-list-state/{runtime_key}"),
+            "selected_artifact_url": "https://example.invalid/therock",
+            "installed_at_unix_ms": 10,
+        }))
+        .expect("a minimal runtime manifest deserializes")
+    }
+
+    const ID_A: &str = "therock-release:gfx120X-all";
+    const ID_B: &str = "therock-release:gfx110X-all";
+
+    /// Runtimes `rt-a` (id `ID_A`) and `rt-b` (id `ID_B`), in that order.
+    fn two_distinct_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
+        vec![
+            listed_runtime_manifest("rt-a", ID_A),
+            listed_runtime_manifest("rt-b", ID_B),
+        ]
+    }
+
+    /// Keys `rt-twin` and `RT-TWIN`, in that order, with distinct ids.
+    fn case_twin_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
+        vec![
+            listed_runtime_manifest("rt-twin", ID_A),
+            listed_runtime_manifest("RT-TWIN", ID_B),
+        ]
+    }
+
+    /// One row of the state matrix: a configuration, the runtimes, and what
+    /// the listing must say about them in both forms.
+    struct ListingState {
+        config: RocmCliConfig,
+        manifests: Vec<therock::InstalledRuntimeManifest>,
+        /// The key marked `active` (JSON) and `*` (text).
+        active: Option<&'static str>,
+        /// The key flagged `rollback_target` (JSON); marked `-` in the text
+        /// unless it is also active.
+        rollback: Option<&'static str>,
+        /// The JSON `active_problem`.
+        problem: serde_json::Value,
+        /// The text's `active_status:` line, without its indentation.
+        status_line: Option<&'static str>,
+    }
+
+    fn config_with(
+        default_runtime_id: Option<&str>,
+        active_runtime_key: Option<&str>,
+        previous_runtime_key: Option<&str>,
+    ) -> RocmCliConfig {
+        RocmCliConfig {
+            default_runtime_id: default_runtime_id.map(str::to_owned),
+            active_runtime_key: active_runtime_key.map(str::to_owned),
+            previous_runtime_key: previous_runtime_key.map(str::to_owned),
+            ..RocmCliConfig::default()
+        }
+    }
+
+    fn assert_listing_state(state: &ListingState) -> Result<()> {
+        use cli_report::JsonOrText as _;
+        let listing = listing_from_manifests(
+            &state.config,
+            state.manifests.clone(),
+            PathBuf::from("registry"),
+            PathBuf::from("active.json"),
+        );
+        let json = serde_json::to_value(&listing)?;
+        let text = listing.render_text();
+        let context = format!("{json:#}\n{text}");
+
+        // The listing marks what the commands resolve: `current_runtime_manifest`
+        // for the active runtime, `select_runtime_manifest` for rollback.
+        let resolved_active = current_runtime_manifest(&state.config, &state.manifests)
+            .map(|manifest| manifest.runtime_key.as_str());
+        assert_eq!(resolved_active, state.active, "resolver vs row:\n{context}");
+        let resolved_rollback = state
+            .config
+            .previous_runtime_key
+            .as_deref()
+            .and_then(|selector| select_runtime_manifest(&state.manifests, selector).ok())
+            .map(|manifest| manifest.runtime_key.as_str());
+        assert_eq!(
+            resolved_rollback, state.rollback,
+            "resolver vs row:\n{context}"
+        );
+
+        let expected_active: Vec<String> = state.active.iter().map(|k| (*k).to_owned()).collect();
+        let expected_rollback: Vec<String> =
+            state.rollback.iter().map(|k| (*k).to_owned()).collect();
+        assert_eq!(
+            runtime_keys_flagged(&json, "active"),
+            expected_active,
+            "{context}"
+        );
+        assert_eq!(
+            runtime_keys_flagged(&json, "rollback_target"),
+            expected_rollback,
+            "{context}"
+        );
+        assert_eq!(json["active_problem"], state.problem, "{context}");
+        assert_eq!(
+            runtime_keys_marked(&text, ACTIVE_RUNTIME_MARKER),
+            expected_active,
+            "{context}"
+        );
+        let rollback_only: Vec<String> = expected_rollback
+            .into_iter()
+            .filter(|key| Some(key.as_str()) != state.active)
+            .collect();
+        assert_eq!(
+            runtime_keys_marked(&text, ROLLBACK_RUNTIME_MARKER),
+            rollback_only,
+            "{context}"
+        );
+        let status_lines: Vec<&str> = text
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("active_status:"))
+            .collect();
+        assert_eq!(
+            status_lines,
+            state.status_line.into_iter().collect::<Vec<_>>(),
+            "{context}"
+        );
+        Ok(())
+    }
+
+    fn state_no_config() -> ListingState {
+        ListingState {
+            config: RocmCliConfig::default(),
+            manifests: two_distinct_runtimes(),
+            active: None,
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_key_exact() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-b"), None),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    /// The default id names the other runtime, so the key alone decides.
+    fn state_key_in_other_case() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("RT-A"), None),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-a"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    /// The one documented case where `active_problem` is set beside an
+    /// `active` runtime: the key is dead, the default id still resolves.
+    fn state_stale_key_default_resolves() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-gone"), None),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: None,
+            problem: serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": "rt-gone"}),
+            status_line: Some("active_status: missing manifest for active_runtime_key=rt-gone"),
+        }
+    }
+
+    fn state_stale_key_default_missing() -> ListingState {
+        ListingState {
+            config: config_with(Some("therock-release:gfx90a"), Some("rt-gone"), None),
+            manifests: two_distinct_runtimes(),
+            active: None,
+            rollback: None,
+            problem: serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": "rt-gone"}),
+            status_line: Some("active_status: missing manifest for active_runtime_key=rt-gone"),
+        }
+    }
+
+    fn state_stale_key_default_ambiguous() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_A), Some("rt-gone"), None),
+            manifests: vec![
+                listed_runtime_manifest("rt-a", ID_A),
+                listed_runtime_manifest("rt-a2", ID_A),
+            ],
+            active: None,
+            rollback: None,
+            problem: serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": "rt-gone"}),
+            status_line: Some("active_status: missing manifest for active_runtime_key=rt-gone"),
+        }
+    }
+
+    fn state_default_matches_none() -> ListingState {
+        ListingState {
+            config: config_with(Some("therock-release:gfx90a"), None, None),
+            manifests: two_distinct_runtimes(),
+            active: None,
+            rollback: None,
+            problem: serde_json::json!({
+                "kind": "missing_manifest_for_id",
+                "runtime_id": "therock-release:gfx90a"
+            }),
+            status_line: Some(
+                "active_status: missing manifest for active_runtime_id=therock-release:gfx90a",
+            ),
+        }
+    }
+
+    fn state_default_matches_one() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), None, None),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_default_matches_one_in_other_case() -> ListingState {
+        ListingState {
+            config: config_with(Some("THEROCK-RELEASE:GFX110X-ALL"), None, None),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_default_matches_two() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_A), None, None),
+            manifests: vec![
+                listed_runtime_manifest("rt-a", ID_A),
+                listed_runtime_manifest("rt-a2", ID_A),
+            ],
+            active: None,
+            rollback: None,
+            problem: serde_json::json!({
+                "kind": "ambiguous_runtime_id",
+                "runtime_id": ID_A,
+                "runtime_keys": ["rt-a", "rt-a2"]
+            }),
+            status_line: Some(
+                "active_status: ambiguous runtime_id=therock-release:gfx120X-all; \
+                 activate one runtime_key: rt-a, rt-a2",
+            ),
+        }
+    }
+
+    /// Ids differing only in case are two matches, even though one equals the
+    /// default exactly.
+    fn state_default_matches_two_differing_in_case() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_A), None, None),
+            manifests: vec![
+                listed_runtime_manifest("rt-a", ID_A),
+                listed_runtime_manifest("rt-a-lower", "therock-release:gfx120x-all"),
+            ],
+            active: None,
+            rollback: None,
+            problem: serde_json::json!({
+                "kind": "ambiguous_runtime_id",
+                "runtime_id": ID_A,
+                "runtime_keys": ["rt-a", "rt-a-lower"]
+            }),
+            status_line: Some(
+                "active_status: ambiguous runtime_id=therock-release:gfx120X-all; \
+                 activate one runtime_key: rt-a, rt-a-lower",
+            ),
+        }
+    }
+
+    /// Case twins: the resolver takes the first key matching in list order,
+    /// even when a later one equals the active key exactly, and the listing
+    /// marks that first one, because that is what the commands act on.
+    fn state_case_twins_key_names_the_second() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("RT-TWIN"), None),
+            manifests: case_twin_runtimes(),
+            active: Some("rt-twin"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_case_twins_key_names_the_first() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_A), Some("rt-twin"), None),
+            manifests: case_twin_runtimes(),
+            active: Some("rt-twin"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_previous_key_exact() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-b"), Some("rt-a")),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: Some("rt-a"),
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_previous_key_in_other_case() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-b"), Some("RT-A")),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: Some("rt-a"),
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_previous_key_is_a_runtime_id() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-b"), Some(ID_A)),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: Some("rt-a"),
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_previous_key_with_whitespace() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-b"), Some(" rt-a\n")),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: Some("rt-a"),
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    fn state_previous_key_missing() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_B), Some("rt-b"), Some("rt-gone")),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-b"),
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    /// Matches both twins only by letter case: rollback refuses it as
+    /// ambiguous, so nothing is the rollback target.
+    fn state_previous_key_ambiguous_case_twins() -> ListingState {
+        ListingState {
+            config: config_with(None, None, Some("Rt-Twin")),
+            manifests: case_twin_runtimes(),
+            active: None,
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    /// A runtime id two runtimes share: rollback refuses it as ambiguous.
+    fn state_previous_key_ambiguous_runtime_id() -> ListingState {
+        ListingState {
+            config: config_with(None, None, Some(ID_A)),
+            manifests: vec![
+                listed_runtime_manifest("rt-a", ID_A),
+                listed_runtime_manifest("rt-a2", ID_A),
+            ],
+            active: None,
+            rollback: None,
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    /// Rollback takes an exact key over its case twin.
+    fn state_previous_key_names_one_case_twin_exactly() -> ListingState {
+        ListingState {
+            config: config_with(None, None, Some("RT-TWIN")),
+            manifests: case_twin_runtimes(),
+            active: None,
+            rollback: Some("RT-TWIN"),
+            problem: serde_json::Value::Null,
+            status_line: None,
+        }
+    }
+
+    /// The active runtime's registry entry was deleted and the default id it
+    /// shared with the rollback target now resolves that one: it is both, and
+    /// the text marks it `*`.
+    fn state_stale_key_falls_back_to_the_rollback_target() -> ListingState {
+        ListingState {
+            config: config_with(Some(ID_A), Some("rt-gone"), Some("rt-a")),
+            manifests: two_distinct_runtimes(),
+            active: Some("rt-a"),
+            rollback: Some("rt-a"),
+            problem: serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": "rt-gone"}),
+            status_line: Some("active_status: missing manifest for active_runtime_key=rt-gone"),
+        }
+    }
+
+    #[test]
+    fn listing_state_no_config() -> Result<()> {
+        assert_listing_state(&state_no_config())
+    }
+
+    #[test]
+    fn listing_state_key_exact() -> Result<()> {
+        assert_listing_state(&state_key_exact())
+    }
+
+    #[test]
+    fn listing_state_key_in_other_case() -> Result<()> {
+        assert_listing_state(&state_key_in_other_case())
+    }
+
+    #[test]
+    fn listing_state_stale_key_default_resolves() -> Result<()> {
+        assert_listing_state(&state_stale_key_default_resolves())
+    }
+
+    #[test]
+    fn listing_state_stale_key_default_missing() -> Result<()> {
+        assert_listing_state(&state_stale_key_default_missing())
+    }
+
+    #[test]
+    fn listing_state_stale_key_default_ambiguous() -> Result<()> {
+        assert_listing_state(&state_stale_key_default_ambiguous())
+    }
+
+    #[test]
+    fn listing_state_default_matches_none() -> Result<()> {
+        assert_listing_state(&state_default_matches_none())
+    }
+
+    #[test]
+    fn listing_state_default_matches_one() -> Result<()> {
+        assert_listing_state(&state_default_matches_one())
+    }
+
+    #[test]
+    fn listing_state_default_matches_one_in_other_case() -> Result<()> {
+        assert_listing_state(&state_default_matches_one_in_other_case())
+    }
+
+    #[test]
+    fn listing_state_default_matches_two() -> Result<()> {
+        assert_listing_state(&state_default_matches_two())
+    }
+
+    #[test]
+    fn listing_state_default_matches_two_differing_in_case() -> Result<()> {
+        assert_listing_state(&state_default_matches_two_differing_in_case())
+    }
+
+    #[test]
+    fn listing_state_case_twins_key_names_the_second() -> Result<()> {
+        assert_listing_state(&state_case_twins_key_names_the_second())
+    }
+
+    #[test]
+    fn listing_state_case_twins_key_names_the_first() -> Result<()> {
+        assert_listing_state(&state_case_twins_key_names_the_first())
+    }
+
+    #[test]
+    fn listing_state_previous_key_exact() -> Result<()> {
+        assert_listing_state(&state_previous_key_exact())
+    }
+
+    #[test]
+    fn listing_state_previous_key_in_other_case() -> Result<()> {
+        assert_listing_state(&state_previous_key_in_other_case())
+    }
+
+    #[test]
+    fn listing_state_previous_key_is_a_runtime_id() -> Result<()> {
+        assert_listing_state(&state_previous_key_is_a_runtime_id())
+    }
+
+    #[test]
+    fn listing_state_previous_key_with_whitespace() -> Result<()> {
+        assert_listing_state(&state_previous_key_with_whitespace())
+    }
+
+    #[test]
+    fn listing_state_previous_key_missing() -> Result<()> {
+        assert_listing_state(&state_previous_key_missing())
+    }
+
+    #[test]
+    fn listing_state_previous_key_ambiguous_case_twins() -> Result<()> {
+        assert_listing_state(&state_previous_key_ambiguous_case_twins())
+    }
+
+    #[test]
+    fn listing_state_previous_key_ambiguous_runtime_id() -> Result<()> {
+        assert_listing_state(&state_previous_key_ambiguous_runtime_id())
+    }
+
+    #[test]
+    fn listing_state_previous_key_names_one_case_twin_exactly() -> Result<()> {
+        assert_listing_state(&state_previous_key_names_one_case_twin_exactly())
+    }
+
+    #[test]
+    fn listing_state_stale_key_falls_back_to_the_rollback_target() -> Result<()> {
+        assert_listing_state(&state_stale_key_falls_back_to_the_rollback_target())
+    }
+
+    /// A data dir whose path is not valid UTF-8 still lists as JSON: the
+    /// paths are written lossily, as the text form writes them, instead of
+    /// failing serialization and leaving stdout empty.
+    #[cfg(unix)]
+    #[test]
+    fn runtimes_list_json_writes_a_non_utf8_path_lossily() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let data_dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/data-\xff"));
+        let mut runtime = listed_runtime_manifest("rt-a", ID_A);
+        runtime.install_root = data_dir.join("rt-a");
+        let listing = listing_from_manifests(
+            &RocmCliConfig::default(),
+            vec![runtime],
+            data_dir.join("registry"),
+            data_dir.join("active.json"),
+        );
+        let json = serde_json::to_value(&listing)?;
+        assert_eq!(json["registry"], "/data-\u{fffd}/registry", "{json:#}");
+        assert_eq!(json["marker"], "/data-\u{fffd}/active.json", "{json:#}");
+        assert_eq!(
+            listed_runtime(&json, "rt-a")["install_root"],
+            "/data-\u{fffd}/rt-a",
+            "{json:#}"
+        );
+        Ok(())
+    }
+
+    /// The text prints `toolchain=` from `RuntimeToolchain::as_str`, which is
+    /// `toolchain_state_text`, the word `rocm examine` prints; the JSON prints
+    /// the serde `lowercase` rename. Both are documented as `included` and
+    /// `excluded`, so a change to either word fails here instead of silently
+    /// changing the JSON. As for the mode test below, a new variant must be
+    /// added to `all` as well as to the match.
+    #[test]
+    fn runtime_toolchain_text_and_json_words_agree_for_every_variant() -> Result<()> {
+        let all = [RuntimeToolchain::Included, RuntimeToolchain::Excluded];
+        for toolchain in all {
+            match toolchain {
+                RuntimeToolchain::Included | RuntimeToolchain::Excluded => {}
+            }
+            assert_eq!(
+                serde_json::to_value(toolchain)?,
+                toolchain.as_str(),
+                "{toolchain:?}"
+            );
+        }
+        assert_eq!(
+            RuntimeToolchain::from_includes_devel(true).as_str(),
+            "included"
+        );
+        assert_eq!(
+            RuntimeToolchain::from_includes_devel(false).as_str(),
+            "excluded"
+        );
+        Ok(())
+    }
+
     /// The text prints `mode=` from `RuntimeMode::as_str` and the JSON from the
     /// serde `kebab-case` rename; both are documented as the same words, so
     /// every variant must agree. The exhaustive `match` turns a new variant
@@ -1859,7 +2547,7 @@ pub(crate) mod tests {
             key_set(&listing),
             std::collections::BTreeSet::from(
                 [
-                    "active_runtime_id",
+                    "default_runtime_id",
                     "active_runtime_key",
                     "previous_runtime_key",
                     "registry",

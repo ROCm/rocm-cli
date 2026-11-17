@@ -125,6 +125,8 @@ Expected result:
   a banner, progress or hint line, reached stdout.
 - The runtime the text form marks `*` has `"active": true`, and it is the only
   one; the runtime marked `-`, if any, has `"rollback_target": true`.
+- The runtime marked active is the one `rocm examine` reports: its
+  `install_root` is the `active_runtime_root` that `rocm examine` prints.
 
 Optional: an unreadable settings file. Copy `config.json` from the config
 directory aside, cut the original off part-way through, and run `rocm version`

@@ -246,21 +246,42 @@ fn ids_listed_under<'a>(report: &'a str, section: &str) -> Vec<&'a str> {
 /// anyway: it is written first, so it is the half that would be left naming the
 /// new runtime if the restore did not run.
 fn config_active_runtime_key(world: &E2eWorld) -> Option<String> {
-    let config_dir = world
+    read_config(world)
+        .get("active_runtime_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The isolated `config.json`.
+fn config_path(world: &E2eWorld) -> PathBuf {
+    world
         .isolate_env()
         .into_iter()
         .find(|(key, _)| *key == "ROCM_CLI_CONFIG_DIR")
         .map(|(_, value)| PathBuf::from(value))
-        .expect("isolate_env did not set ROCM_CLI_CONFIG_DIR");
-    let config = config_dir.join("config.json");
+        .expect("isolate_env did not set ROCM_CLI_CONFIG_DIR")
+        .join("config.json")
+}
+
+fn read_config(world: &E2eWorld) -> serde_json::Value {
+    let config = config_path(world);
     let text = std::fs::read_to_string(&config)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", config.display()));
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", config.display()));
-    value
-        .get("active_runtime_key")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", config.display()))
+}
+
+/// Edit the config the way a person editing the file by hand would: set
+/// `active_runtime_key` and leave every other value as the CLI wrote it.
+fn set_config_active_runtime_key(world: &E2eWorld, runtime_key: &str) {
+    let mut config = read_config(world);
+    config["active_runtime_key"] = serde_json::Value::from(runtime_key);
+    let path = config_path(world);
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&config).expect("config serializes"),
+    )
+    .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
 }
 
 /// The runtime key recorded in the isolated active-runtime marker
@@ -358,6 +379,25 @@ async fn first_runtime_folder_deleted(world: &mut E2eWorld) {
 async fn second_runtime_manifest_deleted(world: &mut E2eWorld) {
     std::fs::remove_file(registry_dir(world).join(format!("{SECOND_KEY}.json")))
         .expect("failed to delete the second runtime's manifest");
+}
+
+/// A key no runtime is registered under: what the config holds after the
+/// active runtime's registry entry goes without the CLI noticing.
+const UNREGISTERED_KEY: &str = "release-tarball-gfx90a";
+
+#[given("the configuration names the first runtime as active in other letter case")]
+async fn config_names_first_in_other_case(world: &mut E2eWorld) {
+    let other_case = FIRST_KEY.to_ascii_uppercase();
+    assert_ne!(
+        other_case, FIRST_KEY,
+        "the edit must change the letter case"
+    );
+    set_config_active_runtime_key(world, &other_case);
+}
+
+#[given("the configuration names an unregistered runtime as active")]
+async fn config_names_unregistered_runtime(world: &mut E2eWorld) {
+    set_config_active_runtime_key(world, UNREGISTERED_KEY);
 }
 
 #[given("two registered runtimes whose keys differ only in letter case")]
@@ -1100,7 +1140,7 @@ async fn json_lists_nothing(world: &mut E2eWorld) {
     let listing = listing_json(world);
     assert_eq!(listing["runtimes"], serde_json::json!([]), "{listing:#}");
     for unset in [
-        "active_runtime_id",
+        "default_runtime_id",
         "active_runtime_key",
         "previous_runtime_key",
         "active_problem",
@@ -1148,22 +1188,84 @@ async fn text_marks_match_json(world: &mut E2eWorld) {
     assert_eq!(text_rows_marked(&text, "-"), rollback_only, "{text}");
 }
 
-#[then("the JSON marks only the first runtime active and reports no problem")]
-async fn json_marks_first_active_without_problem(world: &mut E2eWorld) {
+#[then("the JSON shows the default runtime as typed and no active runtime key")]
+async fn json_shows_default_as_typed(world: &mut E2eWorld) {
     let listing = listing_json(world);
-    // The state under test: the id as typed, and no active key.
     assert_eq!(
-        listing["active_runtime_id"],
+        listing["default_runtime_id"],
         first_runtime_id_in_other_case(),
         "{listing:#}"
     );
     assert_null_field(&listing, "active_runtime_key");
+}
+
+#[then("the JSON marks only the first runtime active and reports no problem")]
+async fn json_marks_first_active_without_problem(world: &mut E2eWorld) {
+    let listing = listing_json(world);
     assert_eq!(
         listed_keys_with(&listing, "active"),
         [FIRST_KEY],
         "{listing:#}"
     );
     assert_null_field(&listing, "active_problem");
+}
+
+#[then("the JSON marks only the second runtime active")]
+async fn json_marks_only_second_active(world: &mut E2eWorld) {
+    let listing = listing_json(world);
+    assert_eq!(
+        listed_keys_with(&listing, "active"),
+        [SECOND_KEY],
+        "{listing:#}"
+    );
+}
+
+/// The install root `rocm examine --json` reports (`summary.active_runtime_root`)
+/// for the active runtime, which comes from the resolver the commands use.
+fn examined_active_runtime_root(world: &E2eWorld) -> PathBuf {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["examine", "--framework", "skip", "--json"]);
+    assert_eq!(rc, 0, "examine failed:\n{stdout}\n{stderr}");
+    let examined: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("examine --json is not JSON ({error}):\n{stdout}"));
+    let root = examined["summary"]["active_runtime_root"]
+        .as_str()
+        .unwrap_or_else(|| panic!("examine reports no active runtime root:\n{examined:#}"));
+    PathBuf::from(root)
+}
+
+#[then("examine reports the first runtime as the active one")]
+async fn examine_reports_first_active(world: &mut E2eWorld) {
+    assert_eq!(
+        examined_active_runtime_root(world),
+        planted_install_root(world, FIRST_FAMILY)
+    );
+}
+
+#[then("examine reports the second runtime as the active one")]
+async fn examine_reports_second_active(world: &mut E2eWorld) {
+    assert_eq!(
+        examined_active_runtime_root(world),
+        planted_install_root(world, SECOND_FAMILY)
+    );
+}
+
+#[then("the text listing says the active runtime key has no registered runtime")]
+async fn text_reports_missing_active_key(world: &mut E2eWorld) {
+    let key = config_active_runtime_key(world).expect("the config names an active runtime key");
+    let text = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    let status: Vec<&str> = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("active_status:"))
+        .collect();
+    assert_eq!(
+        status,
+        [format!(
+            "active_status: missing manifest for active_runtime_key={key}"
+        )],
+        "{text}"
+    );
 }
 
 #[then("the text listing marks the first runtime active with no active_status line")]
@@ -1199,15 +1301,30 @@ async fn json_reports_second_ready(world: &mut E2eWorld) {
     assert_null_field(runtime, "unusable_reason");
 }
 
+/// Names the key the config holds, read back from the config file, and checks
+/// that no listed runtime has it in any letter case.
 #[then("the JSON reports that the active runtime key has no registered runtime")]
 async fn json_reports_missing_active_manifest(world: &mut E2eWorld) {
     let listing = listing_json(world);
+    let key = config_active_runtime_key(world).expect("the config names an active runtime key");
     assert_eq!(
         listing["active_problem"],
-        serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": SECOND_KEY}),
+        serde_json::json!({"kind": "missing_manifest_for_key", "runtime_key": key}),
         "{listing:#}"
     );
-    assert_eq!(listing["active_runtime_key"], SECOND_KEY, "{listing:#}");
+    assert_eq!(listing["active_runtime_key"], key.as_str(), "{listing:#}");
+    let listed: Vec<&str> = listing["runtimes"]
+        .as_array()
+        .expect("`runtimes` is an array")
+        .iter()
+        .filter_map(|runtime| runtime["runtime_key"].as_str())
+        .collect();
+    assert!(
+        !listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(&key)),
+        "`{key}` is registered after all:\n{listing:#}"
+    );
 }
 
 #[then("the JSON marks no runtime active")]

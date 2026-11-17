@@ -320,5 +320,37 @@ Feature: Runtime lifecycle state machine
     When the user sets the default runtime to the first runtime's id in other letter case
     And the user lists the registered runtimes as JSON
     Then the output is a single JSON document and nothing else
+    And the JSON shows the default runtime as typed and no active runtime key
     And the JSON marks only the first runtime active and reports no problem
     And the text listing marks the first runtime active with no active_status line
+
+  # A config edited by hand can name the active runtime in other letter case.
+  # The commands that act on the active runtime match its key ignoring case, so
+  # the list has to mark the runtime they act on, and `rocm examine` has to
+  # report that same runtime. The default runtime still names the second
+  # runtime, so a list that fell back to it would mark the wrong one.
+  @id:runtime-lifecycle-list-active-key-in-other-letter-case
+  Scenario: runtime-lifecycle-24 - An active runtime named in other letter case is listed as the one examine reports
+    Given two registered runtimes with the second active after the first
+    And the configuration names the first runtime as active in other letter case
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON marks only the first runtime active and reports no problem
+    And the text listing marks the first runtime active with no active_status line
+    And examine reports the first runtime as the active one
+
+  # The configured active runtime is not registered, but the default runtime
+  # still names a registered one and the commands fall back to it. The list
+  # marks that runtime active, as `rocm examine` reports it, and still says the
+  # configured active runtime is missing, in both forms.
+  @id:runtime-lifecycle-list-dead-active-key-falls-back-to-default
+  Scenario: runtime-lifecycle-25 - A missing active runtime is reported while the default runtime the commands use is listed active
+    Given two registered runtimes with the second active after the first
+    And the configuration names an unregistered runtime as active
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON marks only the second runtime active
+    And the JSON reports that the active runtime key has no registered runtime
+    And the text listing marks the same runtimes as the JSON
+    And the text listing says the active runtime key has no registered runtime
+    And examine reports the second runtime as the active one

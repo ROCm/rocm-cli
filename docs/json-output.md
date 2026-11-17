@@ -19,12 +19,15 @@ commands that do not have it yet.
   print is listed below as unsupported rather than given a `--json` that mixes
   the two.
 - **Errors are not JSON today.** A command that fails with `--json` prints its
-  error to stderr, prints nothing on stdout, and exits non-zero (1, unless the
-  command documents its own code, as `rocm fix` does). A script tells success
-  from failure by the exit code, not by parsing an error document. A JSON error
-  shape belongs to the shared envelope below. The one refusal printed as JSON
-  today is `rocm diagnose --report --json` declining to prepare a report: that
-  is the command working, so it exits 0 and prints `refusal_envelope` from
+  error to stderr, prints nothing on stdout, and exits 1, unless the command
+  documents its own code, as `rocm fix` does. Command lines the argument parser
+  rejects (an unknown flag, such as `--json` on a command without one, or a
+  missing argument) exit 2 with a usage message on stderr, before the command
+  runs. A script tells success from failure by the exit code, not by parsing an
+  error document. A JSON error shape belongs to the shared envelope below. The
+  one refusal printed as JSON today is `rocm diagnose --report --json`
+  declining to prepare a report: that is the command working, so it exits 0
+  and prints `refusal_envelope` from
   [report.rs](../crates/rocm-core/src/report.rs) (`schema`, `refused`,
   `explanation`, `architecture_matrix`).
 - **Documented fields do not change silently.** A field may be added. Renaming
@@ -56,7 +59,7 @@ commands that do not have it yet.
 | `rocm update` | supported for the check; one compact JSON line, not pretty, and refused with `--apply` and `--dry-run` | supported; the compact form is a known difference from the others | `update-02`, `update-03` |
 | `rocm storage report` | supported; pretty JSON through `JsonOrText` | supported | `json_or_text_impl_renders_the_report_and_serializes_it` |
 | `rocm services list` | supported; pretty JSON. `rocm remote` reads it back over its control channel | supported | `services_json_round_trips_and_applies_the_same_liveness_filter_as_the_table`; exercised indirectly by `remote-15` (`@requires-docker`), whose `rocm remote` reads it back |
-| `rocm runtimes list` | supported; pretty JSON through `JsonOrText` | supported, additive-only, no version field yet | `runtime-lifecycle-19` to `runtime-lifecycle-23` and `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`; what each covers is in [testing.md](testing.md#runtime-selection-and-activation) |
+| `rocm runtimes list` | supported; pretty JSON through `JsonOrText` | supported, additive-only, no version field yet | `runtime-lifecycle-19` to `runtime-lifecycle-25` and `runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`; what each covers is in [testing.md](testing.md#runtime-selection-and-activation) |
 | `rocm runtimes activate`, `rollback`, `uninstall`, `import`, `adopt` | none | follow-up: they change state, so they need the envelope's result and refusal shapes | — |
 | `rocm services logs` | none | intentionally unsupported: streamed text, and `-f` never ends | — |
 | `rocm services stop`, `restart`, `remove`, `prune` | none | follow-up: needs the envelope, including the refusal path | — |
@@ -75,11 +78,11 @@ The same listing as the text form, as one object:
 
 | Field | Value |
 |---|---|
-| `active_runtime_id` | the configured default runtime id as written in the config, or `null`. Not necessarily the active runtime's `runtime_id`: `active_runtime_key` takes precedence when set, and the id may differ from its runtime's in letter case or match no runtime at all. Read each runtime's `active` flag to see which one is in use |
+| `default_runtime_id` | the configured default runtime id as written in the config, or `null`. The text form labels it `active_runtime_id:`. Not necessarily the active runtime's `runtime_id`: an `active_runtime_key` that names a runtime takes precedence, and the id may differ from its runtime's in letter case or match no runtime at all. Read each runtime's `active` flag to see which one is in use |
 | `active_runtime_key` | the configured active runtime key, or `null` |
-| `previous_runtime_key` | the rollback target's key, or `null` |
+| `previous_runtime_key` | the configured rollback key, or `null` |
 | `registry`, `marker` | paths of the runtime registry folder and the active-runtime marker |
-| `active_problem` | `null`, or why no runtime is active (matched as described under the known limitation below): `{"kind": "missing_manifest_for_key", "runtime_key"}`, `{"kind": "missing_manifest_for_id", "runtime_id"}`, or `{"kind": "ambiguous_runtime_id", "runtime_id", "runtime_keys": [...]}` |
+| `active_problem` | `null`, or what is wrong with the configured active runtime, as described under [which runtimes are marked](#which-runtimes-are-marked): `{"kind": "missing_manifest_for_key", "runtime_key"}`, `{"kind": "missing_manifest_for_id", "runtime_id"}`, or `{"kind": "ambiguous_runtime_id", "runtime_id", "runtime_keys": [...]}` |
 | `runtimes` | one object per registered runtime, newest install first, ties broken by `runtime_key` |
 
 Each runtime carries `runtime_key`, `runtime_id`, `version` (as recorded; the
@@ -88,65 +91,88 @@ text adds the build date), `format`, `family`, `mode` (`managed` or
 that activation applies, `unusable` when it fails it; `ready` does not promise
 that an activation succeeds), `unusable_reason` (`null` when ready, otherwise
 why the runtime fails that check: text for a person, not a code to match on),
-`toolchain` (`included` or `excluded`), `active`,
+`toolchain` (`included` or `excluded`, the words `rocm examine` uses), `active`,
 `rollback_target` and `install_root`. `active` and `rollback_target` are the facts the text marks with
 `*` and `-`; a runtime that is both is shown as `*` in the text. The text's
 next-step hint for an empty registry is not part of the JSON.
 
-### Known limitation: the listing's matching rules
+`registry`, `marker` and `install_root` are strings. A path that is not valid
+UTF-8 is written with each invalid sequence replaced by U+FFFD, as the text
+form prints it, so such a path cannot be passed back to the filesystem from the
+JSON as it stands.
 
-`rocm runtimes list` decides which runtime is active, which is the rollback
-target and what `active_problem` says with rules of its own, which are not all
-the ones `rocm examine`, `rocm runtimes activate` and `rocm runtimes rollback`
-resolve with. Today:
+### Which runtimes are marked
 
-- When `active_runtime_key` is set, `active` marks the runtime whose key
-  equals it exactly, and `active_problem` is `missing_manifest_for_key` when
-  no runtime's key equals it exactly. `default_runtime_id` is then not
-  consulted.
-- When no `active_runtime_key` is set, `default_runtime_id` is matched against
-  each runtime's id with ASCII letter case ignored, by one rule for both
-  fields: exactly one match is marked `active` with `active_problem` `null`; no
-  match gives `missing_manifest_for_id`; several give `ambiguous_runtime_id`
-  and nothing active. `rocm config set-default-runtime` reaches this state: it
-  stores the id as typed, clears `active_runtime_key` and
-  `previous_runtime_key`, and tries to remove the active-runtime marker file
-  (best effort: a failed removal is ignored).
-- `rollback_target` marks the runtime whose key equals `previous_runtime_key`
-  exactly.
+`active` marks the runtime that `rocm examine`, `rocm runtimes activate`,
+`rocm runtimes rollback`, `rocm runtimes uninstall` and `rocm update` treat as
+the active one: the listing asks the resolver they use
+(`current_runtime_manifest` in
+[runtime_registry.rs](../apps/rocm/src/runtime_registry.rs)) rather than
+applying rules of its own. That resolver takes the first runtime in list order
+whose key matches `active_runtime_key` with ASCII letter case ignored; when
+`active_runtime_key` is unset or names no runtime, it takes the one runtime
+whose id matches `default_runtime_id`, letter case ignored, and nothing when
+that matches none or several.
 
-The commands acting on the active runtime also accept an `active_runtime_key`
-that differs from a runtime's only in letter case, and fall back to
-`default_runtime_id` when `active_runtime_key` names no runtime.
-`rocm runtimes rollback` also ignores whitespace around `previous_runtime_key`
-and accepts one that differs from a runtime's key in letter case or names a
-runtime by its id. For the active runtime, the commands take the first
-runtime in list order whose key matches `active_runtime_key` ignoring case,
-even when a later one has that key exactly; rollback tries an exact match
-first.
+`rollback_target` marks the runtime `rocm runtimes rollback` selects:
+`previous_runtime_key` resolved the way rollback resolves it
+(`select_runtime_manifest`, same file), which ignores surrounding whitespace,
+takes an exact key first, then the one key differing only in letter case, then
+the one runtime whose id matches. When that selection fails (the value names
+nothing, or matches several runtimes), no runtime is the rollback target. A
+selected runtime whose `status` is `unusable` is still marked; rollback then
+refuses it at the manifest check.
 
-The CLI records the active and rollback keys exactly as the runtimes have
-them, so most of these differences need a change made outside the CLI: a key
-edited by hand in the config shows nothing active in the listing, or no
-rollback target; and if the active runtime's registry entry is deleted while
-exactly one other registered runtime has the same id as `default_runtime_id`
-(activation records the active runtime's id there), the commands fall back to
-that runtime while the listing reports `missing_manifest_for_key`. One
-difference is reachable from the CLI alone, on a case-sensitive filesystem:
-`rocm runtimes import` and `rocm runtimes adopt --runtime-key` store keys as
-given, so two runtimes can have keys that differ only in letter case. When the
-one activated by its exact key is not the first of the two in list order, the
-listing marks it active while the commands act on the other. Each registry
-entry is a file named `<key>.json`, so on a case-insensitive filesystem (the
-default on Windows volumes, and on drvfs mounts under WSL) the second key names
-the first one's file: the command refuses it, or with `--replace` overwrites
-the first runtime's entry, and this state cannot occur.
+`active_problem` reports the configuration, by the same matching:
 
-`active` and `rollback_target` mean what the rules above say, and that meaning
-is part of the documented shape. Changing those rules, for example to match the
-resolution `rocm examine` uses, would change what the two flags report for the
-same configuration, so it is a contract change under the versioning rule
-above, not an additive one.
+- `missing_manifest_for_key` when `active_runtime_key` is set and no runtime's
+  key matches it, letter case ignored. This is the one case where a problem is
+  reported beside an `active` runtime: when `default_runtime_id` still resolves
+  one runtime, the commands fall back to it and the listing marks it active,
+  while `active_problem` still says the configured key names nothing. This
+  happens when the active runtime's registry entry is deleted outside the CLI
+  while another registered runtime has the same id (activation records the
+  active runtime's id as `default_runtime_id`, and installs of one channel and
+  family share an id).
+- With no `active_runtime_key`: `missing_manifest_for_id` when
+  `default_runtime_id` matches no runtime's id, `ambiguous_runtime_id` when it
+  matches several (ids differing only in letter case count as several), and
+  `null` when it matches one, which is then the active runtime. `rocm config
+  set-default-runtime` reaches this state: it stores the id as typed, clears
+  `active_runtime_key` and `previous_runtime_key`, and tries to remove the
+  active-runtime marker file (best effort: a failed removal is ignored).
+
+Two runtimes can have keys that differ only in letter case on a
+case-sensitive filesystem, since `rocm runtimes import` and
+`rocm runtimes adopt --runtime-key` store keys as given. For such a pair the
+resolver takes the first in list order even when `active_runtime_key` equals
+the other exactly, and the listing marks that first one, because it is the one
+those commands act on. Each registry entry is a file named `<key>.json`, so on
+a case-insensitive filesystem (the default on Windows volumes, and on drvfs
+mounts under WSL) the second key names the first one's file: the command
+refuses it, or with `--replace` overwrites the first runtime's entry, and this
+state cannot occur.
+
+Not every surface resolves the active runtime this way. Known differences:
+
+- The runtime manager in `rocm dash` matches exactly: `active_runtime_key`
+  equal to a runtime's key, or with no `active_runtime_key` the single runtime
+  whose id equals `default_runtime_id`, and `previous_runtime_key` equal to a
+  runtime's key. It shows nothing active where the listing marks a runtime
+  through letter case or through the default-id fallback after a dead key,
+  shows no rollback target for a `previous_runtime_key` in other letter case,
+  with surrounding whitespace or given as a runtime id. Of two keys differing
+  only in letter case it marks the one equal to `active_runtime_key`, where the
+  listing marks the first in list order, and of two ids differing only in case
+  it marks the one equal to `default_runtime_id`, where the listing reports
+  `ambiguous_runtime_id`.
+- `rocm setup status` looks `active_runtime_key` up ignoring letter case but
+  does not fall back to `default_runtime_id`.
+- `rocm engines install` without `--runtime-id`, for an engine that runs on the
+  ROCm runtime, resolves `active_runtime_key` (or, when it is unset,
+  `default_runtime_id`) the way rollback resolves a key: a dead key fails the
+  install instead of falling back, and a key matching case twins only by letter
+  case is refused as ambiguous.
 
 The shape is additive-only: fields may be added, none will be renamed or
 removed without a versioned transition. It carries no version field yet; one

@@ -1816,29 +1816,51 @@ plants five runtimes with one install time in reverse key order beside older
 and newer ones, and `registry_sort_is_newest_install_first_then_by_key` tests
 the sort on its own.
 
-The listing's matching rules, including how it uses `default_runtime_id`
-and where it differs from what `rocm examine` and `rocm runtimes
-activate`/`rollback` resolve, are in
-[json-output.md](json-output.md#known-limitation-the-listings-matching-rules).
-`rocm config set-default-runtime` reaches the state where only
-`default_runtime_id` is set.
+Which runtimes the listing marks `active` and `rollback_target`, and when it
+reports `active_problem`, are in
+[json-output.md](json-output.md#which-runtimes-are-marked): the listing asks
+the resolver `rocm examine`, `rocm runtimes activate`/`rollback`,
+`rocm runtimes uninstall` and `rocm update` use, and the surfaces that still
+resolve differently are listed there.
 `@id:runtime-lifecycle-list-default-id-in-other-letter-case`
-(`runtime-lifecycle-23`) sets the first runtime's id in upper case and checks
-that the JSON marks that runtime active with `active_problem` `null`, and that
-the text marks it `*` with no `active_status:` line. The other branches of that
-path are covered by unit tests:
-`runtimes_list_json_marks_the_one_runtime_matching_the_default_id_active`
-(an exact single match),
-`runtimes_list_matches_a_default_id_differing_only_in_case_with_one_rule`,
-`runtimes_list_json_reports_a_default_id_with_no_manifest`
-(`missing_manifest_for_id`),
-`runtimes_list_json_reports_a_default_id_matching_two_runtimes_as_ambiguous`
-and `runtimes_list_reports_a_default_id_matching_ids_differing_only_in_case_as_ambiguous`
-(`ambiguous_runtime_id`):
+(`runtime-lifecycle-23`) sets the first runtime's id in upper case through
+`rocm config set-default-runtime` and checks that the JSON marks that runtime
+active with `active_problem` `null`, and that the text marks it `*` with no
+`active_status:` line.
+`@id:runtime-lifecycle-list-active-key-in-other-letter-case`
+(`runtime-lifecycle-24`) edits the config's active runtime key to the first
+runtime's key in upper case while the default id still names the second, and
+checks that both forms mark the first runtime active with no problem and that
+`rocm examine --json` reports the first runtime's folder as
+`active_runtime_root`.
+`@id:runtime-lifecycle-list-dead-active-key-falls-back-to-default`
+(`runtime-lifecycle-25`) edits the key to one no runtime has while the default
+id still names the second runtime, and checks that both forms mark the second
+runtime active, that the JSON reports `missing_manifest_for_key` and the text
+the matching `active_status:` line, and that `rocm examine --json` reports the
+second runtime's folder.
+The `listing_state_*` unit tests in
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) list a state matrix in
+memory, one test per row (no config; an active key exact, in other case, or naming nothing with
+the default id resolving one, none or several; no active key with the default
+id matching none, one, one in other case, two, or two differing in case; keys
+differing only in case; a previous key exact, in other case, given as a runtime
+id, with whitespace, naming nothing, ambiguous, or naming one of two case twins
+exactly; and a dead key falling back to the rollback target). Each checks the
+JSON flags, `active_problem`, the text markers and the `active_status:` line,
+and that `active` and `rollback_target` are what `current_runtime_manifest` and
+`select_runtime_manifest` resolve. Keys differing only in case are built in
+memory, so these tests hold on a case-insensitive filesystem too.
+`runtimes_list_json_writes_a_non_utf8_path_lossily` (Unix only) lists a data
+folder whose path is not valid UTF-8, and
+`runtime_toolchain_text_and_json_words_agree_for_every_variant` holds the
+`toolchain` words in the text and the JSON together:
 
 ```bash
-cargo xtask e2e -- -n "runtime-lifecycle-(07|19|20|21|22|23) "
+cargo xtask e2e -- -n "runtime-lifecycle-(07|19|20|21|22|23|24|25) "
 cargo test -p rocm --bin rocm runtimes_list
+cargo test -p rocm --bin rocm listing_state
+cargo test -p rocm --bin rocm runtime_toolchain_text_and_json_words_agree_for_every_variant
 cargo test -p rocm --bin rocm registry_sort_is_newest_install_first_then_by_key
 ```
 
