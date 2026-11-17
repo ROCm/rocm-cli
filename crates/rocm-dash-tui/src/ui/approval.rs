@@ -324,6 +324,17 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_dialog_shows_its_review_title_and_approve_button() {
+        // The e2e step `no_approval_prompt_displayed` (dash_steps.rs) proves a
+        // dialog is absent by these two strings never appearing on screen, so
+        // they are pinned here, where the dialog draws them: renaming either
+        // must fail this test rather than let that step pass vacuously.
+        let (out, _) = draw(&long_request(3), None);
+        assert!(out.contains("Review: "), "{out}");
+        assert!(out.contains("Approve (y)"), "{out}");
+    }
+
+    #[test]
     fn a_plain_approval_never_promises_scroll_keys() {
         // Only the callers that handle PgUp and PgDn opt in. Every other dialog
         // uses `draw_approval`, and a hint for keys that do nothing is false.

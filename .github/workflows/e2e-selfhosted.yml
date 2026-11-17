@@ -9,9 +9,11 @@ name: E2E self-hosted
 # THIS workflow's supersession, never the required checks in ci.yml. Only
 # pull_request runs are superseded (see `concurrency:` below).
 #
-# Per-PR scope: a pull request runs exactly one Linux GPU node (`e2e-gpu`,
-# MI300X: the only lane where vLLM is the effective engine) and one Windows GPU
-# pool (the Strix Halo pool: `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
+# Per-PR scope: a pull request runs one Linux GPU silicon, MI300X, as two checks
+# (`e2e-gpu-queue`, the primary, on the shared GPU queue, and `e2e-gpu`, the
+# second, on a self-hosted runner; vLLM is the effective engine on both, and no
+# other silicon here runs it) and one Windows GPU pool (the Strix Halo pool:
+# `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
 # Ubuntu lane keeps its push / dispatch triggers; it does not start on
 # pull_request or merge_group. There is no W7900 lane here: W7900 is covered only
 # by the scheduled queue nightly's `w7900-dual` lane (docs/nightly-on-the-queue.md),
@@ -225,7 +227,12 @@ jobs:
     # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
     # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
     # on gfx1151 — red on the WSL host, and (worse) a silent pass published as
-    # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
+    # an MI300X report, which the consolidated grid renders as MI300X.
+    #
+    # On a pull request this lane is the second MI300X check: the first is the
+    # queue run of `e2e-gpu-queue` below, which does not wait for one of these
+    # runners. This lane is kept for the runners' own coverage (their runtime and
+    # cache), and its failure is as non-blocking as it always was.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
     # Read by `e2e-report`: a run that skipped itself as stale uploads nothing,
@@ -507,11 +514,15 @@ jobs:
       # literally, so a GH-expression-computed name would be invisible to it. The
       # `current` leg's name is UNCHANGED from before this matrix existed — it's
       # also what a single-element (non-release-branch) matrix always uploads.
+      # `e2e-gpu-selfhosted-report`, not `e2e-gpu-report`: that name is the pull
+      # request gate's (`e2e-gpu-queue`), whose queue run is the MI300X lane for
+      # pull requests; this one, on the self-hosted runners, shows beside it as
+      # "MI300X (self-hosted)".
       - name: Upload E2E report (current)
         if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-gpu-report
+          name: e2e-gpu-selfhosted-report
           path: tests/e2e-cucumber/results/
 
       - name: Upload E2E report (n-1)
@@ -562,6 +573,208 @@ jobs:
         run: |
           gh run cancel "$GITHUB_RUN_ID" || echo "::warning::could not cancel run ${GITHUB_RUN_ID}; its other lanes keep running"
 
+  # The MI300X lane of a pull request, run on the shared GPU queue instead of on
+  # a self-hosted runner that has to be free (docs/nightly-on-the-queue.md): it
+  # dispatches queue-pr-run.yml on main with the PR's branch, waits for that run,
+  # and publishes its release-channel report as `e2e-gpu-report`, the MI300X cell
+  # of the consolidated grid. The queue run is the primary MI300X check; `e2e-gpu`
+  # above is the second. This job runs on a GitHub-hosted runner and holds no queue
+  # credential: dispatching needs `actions: write`, nothing more.
+  #
+  # Only a pull request from this repository: a fork's token cannot dispatch, and
+  # the queue only checks out branches of this repository. A run the queue does
+  # not take (too many going, or the nightly's window) fails this job, with the
+  # queue's reason, rather than passing: a missing report is never green.
+  e2e-gpu-queue:
+    name: E2E tests (MI300X, queue)
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API and copies files
+    # The queue run's own limit is 170 min; the dispatch and the download add
+    # minutes.
+    timeout-minutes: 180
+    needs: [changes]
+    permissions:
+      actions: write
+    # Set when the queue refused for the nightly window: a skip, not a failure.
+    outputs:
+      skipped: ${{ steps.queue.outputs.skipped }}
+    # No `always()`: a job that keeps its condition true through a cancellation
+    # is not cancelled, and a superseded push must stop this job from polling.
+    if: >-
+      needs.changes.result == 'success'
+      && needs.changes.outputs.serve == 'true'
+      && github.event_name == 'pull_request'
+      && github.event.action != 'closed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      QUEUE_PR_GATE: ${{ vars.QUEUE_PR_GATE }}
+    steps:
+      - name: Run on the queue
+        id: queue
+        run: |
+          set -euo pipefail
+          # The switch for the queue side: the gate does nothing until the
+          # repository variable QUEUE_PR_GATE is `true`, which is set once the queue
+          # side (the runner's allow-list and the pull request run kind) is
+          # deployed. Without it, a merge of queue-pr-run.yml ahead of the queue
+          # side would turn every pull request red.
+          if [ "${QUEUE_PR_GATE:-}" != true ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the queue lane is switched off: the repository variable QUEUE_PR_GATE is not true"
+            echo "The queue lane is switched off until the queue side is deployed: set the repository variable QUEUE_PR_GATE to true." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # The branch name is the PR author's: checked before it goes anywhere.
+          if ! [[ "$HEAD_REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then
+            echo "::error::the branch name is not one the queue takes: it must start with a letter, a digit or an underscore, hold only letters, digits and . _ / -, and be at most 200 characters"
+            exit 1
+          fi
+          # A dispatch runs the workflow as it is on main. The pull request that
+          # adds queue-pr-run.yml cannot dispatch it until it is merged: that is a
+          # skip, said so, not a failure. It is a skip only when the branch itself
+          # carries the file; a file gone from main and from the branch (renamed or
+          # removed) stays red, as does any other error from either check. Drop
+          # this once queue-pr-run.yml is on main.
+          if ! out=$(gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=main" --jq .name 2>&1); then
+            if [[ "$out" == *"HTTP 404"* ]] &&
+              gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=${HEAD_REF}" --jq .name > /dev/null 2>&1; then
+              echo "skipped=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::queue-pr-run.yml is not on main yet: the queue lane cannot run"
+              echo "The queue lane does not run: this branch adds queue-pr-run.yml and a dispatch uses main's copy." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::queue-pr-run.yml is not on main, or main could not be checked: ${out}"
+            exit 1
+          fi
+          caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh workflow run queue-pr-run.yml --ref main -f "branch=${HEAD_REF}" -f "caller=${caller}"
+          # The run is not listed at once: the step that cancels it looks for it
+          # when this job ends before the id was found, but only after a dispatch.
+          touch "${RUNNER_TEMP}/queue-dispatched"
+
+          # The dispatch does not say which run it started; the run's title names
+          # this job, so look for that.
+          run_id=""
+          for _ in $(seq 1 36); do
+            # A failed call is asked again, not the end of the job.
+            run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+              --limit 50 --json databaseId,displayTitle |
+              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::the dispatched queue run did not appear within 3 minutes"
+            exit 1
+          fi
+          url="https://github.com/${GH_REPO}/actions/runs/${run_id}"
+          echo "queue run: ${url}"
+          # Kept for the step that cancels the run if this job is.
+          echo "$run_id" > "${RUNNER_TEMP}/queue-run-id"
+          echo "### MI300X on the queue" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run: ${url}" >> "$GITHUB_STEP_SUMMARY"
+
+          # Polled once a minute, not `gh run watch`, which polls every few
+          # seconds against this job's token. The job's own timeout bounds this,
+          # and a call that fails (a 502, a rate limit) is asked again.
+          failures=0
+          while true; do
+            if status=$(gh run view "$run_id" --json status --jq .status); then
+              failures=0
+            else
+              status=""
+              failures=$((failures + 1))
+              # A run that cannot be read (deleted, a token problem) would
+              # otherwise hold this job to its timeout.
+              if [ "$failures" -ge 10 ]; then
+                echo "::error::could not read the queue run's status ${failures} times in a row"
+                exit 1
+              fi
+            fi
+            [ "$status" = completed ] && break
+            sleep 60
+          done
+          # The run has finished: a failed call is asked again, a few times and
+          # a while apart, so two API errors in a row do not turn a passing run red.
+          conclusion=unknown
+          for attempt in 1 2 3 4 5; do
+            conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) && [ -n "$conclusion" ] && break
+            conclusion=unknown
+            sleep $((attempt * 10))
+          done
+          echo "queue run concluded: ${conclusion}"
+
+          # What the run published: the lanes' files, one directory per lane,
+          # each with a directory per channel. Only the MI300X lane's release
+          # channel is the report of this job.
+          mkdir -p queue-results report
+          gh run download "$run_id" --name queue-pr-run-results --dir queue-results ||
+            echo "::warning::the queue run published no results"
+          # The nightly's window is by design, not a fault: the lane is skipped
+          # for this push, said in the summary, and the job ends green with no
+          # report, which the consolidated report reads as skipped. Any other
+          # refusal stays red.
+          if [ -f queue-results/refused.txt ] && [[ "$(head -n 1 queue-results/refused.txt)" == nightly:* ]]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the queue lane does not run for this push: the nightly window"
+            echo "The queue lane will not run for this push: the queue side keeps its GPUs for the nightly while the nightly's window lasts. Re-run this job once the window has passed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -f queue-results/refused.txt ]; then
+            echo "::error::the queue did not take the run: $(head -n 1 queue-results/refused.txt)"
+            echo "The queue did not take the run: $(head -n 1 queue-results/refused.txt)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          results=queue-results/mi300x/release/results
+          if [ -f "${results}/report.json" ]; then
+            cp -R "${results}/." report/
+          else
+            echo "::error::the queue run left no MI300X release report (it ${conclusion}); it may be incomplete, which is capacity, not a failing test"
+            echo "No MI300X release report: the run ${conclusion}. Incomplete lanes are capacity, not a failing test; see the run above." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # A failing suite fails the queue run, and the report above shows
+          # which scenarios; the job follows the run's verdict.
+          [ "$conclusion" = success ]
+
+      # A push that supersedes this one cancels the job, and a job that fails
+      # after the dispatch (the run never appeared in the list) ends too; either
+      # would otherwise leave its queue run holding the runner it waits on: cancel
+      # that run too. Cancelling a run that has finished is harmless. The queue
+      # side's lanes are left to their own budgets.
+      - name: Cancel the queue run this job started
+        if: failure() || cancelled()
+        run: |
+          run_id=""
+          [ -f "${RUNNER_TEMP}/queue-run-id" ] && run_id=$(cat "${RUNNER_TEMP}/queue-run-id")
+          # The run was dispatched but its id was not found yet: look for it by the
+          # same title, as long as the main step would have (a run is not listed
+          # at once). Nothing was dispatched without the marker: nothing to look for.
+          if [ -z "$run_id" ] && [ -f "${RUNNER_TEMP}/queue-dispatched" ]; then
+            caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            for _ in $(seq 1 36); do
+              run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+                --limit 50 --json databaseId,displayTitle |
+                jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+              [ -n "$run_id" ] && break
+              sleep 5
+            done
+          fi
+          [ -n "$run_id" ] || exit 0
+          gh run cancel "$run_id" || true
+
+      # A report is uploaded whatever the verdict, as the self-hosted lane's is:
+      # a failing run's report is what the consolidated grid is for.
+      - name: Upload E2E report
+        if: always() && hashFiles('report/report.json') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-gpu-report
+          path: report/
+
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
   # Dispatch ephemeral pool, opt-in only via the `devlab-dispatch` label (see
   # e2e-gpu for why an unscoped label can silently mis-route a job to the wrong
@@ -588,8 +801,9 @@ jobs:
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
-    # Not on pull_request: a PR gets exactly one Linux GPU node (MI300X, the only
-    # lane where vLLM runs) and one Windows pool (Strix Halo). Not on
+    # Not on pull_request: a PR gets one Linux GPU silicon (MI300X, the only
+    # silicon where vLLM runs, as `e2e-gpu-queue` and `e2e-gpu`) and one Windows
+    # pool (Strix Halo). Not on
     # merge_group either: over 7 days 35% of its merge-queue jobs (98 of 281) were
     # cancelled at the 45 min cap, and the queue does not wait for this
     # non-required check. Still runs on push (main, release/**), dispatch and
@@ -1725,6 +1939,7 @@ jobs:
     needs:
       - changes
       - e2e-gpu
+      - e2e-gpu-queue
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
       - e2e-wsl
@@ -1796,7 +2011,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu=e2e-gpu-report
+            e2e-gpu=e2e-gpu-selfhosted-report
+            e2e-gpu-queue=e2e-gpu-report
             e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
             e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
             e2e-wsl=e2e-gpu-strix-wsl-report
@@ -1821,6 +2037,9 @@ jobs:
               echo "- :no_entry_sign: \`$job\` skipped itself as stale; it has no column in the grid above" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
+            # A lane that said it skipped itself on purpose (the queue's nightly
+            # window) uploads nothing and is not missing.
+            [ "$(jq -r --arg job "$job" '.[$job].outputs.skipped // ""' <<<"$NEEDS")" = true ] && continue
             IFS=',' read -ra wanted <<<"$artifacts"
             for artifact in "${wanted[@]}"; do
               if ! grep -qxF "$artifact" <<<"$uploaded"; then

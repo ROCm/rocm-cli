@@ -335,6 +335,77 @@ stderr. `an_unparseable_answer_from_a_failing_child_names_the_exit_status` pins
 the three cases against the fake, and `engine-ipc-02` below shows the same
 message in a `stop_server` report next to what the stop did.
 
+That error also says what is wrong with what the child printed, because "failed
+to parse" alone sends the reader to the engine's source: it printed nothing on
+stdout, or other output before or after its answer (a log line on the wrong
+stream), or JSON that is not an envelope, or something that is not JSON. The
+first says only that nothing was printed. The second quotes the other output,
+and the last two the start of stdout (one line, bounded, control characters
+escaped); those three also state the rule an engine breaks: only its JSON
+answer goes to stdout, its logs go to stderr.
+Nothing is salvaged from such output. Only a top-level JSON object counts as the
+answer, so a pretty-printed answer over many lines is still one answer, and an
+envelope inside an array or another object is not mistaken for one.
+`an_unreadable_stdout_is_described_by_what_is_wrong_with_it` covers the
+classification on every platform, `an_answer_past_the_search_bound_is_not_looked_for`
+the bound on how much of stdout the search reads, and
+`output_besides_the_answer_on_stdout_is_refused_and_named` runs the same cases
+through the fake.
+
+The engine protocol version (see the contract in
+[engine-plugins.md](engine-plugins.md#the-stdio-protocol-contract)) is tested on
+both sides of the conversation and in the rule itself. The rule is a table in
+[`protocol_version.rs`](../crates/rocm-engine-protocol/src/protocol_version.rs)
+(`the_caret_rule_from_this_builds_version`, every platform), and
+`protocol_properties` adds that the field round-trips in both envelopes, that a
+missing version is judged as `0.1.0`, and that the rule is reflexive and
+symmetric. The client refuses an answer in an incompatible protocol before it
+reads `ok` (`an_answer_in_an_incompatible_protocol_is_refused_whatever_it_says`).
+The check before an `install` or `launch` is a state matrix against the fake, each
+row asserting the error together with which requests the fake recorded:
+`a_compatible_engine_is_checked_and_then_sent_the_request` (same, newer
+additive and unversioned capabilities answers: two requests, the capabilities
+check first), `a_handshaked_request_is_not_sent_when_the_check_fails`
+(incompatible, incompatible refusal, unreadable version, an error answer, a crash
+with no answer, empty stdout, contaminated stdout, not JSON: only the
+capabilities request ever reached the engine), and
+`a_request_without_a_handshake_is_sent_once` (every other method is
+sent once, and its answer's version is what is checked). The check's own child
+is pinned too: `the_check_runs_on_the_requests_environment_without_its_progress`
+reads the environment the fake recorded for each run, and
+`the_check_withholds_an_inherited_key_file_as_the_request_does` the command it
+builds. On the engine side, `answer_engine_request` in `protocol_version.rs`
+judges a request's version before its method
+(`a_request_is_judged_by_its_version_before_its_method`), and one shared check,
+`engine_contract::assert_engine_holds_protocol_contract` (behind the
+`test-support` feature), holds every engine to the same list: an incompatible or
+unreadable version refused with `incompatible_protocol` for every method in
+`EngineMethod::ALL` on the stdio path and the decoded path, and for an unknown
+method on the stdio path, `unknown_method` and `invalid_request` for the other
+unusable requests, and this build's version on every answer. Each first-party engine runs it
+(`stdio_answers_hold_the_engine_protocol_contract` in its `lib.rs`), and
+`every_built_in_engine_holds_the_protocol_contract` in `apps/rocm` runs it over
+every built-in engine through `answer_builtin_engine_stdio`, the function
+`rocm __engine-stdio` answers with; the verb's own stdin reading is covered by
+e2e `engine-ipc-08` to `-12`, which run `rocm __engine-stdio vllm`, for `vllm`
+only; of those, `-09` to `-12` fail when the verb bypasses the shared reader.
+Each engine's `tests/stdio_binary.rs` runs its built `rocm-engine-<engine>
+stdio` binary and checks that a request for another protocol and input that is
+not JSON are each answered with an error envelope and exit status 0.
+The shared check is itself tested in both directions: an engine that holds the
+contract passes it, and one that ignores the version, or reads it only on the
+decoded path, fails it. `the_contract_check_fails_an_engine_that_breaks_any_one_rule`
+adds six engines that each break one rule (named in its doc comment), and the
+check fails each of them; the check's other rules have no such engine. `engine-ipc-03` to `-07` below show the daemon's side and
+`engine-ipc-08` to `-12` the engine's.
+
+```bash
+cargo test -p rocm-engine-protocol
+cargo test -p rocm-engine-lemonade -p rocm-engine-vllm -p rocm-engine-aim --lib protocol_contract
+cargo test -p rocm-engine-lemonade -p rocm-engine-vllm -p rocm-engine-aim --test stdio_binary
+cargo test -p rocm every_built_in_engine_holds_the_protocol_contract
+```
+
 The SIGPIPE tests re-execute the test binary in a fresh process with SIGPIPE at
 its default action, which is how `rocm` runs, because the test harness leaves it
 ignored and changing it process-wide would race sibling tests. A write that is
@@ -1786,6 +1857,88 @@ List registered managed or read-only runtimes and their exact side-by-side keys:
 
 ```bash
 rocm runtimes list
+rocm runtimes list --json
+```
+
+`--json` prints the same listing as one JSON document on stdout and nothing
+else: unset values are `null` rather than `<unset>`, each runtime carries
+`active` and `rollback_target` flags computed from the same values the text's
+`*`/`-` markers are drawn from, and the empty-registry next-step hint is
+text-only. The rules every `--json` command follows, and which commands have
+one, are in [json-output.md](json-output.md). Scenarios
+`@id:runtime-lifecycle-list-json-marks-active-and-rollback`
+(`runtime-lifecycle-23`) and `@id:runtime-lifecycle-list-json-empty-registry`
+(`runtime-lifecycle-24`) parse the whole of stdout as one document, so a stray
+line before or after it fails them; `runtime-lifecycle-23` also checks each
+runtime's values as planted, lists the same state as text and checks that the
+`*`/`-` rows name the runtimes the JSON flags, and `runtime-lifecycle-07` covers
+the text markers on their own.
+`@id:runtime-lifecycle-list-json-reports-unusable-runtime`
+(`runtime-lifecycle-25`) deletes a runtime's folder and reads
+`"status": "unusable"` with the reason `install root is missing: <folder>`, and
+`@id:runtime-lifecycle-list-json-reports-missing-active-manifest`
+(`runtime-lifecycle-26`) deletes the active runtime's registry entry and reads
+`active_problem` of kind `missing_manifest_for_key`.
+`@id:runtime-lifecycle-list-json-failure-prints-nothing-on-stdout`
+(`runtime-lifecycle-30`) covers the failure half of those rules: it replaces a
+registry entry with a folder of the same name, so the listing cannot read it
+(an entry that reads but does not parse is skipped, not an error), and checks
+that `--json` exits 1 with nothing on stdout and a plain-text error on stderr
+naming that entry. No scenario checks the
+listing's order: scenario 23's two runtimes share one install time, and the
+registry is read in filesystem order, which can match key order by chance.
+The order is pinned by unit tests:
+`runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
+plants five runtimes with one install time in reverse key order beside older
+and newer ones, and `registry_sort_is_newest_install_first_then_by_key` tests
+the sort on its own.
+
+Which runtimes the listing marks `active` and `rollback_target`, and when it
+reports `active_problem`, are in
+[json-output.md](json-output.md#which-runtimes-are-marked): the listing asks
+the resolver `rocm examine`, `rocm runtimes activate`/`rollback`,
+`rocm runtimes uninstall` and `rocm update` use, and the surfaces that still
+resolve differently are listed there.
+`@id:runtime-lifecycle-list-default-id-in-other-letter-case`
+(`runtime-lifecycle-27`) sets the first runtime's id in upper case through
+`rocm config set-default-runtime` and checks that the JSON marks that runtime
+active with `active_problem` `null`, and that the text marks it `*` with no
+`active_status:` line.
+`@id:runtime-lifecycle-list-active-key-in-other-letter-case`
+(`runtime-lifecycle-28`) edits the config's active runtime key to the first
+runtime's key in upper case while the default id still names the second, and
+checks that both forms mark the first runtime active with no problem and that
+`rocm examine --json` reports the first runtime's folder as
+`active_runtime_root`.
+`@id:runtime-lifecycle-list-dead-active-key-falls-back-to-default`
+(`runtime-lifecycle-29`) edits the key to one no runtime has while the default
+id still names the second runtime, and checks that both forms mark the second
+runtime active, that the JSON reports `missing_manifest_for_key` and the text
+the matching `active_status:` line, and that `rocm examine --json` reports the
+second runtime's folder.
+The `listing_state_*` unit tests in
+[runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) list a state matrix in
+memory, one test per row (no config; an active key exact, in other case, or naming nothing with
+the default id resolving one, none or several; no active key with the default
+id matching none, one, one in other case, two, or two differing in case; keys
+differing only in case; a previous key exact, in other case, given as a runtime
+id, with whitespace, naming nothing, ambiguous, or naming one of two case twins
+exactly; and a dead key falling back to the rollback target). Each checks the
+JSON flags, `active_problem`, the text markers and the `active_status:` line,
+and that `active` and `rollback_target` are what `current_runtime_manifest` and
+`select_runtime_manifest` resolve. Keys differing only in case are built in
+memory, so these tests hold on a case-insensitive filesystem too.
+`runtimes_list_json_writes_a_non_utf8_path_lossily` (Unix only) lists a data
+folder whose path is not valid UTF-8, and
+`runtime_toolchain_text_and_json_words_agree_for_every_variant` holds the
+`toolchain` words in the text and the JSON together:
+
+```bash
+cargo xtask e2e -- -n "runtime-lifecycle-(07|23|24|25|26|27|28|29|30|31) "
+cargo test -p rocm --bin rocm runtimes_list
+cargo test -p rocm --bin rocm listing_state
+cargo test -p rocm --bin rocm runtime_toolchain_text_and_json_words_agree_for_every_variant
+cargo test -p rocm --bin rocm registry_sort_is_newest_install_first_then_by_key
 ```
 
 Each runtime's row is followed by its `install_root:` and a `provenance:` line
@@ -1843,6 +1996,32 @@ the `examine` lines. Both plant read-only manifests and run on the mock lane:
 
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'runtime-lifecycle-22 |examine-54 '
+```
+
+`rocm runtimes list --json` gives each runtime the same four facts as a
+`provenance` object under the same names, with `null` where the text prints
+`unrecorded` ([json-output.md](json-output.md)). Both
+forms render from one listing, and the JSON takes its names and order from
+`RuntimeProvenance::recorded_fields`, the list `RuntimeProvenance::fields`
+shows. `runtimes_list_json_names_recorded_provenance_and_null_for_unrecorded`
+in [runtimes_cmd.rs](../apps/rocm/src/runtimes_cmd.rs) pins the whole object
+for a nightly, an older, an adopted, a tarball, a padded and an all-blank
+runtime; `runtimes_list_text_and_json_name_the_same_provenance` checks over the
+same runtimes that the text line and the JSON object name the same facts with
+the same values; and
+`runtimes_list_json_has_exactly_the_documented_fields_newest_install_first`
+pins the object's key set.
+`@id:runtime-lifecycle-list-json-names-runtime-provenance`
+(`runtime-lifecycle-31`) plants the runtimes of `runtime-lifecycle-22`, reads
+each one's provenance from the JSON, and compares it with the text listing of
+the same state. It sets `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, as the
+examine scenarios that plant a runtime do: with wheel runtimes registered, the
+startup update check looks for a Python and the network and can print a
+progress line on stdout ahead of the document. It runs on the mock lane:
+
+```bash
+cargo xtask e2e -- -n 'runtime-lifecycle-31 '
+cargo test -p rocm --bin rocm runtimes_list
 ```
 
 Activate one validated runtime:
@@ -1972,6 +2151,7 @@ Focused unit coverage:
 
 ```bash
 cargo test -p rocm --bin rocm runtime_activation
+cargo test -p rocm --bin rocm runtimes_list
 cargo test -p rocm --bin rocm runtime_import
 cargo test -p rocm --bin rocm runtime_adopt
 cargo test -p rocm --bin rocm runtime_install_writes
@@ -1990,7 +2170,6 @@ cargo test -p rocm-core model_recipe
 cargo test -p rocm-core staleness_warning
 cargo test -p rocm-core load_model_recipe_index
 cargo test -p rocm --bin rocm update_report_policy
-cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm
 cargo test -p rocm-engine-aim
@@ -2388,9 +2567,11 @@ audit log. Only the serving user can read the key file: it is mode 0600 on Unix
 and has a protected DACL granting only that user on Windows, and every store
 replaces it with a freshly created owner-only file, so permissions loosened in
 place do not survive a re-store. Verifying that the running server actually
-*rejects* an unauthenticated request requires a live engine; that end-to-end
-assertion is a deferred follow-up and is **not yet** exercised by the GPU
-acceptance scripts (`scripts/vllm_therock_gpu_test.py`). The unit tests cover
+*rejects* an unauthenticated request requires a live engine. For vLLM that is
+the `@nightly` GPU scenario `serve-vllm-key-guards-every-route` (serve-61),
+which runs in the nightly runs on Instinct GPUs (see "vLLM endpoint-key
+coverage" below). For the other engines, AIM included, no test yet asserts that
+the running server refuses a keyless request. The unit tests cover
 key policy, generation, the owner-only key file (including one whose
 permissions were loosened before a re-store, and on the Windows build job the
 DACL read back from disk), and key-file resolution. The tests that fail
@@ -2528,8 +2709,9 @@ via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
 reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
 closed** on that exact combination (public bind + `--engine lemonade` + Windows)
-and directs the user to `--engine vllm` or a loopback host. vLLM (all platforms,
-via `VLLM_API_KEY`), direct llama-server serving (via `--api-key-file`),
+and directs the user to `--engine vllm` or a loopback host. vLLM (Linux and WSL,
+via `VLLM_API_KEY` plus the `rocm_cli_vllm_auth` middleware described below),
+direct llama-server serving (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
@@ -2553,6 +2735,60 @@ has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
 lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
+
+vLLM endpoint-key coverage: `VLLM_API_KEY` on its own makes vLLM check the key
+only under a fixed set of path prefixes (`/v1` and a few others), while the
+server also answers routes such as `/invocations`, `/tokenize` and `/metrics`.
+So a keyed vLLM launch also passes `--middleware
+rocm_cli_vllm_auth.RequireEndpointApiKey`, an ASGI middleware compiled into the
+engine adapter
+([rocm_cli_vllm_auth.py](../engines/vllm/src/rocm_cli_vllm_auth.py)), written
+under the engine's data directory at launch and put on the server's
+`PYTHONPATH`. It
+requires the key on every route except `GET`/`HEAD /health` and CORS
+preflights, and raises instead of constructing when the key is empty, so a
+server that loaded it never answers a request unchecked.
+
+```bash
+cargo test -p rocm-engine-vllm endpoint_auth
+cargo test -p rocm-engine-vllm vllm_serve_args
+```
+
+The `endpoint_auth` tests run the shipped middleware under `python3` with a
+standard-library ASGI harness (they fail, rather than skip, when `python3` is
+missing on Linux), so the per-route behavior is covered on every PR without a
+GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
+gets the `--middleware` argument, `VLLM_API_KEY`, and the middleware directory
+at the front of `PYTHONPATH` ahead of the runtime's own entry, together, and
+that an unkeyed launch gets none of them:
+
+```bash
+cargo test -p rocm-engine-vllm vllm_server_command
+```
+
+What no unit test covers is the call in `spawn_vllm_server` that hands the
+resolved endpoint key to `vllm_server_command`: that spawn path probes the host
+(OpenMPI, libatomic, libnuma) before it builds the command, so only a real
+launch exercises it.
+
+That a real vLLM server loads the middleware and refuses keyless calls is
+covered by the `@nightly` GPU scenario `serve-vllm-key-guards-every-route`
+([model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)),
+which runs in the scheduled nightly runs on Instinct GPUs, where vLLM is the
+serving engine: the MI300X job in [nightly.yml](../.github/workflows/nightly.yml)
+and the shared GPU queue's Instinct lanes, MI350P among them
+([nightly-on-the-queue.md](nightly-on-the-queue.md)). Those run after merge, not
+per PR. It is not tagged `@merge-queue`:
+the merge queue runs no lane where vLLM is the engine (the MI300X lane does not
+run on `merge_group`), so under that tag it would run nowhere. To run it on a
+branch before merge, dispatch `e2e-selfhosted.yml` on the MI300X lane with a
+`name_filter`, which bypasses the harness's tag gates (`@nightly` included), so
+the scenario runs without `include_nightly`:
+
+```bash
+gh workflow run e2e-selfhosted.yml --ref <branch> \
+  -f platform=app-dev-gpu -f name_filter='^serve-61 '
+```
 
 Lemonade backend selection and alignment focused tests (reading the
 `llamacpp` rows out of `lemonade backends` when other recipes have indented
@@ -3034,23 +3270,50 @@ a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
 suite's own host filter, so it would also run the Windows-only
 `service-stop-07` on a Linux host, where it fails for want of PowerShell.
 
-`features/engine_ipc.feature` (`engine-ipc-01` and `-02`, Linux, mock lane)
+`features/engine_ipc.feature` (`engine-ipc-01` to `-12`, Linux, mock lane)
 covers how the daemon reads an engine child's answer, through the same
-`stop_server` tool. Each scenario copies the real `rocmd` into a scratch
-directory and puts a stand-in `rocm` shell script beside it, which is the
+`stop_server` tool (`-01` to `-07`), and how an engine reads a request
+(`-08` to `-12`). Each of `-01` to `-07` copies the real `rocmd` into a
+scratch directory and puts a stand-in `rocm` shell script beside it, which is the
 executable the standalone daemon runs for an engine request; the stand-in
 records its argv and the request it was sent, and prints what the scenario
-says. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
+says. Each of `-08` to `-12` runs the real `rocm __engine-stdio vllm`, writes
+the scenario's request to its stdin, and reads what it prints and its exit
+status. `engine-ipc-01` has the engine answer the stop and then exit non-zero: the
 report carries the engine's answer (not an error built from the exit status).
 `engine-ipc-02` has it print something that is not an answer, write to stderr
 and exit non-zero: the report's engine error is the parse failure, naming the
-exit status the engine ended with, followed by its stderr. Both check the report together with the server's process, record and
-endpoint key, and that the stand-in was run once as `__engine-stdio vllm` with
-one `stop` request line. The server is a `vllm` one, for which the engine's
-`Stop` is advisory, so in `-02` the stop still completes; an engine whose stop
+exit status the engine ended with and what was wrong with its stdout, followed
+by its stderr. `engine-ipc-03` has the engine answer that it stopped, in an engine
+protocol this release cannot use (`9.0.0`): the report's engine result is the
+refusal naming both versions, not the answer. `engine-ipc-04` has it write a log
+line on stdout before a valid answer: the report's engine error says it wrote
+other output before its answer, quoting the line. `engine-ipc-05`, `-06`
+and `-07` have it answer in this release's protocol, in a newer one that only
+adds to it (the next patch, computed from `ENGINE_PROTOCOL_VERSION`, with a
+field this release does not know in the envelope and in the stop's data), and with
+no version at all, as an engine from before the
+field does: each is read as answered. (They are three scenarios, not one
+outline, because the suite keys each scenario's result by its `@id`.) Every one checks the report together with the server's
+process, record and endpoint key, and that the stand-in was run once as
+`__engine-stdio vllm` with one `stop` request line, written in this release's
+protocol. The server is a `vllm` one, for which the engine's
+`Stop` is advisory, so in `-02` to `-04` the stop still completes; an engine whose stop
 decides the confirmation (`aim`) is not staged here, because teardown would
-then run the real engine's stop. Run them with a hooks build and `-n
-"engine-ipc"`.
+then run the real engine's stop. `engine-ipc-08` runs the real `rocm
+__engine-stdio vllm` and sends it a `stop` request made for protocol `9.0.0` for a
+server the engine's own state file names (a live `sleep`, with its `/proc` start
+time): the answer is the `incompatible_protocol` refusal naming both versions,
+the process is still running and the engine's record still names it, where a
+`stop` the engine served would have ended it. `-09` sends a method no engine
+has (`frobnicate`) at `9.0.0`, and `-10` a stop whose `protocol_version` is the
+number `9`: each is answered `incompatible_protocol`, which only reading the
+version before the method or the rest of the envelope can produce, and `-10`
+also shows the server still running. `-11` sends `frobnicate` in this release's
+protocol (`unknown_method`) and `-12` text that is not JSON (`invalid_request`).
+Each of `-08` to `-12` pins the whole answer and an exit status of 0. Run them
+with a hooks build and `-n "engine-ipc"`; the steps take this release's version from
+`rocm_engine_protocol::ENGINE_PROTOCOL_VERSION`, a dev-dependency of the suite.
 
 Manual restricted-tool smoke:
 
@@ -3078,6 +3341,38 @@ must fail unless `--allow-mutation` is supplied after an explicit user
 approval. User-facing TUI/chat flows should still route mutating tool calls
 through their normal approval cards rather than relying on this hidden helper
 flag.
+
+Assistant tool-call arguments:
+
+The approval card for a mutating assistant tool call and the command its
+approval runs are built from the same argument object. No tool takes a
+parameter named `arguments`, so a call whose arguments carry a nested
+`arguments` field is refused by `validate_chat_tool_call` in
+[tool_policy.rs](../apps/rocm/src/tool_policy.rs) before any card is shown, on
+the dash, chat and `rocm mcp-call` paths alike. `chat-17`
+(`chat-ambiguous-tool-call-refused-before-approval` in
+[chat.feature](../tests/e2e-cucumber/features/chat.feature), Linux mock lane,
+no GPU) drives it through the interactive chat: a mock model answers with a
+two-payload `launch_server` call, the model is told the call was refused for
+its nested field, and no approval prompt appears.
+
+The hidden `rocm mcp-call` command still accepts a pasted MCP `tools/call`
+params envelope (`name`, `arguments` and an optional `_meta`) and unwraps it at
+its own boundary, but only a pure envelope, and it refuses one that names a
+different tool. `chat-18` runs a read-only tool from such an envelope and
+checks the tool's own result; `chat-19` passes tool fields mixed with a nested
+`arguments` object and checks the call is refused and prints no tool result.
+Arguments that are not a JSON object are refused rather than run as `{}`.
+
+```bash
+cargo xtask e2e -- -n "chat-1[789]"
+cargo test -p rocm --bin rocm nested_arguments
+cargo test -p rocm --bin rocm seam_approval_card_matches
+cargo test -p rocm --bin rocm mcp_call_
+cargo test -p rocm --bin rocm no_rocm_tool_declares_an_arguments_parameter
+cargo test -p rocm-dash-tui no_rocm_tool_declares_an_arguments_parameter
+cargo test -p e2e-cucumber --lib a_scripted_tool_call_answers_only_the_triggering_user_turn
+```
 
 Artifact cache and prefetch policy tests:
 
@@ -3530,8 +3825,9 @@ It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
 the queue nightly only) and the vLLM half falls to the Instinct lane. Of all
-these lanes only MI300X and the Strix Halo Windows and WSL2 lanes run on pull
-requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
+these lanes only MI300X (two checks, `e2e-gpu-queue` on the shared GPU queue
+and `e2e-gpu` on a self-hosted runner, the same silicon) and the Strix Halo
+Windows and WSL2 lanes run on pull requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
 the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
 on the queue nightly), and none of their check names is a required status
 check, so the two unit tests above are the blocking per-PR coverage. The scenario
@@ -3816,8 +4112,10 @@ inputs come from the environment for parity with those scripts:
 ### Install lifecycle (opt-in `@lifecycle` E2E)
 
 The full install lifecycle — packaging, signature-verified install, tamper
-rejection, reinstall, PATH handling, and uninstall — is expressed as
-`@lifecycle` scenarios in the [E2E cucumber suite](../tests/e2e-cucumber/README.md)
+rejection, reinstall, PATH handling, uninstall, and how download progress is
+drawn (one bar per download that stays inside the terminal, a terminal too
+narrow for a bar saying so rather than going silent, and the wget fallback) —
+is expressed as `@lifecycle` scenarios in the [E2E cucumber suite](../tests/e2e-cucumber/README.md)
 (`features/install_lifecycle.feature`). They drive `cargo xtask package`, the
 real root installer (`install.sh` / `install.ps1`), and the installed binaries
 end to end, replacing the former
@@ -4403,7 +4701,7 @@ of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
 log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
 ready, so a mock engine can then fail its smoke test.
-`@id:serve-vllm-extension-load-hint` (serve-61) arms it with
+`@id:serve-vllm-extension-load-hint` (serve-62) arms it with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=extension-load`, which plants the raw startup log
 of a launch killed by a vLLM compiled extension that failed to load and fails
 the launch with the vLLM engine's own message for that log. None of rocm-cli's
@@ -5099,9 +5397,9 @@ hold the behaviour end to end, GPU or not:
   runs only the bash half, on Linux, and ci.yml's Windows lane does not run
   this scenario.
 - `diagnose-60` (Linux and WSL lanes only, like every pseudo-terminal
-  scenario here; the Windows key is checked by hand in
-  [manual-testing.md](manual-testing.md) section 13) runs
-  `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
+  scenario here; the Windows key is checked by hand in the "Pasting An Error
+  Into `rocm diagnose`" section of [manual-testing.md](manual-testing.md))
+  runs `rocm diagnose --symptom-file -` on a pseudo-terminal tall enough to keep
   the whole exchange on screen (it has no scrollback), requires the hint
   telling the user how to end the paste, then types the paste and Ctrl-D, the
   Linux end-of-input key the hint names, and requires the screen, which also
