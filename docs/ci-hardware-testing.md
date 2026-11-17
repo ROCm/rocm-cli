@@ -88,10 +88,12 @@ channel to this on the 10.3.0a SDKs.
 
 It is **advisory and not a required check**. A finding shows as a warning and a
 job summary, and the job stays green, so a known gap does not leave a permanent
-red X on every pull request that touches those paths; the self-test, the build and a check
-that cannot run at all (the build tables no longer parse) still fail the job. It resolves the live
-indexes, so it can warn on a pull request that changed nothing, when an index moves to an SDK
-vLLM has no wheels for; required, that would block unrelated merges. Read a warning
+red X on every pull request that touches those paths. The self-test, the build
+and a check that cannot run at all still fail the job: the build tables no
+longer parse, or a `rocm install sdk --dry-run` times out, fails or prints no
+usable version. It resolves the live indexes, so it can warn on a pull request
+that changed nothing, when an index moves to an SDK vLLM has no wheels for;
+required, that would block unrelated merges. Read a warning
 as "the default SDK has no vLLM build yet": add the discovery row once the
 wheels are published, or wait for them. Locally, with a built `rocm`:
 `python scripts/vllm_route_check.py --rocm target/release/rocm`.

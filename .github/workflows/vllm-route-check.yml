@@ -5,7 +5,7 @@ name: vLLM route check
 # when the vLLM engine has no install route for it (see
 # scripts/vllm_route_check.py). It reads the live indexes, so it can warn on a
 # PR that changed nothing: an index moved on to an SDK vLLM has no wheels for.
-# Required, that would block unrelated merges, so it only reports.
+# Required, that would block unrelated merges, so a missing route only reports.
 #
 # Runs on a PR only when it touches what decides the answer: the resolver that
 # picks the default SDK (therock.rs and therock/), the engine's two build
@@ -63,7 +63,8 @@ jobs:
         id: route
         # Exit 1 = a default SDK has no route: reported below, job stays green.
         # Any other non-zero exit (2 = the check itself could not run, for
-        # example the build tables no longer parse) fails the job.
+        # example the build tables no longer parse, or `rocm install sdk
+        # --dry-run` timed out, failed or printed no plan) fails the job.
         run: |
           rc=0
           python3 scripts/vllm_route_check.py --rocm target/release/rocm \

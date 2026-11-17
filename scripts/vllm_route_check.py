@@ -7,7 +7,7 @@
 
 Runs ``rocm install sdk --channel C --family F --dry-run`` for the release and
 the nightly channel on each Instinct arch (the targets whose default engine is
-vLLM) and fails when the ROCm SDK version the plan selects has neither a
+vLLM) and reports a finding when the ROCm SDK version the plan selects has neither a
 discovery row nor a static pin in the vLLM engine's tables. Without a route,
 ``rocm engines install vllm`` refuses the runtime, and every vLLM-default GPU
 lane runs no scenarios on it (the nightly queue lanes did exactly that on the
@@ -22,9 +22,12 @@ back to the default static pin (a ROCm 7.2.3 vLLM wheel) rather than refuse,
 and this reports that too, because that wheel is not built for the SDK.
 Nothing is installed and no GPU is needed.
 
-It resolves the live indexes, so it can go red with no change in the PR: an
-index that moved on to an SDK vLLM has no wheels for. The workflow that runs it
-is advisory for that reason. Add the missing row, or wait for the wheels.
+It resolves the live indexes, so it can report a gap with no change in the PR:
+an index that moved on to an SDK vLLM has no wheels for. A finding exits 1 and
+the workflow that runs it turns that into a warning, for that reason. Add the
+missing row, or wait for the wheels. A check that could not run (a dry run that
+times out, fails or prints no usable version, an unreadable table, a missing
+``rocm``) exits 2, which fails the job.
 """
 
 from __future__ import annotations
@@ -38,6 +41,9 @@ from pathlib import Path
 DISCOVER_FILE = Path("engines/vllm/src/discover_builds.rs")
 STATIC_FILE = Path("engines/vllm/src/wheel_builds.rs")
 CHANNELS = ("release", "nightly")
+# The next-layout Instinct arches. Not every vLLM-default arch is here (see
+# crates/rocm-core/src/host_gpu/engine_default.rs): add one by hand, or it is
+# never probed.
 # Exact arches, because the next layout selects its device payload by arch and
 # refuses a grouped family. gfx942 is MI300X/MI325X, gfx950 is MI350/MI355.
 FAMILIES = ("gfx942", "gfx950")
@@ -104,7 +110,13 @@ def selected_version(output: str) -> str | None:
 
 
 def probe(rocm: str, channel: str, family: str, routes: dict[str, set]) -> str | None:
-    """Resolve one channel and family; return a failure, or ``None`` when fine."""
+    """Resolve one channel and family; return a missing-route finding, or ``None``.
+
+    Only a real "no vLLM route" finding is returned (the caller reports it as
+    exit 1). A dry run that times out, fails, or prints no selected version
+    means the check itself broke, which is no verdict on routing, so it raises
+    ``CheckError`` and the run exits 2.
+    """
     label = f"{channel}/{family}"
     command = [
         rocm, "install", "sdk", "--channel", channel, "--family", family,
@@ -118,14 +130,22 @@ def probe(rocm: str, channel: str, family: str, routes: dict[str, set]) -> str |
             timeout=DRY_RUN_TIMEOUT_SECS,
             check=False,
         )
+    except OSError as error:
+        raise CheckError(f"{label}: cannot run {rocm}: {error}") from error
     except subprocess.TimeoutExpired:
-        return f"{label}: dry run did not finish in {DRY_RUN_TIMEOUT_SECS}s"
+        raise CheckError(
+            f"{label}: dry run did not finish in {DRY_RUN_TIMEOUT_SECS}s"
+        ) from None
     if result.returncode != 0:
         tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
-        return f"{label}: dry run failed ({result.returncode}): {' | '.join(tail)}"
+        raise CheckError(
+            f"{label}: dry run failed ({result.returncode}): {' | '.join(tail)}"
+        )
     version = selected_version(result.stdout)
     if version is None:
-        return f"{label}: the plan has no selected_rocm_version line"
+        raise CheckError(f"{label}: the plan has no selected_rocm_version line")
+    if not re.match(r"^\d+\.\d+\.\d+", version):
+        raise CheckError(f"{label}: unparseable selected_rocm_version {version!r}")
     problem = route_problem(version, routes)
     if problem:
         return f"{label}: {problem}"
@@ -148,6 +168,55 @@ const VLLM_ROCM_BUILD_TABLE: &[VllmRocmBuild] = &[VllmRocmBuild {
     rocm_sdk_version: "7.2.3",
 }];
 """
+
+
+def probe_self_test(routes: dict[str, set]) -> None:
+    """``probe`` splits "no route" (a return) from "the check broke" (a raise)."""
+    import os
+    import stat
+    import tempfile
+
+    def fake_rocm(directory: str, body: str) -> str:
+        path = os.path.join(directory, "rocm")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"#!{sys.executable}\n{body}\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        return path
+
+    plan = "print('  selected_rocm_version: {}')"
+    with tempfile.TemporaryDirectory() as directory:
+        ok = fake_rocm(directory, plan.format("10.1.0"))
+        assert probe(ok, "nightly", "gfx942", routes) is None
+        gap = fake_rocm(directory, plan.format("10.3.0a20261101"))
+        found = probe(gap, "nightly", "gfx942", routes)
+        assert found and "refuses" in found, found
+        broken_runs = (
+            ("import sys; sys.exit(3)", 300),
+            (plan.format("10.1.0") + "; import sys; sys.exit(3)", 300),
+            ("print('no version here')", 300),
+            (plan.format("nightly"), 300),
+            ("import time; time.sleep(30)", 1),
+        )
+        global DRY_RUN_TIMEOUT_SECS
+        saved = DRY_RUN_TIMEOUT_SECS
+        try:
+            for body, timeout in broken_runs:
+                DRY_RUN_TIMEOUT_SECS = timeout
+                broken = fake_rocm(directory, body)
+                try:
+                    probe(broken, "nightly", "gfx942", routes)
+                except CheckError:
+                    pass
+                else:
+                    raise AssertionError(f"a broken dry run must raise: {body}")
+        finally:
+            DRY_RUN_TIMEOUT_SECS = saved
+        try:
+            probe(os.path.join(directory, "missing"), "nightly", "gfx942", routes)
+        except CheckError:
+            pass
+        else:
+            raise AssertionError("a missing rocm must raise, not crash")
 
 
 def self_test() -> None:
@@ -177,6 +246,7 @@ def self_test() -> None:
     plan = "sdk install\n  channel: nightly\n  selected_rocm_version: 10.3.0a20261101\n"
     assert selected_version(plan) == "10.3.0a20261101"
     assert selected_version("sdk install\n") is None
+    probe_self_test(routes)
     print("vllm route check self-test: ok")
 
 
@@ -194,16 +264,19 @@ def main() -> int:
         return 0
     if not args.rocm:
         parser.error("--rocm is required unless --self-test is given")
-    routes = read_routes(
-        args.discover_file.read_text(encoding="utf-8"),
-        args.static_file.read_text(encoding="utf-8"),
-    )
+    try:
+        routes = read_routes(
+            args.discover_file.read_text(encoding="utf-8"),
+            args.static_file.read_text(encoding="utf-8"),
+        )
+    except (OSError, UnicodeDecodeError) as error:
+        raise CheckError(f"cannot read the engine's build tables: {error}") from error
     failures = []
     for channel in args.channels or CHANNELS:
         for family in args.families or FAMILIES:
             failure = probe(args.rocm, channel, family, routes)
             if failure:
-                print(f"::error::{failure}")
+                print(f"::warning::{failure}")
                 failures.append(failure)
     return 1 if failures else 0
 
