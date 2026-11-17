@@ -736,7 +736,7 @@ Feature: GPU detection and system inspection
   # `examine` reports the active runtime's channel, package source, source layout
   # and exact GPU target in the same words and from the same manifest fields as
   # the `provenance:` line `rocm runtimes list` prints for it
-  # (`runtime-lifecycle-19`). The planted manifest needs no GPU or download, so
+  # (`runtime-lifecycle-22`). The planted manifest needs no GPU or download, so
   # this runs on the mock lane.
   @id:examine-reports-where-the-active-runtime-came-from
   Scenario: examine-49 - Examining the system says where the active runtime came from

@@ -82,8 +82,9 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
 
 /// The runtime registry under the scenario's isolated data dir — where the CLI
 /// reads `<key>.json` manifests from. One definition, so a layout change cannot
-/// leave the planting and the counting looking in different places.
-fn registry_dir(world: &E2eWorld) -> PathBuf {
+/// leave the planting and the counting looking in different places; the
+/// side-by-side steps read it from here too.
+pub(crate) fn registry_dir(world: &E2eWorld) -> PathBuf {
     world
         .isolated_root
         .as_ref()
@@ -330,6 +331,38 @@ fn ids_listed_under<'a>(report: &'a str, section: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The isolated `config.json`, where the CLI records the active runtime.
+pub(crate) fn config_path(world: &E2eWorld) -> PathBuf {
+    world.app_paths().config_dir.join("config.json")
+}
+
+/// The isolated active-runtime marker (`<data>/runtimes/active.json`) — what
+/// the next serve would actually use.
+pub(crate) fn active_marker_path(world: &E2eWorld) -> PathBuf {
+    world
+        .app_paths()
+        .data_dir
+        .join("runtimes")
+        .join("active.json")
+}
+
+/// A JSON file the CLI writes, parsed, or `None` when there is no such file —
+/// which is how the CLI leaves the config and the marker before anything was
+/// activated, and the marker after the runtime in use was uninstalled. Any
+/// other read failure, and a file that is not JSON, fail the step.
+pub(crate) fn read_json_if_present(path: &Path) -> Option<serde_json::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("failed to read {}: {error}", path.display()),
+    };
+    Some(
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("{} is not valid JSON: {error}\n{text}", path.display())
+        }),
+    )
+}
+
 /// The runtime key recorded in the isolated `config.json`.
 ///
 /// The marker (see [`active_runtime_key`]) cannot be used by the scenario that
@@ -337,45 +370,27 @@ fn ids_listed_under<'a>(report: &'a str, section: &str) -> Vec<&'a str> {
 /// anyway: it is written first, so it is the half that would be left naming the
 /// new runtime if the restore did not run.
 fn config_active_runtime_key(world: &E2eWorld) -> Option<String> {
-    let config_dir = world
-        .isolate_env()
-        .into_iter()
-        .find(|(key, _)| *key == "ROCM_CLI_CONFIG_DIR")
-        .map(|(_, value)| PathBuf::from(value))
-        .expect("isolate_env did not set ROCM_CLI_CONFIG_DIR");
-    let config = config_dir.join("config.json");
-    let text = std::fs::read_to_string(&config)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", config.display()));
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", config.display()));
-    value
+    let config = config_path(world);
+    read_json_if_present(&config)
+        .unwrap_or_else(|| panic!("failed to read {}: it does not exist", config.display()))
         .get("active_runtime_key")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
 
-/// The runtime key recorded in the isolated active-runtime marker
-/// (`<data>/runtimes/active.json`) — what the next serve would actually use.
+/// The runtime key recorded in the isolated active-runtime marker.
 ///
 /// Parsed as JSON rather than substring-matched on the file: once a second
 /// runtime has been activated the marker also carries `previous_runtime_key`,
 /// so a `contains` check would be satisfied by either key and could not tell a
 /// refused switch from a completed one.
 fn active_runtime_key(world: &E2eWorld) -> String {
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let marker = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("active.json");
-    let text = std::fs::read_to_string(&marker)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", marker.display()));
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", marker.display()));
-    value
+    let marker = active_marker_path(world);
+    read_json_if_present(&marker)
+        .unwrap_or_else(|| panic!("failed to read {}: it does not exist", marker.display()))
         .get("runtime_key")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| panic!("no runtime_key in {}:\n{text}", marker.display()))
+        .unwrap_or_else(|| panic!("no runtime_key in {}", marker.display()))
         .to_owned()
 }
 
@@ -505,12 +520,7 @@ async fn two_runtimes_and_service_without_runtime(world: &mut E2eWorld) {
 /// written normally.
 #[given("the active runtime marker cannot be written")]
 async fn marker_cannot_be_written(world: &mut E2eWorld) {
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let marker = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("active.json");
+    let marker = active_marker_path(world);
     std::fs::remove_file(&marker)
         .unwrap_or_else(|error| panic!("failed to remove {}: {error}", marker.display()));
     std::fs::create_dir_all(&marker)

@@ -18,9 +18,13 @@
 //! also holds `paths_equivalent` and `normalize_path_for_compare`, which adopt
 //! and uninstall both need, and the on-disk active-runtime marker
 //! (`ActiveRuntimeMarker`, `active_runtime_marker_path`,
-//! `active_runtime_marker_matches`) that activation writes and uninstall reads
-//! and clears. The serde shape of [`InstalledRuntimeManifest`] and its probe
-//! structs is the on-disk contract of the registry files and of each install's
+//! `active_runtime_marker_matches`, `write_active_runtime_marker`,
+//! `forget_active_runtime_rollback_target`) that activation and rollback write,
+//! and that uninstall reads, removes when it names the removed runtime as the
+//! one in use, and otherwise rewrites to drop that runtime as its rollback
+//! target; `runtimes_cmd.rs`'s module doc lists every writer and remover. The
+//! serde shape of [`InstalledRuntimeManifest`] and its probe structs is the
+//! on-disk contract of the registry files and of each install's
 //! `.rocm-cli-runtime.json`; the marker is user state too, and its serde shape
 //! is as fixed.
 
@@ -868,6 +872,81 @@ pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("runtimes").join("active.json")
 }
 
+/// Replace the active-runtime marker in one step.
+///
+/// Two `rocm` processes can activate a runtime against the same data
+/// directory at once (two terminals, a script), so the write goes through the
+/// shared atomic writer: each writer stages into its own exclusively created
+/// temp file, and the marker is replaced rather than removed first, so a
+/// reader always finds a complete marker: on Windows the publish renames first,
+/// which replaces in one step. Only when that rename fails, because another
+/// process holds the marker open without delete sharing, does it fall back to
+/// `ReplaceFileW`, and a `ReplaceFileW` that fails part-way can leave the marker
+/// missing, which the writer repairs with a plain rename when that succeeds
+/// (see `rocm_core::atomic_write`); two replacements in flight at once through
+/// the fallback are not tested. It does not order the two activations: whichever
+/// publishes last wins.
+pub(crate) fn write_active_runtime_marker(
+    paths: &AppPaths,
+    marker: ActiveRuntimeMarker,
+) -> Result<()> {
+    let path = active_runtime_marker_path(paths);
+    // The shared helper rather than a local temp-file-and-rename: it is the same
+    // write the failed-activation restore uses, and it is strictly stronger than
+    // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
+    // sharing violation when another process holds the marker open. The helper
+    // renames first there and falls back to `ReplaceFileW` when that fails. The
+    // destination is never removed first, on any platform — that would leave a
+    // window with no marker at all, which runtime resolution and the storage
+    // retention holds both read as "nothing is active" — and a failed publish
+    // takes its temp file with it, so a retried activation cannot strand one in
+    // the folder `rocm runtimes` reads. The one exception is a Windows publish
+    // that took the old marker away and could not put the new one in place:
+    // the temp file is then the only copy, so it is kept and the error names
+    // it; a failed activation removes it again once the restore has put the
+    // previous marker back (`runtimes_cmd::discard_failed_marker_replacement`).
+    // It also creates the `runtimes` folder when it is missing.
+    let bytes =
+        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
+    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write active runtime marker {}", path.display()))
+}
+
+/// Drops `runtime_key` from the active-runtime marker's rollback target, keeping
+/// every other field, and returns whether the marker changed.
+///
+/// The read-modify-write of the marker for a removed runtime: no marker
+/// (nothing, or something other than a file, at its path), one with no rollback
+/// target, and one whose rollback target is another runtime are all left alone:
+/// it returns `false` and writes nothing. The write is
+/// [`write_active_runtime_marker`], the one activation uses.
+pub(crate) fn forget_active_runtime_rollback_target(
+    paths: &AppPaths,
+    runtime_key: &str,
+) -> Result<bool> {
+    let marker_path = active_runtime_marker_path(paths);
+    // As in `active_runtime_marker_matches`: anything but a file there is no
+    // marker, so there is no rollback target to drop.
+    if !marker_path.is_file() {
+        return Ok(false);
+    }
+    let bytes = fs::read(&marker_path)
+        .with_context(|| format!("failed to read {}", marker_path.display()))?;
+    let mut marker: ActiveRuntimeMarker = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", marker_path.display()))?;
+    if !marker
+        .previous_runtime_key
+        .as_deref()
+        .is_some_and(|previous| previous.eq_ignore_ascii_case(runtime_key))
+    {
+        return Ok(false);
+    }
+    marker.previous_runtime_key = None;
+    marker.previous_runtime_id = None;
+    write_active_runtime_marker(paths, marker)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,7 +1013,7 @@ mod tests {
     /// source. In-crate code — the producer, the reader and the other unit
     /// tests — uses the constant, so it cannot notice the value changing. Two
     /// checks pin the on-disk literal instead: this test, and scenario
-    /// `runtime-lifecycle-19`, whose `plant_adopted_runtime` step writes the
+    /// `runtime-lifecycle-22`, whose `plant_adopted_runtime` step writes the
     /// literal into a manifest and expects it listed as `source=unrecorded`.
     #[test]
     fn adoption_marker_keeps_its_persisted_value() {
@@ -1886,5 +1965,91 @@ mod tests {
             format!("install root is missing: {}", install_root.display())
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    fn marker_with_previous(previous_key: &str) -> ActiveRuntimeMarker {
+        ActiveRuntimeMarker {
+            runtime_id: "therock-nightly:gfx1151".to_owned(),
+            runtime_key: "nightly-pip-gfx1151-7-14-0a1".to_owned(),
+            manifest_path: PathBuf::from("registry/nightly-pip-gfx1151-7-14-0a1.json"),
+            install_root: PathBuf::from("wheel/nightly-pip-gfx1151-7-14-0a1"),
+            previous_runtime_id: Some("therock-release:gfx1151".to_owned()),
+            previous_runtime_key: Some(previous_key.to_owned()),
+            activated_at_unix_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// A rollback target that names another runtime is not this uninstall's to
+    /// drop: the marker is left byte for byte as it was.
+    #[test]
+    fn forgetting_a_rollback_target_leaves_a_marker_naming_another_runtime_untouched() -> Result<()>
+    {
+        let (root, paths) = test_paths("forget-rollback-other-runtime");
+        write_active_runtime_marker(&paths, marker_with_previous("release-pip-gfx1151-7-13-0"))?;
+        let before = fs::read(active_runtime_marker_path(&paths))?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "release-pip-gfx1151-7-12-0")?;
+
+        assert!(!changed);
+        assert_eq!(fs::read(active_runtime_marker_path(&paths))?, before);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A marker with no rollback target has nothing to drop: it is left byte
+    /// for byte as it was.
+    #[test]
+    fn forgetting_a_rollback_target_leaves_a_marker_without_one_untouched() -> Result<()> {
+        let (root, paths) = test_paths("forget-rollback-none");
+        let mut marker = marker_with_previous("release-pip-gfx1151-7-13-0");
+        marker.previous_runtime_id = None;
+        marker.previous_runtime_key = None;
+        write_active_runtime_marker(&paths, marker)?;
+        let before = fs::read(active_runtime_marker_path(&paths))?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "release-pip-gfx1151-7-13-0")?;
+
+        assert!(!changed);
+        assert_eq!(fs::read(active_runtime_marker_path(&paths))?, before);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Runtime keys compare without regard to case everywhere else in the
+    /// registry, so a case variant of the rollback target is the same runtime.
+    #[test]
+    fn forgetting_a_rollback_target_matches_its_key_without_regard_to_case() -> Result<()> {
+        let (root, paths) = test_paths("forget-rollback-case");
+        write_active_runtime_marker(&paths, marker_with_previous("release-pip-gfx1151-7-13-0"))?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "RELEASE-PIP-GFX1151-7-13-0")?;
+
+        assert!(changed);
+        let after: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        assert_eq!(after.previous_runtime_key, None);
+        assert_eq!(after.previous_runtime_id, None);
+        let in_use = "nightly-pip-gfx1151-7-14-0a1";
+        assert_eq!(after.runtime_key, in_use);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// With no marker there is no rollback target to drop, and that is not an
+    /// error: uninstalling a runtime that was never activated must succeed. It
+    /// leaves the data folder as it found it: no marker, and not even the
+    /// `runtimes` folder the marker writer would create.
+    #[test]
+    fn forgetting_a_rollback_target_without_a_marker_changes_nothing() -> Result<()> {
+        let (root, paths) = test_paths("forget-rollback-no-marker");
+        fs::create_dir_all(&paths.data_dir)?;
+
+        let changed = forget_active_runtime_rollback_target(&paths, "release-pip-gfx1151-7-13-0")?;
+
+        assert!(!changed);
+        assert!(!active_runtime_marker_path(&paths).exists());
+        assert_eq!(fs::read_dir(&paths.data_dir)?.count(), 0);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 }

@@ -1029,14 +1029,18 @@ Expected result:
 - After a successful removal, `rocm services list --all` no longer lists the
   record, `rocm services logs <service-id>` fails, and all of
   `<data>/services/<service-id>.json`, `<data>/services/<service-id>.log`,
-  `<data>/engines/<engine>/state/<service-id>.json` and any
-  `<data>/services/<service-id>.endpoint-key` are gone.
+  `<data>/engines/<engine>/state/<service-id>.json`, any
+  `<data>/services/<service-id>.endpoint-key`, and any
+  `<data>/services/<service-id>.endpoint-key.tmp-<pid>-<millis>-<n>` (a copy
+  of the key an interrupted save left behind) are gone; the summary's
+  `files removed:` count includes that copy.
 - `<data>/services/launch.lock` is untouched — it is shared by every launch.
 - `rocm services prune --dry-run` prints the plan and removes nothing. (It still
   refreshes each record against the real processes, so a record whose server has
   since died can have its status corrected on disk; nothing is deleted.)
 - `rocm services prune` leaves running servers alone and says how many it
-  skipped, and also removes leftover engine state files whose record is gone.
+  skipped, and also removes leftover engine state files, logs, endpoint keys
+  and interrupted-save key copies whose record is gone.
 - With no age argument, a record written in the last 24 hours is left alone, and
   the output both counts it ("too recent, kept: 1") and names the flag to
   include it: `rocm services prune --any-age --yes`.
@@ -1078,23 +1082,19 @@ Expected result:
 - A prompt appears naming the serving model and warning that it may
   still be running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
-  placeholder) to stop it first. From the dashboard (not the launcher) on
-  Windows, where the dashboard streams live GPU/CPU/memory but never gets a
-  serving-instance snapshot (no `rocmdashd` unix socket there), the prompt
-  still shows that same stop command and the service id, but not the
-  model's name — the dashboard's own live view is where the name comes
-  from, and it never fills there. The launcher's own copy of the prompt
-  always names the model, Windows included — it reads the managed-service
-  registry directly rather than through the dashboard's daemon connection.
+  placeholder) to stop it first. On Windows the dashboard has no
+  `rocmdashd` unix socket, so it reads the same managed-service registry the
+  launcher does: the prompt names the model there too. Within the first
+  second after `rocm serve` registers a service, before the dashboard's next
+  registry read, it may show the stop command and id without the model's name.
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
-  approval+job flow. The offer appears once the dashboard lists the service as
-  managed; for a service started a moment earlier it is absent and the printed
-  stop command is the way to stop it. The launcher's copy of the prompt does not show this
-  hint or respond to `s` — it has no live Services overlay to jump to — and
-  neither does the dashboard on Windows, for the same reason the model's name
-  is missing there.
+  approval+job flow, on Windows too. The offer appears once the dashboard
+  lists the service as managed; for a service started a moment earlier it is
+  absent and the printed stop command is the way to stop it. The launcher's
+  copy of the prompt does not show this hint or respond to `s` — it has no
+  live Services overlay to jump to.
 - Declining (`n`/Esc) returns to where you were — the dashboard, or the
   launcher's own front door, whichever you pressed `q` from. Any plain modal
   that was open when you pressed `q` (the Esc menu, Options, Detail, Theme
@@ -1122,6 +1122,35 @@ Expected result:
   decision — once inside the dashboard, once more at the launcher, with the
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
+
+#### Endpoint key permissions
+
+A server's API key file must be readable by the user who started it and nobody
+else. On Linux, serve with a key and check the file's mode:
+
+```bash
+rocm serve <model> --managed --require-api-key
+stat -c '%a %U' <data>/services/<service-id>.endpoint-key
+```
+
+Expected result: `600` and your user name.
+
+On native Windows a key-protected `rocm serve` has no engine that can run
+behind it: Lemonade refuses a key-protected bind there, vLLM does not run
+natively, and `--engine aim` stores the key but its server then cannot
+start, because rocm-cli supports AIM GPU passthrough only on Linux and WSL and
+AIM serves only on a GPU. (What happens to that service's key file when the
+launch fails has not been verified on a Windows host.) Check instead
+`rocm remote serve <machine> <model>`, which stores its session key with the
+same owner-only file. From PowerShell, after it reports the endpoint:
+
+```powershell
+icacls <data>\remote-sessions\<session-id>.endpoint-key
+```
+
+Expected result: exactly one entry, for your own account, with `(F)` and no
+`(I)` (inherited) flag — no `Administrators`, `SYSTEM`, `Users` or
+`Authenticated Users` entry, even when `<data>` is a folder those can read.
 
 ### 4a. Dashboard Doctor Report
 
@@ -1189,8 +1218,14 @@ Expected result:
   present. With more than one adapter (for example a hybrid laptop) VRAM
   total stays unmeasured and shows `—` in the Home hero and in the GPU wall
   sidebar, never `0.0%`.
-- The hero's `T/S` row reads `—`, never `0` or `-0`: Windows has no
-  serving-instance view, so no throughput is ever measured there.
+- The hero's `T/S` row reads `—`, never `0` or `-0`: a managed server is
+  listed with no throughput telemetry behind it, so no rate is ever measured
+  there.
+- With a managed server running (`rocm serve`, then `rocm services list`
+  showing it `ready`), the Home tab's `Running` count, the Serving tab's
+  `Running now` list and the Observe tab list that server within a few seconds
+  of `rocm dash` opening, not "Nothing running". After `rocm services stop`
+  it drops off within a few seconds. Its throughput stays unmeasured.
 - Utilization rises under GPU load (run a Lemonade or ComfyUI job) and falls
   back when it ends.
 - Hiding `amdadlx64.dll` (for example on a non-AMD GPU host) leaves
@@ -1413,6 +1448,32 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
 - Re-running `rocm serve` against an already-running service prints the
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
+
+### 6c. The tensorizer upgrade on Python 3.14
+
+Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only
+published vLLM build for that line). On a fresh runtime:
+
+```bash
+rocm install sdk --channel release --version 10.1.0 --yes
+rocm engines install vllm --runtime-id <that runtime>
+```
+
+The install output carries a warning that vLLM's pinned tensorizer cannot be
+imported and was upgraded, then `dependency_check: expected_divergence` with a
+`note:` naming the tensorizer release the runtime holds and `action: none`, not
+`dependency_check: violated`. Confirm with
+`<runtime>/bin/python -c "import tensorizer.serialization"`, which must import
+cleanly. Run the install a second time: no upgrade warning, the same
+`expected_divergence` block, and vLLM is not reinstalled. `rocm serve` must then
+get past engine start-up (it no longer fails with
+`KeyError: 'crypto_stream_salsa20_NONCEBYTES'`).
+
+On some GPU families `rocm install sdk` installs vLLM itself
+(`maybe_auto_install_sdk_preferred_engine`), so the same upgrade warning and the
+`expected_divergence` block appear at the end of that command, a step earlier;
+the `rocm engines install vllm` that follows then shows the block without the
+warning, and nothing more needs doing.
 
 ## 7. ComfyUI Verification
 
@@ -1802,6 +1863,9 @@ Then, in an empty directory, hand it over in each shell you have:
   `rocm diagnose --symptom-file error.txt`.
 - Any shell, nothing piped in: `rocm diagnose --symptom-file -`, paste at the
   prompt, and end the input as the hint printed on the first line says.
+- A file named `-`: save the paste as `-` and run
+  `rocm diagnose --symptom-file ./-`. It reports the same causes; a bare `-`
+  would read standard input instead.
 
 Expected result:
 
@@ -1843,3 +1907,45 @@ HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --json
 
 The e2e scenarios `diagnose-62`, `diagnose-63` and `diagnose-64` run these three
 checks on every lane.
+
+## 15. Dashboard Chat With A Small-Context Local Model
+
+Needs a local OpenAI-compatible endpoint serving a model with a small context
+— llama.cpp's default `n_ctx` is 32768, which is the case this checks. The
+point is that an answer survives a tool call that returns a lot of text.
+
+```bash
+rocm dash
+```
+
+In the Chat tab, ask `which LLMs can this machine support`, which is the
+question that makes the model call `rocm_command` with `["model"]`.
+
+Expected result:
+
+- A written answer listing recommended models. Not
+  `chat request failed: ... 400 Bad Request`, and not a raw JSON error body.
+- The same question asked of `rocm mcp-call` returns the curated list, and the
+  per-recipe diagnostics only when asked for:
+
+  ```bash
+  echo '{"args":["model"]}' > args.json
+  rocm mcp-call rocm_command --arguments-file args.json | wc -c
+  echo '{"args":["model","--verbose"]}' > args.json
+  rocm mcp-call rocm_command --arguments-file args.json | wc -c
+  ```
+
+  The first is a few kilobytes and matches what `rocm model` prints in a
+  terminal; the second is far larger.
+
+- To see the truncation path, ask something that makes the model read a long
+  service log (`rocm_command` with `["logs"]` on a host with a lot of history).
+  The model's answer should say the output was partial and point at running the
+  command in a terminal — it must not present a cut list as a complete one.
+
+- To see the overflow message, point the Chat tab at a model with a very small
+  context (serve one with `--ctx-size 2048`) and ask the same question. The
+  transcript should read `A ROCm check returned more text than this model can
+  read (N of M tokens). Try a more specific question, or a model with a larger
+  context.` — and `rocm-cli.log` should still carry the provider's own body
+  with `exceed_context_size_error` in it.

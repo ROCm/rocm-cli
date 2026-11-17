@@ -39,7 +39,9 @@ use render::{
 };
 use std::io::Write;
 
-pub(crate) use catalog::{COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, is_catalog_id};
+pub(crate) use catalog::{
+    COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, RENDER_GROUP_VERIFY, is_catalog_id,
+};
 pub use catalog::{class_on, needs_on};
 pub use manifest::{
     CATALOG_CONTRACT_VERSION, CatalogManifest, ManifestEntry, ManifestPlatform, catalog_manifest,

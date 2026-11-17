@@ -40,6 +40,7 @@ pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
+pub mod owner_only_file;
 mod package_plan;
 pub mod paths;
 pub mod placeholder;
@@ -61,6 +62,7 @@ pub mod user_path;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod foreign_temp_probe;
+pub mod tensorizer_override;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
@@ -120,9 +122,10 @@ pub use download::{
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
-    engine_state_inference_verified, managed_service_endpoint_model_ready,
+    JSON_STATE_LOCK_FILE_NAME, JsonStateFileRefused, JsonStateRefusal,
+    engine_state_inference_verified, json_state_lock_path, managed_service_endpoint_model_ready,
     managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model,
+    openai_chat_completion_status, openai_models_endpoint_has_model, write_json_state_file,
 };
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
@@ -158,9 +161,11 @@ pub use log_tail::{
     tail_log_decoded,
 };
 pub use managed_runtime::{
-    FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
-    active_managed_therock_channel, active_managed_therock_environment,
-    active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
+    FrameworkInterpreter, ManagedRuntimeEnvironment, RUNTIME_COMPAT_DIR_NAME,
+    active_managed_framework_interpreter, active_managed_therock_channel,
+    active_managed_therock_environment, active_managed_therock_version, amd_smi_link_missing,
+    detect_managed_therock_family, ensure_amd_smi_compat, prepend_runtime_paths,
+    remove_stale_numa_shim, runtime_loader_path_entries, runtime_loader_path_entries_read_only,
 };
 use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
@@ -242,6 +247,9 @@ pub use service_record::{
     engine_stop_decides_confirmation,
 };
 pub use sigpipe::with_sigpipe_ignored;
+pub use tensorizer_override::{
+    TENSORIZER_PYTHON314_FIX, tensorizer_override_requirement, vllm_tensorizer_override_installed,
+};
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,

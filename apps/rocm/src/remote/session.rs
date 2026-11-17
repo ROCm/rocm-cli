@@ -232,7 +232,8 @@ impl std::error::Error for NameAlreadyHeld {}
 /// key on its way out — leaving the holder serving a published tailnet endpoint
 /// that nobody, including its owner, can call.
 ///
-/// `create_new` is what closes it: `O_EXCL` on unix, `CREATE_NEW` on Windows,
+/// `create_new` is what closes it: `O_EXCL` on unix, `CREATE_NEW` on Windows
+/// (both through [`rocm_core::owner_only_file::open_new_owner_only`]),
 /// and on both the existence check and the creation are one indivisible step. It
 /// is the same discipline [`super::publish`] applies to a port — establish
 /// ownership before writing, never after — with the difference that here the
@@ -247,17 +248,10 @@ pub(crate) fn store_key(paths: &AppPaths, session_id: &str, key: &str) -> Result
         .with_context(|| format!("failed to create {}", directory.display()))?;
     let path = key_path(paths, session_id);
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    // 0600 at creation, not tightened afterwards: a credential must never exist,
-    // even briefly, at whatever the umask would have given it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-
-    let mut file = match options.open(&path) {
+    // Owner-only at creation, not tightened afterwards: a credential must never
+    // exist, even briefly, at whatever the umask or the directory's ACL would
+    // have given it. 0600 on Unix, a protected owner-only DACL on Windows.
+    let mut file = match rocm_core::owner_only_file::open_new_owner_only(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(anyhow::Error::new(NameAlreadyHeld { path }));
@@ -593,6 +587,14 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "a credential must be owner-only");
         }
+        // On Windows: a protected DACL granting only this user, not whatever
+        // the data directory would have handed down.
+        #[cfg(windows)]
+        assert_eq!(
+            rocm_core::owner_only_file::owner_only_dacl_mismatch(&path).expect("read the DACL"),
+            None,
+            "a credential must be owner-only"
+        );
 
         clear_key(&paths, "remote-gpu-box-11434");
         assert!(!path.exists());
