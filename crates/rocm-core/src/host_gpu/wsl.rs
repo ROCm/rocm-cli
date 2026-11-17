@@ -193,7 +193,7 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 /// Deliberately not routed through [`host_path`]: these are programs this
 /// process executes, not files it reads to describe the machine, and a
 /// simulated host root holds no working linker to run.
-pub(crate) fn ldconfig_cache() -> Option<String> {
+pub fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
         if let Some(text) = capture_optional_command(program, &["-p"]) {
             return Some(text);

@@ -1718,6 +1718,450 @@ jobs:
         }
     }
 
+    #[test]
+    fn only_e2e_gpu_may_carry_the_stale_gate_on_its_preflight() {
+        let workflow = |job: &str| {
+            format!(
+                "jobs:\n  {job}:\n    steps:\n      - name: GPU preflight (x)\n        {STALE_RUN_GATE}\n        run: |\n          bash p.sh\n"
+            )
+        };
+        let stripped = gpu_preflight_steps(&workflow("e2e-gpu"));
+        assert_eq!(stripped.len(), 1);
+        assert!(
+            !stripped[0].contains(STALE_RUN_GATE),
+            "e2e-gpu's gate is removed so the shape checks see a bare delegation"
+        );
+        for job in ["e2e-gpu-nightly", "e2e-wsl", "e2e-gpu-strix-ubuntu"] {
+            let kept = gpu_preflight_steps(&workflow(job));
+            assert!(
+                kept[0].contains(STALE_RUN_GATE),
+                "`{job}`'s preflight keeps an `if:`, so the shape checks still reject it"
+            );
+        }
+    }
+
+    #[test]
+    fn mi300x_lane_skips_itself_when_its_run_is_stale() {
+        // A queued MI300X job for a superseded head or a closed PR otherwise
+        // costs ~45 min of runner time once it starts, and `gh run cancel` from
+        // outside does not always take it off the queue. The job-level `if`
+        // cannot see staleness (evaluated before queueing), so the first step
+        // records it and every later step is gated on that output; the cancel
+        // itself is `cancel-stale-run`'s (pinned in the test below).
+        let text = read_workflow("e2e-selfhosted.yml");
+        let block = job_block(&text, "e2e-gpu");
+
+        assert_eq!(
+            permission_mapping(block, "    permissions:"),
+            BTreeMap::from([
+                ("contents".to_owned(), "read".to_owned()),
+                ("pull-requests".to_owned(), "read".to_owned()),
+            ]),
+            "e2e-gpu runs PR code on a persistent runner: it holds read scopes only, \
+             and the write-scoped cancel lives in `cancel-stale-run`"
+        );
+        assert_eq!(
+            nested_block(block, "    outputs:")
+                .lines()
+                .skip(1)
+                .map(str::trim)
+                .filter(|l| !l.starts_with('#') && !l.is_empty())
+                .collect::<Vec<_>>(),
+            ["stale: ${{ steps.stale.outputs.stale }}"],
+            "e2e-gpu must publish exactly the guard's `stale` output for `e2e-report`"
+        );
+
+        let steps = job_steps(block).expect("e2e-gpu has steps");
+        let names: Vec<&str> = steps.iter().map(|(n, _)| n.as_str()).collect();
+        for required in [
+            "Reclaim GPU from stray E2E processes",
+            "Run E2E tests on GPU hardware",
+            "Upload E2E report (current)",
+            "Upload E2E report (n-1)",
+            "Upload E2E report (n-2)",
+        ] {
+            assert!(
+                names.contains(&required),
+                "e2e-gpu lost its `{required}` step: {names:?}"
+            );
+        }
+        let (_, guard) = &steps[0];
+        assert_eq!(
+            step_key(guard, "id"),
+            "stale",
+            "the first e2e-gpu step is the stale-run guard"
+        );
+        assert_eq!(
+            step_key(guard, "if"),
+            "github.event_name == 'pull_request'",
+            "the guard runs on pull_request only"
+        );
+        assert_eq!(
+            step_env(guard),
+            BTreeMap::from([
+                ("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned()),
+                ("GH_REPO".to_owned(), "${{ github.repository }}".to_owned()),
+                (
+                    "PR_NUMBER".to_owned(),
+                    "${{ github.event.pull_request.number }}".to_owned()
+                ),
+                // The event's head, not the merge ref (`github.sha`), which would
+                // read as stale on every run.
+                (
+                    "EVENT_HEAD_SHA".to_owned(),
+                    "${{ github.event.pull_request.head.sha }}".to_owned()
+                ),
+            ]),
+            "the guard's environment is pinned exactly"
+        );
+
+        // Every later step carries exactly the gate, uploads ANDed with their
+        // existing condition. Exact comparison, not `contains`: `... && false`
+        // or `always() || ...` would still contain the gate.
+        for (name, step) in &steps[1..] {
+            let cond = step_key(step, "if");
+            let ok = if name.starts_with("Upload E2E report (") {
+                let leg = name
+                    .strip_prefix("Upload E2E report (")
+                    .and_then(|n| n.strip_suffix(')'))
+                    .unwrap();
+                cond == format!(
+                    "always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == '{leg}'"
+                )
+            } else {
+                cond == STALE_RUN_GATE.strip_prefix("if: ").unwrap()
+            };
+            assert!(
+                ok,
+                "e2e-gpu step `{name}` must carry exactly the stale gate in its `if:` \
+                 (found `{cond}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_runs_are_cancelled_by_a_hosted_job_that_runs_no_pr_code() {
+        // `actions: write` can dispatch workflows. It must never share a job
+        // with PR code on the persistent MI300X runner (where a write scope
+        // would sit next to untrusted dependency code), so the cancel
+        // is its own job: hosted, no checkout, same-repo PRs only.
+        let text = read_workflow("e2e-selfhosted.yml");
+        let block = job_block(&text, "cancel-stale-run");
+        assert_eq!(
+            permission_mapping(block, "    permissions:"),
+            BTreeMap::from([("actions".to_owned(), "write".to_owned())]),
+            "the cancel job holds exactly `actions: write`"
+        );
+        assert_eq!(
+            job_scalar(block, "runs-on"),
+            "ubuntu-24.04",
+            "hosted, never self-hosted"
+        );
+        assert_eq!(job_scalar(block, "needs"), "[e2e-gpu]");
+        assert_eq!(job_scalar(block, "timeout-minutes"), "5");
+        let cond = normalized_whitespace(
+            &block
+                .lines()
+                .skip_while(|l| l.trim() != "if: >-")
+                .skip(1)
+                .take_while(|l| indent_of(l) > indent_of("    if: >-"))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        assert_eq!(
+            cond,
+            "always() && github.event_name == 'pull_request' && \
+             github.event.pull_request.head.repo.full_name == github.repository && \
+             needs.e2e-gpu.outputs.stale == 'true'",
+            "only a same-repo pull_request whose e2e-gpu found it stale is cancelled"
+        );
+        let steps = job_steps(block).expect("the cancel job has steps");
+        assert_eq!(
+            steps.len(),
+            1,
+            "one step: the cancel, no checkout or action"
+        );
+        assert!(
+            !steps[0].1.contains("uses:"),
+            "the write-scoped job runs no third-party action"
+        );
+        assert_eq!(
+            step_env(&steps[0].1),
+            BTreeMap::from([
+                ("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned()),
+                ("GH_REPO".to_owned(), "${{ github.repository }}".to_owned()),
+            ]),
+            "the cancel step's environment is pinned exactly"
+        );
+        // The step is exactly one command, so nothing else (a clone, a script
+        // from the PR) can ride along in the job that holds `actions: write`.
+        let script = run_script(&steps[0].1).expect("run block");
+        let script: Vec<&str> = script
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            script,
+            [
+                "gh run cancel \"$GITHUB_RUN_ID\" || echo \"::warning::could not cancel run ${GITHUB_RUN_ID}; its other lanes keep running\""
+            ],
+            "the cancel step is one command and tolerates a failed cancel"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_cancel_step_cancels_this_run_and_survives_a_refusal() {
+        let text = read_workflow("e2e-selfhosted.yml");
+        let steps = job_steps(job_block(&text, "cancel-stale-run")).expect("steps");
+        let step = &steps[0].1;
+        for (refuses, expect_warning) in [(false, false), (true, true)] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let script = dir.path().join("cancel.sh");
+            let calls = dir.path().join("calls");
+            std::fs::write(
+                &script,
+                dedent(&run_block(step).expect("run block")).expect("non-empty"),
+            )
+            .expect("write script");
+            let stub = "#!/bin/sh\n\
+[ -n \"$GH_TOKEN\" ] && [ \"$GH_REPO\" = owner/repo ] || exit 1\n\
+echo \"$*\" >> \"$STUB_CALLS\"\n\
+[ -z \"$STUB_REFUSES\" ]\n";
+            rocm_core::fake_executable::write_fake_executable(&dir.path().join("gh"), stub)
+                .expect("plant gh stub");
+            let path = format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let mut cmd = std::process::Command::new("/bin/bash");
+            cmd.arg("-e")
+                .arg(&script)
+                .env("PATH", path)
+                .env("GITHUB_RUN_ID", "42")
+                .env("STUB_CALLS", &calls);
+            for key in step_env(step).keys() {
+                cmd.env(
+                    key,
+                    if key == "GH_REPO" {
+                        "owner/repo"
+                    } else {
+                        "token"
+                    },
+                );
+            }
+            if refuses {
+                cmd.env("STUB_REFUSES", "1");
+            }
+            let out = cmd.output().expect("running the cancel step");
+            let log = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(
+                out.status.success(),
+                "a refused cancel must not fail the job: {log}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap_or_default().trim(),
+                "run cancel 42"
+            );
+            assert_eq!(
+                log.contains("::warning::could not cancel run 42"),
+                expect_warning
+            );
+        }
+    }
+
+    /// How the stub `gh` answers the guard's PR lookup.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum PrRead {
+        /// The PR with this state and head sha.
+        Pr(&'static str, &'static str),
+        /// `gh api` exits non-zero.
+        Fails,
+        /// `gh api` exits 0 and prints nothing.
+        Empty,
+        /// `gh api` exits 0 on a PR whose state and head are both null.
+        Nulls,
+        /// The PR has a state but a null head sha.
+        NoHead,
+        /// The PR has a null state but a head sha.
+        NoState,
+        /// There is no `gh` on the PATH at all.
+        NoGh,
+    }
+
+    /// Run the stale-run guard's script under `bash -e` with a stub `gh`, as a
+    /// `run:` step does; returns (exit code, `$GITHUB_OUTPUT`, log, summary).
+    ///
+    /// The child's environment is built from the step's own `env:` keys, so a
+    /// key deleted from the workflow is missing here too. The stub rejects any
+    /// endpoint but `repos/owner/repo/pulls/7`, any call without a token, and
+    /// any `gh` subcommand but `api`: the guard has no business cancelling.
+    #[cfg(unix)]
+    fn run_stale_guard(read: PrRead) -> (i32, String, String, String) {
+        let text = read_workflow("e2e-selfhosted.yml");
+        let steps = job_steps(job_block(&text, "e2e-gpu")).expect("e2e-gpu has steps");
+        let guard = &steps[0].1;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = dir.path().join("guard.sh");
+        let output = dir.path().join("output");
+        let summary = dir.path().join("summary.md");
+        std::fs::write(
+            &script,
+            dedent(&run_block(guard).expect("the guard has a `run: |` block"))
+                .expect("the guard script is not empty"),
+        )
+        .expect("write script");
+        std::fs::write(&output, "").expect("write output");
+        std::fs::write(&summary, "").expect("write summary");
+        // The stub answers `gh api ... --jq EXPR` by running the real `jq` over a
+        // canned PR object, so a wrong field in the guard's query is caught too.
+        let stub = "#!/bin/sh\n\
+[ \"$1\" = api ] || { echo \"unexpected gh $*\" >&2; exit 99; }\n\
+[ -n \"$GH_TOKEN\" ] || exit 1\n\
+[ \"$2\" = repos/owner/repo/pulls/7 ] || exit 1\n\
+case \"$STUB_MODE\" in\n\
+  fails) exit 1 ;;\n\
+  empty) exit 0 ;;\n\
+esac\n\
+while [ $# -gt 0 ]; do [ \"$1\" = --jq ] && q=$2; shift; done\n\
+case \"$STUB_MODE\" in\n\
+  nulls) pr='{\"state\":null,\"head\":{\"sha\":null}}' ;;\n\
+  nohead) pr='{\"state\":\"open\",\"head\":{\"sha\":null}}' ;;\n\
+  nostate) pr='{\"state\":null,\"head\":{\"sha\":\"aaa\"}}' ;;\n\
+  *) pr=$(printf '{\"state\":\"%s\",\"head\":{\"sha\":\"%s\"},\"base\":{\"sha\":\"main-tip\"}}' \"$STUB_STATE\" \"$STUB_HEAD\") ;;\n\
+esac\n\
+printf '%s' \"$pr\" | jq -r \"$q\"\n";
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin dir");
+        if !matches!(read, PrRead::NoGh) {
+            rocm_core::fake_executable::write_fake_executable(&bin.join("gh"), stub)
+                .expect("plant gh stub");
+        }
+        // The stub and `jq` come from the real PATH; the no-`gh` case gets a PATH
+        // holding neither, and `bash` is named by path so the spawn still works.
+        let path = if matches!(read, PrRead::NoGh) {
+            bin.display().to_string()
+        } else {
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            )
+        };
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.arg("-e")
+            .arg(&script)
+            .env("PATH", path)
+            .env("GITHUB_RUN_ID", "42")
+            .env("GITHUB_OUTPUT", &output)
+            .env("GITHUB_STEP_SUMMARY", &summary);
+        for key in step_env(guard).keys() {
+            let value = match key.as_str() {
+                "GH_TOKEN" => "token",
+                "GH_REPO" => "owner/repo",
+                "PR_NUMBER" => "7",
+                "EVENT_HEAD_SHA" => "aaa",
+                other => panic!("unexpected guard env key `{other}`"),
+            };
+            cmd.env(key, value);
+        }
+        match read {
+            PrRead::Pr(state, head) => {
+                cmd.env("STUB_STATE", state).env("STUB_HEAD", head);
+            }
+            PrRead::Fails => {
+                cmd.env("STUB_MODE", "fails");
+            }
+            PrRead::Empty => {
+                cmd.env("STUB_MODE", "empty");
+            }
+            PrRead::Nulls => {
+                cmd.env("STUB_MODE", "nulls");
+            }
+            PrRead::NoHead => {
+                cmd.env("STUB_MODE", "nohead");
+            }
+            PrRead::NoState => {
+                cmd.env("STUB_MODE", "nostate");
+            }
+            PrRead::NoGh => {}
+        }
+        let out = cmd.output().expect("running the guard");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status.code().expect("guard exited with a status code"),
+            std::fs::read_to_string(&output).expect("read output"),
+            log,
+            std::fs::read_to_string(&summary).expect("read summary"),
+        )
+    }
+
+    /// `false` (after a loud note) when `jq` is missing off CI; panics on CI,
+    /// where a skip would read as a pass.
+    #[cfg(unix)]
+    fn jq_available_or_skip(test: &str) -> bool {
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !has_jq {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`jq` is not on PATH, so `{test}` cannot run; install it on this runner"
+            );
+            eprintln!("skipping {test}: no `jq` on PATH");
+        }
+        has_jq
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_guard_flags_a_closed_or_superseded_pr_and_never_fails() {
+        if !jq_available_or_skip("stale_guard_flags_a_closed_or_superseded_pr_and_never_fails") {
+            return;
+        }
+        // Open and current: nothing is flagged.
+        let (code, out, _, summary) = run_stale_guard(PrRead::Pr("open", "aaa"));
+        assert_eq!((code, out.as_str(), summary.as_str()), (0, "", ""));
+        // Closed or merged: flagged, and noted in the step summary.
+        let (code, out, _, summary) = run_stale_guard(PrRead::Pr("closed", "aaa"));
+        assert_eq!((code, out.trim()), (0, "stale=true"));
+        assert!(summary.contains("is closed"), "summary: {summary}");
+        // Head moved on: flagged, naming both heads.
+        let (code, out, log, summary) = run_stale_guard(PrRead::Pr("open", "bbb"));
+        assert_eq!((code, out.trim()), (0, "stale=true"));
+        assert!(
+            log.contains("aaa") && log.contains("bbb") && summary.contains("bbb"),
+            "log: {log}, summary: {summary}"
+        );
+        // No `gh`: said so, and the job runs.
+        let (code, out, log, _) = run_stale_guard(PrRead::NoGh);
+        assert_eq!((code, out.as_str()), (0, ""), "{log}");
+        assert!(log.contains("gh is not installed"), "log: {log}");
+        // The PR cannot be read, or is read with a field missing: fail open, run
+        // the job. The stub rejects every call but `gh api`, so the guard
+        // cancelling anything would fail these.
+        for read in [
+            PrRead::Fails,
+            PrRead::Empty,
+            PrRead::Nulls,
+            PrRead::NoHead,
+            PrRead::NoState,
+        ] {
+            let (code, out, log, _) = run_stale_guard(read);
+            assert_eq!(
+                (code, out.as_str()),
+                (0, ""),
+                "an unreadable PR, or no `gh`, must not flag the run stale: {log}"
+            );
+        }
+    }
+
     /// A job's `steps:` items as `(name, whole step)` pairs, in file order;
     /// `None` when the job has no `steps:` list. `block` is what `job_block`
     /// returns.
@@ -1967,6 +2411,17 @@ jobs:
         results: &[(&str, &str)],
         uploaded: Option<&[&str]>,
     ) -> (i32, String, String) {
+        run_report_check_with_stale(step, results, &[], uploaded)
+    }
+
+    /// As `run_report_check`, with `stale` naming the jobs whose `stale` output is `true`.
+    #[cfg(unix)]
+    fn run_report_check_with_stale(
+        step: &str,
+        results: &[(&str, &str)],
+        stale: &[&str],
+        uploaded: Option<&[&str]>,
+    ) -> (i32, String, String) {
         let dir = tempfile::tempdir().expect("temp dir");
         let script = dir.path().join("check.sh");
         let listing = dir.path().join("artifacts.txt");
@@ -1986,7 +2441,13 @@ jobs:
 
         let needs: serde_json::Map<String, serde_json::Value> = results
             .iter()
-            .map(|(job, result)| ((*job).to_owned(), serde_json::json!({ "result": result })))
+            .map(|(job, result)| {
+                let mut ctx = serde_json::json!({ "result": result });
+                if stale.contains(job) {
+                    ctx["outputs"] = serde_json::json!({ "stale": "true" });
+                }
+                ((*job).to_owned(), ctx)
+            })
             .collect();
         let path = format!(
             "{}:{}",
@@ -2021,22 +2482,42 @@ jobs:
 
     #[test]
     #[cfg(unix)]
+    fn missing_report_check_ignores_a_lane_that_skipped_itself_as_stale() {
+        if !jq_available_or_skip("missing_report_check_ignores_a_lane_that_skipped_itself_as_stale")
+        {
+            return;
+        }
+        let (.., step) = report_check_steps()
+            .into_iter()
+            .find(|(workflow, ..)| *workflow == "e2e-selfhosted.yml")
+            .expect("the per-PR workflow has a report check");
+        let results = [
+            ("e2e-gpu", "success"),
+            ("e2e-gpu-strix-ubuntu", "skipped"),
+            ("e2e-gpu-strix-windows", "skipped"),
+            ("e2e-wsl", "skipped"),
+        ];
+        let (code, ..) = run_report_check_with_stale(&step, &results, &[], Some(&[]));
+        assert_eq!(code, 1, "a lane that ran without a report is still flagged");
+        let (code, log, summary) =
+            run_report_check_with_stale(&step, &results, &["e2e-gpu"], Some(&[]));
+        assert_eq!(
+            code, 0,
+            "a stale-skipped lane is not a missing report: {log}"
+        );
+        assert!(
+            summary.contains("`e2e-gpu` skipped itself as stale"),
+            "the lane's absence from the grid is said in the summary: {summary}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn missing_report_check_flags_only_lanes_that_ran_without_a_report() {
         // The contract test above pins the check's inputs; this runs its logic,
         // so a check that never fails (or always does) cannot pass for one.
-        let has_jq = std::process::Command::new("jq")
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success());
-        if !has_jq {
-            // A skip reads as a pass, so on CI a missing `jq` must fail loudly
-            // rather than leave the check's logic silently untested.
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "`jq` is not on PATH, so the missing-report check's logic cannot be \
-                 exercised; install it on this runner"
-            );
-            eprintln!("skipping: no `jq` on PATH");
+        if !jq_available_or_skip("missing_report_check_flags_only_lanes_that_ran_without_a_report")
+        {
             return;
         }
         let (.., step) = report_check_steps()
@@ -2294,14 +2775,40 @@ jobs:
     /// wrapped into a block scalar (`name: >-`) is found exactly like a one-line
     /// one, and a `- name: GPU preflight` line in a comment or some step's
     /// script is not a step. A job with no `steps:` list contributes nothing.
+    /// Exception: `e2e-gpu`'s preflight comes back without its stale-run gate.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
         job_ids(text)
             .into_iter()
-            .flat_map(|job| job_steps(job_block(text, &job)).unwrap_or_default())
-            .filter(|(name, _)| name.starts_with("GPU preflight"))
-            .map(|(_, step)| step)
+            .flat_map(|job| {
+                job_steps(job_block(text, &job))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |(name, step)| (job.clone(), name, step))
+            })
+            .filter(|(_, name, _)| name.starts_with("GPU preflight"))
+            .map(|(job, _, step)| {
+                // Only `e2e-gpu` carries the stale-run guard, which gates every
+                // later step of that job on one `if:`, the preflight included.
+                // That line is dropped from that one job's preflight so the
+                // shape checks keep pinning it as a bare delegation, while
+                // `mi300x_lane_skips_itself_when_its_run_is_stale` requires the gate
+                // itself on every step of the lane. Any other lane that grows
+                // an `if:` on its preflight still fails those checks.
+                if job != "e2e-gpu" {
+                    return step;
+                }
+                let mut kept = String::new();
+                for line in step.lines().filter(|l| l.trim() != STALE_RUN_GATE) {
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+                kept
+            })
             .collect()
     }
+
+    /// The `if:` line the MI300X lane's stale-run guard puts on its later steps.
+    const STALE_RUN_GATE: &str = "if: steps.stale.outputs.stale != 'true'";
 
     /// The whole step whose `- name:` line is `lines[at]`: that line and every
     /// line below it until a non-blank one is indented no deeper than it.
@@ -2926,7 +3433,8 @@ jobs:
                     "{name} is no longer just a named, floor-carrying delegation: a \
                      preflight that also sets `if:` or `continue-on-error:` is a gate \
                      the job can skip or survive, which is the one failure mode a \
-                     required gate has"
+                     required gate has (the one exception, `e2e-gpu`'s stale-run \
+                     gate, is removed by `gpu_preflight_steps`)"
                 );
                 assert_eq!(
                     step_env(step).keys().collect::<Vec<_>>(),
@@ -7762,6 +8270,17 @@ jobs:
             off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
+            // Skips on `closed` because the `stale` output of a skipped `e2e-gpu`
+            // is empty. (Its full condition is also pinned by
+            // `stale_runs_are_cancelled_by_a_hosted_job_that_runs_no_pr_code`.)
+            PinnedIf {
+                job: "cancel-stale-run",
+                condition: "always() && github.event_name == 'pull_request' \
+                            && github.event.pull_request.head.repo.full_name == github.repository \
+                            && needs.e2e-gpu.outputs.stale == 'true'"
+                    .to_owned(),
+                matrix_lane: false,
+            },
             // Skips because the `serve` output of a skipped `changes` is empty.
             PinnedIf {
                 job: "e2e-report",

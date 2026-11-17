@@ -15,9 +15,9 @@ The AMD WSL path is:
 
 1. Windows 11 with the AMD Adrenalin WSL-capable driver.
 2. WSL2 with Ubuntu 24.04 or newer. Ubuntu 22.04 is not supported: it ships
-   glibc 2.35, below the minimum that every published Lemonade embeddable
-   requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the Lemonade engine cannot
-   start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
+   glibc 2.35, below what the Lemonade embeddable ROCm CLI pins requires
+   (glibc 2.38 and `GLIBCXX_3.4.32`; newer Lemonade releases need more), so
+   the Lemonade engine cannot start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
 

@@ -86,8 +86,8 @@ pub struct Device {
 /// The oldest distro release the WSL path supports.
 ///
 /// Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / `GLIBCXX_3.4.32` floor
-/// every published Lemonade embeddable is linked against, so the engine cannot
-/// start there. See `docs/wsl.md`.
+/// the pinned Lemonade embeddable is linked against (newer Lemonade releases
+/// need more), so the engine cannot start there. See `docs/wsl.md`.
 pub const WSL_MIN_UBUNTU: (u32, u32) = (24, 4);
 
 /// WSL2-specific machine state. `None` on every other platform.

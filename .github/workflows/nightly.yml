@@ -404,7 +404,8 @@ jobs:
   # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job (minus its PR-only
+  # stale-run guard) but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
@@ -1505,7 +1506,8 @@ jobs:
       # the reports that arrived, so that lane would drop out of the grid with
       # no row and no FAIL. On a `continue-on-error` lane nothing else is red
       # either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # `skipped`, and not self-skipped as `stale`) must have uploaded its report
+      # artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1542,6 +1544,15 @@ jobs:
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
+            # A lane that publishes `stale=true` skipped its uploads by design
+            # and is not a missing report. Only e2e-selfhosted.yml's `e2e-gpu`
+            # stale-run guard publishes it; the line is inert in nightly.yml and
+            # is there because a contract test keeps the two copies of this script
+            # identical. Say so in the summary rather than dropping the lane silently.
+            if [ "$(jq -r --arg job "$job" '.[$job].outputs.stale // ""' <<<"$NEEDS")" = true ]; then
+              echo "- :no_entry_sign: \`$job\` skipped itself as stale; it has no column in the grid above" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             IFS=',' read -ra wanted <<<"$artifacts"
             for artifact in "${wanted[@]}"; do
               if ! grep -qxF "$artifact" <<<"$uploaded"; then
