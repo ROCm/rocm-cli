@@ -84,6 +84,37 @@ save_results() {
   fi
 }
 
+# A lane that exits non-zero keeps what it has: the channel it was in the middle
+# of, and a note of how it ended in `${out}/lane-status.txt`, so a failure that
+# stops the script before or between suites, or a signal that ends it, still
+# leaves something to read. `lane.log` is the harness's, not written here. The
+# lane's status stays the one it was ending with; a failed write only warns.
+channel_running=""
+channels_failed=""
+lane_end() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ -n "${channel_running}" ]]; then
+      save_results "${channel_running}"
+    fi
+    {
+      mkdir -p "${out}" &&
+        {
+          echo "status=${rc}"
+          echo "channel_running=${channel_running}"
+          echo "channels_failed=${channels_failed# }"
+        } >"${out}/lane-status.txt" &&
+        sync
+    } 2>/dev/null ||
+      echo "warning: could not write ${out}/lane-status.txt" >&2
+  fi
+  exit "${rc}"
+}
+trap lane_end EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
 # One tree on one filesystem: uv only hardlinks out of its cache into a runtime
 # on the same mount, and copies every file otherwise (see e2e-selfhosted.yml).
 mkdir -p "${work}"
@@ -226,9 +257,12 @@ status=0
 for channel in ${channels}; do
   echo "== channel ${channel}"
   rc=0
+  channel_running="${channel}"
   run_channel "${channel}" || rc=$?
   save_results "${channel}"
+  channel_running=""
   if [[ "${rc}" -ne 0 ]]; then
+    channels_failed+=" ${channel}"
     echo "channel ${channel} failed (status ${rc})" >&2
     [[ "${status}" -ne 0 ]] || status="${rc}"
   fi

@@ -238,6 +238,10 @@ default command writes each channel's suite results to `/out/<channel>/results`.
 Widening what is collected is not the fix for a missing file; writing the file
 to `/out` is.
 
+The default command, when it exits non-zero, also writes `/out/lane-status.txt`
+(its exit status, the channel it was in and the channels that failed) and keeps
+the results of the channel it was running. Neither is written on a pass.
+
 A lane passes when its command exits zero. Capturing the command's output into
 `lane.log` does not affect that status.
 
