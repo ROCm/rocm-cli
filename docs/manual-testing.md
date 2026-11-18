@@ -2213,3 +2213,46 @@ Expected result:
   could not be started: it was not found; nothing was changed.`, exits 4, and
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
+
+## 19. Curated Models Narrowed To This Machine
+
+Needs two hosts to be meaningful: one with a large discrete GPU (an MI300X) and
+one with a small or integrated GPU (a Ryzen APU is the case this exists for).
+The mock lane covers the logic with a forced memory figure; what it cannot do is
+read a real machine.
+
+```bash
+rocm model
+```
+
+Expected result, on the large host:
+
+- The large models are still listed — the 54 GiB and 62 GiB recipes appear, not
+  only the small ones.
+- The listing ends with `Narrowed to what this machine can run`, possibly
+  followed by a count of further models that also fit.
+
+Expected result, on the small host:
+
+- The models listed are ones this machine's GPU memory can hold. On an APU with
+  roughly 8 GiB of shared pool that means the Lemonade GGUF recipes, and none of
+  the 17 GiB-and-larger ones.
+- No row says `needs a larger GPU`: a recommendation and a refusal cannot both
+  be true of the same row.
+
+Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
+or a GPU the CLI cannot measure):
+
+- The list is *not* narrowed, and ends with `This machine's GPU memory could not
+  be read, so these are not filtered to what it can run.` An unmeasured machine
+  must not be told its options are narrow.
+
+Then ask the assistant the same question, which must get the same answer:
+
+```bash
+echo '{"args":["model"]}' > args.json
+rocm mcp-call rocm_command --arguments-file args.json
+```
+
+- The recipes listed match what `rocm model` printed in the terminal, narrowing
+  and closing note included.
