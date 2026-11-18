@@ -1499,7 +1499,11 @@ jobs:
         continue-on-error: true
         # Bounds the whole step: each log read has its own timeout, but a run of
         # many jobs on a stalled storage hop would still outlast the job's.
-        timeout-minutes: 5
+        # One job's reads alone can take 3 x 120s + 3 x 5s (about 6.3 minutes), so
+        # a cap below that cuts the fetch off inside the retries it exists to
+        # allow, and the queue lanes go missing from the report; a contract test
+        # holds the cap above that budget.
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
