@@ -662,7 +662,7 @@ Feature: Release install lifecycle
   # ── Download progress rendering ────────────────────────────────────────
 
   @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
-  Scenario: lifecycle-38 - Linux - a download draws one progress bar that stays inside the terminal
+  Scenario: lifecycle-52 - Linux - a download draws one progress bar that stays inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -672,7 +672,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-39 - Linux - a terminal too narrow for a bar downloads quietly and says why
+  Scenario: lifecycle-53 - Linux - a terminal too narrow for a bar downloads quietly and says why
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -681,7 +681,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
-  Scenario: lifecycle-40 - Linux - the wget fallback keeps its progress bar inside the terminal
+  Scenario: lifecycle-54 - Linux - the wget fallback keeps its progress bar inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -691,7 +691,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-piped-into-shell @lifecycle @requires-os:linux
-  Scenario: lifecycle-41 - Linux - piping the installer into a shell still sizes the bar from the terminal
+  Scenario: lifecycle-55 - Linux - piping the installer into a shell still sizes the bar from the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -701,7 +701,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-unsized-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-42 - Linux - a terminal reporting no size still gets a progress bar
+  Scenario: lifecycle-56 - Linux - a terminal reporting no size still gets a progress bar
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -711,7 +711,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-zero-padded-columns @lifecycle @requires-os:linux
-  Scenario: lifecycle-43 - Linux - a zero-padded COLUMNS does not abort the install
+  Scenario: lifecycle-57 - Linux - a zero-padded COLUMNS does not abort the install
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
