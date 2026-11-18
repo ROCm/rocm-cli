@@ -415,22 +415,25 @@ pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
 /// The part of [`KEYWORDS_VLLM_EXTENSION_LOAD`] that may be scored against
 /// `symptom` text which carries no vLLM-identifying token (`anchored == false`).
 ///
-/// Only the first entry — the `_OpNamespace` namespace shape — is withheld. It
-/// is the only entry that both clears
-/// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) on its own *and* names
-/// nothing that is vLLM's.
+/// The first **two** entries are withheld: the `_OpNamespace` namespace shape
+/// and `get_cuda_view_from_cpu_tensor`. Neither names anything a reader could
+/// tie to vLLM, which is what the slice boundary means — see the grouping note
+/// on [`KEYWORDS_VLLM_EXTENSION_LOAD`].
 ///
-/// Withholding it is necessary but **not sufficient**, and an earlier version
-/// of this comment wrongly claimed it was. [`keyword_score`] sums the top
-/// **two** weights, so two individually sub-threshold entries can clear the
-/// threshold together — which is exactly what `get_cuda_view_from_cpu_tensor`
-/// (30) and the generic `GLIBC_2.NN' not found` (30) did, for 60 against a
-/// threshold of 50, with no vLLM token anywhere. The op name is vLLM's own, so
-/// it is now matched by `VLLM_EXTENSION_ANCHOR_PATTERN` instead of sitting here
-/// where it could pair with a generic one. The property this split relies on is
-/// therefore about the *sum*, not about any single entry.
+/// Withholding the `_OpNamespace` entry alone is necessary but **not
+/// sufficient**, and an earlier version of this comment wrongly claimed it was.
+/// It is the only entry that clears
+/// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) by itself, but
+/// [`keyword_score`] sums the top **two** weights, so two individually
+/// sub-threshold entries can clear the threshold together — which is exactly
+/// what `get_cuda_view_from_cpu_tensor` (30) and the generic
+/// `GLIBC_2.NN' not found` (30) did, for 60 against a threshold of 50, with no
+/// vLLM token anywhere. The op name is vLLM's own, so it is now matched by
+/// `VLLM_EXTENSION_ANCHOR_PATTERN` and withheld here rather than left to pair
+/// with a generic one. The property this split relies on is therefore about
+/// the *sum*, not about any single entry.
 ///
-/// Dropping no more than the first entry is what keeps the weak signals —
+/// Dropping no more than those two is what keeps the weak signals —
 /// notably a bare `GLIBC_2.NN' not found`, which must stay *present and
 /// sub-threshold* rather than vanish (`a_glibc_error_alone_stays_below_the_match_threshold`).
 ///
