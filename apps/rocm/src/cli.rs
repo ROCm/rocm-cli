@@ -813,7 +813,10 @@ rocm uninstall --keep-data --yes")]
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
         /// when there is something to remove, it prints the plan and refuses
-        /// with exit 1, removing nothing.
+        /// with exit 1, removing nothing, and ends with a `Try:` line that is
+        /// the same command with --yes added. Run it in the same environment:
+        /// it repeats the flags, not variables such as HOME set before the
+        /// command.
         #[arg(long)]
         yes: bool,
         /// Show what would be removed without deleting anything.
@@ -1488,6 +1491,7 @@ pub(crate) enum SetupCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uninstall_plan::UninstallOptions;
     use crate::{cli_command, device_policy_name, engine_inventory, uninstall::reject_force};
     use clap::{CommandFactory, Parser};
     use rocm_engine_protocol::DevicePolicy;
@@ -1715,7 +1719,9 @@ mod tests {
     fn yes_help_says_what_happens_without_it_outside_a_terminal() {
         // Wording pin: the sentences are only worth having while they are true,
         // and the behavior itself is proven elsewhere —
-        //   uninstall              uninstall-04
+        //   uninstall              uninstall-04; uninstall-16 runs its `Try:` line;
+        //                          `uninstall_refusal_advice_parses_and_clears_the_refusal`
+        //                          (the line is the argv with --yes, no environment)
         //   runtimes uninstall     runtime-lifecycle-04
         //   storage remove-*       storage-01, `removal_requires_yes_when_there_is_no_terminal_to_prompt`
         //   fix                    diagnose-08, `consent_without_prompt` unit tests
@@ -1731,7 +1737,15 @@ mod tests {
         const NEVER_ASKS: &[&str] = &["never asks for confirmation"];
         const NEVER_PROMPTS: &[&str] = &["never prompts"];
         let cases: &[(&[&str], &[&str])] = &[
-            (&["uninstall"], REFUSES),
+            (
+                &["uninstall"],
+                &[
+                    "(default: no)",
+                    "refuses with exit 1,",
+                    "ends with a `Try:` line",
+                    "Run it in the same environment",
+                ],
+            ),
             (&["runtimes", "uninstall"], REFUSES),
             (&["storage", "remove-old-installs"], REFUSES),
             (&["storage", "remove-downloads"], REFUSES),
@@ -2621,18 +2635,27 @@ mod tests {
             panic!("not an uninstall command");
         };
         assert!(force.is_some() && !force_dev_binaries);
-        let refusal = reject_force(force.is_some()).unwrap_err().to_string();
+        let refusal = reject_force(force.is_some(), &UninstallOptions::default())
+            .unwrap_err()
+            .to_string();
         assert!(refusal.contains("`--force` is not an option"), "{refusal}");
         assert!(refusal.contains("--yes"), "{refusal}");
         assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
-        assert!(reject_force(false).is_ok());
+        // Its last line is the command meant, which
+        // `uninstall_force_advice_parses_and_clears_the_refusal` runs.
+        assert_eq!(
+            rocm_core::recovery_hint::try_command(&refusal),
+            Some("rocm uninstall --yes"),
+            "{refusal}"
+        );
+        assert!(reject_force(false, &UninstallOptions::default()).is_ok());
         // `--force=x` is the same mistake, and gets the same answer rather than
         // a usage line that lists every flag.
         let cli = Cli::try_parse_from(["rocm", "uninstall", "--force=x"]).unwrap();
         let Some(Command::Uninstall { force, .. }) = cli.command else {
             panic!("not an uninstall command");
         };
-        assert!(reject_force(force.is_some()).is_err());
+        assert!(reject_force(force.is_some(), &UninstallOptions::default()).is_err());
 
         // Near misses and the forms clap suggests from elsewhere in the command
         // line never offer the destructive flag.
