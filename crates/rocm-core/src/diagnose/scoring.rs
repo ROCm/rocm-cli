@@ -376,11 +376,24 @@ pub(super) const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
 /// vLLM logs or from importing the extension by hand. A glibc version error is
 /// below the threshold on its own, because any binary can print one; it counts
 /// together with the vLLM extension it names.
+/// Ordered so the entries that may only be scored behind a vLLM anchor come
+/// FIRST, because [`vllm_extension_load_keywords`] draws its line by index.
+/// That grouping, not weight order, is what the slice boundary means — the two
+/// leading entries are the ones whose text names nothing a reader could tie to
+/// vLLM, so they must never be scored against an unanchored paste.
 pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
     (
         r"_opnamespace'?\s+'?_(?:\w+_)?c(?:_\w+)?'?\s+object has no attribute",
         50,
         "an op a vLLM compiled extension registers is missing from torch.ops",
+    ),
+    // Anchor-only despite being well under the threshold on its own: paired
+    // with the generic glibc entry below it summed to 60 against a threshold of
+    // 50, so an unanchored paste reached a verdict with no vLLM text in it.
+    (
+        "get_cuda_view_from_cpu_tensor",
+        30,
+        "error names an op registered by vllm._C_stable_libtorch",
     ),
     (
         r"failed to import from vllm\._\w+",
@@ -393,11 +406,6 @@ pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
         "error names a vLLM compiled extension module",
     ),
     (
-        "get_cuda_view_from_cpu_tensor",
-        30,
-        "error names an op registered by vllm._C_stable_libtorch",
-    ),
-    (
         r"glibc_2\.\d+'? not found",
         30,
         "the host's glibc is older than the one the extension was built against",
@@ -407,24 +415,34 @@ pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
 /// The part of [`KEYWORDS_VLLM_EXTENSION_LOAD`] that may be scored against
 /// `symptom` text which carries no vLLM-identifying token (`anchored == false`).
 ///
-/// Only the first entry — the `_OpNamespace` namespace shape — is withheld, and
-/// withholding exactly that one is the whole point. It is the only entry that
-/// both clears [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) on its own
-/// *and* names nothing that is vLLM's; every other entry either spells `vllm`
-/// in its own pattern or is worth less than the threshold by itself. So
-/// dropping the first entry is sufficient to stop an unanchored paste reaching
-/// a verdict, and dropping no more than it is what keeps the weak signals —
+/// Only the first entry — the `_OpNamespace` namespace shape — is withheld. It
+/// is the only entry that both clears
+/// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) on its own *and* names
+/// nothing that is vLLM's.
+///
+/// Withholding it is necessary but **not sufficient**, and an earlier version
+/// of this comment wrongly claimed it was. [`keyword_score`] sums the top
+/// **two** weights, so two individually sub-threshold entries can clear the
+/// threshold together — which is exactly what `get_cuda_view_from_cpu_tensor`
+/// (30) and the generic `GLIBC_2.NN' not found` (30) did, for 60 against a
+/// threshold of 50, with no vLLM token anywhere. The op name is vLLM's own, so
+/// it is now matched by `VLLM_EXTENSION_ANCHOR_PATTERN` instead of sitting here
+/// where it could pair with a generic one. The property this split relies on is
+/// therefore about the *sum*, not about any single entry.
+///
+/// Dropping no more than the first entry is what keeps the weak signals —
 /// notably a bare `GLIBC_2.NN' not found`, which must stay *present and
 /// sub-threshold* rather than vanish (`a_glibc_error_alone_stays_below_the_match_threshold`).
 ///
 /// A whole-table gate returning nothing was tried and is wrong for that reason.
-/// `the_only_unanchored_keyword_is_the_one_this_withholds` pins the property the
-/// split relies on, so a new entry cannot quietly reopen the hole.
+/// `the_only_unanchored_keyword_is_the_one_this_withholds` and
+/// `an_unanchored_paste_cannot_reach_the_threshold_by_summing` pin both halves,
+/// so a new entry cannot quietly reopen the hole.
 pub(super) fn vllm_extension_load_keywords(anchored: bool) -> KeywordTable {
     if anchored {
         KEYWORDS_VLLM_EXTENSION_LOAD
     } else {
-        &KEYWORDS_VLLM_EXTENSION_LOAD[1..]
+        &KEYWORDS_VLLM_EXTENSION_LOAD[2..]
     }
 }
 
@@ -601,9 +619,9 @@ mod tests {
         let withheld = vllm_extension_load_keywords(true);
         let unanchored = vllm_extension_load_keywords(false);
         assert_eq!(
-            unanchored.len() + 1,
+            unanchored.len() + 2,
             withheld.len(),
-            "exactly one entry is withheld without an anchor"
+            "exactly two entries are withheld without an anchor"
         );
         assert!(
             withheld[0].2.contains("missing from torch.ops"),
@@ -621,6 +639,35 @@ mod tests {
                  its own, and clears {MIN_SCORE_FOR_MATCH} by itself"
             );
         }
+    }
+
+    #[test]
+    fn an_unanchored_paste_cannot_reach_the_threshold_by_summing() {
+        // The sibling test above checks each unanchored entry *in isolation*,
+        // which is not the property that matters: `keyword_score` keeps the top
+        // TWO hits and sums them. Two entries worth 30 each, neither naming
+        // vLLM, cleared the 50-point threshold together — 60 points for a paste
+        // with nothing vLLM-specific in it. Checking entries one at a time could
+        // never see that.
+        //
+        // So this asserts the sum. Of the unanchored entries that do not spell
+        // `vllm` in their own pattern, the two heaviest must not reach the
+        // threshold together, because those two are exactly what a paste with no
+        // vLLM token can collect.
+        let mut generic: Vec<i32> = vllm_extension_load_keywords(false)
+            .iter()
+            .filter(|(pattern, ..)| !pattern.contains("vllm"))
+            .map(|(_, weight, _)| *weight)
+            .collect();
+        generic.sort_unstable_by(|a, b| b.cmp(a));
+        let top_two: i32 = generic.iter().take(2).sum();
+        assert!(
+            top_two < MIN_SCORE_FOR_MATCH,
+            "the two heaviest unanchored entries that name no vLLM token sum to \
+             {top_two}, which reaches {MIN_SCORE_FOR_MATCH}: a paste with no vLLM \
+             text would be diagnosed as a vLLM extension-load failure. Move one of \
+             them behind `VLLM_EXTENSION_ANCHOR_PATTERN` instead. Weights: {generic:?}"
+        );
     }
 
     #[test]

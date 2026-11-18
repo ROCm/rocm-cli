@@ -623,8 +623,20 @@ pub const VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM: &str =
 /// `_C_cache_ops`, `_C_stable_libtorch` are vLLM's and nobody else's), and so is
 /// `EngineCore`, vLLM's own process name — which is what admits the real log
 /// line, whose only vLLM token is that prefix. `_C` alone is deliberately absent.
-const VLLM_EXTENSION_ANCHOR_PATTERN: &str =
-    r"vllm|enginecore|_rocm_c|_moe_c|_c_cache_ops|_c_stable_libtorch";
+///
+/// `\b` on the module-name alternatives so each matches a whole token rather
+/// than a prefix of a longer one: without it `_rocm_c` also matched
+/// `_rocm_config`, which is nobody's vLLM extension.
+///
+/// `get_cuda_view_from_cpu_tensor` is an anchor in its own right. It is an op
+/// that `vllm._C_stable_libtorch` registers and nothing else does, so a paste
+/// naming it is identified as vLLM's even with no `vllm` token anywhere. It
+/// also has to be one: the scorer sums the top TWO keyword weights, so leaving
+/// it in the unanchored slice let it pair with the generic
+/// `GLIBC_2.NN not found` entry (30 + 30 = 60) and clear the 50-point threshold
+/// with nothing vLLM-specific present. Moving it here closes that, and
+/// `an_unanchored_paste_cannot_reach_the_threshold_by_summing` keeps it closed.
+const VLLM_EXTENSION_ANCHOR_PATTERN: &str = r"vllm|enginecore|get_cuda_view_from_cpu_tensor|\b_rocm_c\b|\b_moe_c\b|\b_c_cache_ops\b|\b_c_stable_libtorch\b";
 
 /// A vLLM compiled extension failed to load, so an op it registers is missing
 /// from `torch.ops` (ROCMAI-1058).

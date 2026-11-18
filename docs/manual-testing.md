@@ -1593,7 +1593,7 @@ On some GPU families `rocm install sdk` installs vLLM itself
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
 
-### 6d. Naming the engine instead of editing the error
+### 6e. Naming the engine instead of editing the error
 
 Take the failing line from 6a without any `vllm` in it (the
 `torch.OutOfMemoryError: HIP out of memory ...` line from
