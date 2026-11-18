@@ -795,7 +795,7 @@ ignored, and its reason starts with `known gap:` and ends with the issue
 number:
 
 ```rust
-#[ignore = "known gap: in-band SSE error payloads are dropped and the stream reports a clean finish (#516)"]
+#[ignore = "known gap: the ComfyUI unpack keeps world-writable modes from the archive (#522)"]
 ```
 
 The prefix is a rule, not a convention, because it is the only way to find
@@ -1782,6 +1782,71 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
+`comfyui-20` and `comfyui-21` cover what `status`, the plain-words status
+answer, `logs` and `stop` do when rocm-cli's saved record of the ComfyUI it
+started (`apps/comfyui/state/running.json` under the data directory) is
+truncated, so it cannot be parsed. `status` and the answer say the running
+state is unknown and name the file; `logs` still shows the run log, which
+`comfyui-20` plants where `start` writes it: beside the install's `source`
+folder under the runtime. With nothing answering on ComfyUI's default address
+(`comfyui-20`), `status` advises `rocm comfyui stop`, and that command, run as
+printed, moves the record aside to `running.json.unreadable` without stopping
+any process, after which `status` no longer reports it. With
+something answering there (`comfyui-21`, a listener the scenario holds),
+`status` advises stopping it first, and `stop` keeps the record, says only that
+address was checked and exits non-zero; once the listener is gone the same
+`stop` goes through. `comfyui-21` and `comfyui-22` also ask the assistant about
+ComfyUI with no assistant model running, so the chat answers from its own
+read-only `comfyui status` call; its "ROCm CLI summary" must say `Running:
+unknown` with the reason over the unparseable record, and `Running: running
+(not started by rocm-cli)` with no record while something answers there. All
+three scenarios point the default address at a port they
+choose through `ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`, which only an
+`e2e-test-hooks` build reads (see [release-trust.md](release-trust.md)), so a
+ComfyUI the host runs itself cannot change the outcome. No GPU is needed. The
+unit tests `status_over_an_unreadable_record_*`,
+`chat_status_answer_over_an_unreadable_record_*`,
+`logs_over_an_unreadable_record_*` (including a start log beside the
+install's `source` folder under the runtime),
+`logs_with_a_saved_record_also_show_an_older_start_log_in_the_runtime_folder`,
+`stop_sets_an_unreadable_record_aside_and_stops_no_process` and
+`stop_over_an_unreadable_record_keeps_it_while_something_answers` cover the
+same over an empty record too (the last also the record moved aside by hand);
+`stop_reports_an_unreadable_record_it_cannot_move_aside` a record `stop` cannot
+move; `stop_over_an_unreadable_record_already_moved_says_so_and_succeeds` a
+second `stop` racing the first;
+`only_a_record_that_cannot_be_parsed_counts_as_unreadable`,
+`something_other_than_a_file_at_the_record_is_an_error_not_no_record`, the
+Unix-only `a_dangling_link_at_the_record_is_an_error_not_no_record`,
+`logs_over_a_record_that_cannot_be_read_fails_naming_it`,
+`a_reinstall_stops_on_a_saved_state_it_cannot_read` and
+`the_check_before_the_swap_refuses_what_appeared_during_the_download` (which
+also refuses a ComfyUI started during the download; comfyui-12 proves the
+install runs that check) that a failed read
+(permission denied, a directory at the path) is an error rather than an
+unreadable record or no record, for `status`, `stop`, `logs` and the reinstall
+guard;
+`with_no_record_status_and_the_chat_answer_report_what_answers_on_the_default_address`
+what `status` and the answer say with no record, whether or not something
+answers on the default address;
+`the_check_before_the_swap_prints_only_warnings_not_printed_before` that a
+record which became unparseable during the download still gets its note;
+`the_default_address_check_finds_a_listener_and_only_a_listener` and
+`the_default_address_port_override_is_a_port_or_an_error` the real check and
+the test-only port override; `a_stop_that_did_not_stop_prints_its_report_then_fails`
+the non-zero exit, `a_stop_that_failed_is_audited_and_returned_without_a_report`
+a stop that failed outright, and
+`a_stop_is_audited_even_when_its_report_cannot_be_written` the audit record;
+and the Unix-only
+`saving_the_run_record_replaces_the_file_rather_than_rewriting_it_in_place` and
+`saving_the_manifest_replaces_the_file_rather_than_rewriting_it_in_place` that
+both files are replaced atomically:
+
+```bash
+cargo xtask e2e -- -n "comfyui-2[012]"
+cargo test -p rocm --bin rocm comfyui
+```
+
 `comfyui-15` to `comfyui-19` cover which runtime `rocm comfyui install` uses
 when none is chosen: it recovers the runtime `rocm setup` created before
 counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
@@ -2595,7 +2660,9 @@ rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
 
 While a first-time model download is running, `rocm serve <model> --wait` keeps
-waiting past the usual 45 seconds until the server answers or its engine gives up
+waiting, with no CLI-side stall limit or deadline (without `--wait`, piped output
+stops after 45 seconds and a terminal at a stall or after 30 minutes), until the
+server answers or its engine gives up
 (vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
 and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
 by the argument parser, covered by a unit test. Run the log follow above from a
@@ -2669,6 +2736,56 @@ cargo test -p rocm --bin rocm serve_engine_selection
 
 These tests verify that explicit/configured engines still win and shared model
 recipes only choose a preferred engine when no user/default engine is set.
+
+Interactive `rocm serve` (a terminal, without `--verbose` or `--foreground`)
+keeps a status line through download, load, and health until the server can
+serve or that wait fails. A download that is still moving is not cut off at
+45 seconds, and a failure names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes` instead of printing
+`Deployment summary (not ready yet)`. The wait fails when the engine fails or
+exits, a download percent below 100 stops for 3 minutes (`DOWNLOAD_STALL`; a line at 100% is judged as loading), the endpoint
+has not listed the model, with no log, for 5 minutes (`SILENT_UNREACHABLE`, equal to `SILENT_LOAD`), a load line
+stops changing for 5 minutes (`SILENT_LOAD`), or after 30 minutes
+(`rocm_core::SERVE_STARTUP_DEADLINE`). Engine log lines are masked of
+credentials before they are shown (`redact_log_line`). Once the endpoint lists the model,
+the one-token inference request is not sent every poll: it backs off from 1
+second to `INFERENCE_PROBE_RETRY_INTERVAL` (15 seconds), timed from when the
+previous request returned (`InferenceProbeThrottle`, tested under a fake clock
+by `inference_probe_backs_off_to_the_retry_interval_after_listing`). `rocmd` does not
+restart a live `running` service whose endpoint does not answer, or a live
+`starting` one past the stale-start window, while it is younger than that
+deadline (a pid whose recorded start time does not match is not live); a
+recoverable engine healthcheck is still restarted.
+Piped output, or a redirected stderr (`ServeStartupPolicy::for_background_serve`), keeps the 45-second status budget. Like `--wait`, the
+interactive wait first prints the service id, `rocm logs --service
+<service-id> --follow` and a public bind's key (`announces_wait` in
+[start.rs](../apps/rocm/src/service_launch/start.rs)), since it can fail
+without printing a summary; `--wait` keeps its own wait, with no CLI-side
+stall limit or deadline. A wait that ends because the engine failed or the
+process exited settles the record the way a `--wait` does (`stopped`, or the
+engine's own `failed`), records an audit event and adds the same memory
+guidance (a `--wait` that sees the server exit now records the event too);
+when the engine failed but its process is still up, the message names the
+stop command. Only a stall or the
+deadline leaves the server running for the background helper to supervise.
+Scenario `serve-64` in `model_serving.feature` drives it under a PTY. It
+needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
+it checks the wait line, that the named `rocm logs --service` command runs,
+and that the serve exits 0 with the model listed. Scenario `serve-65` is the
+failure side on the no-GPU mock lane: with `ROCM_E2E_SIMULATE_STARTUP_EXIT=1`,
+an `e2e-oom-fault-injection` build (Linux only) spawns a stand-in engine that
+logs one line and exits during startup, in place of the real child. It checks
+the non-zero exit and the "server process exited" message, runs the
+`rocm logs --service` command the failure names, and checks the record is
+`stopped` (`cargo xtask e2e -- -n "serve-65"`). The stall, deadline and
+engine-failed branches need a controllable engine, so `decide_serve_startup` and `wait_for_serve_startup` in
+[serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
+covered by:
+
+```bash
+cargo test -p rocm --bin rocm serve_progress
+cargo test -p rocmd recovery_leaves_a_live
+```
 
 Public-endpoint authentication focused tests:
 
@@ -4922,7 +5039,7 @@ of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
 log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
 ready, so a mock engine can then fail its smoke test.
-`@id:serve-vllm-extension-load-hint` (serve-64) arms it with
+`@id:serve-vllm-extension-load-hint` (serve-66) arms it with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=extension-load`, which plants the raw startup log
 of a launch killed by a vLLM compiled extension that failed to load and fails
 the launch with the vLLM engine's own message for that log. None of rocm-cli's
@@ -4976,15 +5093,16 @@ What is detected, and what is not:
 
 - Detected (the summary says the smoke test failed): a transport error or timeout,
   an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
-  stream cut short.
-- Not detected (no failure is reported and the status reads `ready`): an engine
-  error sent as a `data:` payload inside a `200` stream; a `200` answer with no
-  `data:` line at all (HTML, plain JSON, an empty body); a close-delimited stream
-  cut after a token; and a complete stream with no `content` token, which is
-  deliberately not a failure (a reasoning model can spend its whole small budget
-  first, as the readiness probe also allows for). The metric rows read `n/a` when
-  no content token arrived first; tokens that did arrive (the close-delimited cut,
-  or an in-band `data:` error after content) are measured.
+  stream cut short, and an engine error sent as a `data:` payload inside a `200`
+  stream (vLLM's `{"error": ...}` or `{"object": "error", ...}`), including one
+  that follows content tokens. The reason shown is the server's own message.
+- Not detected (no failure is reported and the status reads `ready`): a `200`
+  answer with no `data:` line at all (HTML, plain JSON, an empty body); a
+  close-delimited stream cut after a token; and a complete stream with no
+  `content` token, which is deliberately not a failure (a reasoning model can
+  spend its whole small budget first, as the readiness probe also allows for).
+  The metric rows read `n/a` when no content token arrived first; tokens that
+  did arrive in a close-delimited cut are measured.
 - Known limitation: the reason shown is whatever the provider call reported, and
   some of its errors are not the engine's, for example the `/v1/models` re-list
   before the request ("no ready managed service"), an unreadable services-directory
@@ -5014,8 +5132,9 @@ cargo test -p rocm --bin rocm the_commands_the_failure_note_names_exist_and_pars
 
 The `serve_smoke_test` tests in [providers.rs](../apps/rocm/src/providers.rs)
 run the real smoke test against a local mock engine over a socket (an engine that
-dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, a
-complete stream with no content, a close-delimited stream cut after a token). Only
+dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, an
+in-band `data:` error, a complete stream with no content, a close-delimited
+stream cut after a token). Only
 the mid-stream-death test goes on to render the summary from the real outcome; the
 others assert on the outcome the smoke test returns.
 
@@ -5047,6 +5166,164 @@ others assert on the outcome the smoke test returns.
 
 ```bash
 cargo xtask e2e -- -n "serve-60"
+```
+
+## Two Dashboards Share One Telemetry Daemon
+
+Every live `rocm dash` of a user points at one unix socket, and the telemetry
+daemon behind it runs inside a dashboard process. Which dashboard serves it,
+and what a daemon may do to a path it finds occupied, is covered at two levels.
+
+The daemon's socket claim, in the `mod tests` of
+[server.rs](../crates/rocm-dash-daemon/src/server.rs), one test per state the
+path can be in: a live owner (`a_second_daemon_refuses_a_live_socket_instead_of_replacing_it`),
+a live daemon from a build without the lock (`an_answering_socket_without_a_lock_holder_is_left_in_place`),
+a lock holder whose socket does not answer (`a_lock_holder_keeps_the_path_even_when_its_socket_looks_stale`),
+a stale socket from a dead daemon (`a_stale_socket_from_a_dead_daemon_is_replaced`),
+the socket-directory policy for every owner and mode (`the_socket_directory_policy`,
+a pure function), a socket directory another user owns, refused before anything
+is created in it and never chmodded
+(`a_socket_directory_another_user_owns_is_refused_before_anything_is_touched`,
+`another_users_writable_socket_directory_is_refused_not_chmodded`,
+`a_symlink_to_another_users_socket_directory_is_refused`) -- these inject a fake
+uid for the daemon through `ServeSeams::our_uid`, since a test cannot make a
+directory another user really owns; real cross-uid ownership is not exercised --
+a missing socket directory created private (every directory the recursive
+create makes on the way included, with no chmod logged), and one of ours that group or
+others have any access to (a `0o755` one included) tightened, before the claim,
+with no chmod on a second check
+(`creates_missing_parent_at_0700`,
+`only_a_socket_directory_others_can_reach_is_tightened`,
+`tightens_owned_preexisting_parent`,
+`serving_creates_a_missing_socket_directory_privately`,
+`serving_restricts_a_socket_directory_it_owns`,
+`a_loose_socket_directory_of_ours_is_made_private_before_the_claim`,
+`a_loose_socket_directory_is_tightened_before_the_claim_runs`), a socket
+directory just created judged like an existing one
+(`a_socket_directory_just_created_is_judged_like_an_existing_one`), a sticky
+directory never chmodded (`a_sticky_socket_directory_is_served_as_it_is`,
+`preexisting_root_sticky_parent_is_used_as_it_is`) and reported as shared
+(`a_sticky_socket_directory_is_reported_as_shared`), with the warning printed
+once, by the daemon that claims the path
+(`the_shared_directory_warning_comes_once_from_the_daemon_that_claims_the_path`), a socket
+directory that cannot be inspected or is not a directory
+(`a_socket_directory_that_cannot_be_inspected_is_reported`,
+`a_socket_directory_that_is_not_a_directory_is_refused`), one reached through
+a symlink, judged by its target (`a_symlinked_socket_directory_is_judged_by_its_target`),
+a symlink planted at the lock path (`a_symlink_at_the_lock_path_is_not_followed`),
+a path that is not a socket (`a_path_that_is_not_a_socket_is_never_removed`),
+a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`),
+a bind lost to a daemon without the lock (`a_bind_lost_to_a_listener_without_the_lock_is_reported_in_use`),
+what a bind that finds the path taken reports for a socket, a file or a path
+that vanished since (`a_bind_that_finds_the_path_taken_reports_what_is_there_now`),
+a failed chmod of the bound socket, which still leaves the socket to be removed
+(`a_claim_whose_chmod_fails_still_removes_its_socket`),
+a busy or slow listener (`a_busy_or_slow_listener_counts_as_answering_not_stale`),
+a socket the probe cannot reach, reported rather than replaced
+(`a_socket_the_probe_cannot_reach_is_reported_not_replaced`; run as root, it
+prints a skip line and counts as passed),
+the helper that gives a bare socket file name no directory to check
+(`a_bare_socket_name_has_no_directory_to_check`; it calls the helper only,
+since serving a bare name would change the process-wide current directory
+under parallel tests),
+a probe that stays for the greeting (`the_probe_waits_for_the_greeting_before_hanging_up`)
+and reads at most a bounded amount of it (`the_probe_reads_a_bounded_greeting_from_a_listener_that_never_ends_a_line`),
+the blocking probe a process uses on its way out, with the same verdicts
+(`the_blocking_probe_tells_an_answering_socket_from_a_stale_one`),
+a serving daemon whose socket is replaced (`a_daemon_whose_socket_is_replaced_gives_up_the_path`)
+or briefly cannot be checked (`a_daemon_keeps_serving_while_its_path_briefly_cannot_be_checked`)
+or stays unreadable (`a_daemon_gives_its_path_up_when_it_stays_unreadable`; run as root,
+both print a skip line and count as passed),
+a file appearing before the bind (`a_file_that_appears_before_the_bind_is_refused_as_not_a_socket`),
+a stopped daemon's clients and runner (`a_stopped_daemon_closes_its_clients_connections`,
+`a_stopped_daemon_closes_its_clients_even_while_its_channel_lives`,
+`a_stopped_daemons_runner_stops_with_it`), a runner that stops
+(`a_daemon_stops_when_its_runner_does`), finished clients being released
+(`finished_client_tasks_are_released`), how many unreadable path checks give
+the path up (`only_five_unreadable_path_checks_in_a_row_give_the_path_up`)
+and several daemons racing (`exactly_one_of_several_concurrent_daemons_binds`).
+The dashboard's keeper, in [dash_daemon.rs](../apps/rocm/src/dash_daemon.rs):
+a surviving dashboard takes over when the owner leaves, closing one that never
+owned the daemon leaves it alone, a daemon refused its path is retried and
+reported after the dashboard closes (naming the log only when the warning
+reached it), a keeper that panicked is reported (`a_keeper_that_panicked_is_reported`),
+with its message (`a_keeper_panic_is_reported_with_its_message`), as having
+stopped when it had served (`a_keeper_that_panicked_after_serving_is_reported_as_stopped`),
+ahead of a failure recorded before it (`a_keeper_panic_is_reported_over_a_recorded_failure`,
+`a_keeper_panic_after_unlogged_failures_is_not_reported_as_logged`) and even when
+another daemon serves by the time the dashboard closes
+(`a_keeper_panic_is_reported_even_when_another_daemon_serves`),
+a daemon that recovered or found another daemon serving is not reported
+(`a_failure_ends_when_another_daemon_serves_the_socket`), or finds another
+daemon serving when the dashboard closes
+(`a_failure_is_not_reported_once_another_daemon_serves_the_socket`), a failed
+daemon does not hold the dashboard up (`a_failed_daemon_does_not_hold_up_the_dashboard`),
+a daemon that serves ends the dashboard's wait as soon as it answers, with
+nothing to report (`the_dashboard_waits_only_until_its_daemon_answers`),
+the wait before the dashboard draws, on tokio's paused clock, ending once the
+socket answers (`the_ready_wait_ends_once_the_socket_answers`), at once when the
+daemon has failed (`the_ready_wait_ends_at_once_when_the_daemon_has_failed`) and
+after its limit otherwise (`the_ready_wait_gives_up_after_its_limit`), the retry waits
+(`a_failing_daemon_backs_off_and_finding_an_owner_resets_it`), a removed socket
+served again without a failure (`a_removed_socket_is_served_again_without_a_failure`),
+the report's count (`the_report_counts_failed_attempts_from_two`), a keeper
+panic logged once, by the keeper's own task, without waiting for `stop_keeper`
+(`a_keeper_panic_is_logged_once_without_waiting_for_stop_keeper`), the report
+on a forced exit -- the recorded failure's, and none when nothing is recorded
+or a daemon answers by then
+(`the_forced_exit_report_is_the_recorded_failures_unless_a_daemon_answers`) --
+and a non-unix target starts no keeper. The keeper's timing is checked with the
+daemon scripted, on tokio's paused clock: failed runs spaced by the growing
+backoff (`failed_runs_are_spaced_by_the_growing_backoff`), a daemon that keeps
+stopping soon after it starts serving backed off rather than restarted every
+second (`a_daemon_that_keeps_stopping_soon_after_serving_backs_off`), the
+backoff starting over after a run that served long enough
+(`a_run_that_served_long_enough_starts_the_backoff_over`), a daemon that served
+and then stopped reported as having stopped
+(`a_daemon_that_served_and_then_stopped_is_reported_as_stopped`), a
+replaced socket claimed again one poll later
+(`a_replaced_socket_is_claimed_again_after_one_poll_without_a_failure`), and a
+socket in use tried again 250 ms later when another daemon holds its lock and
+5 s later when something without the lock answers there
+(`a_socket_in_use_is_tried_again_after_its_holders_poll`). All of
+these are unix only. The dashboard's own side of a reconnect, holding each
+benchmark row once, is `benchmark_rows_are_held_once_across_a_reconnect` in
+[app/mod.rs](../crates/rocm-dash-tui/src/app/mod.rs), which calls
+`on_connected` directly; `dash-58` below covers the event loop's call to it.
+
+End to end, in [dash.feature](../tests/e2e-cucumber/features/dash.feature),
+`dash-56` opens two dashboards in one pseudo-terminal environment, quits the
+first and requires the second to connect again -- the client log records
+one more connection than it held when the first was quit -- and then to show
+the connected header; `dash-58` does the same with two benchmark results
+recorded in the benchmark CSV the daemon reads, and requires the second
+dashboard to list exactly those two rows, each once, both before and after the
+hand-off; and
+`dash-57` puts a regular file where the socket goes and requires the dashboard
+to say, after it closes, that it could not use that file and where the
+warning was logged (and the log to hold it), and to leave the file in place;
+`dash-59` makes the socket's directory unreadable under a serving daemon,
+waits until the daemon gives the socket up, requires the dashboard to show it
+is disconnected and, after it closes, to report that its telemetry daemon
+stopped serving (naming the socket), not that it could not start; `dash-60`
+sets up as `dash-57` does but ends the dashboard with a typed Ctrl-C, and
+requires exit code 130, the same report and log line, and the file left in
+place, so it fails if the forced-exit path stops running the pre-exit hook;
+`dash-61` and `dash-62` do the same with a SIGTERM (exit code 143) and an
+externally delivered SIGINT (130), which end the process from the signal
+watcher instead, so they fail if that path stops running the hook
+(`set_pre_exit_hook` in
+[app/terminal.rs](../crates/rocm-dash-tui/src/app/terminal.rs), whose
+`a_pre_exit_hook_runs_once_and_not_after_it_is_cleared` covers it running
+once and never after its guard is dropped). `dash-56` to `dash-58` and
+`dash-60` to `dash-62` carry only `@requires-os:linux`, so they run on every
+Linux lane, GPU or not, and are skipped on Windows; `dash-59` also carries
+`@requires-dir-permissions`, since a directory permission does not bind root,
+and is skipped where the suite runs as root. Each simulates a GPU-less host
+itself (as `dash-37` does), so the runner's GPU does not change the outcome:
+
+```bash
+cargo xtask e2e -- -n "dash-(5[6-9]|6[0-2])"
 ```
 
 ## Diagnose Engine Provenance
