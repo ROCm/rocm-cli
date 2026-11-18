@@ -38,7 +38,9 @@ impl AppState {
     /// there either — the live read stays authoritative for the entire
     /// session rather than only a brief startup window — the registry read is
     /// cheap and re-run every time this is called, so there is no staleness
-    /// to outlive. Once a snapshot lands
+    /// to outlive. (`instances` itself is refilled from the same registry by
+    /// a background poller once a second — `set_managed_instances` — so it
+    /// can trail this live read by about a second.) Once a snapshot lands
     /// on a host where the daemon does connect, `instances` is authoritative
     /// and the read's *result* is no longer consulted for THIS question (a
     /// model that legitimately stops later in the session is still reflected
@@ -104,13 +106,25 @@ impl AppState {
     /// call sites also ask a sibling registry-backed question in the same
     /// decision and need the two answered from one read, not two independent
     /// ones a registry write in between could answer differently.
+    ///
+    /// Both halves of ownership must hold: the live registry read names the
+    /// instance, and the daemon's broadcast already marks it `managed`, because
+    /// the Services overlay lists only broadcast-managed rows
+    /// ([`is_listed_service`](crate::ui::services_manager::is_listed_service)).
+    /// An instance started a moment ago can be on disk before the next broadcast
+    /// says so; it is not offered here, because `s` could not focus a row for it.
+    /// The quit prompt still prints `rocm services stop <id> --yes` for it (that
+    /// line keys off the registry alone), and the offer appears on the broadcast
+    /// that catches up.
     pub(crate) fn has_stoppable_managed_instance_with(
         &self,
         snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
     ) -> bool {
-        self.instances
-            .values()
-            .any(|i| i.status.is_serving() && snapshot.managed_ids.contains(&i.container_id))
+        self.instances.values().any(|i| {
+            crate::ui::services_manager::is_listed_service(i)
+                && i.status.is_serving()
+                && snapshot.managed_ids.contains(&i.container_id)
+        })
     }
 
     /// Whether the confirm-before-quit prompt is open. Mirrors
@@ -194,13 +208,15 @@ impl AppState {
     /// that normal resolution instead.
     ///
     /// The short-circuit above calls
-    /// [`has_stoppable_managed_instance_with`](Self::has_stoppable_managed_instance_with)
-    /// on exactly the same predicate the row-finding `position` closure below
-    /// re-checks per row (`is_serving() && managed_ids.contains(..)`), so it
-    /// cannot change which outcome this returns — only skip it sooner. Its
-    /// value is avoiding `service_rows`'s allocation and sort on every `s`
-    /// keypress when nothing is stoppable; it is not a correctness guard, and
-    /// there is nothing for the two checks to drift on.
+    /// [`has_stoppable_managed_instance_with`](Self::has_stoppable_managed_instance_with),
+    /// which applies the same ownership test `service_rows` lists by
+    /// (`is_listed_service`) plus the per-row check the `position` closure below
+    /// repeats (`is_serving() && managed_ids.contains(..)`). Because `service_rows`
+    /// lists only broadcast-managed instances, a predicate without that test would
+    /// say "stoppable" for an instance the rows do not contain and the key would
+    /// be dropped silently, so the two must keep agreeing; the test
+    /// `a_registry_managed_instance_the_broadcast_does_not_yet_mark_managed_is_not_offered`
+    /// pins that.
     pub(crate) fn quit_confirm_open_services_key(
         &mut self,
         code: crossterm::event::KeyCode,
@@ -369,6 +385,7 @@ mod tests {
                 "svc-managed".to_string(),
                 Instance {
                     container_id: "svc-managed".to_string(),
+                    managed: true,
                     status,
                     ..Default::default()
                 },
@@ -400,6 +417,7 @@ mod tests {
             "svc-a".to_string(),
             Instance {
                 container_id: "svc-a".to_string(),
+                managed: true,
                 status: InstanceStatus::Stopped,
                 ..Default::default()
             },
@@ -408,6 +426,7 @@ mod tests {
             "svc-b".to_string(),
             Instance {
                 container_id: "svc-b".to_string(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -440,6 +459,7 @@ mod tests {
                 "svc-managed".to_string(),
                 Instance {
                     container_id: "svc-managed".to_string(),
+                    managed: true,
                     status,
                     ..Default::default()
                 },
@@ -473,6 +493,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -517,6 +538,42 @@ mod tests {
             "nothing to stop: the prompt must stay open for its normal y/n/Esc handling"
         );
         assert!(s.services.is_none());
+    }
+
+    /// A managed instance started a moment ago is on disk (`managed_ids`) before the
+    /// daemon's next broadcast marks it `managed`. The Services overlay lists only
+    /// broadcast-managed rows, so `s` cannot focus one for it: the stop offer must
+    /// not be made, and `s` must say it did not handle the key (so the prompt
+    /// resolves it normally) instead of claiming a stoppable instance and dropping it.
+    #[test]
+    fn a_registry_managed_instance_the_broadcast_does_not_yet_mark_managed_is_not_offered() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for (managed, offered) in [(false, false), (true, true)] {
+            let mut s = st();
+            s.instances.insert(
+                "svc-new".to_string(),
+                Instance {
+                    container_id: "svc-new".to_string(),
+                    managed,
+                    status: InstanceStatus::Ready,
+                    ..Default::default()
+                },
+            );
+            with_registry_probe(&mut s, true, &["svc-new"]);
+            assert_eq!(
+                s.has_stoppable_managed_instance_with(&s.live_registry_snapshot()),
+                offered,
+                "managed={managed}"
+            );
+            s.open_quit_confirm();
+            assert_eq!(
+                s.quit_confirm_open_services_key(KeyCode::Char('s')),
+                offered,
+                "managed={managed}"
+            );
+            assert_eq!(s.services.is_some(), offered, "managed={managed}");
+        }
     }
 
     #[test]

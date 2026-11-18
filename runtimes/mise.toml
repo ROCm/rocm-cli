@@ -4,9 +4,11 @@
 # `crates/rocm-deps/build.rs` generates Lemonade's version, URLs and digests
 # from the generated `mise.lock` beside this file; the Lemonade adapter checks
 # downloads against those digests, so no non-test source holds a second copy of
-# the version or digests. The Python runtime stacks are pinned separately,
-# in `profiles.toml`, because mise's `pypi` backend cannot lock them
-# (docs/runtime-dependencies.md says why).
+# the version or digests, except the Linux digest that keys `LINUX_LEMOND_NEEDS`
+# in engines/lemonade/src/install.rs: a Lemonade bump fails a unit test until
+# that record is re-read for the new archive. The Python runtime stacks are
+# pinned separately, in `profiles.toml`, because mise's `pypi` backend cannot
+# lock them (docs/runtime-dependencies.md says why, and covers both points).
 #
 # From the repository root:
 #   runtimes/bin/mise run --cd runtimes update   # bump past the cooldown, re-lock
@@ -28,7 +30,7 @@ minimum_release_age = "7d"
 # Lemonade's embeddable release. Each platform names its asset exactly: the
 # release also carries .msi/.deb/.rpm installers, and a pattern shared by both
 # platforms has been seen to lock the Windows zip for linux-x64.
-"github:lemonade-sdk/lemonade" = { version = "11.5.1", platforms = { linux-x64 = { asset_pattern = "lemonade-embeddable-*-ubuntu-x64.tar.gz" }, windows-x64 = { asset_pattern = "lemonade-embeddable-*-windows-x64.zip" } } }
+"github:lemonade-sdk/lemonade" = { version = "2026.44.1", platforms = { linux-x64 = { asset_pattern = "lemonade-embeddable-*-ubuntu-x64.tar.gz" }, windows-x64 = { asset_pattern = "lemonade-embeddable-*-windows-x64.zip" } } }
 # Tooling, not a runtime: uv resolves the Python locks (`cargo xtask deps
 # lock`). rocm-cli still installs its own uv at runtime; rocm-deps generates no
 # constants for it (see TOOLING_ONLY in crates/rocm-deps/src/pins_gen.rs).

@@ -83,12 +83,13 @@ use windows_inventory::{
 };
 #[cfg(target_os = "linux")]
 use wsl::detect_wsl_windows_display_probe_text;
+pub use wsl::ldconfig_cache;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
 pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
-    ldconfig_cache, ldconfig_lists_librocdxg,
+    ldconfig_lists_librocdxg,
 };
 use wsl::{detect_wsl_windows_display_gfx_target_fast, wsl_driver_summary};
 
@@ -139,6 +140,14 @@ pub struct ExamineSummary {
     pub wsl: Option<WslSummary>,
     pub managed_runtime_count: usize,
     pub managed_service_count: usize,
+    /// Managed runtimes' own `librocdxg.so.1` that the runtime's HSA runtime does
+    /// not load on this WSL host, because it opens `librocdxg.so` and the wheel
+    /// ships no such file (or the file is a dangling link), so it takes the host's
+    /// copy instead. Empty off WSL and when every runtime's copy is reachable. See
+    /// [`crate::runtime_rocdxg`]. Absent from output written before the field
+    /// existed, hence the default.
+    #[serde(default)]
+    pub unlinked_runtime_librocdxg: Vec<PathBuf>,
     pub model_cache_entries: usize,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
@@ -170,7 +179,7 @@ pub struct WslSummary {
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
     /// `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`,
-    /// which finds it through its own `$ORIGIN` runpath with no cache entry and
+    /// which finds it through its own `$ORIGIN` search path with no cache entry and
     /// no `LD_LIBRARY_PATH`. Absent from output written before the field
     /// existed, hence the default.
     #[serde(default)]
@@ -254,6 +263,8 @@ impl ExamineSummary {
             detect_windows_examine_inventory()
         };
         let wsl = detect_wsl_summary();
+        let unlinked_runtime_librocdxg =
+            crate::runtime_rocdxg::unlinked_managed_runtime_copies(wsl.is_some(), &paths);
         let detected_gfx_target = detect_examine_gfx_target_fast(windows_inventory.as_ref());
         let compatible_therock_family = detected_gfx_target
             .as_deref()
@@ -294,6 +305,7 @@ impl ExamineSummary {
                 &paths.data_dir.join("runtimes").join("registry"),
             ),
             managed_service_count: count_json_files(&paths.services_dir()),
+            unlinked_runtime_librocdxg,
             model_cache_entries: count_dir_entries(&paths.data_dir.join("models")),
             config_dir: paths.config_dir,
             data_dir: paths.data_dir,
@@ -592,6 +604,21 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm remote doctor` and the daemon read an `ExamineSummary` another build
+    /// wrote; one from before `unlinked_runtime_librocdxg` existed must still load.
+    #[test]
+    fn a_summary_written_before_the_runtime_librocdxg_field_still_loads() {
+        let mut value = serde_json::to_value(windows_summary_with_driver(None)).expect("serialise");
+        let removed = value
+            .as_object_mut()
+            .expect("an object")
+            .remove("unlinked_runtime_librocdxg");
+        assert!(removed.is_some(), "the field is serialised today");
+
+        let loaded: ExamineSummary = serde_json::from_value(value).expect("old summary loads");
+        assert!(loaded.unlinked_runtime_librocdxg.is_empty());
+    }
+
     pub(super) fn windows_summary_with_driver(
         info: Option<crate::windows_driver::WindowsDriverInfo>,
     ) -> ExamineSummary {
@@ -620,6 +647,7 @@ mod tests {
             wsl: None,
             managed_runtime_count: 0,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),

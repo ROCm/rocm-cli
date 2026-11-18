@@ -13,6 +13,7 @@ mod consent;
 mod family;
 mod fetch;
 mod io;
+mod kept_torch;
 mod probe;
 mod process;
 mod python;
@@ -54,8 +55,8 @@ pub(crate) use self::source::RuntimeVersionSelector;
 #[cfg(test)]
 use self::source::resolve_source;
 use self::source::{
-    SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel, next_layout_requested,
-    requested_source_layout, select_source_layout,
+    SourceLayout, THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE, TheRockChannel, gate_install_layout,
+    layout_serving, requested_source_layout,
 };
 pub(crate) use self::update::{
     RuntimeUpdatePlan, maybe_refresh_startup_update_check, recorded_python_version,
@@ -234,14 +235,15 @@ pub(crate) fn install_sdk(
         ),
         "tarball" => {
             // A tarball catalog lists whole archives, not a resolvable package
-            // graph, so there is nothing to pin a version against — except the
-            // ROCm 10 catalog, which is reachable *only* by naming a version,
-            // because nothing else distinguishes it from the canonical one.
+            // graph, so there is nothing to pin a version against — except in
+            // the next layout's catalogs, whose archives are named by the
+            // version they carry. The canonical catalogs do not support a pin,
+            // so an earlier version is a wheel install.
             if let Some(selector) = version_selector.as_ref()
-                && !next_layout_requested(selector)
+                && layout_serving(channel, Some(selector)) == SourceLayout::Canonical
             {
                 bail!(
-                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                    "specific TheRock version selection for tarball installs is supported only for the newer package layout: a stable ROCm 10+ release (e.g. `--version 10.0.0`) or a nightly built on or after {THEROCK_NEXT_NIGHTLY_FIRST_BUILD_DATE}; for any earlier version, use `--format wheel`"
                 )
             }
             install_tarball_runtime(
@@ -368,20 +370,21 @@ fn install_wheel_runtime(
     // channel, or a grouped family with no exact arch) before paying for Python
     // provisioning below, which can mean a real download for a layout this host
     // or channel can never actually use.
-    select_source_layout(
+    gate_install_layout(
         channel,
         &resolve_family(paths, recovered_family_override.as_deref())?,
         version_selector,
+        layout_override,
     )?;
     // The interpreter has to be picked before `resolve_pip_runtime`, which
     // selects wheels using that interpreter's own tags. `requested_source_layout`
-    // only answers from the *request*: an explicit stable ROCm 10+ pin already
-    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
-    // nightly build-date/prerelease pin always reports `Canonical`, even once
-    // the canonical/nightly feed's own "latest" has rotated past that major on
-    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
-    // peeks the channel's own `rocm` listing to catch that case.
-    let python_layout = match requested_source_layout(layout_override, version_selector) {
+    // only answers from the *request*: a plain auto-select, a stable ROCm 10+
+    // pin and a nightly built since the next layout began all route to `Next`
+    // and get `cp314` that way. A pin into the canonical layout can still
+    // resolve a ROCm 10+ build on that feed (the legacy nightlies carry ROCm 10
+    // alphas), so `canonical_auto_select_needs_next_python` peeks the feed's own
+    // `rocm` listing to catch that case.
+    let python_layout = match requested_source_layout(channel, layout_override, version_selector) {
         SourceLayout::Next => SourceLayout::Next,
         SourceLayout::Canonical => {
             if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
@@ -489,6 +492,14 @@ fn install_wheel_runtime(
         resolution.newest_repo_version.as_deref(),
         &resolution.latest_version,
     );
+    // Under the alignment opt-out an environment that already holds torch keeps it:
+    // the install then asks `uv` for the ROCm packages alone. Decided here, from the
+    // environment the install will run in, so the preview and the install name the
+    // same requirements.
+    let planned_env_python = venv_python_path(&install_root);
+    let planned_kept = kept_torch::kept_torch_stack(rocm_core::torch_alignment_disabled(), || {
+        kept_torch::installed_torch_stack(&planned_env_python)
+    });
     let plan = WheelPlan {
         channel,
         version_selector,
@@ -509,6 +520,10 @@ fn install_wheel_runtime(
             install_root: &install_root,
             runtime_key: &runtime_key,
             package_specs: &wheel_composition.package_specs,
+            // A real install decides again once the environment is prepared (it may
+            // be recreated and lose its torch), and writes the one `torch_kept:` line
+            // then; a preview cannot know, so it prints the plan's.
+            kept_torch: if dry_run { planned_kept.as_ref() } else { None },
             manifest_path: &manifest_path,
         }),
     };
@@ -626,10 +641,27 @@ fn install_wheel_runtime(
     ));
     ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
+    // `ensure_uv_venv` recreates an environment built for another interpreter, and
+    // the recreated one holds no torch. Asked again, so that case installs the
+    // full stack instead of leaving the runtime without torch.
+    let kept = planned_kept.clone().filter(|_| {
+        kept_torch::kept_torch_stack(true, || kept_torch::installed_torch_stack(&env_python))
+            .is_some()
+    });
+    if let Some(kept) = &kept {
+        progress_line(format!(
+            "ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set: keeping the torch this runtime already holds ({}).",
+            kept.describe()
+        ));
+    }
+    if let Some(line) = kept_torch::install_line(planned_kept.as_ref(), kept.as_ref()) {
+        let _ = writeln!(output, "{line}");
+    }
+    let install_specs = kept_torch::install_specs(&wheel_composition.package_specs, kept.as_ref());
 
     progress_line(format!(
         "Installing {} from {}",
-        wheel_composition.package_specs.join(" "),
+        install_specs.join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -637,7 +669,7 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(wheel_composition.package_specs.iter().cloned());
+    install_args.extend(install_specs.iter().cloned());
     run_uv_progress_command(
         paths,
         &uv,
@@ -661,6 +693,7 @@ fn install_wheel_runtime(
         probe_rocm_sdk_runtime_for_target(&env_python, Some(device_target.as_str()))
             .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
+    report_runtime_librocdxg_link(&mut output, &rocm_sdk_probe);
     let installed_version = rocm_sdk_probe
         .rocm_sdk_version
         .clone()
@@ -718,6 +751,50 @@ fn install_wheel_runtime(
     }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
     Ok(SdkInstallResult::installed(output))
+}
+
+/// On WSL the runtime's HSA runtime opens `librocdxg.so`, which the wheel does
+/// not ship, so it would load the host's copy instead of the one beside it. Link
+/// the runtime's own copy into the library directories the probe recorded and
+/// write one report line per copy. The WSL gate is read inside
+/// `link_installed_runtime_copies`, so the install cannot pass a wrong answer.
+fn report_runtime_librocdxg_link(output: &mut String, probe: &RocmSdkPythonProbe) {
+    write_librocdxg_report(
+        output,
+        rocm_core::runtime_rocdxg::link_installed_runtime_copies(&librocdxg_dirs(probe)),
+    );
+}
+
+/// [`report_runtime_librocdxg_link`] with the WSL gate supplied, so the unit tests
+/// run the WSL branch on every Unix host. Shares the directory choice and the report
+/// writing with the install's own path.
+#[cfg(all(test, unix))]
+fn report_runtime_librocdxg_link_when(
+    output: &mut String,
+    is_wsl: bool,
+    probe: &RocmSdkPythonProbe,
+) {
+    write_librocdxg_report(
+        output,
+        rocm_core::runtime_rocdxg::link_installed_runtime_copies_when(
+            is_wsl,
+            &librocdxg_dirs(probe),
+        ),
+    );
+}
+
+/// The directories whose `librocdxg.so.1` is linked: the ones the probe recorded.
+/// `rocm examine` scans a list computed separately from the registry record
+/// (`managed_runtime_library_dirs`) that includes these; a test in `rocm-core`
+/// pins that.
+fn librocdxg_dirs(probe: &RocmSdkPythonProbe) -> Vec<PathBuf> {
+    probe.library_paths.clone()
+}
+
+fn write_librocdxg_report(output: &mut String, lines: Vec<String>) {
+    for line in lines {
+        let _ = writeln!(output, "  {line}");
+    }
 }
 
 /// The host's legacy/system ROCm version when it is strictly newer than the
@@ -1107,6 +1184,49 @@ mod tests {
     use super::test_support::{test_paths, test_runtime_manifest};
     use super::*;
 
+    /// The install report links the probe's library directories when the host is
+    /// WSL, and touches nothing otherwise. Driven with the gate supplied, so both
+    /// branches run on every Unix host; the real gate is tested in
+    /// `runtime_rocdxg::tests` through a simulated host root (hooks lane).
+    #[cfg(unix)]
+    #[test]
+    fn the_install_report_links_only_the_probes_library_directories_when_wsl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lib = dir.path().join("lib");
+        let elsewhere = dir.path().join("elsewhere");
+        for d in [&lib, &elsewhere] {
+            fs::create_dir_all(d).expect("dir");
+            fs::write(d.join("libhsa-runtime64.so.1"), "").expect("runtime");
+            fs::write(d.join("librocdxg.so.1"), "own").expect("copy");
+        }
+        let probe = RocmSdkPythonProbe {
+            library_paths: vec![lib.clone()],
+            root_path: Some(elsewhere.clone()),
+            ..RocmSdkPythonProbe::default()
+        };
+
+        let mut off = String::new();
+        report_runtime_librocdxg_link_when(&mut off, false, &probe);
+        assert!(off.is_empty(), "{off}");
+        assert!(lib.join("librocdxg.so").symlink_metadata().is_err());
+
+        let mut on = String::new();
+        report_runtime_librocdxg_link_when(&mut on, true, &probe);
+        // The whole line, indent included: a copy path or a lost indent changes it.
+        assert!(
+            on.starts_with(&format!(
+                "  librocdxg: linked {} to the runtime's own copy",
+                lib.join("librocdxg.so").display()
+            )) && on.ends_with('\n'),
+            "{on}"
+        );
+        assert_eq!(fs::read(lib.join("librocdxg.so")).expect("link"), b"own");
+        assert!(
+            elsewhere.join("librocdxg.so").symlink_metadata().is_err(),
+            "only the probe's library paths are linked"
+        );
+    }
+
     /// `--format tarball` installs no Python, so a Python choice cannot be honoured
     /// and is refused before anything is resolved or downloaded. The refusal comes
     /// ahead of the platform's tarball check so it reads the same on every host.
@@ -1455,6 +1575,74 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 hostile,
                 "{hostile:?} rendered as {quoted:?}, which a shell did not read back literally"
+            );
+        }
+    }
+
+    /// Pins the production derivation to the literal keys of the side-by-side
+    /// e2e fixture, from the fixture's inputs. The fixture
+    /// (tests/e2e-cucumber/tests/e2e/runtime_side_by_side_steps.rs) re-derives
+    /// keys in `Role::key` to plant runtimes without installing them, and its
+    /// planting step checks those against the same literals in
+    /// `Role::expected_key`. So a change here fails this test, and a change to
+    /// the fixture fails the scenario's Given.
+    #[test]
+    fn wheel_runtime_key_matches_the_side_by_side_e2e_fixture() {
+        let composition = |generation: &str, specs: [&str; 4]| WheelRuntimeComposition {
+            source_layout_generation: generation.to_owned(),
+            package_specs: specs.iter().map(|spec| (*spec).to_owned()).collect(),
+            rocm_sdk_target: Some("gfx942".to_owned()),
+        };
+        let cases = [
+            (
+                TheRockChannel::Release,
+                "7.14.0",
+                composition(
+                    "multi-arch-v2",
+                    [
+                        "rocm[libraries,devel,device-gfx942]==7.14.0",
+                        "torch[device-gfx942]==2.11.0+rocm7.14.0",
+                        "torchvision[device-gfx942]==0.26.0+rocm7.14.0",
+                        "torchaudio==2.11.0+rocm7.14.0",
+                    ],
+                ),
+                "release-wheel-multi-arch-7-14-0-992a08553d8be8f0",
+            ),
+            (
+                TheRockChannel::Release,
+                "10.0.0",
+                composition(
+                    "next-v1",
+                    [
+                        "rocm[libraries,device-gfx942]==10.0.0",
+                        "torch[device-gfx942]==2.13.0+rocm10.0.0",
+                        "torchvision[device-gfx942]==0.28.0+rocm10.0.0",
+                        "torchaudio==2.11.0.2+rocm10.0.0",
+                    ],
+                ),
+                "release-wheel-multi-arch-10-0-0-3d0e256f664a960d",
+            ),
+            (
+                TheRockChannel::Nightly,
+                "10.1.0a20260822",
+                composition(
+                    "multi-arch-v2",
+                    [
+                        "rocm[libraries,device-gfx942]==10.1.0a20260822",
+                        "torch[device-gfx942]==2.12.0+rocm10.1.0a20260822",
+                        "torchvision[device-gfx942]==0.27.0+rocm10.1.0a20260822",
+                        "torchaudio==2.12.0+rocm10.1.0a20260822",
+                    ],
+                ),
+                "nightly-wheel-multi-arch-10-1-0a20260822-95e3a823499c530b",
+            ),
+        ];
+        for (channel, version, composition, expected) in cases {
+            assert_eq!(
+                wheel_runtime_key(channel, version, &composition),
+                expected,
+                "the production key derivation changed; update these literals, and `Role::key` \
+                 and `Role::expected_key` in runtime_side_by_side_steps.rs, together"
             );
         }
     }

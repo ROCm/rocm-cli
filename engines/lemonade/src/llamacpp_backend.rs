@@ -3,17 +3,18 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::direct_llama::find_binary_in;
 use crate::install::{LemonadeInstallManifest, platform_binary_name};
 use crate::process::{
-    LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
-    lemonade_process_environment, run_lemonade_backend_install, spawn_lemond,
-    wait_for_lemonade_cli_status,
+    LemonadeProcessEnvironment, apply_lemonade_process_environment_with_parent,
+    hide_child_console_window, lemonade_process_environment, run_lemonade_backend_install,
+    spawn_lemond, wait_for_lemonade_cli_status,
 };
+use crate::runtime_dir::ParentRuntimeEnvironment;
 use crate::state::{free_local_port, terminate_pid};
 use crate::{DEFAULT_HOST, LLAMACPP_RECIPE, ROCM_BACKEND_NAME};
 
@@ -73,7 +74,11 @@ pub(crate) fn best_llamacpp_backend_for_host(
             log_path,
             &process_env,
         )?;
-        let listing = run_lemonade_backends_list(manifest, &process_env)?;
+        let listing = run_lemonade_backends_list(
+            manifest,
+            &process_env,
+            &ParentRuntimeEnvironment::current(),
+        )?;
         let backends = parse_llamacpp_backend_statuses(&listing);
         Ok(select_best_llamacpp_backend(&backends).map(|(name, _)| name))
     })();
@@ -112,7 +117,28 @@ pub(crate) fn ensure_best_llamacpp_backend(
     process_env: &LemonadeProcessEnvironment,
     force_reinstall: bool,
 ) -> Result<String> {
-    let listing = run_lemonade_backends_list(manifest, process_env)?;
+    ensure_best_llamacpp_backend_with_parent(
+        manifest,
+        host,
+        port,
+        process_env,
+        force_reinstall,
+        &ParentRuntimeEnvironment::current(),
+    )
+}
+
+/// [`ensure_best_llamacpp_backend`] with the parent runtime environment supplied
+/// by the caller, so a serve that was given a confined parent never reads or
+/// creates anything in the host's own.
+pub(crate) fn ensure_best_llamacpp_backend_with_parent(
+    manifest: &mut LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    process_env: &LemonadeProcessEnvironment,
+    force_reinstall: bool,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<String> {
+    let listing = run_lemonade_backends_list(manifest, process_env, parent)?;
     let backends = parse_llamacpp_backend_statuses(&listing);
     let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
         bail!(
@@ -132,7 +158,7 @@ pub(crate) fn ensure_best_llamacpp_backend(
     } else {
         eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
         install_llamacpp_backend_with_retry(|| {
-            run_lemonade_backend_install(manifest, host, port, &backend, process_env)
+            run_lemonade_backend_install(manifest, host, port, &backend, process_env, parent)
         })?;
     }
     Ok(backend)
@@ -140,47 +166,130 @@ pub(crate) fn ensure_best_llamacpp_backend(
 
 /// Parse `lemonade backends` table output into `(backend, status)` pairs for the
 /// `llamacpp` recipe only. Status is one of `installed`/`installable`/`unsupported`.
+///
+/// Lemonade also reports two update states, read here as the state they act
+/// like: `update_available` (an installed build that still runs, with a newer
+/// release out) as `installed`, and `update_required` (an installed build
+/// Lemonade will not run until it is reinstalled, e.g. after the pin in
+/// `backend_versions.json` moved) as `installable`, so it is reinstalled rather
+/// than reused or dropped. Lemonade 2026.44.1's own `Action` for such a row is
+/// `lemonade backends install <recipe>:<backend>`, the command rocm-cli runs,
+/// and its `BackendManager::install_backend` has no early return for an
+/// installed backend while online; for `llamacpp:rocm` it also removes and
+/// fetches TheRock again (`src/cpp/server/system_info.cpp` and
+/// `src/cpp/server/backend_manager.cpp` at that tag). The other state Lemonade defines, `action_required`
+/// (used by other recipes), leaves the row out.
+///
+/// A row that starts in the first column and has a state in its Status column
+/// names its recipe; an indented row continues the recipe above it with another
+/// backend. Any other line, such as a warning, is skipped and leaves the current
+/// recipe as it was, even when its text contains a state word: the state is read
+/// at the column the header names, not from anywhere in the line. The recipe is read from
+/// the layout rather than matched against a list of known recipe names: each
+/// Lemonade release adds recipes (`llamacpp-hrx`, `ds4`, `thenoise` in
+/// 2026.44), and a row for a recipe missing from such a list used to be read as
+/// one more `llamacpp` backend, along with every indented row below it.
 fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
-    const RECIPES: [&str; 8] = [
-        "flm",
-        "kokoro",
-        "llamacpp",
-        "ryzenai-llm",
-        "sd-cpp",
-        "vllm",
-        "whispercpp",
-        "embeddings",
-    ];
-    const STATUSES: [&str; 3] = ["installed", "installable", "unsupported"];
-    let mut current_recipe = "";
+    fn is_state(token: &str) -> bool {
+        token.starts_with("update_available")
+            || matches!(
+                token,
+                "installed" | "installable" | "update_required" | "unsupported" | "action_required"
+            )
+    }
+    fn usable_status(token: &str) -> Option<&'static str> {
+        // Lemonade pads the status column to 16 characters with no separator
+        // after it, so the one 16-character state runs straight into the
+        // message (`update_availableNewer upstream release ...`).
+        if token.starts_with("update_available") {
+            return Some("installed");
+        }
+        match token {
+            "installed" => Some("installed"),
+            "installable" | "update_required" => Some("installable"),
+            "unsupported" => Some("unsupported"),
+            _ => None,
+        }
+    }
+    // A recipe name as Lemonade spells one: lower case, digits, `-` and `_`.
+    // Rules out a warning's first word (`Warning:`) in a table with no header.
+    fn is_recipe_name(token: &str) -> bool {
+        token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+    // Each whitespace-separated token with the byte offset it starts at.
+    fn tokens_at(line: &str) -> Vec<(usize, &str)> {
+        let mut tokens = Vec::new();
+        let mut start = None;
+        for (index, ch) in line.char_indices() {
+            match (ch.is_whitespace(), start) {
+                (true, Some(from)) => {
+                    tokens.push((from, &line[from..index]));
+                    start = None;
+                }
+                (false, None) => start = Some(index),
+                _ => {}
+            }
+        }
+        if let Some(from) = start {
+            tokens.push((from, &line[from..]));
+        }
+        tokens
+    }
+    // Where the header puts the Status column, once the header is read.
+    let mut status_column: Option<usize> = None;
+    let mut current_recipe = String::new();
     let mut result = Vec::new();
     for line in output.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = tokens.first() else {
+        let tokens = tokens_at(line);
+        let Some(&(_, first)) = tokens.first() else {
             continue;
         };
-        if first == "Recipe" || first.starts_with("---") {
+        if first == "Recipe" {
+            status_column = line.find("Status");
             continue;
         }
-        // A row either starts with a recipe name (recipe + its first backend) or,
-        // for grouped recipes, with a backend name continuing the previous recipe.
-        let (backend, rest) = if RECIPES.contains(&first) {
-            current_recipe = match RECIPES.iter().find(|r| **r == first) {
-                Some(r) => r,
-                None => current_recipe,
-            };
-            match tokens.get(1) {
-                Some(backend) => (*backend, &tokens[2..]),
-                None => continue,
-            }
-        } else {
-            (first, &tokens[1..])
+        if first.starts_with("---") {
+            continue;
+        }
+        let continues_recipe = line.starts_with(char::is_whitespace);
+        let backend_index = usize::from(!continues_recipe);
+        let Some(&(_, backend)) = tokens.get(backend_index) else {
+            continue;
         };
+        // The row's state: with a header, the first token that starts at or
+        // after the Status column (a field wider than its column pushes the
+        // status right, never left); without one, the first state word after
+        // the backend. A line whose state slot holds no state is not a row,
+        // such as a warning Lemonade printed mid-table, even one with a state
+        // word in its text, and is skipped without ending the recipe above it,
+        // so the indented rows that follow still count for that recipe.
+        let state = match status_column {
+            Some(column) => tokens
+                .iter()
+                .skip(backend_index + 1)
+                .find(|(offset, _)| *offset >= column)
+                .map(|(_, token)| *token)
+                .filter(|token| is_state(token)),
+            None if continues_recipe || is_recipe_name(first) => tokens
+                .iter()
+                .skip(backend_index + 1)
+                .map(|(_, token)| *token)
+                .find(|token| is_state(token)),
+            None => None,
+        };
+        let Some(state) = state else {
+            continue;
+        };
+        if !continues_recipe {
+            first.clone_into(&mut current_recipe);
+        }
         if current_recipe != LLAMACPP_RECIPE {
             continue;
         }
-        if let Some(status) = rest.iter().find(|t| STATUSES.contains(t)) {
-            result.push((backend.to_owned(), (*status).to_owned()));
+        if let Some(status) = usable_status(state) {
+            result.push((backend.to_owned(), status.to_owned()));
         }
     }
     result
@@ -214,6 +323,7 @@ fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
 fn run_lemonade_backends_list(
     manifest: &LemonadeInstallManifest,
     process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<String> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
@@ -221,7 +331,7 @@ fn run_lemonade_backends_list(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    apply_lemonade_process_environment_with_parent(&mut command, process_env, parent)?;
     hide_child_console_window(&mut command);
     let output = command
         .output()
@@ -241,28 +351,52 @@ fn run_lemonade_backends_list(
 /// replacing one in place, so all three names can accumulate across attempts.
 pub(crate) const ROCM_LLAMACPP_BACKEND_DIRS: [&str; 3] = ["rocm-stable", "rocm-nightly", "rocm"];
 
-/// Like [`crate::direct_llama::find_llama_server_binary`], but scoped to the single backend Lemonade
-/// actually attempted (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s
-/// `"rocm"` / `"vulkan"`), rather than scanning every known backend directory in
-/// priority order. Lemonade reports the generic `"rocm"` — never the more specific
-/// `rocm-stable`/`rocm-nightly` — but may extract the actual build into either
-/// versioned directory, so `"rocm"` maps to the whole ROCm family; `"vulkan"` never
-/// does. This is what lets alignment verification reject a stale ROCm directory left
-/// by an earlier attempt when this round actually picked `vulkan` (or the reverse).
+/// The `bin/llamacpp/` directories that may hold the `llama-server` for a manifest's
+/// selected backend, or `None` when that backend cannot be served directly. Only
+/// `rocm` and `vulkan` are valid manifest backend names: installs record whatever
+/// Lemonade selects from its `rocm`/`vulkan` priority list, so the `rocm-stable` and
+/// `rocm-nightly` directory names are members of the `rocm` family, never backend
+/// names of their own. `cpu` and unknown names fail closed (no CPU fallback).
+pub(crate) fn backend_server_dirs(backend_name: &str) -> Option<&'static [&'static str]> {
+    match backend_name {
+        ROCM_BACKEND_NAME => Some(&ROCM_LLAMACPP_BACKEND_DIRS),
+        "vulkan" => Some(&["vulkan"]),
+        _ => None,
+    }
+}
+
+/// Find a GPU llama-server scoped to the backend Lemonade selected
+/// (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s `"rocm"` /
+/// `"vulkan"`), rather than scanning every known backend directory. `rocm` accepts
+/// its directory family (`rocm-stable`, `rocm-nightly`, `rocm`); Vulkan never crosses
+/// over to a stale ROCm install or the reverse. This is what lets alignment
+/// verification reject a stale ROCm directory left by an earlier attempt when this
+/// round actually picked `vulkan`. CPU and unknown names fail closed. Both flat and
+/// one-level build-numbered extraction layouts are supported.
 pub(crate) fn find_llama_server_binary_for_backend(
     manifest: &LemonadeInstallManifest,
     backend_name: &str,
 ) -> Option<PathBuf> {
     let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
     let binary = platform_binary_name("llama-server");
-    let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
-        &ROCM_LLAMACPP_BACKEND_DIRS
-    } else {
-        &["vulkan"]
-    };
-    family
+    backend_server_dirs(backend_name)?
         .iter()
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
+}
+
+/// Look for `binary` directly in `dir`, then one level down in each subdirectory.
+pub(crate) fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+    let direct = dir.join(binary);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|subdir| subdir.join(binary))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -370,6 +504,160 @@ vllm                rocm        unsupported     Requires Linux                  
         );
     }
 
+    /// `lemonade backends` as Lemonade 2026.44.1 prints it on a Linux host with
+    /// an AMD GPU: a `Tier` and a `Format` column, and recipes (`ds4`,
+    /// `llamacpp-hrx`, `thenoise`) no earlier release listed.
+    const LEMONADE_2026_44_BACKENDS_TABLE: &str = "\
+Recipe              Backend     Tier          Format     Status          Message/Version                               Action
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+acestep             rocm        experimental  native     installable     Backend is supported but not installed.        lemonade backends install acestep:rocm
+                    vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install acestep:vulkan
+ds4                 rocm        guest         native     installable     Backend is supported but not installed.        lemonade backends install ds4:rocm
+flm                 npu         core          native     installable     Backend is supported but not installed.        lemonade backends install flm:npu
+kokoro              cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install kokoro:cpu
+llamacpp            cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:cpu
+                    rocm        core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:rocm
+                    vulkan      core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:vulkan
+llamacpp-hrx        hrx         experimental  native     installable     Backend is supported but not installed.        lemonade backends install llamacpp-hrx:hrx
+moonshine           cpu         core          python     installable     Backend is supported but not installed.        lemonade backends install moonshine:cpu
+onnxruntime         cpu         experimental  native     installable     Backend is supported but not installed.        lemonade backends install onnxruntime:cpu
+openmoss            vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install openmoss:vulkan
+sd-cpp              cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:cpu
+                    rocm        core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:rocm
+                    vulkan      core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:vulkan
+thenoise            rocm        core          python     installable     Backend is supported but not installed.        lemonade backends install thenoise:rocm
+thinksound          rocm        experimental  native     installable     Backend is supported but not installed.        lemonade backends install thinksound:rocm
+                    vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install thinksound:vulkan
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+";
+
+    #[test]
+    fn parses_only_llamacpp_rows_from_the_2026_44_table() {
+        let backends = parse_llamacpp_backend_statuses(LEMONADE_2026_44_BACKENDS_TABLE);
+        assert_eq!(
+            backends,
+            vec![
+                ("cpu".to_owned(), "installable".to_owned()),
+                ("rocm".to_owned(), "installable".to_owned()),
+                ("vulkan".to_owned(), "installable".to_owned()),
+            ]
+        );
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("rocm".to_owned(), false))
+        );
+    }
+
+    /// Lines that are not rows between a `llamacpp` row and its indented rows
+    /// do not end the `llamacpp` rows: a warning with no state word, one whose
+    /// text contains a state word (`installed`), and one whose first word looks
+    /// like a recipe name. With a header the state is read at its Status column.
+    #[test]
+    fn a_warning_line_inside_the_table_does_not_end_the_llamacpp_rows() {
+        let table = "\
+Recipe              Backend     Tier          Format     Status          Message/Version                               Action
+---------------------------------------------------------------------------------------------------------------
+llamacpp            cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:cpu
+Warning: could not reach GitHub to check for updates
+Warning: llamacpp:rocm is installed but outdated
+lemonade is installed but update_required for llamacpp:rocm
+                    rocm        core          native     update_required Backend update is required before use.         lemonade backends install llamacpp:rocm
+                    vulkan      core          native     installed       b11580
+sd-cpp              cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:cpu
+                    rocm        core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:rocm
+";
+        let expected = vec![
+            ("cpu".to_owned(), "installable".to_owned()),
+            ("rocm".to_owned(), "installable".to_owned()),
+            ("vulkan".to_owned(), "installed".to_owned()),
+        ];
+        assert_eq!(parse_llamacpp_backend_statuses(table), expected);
+    }
+
+    /// Without a header there is no Status column to read, so a first-column
+    /// line names a recipe only if its first word is shaped like one: a
+    /// `Warning:` line with a state word in it is still skipped.
+    #[test]
+    fn a_warning_with_a_state_word_does_not_end_the_llamacpp_rows_without_a_header() {
+        let table = "\
+llamacpp            cpu         installable     Backend is supported but not installed.
+Warning: llamacpp:rocm is installed but outdated
+                    rocm        update_required Backend update is required before use.
+                    vulkan      installed       b11580
+sd-cpp              cpu         installable     Backend is supported but not installed.
+";
+        assert_eq!(
+            parse_llamacpp_backend_statuses(table),
+            vec![
+                ("cpu".to_owned(), "installable".to_owned()),
+                ("rocm".to_owned(), "installable".to_owned()),
+                ("vulkan".to_owned(), "installed".to_owned()),
+            ]
+        );
+    }
+
+    /// A field wider than its column pushes the Status column right; the state
+    /// is still the first token at or after the header's Status column.
+    #[test]
+    fn a_field_wider_than_its_column_still_finds_the_state() {
+        let table = "\
+Recipe              Backend     Tier          Format     Status          Message/Version
+llamacpp            rocm        core          native-overflowing installed  b11580
+";
+        assert_eq!(
+            parse_llamacpp_backend_statuses(table),
+            vec![("rocm".to_owned(), "installed".to_owned())]
+        );
+    }
+
+    #[test]
+    fn another_recipes_backend_is_never_read_as_a_llamacpp_backend() {
+        // Plain `lemonade backends` (no `--all`) leaves unsupported backends
+        // out, so on a host with no GPU backend for llama.cpp its only row is
+        // `cpu`. The indented `vulkan` row belongs to `openmoss`; read as a
+        // `llamacpp` backend, it would select a GPU backend Lemonade does not
+        // offer for llama.cpp here.
+        let output = "\
+Recipe              Backend     Tier          Format     Status          Message/Version                               Action
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+llamacpp            cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:cpu
+openmoss            rocm        experimental  native     installable     Backend is supported but not installed.        lemonade backends install openmoss:rocm
+                    vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install openmoss:vulkan
+";
+        let backends = parse_llamacpp_backend_statuses(output);
+        assert_eq!(backends, vec![("cpu".to_owned(), "installable".to_owned())]);
+        assert_eq!(select_best_llamacpp_backend(&backends), None);
+    }
+
+    #[test]
+    fn update_states_read_as_the_state_they_act_like() {
+        // `update_required`: the installed build will not run until it is
+        // reinstalled, so it must be installed again, not reused. An
+        // `update_available` build still runs and is reused; Lemonade prints
+        // that 16-character state with no space before the message. An
+        // `action_required` row is left out, whatever words its message holds.
+        let output = "\
+Recipe              Backend     Tier          Format     Status          Message/Version                               Action
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+llamacpp            rocm        core          native     update_required Backend update is required before use.         lemonade backends install llamacpp:rocm
+                    vulkan      core          native     update_availableNewer upstream release available: b11400       lemonade backends install llamacpp:vulkan
+                    system      core          native     action_required Use the installed driver instead.              -
+";
+        let backends = parse_llamacpp_backend_statuses(output);
+        assert_eq!(
+            backends,
+            vec![
+                ("rocm".to_owned(), "installable".to_owned()),
+                ("vulkan".to_owned(), "installed".to_owned()),
+            ]
+        );
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("rocm".to_owned(), false)),
+            "an update_required rocm backend is reinstalled, not dropped for vulkan"
+        );
+    }
+
     #[test]
     fn selects_vulkan_when_rocm_unsupported() {
         let backends = vec![
@@ -465,6 +753,39 @@ vllm                rocm        unsupported     Requires Linux                  
             find_llama_server_binary_for_backend(&manifest, "vulkan"),
             Some(vulkan_dir.join(&server))
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_llama_server_binary_for_backend_fails_closed_for_cpu_and_unknown() {
+        let dir = scratch_dir("find-server-fail-closed");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        // Every directory holds a server, so a fallback to any of them would be
+        // found: only failing closed returns None.
+        for backend in [
+            "rocm-stable",
+            "rocm-nightly",
+            "rocm",
+            "vulkan",
+            "cpu",
+            "mystery",
+        ] {
+            fs::create_dir_all(llamacpp.join(backend)).unwrap();
+            fs::write(llamacpp.join(backend).join(&server), b"x").unwrap();
+        }
+        let manifest = test_manifest(runtime_dir);
+        // `rocm-stable`/`rocm-nightly` are directories of the `rocm` family, never
+        // backend names a manifest records.
+        for backend in ["cpu", "mystery", "", "rocm-stable", "rocm-nightly"] {
+            assert_eq!(backend_server_dirs(backend), None, "{backend:?}");
+            assert_eq!(
+                find_llama_server_binary_for_backend(&manifest, backend),
+                None,
+                "{backend:?} must not fall back to another backend's server"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 }

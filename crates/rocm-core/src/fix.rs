@@ -16,9 +16,11 @@
 //! place.
 //!
 //! This file is the module root. The exit codes, [`FixOptions`] and [`FixClass`]
-//! live in `fix/options.rs`, and the consent decision, the timeouts and the
-//! `fail!` helper in `fix/consent.rs`; the names are re-exported from here, so
-//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving. The
+//! live in `fix/options.rs` and are re-exported from here, so
+//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving.
+//! `fix/consent.rs` holds the consent decision, the timeouts, the `fail!`
+//! helper, and the one way a runner runs a host command and reports how it
+//! ended (`run_step`, `Step`, `CheckIn`, `StepFailure`, `read_failure`). The
 //! runners, one per auto-applicable fix, are in `fix/runners.rs`. The closed
 //! catalog (`RECIPES`, `FixRecipe`, the lookups by fix-id and the test-only
 //! oracles) is in `fix/catalog.rs`, its rendering in `fix/render.rs` and its
@@ -39,7 +41,9 @@ use render::{
 };
 use std::io::Write;
 
-pub(crate) use catalog::{COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, is_catalog_id};
+pub(crate) use catalog::{
+    COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, RENDER_GROUP_VERIFY, is_catalog_id,
+};
 pub use catalog::{class_on, needs_on};
 pub use manifest::{
     CATALOG_CONTRACT_VERSION, CatalogManifest, ManifestEntry, ManifestPlatform, catalog_manifest,
@@ -64,7 +68,7 @@ pub(crate) use catalog::{ShellRun, run_typed_in_cmd_and_powershell};
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
-        fail!("Unknown fix-id: {fix_id}");
+        fail!("{} {fix_id}", exit::UNKNOWN_ID_PREFIX);
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
@@ -165,7 +169,8 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
             // carry it out with -> INTERNAL, not FAILED (which is reserved for
-            // "attempted, and the command failed"). Held by
+            // "attempted, and a command or the read it planned from failed").
+            // Held by
             // `a_recipe_that_acts_has_a_runner`.
             fail!("Internal error: a recipe the catalog says is applied here has no runner.");
             exit::INTERNAL
@@ -278,6 +283,25 @@ mod tests {
             act_on(&elsewhere, &opts),
             3,
             "a recipe that does not apply here is a wrong-machine result, whatever its class"
+        );
+    }
+
+    /// The published `internal` description: a recipe the catalog says the CLI
+    /// carries out here, with no runner to carry it out, is the CLI's own fault
+    /// and exits with the code published as `internal`, not `failed`.
+    /// `a_recipe_that_acts_has_a_runner` keeps the real catalog off this path;
+    /// this drives the path itself with a synthetic recipe.
+    #[test]
+    fn a_recipe_the_catalog_says_is_applied_with_no_runner_exits_internal() {
+        // `Auto` is the class that says the CLI applies the fix itself
+        // (`FixClass::applies_itself`); a runner-less `NeedsArgument` entry only
+        // prints steps, so it is not this path.
+        let recipe = unfixable_recipe(FixClass::Auto);
+        assert_eq!(plan_of(&recipe), Plan::MissingRunner);
+        assert_eq!(
+            act_on(&recipe, &FixOptions::default()),
+            exit::INTERNAL,
+            "an AUTO entry with no runner must exit with the code published as internal"
         );
     }
 
@@ -858,10 +882,12 @@ mod tests {
             "apply",
             "act_on",
             "run_render_group",
+            "render_group_with",
             "run_unset_override",
             "run_unset_override_linux",
             "report_persistent_override",
             "run_unset_override_windows",
+            "unset_override_windows_with",
             "report_and_clear_override_windows",
             "run_path_export",
             "run_path_export_linux",
@@ -871,6 +897,7 @@ mod tests {
             "run_hip_visible_devices_linux",
             "pin_device_in_rc_file",
             "run_hip_visible_devices_windows",
+            "hip_visible_devices_windows",
         ] {
             assert!(
                 scan.checked.iter().any(|name| name == runner),

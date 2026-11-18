@@ -20,29 +20,29 @@ url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/679980629"
 provenance = "github-attestations"
 
 [[tools."github:lemonade-sdk/lemonade"]]
-version = "11.5.1"
+version = "2026.44.1"
 backend = "github:lemonade-sdk/lemonade"
-specifiers = ["11.5.1"]
+specifiers = ["2026.44.1"]
 
 [tools."github:lemonade-sdk/lemonade".options]
 asset_pattern = "lemonade-embeddable-*-ubuntu-x64.tar.gz"
 
 [tools."github:lemonade-sdk/lemonade"."platforms.linux-x64"]
-checksum = "sha256:bdfd3c3e5d6eda5101c8a32f36e6dd9236ceb9ab2eb66734c32628e6e86e18ac"
+checksum = "sha256:16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90"
 checksum_source = "mise-versions"
-url = "https://github.com/lemonade-sdk/lemonade/releases/download/v11.5.1/lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz"
-url_api = "https://api.github.com/repos/lemonade-sdk/lemonade/releases/assets/494668215"
+url = "https://github.com/lemonade-sdk/lemonade/releases/download/v2026.44.1/lemonade-embeddable-2026.44.1-ubuntu-x64.tar.gz"
+url_api = "https://api.github.com/repos/lemonade-sdk/lemonade/releases/assets/686598439"
 
 [[tools."github:lemonade-sdk/lemonade"]]
-version = "11.5.1"
+version = "2026.44.1"
 backend = "github:lemonade-sdk/lemonade"
-specifiers = ["11.5.1"]
+specifiers = ["2026.44.1"]
 
 [tools."github:lemonade-sdk/lemonade".options]
 asset_pattern = "lemonade-embeddable-*-windows-x64.zip"
 
 [tools."github:lemonade-sdk/lemonade"."platforms.windows-x64"]
-checksum = "sha256:50a133bbc35c4f3f8971eafef2c9fe56c4bbbfb0f1032bf8728324d8d8c8a0e1"
+checksum = "sha256:7ff6c5d6ab612c33690411a7e53d6d0dd62eb515a073375c35015b0778a5a344"
 checksum_source = "mise-versions"
-url = "https://github.com/lemonade-sdk/lemonade/releases/download/v11.5.1/lemonade-embeddable-11.5.1-windows-x64.zip"
-url_api = "https://api.github.com/repos/lemonade-sdk/lemonade/releases/assets/494668221"
+url = "https://github.com/lemonade-sdk/lemonade/releases/download/v2026.44.1/lemonade-embeddable-2026.44.1-windows-x64.zip"
+url_api = "https://api.github.com/repos/lemonade-sdk/lemonade/releases/assets/686598433"

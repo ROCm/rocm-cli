@@ -138,3 +138,20 @@ Feature: Update report
     When the user previews applying the update to that wheel runtime
     Then the preview says a real install would prepare a managed Python
     And the preview prepared no Python, as it says
+
+  # An update installs from the layout its runtime was recorded in, and names no
+  # pin. A runtime of the earlier release stream recorded with only a family
+  # label (`gfx120X-all`, which that stream serves) must therefore still update:
+  # the newest layout needs an exact arch, but the runtime is not being moved
+  # there. Gating the update on a fresh install's routing would refuse it with
+  # "requires an exact GPU arch", though its own resolution never needed one.
+  # The report is the update's plan, so it names the earlier stream it reads.
+  #
+  # Linux only, for the same empty-`PATH` host as update-09.
+  @id:update-apply-keeps-a-grouped-family-runtime-on-its-recorded-stream @requires-os:linux
+  Scenario: update-11 - Previewing an update of an earlier-stream runtime recorded with a family label keeps it on that stream
+    Given a canonical release pip index fixture
+    And a host with no usable Python and a recording uv
+    And a registered wheel runtime of the earlier release stream with a grouped family
+    When the user previews applying the update to that wheel runtime
+    Then the preview resolves the canonical release pip index

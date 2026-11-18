@@ -200,10 +200,11 @@ jobs:
               # file-type-filter gap must still run that test on the PR.
               - '.pre-commit-config.yaml'
               - '.github/workflows/**'
-            # build-and-test runs cargo AND the python/shell smoke steps plus the
-            # install-lifecycle E2E (`cargo xtask package` + the real installer),
-            # so it depends on the Rust set, the packaging xtask, the lifecycle
-            # feature/steps, and the installer inputs.
+            # build-and-test runs cargo, the smoke gate and the remaining
+            # python/shell self-tests, plus the install-lifecycle E2E (`cargo
+            # xtask package` + the real installer), so it depends on the Rust
+            # set, the packaging xtask, the lifecycle feature/steps, and the
+            # installer inputs.
             heavy:
               - '**/*.rs'
               - '**/Cargo.toml'
@@ -500,7 +501,7 @@ jobs:
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
-        run: python scripts/smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       - name: Acceptance harness self-tests
         if: needs.changes.outputs.heavy == 'true'
@@ -865,7 +866,7 @@ jobs:
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: python .\scripts\smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       # One command per step: pwsh carries on past a failing native command and
       # the step reports only the last command's exit code, so a multi-line
@@ -1064,10 +1065,15 @@ jobs:
         # serve-33/serve-34/serve-35 (the native-Windows vLLM refusal for `serve` and
         # `engines install`) are folded in the same way: `@requires-os:windows`,
         # hermetic, and otherwise run only on the optional self-hosted lane.
+        #
+        # runtime-lifecycle-19/20/21 (runtimes installed before and after the ROCm
+        # 10 layout, side by side) are folded in for the same reason: planted
+        # runtimes, no GPU or network, and their Windows paths are what this
+        # lane proves.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
-          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,runtime-lifecycle-side-by-side-across-packaging-change,runtime-lifecycle-side-by-side-uninstall-keeps-the-others,runtime-lifecycle-side-by-side-shared-name-refused"
         run: |
           # Derive from CARGO_TARGET_DIR when it is set, falling back to the
           # default target dir, so a future job-level CARGO_TARGET_DIR cannot
@@ -1984,8 +1990,10 @@ jobs:
   # e2e-gpu-strix-windows). They live there — not here — so a job queued on an
   # offline self-hosted runner (which GitHub cannot cancel) can never hold this
   # workflow's concurrency group and stall its merge-required checks (EAI-7548).
-  # They are non-blocking (continue-on-error) and fork-safe (self-hosted runners
-  # do not execute untrusted fork PRs). See docs/ci-hardware-testing.md.
+  # They are non-blocking (none is a required check) and fork-restricted: GitHub does
+  # not start self-hosted jobs from an external fork's pull_request run without
+  # approval (whether that is every fork run or only a first-time contributor's
+  # is a repository setting). See docs/ci-hardware-testing.md.
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
   #

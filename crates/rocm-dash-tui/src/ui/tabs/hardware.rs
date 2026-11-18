@@ -402,7 +402,7 @@ fn gpu_section_header(snap: &Snapshot, theme: &Theme) -> Line<'static> {
             ));
         }
     }
-    let total_power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
+    let total_power = rocm_dash_core::efficiency::node_power_w(&snap.gpus);
     spans.push(Span::styled(
         format!("  ·  {:.1} kW", total_power / 1000.0),
         Style::default().fg(theme.fg),
@@ -1185,6 +1185,28 @@ mod tests {
             row.contains("0.50 tok/W (held)"),
             "marker clipped at 80 columns: {row:?}"
         );
+    }
+
+    #[test]
+    fn gpu_section_header_kw_skips_a_faulty_power_sensor() {
+        // 500 W next to an infinite and a negative reading: the header must say
+        // 0.5 kW, not `inf kW` or a total deflated by the negative one.
+        let theme = Theme::default_dark();
+        let snap = Snapshot {
+            gpus: vec![
+                mk_gpu("gpu-0", 50.0, 65.0, 500.0),
+                mk_gpu("gpu-1", 50.0, 65.0, f32::INFINITY),
+                mk_gpu("gpu-2", 50.0, 65.0, -300.0),
+            ],
+            ..Default::default()
+        };
+        let text: String = gpu_section_header(&snap, &theme)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("0.5 kW"), "usable total missing: {text}");
+        assert!(!text.contains("inf") && !text.contains("NaN"), "{text}");
     }
 
     #[test]

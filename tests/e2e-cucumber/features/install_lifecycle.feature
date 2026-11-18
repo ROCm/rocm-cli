@@ -468,3 +468,110 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the installed rocm and rocmd binaries are gone
     And the user's own fish completions are untouched
+
+  # ── Default trust: the pinned release key with no signature requested ──
+  #
+  # Every other install here asks for a signature (ROCM_CLI_REQUIRE_SIGNATURE=1),
+  # so lifecycle-03 and -06 stay green under a regression that only bites when
+  # nobody asked. These two run as a user does, without asking:
+  #
+  # - lifecycle-36 installs a specific version with the variable set to 0, so
+  #   only the pinned-key fallback is left to force the check (the release
+  #   channel's own signature requirement does not apply). It catches an
+  #   installer that verifies only when ROCM_CLI_REQUIRE_SIGNATURE is set, and
+  #   one that verifies only when a signature is required, not merely when a
+  #   key resolves.
+  # - lifecycle-37 is a release install with the variable unset and no .sig. It
+  #   catches an installer that verifies only when ROCM_CLI_REQUIRE_SIGNATURE is
+  #   set, and one that tolerates a missing .sig unless that variable is set,
+  #   which lifecycle-36 (the .sig is there) and lifecycle-06 (the variable is
+  #   set) both miss. It does not catch an installer that verifies only when a
+  #   signature is required: the release channel's signature floor requires one,
+  #   which masks that regression here.
+  #
+  # Neither can detect removal of the release channel's signature floor: while a
+  # release key is pinned, a resolved key already forces the check. Nor does
+  # lifecycle-36 check that the harness passes its channel through: if the step
+  # silently ran a release install instead, the floor would force the same
+  # rejection, and the second regression above would go unnoticed.
+
+  @id:lifecycle-linux-default-rejects-untrusted-signer @lifecycle @requires-os:linux
+  Scenario: lifecycle-36 - Linux - installing a specific version with the signature requirement turned off still checks the pinned release key and rejects an untrusted signer
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the user has turned the installer's signature requirement off
+    When the release is packaged and signed with the private key file
+    And a specific version of the signed bundle is installed with no public key supplied
+    Then the install fails reporting signature verification failed
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-default-rejects-missing-signature @lifecycle @requires-os:linux
+  Scenario: lifecycle-37 - Linux - a release install that asks for nothing still rejects a bundle with no signature
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the user has not asked the installer to require a signature
+    When the release is packaged and signed with the private key file
+    And the bundle signature sidecar is removed
+    And the signed bundle is installed with no public key supplied
+    Then the install fails reporting the required signature is missing
+    And no binaries are activated in the target directory
+
+  # ── Download progress rendering ────────────────────────────────────────
+
+  @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
+  Scenario: lifecycle-38 - Linux - a download draws one progress bar that stays inside the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a pseudo-terminal narrower than COLUMNS
+    Then every download progress frame stays within the terminal
+    And the finished screen shows one completed bar per download
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
+  Scenario: lifecycle-39 - Linux - a terminal too narrow for a bar downloads quietly and says why
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a terminal too narrow for a progress bar
+    Then the installer reports that the terminal is too narrow for a progress bar
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
+  Scenario: lifecycle-40 - Linux - the wget fallback keeps its progress bar inside the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a pseudo-terminal with curl unavailable
+    Then every download progress frame stays within the terminal
+    And the download prints no request logging around the bar
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-piped-into-shell @lifecycle @requires-os:linux
+  Scenario: lifecycle-41 - Linux - piping the installer into a shell still sizes the bar from the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed by piping the installer into a shell
+    Then every download progress frame stays within the terminal
+    And each completed bar spans the measured terminal width
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-unsized-terminal @lifecycle @requires-os:linux
+  Scenario: lifecycle-42 - Linux - a terminal reporting no size still gets a progress bar
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed where the terminal reports no size
+    Then the installer still draws a progress bar
+    And each completed bar spans the measured terminal width
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-zero-padded-columns @lifecycle @requires-os:linux
+  Scenario: lifecycle-43 - Linux - a zero-padded COLUMNS does not abort the install
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with a zero-padded COLUMNS and no way to measure
+    Then every download progress frame stays within the terminal
+    And the installed rocm binary is present

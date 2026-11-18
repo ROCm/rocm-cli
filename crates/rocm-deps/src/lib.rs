@@ -24,14 +24,14 @@ mod pins_gen;
 /// GitHub repository publishing the Lemonade embeddable release archives.
 pub const LEMONADE_GITHUB_REPO: &str = "lemonade-sdk/lemonade";
 
-/// Strip a leading `v` from a release tag (`v11.5.1` -> `11.5.1`).
+/// Strip a leading `v` from a release tag (`v2026.44.1` -> `2026.44.1`).
 #[must_use]
 pub fn strip_v(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
 /// Name of the Lemonade embeddable archive for a host token and extension,
-/// e.g. `lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz`.
+/// e.g. `lemonade-embeddable-2026.44.1-ubuntu-x64.tar.gz`.
 #[must_use]
 pub fn lemonade_archive_name(version: &str, os_arch: &str, extension: &str) -> String {
     format!(

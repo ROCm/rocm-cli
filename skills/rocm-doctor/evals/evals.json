@@ -126,7 +126,7 @@
       "note": "Replays a current CLI. The import error matches the torch DLPack entry (Linux and WSL2) at the likely level (score 50), not the high-confidence level. The recorded plan opens with steps that confirm the torch version in the engine's environment before the reinstall, so the agent should present the match as likely and have the user check that first rather than state the cause as certain. The user has not named a group or permission problem, and the agent must not invent one. The prompt names Linux on purpose: this catalog entry applies on Linux and WSL2 only and native Windows gets no match, so the case is not expected to pass on a Windows lane.",
       "prompt": "vLLM fails to start on my AMD GPU on Linux with 'ImportError: libtorch_cuda.so: cannot open shared object file: No such file or directory'. How do I fix it?",
       "expected_behavior": [
-        "Run `rocm diagnose` with the error line as the symptom and relay the matched cause and the engine reinstall the CLI returned",
+        "Run `rocm diagnose` with the error line as the symptom and relay the matched cause",
         "Present the match as likely rather than certain, and have the user check the torch version in the engine's environment before reinstalling the engine",
         "Say near the start of the reply, before any step-by-step plan, that the fix is print-only: the user runs the printed steps and the CLI does not apply them"
       ],
@@ -157,14 +157,15 @@
     {
       "id": "rocm-no-vendor-no-amd-gpu-asks-which-gpu",
       "skill_should_trigger": true,
-      "note": "The user names no GPU vendor, so the skill runs `rocm examine --json` before diagnosing. `evals/hooks.py` replays a current CLI whose examination found no AMD GPU, status `no-amd-gpu`. That status only says the CLI found none, so the skill asks which GPU the machine has and proposes nothing until that is settled. The `logs_contain` pin is a field name that only the replayed examination prints, so it holds only if the agent ran `rocm examine --json` against the replay. The replay omits the `summary` object the real command adds; the skill reads `status` and `has_amd_gpu` and nothing in `summary`.",
+      "note": "The user names no GPU vendor, so the skill runs `rocm examine --json` before diagnosing. `evals/hooks.py` replays a current CLI whose examination found no AMD GPU, status `no-amd-gpu`. That status only says the CLI found none, so the skill asks which GPU the machine has and proposes nothing until that is settled. The `logs_contain` pin is a field name that only the replayed examination prints, so it holds only if the agent ran `rocm examine --json` against the replay. The replay omits the `summary` object the real command adds; the skill reads `status` and `has_amd_gpu` and nothing in `summary`. A reply that diagnoses first and asks only whether the GPU is AMD fails the second expectation and the second unexpected behavior.",
       "prompt": "ROCm stopped working on this machine and torch can't see the GPU. What's wrong?",
       "expected_behavior": [
         "Run `rocm examine --json` before diagnosing, because the user named no GPU vendor",
-        "Tell the user that the CLI found no AMD GPU, and ask which GPU the machine has"
+        "Tell the user that the CLI found no AMD GPU, ask which GPU the machine has as an open question, and end the reply on that question"
       ],
       "unexpected_behavior": [
         "Propose or apply a fix, or route the user to an upstream tracker, before the user has said which GPU the machine has",
+        "Run `rocm diagnose` or show a diagnosis or fix plan in the same reply as the question about which GPU the machine has",
         "Decline the request as out of scope because the GPU is not AMD",
         "Execute a mutating or sudo command without first getting the user's explicit consent"
       ],
@@ -175,13 +176,15 @@
     {
       "id": "rocm-no-vendor-wsl-host-gpu-hidden-asks-which-gpu",
       "skill_should_trigger": true,
-      "note": "On WSL2 `rocm examine` answers status `wsl` whatever the GPU, so the skill reads `has_amd_gpu`, which is set from the Windows side. The replay is a WSL2 host whose Windows side has no AMD GPU: status `wsl`, `has_amd_gpu` false. An agent that treats `wsl` as 'nothing to ask' goes on to diagnose without ever learning which GPU the machine has. The pin is a field name only the replayed examination prints. The replay omits the real command's `summary` object.",
+      "note": "On WSL2 `rocm examine` answers status `wsl` whatever the GPU, so the skill reads `has_amd_gpu`, which is set from the Windows side. The replay is a WSL2 host whose Windows side has no AMD GPU: status `wsl`, `has_amd_gpu` false. An agent that treats `wsl` as 'nothing to ask' goes on to diagnose without ever learning which GPU the machine has. The pin is a field name only the replayed examination prints. The replay omits the real command's `summary` object. A reply that diagnoses first and asks only whether the GPU is AMD fails the second expectation and the second unexpected behavior.",
       "prompt": "I'm in WSL2 on Windows and torch can't see the GPU, torch.cuda.is_available() is False. What's wrong?",
       "expected_behavior": [
-        "Run `rocm examine --json`, read `has_amd_gpu` as false although the status is `wsl`, and ask which GPU the machine has"
+        "Run `rocm examine --json` and read `has_amd_gpu` as false although the status is `wsl`",
+        "Ask which GPU the machine has as an open question, and end the reply on that question"
       ],
       "unexpected_behavior": [
         "Go on to propose a fix without asking which GPU the machine has, because the status is `wsl`",
+        "Run `rocm diagnose` or show a diagnosis or fix plan in the same reply as the question about which GPU the machine has",
         "Decline the user because they are on WSL2",
         "Execute a mutating or sudo command without first getting the user's explicit consent"
       ],

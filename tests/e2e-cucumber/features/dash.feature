@@ -75,7 +75,13 @@ Feature: Interactive dashboard
     When the user opens the dashboard
     And the user opens the Observe view
     Then the managed model is displayed
-    When the user quits the dashboard
+    When the user opens the managed services overlay
+    Then the Services overlay lists the managed model with its port
+    When the user asks to stop the listed service
+    Then a stop approval prompt names the managed model and its port
+    When the user declines the approval prompt
+    And the user closes the managed services overlay
+    And the user quits the dashboard
     Then the dashboard exits successfully
 
 
@@ -908,5 +914,89 @@ Feature: Interactive dashboard
     When the user opens the dashboard replaying an idle 16-core host
     When the user opens the Observe view
     Then the CPU graph and the per-core strip sit side by side
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  Scenario: dash-52 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
+    Given a managed runtime is active
+    And the dashboard watches only managed services
+    And a GGUF model is being served on lemonade
+    Then the model responds to inference requests
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the real managed Lemonade model is displayed
+    When the user opens instance detail
+    Then the managed model's instance detail shows it ready on the port it was served on
+    When the user closes instance detail
+    And the user selects engine status in the Serving view
+    Then Lemonade is shown as a managed runtime installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the model responds to inference requests
+
+  @id:dash-lemonade-external-protocol-discovery @requires-os:linux
+  Scenario: dash-53 - External Lemonade protocol discovery displays every loaded model without adopting the service
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the user opens the managed services overlay
+    Then the Services overlay has no managed servers
+    When the user attempts to stop and restart the external models
+    Then the Services overlay closes without an approval prompt or job
+    And both loaded models are still displayed
+    And the external server received no lifecycle request and no managed record exists
+    When the user selects engine status in the Serving view
+    Then Lemonade is shown as externally running without a managed installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the external server received no lifecycle request and no managed record exists
+
+  @id:dash-lemonade-external-protocol-transitions @requires-os:linux
+  Scenario: dash-54 - External Lemonade protocol models disappear on unload, return on reload, and disappear again when the server stops responding
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the external Lemonade server unloads its second model
+    Then only the first model is displayed, with its throughput
+    When the external Lemonade server unloads every model
+    Then no loaded model is displayed and none are reported as discovered
+    When the external Lemonade server loads both models again
+    Then both loaded models are displayed with throughput shown as unknown
+    And the external server received no lifecycle request and no managed record exists
+    When the external Lemonade server stops responding
+    Then no loaded model is displayed and none are reported as discovered
+    When the user selects engine status in the Serving view
+    Then Lemonade returns to the managed installation status without external availability
+
+  # ROCMAI-1042: on a short terminal the Esc menu drew its bordered modal and
+  # nothing inside it — the wordmark plus all three rows did not fit, and the
+  # only guard was all-or-nothing. The selection stayed live behind the empty
+  # box, so ↑/↓ and Enter still worked on rows nobody could see.
+  #
+  # dash-34 already opens this menu, but only at the default geometry, where
+  # the logo layout fits and the bug is invisible. The unit sweep beside
+  # `ui/menu.rs` covers every height against the layout functions; this is the
+  # one place the real event loop, the real SIGWINCH resize and the real
+  # terminal are in the picture, which is where the empty box was actually
+  # seen.
+  #
+  # The box at this size holds two of the three rows, so what is asserted is
+  # the SELECTED row — drawn with its cursor and its whole label, before and
+  # after a move. That covers both halves of the fix: the fallback draws
+  # instead of returning, and its width floor keeps what it draws legible.
+  @id:dash-esc-menu-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-55 - The Esc menu still shows its selected action on a terminal too short for the logo
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user shrinks the terminal below the Esc menu's logo layout
+    And the user presses Escape
+    Then the dashboard menu shows Options as the selected action
+    When the user moves the dashboard menu selection down
+    Then the dashboard menu shows Help as the selected action
+    When the user presses Escape
+    Then the dashboard menu is closed
     When the user quits the dashboard
     Then the dashboard exits successfully

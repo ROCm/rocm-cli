@@ -44,7 +44,7 @@ repos:
         # mise.cmd is checked out with CRLF on purpose (.gitattributes).
         exclude: '^(THIRD_PARTY_NOTICES\.txt|runtimes/bin/mise\.cmd)$'
 
-  # Python: lint + format the helper scripts and engine workers.
+  # Python: lint + format every Python file in the repository.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.3
     hooks:

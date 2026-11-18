@@ -30,7 +30,16 @@ digests outside `runtimes/`; their build-time constants are generated from
 `mise.lock` into constants at build time (`LEMONADE_VERSION`,
 `LEMONADE_LINUX_X64_URL`, `LEMONADE_LINUX_X64_SHA256`, …), and the Lemonade
 adapter checks its download against that digest, so a version and its digests
-can only move together. uv is pinned only as lock tooling, so no constants are
+can only move together. The one exception is deliberate:
+`LINUX_LEMOND_NEEDS` in [`install.rs`](../engines/lemonade/src/install.rs)
+records what the pinned Linux `lemond` needs from the host (glibc and
+OpenSSL, read with `objdump -T lemond`), keyed by that archive's digest, and a
+unit test holds that digest equal to the one in `mise.lock`. So a Lemonade bump,
+by hand or by the weekly update, fails `cargo test` until someone re-reads those
+needs for the new archive. That is why the weekly update's Lemonade bumps are
+expected to stay red for now: 2026.45.3's `lemond` needs glibc 2.43 and
+OpenSSL 3.2.0, which Ubuntu 24.04 does not have, so the pin stays at 2026.44.1.
+uv is pinned only as lock tooling, so no constants are
 generated for it. The Python stacks are locked here but not yet read by an
 installer: until they are, the versions vLLM installs are still also spelled
 in [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) and
@@ -59,7 +68,8 @@ The mise tasks install the pinned tools first, Lemonade included, so even
 `runtimes/bin/mise run --cd runtimes check` needs the network on a fresh
 machine; `cargo xtask deps check` does not.
 
-To bump one binary by hand, edit its version in `mise.toml` and run `lock`.
+To bump one binary by hand, edit its version in `mise.toml` and run `lock`
+(for Lemonade, also re-read `LINUX_LEMOND_NEEDS`, above).
 To change a Python stack, edit its requirements in `profiles.toml` and run
 `lock`. Commit everything under `runtimes/` together.
 

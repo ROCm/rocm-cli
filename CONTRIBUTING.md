@@ -52,10 +52,10 @@ The pre-push hooks (`cargo clippy`, the e2e harness clippy and `cargo test`) che
 
 The manifest hooks only run when you change the dependency graph. They *rewrite* the generated file instead of only reporting that it is stale. When that happens, the commit stops so you can re-stage the refreshed file.
 
-The `THIRD_PARTY_NOTICES.txt` hook also needs the pinned generator. Without it, the hook skips and CI remains the gate:
+The `THIRD_PARTY_NOTICES.txt` hook also needs the pinned generator. Without it, the hook skips and CI remains the gate for that hook, but the AGENTS.md section 8 gate needs it:
 
 ```bash
-cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
+cargo install cargo-about@0.9.1 --locked --features cli   # for THIRD_PARTY_NOTICES.txt and `cargo xtask tpn --check`
 ```
 
 The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, including untracked files that aren't gitignored, so an unrelated unheadered file (even one not yet committed) can block an otherwise-unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is. `prek` runs it like the others, but doesn't provision the `hawkeye` binary. Unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version may run whatever that version's own license-header rules happen to be, which may disagree with CI, or may reject `licenserc.toml` outright. For example, `hawkeye` 6.x rejects this repository's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code:
@@ -107,14 +107,14 @@ see `docs/aim-catalog.md` for the refresh process and staleness warning.
 | Rust (all crates) | `cargo test` |
 | Lint and format check | `prek run --all-files` |
 
-See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps.
+See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps. [AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md) has the minimum quality gate; this table lists only some of its commands.
 
 ## Making changes
 
 1. **Fork** the repository and create a branch from `main`.
 2. **Make your changes.** Keep commits focused, with one logical change per commit.
 3. **Add or update tests** for any new behavior.
-4. **Run the relevant test suite** before opening a PR.
+4. **Run at least the minimum quality gate** ([AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md), "Verification Matrix For This Repo"), plus the suites relevant to your change, before opening a PR.
 5. **Open a pull request** against `main` with a clear title and description following the Conventional Commits format.
 
 ### Commit signing and sign-off
@@ -131,12 +131,20 @@ git config --global commit.gpgsign true
 
 See [Commit signatures](https://github.com/ROCm/rocm-cli/blob/main/docs/commit-signatures.md) for GPG signing, GitHub "Verified" status, and troubleshooting.
 
+### Commit messages are public history
+
+Pull requests are normally squash-merged, and by default the squash commit's message is built from the messages of the branch's commits; rebase-merge is also enabled, and lands each commit with its own message. Either way, once merged the messages are public history that is not rewritten, so commit messages are reviewed for accuracy on the same footing as the diff: each describes what its own commit does in words still true at the branch head, and one whose words a later commit on the branch made misleading is corrected before the pull request merges. AGENTS.md section 5 states the rule for contributors and section 11 for reviewers.
+
 ### What reviewers look for
 
 - Tests cover the new behavior
 - No secrets, credentials, or internal hostnames in committed files
 - Third-party dependencies recorded in `Cargo.lock`
 - License headers on new source files (see `licenserc.toml`)
+- Comments and documentation a pull request adds or changes that state how the code behaves are checked against that code, and one that is the reason for a decision names the file and the function, constant or test that makes it true, as AGENTS.md section 3 states
+- A blocking objection resting on a timing, ordering, concurrency or "this cannot happen" argument names the mechanism it assumes and where that mechanism is defined, and one whose mechanism cannot be located is raised as a question instead, as AGENTS.md section 11 states
+- A revision answering review feedback is re-reviewed as a whole change, and a commit in it that answers the feedback widens no documented user-facing option's meaning or authority, as AGENTS.md section 11 states
+- An existing end-to-end scenario moved off the blocking mock `e2e` job (for example by a tag) is reviewed like deleting the scenario, as AGENTS.md section 8 states
 
 ## Reporting security issues
 

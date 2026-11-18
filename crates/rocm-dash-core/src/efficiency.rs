@@ -49,6 +49,13 @@ pub fn gpu_ids_overlap(gpu_ids: &[String], gpus: &[GpuMetrics]) -> bool {
 /// a GPU has no per-container reading the split on that GPU is equal, rather
 /// than guessing a skew from partial data. A sole occupant gets the whole GPU.
 ///
+/// An occupant that is still starting and has no reading while another occupant
+/// does is left out of the split. (A status of `Unknown` means no readiness
+/// information, not "not serving", so it stays in.) It has not
+/// allocated GPU memory, so the evidence says it is drawing next to nothing, and
+/// an equal share would show the serving neighbour about half its real power and
+/// roughly double its real tokens per watt until the newcomer loads.
+///
 /// Power on a GPU no instance occupies (idle, or a process outside the managed
 /// set) is attributed to nobody; it still counts toward node power. An entry is
 /// `None` when none of its GPUs matched a GPU reporting power (id join found
@@ -76,6 +83,19 @@ pub fn attribute_power_w<S: BuildHasher>(
         if occupants.is_empty() {
             continue;
         }
+        let reading = |k: usize| {
+            per_container_vram_mb
+                .get(&instances[k].container_id)
+                .is_some_and(|&mb| mb > 0)
+        };
+        let occupants: Vec<usize> = if occupants.iter().any(|&k| reading(k)) {
+            occupants
+                .into_iter()
+                .filter(|&k| reading(k) || !instances[k].status.is_starting())
+                .collect()
+        } else {
+            occupants
+        };
         let weights: Option<Vec<f64>> = occupants
             .iter()
             .map(|&k| {
@@ -106,7 +126,8 @@ pub fn attribute_power_w<S: BuildHasher>(
 /// Whole-node efficiency: aggregate generation throughput over aggregate power.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NodeEfficiency {
-    /// Σ `gen_tps` ÷ Σ board `power_w`, in tokens per watt.
+    /// Σ live `gen_tps` (see [`Instance::live_gen_tps`]) ÷ Σ board `power_w`, in
+    /// tokens per watt.
     pub tokens_per_watt: f64,
     /// Freshness of the throughput behind the figure (instances at zero tok/s
     /// contribute nothing and are not counted): `Held` when any of it is
@@ -127,28 +148,55 @@ impl NodeEfficiency {
     }
 }
 
-/// Node-level efficiency for a snapshot, or `None` when it cannot be stated.
+/// Aggregate generation throughput across instances.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeThroughput {
+    /// Σ `gen_tps` over the instances with a finite, live reading (a Lemonade
+    /// last-request rate is not live), in tokens/s. A real zero counts: an idle
+    /// node is zero throughput, not no data.
+    pub tokens_per_sec: f64,
+    /// Freshness of the throughput behind the sum, as for
+    /// [`NodeEfficiency::freshness`]: instances at zero tok/s add nothing to the
+    /// sum and are not counted.
+    pub freshness: Option<ObservationFreshness>,
+}
+
+impl NodeThroughput {
+    /// Whether any throughput behind the sum is held.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.freshness == Some(ObservationFreshness::Held)
+    }
+}
+
+/// Node throughput over `instances`, or `None` when no instance has a finite,
+/// live `gen_tps` (a single NaN/Inf must not poison the sum).
 ///
-/// Throughput is summed over instances with a finite `gen_tps` (a single
-/// NaN/Inf must not poison the node), power over every GPU's board power. It is
-/// `None` with no traffic (`Σ gen_tps == 0`), no power telemetry
-/// (`Σ power_w == 0`), or a non-finite quotient. Power here is the whole board,
-/// including GPUs no instance occupies, because the question is the node's
-/// efficiency, not an instance's: per-instance figures use attributed power
-/// ([`attribute_power_w`]) instead.
+/// This is the one place the node's throughput and its freshness are worked
+/// out, so every surface that shows the aggregate (the efficiency hero, the
+/// throughput hero, the Hardware header, the assistant) agrees on both. An
+/// instance at zero tok/s contributes nothing to the sum, so its freshness says
+/// nothing about the sum's either: a held idle instance must not mark a figure
+/// that comes from fresh ones as held.
+///
+/// Only live throughput counts: a Lemonade last-request rate (see
+/// [`Instance::live_gen_tps`]) stays unchanged while the server is idle, so it is
+/// left out of the sum and out of the freshness, and an idle Lemonade server on
+/// its own is no throughput reading at all.
 #[must_use]
-pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
-    let mut tps = 0.0_f64;
+pub fn node_throughput<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+) -> Option<NodeThroughput> {
+    let mut tokens_per_sec = 0.0_f64;
+    let mut any = false;
     let mut held = false;
     let mut unknown = false;
-    for inst in &snap.instances {
-        let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) else {
+    for inst in instances {
+        let Some(v) = inst.live_gen_tps() else {
             continue;
         };
-        tps += v;
-        // An instance at zero tok/s adds nothing to the figure, so its
-        // freshness says nothing about the figure's either: a held idle
-        // instance must not mark a figure that comes from fresh ones as held.
+        tokens_per_sec += v;
+        any = true;
         if v <= 0.0 {
             continue;
         }
@@ -165,12 +213,51 @@ pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
     } else {
         Some(ObservationFreshness::Fresh)
     };
-    let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
-    if tps > 0.0 && power > 0.0 {
-        let tokens_per_watt = tps / power;
+    any.then_some(NodeThroughput {
+        tokens_per_sec,
+        freshness,
+    })
+}
+
+/// Total board power (W) of the GPUs that report a usable reading.
+///
+/// A reading that is not finite or not positive is skipped, as
+/// [`attribute_power_w`] does: zero means "no telemetry" (a platform without a
+/// power source), and a faulty sensor reporting infinity, NaN or a negative
+/// value must not turn a quotient into a plausible-looking 0 or deflate the
+/// total. Every surface that shows the node's power or divides by it uses this,
+/// so they agree on what counts.
+#[must_use]
+pub fn node_power_w(gpus: &[GpuMetrics]) -> f64 {
+    gpus.iter()
+        .map(|g| f64::from(g.power_w))
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .sum()
+}
+
+/// Node-level efficiency for a snapshot, or `None` when it cannot be stated.
+///
+/// Throughput is [`node_throughput`]; power is [`node_power_w`], so one faulty
+/// sensor cannot turn the quotient into a plausible-looking 0 (infinity) or
+/// deflate the total (negative). It is `None` with no traffic
+/// (`Σ gen_tps == 0`), no usable power telemetry, or a non-finite quotient.
+///
+/// Power here is the whole board, including GPUs no instance occupies, because
+/// the question is the node's efficiency, not an instance's: per-instance
+/// figures use attributed power ([`attribute_power_w`]) instead.
+///
+/// A node whose only throughput is held at zero tok/s reports a fresh 0 tok/s
+/// from [`node_throughput`] (nothing contributes, so nothing is held), and no
+/// efficiency figure from here, since there is no throughput to divide.
+#[must_use]
+pub fn node_efficiency(snap: &Snapshot) -> Option<NodeEfficiency> {
+    let throughput = node_throughput(&snap.instances)?;
+    let power = node_power_w(&snap.gpus);
+    if throughput.tokens_per_sec > 0.0 && power > 0.0 {
+        let tokens_per_watt = throughput.tokens_per_sec / power;
         tokens_per_watt.is_finite().then_some(NodeEfficiency {
             tokens_per_watt,
-            freshness,
+            freshness: throughput.freshness,
         })
     } else {
         None
@@ -189,9 +276,20 @@ pub fn tokens_per_watt(gen_tps: Option<f64>, power_w: Option<f64>) -> Option<f64
     (power > 0.0).then(|| tps / power)
 }
 
+/// An instance's efficiency, from its live throughput only.
+///
+/// A last-request rate over the board's current (idle) power is not an
+/// efficiency, so it yields `None` and never reaches the snapshot, the wire or a
+/// recording.
+#[must_use]
+pub fn instance_tokens_per_watt(inst: &Instance, power_w: Option<f64>) -> Option<f64> {
+    tokens_per_watt(inst.live_gen_tps(), power_w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::InstanceStatus;
 
     fn gpu(device_id: &str, power_w: f32) -> GpuMetrics {
         GpuMetrics {
@@ -232,6 +330,40 @@ mod tests {
             }),
             ..Instance::default()
         }
+    }
+
+    /// An idle Lemonade server keeps reporting its last request's rate. Counted as
+    /// throughput it would hold the node figure up long after traffic stopped, and
+    /// mark it held while it lasted.
+    #[test]
+    fn node_efficiency_leaves_out_a_last_request_rate() {
+        let mut idle = serving("lemonade", Some(500.0), Some(ObservationFreshness::Held));
+        idle.gen_tps_last_request = true;
+        let live = serving("vllm", Some(30.0), Some(ObservationFreshness::Fresh));
+        let node = node_efficiency(&snap_with(
+            vec![idle.clone(), live],
+            vec![gpu("gpu-0", 100.0)],
+        ))
+        .expect("the live rate is traffic");
+        // Only the live 30 tok/s counts: 30 / 100 W, not 530 / 100 W.
+        assert!((node.tokens_per_watt - 0.3).abs() < 1e-9, "{node:?}");
+        assert!(
+            !node.held(),
+            "a held last-request rate must not mark the figure held"
+        );
+        // An idle Lemonade server alone is no traffic at all.
+        assert_eq!(
+            node_efficiency(&snap_with(vec![idle], vec![gpu("gpu-0", 100.0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_instance_efficiency_leaves_out_a_last_request_rate() {
+        let mut inst = serving("lemonade", Some(40.0), None);
+        assert_eq!(instance_tokens_per_watt(&inst, Some(100.0)), Some(0.4));
+        inst.gen_tps_last_request = true;
+        assert_eq!(instance_tokens_per_watt(&inst, Some(100.0)), None);
     }
 
     #[test]
@@ -304,6 +436,85 @@ mod tests {
             node_efficiency(&snap).unwrap().freshness,
             Some(ObservationFreshness::Fresh)
         );
+    }
+
+    #[test]
+    fn node_throughput_and_node_efficiency_agree_on_freshness() {
+        // The two panels that show these must never disagree: a held instance
+        // at zero beside a fresh one is fresh for both.
+        let snap = snap_with(
+            vec![
+                serving("busy", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("idle", Some(0.0), Some(ObservationFreshness::Held)),
+            ],
+            vec![gpu("gpu-0", 500.0)],
+        );
+        let t = node_throughput(&snap.instances).unwrap();
+        assert!((t.tokens_per_sec - 250.0).abs() < 1e-9);
+        assert!(!t.held());
+        assert_eq!(t.freshness, node_efficiency(&snap).unwrap().freshness);
+        // A held instance that does contribute marks both.
+        let held = snap_with(
+            vec![
+                serving("busy", Some(250.0), Some(ObservationFreshness::Fresh)),
+                serving("slow", Some(5.0), Some(ObservationFreshness::Held)),
+            ],
+            vec![gpu("gpu-0", 500.0)],
+        );
+        assert!(node_throughput(&held.instances).unwrap().held());
+        assert!(node_efficiency(&held).unwrap().held());
+    }
+
+    #[test]
+    fn node_throughput_distinguishes_idle_from_no_data() {
+        // A real zero is a figure; nothing finite is no figure.
+        let idle = [serving("a", Some(0.0), Some(ObservationFreshness::Fresh))];
+        assert!(node_throughput(&idle).unwrap().tokens_per_sec.abs() < f64::EPSILON);
+        let none = [serving("a", None, None), serving("b", Some(f64::NAN), None)];
+        assert_eq!(node_throughput(&none), None);
+        assert_eq!(node_throughput(&[]), None);
+    }
+
+    #[test]
+    fn node_efficiency_skips_a_faulty_power_sensor_like_attribute_power_does() {
+        let insts = vec![serving("a", Some(250.0), Some(ObservationFreshness::Fresh))];
+        // An infinite reading must not turn the quotient into 0.
+        let inf = snap_with(
+            insts.clone(),
+            vec![gpu("gpu-0", 500.0), gpu("gpu-1", f32::INFINITY)],
+        );
+        let n = node_efficiency(&inf).unwrap();
+        assert!((n.tokens_per_watt - 0.5).abs() < 1e-9, "got {n:?}");
+        // A negative reading must not deflate the total.
+        let neg = snap_with(
+            insts.clone(),
+            vec![gpu("gpu-0", 500.0), gpu("gpu-1", -300.0)],
+        );
+        let n = node_efficiency(&neg).unwrap();
+        assert!((n.tokens_per_watt - 0.5).abs() < 1e-9, "got {n:?}");
+        // Only faulty readings: no usable power, so no figure. A lone infinity is
+        // the case only the filter decides: unfiltered, tps / inf is a finite 0.
+        let only_bad = snap_with(
+            insts.clone(),
+            vec![gpu("gpu-0", f32::NAN), gpu("gpu-1", -5.0)],
+        );
+        assert_eq!(node_efficiency(&only_bad), None);
+        let lone_inf = snap_with(insts, vec![gpu("gpu-0", f32::INFINITY)]);
+        assert_eq!(node_efficiency(&lone_inf), None);
+    }
+
+    #[test]
+    fn node_power_sums_only_usable_readings() {
+        let gpus = [
+            gpu("gpu-0", 300.0),
+            gpu("gpu-1", f32::INFINITY),
+            gpu("gpu-2", f32::NAN),
+            gpu("gpu-3", -40.0),
+            gpu("gpu-4", 0.0),
+            gpu("gpu-5", 200.0),
+        ];
+        assert!((node_power_w(&gpus) - 500.0).abs() < 1e-9);
+        assert!(node_power_w(&[]).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -427,6 +638,51 @@ mod tests {
                 vec![Some(200.0), Some(200.0)]
             );
         }
+    }
+
+    #[test]
+    fn a_starting_occupant_with_no_reading_does_not_dilute_a_serving_neighbour() {
+        let gpus = [gpu("gpu-0", 400.0)];
+        let mut serving = inst("a", &["0"]);
+        serving.status = InstanceStatus::Ready;
+        let mut loading = inst("b", &["0"]);
+        loading.status = InstanceStatus::Starting { phase: None };
+        let insts = [serving, loading];
+        // `a` has a VRAM reading; `b` is still loading and has none.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p, vec![Some(400.0), None], "the loader gets no share yet");
+        // Once it has allocated memory it takes part in the split.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000), ("b", 10_000)]));
+        assert_eq!(p, vec![Some(300.0), Some(100.0)]);
+        // With no readings at all nothing is known, so the split stays equal.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[]));
+        assert_eq!(p, vec![Some(200.0), Some(200.0)]);
+    }
+
+    #[test]
+    fn a_starting_occupant_is_left_out_but_an_unmeasured_serving_one_still_forces_equal() {
+        let gpus = [gpu("gpu-0", 400.0)];
+        let mut measured = inst("a", &["0"]);
+        measured.status = InstanceStatus::Ready;
+        let mut unmeasured = inst("b", &["0"]);
+        unmeasured.status = InstanceStatus::Ready;
+        let mut loading = inst("c", &["0"]);
+        loading.status = InstanceStatus::Starting { phase: None };
+        let insts = [measured, unmeasured, loading];
+        // Only `a` has a reading. `c` is starting with none, so it is dropped;
+        // `b` is serving but unmeasured (e.g. a missed /proc join), so leaving
+        // it out would credit `a` with the whole board: the rest stay equal.
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p, vec![Some(200.0), Some(200.0), None]);
+        // Without the starting occupant in the picture the result is the same
+        // for the other two, so the starting one is what changed the split.
+        let p2 = attribute_power_w(&insts[..2], &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p2, vec![Some(200.0), Some(200.0)]);
+        // An `Unknown` status is not "starting": it stays in the split.
+        let mut unknown = inst("d", &["0"]);
+        unknown.status = InstanceStatus::Unknown;
+        let p3 = attribute_power_w(&[insts[0].clone(), unknown], &gpus, &vram(&[("a", 30_000)]));
+        assert_eq!(p3, vec![Some(200.0), Some(200.0)]);
     }
 
     #[test]

@@ -50,6 +50,15 @@ Feature: Runtime configuration
   # It reads the block's verdict rather than one string, because a torch that has
   # already run a GPU kernel with this SDK is kept instead of rewritten and reports
   # a `retained_*` verdict — settled, with nothing installed.
+  # On a ROCm 10.x runtime the vLLM install pins torch itself and the engine's own
+  # metadata declares none, so the verdict is `not_applicable (vllm does not pin
+  # torch)`; the step accepts it only after asking the runtime's interpreter that
+  # the installed vLLM really requires no torch.
+  # Nothing compared a pin there, and the device check only proves torch can run a
+  # kernel, so the same step also imports torch, torchvision, vLLM and its compiled
+  # extensions in the runtime: a reinstall that leaves a torch and torchvision pair
+  # unable to register their operators, or a torch the vLLM build does not match,
+  # fails here instead of passing and breaking every serve.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
   Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
@@ -70,14 +79,16 @@ Feature: Runtime configuration
   # see. This is the same reinstall as scenario 4 with the opt-out set, so what
   # differs between them is exactly the variable.
   #
-  # Four claims across three Thens, because the opt-out is only coherent if all
-  # four hold: torch was not rewritten; the skip is reported as its own verdict
-  # rather than folded into the generic `not_applicable`, which would leave the
-  # user unable to tell whether the variable did anything; the divergence the
-  # opt-out deliberately leaves behind is not then sold back to that user as a
-  # runtime to repair by reinstalling the engine — an instruction that would undo
-  # what they asked for; and the checks the opt-out does not suppress still run,
-  # because it suppresses the correction, not the diagnosis.
+  # Four claims, because the opt-out is only coherent if all four hold: torch
+  # was not rewritten by the alignment; the SDK install itself did not rewrite
+  # it either — it hands `uv` the torch requirements too, so
+  # before it honoured the opt-out the engine's torch was replaced by the SDK's
+  # build in the same command that reported the opt-out, and a GPU on which that
+  # build opens no device failed the install; the divergence the opt-out
+  # deliberately leaves behind is not then sold back to that user as a runtime to
+  # repair by reinstalling the engine — an instruction that would undo what they
+  # asked for; and the checks the opt-out does not suppress still run, because it
+  # suppresses the correction, not the diagnosis.
   #
   # Same lane as scenario 4 and for the same reasons: a real SDK install and a
   # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
@@ -88,6 +99,7 @@ Feature: Runtime configuration
     And the user has opted out of realigning torch
     When the user installs the SDK again
     Then the torch alignment reports the opt-out instead of rewriting torch
+    And the SDK install leaves the torch the runtime held as it was
     And the install does not offer to reinstall the engine over the kept torch
     And the runtime's device health is still reported
 
@@ -129,6 +141,7 @@ Feature: Runtime configuration
   @id:runtime-install-records-the-real-folder @nightly
   Scenario: runtime-06 - Previewing an install through a linked runtimes folder names the real folder
     Given a machine whose runtimes folder is a link to somewhere else
+    And a uv is already installed
     When the user previews an SDK install
     Then the planned runtime folder is inside the folder the link points at
     And the planned runtime folder is not expressed through the link
@@ -144,24 +157,29 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the error explains which install types can be adopted
 
-  # Both channels now resolve from one canonical aggregate index each, so the
-  # provenance the preview prints is the whole of what the user can check before
-  # committing to a multi-GiB install. This pins the nightly half: the source that
-  # was selected, the version that came back from it, and the layout generation
-  # that source was read as. `--family` is supplied so the scenario needs no GPU,
-  # and `@nightly` because it resolves the real index over the network — the same
-  # cost that keeps scenario runtime-06 off the unserialized mock lane.
+  # Both channels resolve from one aggregate index each, so the provenance the
+  # preview prints is the whole of what the user can check before committing to a
+  # multi-GiB install. This pins the nightly half: the source that was selected,
+  # the version that came back from it, and the layout generation that source was
+  # read as. With no pin that is the newest layout's nightly index
+  # (`nightly.repo.amd.com`); runtime-31 pins the earlier stream. `--family` is
+  # an exact arch so the scenario needs no GPU, and `@nightly` because it
+  # resolves the real index over the network — the same cost that keeps scenario
+  # runtime-06 off the unserialized mock lane.
   @id:runtime-resolve-canonical-nightly @nightly
-  Scenario: runtime-08 - Previewing a nightly SDK install reports canonical provenance
+  Scenario: runtime-08 - Previewing a nightly SDK install reports the newest layout's provenance
+    Given a uv is already installed
     When the user dry-runs a nightly SDK install for a known family
-    Then the SDK preview reports canonical nightly provenance
+    Then the SDK preview reports next-layout nightly provenance
 
   # The release channel is where this went wrong in the field (rocm-cli#271). The
   # resolver read a per-family index, `repo.amd.com/rocm/whl/{family}`, which is
   # frozen at 7.13.0 and has no device payloads at all, so every release install
   # got a stale SDK and a bare `rocm[libraries,devel]` — no GPU backend in it.
-  # Both halves are fixed by the same canonical model: one flat aggregate index
-  # for the channel, and the device payload for the chip this host actually has.
+  # Both halves are fixed by the same model: one flat aggregate index for the
+  # channel (now `stable.repo.amd.com` for an unpinned install; runtime-32 pins
+  # the earlier release stream), and the device payload for the chip this host
+  # actually has.
   #
   # The obvious regression test for that history is the one that does not work.
   # Asserting the broken per-family URL is *absent* passes with the bug present:
@@ -182,10 +200,11 @@ Feature: Runtime configuration
   # WSL hosts that can read the Windows-side target before ROCm passthrough is
   # ready, while mock hosts with no target skip it.
   @id:runtime-resolve-canonical-release @requires-gfx-target
-  Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
+  Scenario: runtime-09 - Previewing a release SDK install resolves the newest layout's aggregate for this GPU
     Given a machine with an AMD GPU
+    And a uv is already installed
     When the user dry-runs a release SDK install for this host
-    Then the SDK preview reports canonical release provenance
+    Then the SDK preview reports next-layout release provenance
     And the SDK preview requests the device payload for this host's GPU
 
   # `rollback` can only ever undo one step, not walk a history. A unit test on
@@ -311,36 +330,45 @@ Feature: Runtime configuration
     And the execution section says the consent came from the user's --yes
 
   # Lemonade's llama.cpp backend re-pins itself to match the ROCm SDK rocm-cli
-  # actually installed (Tier 1: point the pinned build at it; Tier 2: fall back
-  # to the newest build if the pin is too old to have shipped a matching
-  # ROCm-version asset; revert to the packaged default if neither verifies).
-  # The unit tests exercise that state machine directly against injected
-  # install/align steps, but nothing else asserts that `rocm engines install
-  # lemonade` actually surfaces the outcome to a real user -- this is the one
-  # part of that path with no other e2e coverage.
+  # actually installed (Tier 1: point the pinned build at it; Tier 2: the newest
+  # build that ships an archive for that ROCm version; revert to the packaged
+  # default if neither verifies). The unit tests exercise that state machine
+  # directly against injected install/align steps, but nothing else asserts that
+  # `rocm engines install lemonade` ends with a ROCm backend paired with the SDK
+  # on a real GPU -- this is the one part of that path with no other e2e
+  # coverage.
   #
-  # `--reinstall` re-extracts the packaged embeddable, resetting
-  # `backend_versions.json` to its pinned defaults, so this fires
-  # deterministically even against a shared runtime tree where an earlier
-  # scenario already left Lemonade's backend aligned (a plain install would
-  # find nothing left to do and print no alignment line at all). Verified
-  # against real hardware (Strix Halo, gfx1151): a fresh SDK's version does not
-  # match Lemonade's packaged pin, Tier 1's install 404s (the pinned build
-  # predates a matching ROCm-version asset), and Tier 2's newest build
-  # succeeds -- producing exactly the line this scenario asserts. That held for
-  # an SDK whose TheRock tarball Lemonade could download; for a 7.14.x SDK Tier 2
-  # fails too (the tarball is not published where Lemonade 11.5.1 looks), which is
-  # why `expectations.toml` carries a Windows row for this scenario (ROCMAI-899).
+  # Which route a lane takes depends on its SDK. An SDK older than Lemonade's
+  # packaged pin (ROCm 7.14 against 2026.44.1's 10.1.0) is aligned, and the CLI
+  # says so; an SDK that already is the packaged pin (ROCm 10.1) needs no
+  # alignment and gets none; a nightly SDK is never aligned and keeps the
+  # packaged pin. The Then accepts each route and fails a revert, or an
+  # alignment the install does not report:
+  # it reads the pin the installed runtime tree holds and compares it with the
+  # active runtime's version. `--reinstall` re-extracts the packaged embeddable,
+  # resetting `backend_versions.json` to its pinned defaults, so this does not
+  # depend on what an earlier scenario left in a shared runtime tree.
+  # `expectations.toml` carries a Windows xfail row for this scenario
+  # (ROCMAI-899), written for Lemonade 11.5.1, which could not fetch a 7.14.x
+  # TheRock tarball; a deterministic XPASS on that lane marks the row stale.
   #
   # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
+  #
+  # The advice `rocm serve` prints for a missing llama-server is `rocm engines
+  # install lemonade --reinstall`. The Givens install Lemonade and delete the
+  # selected backend's llama-server, so the last Then can only pass if the
+  # reinstall put it back.
   @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-os:windows @requires-engine:lemonade @nightly
-  Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
+  Scenario: runtime-16 - Reinstalling Lemonade pairs its ROCm backend with the active SDK
     Given a managed runtime is active
+    And the lemonade engine is installed
+    And the selected Lemonade backend's llama-server binary has been deleted
     When the user reinstalls the lemonade engine
-    Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
+    Then Lemonade's ROCm backend is paired with the active SDK
+    And the selected Lemonade backend's llama-server binary is installed
 
   # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
   # `backend_versions.json` -- the alignment runs on every Lemonade install, so
@@ -429,8 +457,8 @@ Feature: Runtime configuration
   # network are needed and this runs on the ordinary E2E lane.
   #
   # Technical details: the host install is planted under the scenario's root
-  # and exported as ROCM_PATH; its `.info/version` reads `7.20.1-33`. The
-  # catalog serves one release tarball, ROCm 7.10.0, for `gfx120X-all`.
+  # and exported as ROCM_PATH; its `.info/version` reads `10.5.1-33`. The
+  # catalog serves one release tarball, ROCm 10.0.0, for `gfx120X-all`.
   @id:runtime-install-preview-notes-newer-host-rocm @requires-os:linux
   Scenario: runtime-20 - Previewing an install on a host with newer ROCm explains why the older SDK is selected
     Given a release tarball catalog whose newest ROCm is older than the host's
@@ -445,8 +473,8 @@ Feature: Runtime configuration
   # evidence: it shows the same preview printing the note when the host
   # version is readable and newer.
   #
-  # Technical details: `.info/version` reads `7.20.1-33rc1`, which with its
-  # suffix dropped would be `7.20.1`, newer than the catalog's 7.10.0.
+  # Technical details: `.info/version` reads `10.5.1-33rc1`, which with its
+  # suffix dropped would be `10.5.1`, newer than the catalog's 10.0.0.
   @id:runtime-install-preview-ignores-unreadable-host-rocm @requires-os:linux
   Scenario: runtime-21 - Previewing an install on a host whose ROCm version cannot be read makes no newer-host claim
     Given a release tarball catalog whose newest ROCm is older than the host's
@@ -515,7 +543,7 @@ Feature: Runtime configuration
   Scenario: runtime-23 - Previewing an SDK install on a host with no usable Python prepares no Python
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
-    When the user previews a wheel SDK install for arch gfx1200 with no version pin
+    When the user previews a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
     Then the preview says a real install would prepare a managed Python
     And the preview prepared no Python, as it says
 
@@ -535,7 +563,7 @@ Feature: Runtime configuration
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
     And the managed Python version is overridden to 3.13
-    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
     Then the install fails
     And the preview is refused because the install would refuse that Python
 
@@ -559,7 +587,7 @@ Feature: Runtime configuration
     And a host with no usable Python and a recording uv
     And the only Python on the host's path is not usable
     And managed Python bootstrap is disabled
-    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release
     Then the install fails
     And the preview is refused because managed Python is disabled, without a promise
 
@@ -667,6 +695,27 @@ Feature: Runtime configuration
   Scenario: runtime-30 - Previewing an SDK install with a --python-version the layout is not published for is refused
     Given a canonical release pip index fixture
     And a host with no usable Python and a recording uv
-    When the user tries to preview a wheel SDK install for arch gfx1200 with no version pin on Python 3.13
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to an earlier ROCm 7 release on Python 3.13
     Then the install fails
     And the preview is refused because the layout has no wheels for that Python, and prepared none
+
+  # The other half of runtime-08. The newest layout took over the nightly channel
+  # on 2026-08-23; the earlier stream (`rocm.nightlies.amd.com`) stopped the day
+  # before, so a build from before then exists only there. Pinning one must
+  # keep resolving it, from that stream and read as that stream's layout, rather
+  # than failing against the newest layout's index. `@nightly` for the same
+  # reason as runtime-08: it resolves the real index.
+  @id:runtime-resolve-earlier-nightly @nightly
+  Scenario: runtime-31 - Previewing a nightly SDK install pinned to an earlier build reports the earlier stream's provenance
+    When the user dry-runs a nightly SDK install pinned to a build from the earlier stream
+    Then the SDK preview reports canonical nightly provenance
+
+  # The other half of runtime-09: an earlier ROCm 7 release is published only on
+  # the earlier stream (`repo.amd.com`), so pinning one has to keep reading it,
+  # while the unpinned install of runtime-09 reads the newest layout. Same
+  # `@requires-gfx-target` as runtime-09, since the preview detects the chip.
+  @id:runtime-resolve-earlier-release @requires-gfx-target
+  Scenario: runtime-32 - Previewing a release SDK install pinned to an earlier ROCm 7 release reports the earlier stream's provenance
+    Given a machine with an AMD GPU
+    When the user dry-runs a release SDK install pinned to an earlier ROCm 7 release
+    Then the SDK preview reports canonical release provenance

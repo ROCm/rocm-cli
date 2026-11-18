@@ -864,8 +864,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
-    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
-    // not have.
+    // E2E-only launch fault injection (either mode) likewise stands in for the
+    // GPU it does not have.
     //
     // The scripted free-space override opens the same waiver: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
@@ -1124,7 +1124,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let managed_runtime_id = resolved_selection.runtime_id.clone();
     let managed_env_id = resolved_selection.env_id.clone();
 
-    // Persist the endpoint key (public bind only) in a 0600 file so the engine
+    // Persist the endpoint key (public bind only) in an owner-only file so the engine
     // child, the restart/recovery path, and inspection commands can retrieve it by
     // service id. Loopback binds resolve to `None` and store nothing.
     if let Some(key) = endpoint_auth.as_deref() {
@@ -1193,20 +1193,23 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         };
         let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
-        // writes a `starting` record for a process that never existed, so the
-        // helper would be left watching a pid that will never appear, with
-        // nothing in the scenario's teardown to stop it: observed as `rocm
-        // daemon` processes outliving their e2e checkout by days, still
-        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // writes a record (`starting`, or `ready` in its `ready` mode) for a
+        // process that never existed, so the helper would be left watching a pid
+        // that will never appear, with nothing in the scenario's teardown to stop
+        // it: observed as `rocm daemon` processes outliving their e2e checkout by
+        // days, still carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
         // supervising a real spawned server, and there is none here.
         //
         // That — not ordering — is the whole justification. This suppression
         // runs *before* the OOM note is computed in the `summary_mode` block
         // below, so the previous claim here, that the note "is computed before
         // it would have run", was backwards and could not have excused it.
-        // serve-40's `no background automation daemon was left behind` is what
-        // holds the branch: deleting it left the scenario green with a `rocm
-        // daemon` still running.
+        // The `no background automation daemon was left behind` step of the
+        // `@id:serve-oom-launch-memory-guidance` and
+        // `@id:serve-smoke-failure-summary` scenarios records that none was
+        // started but does not discriminate this branch: the helper starts only
+        // when a watcher is enabled, and the isolated config those scenarios use
+        // enables none, so removing the branch leaves them green.
         //
         // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
         // the test-only feature, so this branch folds away in shipped builds.
@@ -1236,16 +1239,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Best-effort inference smoke test, on by default (opt out with
             // `--no-smoke-test`). Only meaningful for a freshly-ready server we
             // just launched; skipped when metrics could not be shown anyway.
-            let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
-                spinner.set_label("Running smoke test…");
-                // The local provider resolves the endpoint key from the per-service
-                // 0600 key file by service id, so the smoke test authenticates
-                // against a protected public endpoint without threading the secret
-                // through here.
-                serve_summary::run_smoke_test(&paths, resolve.served_model_name())
-            } else {
-                serve_summary::SmokeMetrics::default()
-            };
+            let (metrics, smoke_failure) =
+                if !no_smoke_test && !report.already_running && report.status == "ready" {
+                    spinner.set_label("Running smoke test…");
+                    // The local provider resolves the endpoint key from the per-service
+                    // owner-only key file by service id, so the smoke test authenticates
+                    // against a protected public endpoint without threading the secret
+                    // through here.
+                    serve_summary::run_smoke_test(&paths, resolve.served_model_name()).into_parts()
+                } else {
+                    (serve_summary::SmokeMetrics::default(), None)
+                };
             spinner.clear();
 
             let mut notes = collect_serve_notes(
@@ -1314,6 +1318,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 status: report.status.clone(),
                 already_running: report.already_running,
                 metrics,
+                smoke_failure,
                 api_key: launched_key,
                 notes,
             };
@@ -1660,6 +1665,94 @@ mod tests {
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
             "Qwen3-4B-Instruct-2507-GGUF"
+        );
+    }
+
+    #[test]
+    fn serve_small_assistant_resolves_the_gguf_build_on_lemonade() {
+        // The small assistant recipe is published as safetensors under its
+        // canonical id and as GGUF under a companion repo. Lemonade can only
+        // serve the latter, and only with a quantization variant pinned, so
+        // every way of naming the recipe has to arrive at that ref.
+        for model in [
+            "qwen2.5",
+            "qwen2.5-1.5b",
+            "qwen2.5-1.5b-instruct",
+            "qwen-small",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        ] {
+            let recipe = resolve_builtin_model_recipe(model)
+                .unwrap_or_else(|| panic!("{model} resolves to a recipe"));
+            // With no engine named and no GPU family preferring one, automatic
+            // selection follows the recipe. A host whose family prefers vLLM
+            // takes the earlier branch in `select_serve_engine` and is not
+            // covered here; the ref each engine resolves to is, below.
+            assert_eq!(
+                select_serve_engine(None, None, Some(&recipe), None),
+                ServeEngineSelection {
+                    engine: "lemonade".to_owned(),
+                    source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+                },
+                "{model}"
+            );
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "lemonade"),
+                "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M",
+                "{model}"
+            );
+            // vLLM keeps the safetensors repo the canonical id names.
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "vllm"),
+                "Qwen/Qwen2.5-1.5B-Instruct",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_lemonade_catalog_recipe_resolves_to_a_servable_ref() {
+        // Lemonade passes a Hugging Face `owner/repo` through untouched, and the
+        // engine then refuses it without a `:variant` -- on Windows from inside
+        // the detached engine process, where the user never sees the reason. The
+        // catalog is what has to supply the variant, so no recipe that lists
+        // Lemonade may resolve to a bare `owner/repo`. A bare registry name (no
+        // `/`) is a Lemonade model id, not a Hugging Face repo, and is fine.
+        //
+        // Scope: recipes that list Lemonade, and only those. Lemonade can still
+        // be reached for a recipe that does not -- an explicit `--engine
+        // lemonade`, a configured `default_engine`, or the platform default when
+        // nothing else fits -- and that recipe is handed its canonical id, which
+        // is what a recipe with no Lemonade build should get. Refusing a bare
+        // ref before the engine starts is the other half of that, and is not
+        // this test's job.
+        let offenders = rocm_core::builtin_model_recipes()
+            .into_iter()
+            .filter(|recipe| model_recipe_supports_engine(recipe, "lemonade"))
+            .map(|recipe| {
+                let resolved = serve_model_ref_for_engine(
+                    &recipe.canonical_model_id,
+                    Some(&recipe),
+                    "lemonade",
+                );
+                (recipe.canonical_model_id, resolved)
+            })
+            .filter(|(_, resolved)| {
+                // A trailing `:` is as unservable as no colon at all, so the
+                // variant has to be there, not merely the separator.
+                resolved.contains('/')
+                    && resolved
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.split_once(':'))
+                        .is_none_or(|(_, variant)| variant.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "these recipes hand Lemonade a Hugging Face repo with no `:variant`, which the \
+             engine refuses after it has already been launched; give each one a lemonade \
+             engine_recipes entry whose model_id_override names the GGUF repo and variant: \
+             {offenders:?}"
         );
     }
 

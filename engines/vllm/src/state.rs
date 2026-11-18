@@ -191,8 +191,10 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
 /// [`write_terminal_state`] both go through — it is not the only way this
 /// module's state files are written: inference-verification latches go
 /// through `rocm_core::merge_json_state_file` instead (see
-/// [`inference_verified`]), which patches the file directly rather than
-/// routing through here.
+/// [`inference_verified`]), which patches the file under the state
+/// directory's lock rather than routing through here. This function takes no
+/// such lock and writes in place, so the lock does not order it against those
+/// latches.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

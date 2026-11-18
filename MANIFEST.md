@@ -473,7 +473,7 @@ mise's copyright and MIT licence text travel with them in
 | subtle | 2.6.1 | BSD-3-Clause |
 | symlink | 0.1.0 | MIT/Apache-2.0 |
 | syn | 1.0.109 | MIT OR Apache-2.0 |
-| syn | 2.0.118 | MIT OR Apache-2.0 |
+| syn | 2.0.119 | MIT OR Apache-2.0 |
 | syn | 3.0.9 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
@@ -673,12 +673,20 @@ ROCm distribution. Two install formats are supported:
 - **Wheel format** — Python wheel packages (`rocm`, `torch`, `torchvision`,
   `torchaudio`) are resolved from AMD-hosted PyPI-compatible indexes and
   installed via `uv` into a managed virtual environment. Release channel wheels
-  are served from `https://repo.amd.com/rocm/whl-multi-arch`. Nightly channel
-  wheels are served from `https://rocm.nightlies.amd.com/whl-multi-arch`.
+  are served from `https://stable.repo.amd.com/rocm/whl-next`. Nightly channel
+  wheels are served from `https://nightly.repo.amd.com/rocm/whl-next`. An
+  earlier ROCm 7 release is served from the earlier stream,
+  `https://repo.amd.com/rocm/whl-multi-arch`, and a nightly built before
+  2026-08-23 from `https://rocm.nightlies.amd.com/whl-multi-arch`; the CLI reads
+  those only when the install pins such a build.
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
   artifact storage. Release channel tarballs are served from
-  `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
-  `https://rocm.nightlies.amd.com/tarball/`. The metadata index files for
+  `https://stable.repo.amd.com/rocm/core/tarball/`. Nightly tarballs are served
+  from `https://nightly.repo.amd.com/rocm/core/tarball/`. The earlier streams,
+  `https://repo.amd.com/rocm/tarball/` and
+  `https://rocm.nightlies.amd.com/tarball/`, are read only when the install pins
+  a build that exists only there, and a tarball install can pin a version only
+  against the current catalogs. The metadata index files for
   tarball installs are optionally verified with an RSA/SHA-256 detached
   signature (controlled by `ROCM_CLI_METADATA_PUBLIC_KEY_PATH` /
   `ROCM_CLI_METADATA_PUBLIC_KEY_PEM`); the tarball binary itself is not
@@ -716,11 +724,16 @@ Lemonade embeddable archive from the official Lemonade SDK GitHub releases at
 to the rocm-cli managed data directory and is reused for subsequent
 `rocm engines start lemonade` invocations. This is a self-contained binary
 distribution; no Python packages are installed for Lemonade by rocm-cli.
-On Linux/WSL, `rocm engines install lemonade` may also query
-`https://api.github.com/repos/lemonade-sdk/llama.cpp/releases/latest` (an
-unauthenticated call) while aligning Lemonade's `llamacpp:rocm` backend to
-the active ROCm SDK version; see
+On Linux/WSL and Windows, `rocm engines install lemonade` may also list
+`https://api.github.com/repos/lemonade-sdk/llama.cpp/releases` (the 30 newest
+releases, one unauthenticated call) while aligning Lemonade's `llamacpp:rocm`
+backend to the active ROCm SDK version; see
 [Lemonade backend alignment on engine install](docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install).
+Lemonade itself then downloads the llama.cpp backend it installs from the
+`lemonade-sdk/llama.cpp` GitHub releases, and the ROCm runtime that backend
+runs on from AMD's ROCm package repository (as Python wheels into a virtual
+environment of Lemonade's own, or as a TheRock tarball); those downloads are
+Lemonade's, not rocm-cli's.
 
 ### Engine-Specific Python Dependencies
 
@@ -742,9 +755,9 @@ contributors and is part of the public source distribution.
 
 ### `scripts/` Directory
 
-The `scripts/` directory contains Python and shell scripts for local smoke
-testing, GPU integration tests, release packaging, and CI support. These are
-development tools, not shipped to end users.
+The `scripts/` directory contains Python and shell scripts for GPU integration
+tests, release packaging, and CI support. These are development tools, not
+shipped to end users. The local smoke test is `cargo xtask smoke`.
 
 ## Media Assets
 

@@ -30,6 +30,48 @@ const MENU_ITEMS_Y: u16 = 8;
 const MENU_ITEM_COUNT: u16 = MENU_ITEMS.len() as u16;
 /// Minimum inner width the logo needs before the menu will render.
 const MENU_MIN_WIDTH: u16 = 31;
+/// Columns the cursor gutter (`"▸ "` when selected, two spaces otherwise)
+/// takes before a row's label.
+const MENU_CURSOR_W: u16 = 2;
+/// Columns the compact layout insets a row by, so rows don't sit on the border.
+const MENU_COMPACT_PAD: u16 = 1;
+/// Columns the logo layout insets a row by.
+const MENU_LOGO_PAD: u16 = 4;
+
+/// Width of the longest [`MENU_ITEMS`] label, read from the same list the rows
+/// are drawn from so adding or renaming a row moves the width floor with it.
+///
+/// Byte length is the display width here because the labels are ASCII, which
+/// `menu_labels_are_ascii_so_byte_length_is_display_width` pins.
+const fn longest_menu_label() -> u16 {
+    let mut longest = 0u16;
+    let mut i = 0;
+    while i < MENU_ITEMS.len() {
+        let len = MENU_ITEMS[i].label().len() as u16;
+        if len > longest {
+            longest = len;
+        }
+        i += 1;
+    }
+    longest
+}
+
+/// Minimum inner width for the compact (no-logo) fallback menu: the row inset,
+/// the cursor gutter and the longest label, so every row it draws is drawn
+/// whole.
+///
+/// The floor is "render every label in full", not "render something". A
+/// truncated row is still selectable and still activates on Enter, so a floor
+/// of 1 let a user arrow onto a row reading `Qui` and quit from it — the
+/// illegible-but-live state the review flagged. Of the two offered remedies
+/// (raise the floor to the longest label, or open no overlay below it) this is
+/// both: below the floor `menu_rows` yields nothing, so the Esc overlay paints
+/// its empty frame rather than illegible rows, exactly as `menu_fits` already
+/// does for the logo layout. Raising the floor is preferred over suppressing
+/// the overlay entirely because the box is centered and sized from the screen,
+/// so a user can always reach the menu again by widening the terminal, and no
+/// other key path changes.
+const MENU_MIN_WIDTH_COMPACT: u16 = MENU_COMPACT_PAD + MENU_CURSOR_W + longest_menu_label();
 
 /// Whether the Esc menu's inner box is tall and wide enough to show the logo
 /// AND every selectable item. The old guard only checked the logo
@@ -41,6 +83,72 @@ const fn menu_fits(inner_height: u16, inner_width: u16) -> bool {
     inner_width >= MENU_MIN_WIDTH && inner_height >= MENU_ITEMS_Y + MENU_ITEM_COUNT
 }
 
+/// Compact fallback fit check: no logo, just the selectable items, and only
+/// while every label still fits whole (see [`MENU_MIN_WIDTH_COMPACT`]).
+const fn menu_fits_compact(inner_height: u16, inner_width: u16) -> bool {
+    inner_width >= MENU_MIN_WIDTH_COMPACT && inner_height >= 1
+}
+
+/// Where [`draw_menu`] puts the selectable rows, for whichever of the two
+/// layouts (logo or compact) the inner box can fit. `None` from [`menu_rows`]
+/// means neither fits and nothing is drawn.
+struct MenuRows {
+    /// Whether the large wordmark is drawn above the rows.
+    logo: bool,
+    /// Left edge of every row.
+    x: u16,
+    /// Screen row of the first visible item.
+    y: u16,
+    /// Width available to a row, cursor gutter included. Never below
+    /// `MENU_CURSOR_W + longest_menu_label()`.
+    width: u16,
+    /// Index into [`MENU_ITEMS`] of the first visible item.
+    first: usize,
+    /// How many items are visible.
+    count: usize,
+}
+
+/// Lay the Esc menu's rows out inside `inner`, or `None` when the box fits
+/// neither the logo layout nor the compact fallback.
+///
+/// Split out of `draw_menu` so the geometry can be swept directly over widths
+/// and heights without a `Frame` (see the tests below), which is how the
+/// "every height" criterion of ROCMAI-1042 is checked.
+fn menu_rows(inner: Rect, sel: usize) -> Option<MenuRows> {
+    if menu_fits(inner.height, inner.width) {
+        return Some(MenuRows {
+            logo: true,
+            x: inner.x + MENU_LOGO_PAD,
+            y: inner.y + MENU_ITEMS_Y,
+            width: inner.width.saturating_sub(MENU_LOGO_PAD),
+            first: 0,
+            count: MENU_ITEMS.len(),
+        });
+    }
+    if !menu_fits_compact(inner.height, inner.width) {
+        return None;
+    }
+    // Small viewport fallback: hide the large wordmark so the actionable rows
+    // stay visible instead of rendering an empty frame.
+    let count = usize::from(inner.height.min(MENU_ITEM_COUNT));
+    if count == 0 {
+        return None;
+    }
+    // Keep the selection on screen when not every row fits.
+    let sel = sel.min(MENU_ITEMS.len().saturating_sub(1));
+    let first = sel
+        .saturating_sub(count / 2)
+        .min(MENU_ITEMS.len().saturating_sub(count));
+    Some(MenuRows {
+        logo: false,
+        x: inner.x + MENU_COMPACT_PAD,
+        y: inner.y + inner.height.saturating_sub(MENU_ITEM_COUNT) / 2,
+        width: inner.width.saturating_sub(MENU_COMPACT_PAD),
+        first,
+        count,
+    })
+}
+
 /// Esc main menu: Home backdrop dimmed by `grey_overlay`, a double-border modal
 /// with the btop `draw_logo` and the Options/Help/Quit list.
 pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
@@ -48,16 +156,19 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
     let modal = centered_rect(50, 70, 60, 17, area);
     f.render_widget(Clear, modal);
     let inner = panel::bento(f, modal, None, BoxRole::Primary, false, theme);
-    if !menu_fits(inner.height, inner.width) {
+    let Some(rows) = menu_rows(inner, sel) else {
         return;
+    };
+    if rows.logo {
+        let logo_w = 31u16;
+        let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
+        draw_logo(f, cx, inner.y + 1, theme);
     }
-    let logo_w = 31u16;
-    let cx = inner.x + inner.width.saturating_sub(logo_w) / 2;
-    draw_logo(f, cx, inner.y + 1, theme);
 
-    let mx = inner.x + 4;
-    for (i, item) in MENU_ITEMS.iter().enumerate() {
-        let y = inner.y + MENU_ITEMS_Y + i as u16;
+    for row in 0..rows.count {
+        let i = rows.first + row;
+        let item = &MENU_ITEMS[i];
+        let y = rows.y + row as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -77,7 +188,7 @@ pub fn draw_menu(f: &mut Frame, area: Rect, sel: usize, theme: &Theme) {
                 Span::styled(cur, Style::default().fg(theme.accent)),
                 Span::styled(item.label(), st),
             ])),
-            Rect::new(mx, y, inner.width.saturating_sub(4), 1),
+            Rect::new(rows.x, y, rows.width, 1),
         );
     }
 }
@@ -267,7 +378,10 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{MENU_ITEMS, draw_logo, grey_overlay, opt_row};
+    use super::{
+        MENU_COMPACT_PAD, MENU_CURSOR_W, MENU_ITEMS, MENU_MIN_WIDTH_COMPACT, draw_logo,
+        grey_overlay, longest_menu_label, menu_fits_compact, opt_row,
+    };
     use crate::ui::tests::flat;
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
@@ -400,28 +514,161 @@ mod tests {
     }
 
     #[test]
-    fn esc_menu_is_drawn_only_when_the_box_is_tall_enough_for_every_item() {
+    fn esc_menu_falls_back_to_compact_layout_when_logo_layout_is_too_tall() {
         // End-to-end counterpart of `esc_menu_requires_room_for_all_items`: on
-        // a 120-column screen the box has 13 rows at height 19 (the logo would
-        // show but not every item) and 14 at height 20, the smallest screen on
-        // which Options, Help and Quit all fit.
+        // a 120-column screen the box at height 19 is too short for the logo
+        // layout, so it should render a compact no-logo menu instead of an
+        // empty frame.
         let theme = Theme::from_name("default-dark");
         let render = |h: u16| {
             let area = Rect::new(0, 0, 120, h);
             crate::ui::tests::rows(120, h, |f| super::draw_menu(f, area, 0, &theme)).join("\n")
         };
-        let short = render(19);
+        let compact = render(19);
         assert!(
-            !short.contains('█')
-                && !short.contains("Options")
-                && !short.contains("Help")
-                && !short.contains("Quit"),
-            "height 19 must draw an empty frame:\n{short}"
+            !compact.contains('█'),
+            "compact fallback should hide the large logo:\n{compact}"
         );
+        for label in ["Options", "Help", "Quit"] {
+            assert!(
+                compact.contains(label),
+                "{label} must remain visible in compact mode"
+            );
+        }
         let just_fits = render(20);
         assert!(just_fits.contains('█'), "logo at height 20");
         for label in ["Options", "Help", "Quit"] {
             assert!(just_fits.contains(label), "{label} at height 20");
+        }
+    }
+
+    #[test]
+    fn esc_menu_compact_mode_can_render_a_single_visible_row() {
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 120, 3);
+        let tiny =
+            crate::ui::tests::rows(120, 3, |f| super::draw_menu(f, area, 2, &theme)).join("\n");
+        assert!(!tiny.contains('█'), "tiny layout hides logo:\n{tiny}");
+        assert!(
+            tiny.contains("▸ Quit"),
+            "selected row must remain visible:\n{tiny}"
+        );
+        assert!(
+            !tiny.contains("Options"),
+            "only one row should be visible:\n{tiny}"
+        );
+        assert!(
+            !tiny.contains("Help"),
+            "only one row should be visible:\n{tiny}"
+        );
+    }
+
+    #[test]
+    fn esc_menu_keeps_the_selected_row_whole_at_every_height() {
+        // ROCMAI-1042's criterion is "every height", not the three heights the
+        // first version of this fix sampled (19, 20 and 3). Sweep every height
+        // a terminal can plausibly have on a 120-column screen and, for each,
+        // every selection: either the box is too small to draw any row at all,
+        // or the SELECTED row is on screen with its cursor and its whole
+        // label. A scroll window that lost the selection, or a layout that
+        // clipped the label, fails here at the first height it does so.
+        let theme = Theme::from_name("default-dark");
+        let render = |h: u16, sel: usize| {
+            let area = Rect::new(0, 0, 120, h);
+            crate::ui::tests::rows(120, h, |f| super::draw_menu(f, area, sel, &theme)).join("\n")
+        };
+        let mut smallest_drawn: Option<u16> = None;
+        for h in 1..=60u16 {
+            for (sel, selected) in MENU_ITEMS.iter().enumerate() {
+                let screen = render(h, sel);
+                let drew_any = MENU_ITEMS.iter().any(|i| screen.contains(i.label()));
+                if drew_any {
+                    assert!(
+                        screen.contains(&format!("▸ {}", selected.label())),
+                        "height {h}, selection {sel}: the selected row must be drawn whole, \
+                         with its cursor:\n{screen}"
+                    );
+                    smallest_drawn.get_or_insert(h);
+                } else {
+                    // Once the menu starts drawing it must keep drawing as the
+                    // terminal grows: a gap would be the empty-frame bug back
+                    // at a different size.
+                    assert!(
+                        smallest_drawn.is_none(),
+                        "height {h}: the menu drew nothing after first drawing at \
+                         height {smallest_drawn:?}:\n{screen}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            smallest_drawn,
+            Some(3),
+            "the compact fallback should reach down to the smallest screen the \
+             modal frame itself fits in"
+        );
+    }
+
+    #[test]
+    fn menu_rows_never_offers_a_row_narrower_than_the_longest_label() {
+        // The width floor's whole point: whenever `menu_rows` says to draw, the
+        // row it describes has room for the cursor gutter AND the longest
+        // label, so no row is ever selectable while illegible. Swept over every
+        // inner box up to the logo layout's own width, both layouts included.
+        for w in 0..=64u16 {
+            for h in 0..=24u16 {
+                for sel in 0..MENU_ITEMS.len() {
+                    let Some(rows) = super::menu_rows(Rect::new(0, 0, w, h), sel) else {
+                        continue;
+                    };
+                    assert!(
+                        rows.width >= MENU_CURSOR_W + longest_menu_label(),
+                        "inner {w}x{h} sel {sel}: row width {} truncates the longest label \
+                         ({} + {} needed)",
+                        rows.width,
+                        MENU_CURSOR_W,
+                        longest_menu_label()
+                    );
+                    assert!(
+                        rows.count > 0 && rows.first + rows.count <= MENU_ITEMS.len(),
+                        "inner {w}x{h} sel {sel}: window {}..{} is not inside the item list",
+                        rows.first,
+                        rows.first + rows.count
+                    );
+                    assert!(
+                        (rows.first..rows.first + rows.count).contains(&sel),
+                        "inner {w}x{h}: the selection must be inside the visible window"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_menu_width_floor_is_derived_from_the_item_list() {
+        // Pins the derivation rather than the number: "Options" is the longest
+        // of Options/Help/Quit, so the floor is pad + cursor + 7 = 10. Renaming
+        // or adding a row moves both sides together; hard-coding 1 (the floor
+        // this PR first shipped) fails the sweep above instead.
+        assert_eq!(longest_menu_label(), 7, "Options is the longest label");
+        assert_eq!(
+            MENU_MIN_WIDTH_COMPACT,
+            MENU_COMPACT_PAD + MENU_CURSOR_W + longest_menu_label()
+        );
+        assert!(!menu_fits_compact(3, MENU_MIN_WIDTH_COMPACT - 1));
+        assert!(menu_fits_compact(1, MENU_MIN_WIDTH_COMPACT));
+    }
+
+    #[test]
+    fn menu_labels_are_ascii_so_byte_length_is_display_width() {
+        // `longest_menu_label` measures bytes, which only equals the drawn
+        // width while every label is ASCII.
+        for item in MENU_ITEMS {
+            assert!(
+                item.label().is_ascii(),
+                "{:?} is not ASCII; longest_menu_label would under-measure it",
+                item.label()
+            );
         }
     }
 

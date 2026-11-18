@@ -15,7 +15,7 @@
 //!
 //! Callers in other modules, production and test-only, reach the moved items
 //! through the `chat::` module boundary, so this module re-exports each one
-//! another module reads (`run_internal_mcp_call`,
+//! another module reads (`run_internal_mcp_call`, `mcp_call_cli_arguments`,
 //! `rocm_chat_tool_system_prompt_for_host`, the tool-policy items, `any_substring`
 //! and `ensure_flag`, and the test-only ones under `#[cfg(test)]`).
 
@@ -32,8 +32,13 @@ mod turn;
 #[cfg(all(test, unix))]
 pub(crate) use self::summaries::deterministic_comfyui_tool_summary;
 // `run_internal_mcp_call` lives in `mcp_bridge.rs` and stays reachable here as
-// `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.
-pub(crate) use self::mcp_bridge::run_internal_mcp_call;
+// `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`;
+// `mcp_call_cli_arguments` likewise for `main.rs`'s `rocm mcp-call` dispatch.
+// `internal_mcp_tool_call` is read only by `dash_seam.rs`'s tests, so its
+// re-export is `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) use self::mcp_bridge::internal_mcp_tool_call;
+pub(crate) use self::mcp_bridge::{mcp_call_cli_arguments, run_internal_mcp_call};
 // `rocm_chat_tool_system_prompt_for_host` lives in `turn.rs` and stays
 // reachable here as `chat::rocm_chat_tool_system_prompt_for_host` for `dash.rs`.
 use self::turn::render_chat_prompt_result_with_progress;
@@ -49,7 +54,7 @@ pub(crate) use crate::rocm_argv::ensure_flag;
 // here as `chat::<item>` for `dash_seam.rs`. `ChatRocmCommandAction`,
 // `rocm_chat_tool_requested_args`, `chat_install_driver_action` and
 // `chat_rocm_command_action_from_args` are read through `chat::` only by other
-// modules' tests (`driver_plan.rs`, `system_packages.rs`), and this module does
+// modules' tests (`driver_plan.rs`, `system_packages.rs`, `dash_seam.rs`), and this module does
 // not call them itself, so their re-export below is `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) use crate::tool_policy::{
@@ -78,7 +83,7 @@ use std::io::Read as _;
 /// it never writes to and never closes therefore waits, exactly as `cat` would;
 /// the TTY guard is what keeps that off an interactive user, and a
 /// non-interactive caller with no prompt to send should pass `/dev/null` (as
-/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
+/// `cargo xtask smoke` does) rather than an idle pipe. A read error — a
 /// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
 /// prompt", so text that was piped but could not be decoded fails loudly rather
 /// than silently becoming a status screen and a zero exit.

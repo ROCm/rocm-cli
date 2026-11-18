@@ -38,7 +38,7 @@ use crate::ui::approval::{
 };
 use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
-use crate::ui::job_console::{ConsoleOutcome, on_console_key};
+use crate::ui::job_console::{ConsoleOutcome, console_esc_closes, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -250,6 +250,9 @@ pub struct ServeWizardState {
     pub picker: Option<ModelPicker>,
     /// Approval modal; `Some` while a launch is gated.
     pub approval: Option<PendingServe>,
+    /// Confirmation modal shown when the user tries to leave a running serve
+    /// console, to avoid hiding startup failures by accident.
+    pub detach_confirm: Option<ApprovalChoice>,
     /// In-flight (or just-finished) launch job id.
     pub active_job: Option<String>,
     /// Transient validation message (e.g. empty model / bad port).
@@ -271,6 +274,7 @@ impl Default for ServeWizardState {
             browser: None,
             picker: None,
             approval: None,
+            detach_confirm: None,
             active_job: None,
             message: None,
         }
@@ -520,11 +524,36 @@ pub fn on_key(
         return Vec::new();
     }
 
+    // 3b) Running-console detach confirmation has focus.
+    if let Some(choice) = w.detach_confirm {
+        let (choice, verdict) = approval_key(key.code, choice);
+        w.detach_confirm = Some(choice);
+        match verdict {
+            Some(ApprovalVerdict::Approve) => *wizard = None,
+            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => w.detach_confirm = None,
+            None => {}
+        }
+        return Vec::new();
+    }
+
     // 4) A launch job is showing in the console.
     if let Some(job_id) = w.active_job.clone() {
+        // The same predicate `AppState::console_exit` reports to the footer and
+        // to the console's own hint, so neither can advertise a plain "close"
+        // while this branch would raise the confirmation instead.
+        let running = console_esc_closes(jobs.job(&job_id));
         match on_console_key(&job_id, jobs, key) {
             ConsoleOutcome::Cancelled(fx) => return fx,
-            ConsoleOutcome::Closed => *wizard = None,
+            ConsoleOutcome::Closed => {
+                if running {
+                    // Leaving while startup is still in progress can hide a
+                    // near-immediate failure. Make this explicit. This is the
+                    // one `ConsoleExit::Confirmed` owner in the crate.
+                    w.detach_confirm = Some(ApprovalChoice::Deny);
+                } else {
+                    *wizard = None;
+                }
+            }
             ConsoleOutcome::Dismissed => w.active_job = None,
             ConsoleOutcome::Unhandled => {}
         }
@@ -760,8 +789,35 @@ fn spawn_serve(
     fx
 }
 
-/// Render the overlay (form, or the folder browser, or the approval modal, or
-/// the job console — in priority order).
+/// The detach-confirm modal's question and reasons.
+///
+/// The model name is only named when there is one: the form can be left blank
+/// while a prior launch is still running, and `for  ?` reads as a bug.
+fn detach_running_request(model: &str) -> ApprovalRequest {
+    let question = if model.is_empty() {
+        "leave the running serve?".to_string()
+    } else {
+        format!("leave running serve for {model}?")
+    };
+    ApprovalRequest::new(
+        question,
+        vec![
+            "The serve job is still running or starting.".to_string(),
+            "Leaving now can hide a startup failure until you check services/logs later."
+                .to_string(),
+            "Approve: leave this screen now.".to_string(),
+            "Deny: keep watching the live startup console.".to_string(),
+        ],
+    )
+}
+
+/// Render the overlay: always the static form, then any open modal over it.
+///
+/// The picker, folder browser, approval and detach-confirm modals are layered
+/// on top of the form, not chosen instead of it — so whichever one is open, the
+/// form is what the user sees behind it. Never the job console: `_jobs` is
+/// unused because the shared console is drawn one level up, in
+/// `ui::draw_active_manager`, which returns before reaching this function.
 pub fn draw_serve_wizard(
     f: &mut Frame,
     area: Rect,
@@ -827,6 +883,15 @@ pub fn draw_serve_wizard(
     }
     if let Some(pending) = &w.approval {
         draw_approval(f, area, &pending.request, pending.choice, theme);
+    }
+    if let Some(choice) = w.detach_confirm {
+        draw_approval(
+            f,
+            area,
+            &detach_running_request(w.model.trim()),
+            choice,
+            theme,
+        );
     }
 }
 
@@ -1983,13 +2048,18 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.as_ref().unwrap().active_job.is_some());
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('q')));
-        assert!(wiz.is_none(), "q must close the overlay even mid-job");
+        assert!(
+            wiz.is_some(),
+            "q should require detach confirmation mid-job"
+        );
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(wiz.is_none(), "confirming detach closes the overlay");
     }
 
     #[test]
     fn esc_closes_overlay_while_running_then_dismisses_when_terminal() {
-        // Running: Esc leaves the whole overlay (the launch keeps running in the
-        // background) — the user is never trapped during the readiness wait.
+        // Running: Esc asks for detach confirmation first.
         let mut wiz = Some(ServeWizardState::default());
         let mut jobs = State::default();
         wiz.as_mut().unwrap().model = "m".into();
@@ -1998,7 +2068,12 @@ mod tests {
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.as_ref().unwrap().active_job.is_some());
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
-        assert!(wiz.is_none(), "Esc closes the overlay even mid-job");
+        assert!(wiz.is_some(), "Esc should open detach confirmation mid-job");
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        // Deny stays in the console.
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('n')));
+        assert!(wiz.is_some());
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_none());
 
         // Terminal: Esc dismisses the console back to the form (wizard stays open).
         let mut wiz = Some(ServeWizardState::default());
@@ -2017,6 +2092,180 @@ mod tests {
         assert!(
             wiz.is_some(),
             "dismissing a finished console keeps the wizard open"
+        );
+    }
+
+    #[test]
+    fn detach_confirmation_cancel_keeps_running_console_open() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        wiz.as_mut().unwrap().model = "m".into();
+        wiz.as_mut().unwrap().focus(Field::Launch);
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        let w = wiz.as_ref().unwrap();
+        assert!(w.detach_confirm.is_none());
+        assert!(w.active_job.is_some(), "cancel keeps console active");
+    }
+
+    /// Launch "m" and leave the wizard parked on its running console.
+    fn wizard_on_running_console() -> (Option<ServeWizardState>, State) {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        wiz.as_mut().unwrap().model = "m".into();
+        wiz.as_mut().unwrap().focus(Field::Launch);
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Enter));
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(wiz.as_ref().unwrap().active_job.is_some());
+        (wiz, jobs)
+    }
+
+    #[test]
+    fn detach_confirm_follows_the_job_through_every_lifecycle_state() {
+        // One row per state the job can be in while the confirmation is on
+        // screen. The `on_key`-only tests above cover the open/deny/approve
+        // keys; what this pins is that the modal keeps owning the overlay no
+        // matter what the job does underneath it, so an answer is never lost
+        // to a state change the user did not make.
+
+        // Row 1 — confirm opens only while the job runs.
+        let (mut wiz, mut jobs) = wizard_on_running_console();
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        let running = wiz
+            .as_ref()
+            .expect("Esc on a running launch must raise the question, not leave outright");
+        assert!(
+            running.detach_confirm.is_some(),
+            "a running launch must ask before leaving"
+        );
+
+        // Row 2 — the job finishes while the confirmation is open. The modal
+        // stays (the user is answering it), and answering still works: the
+        // question has become moot but must not vanish mid-keystroke.
+        let done_id = wiz.as_ref().unwrap().active_job.clone().unwrap();
+        jobs.apply(StateEvent::JobDone {
+            id: done_id.clone(),
+            code: 0,
+        });
+        assert!(
+            !console_esc_closes(jobs.job(&done_id)),
+            "the launch must really have finished"
+        );
+        assert!(
+            wiz.as_ref().unwrap().detach_confirm.is_some(),
+            "a job finishing must not silently close the open question"
+        );
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('n')));
+        let w = wiz.as_ref().expect("denying keeps the wizard open");
+        assert!(w.detach_confirm.is_none());
+        assert_eq!(
+            w.active_job.as_deref(),
+            Some(done_id.as_str()),
+            "denying returns to the (now finished) console"
+        );
+        // And with the job terminal, leaving no longer asks at all.
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('q')));
+        assert!(
+            wiz.is_none(),
+            "`q` on a finished launch closes without a confirmation"
+        );
+
+        // Row 3 — the job disappears from the reducer while the confirmation is
+        // open (e.g. the job ring evicted it). Approving must still close.
+        let (mut wiz, mut jobs) = wizard_on_running_console();
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        assert!(wiz.as_ref().unwrap().detach_confirm.is_some());
+        let gone = wiz.as_ref().unwrap().active_job.clone().unwrap();
+        wiz.as_mut().unwrap().active_job = Some("vanished".into());
+        assert!(jobs.job("vanished").is_none(), "{gone} replaced by no job");
+        assert!(
+            wiz.as_ref().unwrap().detach_confirm.is_some(),
+            "a vanished job must not drop the open question either"
+        );
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(wiz.is_none(), "approving leaves even with no job to watch");
+    }
+
+    #[test]
+    fn detach_confirm_modal_replaces_the_console_with_the_static_form() {
+        // The `active_job_id` suppression in `app/overlays.rs` is what makes
+        // this true: `ui::draw_active_manager` draws the shared job console and
+        // RETURNS whenever a job id is active, so without that suppression the
+        // console would paint over the question and the user would see no modal
+        // at all while their keys answered one. Drives the real `ui::draw`
+        // path, not `draw_serve_wizard` directly, so the suppression is
+        // actually exercised; reverting the `overlays.rs` hunk fails here.
+        //
+        // What the suppression costs is asserted here too, so the name cannot
+        // drift from the screen: falling through to `draw_serve_wizard` means
+        // the backdrop behind the question is the wizard's own static form, not
+        // the live console the user was watching. That is intended — the swap
+        // lasts one keystroke and `Deny` restores the full console — but it is
+        // a swap, not an overlay, and the test says which.
+        use crate::app::AppState;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "rocm".into(),
+            args: vec!["serve".into(), "m".into()],
+        });
+        state.serve_wizard = Some(ServeWizardState {
+            model: "m".into(),
+            active_job: Some("job".into()),
+            detach_confirm: Some(ApprovalChoice::Deny),
+            ..Default::default()
+        });
+        assert!(
+            state.active_job_id().is_none(),
+            "the confirm modal owns the overlay, so no console job is active"
+        );
+
+        let backend = TestBackend::new(140, 45);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut state)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(
+            screen.contains("leave running serve for m?"),
+            "the detach-confirm question must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Leaving now can hide a startup failure"),
+            "the modal's reasons must be on screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Ctrl+C cancel"),
+            "the shared job console must not be drawn over the modal:\n{screen}"
+        );
+        assert!(
+            screen.contains("[ Launch ]"),
+            "the backdrop behind the question is the wizard's static form, not \
+             the console — a string only the form draws must be on screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn detach_confirm_question_has_no_stray_space_and_survives_an_empty_model() {
+        assert_eq!(
+            detach_running_request("m").title,
+            "leave running serve for m?"
+        );
+        assert_eq!(
+            detach_running_request("").title,
+            "leave the running serve?",
+            "a blank model must not render `for  ?`"
         );
     }
 

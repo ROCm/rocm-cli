@@ -62,6 +62,14 @@ const OVERFLOW_COLS: u16 = 90;
 /// dock switches its GPU panel into the wide layout at.
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
+/// Short enough that the Esc menu's modal can no longer fit the big ROCm
+/// wordmark plus all three rows, so `ui::menu` has to take its compact
+/// fallback. The modal is `centered_rect(50, 70, 60, 17, area)`, i.e. 70% of
+/// the screen height capped at 17, so twelve rows give it eight — under the
+/// `MENU_ITEMS_Y + MENU_ITEM_COUNT` the logo layout needs. The width is left at
+/// `COLS` because only the height is what ROCMAI-1042 is about.
+const SHORT_ROWS: u16 = 12;
+const SHORT_COLS: u16 = COLS;
 
 /// The initial geometry as `vt100` wants it (`NonZeroU16`); the constants above
 /// stay `u16` because `PtySize` takes that. A zero here fails the build.
@@ -682,6 +690,13 @@ impl TuiSession {
     /// demo fixtures' entries, forcing a scrollable body.
     pub fn use_overflow_size(&mut self) -> Result<(), String> {
         self.resize_to(OVERFLOW_ROWS, OVERFLOW_COLS)
+    }
+
+    /// Shrink to [`SHORT_ROWS`]x[`SHORT_COLS`] — too short for the Esc menu's
+    /// logo layout, which is the geometry ROCMAI-1042 reported an empty modal
+    /// at.
+    pub fn use_short_size(&mut self) -> Result<(), String> {
+        self.resize_to(SHORT_ROWS, SHORT_COLS)
     }
 
     /// Write raw bytes to the terminal (keystrokes/text). `Enter` is `"\r"`.

@@ -1,3 +1,7 @@
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
 # Runs a bash script inside the pinned WSL guest.
 #
 # Piping script text to `wsl.exe` from Windows PowerShell 5.1 is unreliable:

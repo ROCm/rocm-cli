@@ -10,10 +10,19 @@ Feature: Model serving
     When the user serves a model using its short name
     Then the output shows the full model name
 
+  # A short name is a catalog entry, and an entry can publish a different build
+  # of the same model per engine, so the names need not be identical -- what must
+  # hold is that each engine names the build it will serve.
+  #
+  # This discriminates nothing yet: the scenario is an expected failure on every
+  # host while its xfail row stands, and the vLLM run stops before printing a
+  # plan, so the step panics there whatever the lemonade half did. It becomes
+  # regression coverage when that row is narrowed. serve-60 and the unit tests in
+  # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
-  Scenario: serve-02 - Short name expansion is consistent across engines
+  Scenario: serve-02 - Every engine expands a short name rather than serving it
     When the user serves the same short name with different engines
-    Then all engines expand to the same full model name
+    Then every engine expands it to the full name of the model it will serve
 
   @id:serve-discoverable-by-name
   Scenario: serve-03 - A running model server is discoverable by name
@@ -70,14 +79,11 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
-  # bypasses Lemonade's model router and runs a packaged llama-server directly
-  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
-  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
-  # managed-lemonade fallback would mask the identical failure behind the
-  # ROCMAI-898 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
-  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
-  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  # Explicit HF-checkpoint canary: `owner/repo:variant` runs the selected GPU
+  # llama-server directly and fails if that backend binary is missing. Named
+  # catalog entries can also serve directly on Linux when their metadata is
+  # simple enough; other registered entries use Lemonade's router. Both canaries
+  # use the same small checkpoint, sharing the cache without another download.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
@@ -359,14 +365,16 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the per-PR lanes: each one pulls the
-  # image and a 9B checkpoint on a cold runner and may wait out the full
-  # 1200s readiness cap, so the pair on the per-PR Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. They run only when
+  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
+  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
+  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
+  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # Unconfirmed: whether the nightly Strix Halo host has Docker; without it both
-  # skip every night (the nightly job logs whether Docker is reachable).
+  # On a host without Docker both skip (the nightly job logs whether Docker is
+  # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
+  # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -858,3 +866,156 @@ Feature: Model serving
     When the user sends a streaming request to the Anthropic messages endpoint
     Then the response is delivered as Anthropic-style server-sent events
     And the streamed content reassembles into a complete reply
+
+  # The catalog's recommended small assistant for a low-VRAM machine, asked for
+  # by its short name with no engine named. Whatever engine is chosen for the
+  # user has to be handed a build of that model it can actually load, so the
+  # short name alone must be enough. (The dash serve wizard fills the field with
+  # the recipe's canonical id rather than a short name; the unit tests cover that
+  # spelling, and it resolves through the same recipe.)
+  #
+  # Deliberately NOT tagged @requires-engine: the engine is the CLI's to pick
+  # here, and pinning one would make the harness attribute the run to an engine
+  # the scenario never asked for. The host's own default engine is what gates it.
+  @id:serve-small-assistant-short-name @requires-gpu
+  Scenario: serve-55 - The recommended small assistant serves from its short name alone
+    Given a managed runtime is active
+    And the recommended small assistant is being served by its short name
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # ROCMAI-863: a Hugging Face repo named without a quantization variant has no
+  # GGUF file to serve, but serving started an engine for it anyway and left the
+  # objection to the background process — where, on Windows, nothing the user can
+  # see ever reports it: an empty log, a success exit, and a server recorded as
+  # stopped. The refusal now comes before anything starts. It also names no
+  # quantization of its own: nothing on this path reads the repository's files, so
+  # a suggested label is a guess, and following a guess fails a second time on a
+  # repo that ships no GGUF at all. @requires-gpu because a host with no usable
+  # GPU is turned away earlier, for that reason instead, and never reaches this
+  # one. No @requires-os deliberately — Windows is the lane the failure was silent
+  # on, so it is the one most worth watching.
+  @id:serve-missing-gguf-variant-refused @requires-gpu @requires-engine:lemonade
+  Scenario: serve-56 - Serving a Hugging Face repo with no quantization variant is refused
+    When the user serves a Hugging Face repo with no quantization variant on Lemonade
+    Then serving is refused before any engine starts
+    And the user is told the model needs an explicit GGUF variant
+    And no quantization is suggested for a repo the CLI has not inspected
+    And no local server was recorded
+  # The pinned Lemonade catalog's smallest vision GGUF needs its mmproj file.
+  # Serving its registered name must retain the router, not flatten the entry
+  # into a single-checkpoint direct serve. Use a scenario-owned port and service;
+  # the additional model download stays off the ordinary per-PR path.
+  # Linux only: registered names take the router on Windows both with and
+  # without the direct llama-server route, so a Windows run cannot tell the
+  # two behaviours apart.
+  # No expectations row is added for this scenario. The flaky Linux rows cover
+  # the direct llama-server route, and this scenario takes the router route, so
+  # those rows' failure mode does not describe it. It is nightly-only.
+  @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
+  Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
+    Given a managed runtime is active
+    And a registered vision GGUF is being served on lemonade on its own port
+    Then the managed engine state confirms the Lemonade router loaded the registered model
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # Which runtime a registered name takes is user-observable: a simple catalog
+  # entry (one checkpoint with a variant, no extra files) is served directly by
+  # the selected GPU llama-server on Linux, while
+  # `serve-lemonade-complex-registered-inference` covers the router route for an
+  # entry that needs more. The endpoint answering would not tell the
+  # two apart, so this reads the engine state's method and backend.
+  @id:serve-lemonade-simple-registered-direct-route @requires-gpu @requires-os:linux @requires-engine:lemonade
+  Scenario: serve-58 - A simple registered GGUF name is served directly by the selected GPU backend
+    Given a managed runtime is active
+    And a simple registered GGUF is being served on lemonade on its own port
+    Then the managed engine state records direct serving by the selected GPU backend
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed
+
+  # A served endpoint's API key sits in `<data>/services/<id>.endpoint-key`, and
+  # nobody but the user who started the server may read it. Here: a loopback
+  # serve with `--require-api-key` (so no public port is opened on the GPU box),
+  # then the key file's mode is checked to be exactly 0600. The file is replaced
+  # by a freshly created owner-only one on every store, so a mode loosened in
+  # place is tightened again; that re-store case is covered by the unit tests in
+  # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
+  # the key before a restart writes it back. The check does not depend on
+  # readiness: the serve waits a fixed 45 seconds for the engine
+  # (`READINESS_WAIT` in `service_launch/readiness.rs`) and then exits 0,
+  # reporting a server still loading as `starting`; the key is written before
+  # the engine starts, and the scenario's teardown stops the service.
+  # Linux-only: on Windows the key is protected by an owner-only DACL
+  # instead, but the Windows GPU lane serves with Lemonade, which refuses a
+  # key-protected bind there (`ensure_public_bind_engine_supported` in
+  # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the
+  # `rocm-core` unit tests that read the DACL back on the Windows build job.
+  @id:serve-endpoint-key-readable-by-owner-only @requires-gpu @requires-os:linux
+  Scenario: serve-59 - Only the user who started a key-protected server can read its key
+    Given a managed runtime is active
+    When the user serves a model that requires an API key
+    Then the server's API key is kept where only that user can read it
+
+  # A launch that became ready but whose first chat request fails must not be
+  # shown as a healthy deployment (#523). Same test-only hook as
+  # @id:serve-oom-launch-memory-guidance, in its
+  # `ready` mode, pointed at a mock engine that fails every chat request. The
+  # unit and provider tests prove the rendering and the failure classes; this
+  # proves `serve()` carries the smoke test's failure into the summary.
+  @id:serve-smoke-failure-summary @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-60 - A launch whose first chat request fails is not presented as ready
+    Given a managed vLLM launch that becomes ready but whose engine fails its first chat request
+    When the user opens the interactive serve summary against that engine
+    Then the deployment summary says the smoke test failed and does not call the service ready
+    And the deployment summary gives the engine's own reason
+    And the engine received exactly one chat request
+    And the deployment summary names the logs command for that service
+    And the launch's service record is left as ready
+    And no background automation daemon was left behind
+
+  # An API key on a vLLM endpoint (`--require-api-key`, a public bind, or
+  # `rocm remote serve`) has to cover the whole server, not only the OpenAI `/v1`
+  # API: vLLM's own key check guards a fixed set of path prefixes, while the
+  # server also answers inference and tokenizer routes outside them. rocm-cli
+  # starts vLLM with a middleware that demands the key on every route except
+  # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
+  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
+  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # serve, so `@nightly` rather than per-PR: it runs after merge in the nightly
+  # runs on Instinct GPUs, which serve with vLLM: the MI300X job in
+  # `nightly.yml` and the shared GPU queue's Instinct lanes (MI350P among them).
+  # Not `@merge-queue`: the merge queue runs no lane where vLLM is the engine
+  # (the MI300X lane does not run on `merge_group`), so under that tag it
+  # skipped everywhere.
+  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @nightly
+  Scenario: serve-61 - A key-protected vLLM endpoint refuses keyless requests outside the OpenAI API
+    Given a managed runtime is active
+    And a model is being served on GPU behind an API key
+    When a client calls the server's routes without the key
+    Then every route outside the OpenAI API refuses the call as unauthorized
+    And the health check answers without the key
+    When the client repeats those calls with the key
+    Then every one of those calls succeeds
+
+  # A vLLM wheel built against a different torch installs and reports a version,
+  # so the inventory called it `runtime: ready` and `serve` then died deep in
+  # engine start-up. The inventory now says it is installed but not usable and
+  # names the extension (read-only, so a host whose torch needs a compat shim
+  # nobody has written yet can still read `ready`). Hermetic: a stand-in interpreter answers the probe, so
+  # no GPU, network or real vLLM is needed. The matching refusal in `serve` is
+  # covered at unit level (`serve_refuses_a_vllm_whose_extensions_do_not_import`)
+  # because reaching it end to end needs a GPU lane.
+  @id:serve-vllm-broken-extensions-reported-not-usable @requires-os:linux
+  Scenario: serve-62 - A vLLM install whose compiled extensions do not import is not reported as ready
+    Given a vLLM install whose compiled extensions do not import
+    When the user lists the engines of that install
+    Then vLLM is reported as installed but not usable
+    And the report names the extension that failed to import

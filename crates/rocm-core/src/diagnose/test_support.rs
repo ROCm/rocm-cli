@@ -2,9 +2,49 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! `Examination` builders shared by the tests of more than one `diagnose` module.
+//! `Examination` builders, shell stubs and a symptom, shared by the tests of
+//! more than one `diagnose` module.
 
+use crate::diagnose::SymptomEngine;
 use crate::examine::{Examination, Gpu, WslFacts};
+
+/// Every `SymptomEngine` variant, for tests that must cover each one. The
+/// exhaustive `match` in [`every_engine`] stops compiling when a variant is
+/// added and not listed here.
+pub(super) const ALL_ENGINES: [SymptomEngine; 1] = [SymptomEngine::Vllm];
+
+/// [`ALL_ENGINES`], checked against the enum by an exhaustive `match`.
+pub(super) fn every_engine() -> [SymptomEngine; 1] {
+    for engine in ALL_ENGINES {
+        match engine {
+            SymptomEngine::Vllm => {}
+        }
+    }
+    ALL_ENGINES
+}
+
+/// An `Examination` of the given catalog platform family (`linux`, `wsl` or
+/// `windows`), with nothing else set.
+pub(super) fn host_of_family(family: &str) -> Examination {
+    match family {
+        "linux" => linux_base(),
+        "wsl" => wsl_base(),
+        "windows" => Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        },
+        other => panic!("no test host for platform family {other:?}"),
+    }
+}
+
+/// A paste carrying text no catalog message contains: an accented path
+/// (two-byte UTF-8), a box-drawing character (three bytes, what a `rich`
+/// traceback frames itself with) and an emoji beyond the Basic Multilingual
+/// Plane (four bytes, a surrogate pair once escaped). Used where a test needs
+/// to know the `--json` output is ASCII because it was escaped, not because the
+/// input happened to be.
+pub(super) const NON_ASCII_PASTE: &str = "torch.OutOfMemoryError: HIP out of memory. \
+     Tried to allocate 2.00 GiB\n\u{2502} File \"/home/jos\u{e9}/caf\u{e9}/serve.py\" \u{1f525}";
 
 pub(super) fn linux_base() -> Examination {
     Examination {
@@ -76,4 +116,41 @@ pub(super) fn windows_driver_exam(version: &str, date: &str) -> Examination {
         adrenalin_date: date.to_owned(),
         ..Examination::default()
     }
+}
+
+/// Writes each `(name, script)` as an executable in a new directory, to be
+/// the whole `PATH` of a shell that runs a Linux verify line.
+#[cfg(unix)]
+pub(super) fn stub_bin_dir(stubs: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("the stub directory is created");
+    for (name, script) in stubs {
+        let path = dir.path().join(name);
+        crate::fake_executable::write_fake_executable(&path, format!("#!/bin/sh\n{script}\n"))
+            .expect("a stub is planted");
+    }
+    dir
+}
+
+/// Runs one printed line in `/bin/sh` whose `PATH` is only `bin` and whose
+/// environment is only `PATH` and `env`. Returns whether it exited 0, and
+/// its stdout and stderr.
+#[cfg(unix)]
+pub(super) fn run_in_sh(
+    line: &str,
+    bin: &std::path::Path,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(line)
+        .env_clear()
+        .env("PATH", bin)
+        .envs(env.iter().copied())
+        .output()
+        .expect("/bin/sh runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }

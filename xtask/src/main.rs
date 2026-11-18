@@ -23,6 +23,8 @@ mod demos;
 mod deps;
 mod e2e;
 mod e2e_prewarm;
+mod e2e_prewarm_vision;
+mod e2e_queue_import;
 mod e2e_report;
 mod engine_stdio_client_contract;
 mod env_mutation_contract;
@@ -43,6 +45,7 @@ mod rocm_releases;
 #[cfg(test)]
 mod rust_source;
 mod signing;
+mod smoke;
 mod tpn;
 mod verify_commits;
 mod verify_pinned_keys;
@@ -337,6 +340,12 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Bring a finished run of the shared GPU queue into the nightly's E2E
+    /// report: write each lane's reports where `e2e-report` reads them, named
+    /// for the lane and for whether the queue blocks on it, and write a status
+    /// section for the top of the support matrix. With `--absent`, import
+    /// nothing and say why. See docs/nightly-on-the-queue.md.
+    E2eQueueImport(e2e_queue_import::Args),
     /// Count received Doctor reports from an export of the report mailbox.
     ///
     /// Reads `.eml` files (one message each) and raw `.json` report bodies,
@@ -389,6 +398,26 @@ pub(crate) enum Command {
         /// Path to write the mechanical verdict + status table markdown.
         #[arg(long)]
         table_out: PathBuf,
+    },
+    /// Run the local no-fallback smoke gate: build, then drive the built
+    /// `rocm`, `rocmd` and engine binaries against a throwaway state root and
+    /// assert their first-run output — chiefly that every GPU-required path
+    /// fails loudly rather than falling back to CPU.
+    Smoke {
+        /// Build profile to build and smoke. `debug` builds the whole workspace
+        /// with all targets; `release` builds only the four binaries the gate
+        /// runs.
+        #[arg(long, value_enum, default_value_t = smoke::Profile::Debug)]
+        profile: smoke::Profile,
+        /// Smoke binaries that are already built instead of building first.
+        #[arg(long)]
+        skip_build: bool,
+        /// Target directory to build into and to find the binaries in, under its
+        /// profile subdirectory. Relative paths resolve against the workspace
+        /// root. Defaults to `CARGO_TARGET_DIR`, or `target` under the workspace
+        /// root; either way the build is given the same directory explicitly.
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
     },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
@@ -484,6 +513,7 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::E2eQueueImport(args) => e2e_queue_import::run(&args)?,
         Command::ReportRollup(args) => report_rollup::run(&args)?,
         Command::ReleaseReadiness {
             since_tag,
@@ -502,6 +532,11 @@ fn run() -> Result<()> {
             &out,
             &table_out,
         )?,
+        Command::Smoke {
+            profile,
+            skip_build,
+            target_dir,
+        } => smoke::run(profile, skip_build, target_dir)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

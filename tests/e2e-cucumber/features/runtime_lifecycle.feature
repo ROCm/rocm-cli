@@ -262,3 +262,196 @@ Feature: Runtime lifecycle state machine
     And the server is still counted as left on the first runtime
     And the switch to the second runtime was kept
     And the server record still names the first runtime
+
+  # ROCm 10 is published in its own layout, beside the canonical one the CLI
+  # installed from before. A runtime installed from it records that layout, and
+  # its key carries a fingerprint of the exact packages it was built from; a
+  # runtime installed before that layout existed has no top-level
+  # `source_layout_generation` or `devel` field: it records its layout and
+  # toolchain only inside `wheel_composition`. Both kinds stay installed side by
+  # side, so the CLI has to keep reading the older record as it was written while
+  # it lists, switches between and removes the newer ones. These scenarios plant
+  # three managed runtimes as an install would leave them — a registry entry, the
+  # same record inside the runtime's own folder, and stub files where the
+  # readiness check looks — without downloading anything. Every command runs
+  # with the startup update check disabled, since it would otherwise ask the
+  # package index about the planted runtimes. The Windows release lane in CI
+  # selects them by id, so they run on both supported platforms.
+  @id:runtime-lifecycle-side-by-side-across-packaging-change
+  Scenario: runtime-lifecycle-19 - Runtimes installed before and after the ROCm 10 layout are used side by side
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    When the user lists the installed runtimes
+    Then all three runtimes are listed as ready, each under its own key
+    When the user activates each of the three runtimes in turn
+    Then each one becomes the runtime in use in turn
+    And none of the three runtimes' install records was rewritten
+
+  @id:runtime-lifecycle-side-by-side-uninstall-keeps-the-others
+  Scenario: runtime-lifecycle-20 - Uninstalling one side-by-side runtime leaves the others usable
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    And the nightly runtime is in use after the ROCm 10 release runtime
+    When the user uninstalls the ROCm 10 release runtime
+    Then that runtime's folder and record are gone
+    And the other two runtimes keep their folders and unchanged records
+    And the nightly runtime is still in use, with no rollback target left
+    When the user uninstalls the runtime in use
+    Then no runtime is in use
+    When the user activates the ROCm 7 runtime
+    Then the ROCm 7 runtime is the runtime in use
+
+  # The ROCm 7 and ROCm 10 release runtimes share a name: the runtime id is
+  # derived from the channel and GPU family alone. Picking either silently could
+  # put the user on the wrong ROCm major version.
+  @id:runtime-lifecycle-side-by-side-shared-name-refused
+  Scenario: runtime-lifecycle-21 - A name shared by side-by-side runtimes is refused with each runtime named
+    Given a ROCm 7 runtime installed before the ROCm 10 layout existed, a ROCm 10 release runtime and a ROCm 10 nightly runtime, all for one GPU family
+    When the user activates a runtime by the name the two release runtimes share
+    Then the CLI refuses and names both release runtimes
+    And no runtime is in use
+
+  # The install report names a runtime's channel, package source, source layout
+  # and exact GPU target; afterwards only its manifest still knows them. The
+  # listing reads them back and says when one was never recorded rather than
+  # inferring it — the older runtime's family is itself an exact target, so a
+  # guess would look like a recorded value. An adopted runtime installed
+  # nothing, so it has no package source; its manifest holds only the marker
+  # adoption writes in place of one, in the on-disk form earlier releases wrote,
+  # and the listing must not show that marker as a source. The planted manifests
+  # need no SDK download or GPU, so this runs on the mock lane.
+  @id:runtime-lifecycle-list-names-runtime-provenance
+  Scenario: runtime-lifecycle-22 - Listing runtimes says which stream, source and GPU each runtime was installed from
+    Given a registered nightly runtime installed for one exact GPU
+    And a registered runtime installed before its source layout and GPU target were recorded
+    And a registered runtime adopted from an environment ROCm CLI did not install
+    When the user lists the registered runtimes
+    Then the nightly runtime's listing names its channel, package source, source layout and exact GPU target
+    And its version shows its build date
+    And the older runtime's listing says which of those facts were not recorded instead of guessing
+    And the adopted runtime's listing says it has no recorded package source
+
+  # A script reads the runtime list without scraping the table. stdout must hold
+  # one JSON document and nothing else; diagnostics belong on stderr. The active
+  # and rollback flags are the facts the text marks with `*` and `-`, so the
+  # scenario also lists the same state as text and checks that both forms mark
+  # the same runtimes.
+  @id:runtime-lifecycle-list-json-marks-active-and-rollback
+  Scenario: runtime-lifecycle-23 - A script reads the runtime list as JSON
+    Given two registered runtimes with the second active after the first
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON lists both runtimes with their recorded values
+    And the JSON marks the second runtime active and the first as the rollback target
+    And the text listing marks the same runtimes as the JSON
+
+  # The empty registry is where the text form prints placeholders (`<unset>`)
+  # and a next-step hint; the JSON form has to stay a parseable document with
+  # nulls instead, not fall back to that text.
+  @id:runtime-lifecycle-list-json-empty-registry
+  Scenario: runtime-lifecycle-24 - Listing runtimes as JSON with none registered
+    Given no ROCm runtime is registered
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON lists no runtimes and no active runtime
+
+  # A runtime whose folder was deleted outside the CLI stays registered, but
+  # activation would refuse it. A script has to see that from the document
+  # alone, without trying the activation.
+  @id:runtime-lifecycle-list-json-reports-unusable-runtime
+  Scenario: runtime-lifecycle-25 - The JSON runtime list reports a runtime whose folder is gone as unusable
+    Given two registered runtimes with the second active after the first
+    And the first runtime's folder has been deleted
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON reports the first runtime unusable because its folder is missing
+    And the JSON reports the second runtime ready
+
+  # The active runtime's registry entry was removed by hand while the config
+  # still names it. The document has to say so, not just mark nothing active.
+  @id:runtime-lifecycle-list-json-reports-missing-active-manifest
+  Scenario: runtime-lifecycle-26 - The JSON runtime list says when the active runtime's registry entry is gone
+    Given two registered runtimes with the second active after the first
+    And the second runtime's registry entry has been deleted
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON reports that the active runtime key has no registered runtime
+    And the JSON marks no runtime active
+
+  # `rocm config set-default-runtime` stores the id as typed and clears the
+  # active key, so the list decides the active runtime from the default id
+  # alone. An id that differs from a runtime's only in letter case still names
+  # that runtime, and the list must not also report its registry entry missing.
+  @id:runtime-lifecycle-list-default-id-in-other-letter-case
+  Scenario: runtime-lifecycle-27 - A default runtime set in other letter case is listed as active with no problem
+    Given two registered runtimes and none active
+    When the user sets the default runtime to the first runtime's id in other letter case
+    And the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON shows the default runtime as typed and no active runtime key
+    And the JSON marks only the first runtime active and reports no problem
+    And the text listing marks the first runtime active with no active_status line
+
+  # A config edited by hand can name the active runtime in other letter case.
+  # The commands that act on the active runtime match its key ignoring case, so
+  # the list has to mark the runtime they act on, and `rocm examine` has to
+  # report that same runtime. The default runtime still names the second
+  # runtime, so a list that fell back to it would mark the wrong one.
+  @id:runtime-lifecycle-list-active-key-in-other-letter-case
+  Scenario: runtime-lifecycle-28 - An active runtime named in other letter case is listed as the one examine reports
+    Given two registered runtimes with the second active after the first
+    And the configuration names the first runtime as active in other letter case
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON marks only the first runtime active and reports no problem
+    And the text listing marks the first runtime active with no active_status line
+    And examine reports the first runtime as the active one
+
+  # The configured active runtime is not registered, but the default runtime
+  # still names a registered one and the commands fall back to it. The list
+  # marks that runtime active, as `rocm examine` reports it, and still says the
+  # configured active runtime is missing, in both forms.
+  @id:runtime-lifecycle-list-dead-active-key-falls-back-to-default
+  Scenario: runtime-lifecycle-29 - A missing active runtime is reported while the default runtime the commands use is listed active
+    Given two registered runtimes with the second active after the first
+    And the configuration names an unregistered runtime as active
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON marks only the second runtime active
+    And the JSON reports that the active runtime key has no registered runtime
+    And the text listing marks the same runtimes as the JSON
+    And the text listing says the active runtime key has no registered runtime
+    And examine reports the second runtime as the active one
+
+  # `--json` changes what a successful list prints, not how a failure is
+  # reported: errors are not JSON. A registry entry the CLI cannot read stops
+  # the list, so a script has to learn that from the exit code and an empty
+  # stdout rather than from a document that looks like a shorter list.
+  @id:runtime-lifecycle-list-json-failure-prints-nothing-on-stdout
+  Scenario: runtime-lifecycle-30 - A runtime list that cannot be read fails as JSON with nothing on stdout
+    Given two registered runtimes with the second active after the first
+    And the first runtime's registry entry cannot be read
+    When the user lists the registered runtimes as JSON
+    Then the list fails with nothing printed on stdout
+    And the error on stderr is plain text naming the unreadable registry entry
+
+  # A script reads where each runtime came from out of the JSON listing instead
+  # of parsing the text's `provenance:` line. A fact the manifest never recorded
+  # has no value there, where the text prints `unrecorded`, so a script cannot
+  # take the placeholder for a recorded value. The same runtimes as
+  # `runtime-lifecycle-22` are planted, and the text listing of the same state
+  # is compared fact by fact, so the two forms are shown to agree. The startup
+  # update check is off: with wheel runtimes registered it looks for a Python
+  # and the network, and can print ahead of the document, which is not what
+  # this scenario is about. The planted manifests need no SDK download or GPU,
+  # so this runs on the mock lane.
+  @id:runtime-lifecycle-list-json-names-runtime-provenance
+  Scenario: runtime-lifecycle-31 - A script reads from the JSON runtime list which stream, source and GPU each runtime was installed from
+    Given a registered nightly runtime installed for one exact GPU
+    And a registered runtime installed before its source layout and GPU target were recorded
+    And a registered runtime adopted from an environment ROCm CLI did not install
+    And ROCm CLI does not check for runtime updates when it starts
+    When the user lists the registered runtimes as JSON
+    Then the output is a single JSON document and nothing else
+    And the JSON names the nightly runtime's channel, package source, source layout and exact GPU target
+    And the JSON gives no value for each fact the older runtime did not record instead of guessing
+    And the JSON gives no package source for the adopted runtime
+    And the text listing names the same provenance as the JSON for every runtime
