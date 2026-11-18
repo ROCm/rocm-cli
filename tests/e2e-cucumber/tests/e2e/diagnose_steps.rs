@@ -343,6 +343,126 @@ async fn user_pasted_a_capture_with_a_foreign_oom(world: &mut E2eWorld) {
     );
 }
 
+/// A vLLM startup OOM as a user pastes it from the engine log: two lines, and
+/// neither names vLLM, which is what made the old prefix necessary. The leading
+/// line and the trailing spaces are there so "exactly as pasted" has something
+/// to lose: a paste trimmed, split or re-joined would no longer compare equal.
+const UNNAMED_VLLM_OOM_PASTE: &str = "INFO Loading model weights took 14.9 GiB\n\
+     torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB  ";
+
+#[given("a user who pasted a vLLM out-of-memory error that does not name vLLM")]
+async fn user_pasted_unnamed_vllm_oom(world: &mut E2eWorld) {
+    world.model_name = Some(UNNAMED_VLLM_OOM_PASTE.to_string());
+}
+
+/// The parts of [`PASTE_NAMING_THE_MACHINE`] that belong to the user's own
+/// machine. None of them is a catalog word, so none can appear in a report
+/// except by being copied from the paste.
+const PASTED_MACHINE_DETAILS: [&str; 3] = ["e2e-paste-user", "e2e-paste-host", "e2e-paste-token"];
+
+/// A vLLM startup OOM as pasted from a log that also names the user's home
+/// directory, host and a token: the shape of paste that must not reach a
+/// report meant for sharing.
+const PASTE_NAMING_THE_MACHINE: &str = "torch.OutOfMemoryError: HIP out of memory. \
+     Tried to allocate 2.00 GiB\n\
+     File \"/home/e2e-paste-user/serve.py\" on e2e-paste-host, HF_TOKEN=e2e-paste-token";
+
+/// A vLLM out-of-memory paste with non-ASCII text in it: an accented path
+/// (two UTF-8 bytes), a box-drawing character (three) and an emoji beyond the
+/// Basic Multilingual Plane (four, a surrogate pair once escaped).
+const NON_ASCII_VLLM_PASTE: &str = "torch.OutOfMemoryError: HIP out of memory. \
+     Tried to allocate 2.00 GiB\n\u{2502} File \"/home/jos\u{e9}/caf\u{e9}/serve.py\" \u{1f525}";
+
+/// Where [`NON_ASCII_VLLM_PASTE`] is saved, inside the scenario's own root.
+fn non_ascii_paste_file(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("engine-paste.txt")
+}
+
+/// Saved with the final line break an editor adds, which `--symptom-file`
+/// removes, so the symptom the report records is the paste itself.
+#[given("a user whose pasted vLLM error contains non-ASCII text, saved to a file")]
+async fn user_saved_non_ascii_vllm_paste(world: &mut E2eWorld) {
+    std::fs::write(
+        non_ascii_paste_file(world),
+        format!("{NON_ASCII_VLLM_PASTE}\n"),
+    )
+    .expect("failed to save the paste");
+    world.model_name = Some(NON_ASCII_VLLM_PASTE.to_string());
+}
+
+#[when(
+    "the user asks the CLI to diagnose that file in machine-readable form, naming vLLM as the engine"
+)]
+async fn user_diagnoses_non_ascii_file_naming_vllm(world: &mut E2eWorld) {
+    let path = non_ascii_paste_file(world).display().to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom-file",
+            &path,
+            "--engine",
+            "vllm",
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("every byte the CLI printed is ASCII")]
+async fn assert_stdout_is_ascii(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().expect("no diagnose output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0:\n{stdout}\n{:?}",
+        world.cli_stderr
+    );
+    let stray: Vec<char> = stdout.chars().filter(|c| !c.is_ascii()).collect();
+    assert!(
+        stray.is_empty(),
+        "--json must be ASCII on the wire, so a Windows console on the OEM code page shows \
+         no mojibake; found {stray:?} in:\n{stdout}"
+    );
+}
+
+#[then("the symptom in the report reads back exactly as the file held it")]
+async fn assert_symptom_reads_back_exactly(world: &mut E2eWorld) {
+    let pasted = world.model_name.clone().expect("no symptom set");
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/symptom")
+            .and_then(serde_json::Value::as_str)
+            .map(str::as_bytes),
+        Some(pasted.as_bytes()),
+        "decoded, the recorded symptom must be the paste byte for byte:\n{output}"
+    );
+}
+
+/// A plain Python failure with no out-of-memory text in it and nothing to do
+/// with vLLM.
+#[given("a user who pasted a Python error that has nothing to do with vLLM")]
+async fn user_pasted_unrelated_python_error(world: &mut E2eWorld) {
+    world.model_name = Some(
+        "Traceback (most recent call last):\n  File \"train.py\", line 3, in <module>\n\
+         ZeroDivisionError: division by zero"
+            .to_string(),
+    );
+}
+
+#[given("a user who pasted a vLLM error that names their own machine")]
+async fn user_pasted_vllm_error_naming_their_machine(world: &mut E2eWorld) {
+    world.model_name = Some(PASTE_NAMING_THE_MACHINE.to_string());
+}
+
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
@@ -759,6 +879,164 @@ async fn user_diagnoses_json(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Diagnose the scenario's symptom, naming `engine` as where it came from.
+/// Keeps stdout, stderr and the exit code apart: a refusal is judged on all
+/// three.
+fn diagnose_naming_engine(world: &mut E2eWorld, engine: &str) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            &symptom,
+            "--engine",
+            engine,
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from")]
+async fn user_diagnoses_naming_vllm(world: &mut E2eWorld) {
+    diagnose_naming_engine(world, "vllm");
+}
+
+/// Text mode, twice: with `--engine vllm`, and without it as the baseline the
+/// "changed nothing" claim is checked against. `cli_outputs` holds the two
+/// stdouts in that order.
+#[when(
+    "the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from"
+)]
+async fn user_diagnoses_as_text_naming_vllm(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (named, named_stderr, rc) = crate::run_rocm(
+        world,
+        &["diagnose", "--symptom", &symptom, "--engine", "vllm"],
+    );
+    let (unnamed, _, unnamed_rc) = crate::run_rocm(world, &["diagnose", "--symptom", &symptom]);
+    assert_eq!(unnamed_rc, 0, "the baseline diagnosis must run:\n{unnamed}");
+    world.cli_outputs = Some(vec![named.clone(), unnamed]);
+    world.cli_output = Some(named);
+    world.cli_stderr = Some(named_stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The text report with `--engine` and the one without it, after checking the
+/// named run exited 0.
+fn named_and_unnamed_text(world: &E2eWorld) -> (String, String) {
+    let outputs = world.cli_outputs.clone().expect("no diagnose outputs");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query):\n{}",
+        outputs[0]
+    );
+    (outputs[0].clone(), outputs[1].clone())
+}
+
+#[then(
+    "the report says the symptom was read as vLLM's, and the vLLM out-of-memory cause is reported"
+)]
+async fn assert_text_says_matched_as_vllm(world: &mut E2eWorld) {
+    let (named, unnamed) = named_and_unnamed_text(world);
+    assert_eq!(
+        named.lines().next(),
+        Some(
+            "Engine: vllm (named with --engine; every non-blank line of the symptom was \
+             read as vllm's)."
+        ),
+        "the text report must open by naming the engine it took the symptom as:\n{named}"
+    );
+    assert!(
+        named.contains("fix-16-vllm-oom"),
+        "the line says the symptom was read as vLLM's, and this paste is a vLLM OOM, so the vLLM cause must be there:\n{named}"
+    );
+    assert!(
+        !unnamed.contains("fix-16-vllm-oom"),
+        "without the flag the unnamed paste must not reach the vLLM cause, or the flag was not \
+         what made the difference:\n{unnamed}"
+    );
+}
+
+/// The line diagnose-79 expects is the one diagnose-76 expects: it says how
+/// the symptom was read. What differs is the outcome beside it.
+#[then("the report says the symptom was read as vLLM's, and no vLLM cause is reported")]
+async fn assert_text_says_read_as_vllm_without_a_match(world: &mut E2eWorld) {
+    let (named, _) = named_and_unnamed_text(world);
+    assert_eq!(
+        named.lines().next(),
+        Some(
+            "Engine: vllm (named with --engine; every non-blank line of the symptom was \
+             read as vllm's)."
+        ),
+        "the text report must open by saying how it read the symptom:\n{named}"
+    );
+    assert!(
+        !named.contains("fix-16-vllm-oom"),
+        "nothing in this paste is vLLM's, so naming the engine must not produce a vLLM cause:\n{named}"
+    );
+}
+
+#[then(
+    "the report says no entry for vLLM exists on this OS, and the diagnosis is the one without the flag"
+)]
+async fn assert_text_says_flag_changed_nothing(world: &mut E2eWorld) {
+    let (named, unnamed) = named_and_unnamed_text(world);
+    let first = named.lines().next().unwrap_or_default();
+    assert_eq!(
+        first,
+        "Engine: vllm (named with --engine; no entry for vllm exists on this OS, so the flag \
+         changed nothing).",
+        "the text report must say the named engine is read by nothing here:\n{named}"
+    );
+    let rest = named
+        .strip_prefix(first)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .unwrap_or_else(|| panic!("the engine line must be followed by a blank line:\n{named}"));
+    assert_eq!(
+        rest, unnamed,
+        "the line says the flag changed nothing, so the rest of the report must be the one \
+         without it"
+    );
+}
+
+/// Piped on standard input with the `\n` a shell or editor adds at the end,
+/// which `--symptom-file` removes; the paste itself goes in unchanged, so the
+/// recorded symptom has to equal it exactly.
+#[when("the user pipes it to the diagnosis, naming vLLM as the engine it came from")]
+async fn user_pipes_symptom_naming_vllm(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
+        world,
+        &[
+            "diagnose",
+            "--symptom-file",
+            "-",
+            "--engine",
+            "vllm",
+            "--json",
+        ],
+        &format!("{symptom}\n"),
+        &[],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `lemonade` because it is an engine `rocm serve --engine` accepts: the
+/// refusal is about what the diagnosis tells apart, not about a typo.
+#[when(
+    "the user asks the CLI to diagnose that symptom, naming an engine the diagnosis does not know"
+)]
+async fn user_diagnoses_naming_unknown_engine(world: &mut E2eWorld) {
+    diagnose_naming_engine(world, "lemonade");
+}
+
 #[when("the user asks the CLI which fixes it offers")]
 async fn user_lists_fixes(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["fix"]);
@@ -1073,6 +1351,56 @@ async fn assert_no_vllm_oom_reported(world: &mut E2eWorld) {
             diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
         }),
         "another engine's OOM must not be attributed to vLLM:\n{output}"
+    );
+}
+
+#[then("the symptom in the report is exactly what the user pasted")]
+async fn assert_report_keeps_the_paste_verbatim(world: &mut E2eWorld) {
+    let pasted = world.model_name.clone().expect("no symptom set");
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/symptom")
+            .and_then(serde_json::Value::as_str),
+        Some(pasted.as_str()),
+        "the report must carry the paste byte for byte, with nothing added:\n{output}"
+    );
+}
+
+#[then("the report says the user named vLLM as the source of the symptom")]
+async fn assert_report_names_vllm_as_source(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/engine")
+            .and_then(serde_json::Value::as_str),
+        Some("vllm"),
+        "the report must record the engine the user named:\n{output}"
+    );
+}
+
+#[then("the CLI refuses the engine, names the ones it accepts, and diagnoses nothing")]
+async fn assert_unknown_engine_refused(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    // clap's usage-error exit code.
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "an unknown engine is a usage error:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lemonade") && stderr.contains("vllm"),
+        "the refusal must name the rejected value and the accepted one:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "nothing may be diagnosed when the engine is refused:\n{stdout}"
     );
 }
 
@@ -2790,6 +3118,55 @@ async fn user_asks_what_a_report_would_carry_json(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report", "--json"]);
     world.cli_output = Some(format!("{stdout}\n{stderr}"));
     world.cli_rc = Some(rc);
+}
+
+/// Text mode, not `--json`: it prints the report and the mail link that
+/// `--send` would offer, so both surfaces a paste could leak into are read.
+/// No `--send`, so nothing is opened or sent.
+#[when(
+    "the user asks the CLI what a report would carry, naming vLLM as the engine the error came from"
+)]
+async fn user_asks_for_a_report_naming_vllm(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    // With the scenario's environment, so a simulated machine planted by a
+    // Given step is the one examined.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            &symptom,
+            "--engine",
+            "vllm",
+            "--report",
+        ],
+    );
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("nothing the user pasted appears in what the CLI printed")]
+async fn assert_paste_absent_from_report(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // A refusal is fixed text that never quotes the paste, so sweeping one
+    // proves nothing. The scenario plants a machine whose report is prepared;
+    // require that report (`cli_version` is a field only a `Report` carries,
+    // see `answer_names_nothing_identifying`) before sweeping it.
+    assert!(
+        out.contains("a report would carry") && out.contains("cli_version"),
+        "no report was prepared, so there is nothing to check the paste against; the \
+         simulated released GPU should have produced one:\n{out}"
+    );
+    for detail in PASTED_MACHINE_DETAILS {
+        assert!(
+            !out.contains(detail),
+            "{detail:?} from the user's paste reached what a report would carry:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("provenance"),
+        "the diagnosis's provenance reached what a report would carry:\n{out}"
+    );
 }
 
 #[then("the CLI either shows the whole report or says why it will not prepare one")]

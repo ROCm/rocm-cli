@@ -36,8 +36,16 @@ use crate::cli_report::{JsonOrText, print_json_or_text};
 use crate::diagnose_model;
 use crate::model_fit::assess_model_on_this_host;
 
+/// What `--symptom` and `--engine` asked for: the error text, exactly as the
+/// user gave it, and the engine they said it came from. One value because
+/// `--engine` cannot be given without `--symptom`.
+pub(crate) struct SymptomQuery {
+    pub(crate) text: String,
+    pub(crate) engine: Option<rocm_core::SymptomEngine>,
+}
+
 pub(crate) fn diagnose(
-    symptom: Option<String>,
+    symptom: Option<SymptomQuery>,
     top: usize,
     json: bool,
     distro: Option<String>,
@@ -97,7 +105,9 @@ pub(crate) fn diagnose(
         .wsl
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
-    let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    let (symptom, engine) =
+        symptom.map_or((String::new(), None), |query| (query.text, query.engine));
+    let mut report = rocm_core::run_diagnose_with_engine(&examination, &symptom, engine);
     // A prepared report carries no model verdict, and a GGUF estimate may read
     // the model's header from the network -- which `--report` promises it never
     // does -- so under `--report` the model is not assessed at all.
@@ -142,6 +152,14 @@ impl Serialize for DiagnoseOutput<'_> {
 }
 
 impl JsonOrText for DiagnoseOutput<'_> {
+    // ASCII on the wire: the report can carry the user's paste verbatim
+    // (`provenance.symptom`) and host paths in evidence, and a Windows console
+    // on the OEM code page shows raw UTF-8 as mojibake (ROCMAI-543). The value
+    // is unchanged once the JSON is decoded.
+    fn render_json(&self) -> serde_json::Result<String> {
+        rocm_core::render_diagnose_json(self.report)
+    }
+
     fn render_text(&self) -> String {
         let mut text = rocm_core::render_diagnose_text(self.report, self.top);
         if let Some(readiness) = &self.report.model {
@@ -240,6 +258,23 @@ fn prepare_cli_report(
     )
 }
 
+/// The report this machine would contribute for `diagnose`, the one document
+/// meant to be shared.
+///
+/// It takes from the diagnosis only the entry it established and whether a fix
+/// was offered. Nothing the user typed reaches it: not the `--symptom` text, and
+/// not the `provenance` that `--engine` adds to the diagnosis, which repeats
+/// that text verbatim. A pasted log can carry paths, host names or tokens, and
+/// this document is printed to be mailed. Pinned by
+/// `a_shared_report_never_carries_the_pasted_symptom_or_its_provenance`.
+fn shared_report(
+    examination: &rocm_core::Examination,
+    report: &rocm_core::DiagnoseReport,
+) -> std::result::Result<rocm_core::Report, rocm_core::ReportRefusal> {
+    let (entry, fix_offered) = established_entry(report);
+    prepare_cli_report(examination, entry, fix_offered)
+}
+
 /// Print the report this machine would contribute, and send nothing.
 fn show_prepared_report(
     examination: &rocm_core::Examination,
@@ -247,13 +282,12 @@ fn show_prepared_report(
     json: bool,
     send: bool,
 ) -> Result<()> {
-    let (entry, fix_offered) = established_entry(report);
     // Exit 0 either way. A refusal is this command working, not failing: it
     // decided correctly and said why, and a nonzero code would send a caller
     // looking for a fault. Anything scripting this reads the outcome from
     // `--json` rather than from the exit code, exactly as `rocm diagnose` itself
     // already asks callers to do.
-    match prepare_cli_report(examination, entry, fix_offered) {
+    match shared_report(examination, report) {
         Ok(prepared) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&prepared)?);
@@ -386,6 +420,64 @@ mod tests {
             crate::cli_version_string().starts_with(&format!("{number} (")),
             "{number:?} does not lead `rocm version`'s string"
         );
+    }
+
+    /// ROCMAI-955: `--engine` makes the diagnosis repeat the user's paste
+    /// verbatim (`provenance`), and `--report` is built from that same
+    /// diagnosis. A paste can carry paths, host names or tokens, and the report
+    /// is the document printed for mailing, so neither the paste nor the
+    /// provenance may reach it -- not the JSON, and not the mail link `--send`
+    /// offers.
+    #[test]
+    fn a_shared_report_never_carries_the_pasted_symptom_or_its_provenance() {
+        let marker = "SECRET-TOKEN-0f3c";
+        let paste = format!(
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB\n\
+             at /home/someone/{marker}/serve.py on build-host-7"
+        );
+        let examination = rocm_core::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            distro_version: "22.04".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![rocm_core::examine::Gpu {
+                name: "test".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+                pci_id: String::new(),
+                is_apu: Some(false),
+                is_amd: true,
+            }],
+            ..rocm_core::Examination::default()
+        };
+        let diagnosis = rocm_core::run_diagnose_with_engine(
+            &examination,
+            &paste,
+            Some(rocm_core::SymptomEngine::Vllm),
+        );
+        assert_eq!(
+            diagnosis.provenance.as_ref().map(|p| p.symptom.as_str()),
+            Some(paste.as_str()),
+            "the premise: the diagnosis does carry the paste"
+        );
+        let shared =
+            shared_report(&examination, &diagnosis).expect("a released GPU must produce a report");
+        // Non-vacuity: the paste decided the entry, so it did flow into this
+        // report -- as a catalog id, and as nothing else.
+        assert_eq!(shared.entry, "fix-16-vllm-oom");
+
+        let json = serde_json::to_string_pretty(&shared).expect("a report serializes");
+        let Delivery::Show(link) = rocm_core::report_delivery::deliver(&shared, false, &|_| None)
+        else {
+            panic!("a report that is not being sent is only shown");
+        };
+        for (surface, text) in [("report", &json), ("mail link", &link)] {
+            for leaked in [marker, "someone", "build-host-7", "provenance", "symptom"] {
+                assert!(
+                    !text.contains(leaked),
+                    "the {surface} carries {leaked:?} from the user's paste:\n{text}"
+                );
+            }
+        }
     }
 
     /// An opener that records rather than opens, and can be told to fail.
@@ -546,6 +638,7 @@ mod tests {
             },
             out_of_scope: None,
             model: None,
+            provenance: None,
         }
     }
 
@@ -599,6 +692,59 @@ mod tests {
             serde_json::to_string(&output(&report, true)).expect("the view serializes"),
             serde_json::to_string(&report).expect("the report serializes")
         );
+    }
+
+    /// What `--json` prints is the ASCII rendering, not serde's raw UTF-8.
+    ///
+    /// The report carries a non-ASCII `provenance.symptom` (an accented path, a
+    /// box-drawing character, an emoji), so the two renderings differ: an
+    /// all-ASCII report would render the same either way and could not tell
+    /// whether `DiagnoseOutput` overrides `render_json` at all. A serialization
+    /// error comes back through the same `Result` rather than a panic (see
+    /// `a_failing_render_json_hook_is_an_error_and_writes_nothing`).
+    #[test]
+    fn diagnose_json_is_the_ascii_rendering_of_the_report() {
+        use std::fmt::Write as _;
+        let paste = "torch.OutOfMemoryError: HIP out of memory\n\u{2502} \
+                     /home/jos\u{e9}/serve.py \u{1f525}";
+        let examination = rocm_core::Examination {
+            os_family: "linux".to_owned(),
+            ..rocm_core::Examination::default()
+        };
+        let report = rocm_core::run_diagnose_with_engine(
+            &examination,
+            paste,
+            Some(rocm_core::SymptomEngine::Vllm),
+        );
+
+        let printed = output(&report, false)
+            .render_json()
+            .expect("the report renders");
+        assert!(
+            printed.is_ascii(),
+            "--json must be ASCII on the wire:\n{printed}"
+        );
+
+        // Exactly the plain rendering with each non-ASCII character escaped,
+        // nothing more: the same document, only spelled in ASCII.
+        let plain = serde_json::to_string_pretty(&report).expect("the report serializes");
+        assert!(!plain.is_ascii(), "the fixture must carry non-ASCII text");
+        let backslash = char::from(92_u8);
+        let mut expected = String::new();
+        for c in plain.chars() {
+            if c.is_ascii() {
+                expected.push(c);
+            } else {
+                for unit in c.encode_utf16(&mut [0_u16; 2]) {
+                    let _ = write!(expected, "{backslash}u{unit:04x}");
+                }
+            }
+        }
+        assert_eq!(printed, expected);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&printed).expect("the printed document is valid JSON");
+        assert_eq!(parsed["provenance"]["symptom"].as_str(), Some(paste));
     }
 
     #[test]

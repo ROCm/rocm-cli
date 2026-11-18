@@ -10,22 +10,12 @@ This page collects developer verification commands. The README stays focused on 
 
 ## Local Verification
 
-Run the Rust test suite:
+The minimum quality gate is in [AGENTS.md](../AGENTS.md) section 8.
 
-```bash
-cargo test --workspace --all-targets
-```
-
-Note that `cargo test` runs every test as a thread in **one process**, which is
+`cargo test` runs every test as a thread in **one process**, which is
 also what the `windows-debug` job of the required `windows-build-and-test` lane
 does. See [Tests that touch the environment](#tests-that-touch-the-environment)
 before writing a test that sets an environment variable.
-
-Run clippy with warnings as errors:
-
-```bash
-cargo clippy --workspace --all-targets -- -D warnings
-```
 
 ### Source file size
 
@@ -1080,9 +1070,9 @@ file, the workspace root manifest, CI config, or a doc an xtask test reads —
 the proptest seed guard and which no other crate depends on: a changed file under
 a `proptest-regressions` directory, and a changed Rust file whose diff adds or
 removes a line containing `proptest!` (found with `git diff -G`). On `main`
-and in the merge queue the full workspace always runs. For a full local verification, keep using
-`cargo test --workspace --all-targets` above — `affected` is a CI optimization, and it also
-narrows the local pre-push hooks (next section).
+and in the merge queue the full workspace always runs. The minimum quality gate in
+[AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
+that also narrows the local pre-push hooks (next section).
 
 ### Pre-push hook scope
 
@@ -2381,6 +2371,55 @@ scratch folder itself:
 ```bash
 HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
 ```
+
+## Removing Old Installs
+
+`rocm storage remove-old-installs` picks which install folders to delete from a
+set the user never listed, so its retention policy has property tests as well as
+examples:
+
+```bash
+cargo test -p rocm --bin rocm storage::properties
+cargo test -p rocm --bin rocm storage::tests::applying_a_whole_plan_never_removes_the_install_in_use
+cargo test -p rocm --bin rocm version_proptests
+```
+
+The `storage::properties` filter also runs `generator_reach_report` and the
+example test named below, which are not properties. Each property in it runs
+2048 cases, and the whole-plan property described further down runs 256. Both
+read `PROPTEST_CASES` through `proptest_cases`, so it can raise either count but
+never lower it. All but one check the
+pure policy: that the install in use, the rollback target, the install the
+configured default names, anything the active-runtime marker names, and anything
+ROCm CLI does not own are never selected, even at `--keep 0`; that each group
+keeps exactly its `--keep` most recent installs that nothing else holds and
+removes the rest, so raising `--keep` never removes more; that every install is
+either kept or removed, once; and that each kept install is reported with the
+first reason that applies. The remaining one passes each selected key through
+the real runtime resolver and checks that it resolves back to that same install.
+The resolver tries an exact key match first, so generated cases never reach its
+case-insensitive fallback; what the check guards is that precedence, which a
+resolver trying the case-insensitive match first breaks on the generated keys
+that differ only in letter case. That input is also pinned as an example test,
+`a_case_twin_pair_resolves_to_the_install_the_policy_cleared`, which does not
+depend on the generators reaching it. The tests work
+out the expected groups and holds themselves, from the `--keep` help and the
+matching rules the policy implements, rather than by calling the policy's
+helpers. Keys, channels, formats and families come from small alphabets, some of
+them weighted, so keys differing only in letter case, shared runtime ids, tied
+install times and retention groups with more candidates than `--keep` are
+generated; `generator_reach_report`, a fixed 20,000-sample measurement rather
+than a property, prints how often (run it with `-- --nocapture`) and fails if
+the generator stops reaching them. Its floors are about four fifths of the
+measured counts, so re-measure them after any change to the generators.
+
+`applying_a_whole_plan_never_removes_the_install_in_use` runs 256 cases through
+real registry files, install folders and the real removal call, and checks that
+the install in use and every other install the plan left out survive, and that
+every install the plan named is gone.
+The `version_proptests` command runs that whole module; among its
+version-ordering properties are the retention ones for order independence and
+recency over version.
 
 ## Provider-Assisted Planning
 
@@ -4065,6 +4104,8 @@ Release trust checks:
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file
+cargo test -p rocm --bin rocm wsl_rocdxg_generated_steps_install_exactly_the_verified_file
+cargo test -p rocm --bin rocm wsl_doc_manual_steps_stop_before_the_check_when_the_download_fails
 python scripts/release_readiness.py --self-test
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 bash scripts/reclaim-gpu.sh --self-test
@@ -4098,6 +4139,30 @@ one, and an empty one. That step is the only thing authenticating a package
 that is then installed as root, and this replaces the self-test that shipped
 with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 `sha256sum`, so it is Unix-only.
+
+`wsl_rocdxg_generated_steps_install_exactly_the_verified_file` runs every
+Execute step of that plan, each in its own `sh -c` as the CLI does, against
+stand-ins for `sudo`, `curl`, `install`, `apt-get` and `ldconfig`. It proves the
+file `apt-get` installs is the root-staged copy the digest was checked against,
+that a tampered download stops the plan before `apt-get`, and that the private
+download directory and the staged copy are both removed after a successful
+install. When the check or `apt-get` fails, it checks the rejected package is
+left in the root-only directory and that the next run of the same version
+replaces it. It also checks the staging directories end up mode 0755. The
+`curl` stand-in fails if it is run under `sudo` or asked to write anywhere but
+a 0700 directory directly under `$TMPDIR`, so a plan that downloads as root or
+straight into the staging directory fails the test. It is Unix-only too.
+`wsl_rocdxg_plan_never_installs_from_a_path_another_user_can_write` checks the
+same layout on the plan text for both the `sudo` and the already-root plan, and
+scenario `@id:driver-install-wsl-dry-run-plan` checks it on the `--dry-run`
+output on the `@requires-wsl` lane.
+`wsl_doc_manual_steps_stop_before_the_check_when_the_download_fails` runs the
+manual steps from [wsl.md](wsl.md) against the same kind of stand-ins. With a
+copy an earlier run left staged and a download that fails, it checks that the
+block stops before the digest check, installs nothing and exits non-zero, and
+that the private download directory is removed. A failed install also exits
+non-zero and removes that directory, and a good download installs once and
+exits zero. It is Unix-only.
 
 The eight native Linux GPU preflights are one script,
 [`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
@@ -4763,7 +4828,7 @@ own wording is planted, so the detected line and the `rocm diagnose --symptom`
 command the scenario asserts are computed by `extension_load_failure_hint` in
 [`engines/vllm/src/startup_diagnostics.rs`](../engines/vllm/src/startup_diagnostics.rs).
 That is the half `@id:diagnose-recognises-a-vllm-extension-load-failure`
-(diagnose-71) cannot reach: it drives `rocm diagnose --symptom` directly and
+(diagnose-80) cannot reach: it drives `rocm diagnose --symptom` directly and
 never `rocm serve`. No process is spawned, and
 the seam compiles out entirely without the feature, so a build that does not
 enable it behaves exactly as the shipped binary does.
@@ -4880,6 +4945,121 @@ others assert on the outcome the smoke test returns.
 
 ```bash
 cargo xtask e2e -- -n "serve-60"
+```
+
+## Diagnose Engine Provenance
+
+`rocm diagnose --engine vllm` (ROCMAI-955) says which engine a symptom came
+from, whether it was passed with `--symptom` or read with `--symptom-file`, so
+a vLLM error that does not itself name vLLM is matched as vLLM's without anyone
+writing `vllm: ` into the user's text. The vLLM out-of-memory
+entry (`fix-16-vllm-oom`) only scores lines that name vLLM; with the engine
+named, every non-blank line of the symptom counts as vLLM's, as if `vllm` were
+written on each of them (a blank line is dropped, where a prefix would keep it;
+it scores nothing either way). No other entry reads the engine. The JSON
+diagnosis records the engine and the symptom, verbatim once decoded, under
+`provenance`; without `--engine` the field is absent. The output is otherwise
+unchanged, except that non-ASCII text in `--json` is now written as `\uXXXX`
+escapes on every run, host-derived evidence included (see below); the skill
+eval replays (`cargo xtask eval-fixtures --check`) are ASCII and stay as they
+are.
+`--engine` requires a symptom from either flag (a clap group over the two), and
+`--engine` alone is a usage error. With `--symptom-file` the recorded symptom
+is the text as read, with the one trailing line break that flag removes.
+
+`--engine` is accepted with `--report` and `--distro`, as plain `--symptom` is.
+`--distro` prints the diagnosis on the user's own screen, `provenance`
+included. The `--report` document, the one printed for mailing, is built from
+the examination, the entry the diagnosis established and whether a fix was
+offered, and from nothing the user typed, so neither the paste nor
+`provenance` reaches it or the mail link `--send` offers.
+
+`rocm diagnose --json` is ASCII on the wire (ROCMAI-543): the paste in
+`provenance.symptom`, and any host path an evidence line quotes, can hold
+non-ASCII text, so `render_report_json` in
+[report.rs](../crates/rocm-core/src/diagnose/report.rs) writes every non-ASCII
+character as a `\uXXXX` escape (a surrogate pair beyond the Basic Multilingual
+Plane). A JSON parser reads back the identical string. The ROCMAI-543 corpus
+test runs `diagnose_with_engine` with an accented path, a box-drawing
+character and an emoji, and fails if the escaping is dropped.
+
+The text report (not `--json`) opens with a line naming the engine. Where an
+entry on the examined platform reads it, the line says every non-blank line of
+the symptom was read as that engine's; that is how it was read, not a claim
+that anything matched, so an unrelated or empty paste gets the same line and no
+vLLM cause. Where no entry on the examined platform reads that engine, the line
+says the flag
+changed nothing; that is native Windows today, and a platform the catalog does
+not cover. The answer comes from `reads_engine_here` in
+[catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs), which reads the same
+`CHECKERS` table and platform family the checks run from, so the line follows
+the catalog rather than a list of operating systems. The answer is not
+serialized, so it adds nothing to the JSON report.
+
+Unit coverage — the match equals the prefixed form on Linux and WSL2, a
+multi-line paste is anchored on every non-blank line, nothing else changes
+(native Windows included), the diagnosis keeps the symptom byte for byte, the
+shared report and its mail link carry none of it, the text line agrees with
+what the flag did on Linux, WSL2, native Windows and an uncovered platform, and
+the flag takes only `vllm`:
+
+```bash
+cargo test -p rocm-core naming_vllm_
+cargo test -p rocm-core the_report_records_the_named_engine_and_the_symptom_verbatim
+cargo test -p rocm-core the_text_report_says_which_engine_was_named_and_whether_it_counted
+cargo test -p rocm-core a_non_ascii_paste_round_trips_through_the_json_exactly
+cargo test -p rocm-core every_message_the_diagnose_catalog_can_emit_is_ascii
+cargo test -p rocm-core every_engine_name_is_its_serialized_name
+cargo test -p rocm --bin rocm a_failing_render_json_hook_is_an_error_and_writes_nothing
+cargo test -p rocm --bin rocm diagnose_json_is_the_ascii_rendering_of_the_report
+cargo test -p rocm --bin rocm a_shared_report_never_carries_the_pasted_symptom_or_its_provenance
+cargo test -p rocm --bin rocm diagnose_engine_takes_the_engines_the_catalog_tells_apart
+```
+
+Scenarios in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature):
+`diagnose-71` (`@requires-os:linux`, as `diagnose-36`, because the vLLM entry is
+not in the native Windows catalog) diagnoses an unprefixed two-line vLLM OOM
+with the engine named and checks the match and the verbatim symptom;
+`diagnose-72` checks the recorded engine and symptom on every lane;
+`diagnose-73` checks that an engine `rocm serve` knows but the catalog does not
+tell apart (`lemonade`) is a usage error that diagnoses nothing;
+`diagnose-74` (`@requires-os:linux`) simulates a Linux machine whose only GPU
+is on the compatibility matrix, as `diagnose-58` does, so a real report is
+prepared on every Linux lane, WSL2 and GPU-less ones included; it asks for that
+`--report` with the engine named and a paste naming a user, host and token, and
+checks that a report was printed and that none of them, and no `provenance`,
+appears in it or in the mail link, and that nothing was sent (native Windows
+cannot be simulated this way; the payload unit test above covers it there);
+`diagnose-75` pipes the paste in with `--symptom-file -` and a final line
+break, names vLLM, and checks the recorded engine and that the recorded
+symptom is the paste without that line break; `diagnose-76`
+(`@requires-os:linux`, so Linux and WSL2) asks for the text report with the
+engine named and checks that it opens by saying the symptom was read as vLLM's
+and that the vLLM cause is there, and was not there without the flag;
+`diagnose-77` (`@requires-os:windows`) checks that the line says no entry for
+vLLM exists on this OS and that the rest of the report is the one without the
+flag; and `diagnose-78`, on every lane, saves a paste with an accented path, a
+box-drawing character and an emoji to a file, diagnoses it with
+`--symptom-file` and `--engine vllm --json`, and checks that every byte printed
+is ASCII and that the decoded symptom is the paste byte for byte; and
+`diagnose-79` (`@requires-os:linux`) names vLLM for a plain Python traceback
+and checks that the text report still says the symptom was read as vLLM's and
+reports no vLLM cause: the line says how the symptom was read, never that it
+matched. (`diagnose-59` to `diagnose-70` belong to other changes; see their own
+sections.)
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(7[1-689]) '
+```
+
+A name filter bypasses the suite's host filter, so on native Windows select
+`diagnose-72`, `diagnose-73`, `diagnose-75`, `diagnose-77` and `diagnose-78`
+instead (Linux and WSL2 run `diagnose-71` to `diagnose-76`, `diagnose-78` and
+`diagnose-79`):
+
+```bash
+cargo xtask e2e -- -n 'diagnose-(7[23578]) '
 ```
 
 ## Windows Tool Notes
@@ -5162,6 +5342,23 @@ Deleting the call in `install_wheel_runtime` is caught by the dead-code lint und
 ```bash
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-(49|50|51|52|53) '
 ```
+
+`examine-55` plants a native Linux machine whose kernel topology has two GPUs, at `0000:03:00.0` (gfx1100) and `0000:04:00.0` (gfx1101), with an `lspci` stand-in that lists an empty bus and a `rocminfo` stand-in that lists only the second, as "AMD Radeon RX 7800 XT" with its `BDFID`: the ROCm runtime with the first GPU hidden from it. The stand-in prints each agent the way the real tool does, ending with an `ISA Info:` block whose entries have `Name:` lines of their own. So the scenario also requires the parser to skip those lines rather than take them for the agent's name. `rocm examine --json` must report the second GPU with that model name, its own gfx1101 and `is_apu: false` (the stand-in prints the empty `Memory Properties:` line a discrete card gets), and the first with gfx1100, no model name (the kernel-topology placeholder, explained by one "marketing name is unknown" note) and `is_apu: null`, since nothing that can see it gives a verdict (the rules are the table at `apu_verdict_from_target` in [linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs)). So a reading the runtime gives for one GPU must not land on the other. It runs on the Linux lanes and needs no GPU. The other rows of the match (agents with no `BDFID`; an address no listed GPU has; an address shared across PCI domains; more readings at an address than listed GPUs; partitions at addresses of their own; agents listed with no AMD GPU to match) are unit tests in [linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs), next to `apply_rocminfo_gpu_agents`, and `a_real_rocminfo_listing_yields_its_gpu_agent` parses a captured real listing, [rocminfo_gfx1151_apu.txt](../crates/rocm-core/tests/fixtures/rocminfo_gfx1151_apu.txt). The commands for examine-55 to examine-59 follow examine-59.
+
+`examine-56` plants a native Linux machine whose kernel topology has one gfx1103 integrated GPU at `0000:c4:00.0`, an `lspci` stand-in that lists an empty bus, and a `rocminfo` stand-in that reports that GPU at the same `BDFID` as "AMD Radeon 780M Graphics", with the architecture gfx1100 only while `HSA_OVERRIDE_GFX_VERSION` is 11.0.0 in its environment (as the real runtime does) and gfx1103 otherwise, and `Memory Properties: APU` either way (the runtime reads that from the device). The scenario sets the variable, and the stand-in leaves a marker file in the scenario directory when it runs with it; the Then step requires that marker, so the inspection's own `rocminfo` run must have seen the override, and a scenario that lost the variable fails instead of passing on the native listing. `rocm examine --json` must keep the card's own gfx1103 with `is_apu: true` (so `has_apu` is true and `has_discrete_amd` false) and take the runtime's model name: a `rocminfo` reading fills a gfx target only where the entry has none, so `gpus[].gfx_target` stays the native target that `rocm diagnose`'s override check holds against the framework's arch list. What it proves is that the overridden target does not replace the card's own; it does not prove where the integrated verdict comes from, because gfx1103 is an APU-family target, which gives `true` without the runtime's reading. The runtime's `Memory Properties` reading deciding the verdict is proved by the unit test `a_matched_agents_verdict_is_its_memory_properties_reading_or_else_the_target_rule`. It runs on the Linux lanes and needs no GPU; the unit test behind the kept target is `an_overridden_runtime_target_does_not_replace_the_cards_own`, and the command after examine-59 runs both.
+
+`examine-57` plants a native Linux machine whose `lspci` stand-in lists a "Phoenix1" at `0000:05:00.0`, which the examination's name table reads as gfx1103, an integrated GPU, and whose kernel topology has a gfx1100 node at that address. `rocm examine --json` must list the one GPU with the kernel's gfx1100 and `is_apu: false` (so `has_apu` is false and `has_discrete_amd` true): the kernel's target replaces a target the PCI scan guessed from the name, and the verdict the scan derived with that guess goes with it (the verdict rules are the table at `apu_verdict_from_target` in [linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs)). Krackan Point is where the tables themselves disagree (the name table gfx1150, the device-id map gfx1152, which is right unconfirmed). The disagreement is planted rather than taken from a real part so that it does not depend on one table entry. It runs on the Linux lanes and needs no GPU; the unit test behind it is `the_kernels_target_fills_or_replaces_the_scans_and_the_verdict_follows_the_rules`.
+
+`examine-58` plants a native Linux machine whose `lspci` stand-in lists a nameless "Device 7fff" at `0000:c3:00.0`, an id no table knows, so the scan has no target for it and calls it discrete by default; its kernel topology has a gfx1151 node at that address, and its `rocminfo` stand-in lists no GPU. `rocm examine --json` must list the one GPU with gfx1151 and `is_apu: true` (so `has_apu` is true and `has_discrete_amd` false), the shape of a Strix Halo whose `pci.ids` has no name for it. It runs on the Linux lanes and needs no GPU; the unit test behind it is the same, and `the_pci_lines_examine_57_and_58_plant_read_as_their_scenarios_assume` pins what the name table reads from both planted lines.
+
+`examine-59` plants the same two GPUs as `examine-55`, with a `rocminfo` stand-in that lists both, in the same order and with the same architectures, but prints no `BDFID:` line for either. Without a bus address nothing says which card a reading belongs to, so `rocm examine --json` must apply neither: each GPU keeps its own gfx target, the kernel-topology placeholder name and `is_apu: null`, and the notes carry one "2 GPU reading(s) from rocminfo could not be matched to a listed GPU" note that names both readings with "(no bus address)". Both are asserted in the one scenario, so a note that is printed while a reading is applied anyway, or a refusal with no note, fails it. It runs on the Linux lanes and needs no GPU; the unit test behind it is `agents_without_an_address_are_never_paired_by_position`.
+
+```bash
+cargo test -p rocm-core --lib -- examine::linux_gpus host_gpu::linux
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-(55|56|57|58|59) '
+```
+
+The `host_gpu::linux` filter holds `a_dev_id_decodes_every_function_bit_and_refuses_zero_and_wider_values`, which pins the PCI-address decode the kernel topology's `location_id` and `rocminfo`'s `BDFID` share to literal addresses.
 
 `serve-42` plants the same WSL machine with `LD_LIBRARY_PATH` empty and runs `rocm serve`: it is refused, its advice names the WSL `driver_status` and not `/dev/kfd`, and `rocm examine` on that machine reports `wsl_rocdxg_missing`, so the command the refusal names exists and shows the condition. The launch that follows when `LD_LIBRARY_PATH` does reach the library has no scenario, because it would start preparing a real engine; the serve gate's decision there is covered by unit tests in `gpu_visibility.rs`.
 
