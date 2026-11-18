@@ -163,10 +163,10 @@ mod tests {
              provision` uploads. The shell never echoes a comment.",
         ),
         (
-            "engines/vllm/src/rocm_cli_vllm_auth.py",
+            "crates/rocm-engine-protocol/src/rocm_cli_vllm_auth.py",
             "The `©` is in the `#` copyright comment of the auth middleware \
-             module `rocm serve` writes for vLLM to import. Python never prints \
-             a comment.",
+             module `rocm serve` writes for vLLM, native or in an AIM \
+             container, to import. Python never prints a comment.",
         ),
     ];
 

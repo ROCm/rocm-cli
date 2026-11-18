@@ -1782,6 +1782,71 @@ cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 `-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
 gate is not applied: run it only on Linux.
 
+`comfyui-20` and `comfyui-21` cover what `status`, the plain-words status
+answer, `logs` and `stop` do when rocm-cli's saved record of the ComfyUI it
+started (`apps/comfyui/state/running.json` under the data directory) is
+truncated, so it cannot be parsed. `status` and the answer say the running
+state is unknown and name the file; `logs` still shows the run log, which
+`comfyui-20` plants where `start` writes it: beside the install's `source`
+folder under the runtime. With nothing answering on ComfyUI's default address
+(`comfyui-20`), `status` advises `rocm comfyui stop`, and that command, run as
+printed, moves the record aside to `running.json.unreadable` without stopping
+any process, after which `status` no longer reports it. With
+something answering there (`comfyui-21`, a listener the scenario holds),
+`status` advises stopping it first, and `stop` keeps the record, says only that
+address was checked and exits non-zero; once the listener is gone the same
+`stop` goes through. `comfyui-21` and `comfyui-22` also ask the assistant about
+ComfyUI with no assistant model running, so the chat answers from its own
+read-only `comfyui status` call; its "ROCm CLI summary" must say `Running:
+unknown` with the reason over the unparseable record, and `Running: running
+(not started by rocm-cli)` with no record while something answers there. All
+three scenarios point the default address at a port they
+choose through `ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE`, which only an
+`e2e-test-hooks` build reads (see [release-trust.md](release-trust.md)), so a
+ComfyUI the host runs itself cannot change the outcome. No GPU is needed. The
+unit tests `status_over_an_unreadable_record_*`,
+`chat_status_answer_over_an_unreadable_record_*`,
+`logs_over_an_unreadable_record_*` (including a start log beside the
+install's `source` folder under the runtime),
+`logs_with_a_saved_record_also_show_an_older_start_log_in_the_runtime_folder`,
+`stop_sets_an_unreadable_record_aside_and_stops_no_process` and
+`stop_over_an_unreadable_record_keeps_it_while_something_answers` cover the
+same over an empty record too (the last also the record moved aside by hand);
+`stop_reports_an_unreadable_record_it_cannot_move_aside` a record `stop` cannot
+move; `stop_over_an_unreadable_record_already_moved_says_so_and_succeeds` a
+second `stop` racing the first;
+`only_a_record_that_cannot_be_parsed_counts_as_unreadable`,
+`something_other_than_a_file_at_the_record_is_an_error_not_no_record`, the
+Unix-only `a_dangling_link_at_the_record_is_an_error_not_no_record`,
+`logs_over_a_record_that_cannot_be_read_fails_naming_it`,
+`a_reinstall_stops_on_a_saved_state_it_cannot_read` and
+`the_check_before_the_swap_refuses_what_appeared_during_the_download` (which
+also refuses a ComfyUI started during the download; comfyui-12 proves the
+install runs that check) that a failed read
+(permission denied, a directory at the path) is an error rather than an
+unreadable record or no record, for `status`, `stop`, `logs` and the reinstall
+guard;
+`with_no_record_status_and_the_chat_answer_report_what_answers_on_the_default_address`
+what `status` and the answer say with no record, whether or not something
+answers on the default address;
+`the_check_before_the_swap_prints_only_warnings_not_printed_before` that a
+record which became unparseable during the download still gets its note;
+`the_default_address_check_finds_a_listener_and_only_a_listener` and
+`the_default_address_port_override_is_a_port_or_an_error` the real check and
+the test-only port override; `a_stop_that_did_not_stop_prints_its_report_then_fails`
+the non-zero exit, `a_stop_that_failed_is_audited_and_returned_without_a_report`
+a stop that failed outright, and
+`a_stop_is_audited_even_when_its_report_cannot_be_written` the audit record;
+and the Unix-only
+`saving_the_run_record_replaces_the_file_rather_than_rewriting_it_in_place` and
+`saving_the_manifest_replaces_the_file_rather_than_rewriting_it_in_place` that
+both files are replaced atomically:
+
+```bash
+cargo xtask e2e -- -n "comfyui-2[012]"
+cargo test -p rocm --bin rocm comfyui
+```
+
 `comfyui-15` to `comfyui-19` cover which runtime `rocm comfyui install` uses
 when none is chosen: it recovers the runtime `rocm setup` created before
 counting the ready ones, as `rocm serve` does, so a runtime whose registry entry
@@ -1827,18 +1892,19 @@ self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
 above, so on WSL2, Windows or a machine with no GPU it would still run the real
 install.
 
-`serve-26` and `serve-27` (`features/model_serving.feature`, the AIM serve and
-restart canaries) are `@nightly` for cost: each pulls the AIM image and a 9B
+`serve-26`, `serve-27` and `serve-63` (`features/model_serving.feature`, the
+AIM serve and restart canaries and the AIM endpoint-key check) are `@nightly`
+for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
 Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
 them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
 i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
 `E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
 `include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
-gets a 105 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
+gets a 125 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
 the tagging and that they stay reachable when the opt-in is set.
 
-Both scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
+All three scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
 logs whether Docker is reachable ("Report whether Docker is reachable").
 `serve-27` failed to confirm the AIM stop on the Strix Halo pool (rocm-cli#1058)
 and passed on the 2026-11-15 and 2026-11-16 nightlies, so it runs expect-pass
@@ -2717,12 +2783,14 @@ place do not survive a re-store. Verifying that the running server actually
 *rejects* an unauthenticated request requires a live engine. For vLLM that is
 the `@nightly` GPU scenario `serve-vllm-key-guards-every-route` (serve-61),
 which runs in the nightly runs on Instinct GPUs (see "vLLM endpoint-key
-coverage" below). For the other engines, AIM included, no test yet asserts that
-the running server refuses a keyless request. The unit tests cover
-key policy, generation, the owner-only key file (including one whose
-permissions were loosened before a re-store, and on the Windows build job the
-DACL read back from disk), and key-file resolution. The tests that fail
-without the repair of a loosened key file are `restoring_a_key_over_a_loosened_file_makes_it_0600_again`
+coverage" below). For AIM it is the `@nightly` scenario
+`serve-aim-key-guards-every-route` (serve-63; see "AIM endpoint-key coverage"
+below), and `rocm serve` with AIM also checks it itself before serving. For
+the other engines no test yet asserts that the running server refuses a keyless
+request. The unit tests cover key policy, generation, the owner-only key file
+(including one whose permissions were loosened before a re-store, and on the
+Windows build job the DACL read back from disk), and key-file resolution. The
+tests that fail without the repair of a loosened key file are `restoring_a_key_over_a_loosened_file_makes_it_0600_again`
 in [`endpoint_keys.rs`](../apps/rocm/src/endpoint_keys.rs), `write_owner_only_file_atomically_tightens_a_loosened_file`
 in [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs), and on Windows
 `write_owner_only_file_atomically_replaces_a_loose_dacl_with_an_owner_only_one`
@@ -2856,8 +2924,9 @@ via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
 reads. Rather than launch an unauthenticated public server, `rocm serve` **fails
 closed** on that exact combination (public bind + `--engine lemonade` + Windows)
-and directs the user to `--engine vllm` or a loopback host. vLLM (Linux and WSL,
-via `VLLM_API_KEY` plus the `rocm_cli_vllm_auth` middleware described below),
+and directs the user to `--engine vllm` or a loopback host. vLLM (Linux and WSL)
+and AIM, both via `VLLM_API_KEY` plus the `rocm_cli_vllm_auth` middleware
+described below,
 direct llama-server serving (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
@@ -2888,8 +2957,10 @@ only under a fixed set of path prefixes (`/v1` and a few others), while the
 server also answers routes such as `/invocations`, `/tokenize` and `/metrics`.
 So a keyed vLLM launch also passes `--middleware
 rocm_cli_vllm_auth.RequireEndpointApiKey`, an ASGI middleware compiled into the
-engine adapter
-([rocm_cli_vllm_auth.py](../engines/vllm/src/rocm_cli_vllm_auth.py)), written
+binary
+([rocm_cli_vllm_auth.py](../crates/rocm-engine-protocol/src/rocm_cli_vllm_auth.py),
+shared by both engines that run vLLM through
+[endpoint_auth.rs](../crates/rocm-engine-protocol/src/endpoint_auth.rs)), written
 under the engine's data directory at launch and put on the server's
 `PYTHONPATH`. It
 requires the key on every route except `GET`/`HEAD /health` and CORS
@@ -2897,14 +2968,15 @@ preflights, and raises instead of constructing when the key is empty, so a
 server that loaded it never answers a request unchecked.
 
 ```bash
+cargo test -p rocm-engine-protocol endpoint_auth
 cargo test -p rocm-engine-vllm endpoint_auth
 cargo test -p rocm-engine-vllm vllm_serve_args
 ```
 
-The `endpoint_auth` tests run the shipped middleware under `python3` with a
-standard-library ASGI harness (they fail, rather than skip, when `python3` is
-missing on Linux), so the per-route behavior is covered on every PR without a
-GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
+The `rocm-engine-protocol` `endpoint_auth` tests run the shipped middleware
+under `python3` with a standard-library ASGI harness (they fail, rather than
+skip, when `python3` is missing on Linux), so the per-route behavior is covered
+on every PR without a GPU. The `vllm_server_command` tests assert, on every PR, that a keyed launch
 gets the `--middleware` argument, `VLLM_API_KEY`, and the middleware directory
 at the front of `PYTHONPATH` ahead of the runtime's own entry, together, and
 that an unkeyed launch gets none of them:
@@ -2960,6 +3032,32 @@ They run on fixtures: the `lemonade backends` table Lemonade 2026.44.1 prints,
 and a release listing shaped like the real one. The live paths (a real
 `lemond`, the GitHub listing, a real backend install) run only on the gated
 Lemonade GPU lanes.
+
+AIM endpoint-key coverage: an AIM container bundles vLLM, so the same gap
+applies to it. A keyed AIM launch
+([endpoint_auth.rs](../engines/aim/src/endpoint_auth.rs)) bind-mounts the
+middleware's directory read-only at `/opt/rocm-cli/python`, prepends that to
+the container's `PYTHONPATH` (keeping the caller's or the image's value) and
+adds `"middleware"` to `AIM_ENGINE_ARGS` (keeping any arguments already there),
+all through the container's env file. Since the container's vLLM is not under
+rocm-cli's control, `serve_http` then calls `POST /tokenize` without the key
+once the container is ready, and stops the container and fails unless that is
+refused with `401`.
+
+```bash
+cargo test -p rocm-engine-aim endpoint_auth
+cargo test -p rocm-engine-aim keyed
+cargo test -p rocm-engine-aim run_args_mount
+```
+
+These cover the env and mount built for a keyed launch against one without a
+key (including an image whose own `PYTHONPATH` and `AIM_ENGINE_ARGS` must
+survive), the launch refused when the image's config cannot be read or its
+`AIM_ENGINE_ARGS` cannot carry the middleware, and the refusal against a fake
+server (`spawn_fake_server`) that does or does not check every route. That a
+real AIM image applies `AIM_ENGINE_ARGS` and loads the middleware is covered
+only by the `@nightly` scenario `serve-aim-key-guards-every-route`, which has
+the same Docker caveat as `serve-26` and `serve-27` above.
 
 Engine recipe adapter contract focused tests:
 

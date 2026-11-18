@@ -22,6 +22,7 @@ anyhow.workspace = true
 rocm-core = { path = "../rocm-core" }
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3"
 
 [dev-dependencies]
 # The leftover a killed owner-only key store leaves, for the tests of the

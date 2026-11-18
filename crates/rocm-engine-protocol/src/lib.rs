@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod endpoint_auth;
+
 /// The version of the engine stdio protocol this build speaks.
 ///
 /// It is carried in every request and answer as `protocol_version`. See the
