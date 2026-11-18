@@ -372,12 +372,21 @@ mod tests {
         let mut state = serving_dashboard();
         painted_at(&mut state, 10);
 
-        for code in [
-            KeyCode::PageDown,
-            KeyCode::PageUp,
-            KeyCode::Home,
-            KeyCode::End,
-        ] {
+        // Asserting only "no verdict" would be vacuous: before ROCMAI-1050
+        // there was no scroll handling at all, so these keys fell through
+        // `approval_key`'s `_ => (choice, None)` and produced exactly this.
+        // The premise is therefore pinned first -- the prompt must have
+        // somewhere to scroll -- and each key is then required to *move* as
+        // well as to stay silent. A `quit_confirm_scroll_key` that handled
+        // nothing would satisfy the old assertions and fail these.
+        assert!(
+            state.quit_confirm_max_scroll.get() > 0,
+            "premise: at this height the body must overflow, or paging is a no-op \
+             and this test proves nothing"
+        );
+
+        for code in [KeyCode::PageDown, KeyCode::End] {
+            state.quit_confirm_scroll = 0;
             assert_eq!(
                 state.resolve_quit_confirm_key(code),
                 None,
@@ -386,6 +395,27 @@ mod tests {
             assert!(
                 state.quit_confirm.is_some(),
                 "{code:?} must leave the prompt open awaiting an answer"
+            );
+            assert!(
+                state.quit_confirm_scroll > 0,
+                "{code:?} must scroll the body, not fall through unhandled"
+            );
+        }
+
+        for code in [KeyCode::PageUp, KeyCode::Home] {
+            state.quit_confirm_scroll = state.quit_confirm_max_scroll.get();
+            assert_eq!(
+                state.resolve_quit_confirm_key(code),
+                None,
+                "{code:?} must resolve no verdict"
+            );
+            assert!(
+                state.quit_confirm.is_some(),
+                "{code:?} must leave the prompt open awaiting an answer"
+            );
+            assert!(
+                state.quit_confirm_scroll < state.quit_confirm_max_scroll.get(),
+                "{code:?} must scroll the body back, not fall through unhandled"
             );
         }
     }
