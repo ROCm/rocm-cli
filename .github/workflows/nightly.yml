@@ -1421,6 +1421,9 @@ jobs:
       # leaving the queue's GPUs out without a word.
       - name: Fetch the latest queue results
         continue-on-error: true
+        # Bounds the whole step: each log read has its own timeout, but a run of
+        # many jobs on a stalled storage hop would still outlast the job's.
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1447,40 +1450,87 @@ jobs:
           [ -n "$candidates" ] ||
             absent "no queue run on main finished in the last 24 hours (a run still going is not imported)"
           found=""
+          # Every rejection says why, on the run's own line: the step used to
+          # end in one warning that did not distinguish a run still going from
+          # a log that could not be read (run 44002836099 was rejected with
+          # no way to tell which).
+          skipped() { echo "::notice::queue run ${candidate} not imported: $1"; }
+          # The job log is a redirect to blob storage, and a failure of that
+          # hop is worth another try before the run is given up on. Read it with
+          # curl, not `gh api`: newer gh refuses a response holding terminal
+          # escape sequences ("pass --allow-escape-sequences"), which every
+          # job log does, so every log read failed and run 44002836099 was
+          # rejected as unreadable. curl follows the redirect and sends the token
+          # only to api.github.com.
+          fetch_job_log() {
+            local job="$1" attempt
+            for attempt in 1 2 3; do
+              curl -fsSL --connect-timeout 15 --max-time 120 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part && return 0
+              echo "::notice::queue run ${candidate}: reading the log of job ${job} failed (attempt ${attempt} of 3)"
+              sleep 5
+            done
+            return 1
+          }
           for candidate in $candidates; do
             rm -rf queue-results/results queue-results/job.log
             # A run that started a day ago is not tonight's.
-            run_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}" --jq '[.status, .run_started_at] | @tsv') || continue
+            run_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}" --jq '[.status, .run_started_at] | @tsv') || {
+              skipped "the run could not be read"
+              continue
+            }
             # A finished run only, red or green: a run still going has a
             # partial job log.
-            [ "${run_info%%$'\t'*}" = "completed" ] || continue
+            if [ "${run_info%%$'\t'*}" != "completed" ]; then
+              skipped "its status is '${run_info%%$'\t'*}', not completed"
+              continue
+            fi
             started="${run_info#*$'\t'}"
-            started_at=$(date -u -d "$started" +%s 2>/dev/null) &&
-              [ "$started_at" -ge "$(date -u -d '24 hours ago' +%s)" ] || continue
-            gh run download "$candidate" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results || continue
+            started_at=$(date -u -d "$started" +%s 2>/dev/null) || {
+              skipped "its start time '${started}' could not be read"
+              continue
+            }
+            if [ "$started_at" -lt "$(date -u -d '24 hours ago' +%s)" ]; then
+              skipped "it started at ${started}, more than 24 hours ago"
+              continue
+            fi
+            gh run download "$candidate" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results || {
+              skipped "its queue-run-results artifact could not be downloaded"
+              continue
+            }
             # The log names the branch the run tested and which lanes the queue
             # blocks on; a run that tested another branch is skipped, not the end
             # of the search. `e2e-queue-import` checks the log again.
             # The run may have several jobs: scan them all for the one that
             # prints the lane matrix.
-            jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/jobs?per_page=100" --jq '.jobs[].id') || continue
+            jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/jobs?per_page=100" --jq '.jobs[].id') || {
+              skipped "its jobs could not be listed"
+              continue
+            }
             : > queue-results/job.log
+            unreadable=0
             for job in $jobs; do
-              gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part 2>/dev/null || continue
+              if ! fetch_job_log "$job"; then
+                unreadable=$((unreadable + 1))
+                continue
+              fi
               if grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log.part; then
                 mv queue-results/job.log.part queue-results/job.log
                 break
               fi
             done
             rm -f queue-results/job.log.part
-            grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log || continue
+            if ! grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log; then
+              skipped "none of its $(wc -w <<<"$jobs") job log(s) names the tested branch ('rocm-cli main at <sha>'); ${unreadable} could not be read"
+              continue
+            fi
             found="$candidate"
             echo "$started" > queue-results/started.txt
             break
           done
           if [ -z "$found" ]; then
             rm -rf queue-results/results queue-results/job.log
-            absent "none of the newest queue runs of the last 24 hours tested main with a readable log and results"
+            absent "none of the newest queue runs of the last 24 hours tested main with a readable log and results (the notices above say why each was not imported)"
           fi
           echo "$found" > queue-results/run-id.txt
 
@@ -1609,6 +1659,13 @@ jobs:
   # overwritten each night; the run link, commit and date in its header say
   # which run it came from. Main-branch runs only, so a dispatch from another
   # branch cannot overwrite the page, and never from an empty or cancelled run.
+  # A report job that FAILED still publishes: it fails when a lane ran and
+  # uploaded no report, which is a broken nightly, and that is when the grid is
+  # most worth reading (run 44029433287 skipped the page for exactly that). The
+  # grid guard in the step below keeps a degenerate report off the page, and the
+  # report job uploads `consolidated/` whatever its own result. A report job
+  # that failed before writing it (checkout, toolchain) leaves nothing to
+  # download, so this job fails at the download instead of publishing.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
     runs-on: ubuntu-24.04 # one LTS: publishing only
@@ -1616,7 +1673,7 @@ jobs:
     permissions:
       contents: write
     needs: e2e-report-nightly
-    if: ${{ !cancelled() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && (needs.e2e-report-nightly.result == 'success' || needs.e2e-report-nightly.result == 'failure') && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
     concurrency:
       group: publish-e2e-wiki
       cancel-in-progress: false
@@ -1825,11 +1882,11 @@ jobs:
           path: release-readiness/narrative.md
           if-no-files-found: ignore
 
-  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
-  # but unlike that job this one also runs (and publishes an explicit
-  # "evidence unavailable" notice) when release-readiness-nightly fails
-  # outright, rather than just skipping and leaving the wiki showing
-  # whatever verdict the last successful run left there.
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki.
+  # Like that job it also runs when its upstream failed, and this one then
+  # publishes an explicit "evidence unavailable" notice when
+  # release-readiness-nightly fails outright, rather than leaving the wiki
+  # showing whatever verdict the last successful run left there.
   publish-release-readiness-wiki:
     name: Publish release readiness to wiki
     runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only

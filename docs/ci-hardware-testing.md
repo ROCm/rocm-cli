@@ -374,9 +374,10 @@ On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
 wiki, overwriting it each night (the page header names the run, commit and
 date). It skips cancelled runs and runs that consolidated no platforms. It also
-skips (silently, leaving the previous page in place) when `e2e-report-nightly`
-fails, which includes any lane's `release` or `nightly` leg dying before it
-uploads its report. One-time
+runs when `e2e-report-nightly` failed, which includes any lane's `release` or
+`nightly` leg dying before it uploads its report: that is a broken nightly, and
+the grid is then most worth reading. The page guard still leaves the previous
+page in place when the consolidation has no platform table. One-time
 setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
@@ -425,11 +426,11 @@ The narrative job drafts prose from those facts via `actions/ai-inference`
 fail without blocking the table). `publish-release-readiness-wiki` then
 publishes the verdict table, plus the narrative if one was produced, to the
 `Release-Readiness` wiki page, gated on `main`/repo like `publish-e2e-wiki`
-and sharing its one-time wiki setup and skip-on-degenerate-table guard — but
-unlike `publish-e2e-wiki`, it still runs (and publishes an explicit
-"evidence unavailable" notice) when `release-readiness-nightly` fails
-outright, instead of leaving the wiki showing a stale verdict with no sign
-it's stale.
+and sharing its one-time wiki setup and skip-on-degenerate-table guard. Like
+`publish-e2e-wiki`, it still runs after its upstream job failed, and it also
+publishes an explicit "evidence unavailable" notice when
+`release-readiness-nightly` fails outright, instead of leaving the wiki showing
+a stale verdict with no sign it's stale.
 
 The lane artifacts are named canonically (`e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`,
 `e2e-gpu-report`, `e2e-gpu-selfhosted-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
@@ -704,6 +705,21 @@ that runtime's own stale composition via repair, but never follows
 `update`/`repair` toward the index's latest key, and installs a fresh
 side-by-side runtime only when no match is found. See
 [`decide()`](../xtask/src/e2e_prewarm.rs)'s doc comment for the full rationale.
+
+Two failures of the pre-warm's installs are not the lane's failure:
+
+- **A server error from the index.** `rocm install sdk` and `rocm update --apply`
+  are run again, up to four attempts a minute apart, when the CLI reports
+  `HTTP 5xx while fetching <url>`. Anything else, a 404 included, fails on the
+  first attempt.
+- **vLLM refusing an unpinned nightly SDK** (`has no static build pin`). The pre-warm
+  records the reason in `e2e-engine-not-applicable.txt` in the runtimes directory,
+  and the suite reports the scenarios that serve with vLLM (serve, bench and chat scenarios, and any that pin the engine) as not applicable
+  instead of running each into the refusal. A pinned nightly, the release channel
+  and every other engine's failure stay fatal. This is temporary: remove it, the
+  marker and its reader in the harness once vLLM wheels for the 10.3 SDK exist and
+  the discover table in
+  [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) has a 10.3 row.
 
 ## Blocking vs. non-blocking
 

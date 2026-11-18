@@ -51,3 +51,15 @@ pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
 /// which checks that every self-hosted E2E lane sets it, so the two cannot name
 /// different variables.
 pub const EXPECT_GPU_ENV: &str = "E2E_EXPECT_GPU";
+
+/// File the pre-warm leaves in the shared runtimes directory when the serving
+/// engine cannot be installed for a reason that is no failure of the lane.
+///
+/// It sits in `E2E_SHARED_RUNTIMES_DIR`; its content is the reason the suite
+/// reports for each scenario skipped because of it.
+///
+/// Shared between the producer (`xtask e2e-prewarm`) and the consumer
+/// (`e2e_cucumber::capability`) for the reason [`OOM_FAULT_INJECTION_ENV`] is:
+/// a name that drifts apart turns the skip into a silent no-op, and the
+/// scenarios then fail one by one instead.
+pub const ENGINE_NOT_APPLICABLE_MARKER: &str = "e2e-engine-not-applicable.txt";
