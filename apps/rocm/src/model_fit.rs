@@ -187,6 +187,42 @@ fn host_accelerator_memory(
     )
 }
 
+/// The host facts `rocm model` renders its recommendations against: the usable
+/// GPU memory a model would be judged against, and installed system RAM.
+///
+/// Both were previously hardcoded to `None` at the call site, which left every
+/// row's fit verdict reading "unknown" and the whole listing unable to narrow
+/// to what the machine can run -- on a 2 TB-RAM host it reported host RAM
+/// telemetry as unavailable.
+///
+/// Derived through [`classify_accelerator_memory`] rather than by reducing the
+/// `amd-smi` rows here, so the listing and `rocm diagnose --model` cannot give
+/// different answers about the same machine: they now take the same figure from
+/// the same rule, including its "largest mask-visible card, never the sum"
+/// decision and its refusal to read an APU's carve-out as the pool.
+///
+/// An APU therefore reports `None` and the listing stays unfiltered, which is
+/// honest on this branch: the pool an integrated part allocates from is not
+/// readable here yet.
+pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
+    let vram = gpu_vram_usage();
+    let host_gpu_summary = detect_host_gpu_summary(None);
+    let accelerator = classify_accelerator_memory(
+        vram.as_deref(),
+        host_gpu_summary.gfx_target.as_deref(),
+        // The examination is not probed for a listing; `amd-smi` having
+        // answered at all is the evidence of a GPU here, and a host where it
+        // did not is one this listing leaves unfiltered either way.
+        vram.is_some(),
+        rocm_core::usable_amd_gpu_indices().as_deref(),
+    );
+    let gpu_gib = match accelerator {
+        AcceleratorMemory::Dedicated(gib) => Some(gib),
+        _ => None,
+    };
+    (gpu_gib, rocm_core::detect_system_ram_gib())
+}
+
 /// The pure classification behind [`host_accelerator_memory`], split out so it
 /// can be exercised with fixed input instead of a live `amd-smi` subprocess.
 /// Deciding whether a host is an APU and which figure represents its memory is

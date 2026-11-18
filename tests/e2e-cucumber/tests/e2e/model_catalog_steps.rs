@@ -241,3 +241,121 @@ async fn catalog_warns_aim_entry_is_stale(world: &mut E2eWorld) {
         "expected a staleness warning for the AIM entry, got:\n{output}"
     );
 }
+
+/// Plant the GPU capacity the recommendation is selected on.
+///
+/// `ROCM_E2E_FORCE_GPU_TOTAL_GIB` is the `e2e-test-hooks` seam for this: the
+/// no-GPU lane measures no capacity and the GPU box measures none either (no
+/// `amd-smi`, unreadable `mem_info_vram_total`), so a planted figure is the
+/// only way a narrowed listing is reachable from a test.
+fn plant_gpu_capacity_gib(world: &mut E2eWorld, total_gib: u32) {
+    world
+        .command_env
+        .push(("ROCM_E2E_FORCE_GPU_TOTAL_GIB", total_gib.to_string().into()));
+}
+
+/// 8 GiB: above the four small GGUF/safetensors recipes, below every recipe
+/// the `featured` flag used to select, which is the defect these scenarios are
+/// about.
+#[given("a machine whose GPU has room for only the smaller models")]
+async fn a_small_gpu_machine(world: &mut E2eWorld) {
+    plant_gpu_capacity_gib(world, 8);
+}
+
+#[given("a machine whose GPU is too small for any curated model")]
+async fn a_tiny_gpu_machine(world: &mut E2eWorld) {
+    plant_gpu_capacity_gib(world, 1);
+}
+
+/// Planting nothing is the premise: with no hook set and no readable telemetry
+/// on the lane, the capacity is genuinely unknown rather than small.
+#[given("a machine whose GPU memory cannot be read")]
+async fn an_unmeasured_machine(world: &mut E2eWorld) {
+    let _ = world;
+}
+
+#[when("the user asks which models are recommended")]
+async fn user_asks_for_recommendations(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["model"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Every offered row carries its own fit verdict, so the listing states the
+/// claim this asserts rather than the test inferring it from model names --
+/// which would go stale the moment the catalog changes.
+#[then("every model offered is one this machine can run")]
+async fn assert_every_offer_fits(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("fits this GPU"),
+        "a narrowed listing must offer something and say it fits:\n{output}"
+    );
+    assert!(
+        !output.contains("needs a larger GPU"),
+        "a model this machine cannot run must not be recommended to it:\n{output}"
+    );
+}
+
+#[then("the user is told the offer was narrowed to this machine")]
+async fn assert_narrowing_stated(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("Narrowed to what this machine can run"),
+        "a short list with nothing said about it reads as a small catalog:\n{output}"
+    );
+}
+
+#[then("the user is told none of the curated models fit")]
+async fn assert_nothing_fits_is_stated(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("None of the curated models fit"),
+        "an empty list must say why, not render as a broken command:\n{output}"
+    );
+}
+
+#[then("no model is offered")]
+async fn assert_no_model_offered(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        !output.contains("fits this GPU"),
+        "nothing fits, so nothing may be offered as fitting:\n{output}"
+    );
+}
+
+/// Asserts what was *offered*, not only what was said about it.
+///
+/// Checking the notes alone is not enough, and that is not hypothetical: under
+/// a sabotaged fit predicate this step still passed, because the notes are
+/// driven by whether a figure exists rather than by what the filter did with
+/// one. The evidence that nothing was narrowed is that the large models are
+/// still on offer -- they need far more than any small host could supply, so
+/// their presence is only possible on an unfiltered list.
+#[then("the recommendations are not narrowed to this machine")]
+async fn assert_not_narrowed(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("~54 GiB") || output.contains("~62 GiB"),
+        "an unfiltered listing still offers the large curated models; their absence means the \
+         list was narrowed after all:\n{output}"
+    );
+    assert!(
+        !output.contains("Narrowed to what this machine can run"),
+        "nothing could be measured, so nothing may be claimed to have been narrowed:\n{output}"
+    );
+    assert!(
+        !output.contains("None of the curated models fit"),
+        "an unmeasured machine must never be told nothing fits it:\n{output}"
+    );
+}
+
+#[then("the user is told the list is not specific to it")]
+async fn assert_unmeasured_is_stated(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("could not be read, so these are not filtered"),
+        "the listing must say the recommendations are not host-specific:\n{output}"
+    );
+}
