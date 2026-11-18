@@ -166,6 +166,19 @@ data. Fixing only the state a reviewer named invites the next round to name its 
 when a finding is one instance of a class, fix the class and list the sibling cases in
 the reply.
 
+**A fix, guard or hardening applied at one place is checked against the other sites that
+share its defect.** Code that does the same thing elsewhere keeps the old behavior: a guard
+at one of several sites, or in a shared helper that a hand-rolled copy never calls, protects
+nothing the others reach. Search for the defect itself (an unguarded write, an unbounded
+read), not only for the symbol you changed, across the repository (scripts, workflows and
+`cfg(windows)` branches count). The PR text names the pattern or command searched and where
+it was run, and says for each other site found whether it was changed or left as it is,
+and why: a site that must differ keeps its reason, and a site left for a follow-up is named.
+A search that finds nothing is a complete answer once the PR text says how it was run. The
+state-matrix rule above governs a missing lifecycle state; for a code site a reviewer names,
+its disposition (changed, or left and why) goes in the reply to that thread as well as in
+the PR text.
+
 **Platform-gated code gets a test that runs on its gate.** When a `cfg(windows)` path
 cannot be driven by e2e, put its logic behind a pure helper or an injectable function
 (a script runner, a clock) so a unit test runs on the Windows CI job, including the error
@@ -512,6 +525,7 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 - when reviewing a revision that answers review feedback, diff it whole against the revision you last reviewed, the same way the author does (**Review-fix commits** below), not only the lines your finding named: a remediation is written in a narrow window, gets the least scrutiny, and is where new defects arrive
 - when reviewing, treat a comment or doc line in the diff that states how the code behaves as a claim to check against that code (§3), not as context; one that is the reason for a decision (§3 says which) is checked before you approve, including that it names where the code makes it true
+- when reviewing, ask for the search and what became of each site when a PR fixes, guards or hardens one place (§3)
 - when reviewing, before marking an objection blocking because it rests on a timing, ordering, concurrency or "this cannot happen" argument, name the mechanism it assumes and where that is defined (file and symbol); an objection whose mechanism you cannot locate is posted as a question, not a blocking finding
 - when reviewing, read the commit messages as well as the diff: each lands in public history on `main`, in the squash commit's body or, under rebase-merge, as a commit of its own (§5)
 
@@ -569,6 +583,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 18. Review-fix commits diffed whole against the reviewed head; no documented option widened inside one — *§11*
 19. Any existing scenario moved off the blocking mock `e2e` job justified as a deletion — *§8*
 20. Every commit message describes its own commit in words still true at the branch head — *§5*
+21. A fix, guard or hardening applied at one place checked against the other sites that share its defect — *§3*
 
 ## 14) Related Internal Workflows
 
