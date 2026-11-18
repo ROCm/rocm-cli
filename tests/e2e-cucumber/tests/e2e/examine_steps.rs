@@ -1916,10 +1916,11 @@ fn plant_pci_bus(world: &mut E2eWorld, rows: &[(&str, &str, bool, &str)], nodes:
             .expect("failed to write planted KFD node properties");
             continue;
         }
-        // KFD states the address as `location_id = (bus << 8) | devfn`.
+        // KFD states the address as two decimal properties: `domain`, and
+        // `location_id = (bus << 8) | devfn`.
         let mut parts = address.split([':', '.']);
-        let (_domain, bus, device, function) = (
-            parts.next(),
+        let (domain, bus, device, function) = (
+            u32::from_str_radix(parts.next().expect("domain"), 16).expect("domain"),
             u32::from_str_radix(parts.next().expect("bus"), 16).expect("bus"),
             u32::from_str_radix(parts.next().expect("device"), 16).expect("device"),
             parts
@@ -1933,7 +1934,7 @@ fn plant_pci_bus(world: &mut E2eWorld, rows: &[(&str, &str, bool, &str)], nodes:
             node.join("properties"),
             format!(
                 "cpu_cores_count 0\nsimd_count 120\ngfx_target_version {version}\n\
-                 domain 0\nlocation_id {location_id}\n"
+                 domain {domain}\nlocation_id {location_id}\n"
             ),
         )
         .expect("failed to write planted KFD node properties");

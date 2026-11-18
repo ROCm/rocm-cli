@@ -222,8 +222,7 @@ mod tests {
          reaches a console or nothing at all -- see the `cli_progress.rs` exemption.";
 
     const STRIPPED_FROM_INPUT: &str = "Matched so it can be taken *out* of text arriving from outside the process -- a \
-         BOM ahead of JSON (`strip_prefix`/`trim_start_matches`) or a `™` in a \
-         vendor marketing name (`replace`). The character is a needle, never \
+         BOM ahead of JSON (`strip_prefix`/`trim_start_matches`). The character is a needle, never \
          something this code writes; the only way it reaches a stream is if the input \
          already carried it, which no transliteration here would change.";
 
