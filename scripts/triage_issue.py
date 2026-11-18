@@ -27,7 +27,7 @@ can write issues:
    is assigned. A missing or malformed reply still gets the deterministic
    labels and the assignment.
 
-Idempotent: an issue that already carries a priority label or an assignee is
+Idempotent: an issue that already carries a priority or area label or an assignee is
 left alone for that part, so a re-run (``workflow_dispatch``) does not stack
 labels or reassign.
 
@@ -112,13 +112,34 @@ def field_value(body: str, label: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+# The bug template's own hint under **Steps to reproduce**; left unedited it
+# is not a set of steps.
+STEPS_PLACEHOLDER = "Commands, flags, or a minimal example that reproduces the issue"
+
+
+def is_bug_template(body: str) -> bool:
+    """True when the body still has the bug template's headings.
+
+    A free-form report labelled ``bug`` (blank issues are allowed) is not asked
+    for the template's fields: it may already say all of it in prose.
+    """
+    sections = parse_sections(body)
+    return "steps to reproduce" in sections and "your environment" in sections
+
+
 def missing_info(body: str, labels: set[str]) -> list[str]:
-    """What a bug report still has to say. Only bug-template reports are checked."""
-    if "bug" not in labels:
+    """What a bug report still has to say.
+
+    Only a ``bug`` report written in the bug template is checked.
+    """
+    if "bug" not in labels or not is_bug_template(body):
         return []
     sections = parse_sections(body)
+    steps = sections.get("steps to reproduce", "")
+    if steps.strip() == STEPS_PLACEHOLDER:
+        steps = ""
     missing = []
-    if len(sections.get("steps to reproduce", "")) < 10:
+    if len(steps) < 10:
         missing.append("steps to reproduce")
     if not field_value(body, "rocm-cli version"):
         missing.append("the `rocm --version` output")
@@ -134,7 +155,9 @@ def platform_labels(body: str) -> list[str]:
         found.append("platform:linux")
     if re.search(r"\bwindows\b", value):
         found.append("platform:windows")
-    return found
+    # The template's own `Linux / WSL2 / Windows` line, never edited, names all
+    # three; that is no report of a platform.
+    return [] if len(found) == 3 else found
 
 
 def load_maintainers(path: Path = MAINTAINERS_FILE) -> list[str]:
@@ -215,7 +238,7 @@ def plan(issue: dict, classification: dict[str, str], maintainers: list[str]) ->
     add += [label for label in platform_labels(body) if label not in existing]
     if not existing & TYPE_LABELS and "type" in classification:
         add.append(classification["type"])
-    if "area" in classification:
+    if "area" in classification and not existing & set(AREAS.values()):
         add.append(AREAS[classification["area"]])
     already_prioritised = any(name.startswith(PRIORITY_PREFIX) for name in existing)
     if not already_prioritised and "priority" in classification:
@@ -367,6 +390,28 @@ def self_test() -> int:
     assert missing_info(thin_body, {"enhancement"}) == []
     assert platform_labels(bug_body) == ["platform:wsl", "platform:windows"]
 
+    # An untouched template asks for steps and gets no platform label.
+    raw_template = (
+        "**Current behavior**\nx\n\n**Steps to reproduce**\n"
+        f"{STEPS_PLACEHOLDER}\n\n**Your environment**\n"
+        "- rocm-cli version (`rocm --version`): 0.4.1\n"
+        "- Platform: Linux / WSL2 / Windows\n"
+    )
+    assert missing_info(raw_template, {"bug"}) == ["steps to reproduce"]
+    assert platform_labels(raw_template) == []
+    # A free-form `bug` report is not held to the template's fields.
+    free_form = "rocm serve crashes on gfx1151 with 0.4.1, run `rocm serve foo`."
+    assert missing_info(free_form, {"bug"}) == []
+    free_issue = {
+        "number": 7,
+        "body": free_form,
+        "labels": [],
+        "user": {"login": "rep"},
+        "assignees": [],
+    }
+    got = plan(free_issue, {"type": "bug"}, team)
+    assert got["labels"] == ["bug"] and got["comment"] is None, got
+
     # Round robin walks the team and skips the reporter.
     assert [pick_assignee(n, team, "zz") for n in (3, 4, 5, 6)] == ["a", "b", "c", "a"]
     assert pick_assignee(3, team, "A") == "b"
@@ -450,10 +495,15 @@ def self_test() -> int:
         "number": 6,
         "body": thin_body,
         "user": {"login": "rep"},
-        "labels": [{"name": "bug"}, {"name": "needs-info"}, {"name": "priority:P2"}],
+        "labels": [
+            {"name": "bug"},
+            {"name": "needs-info"},
+            {"name": "priority:P2"},
+            {"name": "installation"},
+        ],
         "assignees": [{"login": "a"}],
     }
-    got = plan(again, {"priority": "P0"}, team)
+    got = plan(again, {"priority": "P0", "area": "cli"}, team)
     assert got == {"labels": [], "assignee": None, "comment": None}, got
 
     # Every label the script can apply is creatable or pre-existing.

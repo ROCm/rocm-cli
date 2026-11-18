@@ -15,15 +15,15 @@ does not close, edit or comment on an issue except for one `needs-info` comment
 
 | Step | How |
 | --- | --- |
-| `platform:linux`, `platform:windows`, `platform:wsl` | read from the `Platform:` line of the issue template |
-| `needs-info` plus one comment | a bug report with no reproduction steps or no `rocm --version` output |
+| `platform:linux`, `platform:windows`, `platform:wsl` | read from the `Platform:` line of the issue template; the unedited `Linux / WSL2 / Windows` line gets none |
+| `needs-info` plus one comment | a bug report written in the bug template with no reproduction steps (the template's hint text does not count) or no `rocm --version` output; a free-form report is not checked |
 | type (`bug`, `enhancement`, `question`, `documentation`) | model, only when the issue has no type label yet; the template's own label is never overridden |
-| area (`area:cli`, `area:dash-tui`, `area:rocmd`, `area:assistant`, `engines`, `installation`, `documentation`) | model |
+| area (`area:cli`, `area:dash-tui`, `area:rocmd`, `area:assistant`, `engines`, `installation`, `documentation`) | model, only when the issue has no area label yet |
 | `priority:P0` to `priority:P3` | model, against the rubric in [issue-triage.txt](../.github/prompts/issue-triage.txt) |
 | assignee | round-robin over [triage-maintainers.txt](../.github/triage-maintainers.txt): the issue number modulo the list length, skipping the reporter |
 
 Missing labels are created on first use. An issue that already has a priority
-label, `needs-info` or an assignee is left alone for that part, so re-running
+or area label, `needs-info` or an assignee is left alone for that part, so re-running
 the workflow does not stack labels or reassign.
 
 ## Trust model
