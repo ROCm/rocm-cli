@@ -997,7 +997,7 @@ a profile's first lock" there):
   path-filtered, does not run on pushes or in the merge queue, and runs on a
   GitHub-hosted runner rather than locally. The same job, and the weekly
   update's `check` job, also run `cargo xtask deps verify-downloads`, which
-  downloads every binary `runtimes/mise.lock` records (uv as well as
+  downloads every binary [`runtimes/mise.lock`](../runtimes/mise.lock) records (uv as well as
   Lemonade) and fails if its SHA-256 differs from the lock; its
   own tests use a fake download and run with `cargo test -p xtask`.
 - `python scripts/validate_runtime_update.py --self-test`

@@ -626,7 +626,7 @@ Pinned versions of the third-party runtimes rocm-cli manages, locked in [`runtim
 | File | Responsibility | Class |
 | --- | --- | --- |
 | [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names and download URLs from them (`strip_v`, `lemonade_archive_name`, `lemonade_download_url`, `LEMONADE_GITHUB_REPO`). | flat |
-| [`pins_gen.rs`](../crates/rocm-deps/src/pins_gen.rs) | Turns `runtimes/mise.lock` into the pin constants (`LEMONADE_VERSION`, per-platform URLs and digests); run by `build.rs` and compiled into `xtask` by path. | flat |
+| [`pins_gen.rs`](../crates/rocm-deps/src/pins_gen.rs) | Turns [`runtimes/mise.lock`](../runtimes/mise.lock) into the pin constants (`LEMONADE_VERSION`, per-platform URLs and digests); run by `build.rs` and compiled into `xtask` by path. | flat |
 
 ### `crates/e2e-report`
 
@@ -752,10 +752,10 @@ Repository tasks, run through the workspace alias `cargo xtask <command>`: relea
 | [`deps/check.rs`](../xtask/src/deps/check.rs) | `cargo xtask deps check`: verifies every Python lock offline (header, inputs digest, cutoff, hosts, ROCm line, wheel tags, names and versions) and runs the `mise.lock` rules. | flat |
 | [`deps/diff.rs`](../xtask/src/deps/diff.rs) | `cargo xtask deps diff`: the Markdown table of versions and digests changed since a revision, used as the weekly update's pull-request body. | flat |
 | [`deps/lock.rs`](../xtask/src/deps/lock.rs) | `cargo xtask deps lock`: resolves each profile per OS with the pinned uv at its recorded cutoff, writes every lock before replacing any, and removes stray files from `runtimes/locks/`. | flat |
-| [`deps/mise_lock.rs`](../xtask/src/deps/mise_lock.rs) | Parses `runtimes/mise.lock` and checks it: platforms, release-asset URLs at the locked version, `url_api`, provenance, and no unknown fields. | flat |
-| [`deps/profiles.rs`](../xtask/src/deps/profiles.rs) | Parses `runtimes/profiles.toml` (policy and profiles), the lock paths and inputs digest, and ties the vLLM profile to the adapter's build row. | flat |
+| [`deps/mise_lock.rs`](../xtask/src/deps/mise_lock.rs) | Parses [`runtimes/mise.lock`](../runtimes/mise.lock) and checks it: platforms, release-asset URLs at the locked version, `url_api`, provenance, and no unknown fields. | flat |
+| [`deps/profiles.rs`](../xtask/src/deps/profiles.rs) | Parses [`runtimes/profiles.toml`](../runtimes/profiles.toml) (policy and profiles), the lock paths and inputs digest, and ties the vLLM profile to the adapter's build row. | flat |
 | [`deps/pylock.rs`](../xtask/src/deps/pylock.rs) | Reads PEP 751 `pylock.toml` files, refusing unknown fields, and writes the header (`inputs`, `exclude-newer`) `deps check` expects. | flat |
-| [`deps/verify.rs`](../xtask/src/deps/verify.rs) | `cargo xtask deps verify-downloads`: downloads every binary `runtimes/mise.lock` records and checks its SHA-256 against the lock. | flat |
+| [`deps/verify.rs`](../xtask/src/deps/verify.rs) | `cargo xtask deps verify-downloads`: downloads every binary [`runtimes/mise.lock`](../runtimes/mise.lock) records and checks its SHA-256 against the lock. | flat |
 | [`e2e.rs`](../xtask/src/e2e.rs) | `cargo xtask e2e`: builds release `rocm` and `rocmd` with the E2E test features and runs the cucumber suite, forwarding extra arguments to cucumber. | flat |
 | [`e2e_prewarm.rs`](../xtask/src/e2e_prewarm.rs) | `cargo xtask e2e-prewarm`: prepares the shared managed runtime the GPU E2E lanes serve against, refreshing it when the channel index publishes something newer or the required packages differ. | flat |
 | [`e2e_prewarm_vision.rs`](../xtask/src/e2e_prewarm_vision.rs) | The pre-warm's torchvision check, split out of [`e2e_prewarm.rs`](../xtask/src/e2e_prewarm.rs): removes a runtime whose torch and torchvision do not match and fails the pre-warm when the active runtime cannot `import torchvision.ops`, unless the default engine does not import torch. | flat |
