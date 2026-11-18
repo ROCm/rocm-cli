@@ -365,14 +365,15 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
-  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
-  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # `@nightly` keeps the AIM scenarios (these two and serve-63) off the
+  # pull-request lanes: each one pulls the image and a 9B checkpoint on a cold
+  # runner and may wait out the full 1200s readiness cap, so these two on the
+  # Strix Ubuntu job (~25 min without them, 45 min cap) ended every run at
+  # the cap. That job now runs
   # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # On a host without Docker both skip (the nightly job logs whether Docker is
+  # On a host without Docker they skip (the nightly job logs whether Docker is
   # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
   # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
@@ -988,8 +989,9 @@ Feature: Model serving
   # server also answers inference and tokenizer routes outside them. rocm-cli
   # starts vLLM with a middleware that demands the key on every route except
   # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
-  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
-  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # unit-tested on every PR (`endpoint_auth` in the engine-protocol crate,
+  # where both engines take it from); this proves it is actually wired into a
+  # real vLLM server. A full extra vLLM
   # serve, so `@nightly` rather than per-PR: it runs after merge in the nightly
   # runs on Instinct GPUs, which serve with vLLM: the MI300X job in
   # `nightly.yml` and the shared GPU queue's Instinct lanes (MI350P among them).
@@ -1021,6 +1023,25 @@ Feature: Model serving
     Then vLLM is reported as installed but not usable
     And the report names the extension that failed to import
 
+  # The AIM engine's container bundles vLLM, so the same gap applies: its
+  # `VLLM_API_KEY` check guards only vLLM's own path prefixes. rocm-cli mounts
+  # the same middleware into the container and adds it through the AIM
+  # runtime's `AIM_ENGINE_ARGS`, then refuses to serve unless a keyless call to
+  # `/tokenize` is refused. The env, mount and refusal are unit-tested on every
+  # PR (`endpoint_auth` and the keyed `run_container`/`serve_http` tests in the
+  # AIM engine crate); this proves a real AIM image actually loads the
+  # middleware. `@nightly` for the same reason as serve-26: it pulls the image
+  # and a 9B checkpoint on a cold runner.
+  @id:serve-aim-key-guards-every-route @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  Scenario: serve-63 - A key-protected AIM endpoint refuses keyless requests outside the OpenAI API
+    Given a managed runtime is active
+    And a model is being served on aim behind an API key
+    When a client calls the server's routes without the key
+    Then every route outside the OpenAI API refuses the call as unauthorized
+    And the health check answers without the key
+    When the client repeats those calls with the key
+    Then every one of those calls succeeds
+
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the
@@ -1037,7 +1058,7 @@ Feature: Model serving
   # specifically — the only possible outcome of a scripted/CI `--verbose`
   # session, per that function's own doc comment.
   @id:serve-scripted-death-after-startup @requires-no-gpu
-  Scenario: serve-63 - A managed engine that dies after startup fails loudly
+  Scenario: serve-64 - A managed engine that dies after startup fails loudly
     Given the scripted engine is armed to die shortly after startup
     When the user serves a model expecting the engine to crash after startup
     Then serving fails with a non-zero exit and names the crash
@@ -1047,13 +1068,13 @@ Feature: Model serving
   # externally triggered stop in the same post-startup window must NOT be
   # treated as the crash above. `rocm services stop` run from a second
   # invocation kills the pid the attached `--verbose` session is watching,
-  # landing in the identical `AttachOutcome::ServerExited` arm serve-63
+  # landing in the identical `AttachOutcome::ServerExited` arm serve-64
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
   # Before ROCMAI-541 this made a clean, intentional, externally-triggered
-  # stop fail exactly like serve-63's crash.
+  # stop fail exactly like serve-64's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
-  Scenario: serve-64 - An externally stopped attached serve exits cleanly, not as a crash
+  Scenario: serve-65 - An externally stopped attached serve exits cleanly, not as a crash
     Given the scripted engine is armed to run until stopped
     When the user attaches to the scripted serve in the background
     And another shell stops that service while it is attached

@@ -426,8 +426,12 @@ pub(super) fn spawn_managed_engine_child(
         Err(error) => {
             // The single cleanup choke point for every failure path below the
             // record's first write: `record.engine_pid` tells it whether a child
-            // ever ran, so a pre-spawn failure deletes everything and a post-spawn
-            // one keeps the record and log (marked `status = "stopped"`) instead.
+            // ever ran, so a pre-spawn failure deletes everything and a
+            // post-spawn one keeps the record and log instead. It marks that
+            // kept record `stopped` only while the record is still live — one a
+            // crash path already stamped `failed` is deliberately left `failed`
+            // rather than relabelled as an abandoned launch. See
+            // `abandon_launch_record` in `launch_transaction.rs`.
             abandon_failed_managed_launch(paths, &record);
             Err(error)
         }

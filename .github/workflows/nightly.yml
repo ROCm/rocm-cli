@@ -516,11 +516,13 @@ jobs:
   # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
-    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits; on a
-    # host without Docker they skip and cost nothing. The "Report whether Docker
-    # is reachable" step logs the answer each run. serve-27's known failure on
-    # this pool is an xfail row in expectations.toml (rocm-cli#1058).
-    timeout-minutes: 120
+    # 140: serve-26/27/63 (AIM, @nightly) add up to 3 x 1200s readiness waits
+    # (each container downloads its checkpoint afresh: none is cached between
+    # scenarios); on a host without Docker they skip and cost nothing. The
+    # "Report whether Docker is reachable" step logs the answer each run.
+    # serve-27 once failed here (rocm-cli#1058) and now runs expect-pass, with
+    # no row in expectations.toml.
+    timeout-minutes: 140
     # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
     # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request
     # or merge_group (pinned by workflow_contract.rs). This lane used to target
@@ -570,14 +572,14 @@ jobs:
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # serve-26/27 (AIM) need Docker reachable on this host; without it they skip
+      # serve-26/27/63 (AIM) need Docker reachable on this host; without it they skip
       # silently. Say which it is, so a nightly that never ran them is visible.
       - name: Report whether Docker is reachable (AIM serve scenarios need it)
         run: |
           if docker info >/dev/null 2>&1; then
-            echo "docker reachable: serve-26/27 (AIM) can run on this host"
+            echo "docker reachable: serve-26/27/63 (AIM) can run on this host"
           else
-            echo "::warning::docker is not reachable on this host: serve-26/27 (AIM) will skip"
+            echo "::warning::docker is not reachable on this host: serve-26/27/63 (AIM) will skip"
           fi
 
       - name: Run E2E tests on Strix Halo (incl. nightly-only)

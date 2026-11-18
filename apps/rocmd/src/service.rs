@@ -991,6 +991,18 @@ mod tests {
             let reloaded = reloaded?;
             assert_eq!(reloaded.status, "stopped", "{status}");
             assert_eq!(reloaded.stop_requested_unix_ms, None, "{status}");
+            // The field the guarded marker move exists to protect. An empty
+            // `stop_requested_unix_ms` here means a concurrent listing settled
+            // this stop first; an unguarded `take()`-and-assign writes that
+            // `None` over the `settled_stop_unix_ms` the listing had just
+            // written, leaving both unset — which reads as a crash. Without
+            // this assertion the unguarded form, which did ship earlier in this
+            // PR before being caught, passes every test in this file unchanged.
+            assert!(
+                reloaded.settled_stop_unix_ms.is_some(),
+                "{status}: the stop's durable evidence must survive a listing \
+                 that consumed the live marker first"
+            );
             assert!(key_removed, "{status}");
         }
         Ok(())

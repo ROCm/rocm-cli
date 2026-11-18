@@ -28,3 +28,6 @@ __pycache__/
 # Sphinx docs: _toc.yml is generated from _toc.yml.in at build time
 docs/rocm-docs/sphinx/_toc.yml
 docs/rocm-docs/_build/
+
+# macOS Finder metadata
+.DS_Store
