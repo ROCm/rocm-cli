@@ -36,13 +36,7 @@ async fn says_not_found(world: &mut E2eWorld, service_id: String) {
     // backtrace when RUST_BACKTRACE is set, as CI does; that is not a cause.
     let error = stderr.find("Error:").map_or_else(
         || panic!("no error was printed:\n{stdout}\n{stderr}"),
-        |start| {
-            let error = &stderr[start..];
-            error
-                .split_once("\n\nStack backtrace:")
-                .map_or(error, |(message, _)| message)
-                .trim_end()
-        },
+        |start| rocm_core::recovery_hint::without_backtrace(&stderr[start..]).trim_end(),
     );
     assert_eq!(
         error,
