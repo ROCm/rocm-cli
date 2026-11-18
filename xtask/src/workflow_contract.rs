@@ -6069,7 +6069,14 @@ fi
             .iter()
             .find(|(name, _)| name.starts_with("Fetch the latest queue results"))
             .expect("e2e-report-nightly has a `Fetch the latest queue results` step");
-        let script = normalized_whitespace(step);
+        // Code only: a comment that names `--max-time` or `sleep` is not the budget.
+        let script = normalized_whitespace(
+            &step
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
 
         // The number that follows `marker`, which must be present.
         let number_after = |marker: &str| -> u64 {
