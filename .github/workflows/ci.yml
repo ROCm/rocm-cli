@@ -1670,7 +1670,7 @@ jobs:
 
       - name: Check license headers
         run: |
-          "${HAWKEYE_INSTALL_DIR}/hawkeye" check
+          "${HAWKEYE_INSTALL_DIR}/hawkeye" check --fail-on-unknown
 
   docs-links:
     name: Markdown links resolve (lychee)

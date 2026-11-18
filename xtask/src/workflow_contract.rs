@@ -9925,6 +9925,54 @@ fi
         }
     }
 
+    /// hawkeye reports an included file that has no comment-style rule as
+    /// `unsupported` and still exits 0, so a new `includes` glob without a
+    /// matching `[[rules]]` entry, or a deleted rules block, would stop
+    /// enforcing headers on that file type with every check green.
+    /// `--fail-on-unknown` turns that into a failure, so both the local hook
+    /// and the CI step must pass it.
+    #[test]
+    fn license_header_checks_fail_on_files_hawkeye_cannot_check() {
+        let flag = "--fail-on-unknown";
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let entry = hook_block(&config, "license-headers")
+            .lines()
+            .map(strip_comment)
+            .find_map(|line| line.trim().strip_prefix("entry:"))
+            .expect("the license-headers hook has an `entry:`");
+        let words: Vec<&str> = entry.split_whitespace().collect();
+        assert!(
+            words.contains(&"hawkeye") && words.contains(&"check") && words.contains(&flag),
+            "the license-headers hook's `entry:` is `{entry}`, which must run `hawkeye check \
+             {flag}`: without it hawkeye exits 0 for an included file type it has no rule for"
+        );
+
+        let ci = read_workflow("ci.yml");
+        let step = named_step(
+            job_block(&ci, "license-headers"),
+            "- name: Check license headers",
+        );
+        let code: Vec<&str> = step.lines().map(strip_comment).collect();
+        assert!(
+            code.iter().any(|line| {
+                line.contains("hawkeye")
+                    && line.contains(" check ")
+                    && line.split_whitespace().any(|word| word == flag)
+            }),
+            "the CI `Check license headers` step must run `hawkeye check {flag}`, or a file \
+             type hawkeye has no rule for is skipped with the job green:\n{step}"
+        );
+        assert!(
+            !code
+                .iter()
+                .any(|line| line.contains("|| true") || line.contains("continue-on-error")),
+            "the CI `Check license headers` step must not swallow hawkeye's exit status \
+             (`|| true`, `continue-on-error`), or the flag above cannot fail the job:\n{step}"
+        );
+    }
+
     /// `cargo xtask check-architecture-doc` is only a gate if all three places
     /// that can fail a change actually run it: the pre-commit hook, the pre-push
     /// hook (which reads the working tree, so it catches a commit made with
