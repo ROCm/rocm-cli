@@ -73,7 +73,8 @@
 //!
 //! This makes each file individually atomic. It does not serialize a
 //! read-modify-write across processes: two writers that each read, change and
-//! write the same file are still last-writer-wins.
+//! write the same file are still last-writer-wins. That takes a lock around the
+//! whole sequence, as `config.json` has in [`crate::ConfigLock`].
 
 use crate::disk_space;
 use crate::unix_time_millis;

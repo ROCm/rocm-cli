@@ -1962,7 +1962,15 @@ Settings live in `config.json` in the config directory and are replaced in one
 step, so an interrupted save leaves the previous file rather than a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
+it back to `config.json` before running another command. Commands that change
+settings at the same time, from two terminals or a script, take turns: each
+reads the file only once the previous change is saved, so none of them undoes
+another's change. One that waits more than 30 seconds for its turn stops with
+an error saying it did not save its change to the file. The
+turn-taking goes through `config.json.lock` beside the file, so a config
+directory where that file cannot be created, such as a read-only one, refuses
+every settings change. The lock file can stay there and must not be deleted
+while a command is running. If the file exists
 but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
