@@ -4292,12 +4292,20 @@ corrupt the bundle's checksum sidecar,
 pull request GitHub does not know, and
 `@id:lifecycle-linux-pr-channel-malformed-number` (lifecycle-50) and
 `@id:lifecycle-windows-pr-channel-malformed-number` (lifecycle-51) give
-`pr-abc`, which is refused before `gh` is called; each installs nothing. The
-Windows ones run on the Windows lifecycle lane; `install.ps1` has no hermetic
-script of its own, so the cases only `pr_channel.sh` covers (no CI run, a
-missing `gh`, an empty head commit, a run whose artifact list cannot be read,
-and `ROCM_CLI_ARCHIVE`, `ROCM_CLI_DOWNLOAD_BASE` or `ROCM_CLI_DOWNLOAD_ONLY`
-with the channel) have no Windows test yet.
+`pr-abc`, which is refused before `gh` is called; each installs nothing.
+`@id:lifecycle-linux-pr-channel-no-ci-run` (lifecycle-52) and
+`@id:lifecycle-windows-pr-channel-no-ci-run` (lifecycle-53) ask for a pull
+request with a head commit but no CI run,
+`@id:lifecycle-linux-pr-channel-gh-missing` (lifecycle-54) and
+`@id:lifecycle-windows-pr-channel-gh-missing` (lifecycle-55) run with no `gh` on
+`PATH`, and `@id:lifecycle-linux-pr-channel-refuses-download-base`
+(lifecycle-56) and `@id:lifecycle-windows-pr-channel-refuses-download-base`
+(lifecycle-57) set `ROCM_CLI_DOWNLOAD_BASE`, which is refused before `gh` is
+called. The Windows ones run on the Windows lifecycle lane; `install.ps1` has no
+hermetic script of its own, so the cases only `pr_channel.sh` covers (an empty
+head commit, a run whose artifact list cannot be read, a pull request artifact
+without its `.sha256`, and `ROCM_CLI_ARCHIVE` or `ROCM_CLI_DOWNLOAD_ONLY` with
+the channel, which `install.ps1` has no variable for) have no Windows test yet.
 
 `fake-gh` is as strict as the real API: it fails a call that names the wrong
 repository, lists runs for another commit than the pull request's head, or asks

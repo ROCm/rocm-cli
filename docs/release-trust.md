@@ -120,11 +120,13 @@ they are not trust roots.
 ## Installer Verification
 
 Installers always verify checksums, and while a release key is pinned they
-verify the detached signature on every install whatever the channel. The
+verify the detached signature on every install whatever the channel, except
+a `pr-<number>` channel (see [Pull request builds](#pull-request-builds)). The
 release public key is pinned in both [install.sh](../install.sh) and
 [install.ps1](../install.ps1) (canonical copy
 [rocm-cli-release-current-public.pem](keys/rocm-cli-release-current-public.pem)),
-so a key always resolves and a missing `.sig` sidecar fails the install. An
+so a key always resolves and a missing `.sig` sidecar fails the install (again
+except on a `pr-<number>` channel, which empties the key list). An
 unset or `0` `ROCM_CLI_REQUIRE_SIGNATURE` does not turn verification off. A key
 supplied through `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` or
 `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` (or `install.ps1`'s `-SigningPublicKeyPath` or

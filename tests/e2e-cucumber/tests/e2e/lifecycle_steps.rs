@@ -88,6 +88,9 @@ pub struct LifecycleState {
     /// The directory `fake-gh` serves a pull request's CI builds from, and the
     /// directory holding the planted `gh`; set by the pull request scenarios.
     gh_stub_dir: Option<PathBuf>,
+    /// Set by the scenario where the machine has no GitHub CLI, so the
+    /// installer's `PATH` is built without one instead of with `fake-gh`.
+    gh_missing: bool,
 }
 
 /// What a scenario's installer runs are told about `ROCM_CLI_REQUIRE_SIGNATURE`.
@@ -627,6 +630,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         fish_config_before_install: None,
         signature_requirement: SignatureRequirement::Required,
         gh_stub_dir: None,
+        gh_missing: false,
     });
 }
 
@@ -2865,6 +2869,52 @@ async fn given_pr_unknown(world: &mut E2eWorld) {
     std::fs::remove_file(stub.join("head")).expect("remove the head commit");
 }
 
+#[given("CI has not run for pull request 1048")]
+async fn given_pr_no_ci_run(world: &mut E2eWorld) {
+    // The pull request exists and has a head commit, but no run was made for it.
+    plant_gh_stub(world, &[], None);
+}
+
+#[given("the GitHub CLI is not installed")]
+async fn given_gh_missing(world: &mut E2eWorld) {
+    // Only the call log is wanted from the stub directory: no `gh` is planted,
+    // so any call the installer made would fail to run rather than be logged,
+    // and the installer's own check for the command is what must refuse.
+    let stub = root(world).join("gh-stub");
+    std::fs::create_dir_all(stub.join("bin")).expect("failed to create the gh stub directory");
+    let st = state_mut(world);
+    st.gh_stub_dir = Some(stub);
+    st.gh_missing = true;
+}
+
+/// `PATH` with no `gh` on it, for the scenario where the machine has none.
+///
+/// On Unix `gh` is hidden by name, because it can share `/usr/bin` with the
+/// tools the installer needs. On Windows the GitHub CLI installs into a
+/// directory of its own, so dropping every directory that holds one is enough.
+fn path_without_gh(world: &E2eWorld) -> String {
+    #[cfg(unix)]
+    {
+        shadow_path(world, &["gh"], &[])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = world;
+        let kept: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .filter(|dir| {
+                    !["gh.exe", "gh.cmd", "gh.bat", "gh.ps1"]
+                        .iter()
+                        .any(|name| dir.join(name).exists())
+                })
+                .collect();
+        std::env::join_paths(kept)
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 #[when("the checksum sidecar of the pull request bundle is corrupted")]
 async fn when_corrupt_pr_checksum(world: &mut E2eWorld) {
     let stub = state(world)
@@ -2904,12 +2954,32 @@ async fn when_install_pr_channel_with_key(world: &mut E2eWorld) {
     install_pr_channel(world, "pr-1048", PrSignature::PublicKey);
 }
 
+#[when("the pull request channel pr-1048 is installed with a download base")]
+async fn when_install_pr_channel_with_download_base(world: &mut E2eWorld) {
+    install_pr_channel_with(
+        world,
+        "pr-1048",
+        PrSignature::NotAsked,
+        "http://127.0.0.1:9/dist",
+    );
+}
+
 #[when("the channel pr-abc is installed")]
 async fn when_install_pr_channel_malformed(world: &mut E2eWorld) {
     install_pr_channel(world, "pr-abc", PrSignature::NotAsked);
 }
 
 fn install_pr_channel(world: &mut E2eWorld, channel: &str, signature: PrSignature) {
+    // No download base: the channel takes its build from CI and refuses one.
+    install_pr_channel_with(world, channel, signature, "");
+}
+
+fn install_pr_channel_with(
+    world: &mut E2eWorld,
+    channel: &str,
+    signature: PrSignature,
+    download_base: &str,
+) {
     let st = state(world);
     let stub = st
         .gh_stub_dir
@@ -2923,18 +2993,20 @@ fn install_pr_channel(world: &mut E2eWorld, channel: &str, signature: PrSignatur
     // the machine running the suite has set.
     cmd.env_remove("ROCM_CLI_GITHUB_REPO")
         .env_remove("FAKE_GH_REPO");
-    let mut path = vec![stub.join("bin")];
-    path.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
+    let path_value = if st.gh_missing {
+        path_without_gh(world)
+    } else {
+        let mut path = vec![stub.join("bin")];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(path)
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned()
+    };
     let extra = [
-        (
-            "PATH",
-            std::env::join_paths(path)
-                .expect("join PATH")
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        ("PATH", path_value),
         ("FAKE_GH_DIR", stub.to_string_lossy().into_owned()),
         ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
         ("ROCM_CLI_UPDATE_USER_PATH", "0".to_string()),
@@ -2958,13 +3030,12 @@ fn install_pr_channel(world: &mut E2eWorld, channel: &str, signature: PrSignatur
         PrSignature::PublicKey => &[("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH", public_key)],
         PrSignature::NotAsked | PrSignature::Required => &[],
     };
-    // No download base: the channel takes its build from CI and refuses one.
     let (out, ok) = run_installer_command(
         world,
         cmd,
         &workspace_root(),
         &install_dir,
-        "",
+        download_base,
         key_env,
         &extra,
     );
@@ -3116,6 +3187,41 @@ async fn then_pr_signature_cannot_be_required(world: &mut E2eWorld) {
     assert!(
         !st.last_output.contains("ROCM_CLI_SIGNING_PUBLIC_KEY"),
         "the refusal points at a key, which cannot help:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting no CI run was found for pull request 1048")]
+async fn then_pr_no_ci_run(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("no CI run found for pull request #1048"),
+        "installer output lacks the missing-run refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting the GitHub CLI is missing")]
+async fn then_gh_missing(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output.contains("missing required command: gh"),
+        "installer output lacks the missing-command refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails because a download base cannot be used with a pull request build")]
+async fn then_pr_download_base_refused(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("ROCM_CLI_DOWNLOAD_BASE cannot be combined with the pr-1048 channel"),
+        "installer output lacks the download-base refusal:\n{}",
         st.last_output
     );
 }

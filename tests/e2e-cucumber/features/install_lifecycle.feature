@@ -514,6 +514,7 @@ Feature: Release install lifecycle
     And the bundle signature sidecar is removed
     And the signed bundle is installed with no public key supplied
     Then the install fails reporting the required signature is missing
+    And no binaries are activated in the target directory
 
   # ── Pull request channel: pr-<number> installs the bundle CI built ──────
   # CI packages a bundle for each pull request unsigned, so the channel trusts
@@ -659,10 +660,67 @@ Feature: Release install lifecycle
     And gh was never called
     And no binaries are activated in the target directory
 
+  # Three more refusals, each before anything is activated: a pull request CI
+  # never started a run for, a machine without the GitHub CLI the channel
+  # needs, and a download base, which the channel refuses because its build
+  # comes from CI rather than from release assets.
+
+  @id:lifecycle-linux-pr-channel-no-ci-run @lifecycle @requires-os:linux
+  Scenario: lifecycle-52 - Linux - the pr channel names a pull request CI has not run for, and installs nothing
+    Given a freshly built release tree
+    And CI has not run for pull request 1048
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting no CI run was found for pull request 1048
+    And nothing was downloaded from CI
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-no-ci-run @lifecycle @requires-os:windows
+  Scenario: lifecycle-53 - Windows - the pr channel names a pull request CI has not run for, and installs nothing
+    Given a freshly built release tree
+    And CI has not run for pull request 1048
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting no CI run was found for pull request 1048
+    And nothing was downloaded from CI
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-pr-channel-gh-missing @lifecycle @requires-os:linux
+  Scenario: lifecycle-54 - Linux - the pr channel names the missing GitHub CLI, and installs nothing
+    Given a freshly built release tree
+    And the GitHub CLI is not installed
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting the GitHub CLI is missing
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-gh-missing @lifecycle @requires-os:windows
+  Scenario: lifecycle-55 - Windows - the pr channel names the missing GitHub CLI, and installs nothing
+    Given a freshly built release tree
+    And the GitHub CLI is not installed
+    When the pull request channel pr-1048 is installed
+    Then the install fails reporting the GitHub CLI is missing
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-linux-pr-channel-refuses-download-base @lifecycle @requires-os:linux
+  Scenario: lifecycle-56 - Linux - the pr channel refuses a download base before gh is called, and installs nothing
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed with a download base
+    Then the install fails because a download base cannot be used with a pull request build
+    And gh was never called
+    And no binaries are activated in the target directory
+
+  @id:lifecycle-windows-pr-channel-refuses-download-base @lifecycle @requires-os:windows
+  Scenario: lifecycle-57 - Windows - the pr channel refuses a download base before gh is called, and installs nothing
+    Given a freshly built release tree
+    And CI built a bundle for pull request 1048 whose newest run has expired
+    When the pull request channel pr-1048 is installed with a download base
+    Then the install fails because a download base cannot be used with a pull request build
+    And gh was never called
+    And no binaries are activated in the target directory
+
   # ── Download progress rendering ────────────────────────────────────────
 
   @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
-  Scenario: lifecycle-52 - Linux - a download draws one progress bar that stays inside the terminal
+  Scenario: lifecycle-58 - Linux - a download draws one progress bar that stays inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -672,7 +730,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-53 - Linux - a terminal too narrow for a bar downloads quietly and says why
+  Scenario: lifecycle-59 - Linux - a terminal too narrow for a bar downloads quietly and says why
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -681,7 +739,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
-  Scenario: lifecycle-54 - Linux - the wget fallback keeps its progress bar inside the terminal
+  Scenario: lifecycle-60 - Linux - the wget fallback keeps its progress bar inside the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -691,7 +749,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-piped-into-shell @lifecycle @requires-os:linux
-  Scenario: lifecycle-55 - Linux - piping the installer into a shell still sizes the bar from the terminal
+  Scenario: lifecycle-61 - Linux - piping the installer into a shell still sizes the bar from the terminal
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -701,7 +759,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-unsized-terminal @lifecycle @requires-os:linux
-  Scenario: lifecycle-56 - Linux - a terminal reporting no size still gets a progress bar
+  Scenario: lifecycle-62 - Linux - a terminal reporting no size still gets a progress bar
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -711,7 +769,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-linux-progress-zero-padded-columns @lifecycle @requires-os:linux
-  Scenario: lifecycle-57 - Linux - a zero-padded COLUMNS does not abort the install
+  Scenario: lifecycle-63 - Linux - a zero-padded COLUMNS does not abort the install
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file

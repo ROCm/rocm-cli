@@ -178,9 +178,10 @@ function Convert-FileUriToPath {
 # rotation key is published. Resolve-SigningPublicKey falls back to these keys
 # whenever no key is passed with -SigningPublicKeyPath/-SigningPublicKeyPem (or
 # ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/ROCM_CLI_SIGNING_PUBLIC_KEY_PEM), so while a
-# release key is pinned every install on any channel verifies the detached
-# signature and a missing .sig sidecar fails it, whether
-# ROCM_CLI_REQUIRE_SIGNATURE is unset or 0. A key supplied that way replaces
+# release key is pinned every install on any channel except a pr-<number>
+# channel verifies the detached signature and a missing .sig sidecar fails it,
+# whether ROCM_CLI_REQUIRE_SIGNATURE is unset or 0. A pr-<number> channel
+# installs an unsigned CI bundle and empties this list. A key supplied that way replaces
 # these keys rather than adding to them. Two slots support zero-downtime key
 # rotation: a release signed with either the current or the pre-staged next key
 # verifies, so the next key is trusted before its first use.
