@@ -113,10 +113,16 @@ struct PlatformOffer<'a> {
 /// Choose what one hardware group recommends for this host.
 ///
 /// `fit` is `None` on a host whose GPU memory could not be read. That case
-/// keeps the previous behaviour exactly — the curated `featured` short list,
-/// uncapped and unfiltered — because a machine the CLI could not measure must
-/// not be told its options are narrow. It is the same `Unknown`-is-not-`Absent`
-/// rule `model_readiness` applies to a verdict, applied to a listing.
+/// falls back to the curated `featured` short list, uncapped and unnarrowed by
+/// memory, because a machine the CLI could not measure must not be told its
+/// options are narrow. It is the same `Unknown`-is-not-`Absent` rule
+/// `model_readiness` applies to a verdict, applied to a listing.
+///
+/// The engine gate still applies there. Whether vLLM can run is decided by
+/// [`engine_ruled_out_by_platform_with`] from the OS and Docker alone, so an
+/// unreadable memory figure says nothing about it — and two of the four
+/// `featured` recipes are vLLM-only, which native Windows cannot serve at any
+/// size.
 fn platform_offer<'a>(
     candidates: &[&'a ModelRecipeRecord],
     fit: Option<f64>,
@@ -128,6 +134,7 @@ fn platform_offer<'a>(
                 .iter()
                 .copied()
                 .filter(|recipe| model_recipe_featured(recipe))
+                .filter(|recipe| engine_allowed(recipe))
                 .collect(),
             also_fit: 0,
         };
@@ -228,21 +235,17 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         let _ = writeln!(output, "\n{heading}");
         for recipe in offer.offered {
             // Show the canonical Hugging Face id (the reliable serve target) and
-            // the quant that fits this hardware. Append a fit verdict only when the
-            // host GPU VRAM is known — otherwise every row would read "GPU fit
-            // unknown", which is noise.
+            // the quant that fits this hardware. Append a fit verdict only where
+            // both sides of the comparison are known — on an unmeasured host
+            // every row would read "GPU fit unknown", which is noise, and on a
+            // recipe with no declared minimum there is nothing to compare.
             let detail = recipe
                 .quantization
                 .clone()
                 .unwrap_or_else(|| model_recipe_memory_label(recipe));
-            let fit_label = if aggregate_gpu_vram_gib.is_some() {
-                format!(
-                    "  {}",
-                    model_recipe_gpu_fit_label(recipe, aggregate_gpu_vram_gib)
-                )
-            } else {
-                String::new()
-            };
+            let fit_label = aggregate_gpu_vram_gib
+                .and_then(|available| model_recipe_gpu_fit_label(recipe, available))
+                .map_or_else(String::new, |label| format!("  {label}"));
             let _ = writeln!(
                 output,
                 "  {}  {}{}",
@@ -297,16 +300,21 @@ fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
     )
 }
 
+/// How a recipe's declared GPU minimum compares with this host's memory.
+///
+/// `None` where the recipe declares no minimum: the comparison has no subject,
+/// and saying "fits" on the strength of a figure nobody wrote down is the same
+/// unknown-read-as-a-fact that [`recipe_fits_gpu`] exists to refuse.
 fn model_recipe_gpu_fit_label(
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
-) -> &'static str {
-    match (recipe.min_gpu_mem_gb, aggregate_gpu_vram_gib) {
-        (Some(required), Some(available)) if available >= f64::from(required) => "fits this GPU",
-        (Some(_), Some(_)) => "needs a larger GPU",
-        (Some(_), None) => "GPU fit unknown",
-        (None, _) => "fits",
-    }
+    available_gib: f64,
+) -> Option<&'static str> {
+    let required = recipe.min_gpu_mem_gb?;
+    Some(if available_gib >= f64::from(required) {
+        "fits this GPU"
+    } else {
+        "needs a larger GPU"
+    })
 }
 
 pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
@@ -812,14 +820,12 @@ fn append_model_fit_lines(
                 );
                 // Not `/examine`: an `Examination` is a static host snapshot and
                 // carries no VRAM figure at all, so sending the user there for a
-                // missing VRAM reading is a confident dead end. But naming
-                // `amd-smi metric --json` directly is just as much of one here:
-                // every production caller of this function hardcodes
-                // `aggregate_gpu_vram_gib = None`, so the reading this function
-                // sees never changes no matter what the user runs. `rocm
-                // diagnose --model` is the command that actually threads a live
-                // reading through (`host_accelerator_memory`), so it is pointed
-                // at instead of a command this one cannot act on.
+                // missing VRAM reading is a confident dead end. Nor `amd-smi
+                // metric --json`: reaching this branch means the measurement
+                // this path already attempted came back empty, so repeating it
+                // raw answers nothing. `rocm diagnose --model` classifies the
+                // same reading against one model (`host_accelerator_memory`) and
+                // says why it is missing, which is what the user needs here.
                 let _ = writeln!(
                     output,
                     "      action: run `rocm diagnose --model {}` for a live reading",
@@ -1247,6 +1253,25 @@ mod tests {
         );
     }
 
+    /// A signed index is shown whole rather than narrowed, so its rows are the
+    /// one place a recipe with no declared minimum still reaches the fit label
+    /// on a measured host. A bare "fits" there would assert something nobody
+    /// measured — the same reading [`recipe_fits_gpu`] refuses.
+    #[test]
+    fn a_recipe_with_no_declared_minimum_claims_no_fit() {
+        let recipes = builtin_model_recipes();
+        let undeclared = recipes
+            .iter()
+            .find(|recipe| recipe.min_gpu_mem_gb.is_none())
+            .expect("the catalog ships recipes with no declared GPU minimum");
+
+        assert_eq!(
+            model_recipe_gpu_fit_label(undeclared, 0.25),
+            None,
+            "a model with no declared minimum must not be labelled against a host's memory"
+        );
+    }
+
     /// The defect this whole change exists for: `featured` is a static flag, and
     /// on the current catalog its four recipes need 17, 22, 54 and 62 GiB while
     /// the eight recipes at or below 8 GiB carry it on none of them. A small or
@@ -1299,7 +1324,7 @@ mod tests {
         let recipes = builtin_model_recipes();
         let candidates = recipes.iter().collect::<Vec<_>>();
 
-        let offer = platform_offer(&candidates, None, &|_| false);
+        let offer = platform_offer(&candidates, None, &|_| true);
 
         assert_eq!(
             offer.also_fit, 0,
@@ -1316,8 +1341,45 @@ mod tests {
             !offer.offered.is_empty(),
             "the curated list is what an unmeasured host still gets"
         );
-        // The engine gate said no to everything and was ignored, which is the
-        // point: with no figure to filter on, nothing is filtered.
+        assert!(
+            offer
+                .offered
+                .iter()
+                .any(|recipe| recipe.min_gpu_mem_gb.is_some_and(|needed| needed > 50)),
+            "a model far larger than any small host is still offered when no figure ruled it out"
+        );
+    }
+
+    /// An unreadable memory figure says nothing about whether vLLM can run, so
+    /// the relaxation in [`platform_offer`] must be to the memory filter alone.
+    /// Native Windows cannot serve a vLLM recipe at any size, and two of the
+    /// four `featured` recipes are vLLM-only.
+    #[test]
+    fn an_unmeasured_host_still_has_its_engine_gate_applied() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+        let not_lemonade = |recipe: &ModelRecipeRecord| {
+            recipe
+                .preferred_engines
+                .first()
+                .is_some_and(|engine| engine == "lemonade")
+        };
+
+        let offer = platform_offer(&candidates, None, &not_lemonade);
+
+        assert!(
+            !offer.offered.is_empty(),
+            "the recipes the gate allows are still offered"
+        );
+        assert!(
+            offer.offered.iter().all(|recipe| not_lemonade(recipe)),
+            "a recipe the platform rules out is not offered to an unmeasured host either: {:?}",
+            offer
+                .offered
+                .iter()
+                .map(|recipe| &recipe.canonical_model_id)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Also the regression test for reading an absent `min_gpu_mem_gb` as "fits
@@ -1445,11 +1507,9 @@ mod tests {
         assert!(rendered.contains("recommended_system_ram: 16 GiB"));
         assert!(rendered.contains("system_ram_fit: unknown"));
         assert!(rendered.contains("gpu_fit: unknown"));
-        // Every production caller of this function hardcodes
-        // `aggregate_gpu_vram_gib = None` (see `Command::Model` and the `/model`
-        // assistant tool), so this branch is the only one `rocm model` ever
-        // actually reaches -- its remediation must name a command this same
-        // path can act on, not one whose reading this function never sees.
+        // This branch is what a host whose VRAM could not be read reaches, and
+        // its remediation must name a command that explains the gap rather than
+        // the raw measurement this path already tried and got nothing from.
         assert!(rendered.contains("action: run `rocm diagnose --model"));
         assert!(!rendered.contains("amd-smi metric --json"));
         assert!(rendered.contains("engine_support:"));
