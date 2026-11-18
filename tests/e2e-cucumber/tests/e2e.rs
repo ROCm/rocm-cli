@@ -521,9 +521,11 @@ impl E2eWorld {
         if let Some(path) = &self.legacy_rocm_path {
             env.push(("ROCM_PATH", path.clone().into_os_string()));
         }
-        // When a scenario declares a longer serve-readiness window (via a
-        // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN per-engine readiness cap(s) to match. `rocm serve --managed`
+        // When a scenario declares a serve-readiness window (via a
+        // `@serve-timeout:<secs>` tag, or a matching xfail row's
+        // `serve_timeout_secs`, which wins over the tag and can be shorter →
+        // serve_timeout_override), also set the CLI's OWN per-engine readiness
+        // cap(s) to match, lowering them when the override is shorter. `rocm serve --managed`
         // otherwise kills/fails a server that isn't ready within its default (5
         // min, EAI-7393), which a large model's cold load legitimately exceeds —
         // so extending only the harness's poll (`model_is_ready`) isn't enough;
