@@ -60,6 +60,14 @@ pub(crate) enum AgentsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Delete the records, homes and transcripts of agents that are no longer
+    /// running (exited, or lost their supervising `rocm`). Running agents are
+    /// never touched.
+    Prune {
+        /// Delete without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// What `rocm` needs to know to sandbox one agent kind.
@@ -171,6 +179,7 @@ pub(crate) fn run(command: AgentsCommand) -> Result<()> {
             run_agent(&root, &agent, workspace, local, context, &args)
         }
         AgentsCommand::List { json } => list(&root, json),
+        AgentsCommand::Prune { yes } => prune(&root, yes),
     }
 }
 
@@ -319,6 +328,9 @@ fn run_agent(
 
     seed_agent_state(kind, &home, &placeholder)?;
 
+    let tool_dirs = std::env::var_os("HOME")
+        .map(|home| policy::user_tool_dirs(Path::new(&home)))
+        .unwrap_or_default();
     let policy_path = dir.join("policy.yaml");
     std::fs::write(
         &policy_path,
@@ -327,6 +339,7 @@ fn run_agent(
             agent_bin: &agent_bin,
             home: &home,
             tmp: &tmp,
+            tool_dirs: &tool_dirs,
         }),
     )?;
     registry::save(&dir.join("record.json"), &record.lock().unwrap())?;
@@ -339,7 +352,7 @@ fn run_agent(
         ("HOME".into(), path_str(&home)?),
         ("TMPDIR".into(), path_str(&tmp)?),
         ("CLAUDE_CODE_TMPDIR".into(), path_str(&tmp)?),
-        ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+        ("PATH".into(), sandbox_path(&tool_dirs)?),
         (
             "TERM".into(),
             std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
@@ -404,6 +417,56 @@ fn run_agent(
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
+    Ok(())
+}
+
+/// The sandbox's `PATH`: the user's tool directories first, as in a login
+/// shell, then the system ones.
+fn sandbox_path(tool_dirs: &[PathBuf]) -> Result<String> {
+    let mut parts = tool_dirs
+        .iter()
+        .map(|dir| path_str(dir))
+        .collect::<Result<Vec<_>>>()?;
+    parts.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(str::to_owned));
+    Ok(parts.join(":"))
+}
+
+fn prune(root: &Path, yes: bool) -> Result<()> {
+    let records = registry::load_all(root)?;
+    let stale: Vec<&AgentRecord> = records
+        .iter()
+        .filter(|r| r.status != AgentStatus::Running)
+        .collect();
+    let running = records.len() - stale.len();
+    if stale.is_empty() {
+        println!("Nothing to prune: no stopped agents ({running} running).");
+        return Ok(());
+    }
+    println!(
+        "{} stopped agent(s) to delete, with their homes, transcripts and audit logs:",
+        stale.len()
+    );
+    for r in &stale {
+        println!(
+            "  {} ({}, {})",
+            r.id,
+            r.status.label(),
+            r.workspace.display()
+        );
+    }
+    if running > 0 {
+        println!("{running} running agent(s) are kept.");
+    }
+    if !rocm_core::require_yes_or_interactive(yes, "rocm agents prune")? {
+        let mut out = std::io::stdout();
+        rocm_core::confirm::print_prompt(&mut out, "Delete them? [y/N]: ")?;
+        if !rocm_core::confirm::read_answer(&mut std::io::stdin().lock(), &mut out)? {
+            println!("Nothing was deleted.");
+            return Ok(());
+        }
+    }
+    let deleted = registry::delete_stopped(root, &stale)?;
+    println!("Deleted {deleted} agent(s).");
     Ok(())
 }
 
