@@ -2595,7 +2595,9 @@ rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
 
 While a first-time model download is running, `rocm serve <model> --wait` keeps
-waiting past the usual 45 seconds until the server answers or its engine gives up
+waiting, with no CLI-side stall limit or deadline (without `--wait`, piped output
+stops after 45 seconds and a terminal at a stall or after 30 minutes), until the
+server answers or its engine gives up
 (vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
 and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
 by the argument parser, covered by a unit test. Run the log follow above from a
@@ -2669,6 +2671,56 @@ cargo test -p rocm --bin rocm serve_engine_selection
 
 These tests verify that explicit/configured engines still win and shared model
 recipes only choose a preferred engine when no user/default engine is set.
+
+Interactive `rocm serve` (a terminal, without `--verbose` or `--foreground`)
+keeps a status line through download, load, and health until the server can
+serve or that wait fails. A download that is still moving is not cut off at
+45 seconds, and a failure names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes` instead of printing
+`Deployment summary (not ready yet)`. The wait fails when the engine fails or
+exits, a download percent below 100 stops for 3 minutes (`DOWNLOAD_STALL`; a line at 100% is judged as loading), the endpoint
+has not listed the model, with no log, for 5 minutes (`SILENT_UNREACHABLE`, equal to `SILENT_LOAD`), a load line
+stops changing for 5 minutes (`SILENT_LOAD`), or after 30 minutes
+(`rocm_core::SERVE_STARTUP_DEADLINE`). Engine log lines are masked of
+credentials before they are shown (`redact_log_line`). Once the endpoint lists the model,
+the one-token inference request is not sent every poll: it backs off from 1
+second to `INFERENCE_PROBE_RETRY_INTERVAL` (15 seconds), timed from when the
+previous request returned (`InferenceProbeThrottle`, tested under a fake clock
+by `inference_probe_backs_off_to_the_retry_interval_after_listing`). `rocmd` does not
+restart a live `running` service whose endpoint does not answer, or a live
+`starting` one past the stale-start window, while it is younger than that
+deadline (a pid whose recorded start time does not match is not live); a
+recoverable engine healthcheck is still restarted.
+Piped output, or a redirected stderr (`ServeStartupPolicy::for_background_serve`), keeps the 45-second status budget. Like `--wait`, the
+interactive wait first prints the service id, `rocm logs --service
+<service-id> --follow` and a public bind's key (`announces_wait` in
+[start.rs](../apps/rocm/src/service_launch/start.rs)), since it can fail
+without printing a summary; `--wait` keeps its own wait, with no CLI-side
+stall limit or deadline. A wait that ends because the engine failed or the
+process exited settles the record the way a `--wait` does (`stopped`, or the
+engine's own `failed`), records an audit event and adds the same memory
+guidance (a `--wait` that sees the server exit now records the event too);
+when the engine failed but its process is still up, the message names the
+stop command. Only a stall or the
+deadline leaves the server running for the background helper to supervise.
+Scenario `serve-64` in `model_serving.feature` drives it under a PTY. It
+needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
+it checks the wait line, that the named `rocm logs --service` command runs,
+and that the serve exits 0 with the model listed. Scenario `serve-65` is the
+failure side on the no-GPU mock lane: with `ROCM_E2E_SIMULATE_STARTUP_EXIT=1`,
+an `e2e-oom-fault-injection` build (Linux only) spawns a stand-in engine that
+logs one line and exits during startup, in place of the real child. It checks
+the non-zero exit and the "server process exited" message, runs the
+`rocm logs --service` command the failure names, and checks the record is
+`stopped` (`cargo xtask e2e -- -n "serve-65"`). The stall, deadline and
+engine-failed branches need a controllable engine, so `decide_serve_startup` and `wait_for_serve_startup` in
+[serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
+covered by:
+
+```bash
+cargo test -p rocm --bin rocm serve_progress
+cargo test -p rocmd recovery_leaves_a_live
+```
 
 Public-endpoint authentication focused tests:
 

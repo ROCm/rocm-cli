@@ -61,6 +61,7 @@ mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
 mod serve_port;
+mod serve_progress;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;
