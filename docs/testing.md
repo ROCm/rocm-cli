@@ -795,7 +795,7 @@ ignored, and its reason starts with `known gap:` and ends with the issue
 number:
 
 ```rust
-#[ignore = "known gap: in-band SSE error payloads are dropped and the stream reports a clean finish (#516)"]
+#[ignore = "known gap: the ComfyUI unpack keeps world-writable modes from the archive (#522)"]
 ```
 
 The prefix is a rule, not a convention, because it is the only way to find
@@ -5030,15 +5030,16 @@ What is detected, and what is not:
 
 - Detected (the summary says the smoke test failed): a transport error or timeout,
   an HTTP status other than 200, a parse error, and a chunked or `Content-Length`
-  stream cut short.
-- Not detected (no failure is reported and the status reads `ready`): an engine
-  error sent as a `data:` payload inside a `200` stream; a `200` answer with no
-  `data:` line at all (HTML, plain JSON, an empty body); a close-delimited stream
-  cut after a token; and a complete stream with no `content` token, which is
-  deliberately not a failure (a reasoning model can spend its whole small budget
-  first, as the readiness probe also allows for). The metric rows read `n/a` when
-  no content token arrived first; tokens that did arrive (the close-delimited cut,
-  or an in-band `data:` error after content) are measured.
+  stream cut short, and an engine error sent as a `data:` payload inside a `200`
+  stream (vLLM's `{"error": ...}` or `{"object": "error", ...}`), including one
+  that follows content tokens. The reason shown is the server's own message.
+- Not detected (no failure is reported and the status reads `ready`): a `200`
+  answer with no `data:` line at all (HTML, plain JSON, an empty body); a
+  close-delimited stream cut after a token; and a complete stream with no
+  `content` token, which is deliberately not a failure (a reasoning model can
+  spend its whole small budget first, as the readiness probe also allows for).
+  The metric rows read `n/a` when no content token arrived first; tokens that
+  did arrive in a close-delimited cut are measured.
 - Known limitation: the reason shown is whatever the provider call reported, and
   some of its errors are not the engine's, for example the `/v1/models` re-list
   before the request ("no ready managed service"), an unreadable services-directory
@@ -5068,8 +5069,9 @@ cargo test -p rocm --bin rocm the_commands_the_failure_note_names_exist_and_pars
 
 The `serve_smoke_test` tests in [providers.rs](../apps/rocm/src/providers.rs)
 run the real smoke test against a local mock engine over a socket (an engine that
-dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, a
-complete stream with no content, a close-delimited stream cut after a token). Only
+dies mid-answer or inside a chunk, a 500, 401 and 404, a hostile status line, an
+in-band `data:` error, a complete stream with no content, a close-delimited
+stream cut after a token). Only
 the mid-stream-death test goes on to render the summary from the real outcome; the
 others assert on the outcome the smoke test returns.
 
