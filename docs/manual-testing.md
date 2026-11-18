@@ -372,6 +372,32 @@ fallback paired an architecture line with the wrong GPU. On that machine
 `rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
 discrete card does have ROCm support, so the whole-machine claim is false.
 
+On Linux, check that each GPU keeps its own identity when the ROCm runtime
+cannot see all of them. On a host with two or more AMD GPUs and ROCm installed,
+hide one card from the runtime and inspect:
+
+```bash
+ROCR_VISIBLE_DEVICES=0 rocm examine --json
+```
+
+Match the `gpus[]` entries by `pci_id` against `lspci -D`. Every listed card
+must keep its own `gfx_target`, name and `is_apu`. The hidden card keeps the
+`gfx_target` the kernel gives it, and does **not** carry the visible card's
+model name or verdict; it may show the kernel-topology placeholder name. A
+hidden card carrying another card's name, target or `is_apu` means `rocminfo`'s
+agents were paired with the wrong GPU.
+
+Then run `rocm examine --json` once with no override set, and once with
+`HSA_OVERRIDE_GFX_VERSION` set to a value that names a different target from
+every card's own (on a gfx1151 or gfx1103 host, `11.0.0`, which names gfx1100;
+an override that names a card's own target cannot show anything). Every card's
+`gfx_target` must be the same in both runs, the native one, and an integrated
+GPU must still read `is_apu: true`. To read the native target from the kernel
+instead, `grep gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties`
+gives a decimal value per GPU node: major is `v / 10000`, minor is
+`(v / 100) % 100` and stepping is `v % 100`, with minor and stepping written as
+hex digits, so `110001` is gfx1101 and `90010` is gfx90a.
+
 ## 2b. Bare-Metal Driver Install
 
 On a real apt/dnf/zypper Linux host:
@@ -819,10 +845,12 @@ Expected result:
     found yet.`. The same file written over the activity log instead gives
     `Recent activity: none shown; the newest line is longer than the 4 MiB a log
     view reads`, not `no activity yet`.
-  - `rocm comfyui logs`, which reads the saved ComfyUI logs: write the file under
-    `apps/comfyui/logs/` in the data folder and expect `No output shown: the
-    newest line is longer than the 4 MiB a log view reads.`; an empty file there
-    gives `The saved log is empty.`.
+  - `rocm comfyui logs`, which reads the saved ComfyUI logs from the `logs/`
+    folder beside the install's `source/` folder under its runtime (where
+    `start` and `install` write), and from `apps/comfyui/logs/` in the data
+    folder too: write the file in the `logs/` folder beside `source/` and
+    expect `No output shown: the newest line is longer than the 4 MiB a log
+    view reads.`; an empty file there gives `The saved log is empty.`.
   - A stray byte that is not valid text in any of these logs shows the readable
     lines with a replacement character, not a `failed to read` line.
 - The `service_logs` tool (`rocm mcp-call service_logs --arguments-json
@@ -1696,6 +1724,25 @@ Expected result:
   `apps/comfyui/state/running.json` under rocm-cli's data folder containing
   only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
   is running, and goes ahead.
+- With the same one-character `running.json` in place and nothing listening on
+  port 8188, `rocm comfyui status` succeeds, shows `status: unknown` under `Running` with a note naming the file,
+  and names `rocm comfyui stop` as the next step; `rocm comfyui logs` still
+  shows the saved logs; `rocm comfyui stop` prints `status: unknown`, says it
+  moved the file to `running.json.unreadable` beside it, stopped no process
+  and checked only `http://127.0.0.1:8188` (so a ComfyUI started on another
+  address is not covered), names where the record is kept, and exits 0.
+  `running.json` is gone afterwards and `rocm comfyui status` no longer
+  reports it.
+- With the same file in place and something listening on
+  `http://127.0.0.1:8188` (a ComfyUI started outside rocm-cli, or
+  `python -m http.server 8188`), `rocm comfyui status` says something answers
+  there and advises stopping it first, or moving `running.json` aside by hand
+  if what answers is not ComfyUI; `rocm comfyui stop` leaves `running.json` in
+  place and exits non-zero. Once the listener is stopped, `rocm comfyui stop`
+  moves the file aside as above.
+- With a directory created at `running.json` instead, `rocm comfyui status`,
+  `rocm comfyui stop` and `rocm comfyui install --reinstall --dry-run` fail
+  naming `failed to read …/running.json` rather than reporting no record.
 - If the reinstall fails after the new code is in place (on a host where the
   AMD GPU check fails, say), the error names what was replaced or set aside
   and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
@@ -1907,6 +1954,33 @@ Expected result:
   service read `failed` rather than `stopped`, so rocmd's recovery restarts it.
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
+
+To check that an endpoint key covers every route of an AIM container, not only
+`/v1`, serve the same raw image behind a key and repeat the calls from section
+7 against it:
+
+```bash
+export ROCM_SERVE_API_KEY=manual-test-key
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency --require-api-key
+docker inspect --format '{{json .Mounts}}' rocm-aim-<service-id>
+```
+
+Expected result:
+
+- The service reaches `ready`, and `docker inspect` shows the engine's
+  `python` directory mounted read-only at `/opt/rocm-cli/python`.
+- With `Qwen/Qwen3.5-9B` as the model, the `/invocations` and `/tokenize` calls
+  from section 7 print `401` without the key and `200` with
+  `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"`; `/health` prints `200`
+  without it.
+- If the image does not apply `AIM_ENGINE_ARGS`, the serve fails instead,
+  naming `POST /tokenize` and the status it answered, and the container is
+  removed.
+
+The automated scenario is the `@nightly` `serve-aim-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
+which runs only on a nightly host with Docker and a Radeon or Strix Halo GPU.
 
 ## 12. Background Automation Helper
 
@@ -2213,3 +2287,78 @@ Expected result:
   could not be started: it was not found; nothing was changed.`, exits 4, and
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
+
+## 18. Settings Changed From Several Terminals At Once
+
+Commands that change settings take turns on `config.json`, so none of them
+undoes another's change. Scenario `config-12` checks this on the mock lane; this
+is the same check by hand. It runs on a scratch config, data and cache folder,
+set only inside the loops, so your own settings and audit log are untouched and
+your shell is left as it was. The scratch folder is removed at the end.
+
+In PowerShell:
+
+```powershell
+$scratch = Join-Path $env:TEMP "rocm-config-race"
+$jobs = @(
+  @('set-default-engine', 'lemonade', 'aim', 'default_engine'),
+  @('set-telemetry', 'local', 'off', 'telemetry.mode'),
+  @('set-permissions', 'ask', 'full-access', 'permissions.mode')
+) | ForEach-Object {
+  Start-Job -ArgumentList $_, $scratch -ScriptBlock {
+    param($w, $scratch)
+    $env:ROCM_CLI_CONFIG_DIR = "$scratch\config"
+    $env:ROCM_CLI_DATA_DIR = "$scratch\data"
+    $env:ROCM_CLI_CACHE_DIR = "$scratch\cache"
+    $lost = 0
+    $failed = 0
+    for ($i = 0; $i -lt 50; $i++) {
+      $value = $w[1 + ($i % 2)]
+      if ($i -gt 0) {
+        $json = Get-Content "$scratch\config\config.json" -Raw | ConvertFrom-Json
+        $found = $json
+        foreach ($part in $w[3].Split('.')) { $found = $found.$part }
+        $previous = ($w[1 + (($i - 1) % 2)]).Replace('-', '_')
+        if ($found -ne $previous) { $lost++ }
+      }
+      rocm config $w[0] $value | Out-Null
+      if ($LASTEXITCODE -ne 0) { $failed++ }
+    }
+    "$($w[0]): lost $lost, failed $failed"
+  }
+}
+$jobs | Wait-Job | Receive-Job
+Get-ChildItem "$scratch\config" | Select-Object -ExpandProperty Name
+Remove-Item -Recurse -Force $scratch
+```
+
+In WSL or on Linux (needs `jq`):
+
+```bash
+scratch=$(mktemp -d)
+writer() {  # setter, its two values, where the setting sits in config.json
+  local lost=0 failed=0 i value previous
+  for i in $(seq 0 49); do
+    if [ $((i % 2)) -eq 0 ]; then value=$2 previous=$3; else value=$3 previous=$2; fi
+    if [ "$i" -gt 0 ] && [ "$(jq -r "$4" "$scratch/config/config.json")" != "${previous//-/_}" ]; then
+      lost=$((lost + 1))
+    fi
+    ROCM_CLI_CONFIG_DIR=$scratch/config ROCM_CLI_DATA_DIR=$scratch/data \
+      ROCM_CLI_CACHE_DIR=$scratch/cache rocm config "$1" "$value" >/dev/null \
+      || failed=$((failed + 1))
+  done
+  echo "$1: lost $lost, failed $failed"
+}
+writer set-default-engine lemonade aim .default_engine &
+writer set-telemetry local off .telemetry.mode &
+writer set-permissions ask full-access .permissions.mode &
+wait
+ls "$scratch/config"
+rm -rf "$scratch"
+```
+
+Expected result:
+
+- Each loop prints `lost 0, failed 0`.
+- The scratch config folder lists `config.json` and `config.json.lock`; the
+  lock file is expected and stays beside the settings.

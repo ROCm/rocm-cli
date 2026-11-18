@@ -115,6 +115,10 @@ pub struct E2eWorld {
     /// read from its stderr by the step that checks the refusal, for the step
     /// that follows that advice after other commands have replaced `cli_stderr`.
     pub suggested_settings_rename: Option<(String, String)>,
+    /// What `config-12`'s concurrent settings writers found: one line per
+    /// command that failed and per change a writer saw undone. Set by the When
+    /// step that runs them, read by its Then steps.
+    pub concurrent_settings_findings: Option<e2e::config_steps::ConcurrentSettingsFindings>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
@@ -400,6 +404,7 @@ impl Default for E2eWorld {
             cli_elapsed: None,
             suggested_data_dir: None,
             suggested_settings_rename: None,
+            concurrent_settings_findings: None,
             remote_env: Vec::new(),
             launch_release: None,
             launch_stage: None,
@@ -1005,6 +1010,25 @@ pub fn run_rocm_bounded_with_env(
     envs: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> (String, String, i32) {
+    run_rocm_bounded_in(
+        &world.isolate_env(),
+        world.current_scenario.as_deref(),
+        args,
+        envs,
+        timeout,
+    )
+}
+
+/// [`run_rocm_bounded_with_env`] with the scenario's environment and name
+/// passed in rather than read from the world, for steps that run commands from
+/// several threads at once.
+pub fn run_rocm_bounded_in(
+    env: &[(&'static str, std::ffi::OsString)],
+    scenario: Option<&str>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
     use std::process::Stdio;
 
     let binary = rocm_binary();
@@ -1013,7 +1037,9 @@ pub fn run_rocm_bounded_with_env(
     let err_path = dir.path().join("stderr");
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
-    world.isolate_cmd(&mut cmd);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
     cmd.envs(envs.iter().copied());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(
@@ -1050,7 +1076,7 @@ pub fn run_rocm_bounded_with_env(
             timeout.as_secs()
         );
     }
-    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    record_command(scenario, args, rc, &stdout);
     (stdout, stderr, rc)
 }
 

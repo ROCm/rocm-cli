@@ -1365,16 +1365,17 @@ directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather 
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
-With the vLLM engine, an endpoint bound to a public interface
+With the vLLM and AIM engines, an endpoint bound to a public interface
 (`--allow-public-bind`), or served with `--require-api-key`, answers only
 clients that present its API key as an `Authorization: Bearer` header, on every
 route the server answers, not just the OpenAI `/v1` API — including vLLM's own
 `/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
-CORS preflights: the `/health` liveness check stays open. The AIM engine runs
-the same vLLM server inside its container but does not install this check, so
-a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
-leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
-without the key.
+CORS preflights: the `/health` liveness check stays open. An AIM container gets
+this check through `AIM_ENGINE_ARGS`; one whose image does not apply it fails to
+start and its container is removed, rather than serving with only `/v1`
+protected. A key-protected AIM launch also refuses to start when it cannot read
+the image's config, or when `AIM_ENGINE_ARGS` (from `--engine-env` or the image)
+is not a JSON object or already names a `middleware`.
 
 Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
 key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
@@ -1898,8 +1899,25 @@ downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
 launched is running or still starting, and its dry run says so; stop it with
 `rocm comfyui stop` first. This is checked before the download and again just
 before the code is replaced, so a ComfyUI started during the download is
-caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
-reinstall says so and is not refused, since `stop` cannot read it either. If a
+caught too. If rocm-cli's saved record of that ComfyUI cannot be parsed (a
+`running.json` that is truncated, empty or otherwise not a record rocm-cli
+wrote), the reinstall says so and is not refused, since the record names no
+process that `stop` could stop either. `status` and
+the answer to `rocm "what is the comfyui status"` then report the running state
+as unknown, naming the file, and `logs` still shows the saved logs. To tell
+whether anything else might be the ComfyUI it started, `status`, that answer
+and `rocm comfyui stop` check only ComfyUI's default address,
+`http://127.0.0.1:8188`. If nothing answers there, `rocm comfyui stop` moves
+the record aside to `running.json.unreadable` in the same `state` folder
+(replacing one moved there before) without stopping any process. If something
+does answer, rocm-cli cannot tell whether that is the ComfyUI it started, so
+`stop` leaves the record in place and exits non-zero, saying to stop what
+answers there yourself and run `rocm comfyui stop` again, or, if what answers
+is not that ComfyUI, to move the record aside yourself. A reinstall over such a
+record does not wait for any of this: it goes ahead even if a ComfyUI is still
+running from the folder, and may replace its code under it. A `running.json`
+that cannot be read at all (permission denied, say), or something other than a
+file at its path, is reported as an error rather than as no record. If a
 reinstall is interrupted part-way, or stops part-way (because a file it must
 delete or move is in use, say), `start` refuses to launch the half-replaced
 folder, and `start`, `status`, the answer to
@@ -1962,7 +1980,15 @@ Settings live in `config.json` in the config directory and are replaced in one
 step, so an interrupted save leaves the previous file rather than a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
+it back to `config.json` before running another command. Commands that change
+settings at the same time, from two terminals or a script, take turns: each
+reads the file only once the previous change is saved, so none of them undoes
+another's change. One that waits more than 30 seconds for its turn stops with
+an error saying it did not save its change to the file. The
+turn-taking goes through `config.json.lock` beside the file, so a config
+directory where that file cannot be created, such as a read-only one, refuses
+every settings change. The lock file can stay there and must not be deleted
+while a command is running. If the file exists
 but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records

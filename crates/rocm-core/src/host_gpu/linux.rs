@@ -133,7 +133,9 @@ pub(crate) fn kfd_gpu_nodes_in(nodes_dir: &Path) -> Option<Vec<KfdGpuNode>> {
 /// 12032, 17920, 23808, 35584, 43520, 49664 and 55808, which decode to exactly
 /// the eight addresses `lspci -D` lists for its accelerators (EAI-8449).
 ///
-/// `None` when the property is absent or zero. Zero is refused rather than
+/// `None` when the property is absent, zero, or wider than 16 bits (which
+/// `pci_dev_id()` cannot produce; see [`pci_bus_device_function`]). Zero is
+/// refused rather than
 /// decoded: `0000:00:00.0` is the host bridge, so emitting it would be a
 /// wrong-but-plausible address that could match an unrelated PCI entry.
 #[cfg(any(target_os = "linux", test))]
@@ -141,16 +143,39 @@ fn kfd_node_pci_id(properties: &str) -> Option<String> {
     let location = kfd_property_value(properties, "location_id")?
         .parse::<u32>()
         .ok()?;
-    if location == 0 {
-        return None;
-    }
     let domain = kfd_property_value(properties, "domain")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
-    let bus = (location >> 8) & 0xff;
-    let device = (location >> 3) & 0x1f;
-    let function = location & 0x7;
-    Some(format!("{domain:04x}:{bus:02x}:{device:02x}.{function}"))
+    let bdf = pci_bus_device_function(location)?;
+    Some(format!("{domain:04x}:{bdf}"))
+}
+
+/// The `bus:device.function` part of a PCI address, spelled as `lspci` spells
+/// it, from the kernel's `pci_dev_id()` encoding: `(bus << 8) | devfn`, with
+/// `devfn` packing the device number in bits 3..8 and the function in bits
+/// 0..3. So `4352` (`0x1100`) is `11:00.0`.
+///
+/// Two readings carry an address in this encoding, and both decode through
+/// here so they cannot disagree about a card: the KFD topology's `location_id`
+/// (`kfd_node_pci_id`, which adds the `domain` property in front) and
+/// `rocminfo`'s per-agent `BDFID`, which has no domain at all
+/// (`examine::linux_gpus`, which matches each `rocminfo` agent onto the GPU
+/// with this address).
+///
+/// `None` for zero, for the reason `kfd_node_pci_id` gives: `00:00.0` is the
+/// host bridge, and `rocminfo` prints `BDFID: 0` for its CPU agents, so a zero
+/// is "no address" rather than an address that could match an unrelated entry.
+/// `None` above `0xffff` too, which the encoding cannot produce.
+pub(crate) fn pci_bus_device_function(dev_id: u32) -> Option<String> {
+    // Above 16 bits is no `pci_dev_id()`: decoding only the low 16 would turn
+    // it into an address that could belong to another card.
+    if dev_id == 0 || dev_id > 0xffff {
+        return None;
+    }
+    let bus = (dev_id >> 8) & 0xff;
+    let device = (dev_id >> 3) & 0x1f;
+    let function = dev_id & 0x7;
+    Some(format!("{bus:02x}:{device:02x}.{function}"))
 }
 
 /// The KFD-topology read, against a caller-supplied nodes directory.
@@ -692,6 +717,23 @@ mod tests {
         );
         // A node that states no location at all cannot be placed on the bus.
         assert_eq!(kfd_node_pci_id("gfx_target_version 90402\n"), None);
+    }
+
+    #[test]
+    fn a_dev_id_decodes_every_function_bit_and_refuses_zero_and_wider_values() {
+        // The decode both the KFD topology and `rocminfo`'s `BDFID` go through,
+        // pinned to literal addresses: a test that only compares the two sides
+        // stays green when the shared decode is wrong on both. Functions 5 and
+        // 7 use the function's high bit, which a two-bit mask would drop.
+        assert_eq!(pci_bus_device_function(0x1c7).as_deref(), Some("01:18.7"));
+        assert_eq!(pci_bus_device_function(0x305).as_deref(), Some("03:00.5"));
+        assert_eq!(pci_bus_device_function(49_920).as_deref(), Some("c3:00.0"));
+        assert_eq!(pci_bus_device_function(0xfffe).as_deref(), Some("ff:1f.6"));
+        assert_eq!(pci_bus_device_function(0), None);
+        // Past 16 bits is not this encoding; its low 16 bits (0x0300, a real
+        // card's address) must not be read as one.
+        assert_eq!(pci_bus_device_function(0x1_0300), None);
+        assert_eq!(pci_bus_device_function(0xffff).as_deref(), Some("ff:1f.7"));
     }
 
     #[test]
