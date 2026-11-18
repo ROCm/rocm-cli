@@ -2465,9 +2465,10 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
     fn every_lane_that_runs_is_checked_for_its_report_artifact() {
         // A lane that dies before writing report.json uploads nothing, and the
         // consolidated grid can only render reports that arrived, so the lane
-        // drops out with no row and no FAIL — and on a `continue-on-error` lane
-        // nothing else is red either. The report job's missing-report check is
-        // what catches that, and it only knows a lane through LANE_REPORTS.
+        // drops out with no row and no FAIL. The lane's own job is red, but
+        // nothing in the grid says which report is absent. The report job's
+        // missing-report check is what names it, and it only knows a lane
+        // through LANE_REPORTS.
         //
         // Derived from the lanes, like its siblings: a new lane fails here until
         // it is added to the map under the exact artifact name its upload step
@@ -2741,8 +2742,10 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             "the summary must name the lane: {summary}"
         );
 
-        // A continue-on-error lane may present as `success`; the missing
-        // artifact alone has to be enough.
+        // The `needs` result does not say which leg failed to upload, and a
+        // masked lane (which `e2e_lanes_do_not_mask_failures_with_continue_on_error`
+        // forbids) would read `success`; the missing artifact alone has to be
+        // enough.
         let (code, log, _) = run_report_check(&step, &all("success"), Some(&without_victim));
         assert_eq!(
             code, 1,
@@ -3761,9 +3764,8 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
     /// cucumber measures scenario durations by subtracting `SystemTime` stamps, so
     /// a guest whose clock steps backwards mid-run kills the suite (#455 makes that
     /// survivable; this keeps the durations real). The hazard is invisible: the
-    /// step's absence breaks nothing that any other test here observes, and on the
-    /// nightly lane job-level `continue-on-error: true` means a regression would
-    /// not even turn the run red.
+    /// step's absence breaks nothing that any other test here observes: a clock
+    /// that never steps backwards on a given night passes the lane either way.
     ///
     /// Steps are matched as WHOLE LINES, not found as substrings of the job: the
     /// surrounding comments discuss the clock at length, and a comment line that
@@ -5630,13 +5632,15 @@ fi
 
     /// `release-readiness-nightly` must gate E2E lane coverage through
     /// `e2e-report-nightly`'s own result, not through each lane job's own
-    /// `continue-on-error: true`-masked result (which is always `success`
-    /// regardless of what actually happened). Ties the gate to the one place
-    /// that already fails correctly when a lane silently drops out — see
+    /// result. Readiness reads failing scenarios from the consolidated report's
+    /// failure total and a lane that uploaded no report from the report job's
+    /// own result (docs/ci-hardware-testing.md says what that leaves out). Ties
+    /// the gate to the one place that fails correctly when a lane silently
+    /// drops out — see
     /// `every_lane_that_runs_is_checked_for_its_report_artifact`, which pins
     /// that `e2e-report-nightly` itself is driven by `LANE_REPORTS` and so
-    /// covers every lane, including ones added later, without this job
-    /// needing its own copy of the lane list.
+    /// covers every lane, including ones added later, without this job needing
+    /// its own copy of the lane list.
     #[test]
     fn release_readiness_nightly_gates_on_the_e2e_report_job_not_individual_lanes() {
         let nightly = read_workflow("nightly.yml");
@@ -5669,8 +5673,8 @@ fi
             assert!(
                 !needs.contains(&lane.to_string()),
                 "release-readiness-nightly must not depend on individual E2E lane job `{lane}` \
-                 directly: continue-on-error on that job means its own `result` is always \
-                 `success`, so gating on it can never fire"
+                 directly: it gates on e2e-report-nightly, whose result also covers a lane \
+                 that uploaded no report, so one copy of the lane list is enough"
             );
         }
 
@@ -5690,6 +5694,235 @@ fi
             "release-readiness-nightly must read --windows-result from \
              needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
              result) -- otherwise a failed Windows nightly build never fails the gate"
+        );
+    }
+
+    /// Every line of a self-hosted lane's job block in `text` that may set
+    /// `continue-on-error` to anything but `false`, as `job: line` (the line
+    /// trimmed), lanes and lines in file order.
+    ///
+    /// A fail-closed line scan rather than a YAML parse. Each line is cut at
+    /// its first ` #` (a YAML comment; in an indented job block this also
+    /// empties a whole comment line), and counts when what is left contains
+    /// `continue-on-error` anywhere, unless it is exactly `continue-on-error:
+    /// false` or `- continue-on-error: false`. That reports a true value, an
+    /// expression, a quoted key or value, a flow mapping and extra spaces after
+    /// the `- `. A `run:` script that merely contains the text is reported too,
+    /// deliberately: telling script text from YAML keys is the parsing this
+    /// scan exists to avoid, and a false alarm costs a reword where a missed
+    /// mask costs a green run over a red lane.
+    ///
+    /// What it does not see, by the same choice not to parse YAML: anything
+    /// after a ` #`, which is usually a comment (a comment cannot mask) but
+    /// also cuts a quoted value containing ` #` and whatever follows it on the
+    /// line, such as `- {name: "Run #1", continue-on-error: true}`; the key in
+    /// another case, such as `CONTINUE-ON-ERROR: true`, since the match is
+    /// case-sensitive; a value a lane takes from a YAML anchor or merge key
+    /// (`<<: *defaults`) defined outside its job block; and anything after a
+    /// comment line indented like a job id (`  # note`), where `job_block`
+    /// ends the lane. In the other direction, a comment at column 0 inside a
+    /// lane has no space before its `#`, so it is not cut and a mention of the
+    /// key there is reported. The unit test pins each of these as a known
+    /// limit.
+    fn continue_on_error_lines(text: &str) -> Vec<String> {
+        self_hosted_e2e_jobs(text)
+            .into_iter()
+            .flat_map(|(job, _)| {
+                job_block(text, &job)
+                    .lines()
+                    .map(|line| strip_comment(line).trim())
+                    .filter(|code| {
+                        code.contains("continue-on-error")
+                            && !matches!(
+                                *code,
+                                "continue-on-error: false" | "- continue-on-error: false"
+                            )
+                    })
+                    .map(|code| format!("{job}: {code}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Why `text` (the workflow named `workflow`) breaks the no-mask rule, as
+    /// one message listing every line `continue_on_error_lines` reports, as
+    /// `job: line`; `None` when no self-hosted E2E lane has such a line.
+    ///
+    /// A job-level `continue-on-error: true` does more than keep the run going:
+    /// a failed leg then reads `success` in `needs.<lane>.result` downstream and
+    /// in the run's conclusion, so a broken lane is indistinguishable from a
+    /// passing one everywhere but its own log. A step-level one lets the
+    /// failing step pass the job. The lanes run in separate jobs with
+    /// `fail-fast: false`, so an unmasked failure does not cancel a sibling
+    /// lane. Both consolidated report jobs are pinned to run on `always()`, so
+    /// a failed lane does not skip them: nightly's `e2e-report-nightly` by
+    /// `e2e_lanes_do_not_mask_failures_with_continue_on_error`, and
+    /// e2e-selfhosted's `e2e-report` by
+    /// `closing_a_pr_supersedes_its_self_hosted_runs`.
+    fn mask_failure(workflow: &str, text: &str) -> Option<String> {
+        let lines = continue_on_error_lines(text);
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{workflow}: self-hosted E2E lanes may set `continue-on-error` to something \
+             other than `false`, on the job or on a step, in these lines: {lines:?}. On the \
+             job that makes a failed lane read `success` in `needs.<lane>.result` and in \
+             the run's conclusion; on a step it lets the failing step pass the job. Either \
+             way the run goes green while the lane is red. Remove it, or reword a script \
+             that only mentions the key (this scan is deliberately fail-closed)"
+        ))
+    }
+
+    #[test]
+    fn mask_failure_names_every_masked_line_and_passes_an_unmasked_workflow() {
+        // Two lanes: one masked on the job and on a step, one explicitly unmasked.
+        let workflow = "on: push\njobs:\n  quiet:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: false\n  loud:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: ${{ true }}\n    steps:\n      - continue-on-error: true\n";
+        let failure = mask_failure("w.yml", workflow).expect("a masked lane must fail");
+        assert!(
+            failure.starts_with("w.yml: ")
+                && failure.contains("\"loud: continue-on-error: ${{ true }}\"")
+                && failure.contains("\"loud: - continue-on-error: true\"")
+                && !failure.contains("quiet"),
+            "{failure}"
+        );
+
+        assert_eq!(
+            mask_failure(
+                "w.yml",
+                &one_lane_workflow("    continue-on-error: false\n")
+            ),
+            None
+        );
+        assert_eq!(
+            mask_failure(
+                "w.yml",
+                &one_lane_workflow("    steps:\n      - run: echo\n")
+            ),
+            None
+        );
+    }
+
+    /// A one-lane self-hosted workflow: `job_lines` follow the job's
+    /// `runs-on`, verbatim.
+    fn one_lane_workflow(job_lines: &str) -> String {
+        format!("on: push\njobs:\n  lane:\n    runs-on: [self-hosted, linux, mi300x]\n{job_lines}")
+    }
+
+    #[test]
+    fn continue_on_error_scan_accepts_only_a_plain_false() {
+        let step = |key_line: &str| {
+            format!("    steps:\n      - name: Run\n        {key_line}\n        run: echo\n")
+        };
+        for (case, job_lines, flagged) in [
+            ("job-level true", "    continue-on-error: true\n".to_owned(), true),
+            ("step-level true", step("continue-on-error: true"), true),
+            ("expression", step("continue-on-error: ${{ true }}"), true),
+            ("quoted value", step("continue-on-error: 'true'"), true),
+            ("capitalised False", step("continue-on-error: False"), true),
+            (
+                "flow mapping",
+                "    steps:\n      - {name: x, continue-on-error: true}\n".to_owned(),
+                true,
+            ),
+            (
+                "extra spaces after the dash",
+                "    steps:\n      -   continue-on-error: true\n        run: echo\n".to_owned(),
+                true,
+            ),
+            ("quoted key", step("\"continue-on-error\": true"), true),
+            (
+                "text in a run script (fail-closed)",
+                "    steps:\n      - name: Run\n        run: |\n          continue-on-error: true\n"
+                    .to_owned(),
+                true,
+            ),
+            ("plain false", step("continue-on-error: false"), false),
+            ("false with a trailing comment", step("continue-on-error: false # why"), false),
+            (
+                "dash-line false",
+                "    steps:\n      - continue-on-error: false\n        run: echo\n".to_owned(),
+                false,
+            ),
+            (
+                "a comment line",
+                "    # no continue-on-error: true here\n    steps:\n      - run: echo\n".to_owned(),
+                false,
+            ),
+            ("absent", step("shell: bash"), false),
+            // Known limits, pinned so they stay documented behaviour rather
+            // than silent holes (see the doc comment on the scan).
+            (
+                "limit: a quoted ` #` cuts the rest of the line",
+                "    steps:\n      - {name: \"Run #1\", continue-on-error: true}\n".to_owned(),
+                false,
+            ),
+            ("limit: the match is case-sensitive", step("CONTINUE-ON-ERROR: true"), false),
+            (
+                "limit: a merge key from outside the job block",
+                "    <<: *lenient_defaults\n    steps:\n      - run: echo\n".to_owned(),
+                false,
+            ),
+            (
+                "limit: a comment indented like a job id ends the lane (missed)",
+                "  # note\n    continue-on-error: true\n".to_owned(),
+                false,
+            ),
+            (
+                "limit: a column-0 comment is not cut (flagged)",
+                "# continue-on-error: true\n    steps:\n      - run: echo\n".to_owned(),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                !continue_on_error_lines(&one_lane_workflow(&job_lines)).is_empty(),
+                flagged,
+                "{case}"
+            );
+        }
+
+        assert_eq!(
+            continue_on_error_lines(&one_lane_workflow(&step("continue-on-error: ${{ true }}"))),
+            ["lane: continue-on-error: ${{ true }}"]
+        );
+        assert_eq!(
+            continue_on_error_lines(&one_lane_workflow(
+                "    steps:\n      - {name: x, continue-on-error: true}\n"
+            )),
+            ["lane: - {name: x, continue-on-error: true}"]
+        );
+    }
+
+    #[test]
+    fn e2e_lanes_do_not_mask_failures_with_continue_on_error() {
+        for (workflow, text) in self_hosted_workflows() {
+            let lanes = self_hosted_e2e_jobs(&text);
+            // Guards against a vacuous pass: a parsing change that found no
+            // lanes would otherwise check nothing.
+            let expected_lane = match workflow {
+                "e2e-selfhosted.yml" => "e2e-gpu",
+                "nightly.yml" => "e2e-gpu-nightly",
+                other => panic!("no known lane for {other}"),
+            };
+            assert!(
+                lanes.iter().any(|(job, _)| job == expected_lane),
+                "{workflow}: found no `{expected_lane}` among its self-hosted lanes {lanes:?}, \
+                 so nothing below would be checked"
+            );
+            if let Some(failure) = mask_failure(workflow, &text) {
+                panic!("{failure}");
+            }
+        }
+
+        // With the lanes unmasked, a failed lane fails its job, and the default
+        // `success()` condition would then skip the consolidated report on the
+        // very night it is worth reading.
+        let nightly = read_workflow("nightly.yml");
+        let condition = job_scalar(job_block(&nightly, "e2e-report-nightly"), "if");
+        assert!(
+            ["always()", "${{ always() }}"].contains(&condition),
+            "e2e-report-nightly must run on `always()` so a failed lane is still \
+             reported; found `if: {condition}`"
         );
     }
 
@@ -6026,7 +6259,7 @@ fi
         );
         let nightly_ids: Vec<String> = nightly_lanes.iter().map(|(job, _)| job.clone()).collect();
         assert_eq!(
-            backticked_list_between(&readme_flat, "as non-blocking lanes (", ") with"),
+            backticked_list_between(&readme_flat, "above, in its own lanes (", ") with"),
             nightly_ids,
             "the E2E README must name every nightly self-hosted lane, in workflow order"
         );

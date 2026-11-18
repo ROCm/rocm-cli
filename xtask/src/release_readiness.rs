@@ -142,18 +142,17 @@ fn assemble_facts(
         Some(_) => {}
     }
     // The Total row above only counts platforms whose `report.json` actually
-    // got uploaded — a GPU lane that dies before uploading (preflight
-    // failure, timeout, runner loss) just drops out of it, silently reading
-    // as zero failures. Every lane is `continue-on-error`, so the lane job's
-    // own `needs.<job>.result` reads `success` even when it failed; gating on
-    // that (as an earlier version of this code did) can never fire. Gate on
-    // `e2e-report-nightly`'s result instead: its "every lane that ran
-    // uploaded its report" check (`nightly.yml`, `LANE_REPORTS`) already
-    // fails that job when a lane is silently missing, covering every lane in
-    // `LANE_REPORTS` — including ones added later — for free (a re-run can
-    // pass on an earlier attempt's artifact, so it can still miss a lane). Unlike the
-    // build gates, this job is `if: always()` and has no legitimate
-    // no-op-night skip, so `skipped` isn't accepted here.
+    // got uploaded — a GPU lane that dies before uploading (preflight failure,
+    // timeout, runner loss) just drops out of it, silently reading as zero
+    // failures. `e2e-report-nightly`'s "every lane that ran uploaded its
+    // report" check (`nightly.yml`, `LANE_REPORTS`) fails that job when a lane
+    // is silently missing, covering every lane in `LANE_REPORTS` — including
+    // ones added later — without a second copy of the lane list here (a re-run
+    // can pass on an earlier attempt's artifact, so it can still miss a lane),
+    // so gate on that job's result. The lane jobs' own results are not read;
+    // docs/ci-hardware-testing.md's readiness paragraph says what that leaves
+    // out. Unlike the build gates, this job is `if: always()` and has no
+    // legitimate no-op-night skip, so `skipped` isn't accepted here.
     if e2e_report_job_result != "success" {
         failing_gates.push(format!("E2E (lane report check: {e2e_report_job_result})"));
     }
@@ -430,11 +429,13 @@ fn queue_absent_reason(markdown: &str) -> Option<String> {
 ///
 /// The second part exists because two kinds of failed row contribute `0` to
 /// the `Fail` column, so the Total row's own Fail cell has no record of them:
-/// an `EMPTY` platform (no `report.json`, or one that's empty/unparseable),
-/// and a `FAIL` platform whose only problem is the harness's post-run lane
-/// check (`lane_failure` in its `platform.json`, e.g. "0 scenarios executed"),
-/// which fails no scenario cell. A `FAIL` row with a nonzero own `Fail` cell
-/// is already folded into the Total row and is not counted again.
+/// an `EMPTY` platform (a `report.json` with no scenarios, or one that is empty
+/// or unparseable, with no `platform.json` beside it; a missing `report.json`
+/// gives no row at all), and a `FAIL` platform whose only problem is the
+/// harness's post-run lane check (`lane_failure` in its `platform.json`, e.g.
+/// "0 scenarios executed"), which fails no scenario cell. A `FAIL` row with a
+/// nonzero own `Fail` cell is already folded into the Total row and is not
+/// counted again.
 ///
 /// A row for a shared-queue lane the queue does not block on (its platform
 /// cell carries [`e2e_report::ADVISORY_QUEUE_MARKER`]) counts for neither: the
