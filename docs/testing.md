@@ -3858,6 +3858,8 @@ Release trust checks:
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file
+cargo test -p rocm --bin rocm wsl_rocdxg_generated_steps_install_exactly_the_verified_file
+cargo test -p rocm --bin rocm wsl_doc_manual_steps_stop_before_the_check_when_the_download_fails
 python scripts/release_readiness.py --self-test
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 bash scripts/reclaim-gpu.sh --self-test
@@ -3891,6 +3893,30 @@ one, and an empty one. That step is the only thing authenticating a package
 that is then installed as root, and this replaces the self-test that shipped
 with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 `sha256sum`, so it is Unix-only.
+
+`wsl_rocdxg_generated_steps_install_exactly_the_verified_file` runs every
+Execute step of that plan, each in its own `sh -c` as the CLI does, against
+stand-ins for `sudo`, `curl`, `install`, `apt-get` and `ldconfig`. It proves the
+file `apt-get` installs is the root-staged copy the digest was checked against,
+that a tampered download stops the plan before `apt-get`, and that the private
+download directory and the staged copy are both removed after a successful
+install. When the check or `apt-get` fails, it checks the rejected package is
+left in the root-only directory and that the next run of the same version
+replaces it. It also checks the staging directories end up mode 0755. The
+`curl` stand-in fails if it is run under `sudo` or asked to write anywhere but
+a 0700 directory directly under `$TMPDIR`, so a plan that downloads as root or
+straight into the staging directory fails the test. It is Unix-only too.
+`wsl_rocdxg_plan_never_installs_from_a_path_another_user_can_write` checks the
+same layout on the plan text for both the `sudo` and the already-root plan, and
+scenario `@id:driver-install-wsl-dry-run-plan` checks it on the `--dry-run`
+output on the `@requires-wsl` lane.
+`wsl_doc_manual_steps_stop_before_the_check_when_the_download_fails` runs the
+manual steps from [wsl.md](wsl.md) against the same kind of stand-ins. With a
+copy an earlier run left staged and a download that fails, it checks that the
+block stops before the digest check, installs nothing and exits non-zero, and
+that the private download directory is removed. A failed install also exits
+non-zero and removes that directory, and a good download installs once and
+exits zero. It is Unix-only.
 
 The eight native Linux GPU preflights are one script,
 [`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
