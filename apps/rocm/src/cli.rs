@@ -395,7 +395,10 @@ pub(crate) enum Command {
     /// apply). With --prompt, or a prompt piped on standard input, sends that one
     /// prompt and prints the reply. Use `rocm config enable-provider` and
     /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server.
+    /// `local` provider talks to a running server. On Linux/WSL the interactive
+    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
+    /// and, like it, prints why that daemon was failing after it closes,
+    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -761,6 +764,15 @@ rocm logs --search error timeout")]
     /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
     /// lemonade_port in config.json. External models have no Services stop/restart
     /// controls; discovery is read-only and quitting leaves external servers running.
+    ///
+    /// On Linux/WSL, open dashboards share one telemetry daemon; when the dashboard
+    /// running it closes, one still open takes it over. If the daemon was
+    /// failing when the dashboard closed, the reason is printed after it closes,
+    /// whether it was quit or ended with Ctrl-C, SIGINT or SIGTERM, unless
+    /// another dashboard's daemon is serving by then. A crash of the dashboard's
+    /// own supervision of its telemetry daemon is reported even then when the
+    /// dashboard is quit; on Ctrl-C or a signal it is only written to the log
+    /// files under the data directory's logs folder, as it happens.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]

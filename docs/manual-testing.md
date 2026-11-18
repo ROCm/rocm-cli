@@ -1370,6 +1370,86 @@ Expected result:
   disabling the wait. Clear the override with
   `Remove-Item Env:ROCM_DASH_CHAT_TIMEOUT_SECS` afterwards.
 
+### 4e. Two Dashboards At Once
+
+**Linux or WSL only.** There is no daemon socket on Windows.
+
+Open two terminals and run `rocm dash` in each, the first one first. Then quit
+the first dashboard with `q`.
+
+Expected result:
+
+- Both headers read `connected · <host> · rocm daemon <version>` while both
+  are open (widen the terminal if the header is cut off before it).
+- After the first dashboard quits, the second one's header may read
+  `disconnected` for a moment, then reads `connected · ... · rocm daemon` again
+  within a few seconds, and its figures keep updating. A second dashboard that
+  stays `disconnected` is the bug this checks for.
+- Expected costs of the hand-off, not bugs: the second dashboard's GPU
+  figures can stay empty for a while after it reconnects -- up to about 15
+  seconds, the daemon's 5 s `amd-smi` detection limit plus its 10 s limit on
+  the first system query -- because the daemon that took over detects the GPU
+  from scratch. Its charts keep the history they had: the new daemon starts
+  with nothing to replay, so nothing is added twice. Its benchmark list is
+  rebuilt from the benchmark CSV, so each row appears once. A dashboard opened
+  after the hand-off gets only what the new daemon has recorded since it took
+  over (it keeps the last 30 snapshots, about 30 seconds). `rocm dash` records
+  sessions unless the session file cannot be opened (then it logs a warning
+  and records nothing), so the daemon that took over starts a new
+  `session-*.ndjson` file in `telemetry` under the data directory.
+- Not part of the hand-off, a known issue: a dashboard that reconnects to the
+  *same* daemon gets that daemon's up to 30 most recent snapshots replayed and
+  appends them, so a few recent chart points can appear twice.
+- The same holds when the first dashboard is killed instead of quit
+  (`kill -9 <pid>` from a third terminal).
+- Quitting the second dashboard as well leaves no `rocmdashd.sock` in the
+  socket directory (`$XDG_RUNTIME_DIR` when it is set); the
+  `rocmdashd.sock.lock` file beside it is expected to stay.
+- Opening a dashboard while a regular file sits at the socket path leaves the
+  file in place; the dashboard opens at once (it does not wait for a daemon
+  that has already failed) and the header reads `disconnected`. After
+  quitting, `rocm dash` prints, below the restored terminal, that its
+  telemetry daemon could not start because that path is not a socket (with
+  the number of failed attempts in a row, when it has retried), and names the
+  log directory (`logs` under the data directory: `~/.rocm/logs`, unless
+  `ROCM_CLI_DATA_DIR` is set or `config.json` records a managed root, which
+  then holds the data directory), whose `rocm-cli.log.<date>` files hold one
+  warning per failed attempt. With `RUST_LOG`
+  set to drop warnings, the line about the log is left out. Opened from the
+  bare `rocm` launcher instead, the dashboard writes the same lines to the
+  main screen once it has restored the terminal, and the launcher then
+  switches back to its own alternate screen, a separate buffer, so the lines
+  are seen when the launcher itself exits.
+- The same report is printed when that dashboard is ended with Ctrl-C instead
+  of quit (exit code 130), or with `kill -INT` or `kill -TERM` from another
+  terminal (130 or 143): the terminal is restored first and the lines follow
+  it. A crash of the dashboard's own supervision of its telemetry daemon is
+  not reported on these exits; it is still in the client log, which the
+  supervising task writes as it crashes (`spawn_logging_panic` in
+  [dash_daemon.rs](../apps/rocm/src/dash_daemon.rs)).
+- A daemon that served and then stopped is reported after quitting as having
+  *stopped serving* rather than as unable to start. To see it, give a single
+  dashboard a throwaway socket directory of your own rather than your real
+  `$XDG_RUNTIME_DIR`: `d=$(mktemp -d)`, then `XDG_RUNTIME_DIR=$d rocm dash`;
+  from another terminal run `chmod 000 "$d"`, wait about 15 seconds, quit the
+  dashboard, then `chmod 700 "$d"` and `rm -r "$d"` (the socket and its lock
+  stay behind: a daemon removes its socket only while it can still see it is
+  its own). Do not run this as root, which `chmod 000` does not stop. Nothing is
+  reported when, by the time the dashboard closes, another dashboard's daemon
+  serves the socket -- except a crash of the dashboard's own supervision of
+  its telemetry daemon, which is always reported when the dashboard is quit
+  (on Ctrl-C or a signal it is only logged; see the bullet above).
+- A `unix:` socket path set in `dashboard.tui.connect` in `config.json` has
+  its directory restricted to mode `0700` when you own that directory and it
+  is not sticky (a sticky one such as `/tmp` keeps its mode), so point it at
+  a dedicated directory, not `$HOME` or one you share. To see it:
+  `d=$(mktemp -d); chmod 755 "$d"`, set `dashboard.tui.connect` to
+  `unix:$d/rocmdashd.sock` (with `$d` expanded), open and quit `rocm dash`,
+  then `stat -c %a "$d"` prints `700` and the day's `rocm-cli.log.<date>`
+  file holds one `restricted socket directory to mode 0700` line naming `$d`
+  and `from=0755`; opening it again adds no such line. Restore the setting
+  and `rm -r "$d"` afterwards.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are

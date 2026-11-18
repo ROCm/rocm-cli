@@ -76,6 +76,11 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
 
 [dev-dependencies]
+# `test-util` pauses tokio's clock in the dashboard daemon keeper's timing
+# tests (`#[tokio::test(start_paused = true)]` in `dash_daemon.rs`), so the
+# waits between its runs are read exactly. A feature of a crate already in
+# the tree; test-only.
+tokio = { workspace = true, features = ["test-util"] }
 # The fake engine child both engine IPC callers are tested against.
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
 # The Windows DACL check the tests of the owner-only key stores read their
