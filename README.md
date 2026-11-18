@@ -1424,10 +1424,16 @@ Likewise, an explicit `--port` that differs from the port the running service
 is already on is refused rather than silently ignored; omit `--port` to reuse
 the running service, or stop it first to serve on the new port.
 
-By default the server runs in the background under ROCm CLI's supervision and
-prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). On an
+By default the server runs in the background under ROCm CLI's supervision.
+For a fresh launch in a terminal it first prints the service id, how to follow its log
+(`rocm logs --service <service-id> --follow`) and, for a public bind, the
+API key. While it starts, the status line follows the engine: a download, a weight
+load, or the latest log line, until the server is ready or that wait fails
+(the engine exits, a download stops advancing, or the startup deadline
+passes). When the server is ready it prints a deployment summary: a table
+with the status, the full inference endpoint, the API-qualified model name,
+and a quick smoke test (time to first token and approximate tokens per
+second). On an
 interactive terminal, if the smoke test cannot complete, the summary is headed
 `(smoke test failed)`, shows the status as `started, smoke test failed` instead
 of `ready`, and a note gives the reason and points at
@@ -1435,9 +1441,22 @@ of `ready`, and a note gives the reason and points at
 still exits 0. Which failures are detected, and which still read as `ready`, is
 listed under
 [Serve Smoke Test Failure](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md#serve-smoke-test-failure)
-in the testing guide. Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+in the testing guide. A model that is still loading is not reported as a finished "not
+ready" summary. The wait fails, and `rocm serve` exits non-zero, when the
+engine reports failure or its process exits, when a download percent stops
+advancing for 3 minutes (a line at 100% counts as loading), when the endpoint has not listed the model and there is no engine log for
+5 minutes, when a load log line stops changing for 5 minutes with the endpoint
+not yet listing the model, or after 30 minutes in all. A stall leaves the server running:
+the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and the background helper does not
+restart a live server for being slow until those 30 minutes pass. Engine log
+lines shown on the status line have credentials (the endpoint key, `--api-key`
+and token values, `hf_` tokens) masked. Once the server lists the model, the wait
+checks whether it can answer with a one-token request, first right away and
+then at growing intervals up to every 15 seconds. Piped output, or a stderr that is not a terminal (`2>log`), keeps
+the 45-second wait and reports the server as it stood then. Control returns
+to your shell with the server still running; manage it later with
+`rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1455,8 +1474,8 @@ can:
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
-`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), with
+no CLI-side stall limit or deadline, instead of the default wait above; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait

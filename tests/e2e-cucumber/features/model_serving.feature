@@ -1,5 +1,15 @@
 Feature: Model serving
 
+  # Interactive `rocm serve` (a terminal, not --verbose or --foreground) follows
+  # download, load, and health on the status line until the server is ready or
+  # the startup wait fails. Scenario serve-64 drives it under a real PTY; it
+  # needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes
+  # only. serve-65 covers an engine that exits during startup on the no-GPU
+  # mock lane with a stand-in engine. The stall, deadline and engine-failed
+  # branches need a controllable engine, so no lane reaches them; `decide_serve_startup` and
+  # `wait_for_serve_startup` in apps/rocm/src/serve_progress.rs are their
+  # state matrix.
+
   # Per-platform expectations (pass / xfail / skip) are resolved at runtime from
   # the host capability probe + expectations.toml, keyed by the @id tag — not by
   # @expected-failure tags. Engine requirements are declared via @requires-engine
@@ -1040,3 +1050,33 @@ Feature: Model serving
     And the health check answers without the key
     When the client repeats those calls with the key
     Then every one of those calls succeeds
+
+  # Interactive `rocm serve` under a real terminal: while it waits it names the
+  # command that follows the engine's log, then it exits 0 once the endpoint
+  # lists the model. The named command is run, not just read: a hint that
+  # points at a command that does not work would still pass a string check.
+  @id:serve-interactive-startup-progress @requires-gpu
+  Scenario: serve-64 - Interactive serve shows how to follow startup and exits when the model is served
+    Given a managed runtime is active
+    When the user serves a model on GPU under a real terminal
+    Then the terminal names the command that follows the server's log
+    And the named log command runs successfully
+    And the serve exits cleanly and the endpoint lists the model
+
+  # The failure side of serve-64, on the mock lane. A real engine cannot start on
+  # a host with no GPU, so the `e2e-oom-fault-injection` build swaps the managed
+  # child for a stand-in that writes one log line and exits during startup
+  # (`ROCM_E2E_SIMULATE_STARTUP_EXIT`); the record, the log, the startup wait and
+  # the settling are the production path. The hook is absent from shipped
+  # binaries, so @requires-oom-fault-injection keeps this off the self-hosted
+  # lanes. The log command the failure names is run, and the record is checked,
+  # so the message cannot claim a log or a settled launch that is not there.
+  @id:serve-startup-exit-names-log @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-65 - An engine that exits during interactive startup fails the serve and names its log
+    Given a managed engine will exit while it starts
+    When the user serves a model with that engine under a real terminal
+    Then the serve fails saying the server process exited
+    And the failure names the command that shows the server's log
+    And that log command shows the engine's last line
+    And the failed launch is recorded as stopped
+    And no background automation daemon was left behind
