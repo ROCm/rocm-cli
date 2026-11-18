@@ -154,7 +154,7 @@ table), refuse on a non-interactive shell without `--yes`, and confirm first.
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
   once you know N.
 
-## Closed catalog (29 failure modes)
+## Closed catalog (30 failure modes)
 
 The OS column is the platform family the CLI scopes an entry to, and WSL2 is a
 family of its own — not a flavour of `linux`. An entry reaches a WSL host only
@@ -186,6 +186,7 @@ reporting confident nonsense.
 | `info-20-gpu-no-rocm-support` | linux/windows | Every AMD GPU on the host is a part ROCm has never shipped a runtime build for (today: gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo). Vulkan-based engines still work | every detected AMD GPU identifies as an unsupported target, and none is unidentified; scores a flat 60 | diagnose-only |
 | `fix-21-msvc-redist-outdated` | windows | MSVC runtime present but older than 14.40, so programs built with a recent toolset (such as the llama.cpp server that Lemonade installs) crash | `rocm examine --json` shows `msvc_redist_version` below 14.40; an access violation (`0xC0000005`, `-1073741819`) with `msvcp140.dll` as the faulting module | print-only |
 | `fix-22-display-driver-old` | windows | The AMD display driver is dated before the first HIP SDK for Windows (27 July 2023). Advice only: AMD publishes no minimum driver version for the HIP SDK or the Lemonade Vulkan backend, so the minimum is not established and the entry never claims the driver is broken. The date is only a floor and cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers | `rocm examine` shows `driver_age: older than the first HIP SDK for Windows`; the entry scores below the match threshold (WEAK) | print-only |
+| `fix-23-vllm-extension-load` | linux/wsl | One of vLLM's compiled extensions (`vllm/_*.abi3.so`) failed to load, for example because it was built against a newer glibc than the host has, so an op it registers is missing and the engine fails at startup | `AttributeError: '_OpNamespace' '_C' object has no attribute '...'` — enough on its own, but only when the pasted text also identifies vLLM (the word `vllm`, the `EngineCore` process prefix, or a vLLM extension name such as `_rocm_C`/`_moe_C`/`_C_cache_ops`/`_C_stable_libtorch`), since every PyTorch-ecosystem library with a `_C` extension raises the identical line; `Failed to import from vllm._...`; `GLIBC_2.NN' not found` naming a vllm `.abi3.so` | print-only |
 | `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | print-only |
 | `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | print-only |
 | `fix-wsl-3-rocdxg-missing` | wsl | ROCDXG, the ROCm-to-DXCore shim the WSL path runs on, is not installed | `librocdxg.so` not found under any ROCm install | print-only |
@@ -197,7 +198,7 @@ reporting confident nonsense.
 One thing the numbering does not tell you: the `fix-wsl-N` entries are a parallel
 series, not a continuation of the numeric one, because they answer for a
 different platform family. The numeric series itself runs `fix-1` through
-`fix-19`, then `fix-21` and `fix-22`. The ids are stable handles rather than positions, so
+`fix-19`, then `fix-21` through `fix-23`. The ids are stable handles rather than positions, so
 the number `fix-20` is simply not used here: slot 20 belongs to
 `info-20-gpu-no-rocm-support`, which is in the table above but under an `info-`
 prefix because it has no fix to offer. A gap is not an error, and a retired
@@ -206,7 +207,7 @@ entry would leave a hole rather than renumber the ones after it.
 Linux-only: fix-3, -4, -5, -7, -10, -11, -12. Windows-only: fix-13, -14, -15, -21, -22.
 Linux + Windows: info-20 (diagnose-only).
 WSL-only: fix-wsl-1 through fix-wsl-7. Linux + Windows: fix-9.
-Linux + WSL: fix-16, -17, -18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8.
+Linux + WSL: fix-16, -17, -18, -19, -23. Linux + Windows + WSL: fix-1, -2, -6, -8.
 
 ## Framework routing
 

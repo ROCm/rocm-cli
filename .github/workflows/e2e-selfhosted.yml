@@ -125,12 +125,16 @@ jobs:
       # merge_group) and its
       # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
-      # ROCMAI-430: the three most recent rows of the official release list
-      # (rocm.docs.amd.com/en/latest/release/versions.html, see
+      # ROCMAI-430: the three newest final releases on the release channel's
+      # package indexes (resolved at run time, see
       # xtask/src/rocm_releases.rs), fanned out ONLY on a release-branch push —
       # everywhere else (PR, merge queue, manual dispatch) this stays a
       # single-element `current` matrix, same cost as before this existed.
       sdk_version_matrix: ${{ steps.sdk_matrix.outputs.matrix }}
+      # The versions n-1/n-2 resolve to, read once here so every leg of the run
+      # pins the same ones even if a release is published meanwhile. `{}` when
+      # the matrix is only `current`.
+      sdk_pins: ${{ steps.sdk_pins.outputs.pins }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -204,6 +208,17 @@ jobs:
             echo 'matrix=["current","n-1","n-2"]' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve n-1/n-2 pins once (ROCMAI-430)
+        id: sdk_pins
+        env:
+          SDK_MATRIX: ${{ steps.sdk_matrix.outputs.matrix }}
+        run: |
+          if [[ "${SDK_MATRIX}" == *n-1* ]]; then
+            echo "pins=$(cargo xtask release-pins)" >> "$GITHUB_OUTPUT"
+          else
+            echo 'pins={}' >> "$GITHUB_OUTPUT"
           fi
 
   # Exists only to start a run in the PR's concurrency group when the PR is
@@ -510,6 +525,7 @@ jobs:
           fi
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps, not one templated `name:` (ROCMAI-430):
@@ -797,10 +813,11 @@ jobs:
     # this replaced, and a run took 26m54s against the old 35min cap (run
     # 34489547654) versus 18-19m on a warm static host — keep the same headroom
     # ratio the 35 was chosen for.
-    # An include_nightly dispatch also runs the AIM serve scenarios (serve-26/27,
-    # @nightly, up to 1200s readiness each on a cold pull) and the large-model
-    # serve, which cannot fit the 45min budget of an ordinary push run.
-    timeout-minutes: ${{ inputs.include_nightly && 105 || 45 }}
+    # An include_nightly dispatch also runs the AIM serve scenarios
+    # (serve-26/27/63, @nightly, up to 1200s readiness each on a cold pull) and
+    # the large-model serve, which cannot fit the 45min budget of an ordinary
+    # push run.
+    timeout-minutes: ${{ inputs.include_nightly && 125 || 45 }}
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
@@ -941,6 +958,7 @@ jobs:
         env:
           MATRIX_CHANNEL: ${{ matrix.channel }}
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps per the `sdk_version` leg, same as
@@ -1288,6 +1306,7 @@ jobs:
           }
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       - name: Upload E2E report (current)
@@ -1824,7 +1843,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:GITHUB_EVENT_INPUTS_NAME_FILTER'
+          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:E2E_RELEASE_PINS:GITHUB_EVENT_INPUTS_NAME_FILTER'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1872,6 +1891,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # actions/upload-artifact runs on the Windows host, not inside the WSL

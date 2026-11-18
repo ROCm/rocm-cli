@@ -116,9 +116,10 @@ pub struct ScenarioDecl {
     pub requires_wsl: bool,
     /// `@requires-oom-fault-injection`: the scenario drives the test-only
     /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
-    /// to fabricate a GPU-less launch (one that OOMs, or one that becomes ready
-    /// and then fails its smoke test), so it can only run against a binary
-    /// compiled with that feature. `xtask e2e` builds it in when it builds the
+    /// to fabricate a GPU-less launch in one of the modes that hook offers — see
+    /// `e2e_simulate_oom_launch` in `apps/rocm/src/service_launch/readiness.rs`
+    /// for the set, which grows — so it can only run against a binary compiled
+    /// with that feature. `xtask e2e` builds it in when it builds the
     /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
     /// test a prebuilt shipping release binary that has the hook compiled out —
     /// there the real GPU-required serve pre-flight would run instead. Skipped
@@ -1218,14 +1219,14 @@ serve_timeout_secs = 90
 
     #[test]
     fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
-        // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
+        // serve-26/27/63 pull the AIM image and a 9B checkpoint on a cold runner and
         // may each wait out a 1200s readiness cap. Run on every PR on the Strix
         // Ubuntu pool (before that lane left the PR path) they pushed the job
         // (~25 min otherwise) into its 45 min cap on every run. They must
         // resolve to Skip unless the nightly opt-in is set, and must still be
         // reachable (not Skip for the nightly reason) when it is.
         let m = Expectations::default();
-        for prefix in ["serve-26 -", "serve-27 -"] {
+        for prefix in ["serve-26 -", "serve-27 -", "serve-63 -"] {
             let d = ScenarioDecl::from_tags(&model_serving_tags(prefix));
             assert_eq!(d.requires_engine.as_deref(), Some("aim"), "{prefix}");
             assert!(d.nightly, "{prefix} must be @nightly");

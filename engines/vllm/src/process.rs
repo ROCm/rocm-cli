@@ -819,7 +819,7 @@ fn vllm_serve_args(
     }
     args.extend(engine_recipe_launch_args(engine_recipe));
     if require_api_key {
-        args.extend(crate::endpoint_auth::middleware_args());
+        args.extend(rocm_engine_protocol::endpoint_auth::middleware_args());
     }
     args
 }
@@ -897,9 +897,12 @@ fn wait_for_vllm_ready(
             .try_wait()
             .context("failed to poll vLLM server process status")?
         {
-            let log_context = startup_log_context(log_path);
             bail!(
-                "vLLM server process exited before becoming ready (status: {status}){log_context}"
+                "{}",
+                crate::startup_diagnostics::exited_before_ready_message(
+                    &status.to_string(),
+                    log_path
+                )
             );
         }
 
@@ -1143,7 +1146,7 @@ mod tests {
             .expect("a keyed endpoint must be launched with the auth middleware");
         assert_eq!(
             args.get(position + 1).map(String::as_str),
-            Some(crate::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
+            Some(rocm_engine_protocol::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
         );
         assert!(
             !args.iter().any(|arg| arg.contains("api-key")),
@@ -1206,7 +1209,7 @@ mod tests {
             .expect("a keyed launch must pass the auth middleware to vllm serve");
         assert_eq!(
             args.get(position + 1).map(String::as_str),
-            Some(crate::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
+            Some(rocm_engine_protocol::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
         );
         assert!(
             !args.iter().any(|arg| arg.contains("secret-key")),

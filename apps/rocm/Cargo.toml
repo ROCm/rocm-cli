@@ -19,14 +19,17 @@ e2e-test-hooks = [
 ]
 # Test-only fault injection for the e2e suite. Enabled ONLY by the `xtask e2e`
 # mock-lane build (never by the release build), it compiles in a `rocm serve`
-# hook that simulates a managed vLLM launch, so the `rocm serve` summary can be
+# hook that simulates a managed vLLM launch, so `rocm serve`'s own output can be
 # verified on a GPU-less CI host: one that OOM'd and never became ready (the
-# OOM guidance), or, in the hook's `ready` mode, one that became ready (the
-# hook only fabricates the ready record; a mock engine supplies the failure of
-# the post-launch smoke test).
+# OOM guidance), one that became ready (the hook only fabricates the ready
+# record; a mock engine supplies the failure of the post-launch smoke test), or
+# one that died on a vLLM compiled extension that failed to load (the hook
+# plants the raw startup log; the vLLM engine computes the failure message).
+# That last mode calls into the vLLM engine's own test-only hook, hence the
+# dependency feature below — the two must never be enabled apart.
 # See `e2e_simulate_oom_launch` / `simulate_oom_managed_launch` in
 # `service_launch/readiness.rs`.
-e2e-oom-fault-injection = []
+e2e-oom-fault-injection = ["rocm-engine-vllm/e2e-test-hooks"]
 
 [dependencies]
 anyhow.workspace = true
@@ -76,6 +79,11 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
 
 [dev-dependencies]
+# `test-util` pauses tokio's clock in the dashboard daemon keeper's timing
+# tests (`#[tokio::test(start_paused = true)]` in `dash_daemon.rs`), so the
+# waits between its runs are read exactly. A feature of a crate already in
+# the tree; test-only.
+tokio = { workspace = true, features = ["test-util"] }
 # The fake engine child both engine IPC callers are tested against.
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
 # The Windows DACL check the tests of the owner-only key stores read their

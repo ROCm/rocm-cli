@@ -401,7 +401,10 @@ pub(crate) enum Command {
     /// apply). With --prompt, or a prompt piped on standard input, sends that one
     /// prompt and prints the reply. Use `rocm config enable-provider` and
     /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server.
+    /// `local` provider talks to a running server. On Linux/WSL the interactive
+    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
+    /// and, like it, prints why that daemon was failing after it closes,
+    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -518,8 +521,13 @@ rocm model --verbose"
     /// Picks an engine and ROCm runtime automatically unless overridden. An
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
-    /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
+    /// server runs as a managed background service. For a fresh launch in a terminal it
+    /// first prints the service id and how to follow its log; while it starts, the status line
+    /// follows what the engine is doing (download, load, or the latest log line) until
+    /// the server is ready or that wait fails. A ready server then prints a deployment
+    /// summary (status, endpoint, model, and smoke-test metrics). A wait that fails
+    /// while the server is still running names `rocm logs` and `rocm services stop`
+    /// instead of a finished "not ready" summary. Use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
@@ -608,8 +616,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep waiting until the server answers requests or its engine gives up
         /// (vLLM and AIM after 5 minutes by default, raised with
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
-        /// instead of returning `starting` after 45 seconds.
-        /// Also waits on a matching server that is already starting. Fails with a
+        /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
+        /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. Fails with a
         /// pointer to the logs if the server exits first. Cannot be
         /// combined with --foreground or --verbose, which already stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
@@ -767,6 +776,15 @@ rocm logs --search error timeout")]
     /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
     /// lemonade_port in config.json. External models have no Services stop/restart
     /// controls; discovery is read-only and quitting leaves external servers running.
+    ///
+    /// On Linux/WSL, open dashboards share one telemetry daemon; when the dashboard
+    /// running it closes, one still open takes it over. If the daemon was
+    /// failing when the dashboard closed, the reason is printed after it closes,
+    /// whether it was quit or ended with Ctrl-C, SIGINT or SIGTERM, unless
+    /// another dashboard's daemon is serving by then. A crash of the dashboard's
+    /// own supervision of its telemetry daemon is reported even then when the
+    /// dashboard is quit; on Ctrl-C or a signal it is only written to the log
+    /// files under the data directory's logs folder, as it happens.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -1204,7 +1222,9 @@ pub(crate) enum ComfyuiCommand {
         /// what its release shipped instead replaces whatever has the names the new release
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
         /// running or still starting, checked before the download and again just before the code
-        /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// is replaced, unless rocm-cli's saved record of it cannot be parsed, which it then says;
+        /// a record that cannot be read at all (a directory at its path, permission denied) is an
+        /// error naming the file.
         /// Over an existing install, a download that is not a ComfyUI release (no main.py) is
         /// discarded and the install is left as it was.
         #[arg(long)]
@@ -1232,6 +1252,13 @@ pub(crate) enum ComfyuiCommand {
         yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
+    ///
+    /// If rocm-cli's saved record of the ComfyUI it started cannot be parsed, it
+    /// stops no process, since the record names none, and checks only the
+    /// default address: if nothing answers there it moves the record aside to
+    /// `running.json.unreadable`; if something does, it keeps the record and
+    /// exits non-zero. A record that cannot be read at all (a directory at its
+    /// path, permission denied) is an error naming the file.
     Stop {
         /// Accepted for consistency with other mutating commands; stopping never prompts.
         #[arg(long)]

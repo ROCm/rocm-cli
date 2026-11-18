@@ -33,6 +33,17 @@ const ENGINE_IMPORT_SYMPTOM: &str =
 /// The catalog entry [`ENGINE_IMPORT_SYMPTOM`] must reach.
 const ENGINE_IMPORT_FIX_ID: &str = "fix-17-torch-dlpack";
 
+/// The line a vLLM engine logs when one of its compiled extensions did not load
+/// and the engine then calls an op that extension registers, copied from a real
+/// launch (ROCMAI-1058). Pasted as is, apostrophes and process prefix included,
+/// because that is what a user copies out of the log.
+const EXTENSION_LOAD_SYMPTOM: &str = "(EngineCore pid=629513) ERROR 11-16 11:48:44 \
+     [core.py:1374] AttributeError: '_OpNamespace' '_C' object has no attribute \
+     'get_cuda_view_from_cpu_tensor'";
+
+/// The catalog entry [`EXTENSION_LOAD_SYMPTOM`] must reach.
+const EXTENSION_LOAD_FIX_ID: &str = "fix-23-vllm-extension-load";
+
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
 /// recipes gate on host state (e.g. `$USER`) and return non-zero even for a
@@ -140,6 +151,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     // `rocm fix` has to resolve that id -- by naming the problem and changing
     // nothing. Leaving it out here would let the two published forms drift.
     "info-20-gpu-no-rocm-support",
+    "fix-23-vllm-extension-load",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -454,6 +466,11 @@ async fn user_pasted_vllm_error_naming_their_machine(world: &mut E2eWorld) {
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
+}
+
+#[given("a user who hit a vLLM compiled-extension load failure")]
+async fn user_hit_extension_load_failure(world: &mut E2eWorld) {
+    world.model_name = Some(EXTENSION_LOAD_SYMPTOM.to_string());
 }
 
 #[given("a user who has chosen the fix for the engine-startup import failure")]
@@ -1487,6 +1504,33 @@ async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
 
 #[then("the CLI reports the engine-startup import failure as an established cause")]
 async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
+    assert_established_cause(world, ENGINE_IMPORT_FIX_ID, "engine-startup import failure");
+}
+
+#[then("the CLI reports the vLLM compiled-extension load failure as an established cause")]
+async fn assert_extension_load_failure_established(world: &mut E2eWorld) {
+    assert_established_cause(
+        world,
+        EXTENSION_LOAD_FIX_ID,
+        "vLLM compiled-extension load failure",
+    );
+}
+
+#[then("the CLI can act on the fix named for the vLLM compiled-extension load failure")]
+async fn assert_extension_load_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_matched(&report, EXTENSION_LOAD_FIX_ID, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+/// Asserts that diagnose exited 0 and that `fix_id` cleared the threshold the
+/// report itself publishes. Shared by the steps for the symptom-driven engine
+/// entries.
+fn assert_established_cause(world: &E2eWorld, fix_id: &str, what: &str) {
     assert_eq!(
         world.cli_rc,
         Some(0),
@@ -1505,17 +1549,15 @@ async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
         .and_then(|m| m.as_array())
         .expect("diagnose JSON has no 'matched' array")
         .iter()
-        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(ENGINE_IMPORT_FIX_ID))
+        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(fix_id))
         .and_then(|d| d.get("score"))
         .and_then(serde_json::Value::as_i64)
-        .unwrap_or_else(|| {
-            panic!("the catalog did not recognise the engine-startup import failure:\n{output}")
-        });
+        .unwrap_or_else(|| panic!("the catalog did not recognise the {what}:\n{output}"));
     // Below the bar the entry is presented among the sub-threshold noise it was
     // added to outrank, which is the state the report was in before it existed.
     assert!(
         score >= threshold,
-        "{ENGINE_IMPORT_FIX_ID} scored {score}, under the report's own threshold \
+        "{fix_id} scored {score}, under the report's own threshold \
          of {threshold}, so it is not an established cause:\n{output}"
     );
 }
@@ -2585,7 +2627,7 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
     // allocates from, and running it again would answer identically forever --
     // so that gap earns its own reason, distinct from the no-telemetry-at-all
     // case, and no dead-end remediation. An APU whose pool IS readable never
-    // reaches this step: it reports a figure, and diagnose-80 covers it.
+    // reaches this step: it reports a figure, and diagnose-81 covers it.
     // None of the four may be reported as "this model is too big for you".
     let evidence = model_field(&model, "evidence").to_string();
     match model_verdict(&model) {
@@ -5306,7 +5348,7 @@ async fn machine_with_an_unreadable_shared_pool(world: &mut E2eWorld) {
 
 #[given("a machine whose integrated GPU shares system memory beside a second AMD card")]
 async fn machine_with_two_amd_cards(world: &mut E2eWorld) {
-    // The APU, exactly as diagnose-80 plants it: its aperture IS readable, so
+    // The APU, exactly as diagnose-81 plants it: its aperture IS readable, so
     // a verdict of 60 GiB is what this host would get on its own. That is the
     // premise -- the scenario is about what the second card takes away.
     plant_single_gpu_with_memory(
@@ -5569,7 +5611,7 @@ async fn assert_no_cards_aperture_is_attributed(world: &mut E2eWorld) {
              back either one names a pool the model may never see: {model:#}"
         );
     }
-    // The premise the two assertions above rest on: diagnose-80 plants the same
+    // The premise the two assertions above rest on: diagnose-81 plants the same
     // APU with the same readable 60 GiB aperture and DOES get a figure, so what
     // is withheld here is withheld because of the second card and not because
     // the fixture simply has nothing to report.
@@ -5655,7 +5697,7 @@ async fn catalog_with_a_cpu_only_copy(world: &mut E2eWorld) {
 /// process: a scenario that asks two questions of the *same* host gets the
 /// planted machine for the first and the runner's own for the second. That is
 /// not a failure a reader would recognise as one, it is a silent change of
-/// subject. Before this helper existed, the second half of diagnose-84
+/// subject. Before this helper existed, the second half of diagnose-85
 /// answered about the dev box's real 191.9 GiB MI300X out of the built-in
 /// catalog, while reading as though it answered about the planted APU and the
 /// planted recipe. Restoring the environment is what keeps both halves of the

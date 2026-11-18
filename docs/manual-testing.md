@@ -460,6 +460,16 @@ Expected result:
 - The OpenAI-compatible endpoint answers a simple chat request.
 - `rocm services list` shows an `anthropic endpoint:` URL, and `POST <url>/v1/messages` with `{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}` returns an Anthropic `message` that names the served model. The same request with `"stream":true` answers with `text/event-stream` (`message_start` through `message_stop`, text in `content_block_delta` events). A request with `tools` and `"tool_choice":{"type":"tool","name":"<tool>"}` returns a `tool_use` content block naming that tool with its arguments and `"stop_reason":"tool_use"`; sending the call back as a `tool_result` block gets the model's answer. Combining `"stream":true` with `tools` is refused with an `invalid_request_error`.
 
+The same model without `--foreground` or `--verbose` is the interactive
+summary. While the server starts, the status line follows the engine (a
+download percent, a load line, or a wait for the model to serve) and keeps
+updating past the first minute. It does not finish with
+`Deployment summary (not ready yet)` while the server is still loading. A
+ready server then prints the deployment summary. If that wait fails and the
+process is still up, the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and `rocm services` still lists the
+server.
+
 If the llama.cpp server exits at start with an access violation (`0xC0000005`
 in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
@@ -644,6 +654,20 @@ Expected result:
 - The command refuses up front, naming the service already holding that port
   and how to free it (`rocm services stop <service-id> --yes`), without
   spawning an engine process or writing a new record.
+
+The default command, without `--foreground` or `--verbose`, leaves the server
+in the background. While it starts, the status line follows the engine: a
+download percent, a load line, or a wait for the model to serve. A model that
+is still loading after 45 seconds (the old wait, which piped output or a redirected stderr still
+uses) keeps that line; it is not replaced by a finished "not ready yet"
+summary. The wait fails with a non-zero exit only when the engine fails or
+exits, a download percent below 100 stops for 3 minutes, the endpoint has not listed the model with no
+engine log for 5 minutes, a load line stops changing for 5 minutes, or 30
+minutes pass. When the endpoint answers, the
+command prints the deployment summary and returns to the shell. If the wait
+fails and the process is still up, the message names `rocm logs --service
+<service-id>` and `rocm services stop <service-id> --yes`, and `rocm services`
+still lists the server.
 
 ### Windows display driver check
 
@@ -845,10 +869,12 @@ Expected result:
     found yet.`. The same file written over the activity log instead gives
     `Recent activity: none shown; the newest line is longer than the 4 MiB a log
     view reads`, not `no activity yet`.
-  - `rocm comfyui logs`, which reads the saved ComfyUI logs: write the file under
-    `apps/comfyui/logs/` in the data folder and expect `No output shown: the
-    newest line is longer than the 4 MiB a log view reads.`; an empty file there
-    gives `The saved log is empty.`.
+  - `rocm comfyui logs`, which reads the saved ComfyUI logs from the `logs/`
+    folder beside the install's `source/` folder under its runtime (where
+    `start` and `install` write), and from `apps/comfyui/logs/` in the data
+    folder too: write the file in the `logs/` folder beside `source/` and
+    expect `No output shown: the newest line is longer than the 4 MiB a log
+    view reads.`; an empty file there gives `The saved log is empty.`.
   - A stray byte that is not valid text in any of these logs shows the readable
     lines with a replacement character, not a `failed to read` line.
 - The `service_logs` tool (`rocm mcp-call service_logs --arguments-json
@@ -1396,6 +1422,86 @@ Expected result:
   disabling the wait. Clear the override with
   `Remove-Item Env:ROCM_DASH_CHAT_TIMEOUT_SECS` afterwards.
 
+### 4e. Two Dashboards At Once
+
+**Linux or WSL only.** There is no daemon socket on Windows.
+
+Open two terminals and run `rocm dash` in each, the first one first. Then quit
+the first dashboard with `q`.
+
+Expected result:
+
+- Both headers read `connected · <host> · rocm daemon <version>` while both
+  are open (widen the terminal if the header is cut off before it).
+- After the first dashboard quits, the second one's header may read
+  `disconnected` for a moment, then reads `connected · ... · rocm daemon` again
+  within a few seconds, and its figures keep updating. A second dashboard that
+  stays `disconnected` is the bug this checks for.
+- Expected costs of the hand-off, not bugs: the second dashboard's GPU
+  figures can stay empty for a while after it reconnects -- up to about 15
+  seconds, the daemon's 5 s `amd-smi` detection limit plus its 10 s limit on
+  the first system query -- because the daemon that took over detects the GPU
+  from scratch. Its charts keep the history they had: the new daemon starts
+  with nothing to replay, so nothing is added twice. Its benchmark list is
+  rebuilt from the benchmark CSV, so each row appears once. A dashboard opened
+  after the hand-off gets only what the new daemon has recorded since it took
+  over (it keeps the last 30 snapshots, about 30 seconds). `rocm dash` records
+  sessions unless the session file cannot be opened (then it logs a warning
+  and records nothing), so the daemon that took over starts a new
+  `session-*.ndjson` file in `telemetry` under the data directory.
+- Not part of the hand-off, a known issue: a dashboard that reconnects to the
+  *same* daemon gets that daemon's up to 30 most recent snapshots replayed and
+  appends them, so a few recent chart points can appear twice.
+- The same holds when the first dashboard is killed instead of quit
+  (`kill -9 <pid>` from a third terminal).
+- Quitting the second dashboard as well leaves no `rocmdashd.sock` in the
+  socket directory (`$XDG_RUNTIME_DIR` when it is set); the
+  `rocmdashd.sock.lock` file beside it is expected to stay.
+- Opening a dashboard while a regular file sits at the socket path leaves the
+  file in place; the dashboard opens at once (it does not wait for a daemon
+  that has already failed) and the header reads `disconnected`. After
+  quitting, `rocm dash` prints, below the restored terminal, that its
+  telemetry daemon could not start because that path is not a socket (with
+  the number of failed attempts in a row, when it has retried), and names the
+  log directory (`logs` under the data directory: `~/.rocm/logs`, unless
+  `ROCM_CLI_DATA_DIR` is set or `config.json` records a managed root, which
+  then holds the data directory), whose `rocm-cli.log.<date>` files hold one
+  warning per failed attempt. With `RUST_LOG`
+  set to drop warnings, the line about the log is left out. Opened from the
+  bare `rocm` launcher instead, the dashboard writes the same lines to the
+  main screen once it has restored the terminal, and the launcher then
+  switches back to its own alternate screen, a separate buffer, so the lines
+  are seen when the launcher itself exits.
+- The same report is printed when that dashboard is ended with Ctrl-C instead
+  of quit (exit code 130), or with `kill -INT` or `kill -TERM` from another
+  terminal (130 or 143): the terminal is restored first and the lines follow
+  it. A crash of the dashboard's own supervision of its telemetry daemon is
+  not reported on these exits; it is still in the client log, which the
+  supervising task writes as it crashes (`spawn_logging_panic` in
+  [dash_daemon.rs](../apps/rocm/src/dash_daemon.rs)).
+- A daemon that served and then stopped is reported after quitting as having
+  *stopped serving* rather than as unable to start. To see it, give a single
+  dashboard a throwaway socket directory of your own rather than your real
+  `$XDG_RUNTIME_DIR`: `d=$(mktemp -d)`, then `XDG_RUNTIME_DIR=$d rocm dash`;
+  from another terminal run `chmod 000 "$d"`, wait about 15 seconds, quit the
+  dashboard, then `chmod 700 "$d"` and `rm -r "$d"` (the socket and its lock
+  stay behind: a daemon removes its socket only while it can still see it is
+  its own). Do not run this as root, which `chmod 000` does not stop. Nothing is
+  reported when, by the time the dashboard closes, another dashboard's daemon
+  serves the socket -- except a crash of the dashboard's own supervision of
+  its telemetry daemon, which is always reported when the dashboard is quit
+  (on Ctrl-C or a signal it is only logged; see the bullet above).
+- A `unix:` socket path set in `dashboard.tui.connect` in `config.json` has
+  its directory restricted to mode `0700` when you own that directory and it
+  is not sticky (a sticky one such as `/tmp` keeps its mode), so point it at
+  a dedicated directory, not `$HOME` or one you share. To see it:
+  `d=$(mktemp -d); chmod 755 "$d"`, set `dashboard.tui.connect` to
+  `unix:$d/rocmdashd.sock` (with `$d` expanded), open and quit `rocm dash`,
+  then `stat -c %a "$d"` prints `700` and the day's `rocm-cli.log.<date>`
+  file holds one `restricted socket directory to mode 0700` line naming `$d`
+  and `from=0755`; opening it again adds no such line. Restore the setting
+  and `rm -r "$d"` afterwards.
+
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are
@@ -1542,7 +1648,32 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
-### 6c. The tensorizer upgrade on Python 3.14
+### 6c. A vLLM compiled extension that did not load
+
+Needs a Linux host whose glibc is older than the managed vLLM wheel was built
+against (for example Debian 12, glibc 2.36, with a wheel that needs 2.38). The
+behaviour is described in
+[Compiled extension load failures](vllm.md#compiled-extension-load-failures).
+
+```bash
+rocm serve <model> --engine vllm --verbose --foreground
+```
+
+Expected result:
+
+- The serve fails, and the startup failure message ends with
+  `Detected a vLLM compiled extension that failed to load (...)`. The line in
+  the parentheses is the `Failed to import from vllm._...` warning, which names
+  the missing `GLIBC_2.NN` or library, even though the echoed 80-line tail
+  above it shows only the API server's traceback.
+- It then prints `rocm diagnose --symptom '...'`. Paste that line unchanged: it
+  must report `fix-23-vllm-extension-load` first.
+- `rocm fix fix-23-vllm-extension-load` prints the plan and exits 0 without
+  changing anything. Running its step 2 inside `rocm engines shell vllm` raises
+  the loader's own `ImportError` for the extension that failed.
+- A serve that fails for any other reason does not print the paragraph.
+
+### 6d. The tensorizer upgrade on Python 3.14
 
 Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only
 published vLLM build for that line). On a fresh runtime:
@@ -1568,7 +1699,7 @@ On some GPU families `rocm install sdk` installs vLLM itself
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
 
-### 6d. Naming the engine instead of editing the error
+### 6e. Naming the engine instead of editing the error
 
 Take the failing line from 6a without any `vllm` in it (the
 `torch.OutOfMemoryError: HIP out of memory ...` line from
@@ -1722,6 +1853,25 @@ Expected result:
   `apps/comfyui/state/running.json` under rocm-cli's data folder containing
   only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
   is running, and goes ahead.
+- With the same one-character `running.json` in place and nothing listening on
+  port 8188, `rocm comfyui status` succeeds, shows `status: unknown` under `Running` with a note naming the file,
+  and names `rocm comfyui stop` as the next step; `rocm comfyui logs` still
+  shows the saved logs; `rocm comfyui stop` prints `status: unknown`, says it
+  moved the file to `running.json.unreadable` beside it, stopped no process
+  and checked only `http://127.0.0.1:8188` (so a ComfyUI started on another
+  address is not covered), names where the record is kept, and exits 0.
+  `running.json` is gone afterwards and `rocm comfyui status` no longer
+  reports it.
+- With the same file in place and something listening on
+  `http://127.0.0.1:8188` (a ComfyUI started outside rocm-cli, or
+  `python -m http.server 8188`), `rocm comfyui status` says something answers
+  there and advises stopping it first, or moving `running.json` aside by hand
+  if what answers is not ComfyUI; `rocm comfyui stop` leaves `running.json` in
+  place and exits non-zero. Once the listener is stopped, `rocm comfyui stop`
+  moves the file aside as above.
+- With a directory created at `running.json` instead, `rocm comfyui status`,
+  `rocm comfyui stop` and `rocm comfyui install --reinstall --dry-run` fail
+  naming `failed to read …/running.json` rather than reporting no record.
 - If the reinstall fails after the new code is in place (on a host where the
   AMD GPU check fails, say), the error names what was replaced or set aside
   and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
@@ -1933,6 +2083,33 @@ Expected result:
   service read `failed` rather than `stopped`, so rocmd's recovery restarts it.
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
+
+To check that an endpoint key covers every route of an AIM container, not only
+`/v1`, serve the same raw image behind a key and repeat the calls from section
+7 against it:
+
+```bash
+export ROCM_SERVE_API_KEY=manual-test-key
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency --require-api-key
+docker inspect --format '{{json .Mounts}}' rocm-aim-<service-id>
+```
+
+Expected result:
+
+- The service reaches `ready`, and `docker inspect` shows the engine's
+  `python` directory mounted read-only at `/opt/rocm-cli/python`.
+- With `Qwen/Qwen3.5-9B` as the model, the `/invocations` and `/tokenize` calls
+  from section 7 print `401` without the key and `200` with
+  `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"`; `/health` prints `200`
+  without it.
+- If the image does not apply `AIM_ENGINE_ARGS`, the serve fails instead,
+  naming `POST /tokenize` and the status it answered, and the container is
+  removed.
+
+The automated scenario is the `@nightly` `serve-aim-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
+which runs only on a nightly host with Docker and a Radeon or Strix Halo GPU.
 
 ## 12. Background Automation Helper
 
@@ -2176,9 +2353,11 @@ becomes ready:
 - `rocm serve <model> --no-smoke-test` prints the plain `Deployment summary` with
   no smoke-test note, and re-running against an already-running service prints
   the `(already running)` summary with no smoke-test note.
-- Some failures are deliberately not detected and still read as `ready` (an error
-  sent as a `data:` payload inside a `200` stream, a `200` answer with no `data:`
-  line, a close-delimited stream cut after a token); the full list is in
+- An error the engine sends as a `data:` payload inside a `200` stream is
+  detected: the summary reads `started, smoke test failed` with the engine's
+  message. Some failures are deliberately not detected and still read as `ready`
+  (a `200` answer with no `data:` line, a close-delimited stream cut after a
+  token); the full list is in
   [testing.md](testing.md#serve-smoke-test-failure).
 - A reasoning model that spends its small token budget before emitting any
   content is not a failure: the summary stays `ready` with the two metric rows
