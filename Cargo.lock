@@ -3818,6 +3818,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures",
+ "libc",
  "rocm-core",
  "rocm-dash-collectors",
  "rocm-dash-core",
@@ -3913,6 +3914,7 @@ dependencies = [
  "rocm-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

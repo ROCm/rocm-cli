@@ -179,8 +179,12 @@ All of those checks happen before activation. Run the current host's set with
 The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to
 `apt-get install`, which runs its maintainer scripts as root. rocm-cli therefore
 carries a SHA-256 digest for each published ROCDXG release and checks the
-download against it before the install step; on a mismatch the plan stops before
-anything runs as root. Verification is on by default and needs nothing set.
+package against it before the install step; on a mismatch the plan stops before
+the package's maintainer scripts run. The check is made on a copy root has
+placed in `/var/cache/rocm-cli/rocdxg/`, which only root can write, and that
+same file is what `apt-get install` reads, so no other local user can change
+the package between the check and the install. Verification is on by default
+and needs nothing set.
 
 `ROCM_CLI_ROCDXG_SHA256` supplies a digest for a release rocm-cli has none for,
 and overrides the pinned digest for one it does:
@@ -314,6 +318,24 @@ the override *logic* does not exist at all in a build without
 environment entirely and unconditionally returns the hardcoded default URL, so
 a stray environment variable can never redirect a production install.
 
+## ComfyUI Default Address Port Override
+
+This one is not about download integrity; it is listed here beside the other
+`e2e-test-hooks` override. `rocm comfyui status` and the chat's status answer
+check ComfyUI's default address when rocm-cli has no record of the ComfyUI it
+started, or one it cannot parse; `rocm comfyui stop` checks it only for a record
+it cannot parse. The port of that address can be overridden, only in builds
+compiled with `e2e-test-hooks`, so an E2E scenario decides whether anything
+answers there:
+
+```text
+ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE
+```
+
+A build without the feature ignores it. In a build with it, a value that is set
+but is not a port number stops the command with a panic rather than probing the
+real port.
+
 ## Dashboard Test Clock File
 
 `rocm dash` checks for one test-only input that, unlike the override above, is
@@ -368,7 +390,7 @@ Cargo feature:
 ROCM_CLI_TEST_HOST_ROOT
 ```
 
-Same model as the ComfyUI override above: in a build without
+Same model as the ComfyUI source archive override above: in a build without
 `e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
 reads the environment, so a release build always probes the real machine. The
 re-rooting changes only where the probes read; the CLI still names the logical
