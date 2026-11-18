@@ -41,6 +41,9 @@ base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive", "string", "suggestions"] }
 clap_complete = "4.6"
+# `rocm __man-page` renders the rocm(1) manual page from the clap command tree:
+# clap_mangen for the sections clap knows, roff for the ones written by hand.
+clap_mangen = "0.3"
 crossterm = { version = "0.29", features = ["libc", "use-dev-tty"] }
 directories = "6.0"
 keyring-core = "1.0.0"
@@ -49,6 +52,7 @@ libc = "0.2"
 # xtask's module-size check reads off syn's spans.
 proc-macro2 = { version = "1", features = ["span-locations"] }
 rand = "0.10"
+roff = "1.1"
 rpassword = "7.5"
 rsa = "0.9"
 semver = "1.0"

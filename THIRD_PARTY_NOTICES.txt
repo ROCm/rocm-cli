@@ -3213,6 +3213,7 @@ The following component(s) are licensed under Apache License 2.0:
   - anstyle-wincon 3.0.11 <https://github.com/rust-cli/anstyle.git>
   - anstyle 1.0.14 <https://github.com/rust-cli/anstyle.git>
   - clap_lex 1.1.0 <https://github.com/clap-rs/clap>
+  - clap_mangen 0.3.3 <https://github.com/clap-rs/clap>
   - colorchoice 1.0.5 <https://github.com/rust-cli/anstyle.git>
   - crc32fast 1.5.0 <https://github.com/srijs/rust-crc32fast>
   - hex 0.4.3 <https://github.com/KokaKiwi/rust-hex>
@@ -3220,6 +3221,7 @@ The following component(s) are licensed under Apache License 2.0:
   - is_terminal_polyfill 1.70.2 <https://github.com/polyfill-rs/is_terminal_polyfill>
   - jni-sys 0.4.1 <https://github.com/jni-rs/jni-sys>
   - once_cell_polyfill 1.70.2 <https://github.com/polyfill-rs/once_cell_polyfill>
+  - roff 1.1.1 <https://github.com/rust-cli/roff-rs>
   - terminal_size 0.4.4 <https://github.com/eminence/terminal-size>
   - toml_edit 0.25.12+spec-1.1.0 <https://github.com/toml-rs/toml>
 

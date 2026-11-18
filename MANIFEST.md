@@ -105,6 +105,7 @@ repository.
 | clap_complete | 4.6.11 | MIT OR Apache-2.0 |
 | clap_derive | 4.6.7 | MIT OR Apache-2.0 |
 | clap_lex | 1.1.0 | MIT OR Apache-2.0 |
+| clap_mangen | 0.3.3 | MIT OR Apache-2.0 |
 | cmake | 0.1.58 | MIT OR Apache-2.0 |
 | color-eyre | 0.6.5 | MIT OR Apache-2.0 |
 | color-spantrace | 0.3.0 | MIT OR Apache-2.0 |
@@ -393,6 +394,7 @@ repository.
 | reqwest | 0.13.4 | MIT OR Apache-2.0 |
 | rig-core | 0.38.1 | MIT |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
+| roff | 1.1.1 | MIT OR Apache-2.0 |
 | rpassword | 7.5.4 | Apache-2.0 |
 | rsa | 0.9.10 | MIT OR Apache-2.0 |
 | rtoolbox | 0.0.5 | Apache-2.0 |

@@ -35,6 +35,7 @@ mod e2e {
     pub mod lemonade_install_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
+    pub mod manual_page_steps;
     pub mod model_catalog_steps;
     pub mod planner_steps;
     pub mod remote_steps;
