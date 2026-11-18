@@ -38,6 +38,7 @@ use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval_scrolled,
+    scrolled,
 };
 use crate::ui::exec::resolve_exe;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
@@ -72,9 +73,6 @@ const KNOWN_REPORT_SCHEMA: u64 = 1;
 pub const REPORT_SENDER_NOTICE: &str = "If you send the mail, it goes from your own mail account \
                                         and carries your address. The report itself names no \
                                         user, host, or file path.";
-
-/// Rows a PgUp or PgDn moves the approval body.
-const APPROVAL_PAGE: u16 = 5;
 
 /// What the overlay knows about the last report preview.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -189,21 +187,6 @@ pub fn on_key(
         _ => {}
     }
     Vec::new()
-}
-
-/// Where a key moves the approval body, or `None` when it is not a scroll key.
-/// PgUp and PgDn move a page, Home and End jump. Up and Down stay with the
-/// buttons.
-fn scrolled(current: u16, max: u16, key: KeyCode) -> Option<u16> {
-    match key {
-        KeyCode::PageDown => Some(current.saturating_add(APPROVAL_PAGE).min(max)),
-        // The stored offset can sit past `max` after the dialog grew, since only
-        // the draw clamps it. Clamp first, so one PgUp is always one page.
-        KeyCode::PageUp => Some(current.min(max).saturating_sub(APPROVAL_PAGE)),
-        KeyCode::Home => Some(0),
-        KeyCode::End => Some(max),
-        _ => None,
-    }
 }
 
 /// Judge the finished preview. Only a job that exited 0 and printed a JSON
@@ -475,6 +458,7 @@ pub fn draw_examine_manager(
 mod tests {
     use super::*;
     use crate::app::test_support::press as key;
+    use crate::ui::approval::APPROVAL_PAGE;
     use crossterm::event::KeyCode;
 
     #[test]

@@ -1222,6 +1222,18 @@ async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
     // actually gates on the post-resize render.
 }
 
+#[when("the user shrinks the terminal to a short window")]
+async fn shrink_to_a_short_window(world: &mut E2eWorld) {
+    // ROCMAI-1050: the same geometry `shrink_below_menu_logo_layout` uses, under
+    // a name that does not speak of the Esc menu — this is also the height at
+    // which the quit prompt cut the stop command off its own remediation
+    // bullet. Only resizes; the `Then` steps after it gate on a post-resize
+    // frame.
+    session(world)
+        .use_short_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+}
+
 #[when("the user shrinks the terminal below the Esc menu's logo layout")]
 async fn shrink_below_menu_logo_layout(world: &mut E2eWorld) {
     // ROCMAI-1042: at this height the Esc menu's modal is too short for the

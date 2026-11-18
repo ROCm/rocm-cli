@@ -157,13 +157,16 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
         // `false`: the launcher has no live Services overlay to jump to
         // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
         // it must not advertise the `s` hint the dashboard's copy does.
-        crate::ui::approval::draw_approval(
-            f,
-            area,
-            &crate::ui::quit_confirm_request(state, false),
-            choice,
-            theme,
-        );
+        state
+            .quit_confirm_max_scroll
+            .set(crate::ui::approval::draw_approval_scrolled(
+                f,
+                area,
+                &crate::ui::quit_confirm_request(state, false),
+                choice,
+                state.quit_confirm_scroll,
+                theme,
+            ));
     }
 }
 

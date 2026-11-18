@@ -1116,3 +1116,24 @@ Feature: Interactive dashboard
     Then the dashboard exits from the signal with code 130
     And the dashboard reports that its telemetry daemon could not use that file
     And that file is left in place
+
+  # ROCMAI-1050: at a short window height the prompt painted the
+  # "<model> — stop it first:" bullet and cut the command on the line directly
+  # beneath it, with nothing on screen saying anything had been dropped — the
+  # dashboard named a remedy it did not show. `dash-26` pins the same
+  # assertion at the default geometry; this is the short-window case, which is
+  # where the line was actually lost.
+  @id:dash-quit-confirm-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-63 - The quit prompt still shows the stop command on a short terminal
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running

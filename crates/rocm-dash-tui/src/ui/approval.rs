@@ -84,6 +84,38 @@ pub enum ApprovalVerdict {
     Cancel,
 }
 
+/// Rows a PgUp or PgDn moves the approval body.
+pub const APPROVAL_PAGE: u16 = 5;
+
+/// Rows and columns the popup frame itself costs, so a body measured before the
+/// popup exists is measured against the space it will actually get.
+const FRAME_ROWS: u16 = 2;
+const FRAME_COLS: u16 = 2;
+/// Rows reserved below the body for the buttons and the "More to read" row.
+const FOOTER_ROWS: u16 = 2;
+/// Tallest the dialog is allowed to be, unchanged from when the height was a
+/// flat `centered_rect` cap.
+const POPUP_MAX_ROWS: u16 = 24;
+
+/// Where a key moves the approval body, or `None` when it is not a scroll key.
+/// PgUp and PgDn move a page, Home and End jump. Up and Down stay with the
+/// buttons.
+///
+/// Shared by every caller rendering through [`draw_approval_scrolled`], so the
+/// keys the dialog's own "More to read" row advertises are the keys that move
+/// it. A second hand-rolled copy is how that hint and its handler drift apart.
+pub fn scrolled(current: u16, max: u16, key: KeyCode) -> Option<u16> {
+    match key {
+        KeyCode::PageDown => Some(current.saturating_add(APPROVAL_PAGE).min(max)),
+        // The stored offset can sit past `max` after the dialog grew, since only
+        // the draw clamps it. Clamp first, so one PgUp is always one page.
+        KeyCode::PageUp => Some(current.min(max).saturating_sub(APPROVAL_PAGE)),
+        KeyCode::Home => Some(0),
+        KeyCode::End => Some(max),
+        _ => None,
+    }
+}
+
 /// Pure key handler. Returns the (possibly moved) cursor and an optional
 /// verdict. No side effects — the caller routes the verdict CLI-side.
 pub const fn approval_key(
@@ -150,7 +182,37 @@ fn draw_approval_inner(
     scroll: Option<u16>,
     theme: &Theme,
 ) -> u16 {
-    let popup = centered_rect(72, 70, 96, 24, area);
+    // The geometry this dialog has always had. On a roomy screen it is still
+    // the final answer, so every caller renders exactly as before there.
+    let baseline = centered_rect(72, 70, 96, 24, area);
+
+    let body: Vec<Line> = req
+        .body
+        .iter()
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg))))
+        .collect();
+    let paragraph = Paragraph::new(body).wrap(Wrap { trim: false });
+
+    // Measure the wrapped body against the width the popup *will* have — the
+    // percentage and cap governing width are unchanged below, so `baseline`
+    // already carries it. Measuring at any other width miscounts the rows.
+    let text_width = baseline.width.saturating_sub(FRAME_COLS);
+    let needed = u16::try_from(paragraph.line_count(text_width))
+        .unwrap_or(u16::MAX)
+        .saturating_add(FRAME_ROWS + FOOTER_ROWS);
+
+    // 70% of a short screen leaves rows unused while the body is being cut off
+    // at the bottom (ROCMAI-1050: at twelve rows the quit prompt showed the
+    // "stop it first:" bullet and hid the command under it). Where the screen
+    // itself is what the body does not fit in, spend the rest of it before
+    // asking the user to scroll. Bounded by the same 24-row cap as before, so
+    // this only ever claims space the old 70% left idle, and a tall body on a
+    // big screen keeps today's size rather than growing into a wall of text.
+    let desired = baseline
+        .height
+        .max(needed.min(area.height).min(POPUP_MAX_ROWS));
+    let popup = centered_rect(72, 100, 96, desired, area);
+
     let inner = draw_popup_frame(f, popup, &format!("Review: {}", req.title), theme);
     if inner.height == 0 {
         return 0;
@@ -161,12 +223,6 @@ fn draw_approval_inner(
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(inner);
 
-    let body: Vec<Line> = req
-        .body
-        .iter()
-        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg))))
-        .collect();
-    let paragraph = Paragraph::new(body).wrap(Wrap { trim: false });
     let total = paragraph.line_count(rows[0].width);
     let visible = usize::from(rows[0].height);
     let max_scroll = u16::try_from(total.saturating_sub(visible)).unwrap_or(u16::MAX);

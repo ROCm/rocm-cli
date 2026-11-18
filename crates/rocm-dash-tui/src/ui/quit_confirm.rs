@@ -244,6 +244,217 @@ mod tests {
 
     use crate::ui::draw;
 
+    /// A dashboard with one managed model serving, so `q` opens the prompt with
+    /// its full body: the bullet, the stop command under it, the trailer, and
+    /// the `Press s` hint.
+    fn serving_dashboard() -> AppState {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                model_name: "Qwen2.5-7B".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+        state.open_quit_confirm();
+        state
+    }
+
+    /// Paint the whole dashboard at `rows` high and flatten it, the way a user
+    /// reads the screen rather than the way the body is built.
+    fn painted_at(state: &mut AppState, rows: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(120, rows)).unwrap();
+        term.draw(|f| draw(f, state)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// Scenario 1. The reported geometry (ROCMAI-1050): twelve rows used to
+    /// paint the "stop it first:" bullet and cut the command directly under it,
+    /// so the prompt named a remedy it did not show. The popup now spends the
+    /// rows that the flat 70% height left idle on a screen this short.
+    #[test]
+    fn a_short_terminal_still_shows_the_command_that_stops_the_model() {
+        let mut state = serving_dashboard();
+        let painted = painted_at(&mut state, 12);
+        assert!(
+            painted.contains("Qwen2.5-7B"),
+            "the model still serving must be named: {painted}"
+        );
+        assert!(
+            painted.contains("rocm services stop svc-managed --yes"),
+            "the command that stops it must be on screen, not below the fold: {painted}"
+        );
+    }
+
+    /// Scenario 2. Whatever is still too tall to fit must announce itself —
+    /// silent truncation is the defect, and a body that merely fits less is
+    /// still a body the user cannot tell is incomplete.
+    #[test]
+    fn a_body_that_still_overflows_says_so_and_names_the_keys() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        // Six serving models: five bullets with their own stop commands plus
+        // the overflow line, far past what a short screen can hold.
+        for n in 0..6 {
+            let id = format!("svc-{n}");
+            state.instances.insert(
+                id.clone(),
+                Instance {
+                    container_id: id,
+                    model_name: format!("model-{n}"),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        let ids: Vec<String> = (0..6).map(|n| format!("svc-{n}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        with_registry_probe(&mut state, true, &refs);
+        state.open_quit_confirm();
+
+        let painted = painted_at(&mut state, 14);
+        assert!(
+            painted.contains("More to read"),
+            "an overflowing body must say there is more: {painted}"
+        );
+        assert!(
+            painted.contains("PgUp/PgDn"),
+            "and must name the keys that reveal it: {painted}"
+        );
+    }
+
+    /// Scenario 3. The rest of the body is reachable, and the decision stays on
+    /// screen while the user reads — a prompt that scrolls its buttons away
+    /// would trade one trap for another.
+    #[test]
+    fn paging_reveals_the_rest_while_the_choices_stay_on_screen() {
+        use crossterm::event::KeyCode;
+        let mut state = serving_dashboard();
+        // One draw first, so the dialog has reported how far it can scroll.
+        let first = painted_at(&mut state, 10);
+        assert!(
+            state.quit_confirm_max_scroll.get() > 0,
+            "this geometry must actually overflow, or the test proves nothing: {first}"
+        );
+
+        assert!(state.quit_confirm_scroll_key(KeyCode::End));
+        let scrolled_to_end = painted_at(&mut state, 10);
+        assert!(
+            scrolled_to_end.contains("may still be running"),
+            "the trailer below the fold must become readable: {scrolled_to_end}"
+        );
+        assert!(
+            scrolled_to_end.contains("Approve (y)") && scrolled_to_end.contains("Deny (n)"),
+            "both choices must stay visible while reading: {scrolled_to_end}"
+        );
+
+        assert!(state.quit_confirm_scroll_key(KeyCode::Home));
+        assert_eq!(state.quit_confirm_scroll, 0, "Home must return to the top");
+    }
+
+    /// Scenario 4. The scroll keys must not be read as an answer. Paging is the
+    /// one interaction a user performs *before* deciding, so a PgDn that quit
+    /// the dashboard would be the worst possible misfire.
+    #[test]
+    fn paging_through_the_prompt_never_answers_it() {
+        use crossterm::event::KeyCode;
+        let mut state = serving_dashboard();
+        painted_at(&mut state, 10);
+
+        for code in [
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert_eq!(
+                state.resolve_quit_confirm_key(code),
+                None,
+                "{code:?} must resolve no verdict"
+            );
+            assert!(
+                state.quit_confirm.is_some(),
+                "{code:?} must leave the prompt open awaiting an answer"
+            );
+        }
+    }
+
+    /// Scenario 5. A body that fits must not advertise scrolling, mirroring the
+    /// examine report's own `a_report_that_fits_shows_no_scroll_hint`.
+    #[test]
+    fn a_prompt_that_fits_offers_no_scrolling() {
+        let mut state = serving_dashboard();
+        let painted = painted_at(&mut state, 40);
+        assert!(
+            painted.contains("rocm services stop svc-managed --yes"),
+            "the whole body must be on screen at this height: {painted}"
+        );
+        assert!(
+            !painted.contains("More to read"),
+            "a body that fits needs no hint: {painted}"
+        );
+        assert_eq!(
+            state.quit_confirm_max_scroll.get(),
+            0,
+            "nothing to scroll when everything fits"
+        );
+    }
+
+    /// The growth is bounded. A roomy screen keeps the geometry this dialog had
+    /// before ROCMAI-1050, so the ten manager flows sharing it are untouched
+    /// there — the extra rows are only ever taken from what the flat 70% left
+    /// idle on a screen too short to use it.
+    ///
+    /// Asserted through what the user can see rather than through the sizing
+    /// arithmetic: with the body far longer than any allowed height, the rows
+    /// on screen are `total - max_scroll`, so a dialog that had grown past the
+    /// 24-row cap would show more of them. Re-deriving the cap here instead
+    /// would pass for any geometry the code happened to produce.
+    #[test]
+    fn a_roomy_screen_keeps_the_dialog_at_its_old_size() {
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest, draw_approval_scrolled};
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 24 rows of popup, less its two border rows and the two footer rows,
+        // is the 20-row body the old geometry gave every tall screen.
+        const ROWS_AT_THE_CAP: usize = 20;
+
+        let total = 200usize;
+        let req = ApprovalRequest::new(
+            "Long body",
+            (0..total).map(|i| format!("line {i}")).collect(),
+        );
+        let theme = Theme::from_name("default-dark");
+
+        for height in [40u16, 60, 120] {
+            let mut term = Terminal::new(TestBackend::new(140, height)).unwrap();
+            let mut max = 0;
+            term.draw(|f| {
+                max = draw_approval_scrolled(f, f.area(), &req, ApprovalChoice::Approve, 0, &theme);
+            })
+            .unwrap();
+            let visible = total - usize::from(max);
+            assert_eq!(
+                visible, ROWS_AT_THE_CAP,
+                "on a {height}-row screen the dialog must still show {ROWS_AT_THE_CAP} body \
+                 rows, as it did before the short-screen growth was added"
+            );
+        }
+    }
+
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
