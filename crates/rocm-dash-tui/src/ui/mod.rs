@@ -300,12 +300,14 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
     // job console here, panned by the single `console_scroll`/`console_hscroll`
     // source. Centralized so the 13 managers don't each duplicate the branch.
     if let Some(job) = state.active_job_id().and_then(|id| state.jobs.job(id)) {
+        let exit = state.console_exit();
         let handles = job_console::draw_job_console(
             f,
             rect,
             job,
             (state.console_scroll, state.console_hscroll),
             state.tick_count,
+            exit,
             theme,
         );
         state.scrollbars.borrow_mut().extend(handles);
