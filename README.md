@@ -1365,16 +1365,17 @@ directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather 
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
-With the vLLM engine, an endpoint bound to a public interface
+With the vLLM and AIM engines, an endpoint bound to a public interface
 (`--allow-public-bind`), or served with `--require-api-key`, answers only
 clients that present its API key as an `Authorization: Bearer` header, on every
 route the server answers, not just the OpenAI `/v1` API — including vLLM's own
 `/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
-CORS preflights: the `/health` liveness check stays open. The AIM engine runs
-the same vLLM server inside its container but does not install this check, so
-a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
-leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
-without the key.
+CORS preflights: the `/health` liveness check stays open. An AIM container gets
+this check through `AIM_ENGINE_ARGS`; one whose image does not apply it fails to
+start and its container is removed, rather than serving with only `/v1`
+protected. A key-protected AIM launch also refuses to start when it cannot read
+the image's config, or when `AIM_ENGINE_ARGS` (from `--engine-env` or the image)
+is not a JSON object or already names a `middleware`.
 
 Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
 key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
@@ -1962,7 +1963,15 @@ Settings live in `config.json` in the config directory and are replaced in one
 step, so an interrupted save leaves the previous file rather than a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
+it back to `config.json` before running another command. Commands that change
+settings at the same time, from two terminals or a script, take turns: each
+reads the file only once the previous change is saved, so none of them undoes
+another's change. One that waits more than 30 seconds for its turn stops with
+an error saying it did not save its change to the file. The
+turn-taking goes through `config.json.lock` beside the file, so a config
+directory where that file cannot be created, such as a read-only one, refuses
+every settings change. The lock file can stay there and must not be deleted
+while a command is running. If the file exists
 but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records

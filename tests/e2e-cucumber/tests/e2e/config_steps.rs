@@ -173,6 +173,7 @@ async fn refuse_engine_no_target(world: &mut E2eWorld) {
         world,
         "set-engine requires --runtime-id, --env-id, or --clear",
     );
+    assert_refused_before_locking(world);
 }
 
 #[then("the CLI confirms the engine configuration was updated")]
@@ -194,6 +195,50 @@ async fn confirm_provider_disabled(world: &mut E2eWorld) {
 async fn refuse_local_provider(world: &mut E2eWorld) {
     assert_failed(world);
     assert_output_contains(world, "local provider is always enabled");
+    assert_refused_before_locking(world);
+}
+
+/// A refused settings change is refused before it takes the settings lock, so
+/// it leaves nothing behind in the config folder, not even the lock file (and
+/// on a read-only config folder the user sees the refusal, not a failure to
+/// create that file).
+///
+/// Skipped on a host with a legacy rocm-dash `config.toml`: every `rocm`
+/// command first migrates it into a config folder that has no `config.json`
+/// yet, under the lock, so the lock file is there whatever the refusal did.
+/// That file sits in the user's real config folder, which the scenario's
+/// environment does not move (Windows finds it through the known-folder API).
+fn assert_refused_before_locking(world: &E2eWorld) {
+    if let Some(legacy) = legacy_dashboard_config_on_this_host() {
+        eprintln!(
+            "skipped the lock-file check: {} exists, and its migration takes the lock",
+            legacy.display()
+        );
+        return;
+    }
+    let lock = settings_path(world).with_file_name("config.json.lock");
+    assert!(
+        !lock.exists(),
+        "the refused change took the settings lock: {} exists",
+        lock.display()
+    );
+}
+
+/// The legacy rocm-dash `config.toml` where `rocm` looks for it on this host,
+/// when one is there: under `%APPDATA%` on Windows, under `$XDG_CONFIG_HOME`
+/// (or `~/.config`) elsewhere.
+fn legacy_dashboard_config_on_this_host() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+            })
+    }?;
+    Some(base.join("rocm-dash").join("config.toml")).filter(|path| path.exists())
 }
 
 #[then("the CLI reports it could not save the key securely")]
@@ -598,6 +643,236 @@ async fn refuses_to_change_setting(world: &mut E2eWorld) {
         "the refusal repeated the ROCM_CLI_DATA_DIR advice the user already followed:\n{}",
         combined_output(world)
     );
+}
+
+// ── Settings changed at the same time ─────────────────────────────
+
+/// One of `config-12`'s writers: the two `rocm` commands it alternates
+/// between, each with what the settings file then records at `pointer`
+/// (`None`: nothing there).
+struct SettingsWriter {
+    name: &'static str,
+    changes: [(&'static [&'static str], Option<&'static str>); 2],
+    pointer: &'static str,
+}
+
+/// Every kind of `rocm config` change that loads, changes and saves the
+/// settings: a setter, a `clear-*`, and `set-engine` with each of its flags.
+/// `enable-provider` is left out: it also reads the secret store, which this
+/// lane cannot rely on, and goes through the same locked update as the rest.
+const SETTINGS_WRITERS: [SettingsWriter; 7] = [
+    SettingsWriter {
+        name: "default engine",
+        changes: [
+            (
+                &["config", "set-default-engine", "lemonade"],
+                Some("lemonade"),
+            ),
+            (&["config", "clear-default-engine"], None),
+        ],
+        pointer: "/default_engine",
+    },
+    SettingsWriter {
+        name: "telemetry",
+        changes: [
+            (&["config", "set-telemetry", "local"], Some("local")),
+            (&["config", "set-telemetry", "off"], Some("off")),
+        ],
+        pointer: "/telemetry/mode",
+    },
+    SettingsWriter {
+        name: "permissions",
+        changes: [
+            (&["config", "set-permissions", "ask"], Some("ask")),
+            (
+                &["config", "set-permissions", "full-access"],
+                Some("full_access"),
+            ),
+        ],
+        pointer: "/permissions/mode",
+    },
+    SettingsWriter {
+        name: "planner provider",
+        changes: [
+            (
+                &["config", "set-planner-provider", "anthropic"],
+                Some("anthropic"),
+            ),
+            (&["config", "clear-planner-provider"], None),
+        ],
+        pointer: "/planner_provider",
+    },
+    SettingsWriter {
+        name: "default runtime",
+        changes: [
+            (
+                &["config", "set-default-runtime", "therock-release:gfx942"],
+                Some("therock-release:gfx942"),
+            ),
+            (&["config", "clear-default-runtime"], None),
+        ],
+        pointer: "/default_runtime_id",
+    },
+    SettingsWriter {
+        name: "vllm runtime",
+        changes: [
+            (
+                &["config", "set-engine", "vllm", "--runtime-id", "runtime-a"],
+                Some("runtime-a"),
+            ),
+            (
+                &["config", "set-engine", "vllm", "--runtime-id", "runtime-b"],
+                Some("runtime-b"),
+            ),
+        ],
+        pointer: "/engines/vllm/preferred_runtime_id",
+    },
+    SettingsWriter {
+        name: "lemonade env",
+        changes: [
+            (
+                &["config", "set-engine", "lemonade", "--env-id", "env-a"],
+                Some("env-a"),
+            ),
+            (&["config", "set-engine", "lemonade", "--clear"], None),
+        ],
+        pointer: "/engines/lemonade/preferred_env_id",
+    },
+];
+
+/// How many changes each writer makes, as many as in the run that found the
+/// lost updates. A race can only be caught, never ruled out, by running it:
+/// against binaries without the lock this scenario failed 3 of 3 runs in WSL
+/// and 2 of 6 on native Windows. The deterministic check is `rocm-core`'s
+/// `an_update_waits_for_the_one_in_progress_and_keeps_its_change`. Under half a
+/// minute on a desktop.
+const SETTINGS_WRITER_ROUNDS: usize = 50;
+
+/// What `config-12`'s writers found.
+#[derive(Debug, Default)]
+pub struct ConcurrentSettingsFindings {
+    /// Commands that exited non-zero, and settings-file reads that failed.
+    failures: Vec<String>,
+    /// Changes a writer found undone when it came to make its next one.
+    undone: Vec<String>,
+}
+
+/// The value at `pointer` in the settings file at `path`.
+fn setting_in(path: &std::path::Path, pointer: &str) -> Result<Option<String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not JSON ({e}):\n{text}", path.display()))?;
+    Ok(value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
+/// How long one settings command may take. It waits at most 30 seconds for
+/// the settings lock, so anything longer is a hang, not a slow turn.
+const SETTINGS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Run one writer: before each change, check that its previous change is
+/// still in the file, then make the next one.
+fn run_settings_writer(
+    writer: &SettingsWriter,
+    env: &[(&'static str, std::ffi::OsString)],
+    scenario: Option<&str>,
+    settings: &std::path::Path,
+) -> ConcurrentSettingsFindings {
+    let mut findings = ConcurrentSettingsFindings::default();
+    for round in 0..SETTINGS_WRITER_ROUNDS {
+        if round > 0 {
+            let expected = writer.changes[(round - 1) % 2].1;
+            match setting_in(settings, writer.pointer) {
+                Ok(found) if found.as_deref() == expected => {}
+                Ok(found) => findings.undone.push(format!(
+                    "{}: before change {round} the file held {found:?}, not the {expected:?} \
+                     this command had just set",
+                    writer.name
+                )),
+                Err(error) => findings
+                    .failures
+                    .push(format!("{} before change {round}: {error}", writer.name)),
+            }
+        }
+        let args = writer.changes[round % 2].0;
+        let (_, stderr, rc) =
+            crate::run_rocm_bounded_in(env, scenario, args, &[], SETTINGS_COMMAND_TIMEOUT);
+        if rc != 0 {
+            findings.failures.push(format!(
+                "`rocm {}` (change {round}) exited {rc}: {}",
+                args.join(" "),
+                stderr.trim()
+            ));
+        }
+    }
+    findings
+}
+
+#[when("seven commands change different settings over and over at the same time")]
+async fn change_settings_concurrently(world: &mut E2eWorld) {
+    let env = world.isolate_env();
+    let scenario = world.current_scenario.clone();
+    let settings = settings_path(world);
+    let findings = std::thread::scope(|scope| {
+        // Every writer is started before any is joined, so they overlap.
+        let mut handles = Vec::new();
+        for writer in &SETTINGS_WRITERS {
+            handles.push(
+                scope.spawn(|| run_settings_writer(writer, &env, scenario.as_deref(), &settings)),
+            );
+        }
+        let mut all = ConcurrentSettingsFindings::default();
+        for handle in handles {
+            let one = handle.join().expect("a settings writer panicked");
+            all.failures.extend(one.failures);
+            all.undone.extend(one.undone);
+        }
+        all
+    });
+    world.concurrent_settings_findings = Some(findings);
+}
+
+const fn concurrent_settings_findings(world: &E2eWorld) -> &ConcurrentSettingsFindings {
+    world
+        .concurrent_settings_findings
+        .as_ref()
+        .expect("the concurrent settings writers were run")
+}
+
+#[then("every one of those commands succeeded")]
+async fn concurrent_commands_succeeded(world: &mut E2eWorld) {
+    let failures = &concurrent_settings_findings(world).failures;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[then("no command found a change it had made undone")]
+async fn no_concurrent_change_undone(world: &mut E2eWorld) {
+    let undone = &concurrent_settings_findings(world).undone;
+    assert!(
+        undone.is_empty(),
+        "{} of {} changes were undone by another command:\n{}",
+        undone.len(),
+        SETTINGS_WRITERS.len() * (SETTINGS_WRITER_ROUNDS - 1),
+        undone.join("\n")
+    );
+}
+
+#[then("the settings file keeps the last value each command set")]
+async fn settings_keep_last_values(world: &mut E2eWorld) {
+    let settings = settings_path(world);
+    for writer in &SETTINGS_WRITERS {
+        let last = writer.changes[(SETTINGS_WRITER_ROUNDS - 1) % 2].1;
+        let found = setting_in(&settings, writer.pointer).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            found.as_deref(),
+            last,
+            "the {} setting lost the last change made to it",
+            writer.name
+        );
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

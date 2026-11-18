@@ -1959,6 +1959,33 @@ Expected result:
 - On native Windows, the same command fails explicitly instead of falling
   back to another engine.
 
+To check that an endpoint key covers every route of an AIM container, not only
+`/v1`, serve the same raw image behind a key and repeat the calls from section
+7 against it:
+
+```bash
+export ROCM_SERVE_API_KEY=manual-test-key
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency --require-api-key
+docker inspect --format '{{json .Mounts}}' rocm-aim-<service-id>
+```
+
+Expected result:
+
+- The service reaches `ready`, and `docker inspect` shows the engine's
+  `python` directory mounted read-only at `/opt/rocm-cli/python`.
+- With `Qwen/Qwen3.5-9B` as the model, the `/invocations` and `/tokenize` calls
+  from section 7 print `401` without the key and `200` with
+  `-H "Authorization: Bearer $ROCM_SERVE_API_KEY"`; `/health` prints `200`
+  without it.
+- If the image does not apply `AIM_ENGINE_ARGS`, the serve fails instead,
+  naming `POST /tokenize` and the status it answered, and the container is
+  removed.
+
+The automated scenario is the `@nightly` `serve-aim-key-guards-every-route` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
+which runs only on a nightly host with Docker and a Radeon or Strix Halo GPU.
+
 ## 12. Background Automation Helper
 
 The helper (`rocm daemon`) runs only while an automation watcher is enabled.
@@ -2264,3 +2291,78 @@ Expected result:
   could not be started: it was not found; nothing was changed.`, exits 4, and
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
+
+## 18. Settings Changed From Several Terminals At Once
+
+Commands that change settings take turns on `config.json`, so none of them
+undoes another's change. Scenario `config-12` checks this on the mock lane; this
+is the same check by hand. It runs on a scratch config, data and cache folder,
+set only inside the loops, so your own settings and audit log are untouched and
+your shell is left as it was. The scratch folder is removed at the end.
+
+In PowerShell:
+
+```powershell
+$scratch = Join-Path $env:TEMP "rocm-config-race"
+$jobs = @(
+  @('set-default-engine', 'lemonade', 'aim', 'default_engine'),
+  @('set-telemetry', 'local', 'off', 'telemetry.mode'),
+  @('set-permissions', 'ask', 'full-access', 'permissions.mode')
+) | ForEach-Object {
+  Start-Job -ArgumentList $_, $scratch -ScriptBlock {
+    param($w, $scratch)
+    $env:ROCM_CLI_CONFIG_DIR = "$scratch\config"
+    $env:ROCM_CLI_DATA_DIR = "$scratch\data"
+    $env:ROCM_CLI_CACHE_DIR = "$scratch\cache"
+    $lost = 0
+    $failed = 0
+    for ($i = 0; $i -lt 50; $i++) {
+      $value = $w[1 + ($i % 2)]
+      if ($i -gt 0) {
+        $json = Get-Content "$scratch\config\config.json" -Raw | ConvertFrom-Json
+        $found = $json
+        foreach ($part in $w[3].Split('.')) { $found = $found.$part }
+        $previous = ($w[1 + (($i - 1) % 2)]).Replace('-', '_')
+        if ($found -ne $previous) { $lost++ }
+      }
+      rocm config $w[0] $value | Out-Null
+      if ($LASTEXITCODE -ne 0) { $failed++ }
+    }
+    "$($w[0]): lost $lost, failed $failed"
+  }
+}
+$jobs | Wait-Job | Receive-Job
+Get-ChildItem "$scratch\config" | Select-Object -ExpandProperty Name
+Remove-Item -Recurse -Force $scratch
+```
+
+In WSL or on Linux (needs `jq`):
+
+```bash
+scratch=$(mktemp -d)
+writer() {  # setter, its two values, where the setting sits in config.json
+  local lost=0 failed=0 i value previous
+  for i in $(seq 0 49); do
+    if [ $((i % 2)) -eq 0 ]; then value=$2 previous=$3; else value=$3 previous=$2; fi
+    if [ "$i" -gt 0 ] && [ "$(jq -r "$4" "$scratch/config/config.json")" != "${previous//-/_}" ]; then
+      lost=$((lost + 1))
+    fi
+    ROCM_CLI_CONFIG_DIR=$scratch/config ROCM_CLI_DATA_DIR=$scratch/data \
+      ROCM_CLI_CACHE_DIR=$scratch/cache rocm config "$1" "$value" >/dev/null \
+      || failed=$((failed + 1))
+  done
+  echo "$1: lost $lost, failed $failed"
+}
+writer set-default-engine lemonade aim .default_engine &
+writer set-telemetry local off .telemetry.mode &
+writer set-permissions ask full-access .permissions.mode &
+wait
+ls "$scratch/config"
+rm -rf "$scratch"
+```
+
+Expected result:
+
+- Each loop prints `lost 0, failed 0`.
+- The scratch config folder lists `config.json` and `config.json.lock`; the
+  lock file is expected and stays beside the settings.

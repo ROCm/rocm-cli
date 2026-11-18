@@ -2333,6 +2333,9 @@ mod tests {
             active_runtime_key: Some("release-wheel-gfx110x-7-11-0".to_owned()),
             ..RocmCliConfig::default()
         };
+        // Saved, as `storage()` loads it: the uninstall changes the settings
+        // on disk under the config lock, not the copy passed in.
+        config.save(&paths)?;
 
         let plan = build_prune_plan(&paths, &config, 1)?;
         let planned: Vec<&str> = plan
@@ -2389,11 +2392,17 @@ mod tests {
             InstallRootDecision::ReadOnly,
             "an adopted install's folder stays off-limits to deletion"
         );
-        assert_eq!(
-            config.active_runtime_key.as_deref(),
-            Some("release-wheel-gfx110x-7-11-0"),
-            "removing an old install must not deactivate the runtime in use"
-        );
+        let saved = RocmCliConfig::load(&paths)?;
+        for (which, active) in [
+            ("in the caller's settings", &config.active_runtime_key),
+            ("on disk", &saved.active_runtime_key),
+        ] {
+            assert_eq!(
+                active.as_deref(),
+                Some("release-wheel-gfx110x-7-11-0"),
+                "removing an old install must not deactivate the runtime in use ({which})"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

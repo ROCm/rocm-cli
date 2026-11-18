@@ -365,14 +365,15 @@ Feature: Model serving
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
   # self-hosted runner with Docker is where this actually runs.
-  # `@nightly` keeps both AIM scenarios off the pull-request lanes: each one
-  # pulls the image and a 9B checkpoint on a cold runner and may wait out the
-  # full 1200s readiness cap, so the pair on the Strix Ubuntu job (~25 min
-  # without them, 45 min cap) ended every run at the cap. That job now runs
+  # `@nightly` keeps the AIM scenarios (these two and serve-63) off the
+  # pull-request lanes: each one pulls the image and a 9B checkpoint on a cold
+  # runner and may wait out the full 1200s readiness cap, so these two on the
+  # Strix Ubuntu job (~25 min without them, 45 min cap) ended every run at
+  # the cap. That job now runs
   # only on push, dispatch and nightly, never on pull_request. They run only when
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
-  # On a host without Docker both skip (the nightly job logs whether Docker is
+  # On a host without Docker they skip (the nightly job logs whether Docker is
   # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
   # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
@@ -987,8 +988,9 @@ Feature: Model serving
   # server also answers inference and tokenizer routes outside them. rocm-cli
   # starts vLLM with a middleware that demands the key on every route except
   # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
-  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
-  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # unit-tested on every PR (`endpoint_auth` in the engine-protocol crate,
+  # where both engines take it from); this proves it is actually wired into a
+  # real vLLM server. A full extra vLLM
   # serve, so `@nightly` rather than per-PR: it runs after merge in the nightly
   # runs on Instinct GPUs, which serve with vLLM: the MI300X job in
   # `nightly.yml` and the shared GPU queue's Instinct lanes (MI350P among them).
@@ -1020,6 +1022,25 @@ Feature: Model serving
     Then vLLM is reported as installed but not usable
     And the report names the extension that failed to import
 
+  # The AIM engine's container bundles vLLM, so the same gap applies: its
+  # `VLLM_API_KEY` check guards only vLLM's own path prefixes. rocm-cli mounts
+  # the same middleware into the container and adds it through the AIM
+  # runtime's `AIM_ENGINE_ARGS`, then refuses to serve unless a keyless call to
+  # `/tokenize` is refused. The env, mount and refusal are unit-tested on every
+  # PR (`endpoint_auth` and the keyed `run_container`/`serve_http` tests in the
+  # AIM engine crate); this proves a real AIM image actually loads the
+  # middleware. `@nightly` for the same reason as serve-26: it pulls the image
+  # and a 9B checkpoint on a cold runner.
+  @id:serve-aim-key-guards-every-route @requires-gpu @requires-engine:aim @serve-timeout:1200 @nightly
+  Scenario: serve-63 - A key-protected AIM endpoint refuses keyless requests outside the OpenAI API
+    Given a managed runtime is active
+    And a model is being served on aim behind an API key
+    When a client calls the server's routes without the key
+    Then every route outside the OpenAI API refuses the call as unauthorized
+    And the health check answers without the key
+    When the client repeats those calls with the key
+    Then every one of those calls succeeds
+
   # ROCMAI-1058: when one of vLLM's compiled extensions fails to load (typically
   # built against a newer glibc than the host has), vLLM logs a warning, carries
   # on, and dies later on the first op that extension registers. `rocm serve`
@@ -1037,7 +1058,7 @@ Feature: Model serving
   # that the process died; every sentence asserted below is computed from that
   # log by the engine, so breaking the hint fails this scenario.
   @id:serve-vllm-extension-load-hint @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-63 - A launch that died on a vLLM compiled extension that did not load says so and points at diagnose
+  Scenario: serve-64 - A launch that died on a vLLM compiled extension that did not load says so and points at diagnose
     Given a managed vLLM launch whose compiled extension will fail to load
     When the user serves a model on that launch
     Then the startup failure names the vLLM compiled extension that did not load
