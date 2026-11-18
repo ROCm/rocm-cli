@@ -22,6 +22,7 @@
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use semver::Version;
+use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -31,7 +32,7 @@ const RELEASE_INDEX_URLS: [&str; 2] = [
     "https://stable.repo.amd.com/rocm/whl-next/rocm/",
 ];
 
-/// Seconds `curl` may spend on one listing before the leg fails.
+/// Seconds `curl` may spend on each attempt at one listing.
 const FETCH_TIMEOUT_SECS: &str = "60";
 
 /// One of the three legs of the self-hosted E2E `sdk_version` matrix.
@@ -51,6 +52,29 @@ impl ReleaseLabel {
             Self::Current => 0,
             Self::NMinus1 => 1,
             Self::NMinus2 => 2,
+        }
+    }
+
+    /// The key this label has in the JSON map [`resolve_pins`] prints.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::NMinus1 => "n-1",
+            Self::NMinus2 => "n-2",
+        }
+    }
+
+    /// The pin for this label from a map [`resolve_pins`] produced earlier in
+    /// the run, so every leg of one run pins the same versions even if a release
+    /// is published between legs. `Current` needs no entry; a missing entry for
+    /// `n-1`/`n-2` is an error, never a fall back to a live lookup.
+    pub fn pin_from(self, pins: &BTreeMap<String, String>) -> Result<Option<String>> {
+        if matches!(self, Self::Current) {
+            return Ok(None);
+        }
+        match pins.get(self.key()) {
+            Some(version) => Ok(Some(version.clone())),
+            None => bail!("no pin for {} in the resolved release pins", self.key()),
         }
     }
 
@@ -86,6 +110,39 @@ impl ReleaseLabel {
     }
 }
 
+/// Environment variable carrying [`resolve_pins`]'s JSON to each leg. An
+/// environment variable rather than a flag: JSON quotes do not survive
+/// PowerShell's native-argument passing on the Windows lane.
+pub const PINS_ENV: &str = "E2E_RELEASE_PINS";
+
+/// The pins a leg was handed through [`PINS_ENV`], or `None` when unset or
+/// empty (a local run, which then reads the live indexes itself).
+pub fn pins_from_env() -> Result<Option<BTreeMap<String, String>>> {
+    match std::env::var(PINS_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("{PINS_ENV} is not a JSON object of strings")),
+        _ => Ok(None),
+    }
+}
+
+/// The `n-1` and `n-2` pins resolved once, as the JSON object the workflow's
+/// `changes` job exports to every leg as [`PINS_ENV`].
+pub fn resolve_pins() -> Result<BTreeMap<String, String>> {
+    resolve_pins_with(curl_listing)
+}
+
+/// [`resolve_pins`] with the listing fetch injected, so tests need no network.
+fn resolve_pins_with(fetch: impl Fn(&str) -> Result<String>) -> Result<BTreeMap<String, String>> {
+    let mut pins = BTreeMap::new();
+    for label in [ReleaseLabel::NMinus1, ReleaseLabel::NMinus2] {
+        if let Some(version) = label.pin_with(&fetch)? {
+            pins.insert(label.key().to_owned(), version);
+        }
+    }
+    Ok(pins)
+}
+
 /// Every distinct final release named in the listings, newest first.
 fn newest_final_releases(listings: &[String]) -> Vec<String> {
     static PACKAGE_FILE: OnceLock<Regex> = OnceLock::new();
@@ -117,6 +174,9 @@ fn newest_final_releases(listings: &[String]) -> Vec<String> {
 fn curl_listing(url: &str) -> Result<String> {
     let output = Command::new("curl")
         .args(["--fail", "--silent", "--show-error", "--location"])
+        // One blip must not fail a release-branch leg; mirrors the pre-warm's
+        // retry of its index reads.
+        .args(["--retry", "3", "--retry-connrefused"])
         .args(["--max-time", FETCH_TIMEOUT_SECS, url])
         .output()
         .context("failed to run curl")?;
@@ -132,8 +192,9 @@ fn curl_listing(url: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RELEASE_INDEX_URLS, ReleaseLabel, newest_final_releases};
+    use super::{RELEASE_INDEX_URLS, ReleaseLabel, newest_final_releases, resolve_pins_with};
     use anyhow::{Result, anyhow};
+    use std::collections::BTreeMap;
 
     const CANONICAL: &str = r#"
 <a href="rocm-7.13.0-py3-none-linux_x86_64.whl">rocm-7.13.0-py3-none-linux_x86_64.whl</a><br/>
@@ -217,5 +278,27 @@ mod tests {
             text.contains("3 newest") && text.contains("only 1: 10.0.0"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn resolved_pins_are_what_every_leg_uses() {
+        let pins = resolve_pins_with(serve(CANONICAL, NEXT)).unwrap();
+        assert_eq!(pins["n-1"], "10.0.0");
+        assert_eq!(pins["n-2"], "7.14.1");
+        // A leg reads the map, so a release published after it was resolved
+        // cannot move that leg's pin.
+        assert_eq!(
+            ReleaseLabel::NMinus1.pin_from(&pins).unwrap().as_deref(),
+            Some("10.0.0")
+        );
+        assert_eq!(ReleaseLabel::Current.pin_from(&pins).unwrap(), None);
+    }
+
+    #[test]
+    fn a_leg_with_no_resolved_pin_fails_instead_of_looking_it_up() {
+        let err = ReleaseLabel::NMinus2
+            .pin_from(&BTreeMap::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("n-2"), "{err}");
     }
 }

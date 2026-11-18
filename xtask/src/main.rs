@@ -316,10 +316,16 @@ pub(crate) enum Command {
         /// Pin the pre-warmed SDK to one of the three newest final releases
         /// listed on the release channel's package indexes (see
         /// `rocm_releases`), for the self-hosted sdk_version matrix. `current` tracks the channel's latest, same as
-        /// omitting `--version`/`--build-date` entirely.
+        /// omitting `--version`/`--build-date` entirely. When
+        /// `E2E_RELEASE_PINS` holds the JSON `release-pins` printed, `n-1`/`n-2`
+        /// use those versions instead of reading the indexes again.
         #[arg(long, conflicts_with_all = ["version", "build_date"])]
         release_label: Option<rocm_releases::ReleaseLabel>,
     },
+    /// Print, as one JSON object, the versions `n-1` and `n-2` resolve to on the
+    /// release channel's package indexes right now. The E2E workflow's `changes`
+    /// job runs it once and hands the result to every sdk_version leg.
+    ReleasePins,
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
     /// stdout for `$GITHUB_STEP_SUMMARY`.
@@ -490,7 +496,10 @@ fn run() -> Result<()> {
             release_label,
         } => {
             let resolved_version = match release_label {
-                Some(label) => label.pin()?,
+                Some(label) => match rocm_releases::pins_from_env()? {
+                    Some(pins) => label.pin_from(&pins)?,
+                    None => label.pin()?,
+                },
                 None => version,
             };
             e2e_prewarm::run(
@@ -500,6 +509,12 @@ fn run() -> Result<()> {
                 resolved_version.as_deref(),
                 build_date.as_deref(),
             )?;
+        }
+        Command::ReleasePins => {
+            println!(
+                "{}",
+                serde_json::to_string(&rocm_releases::resolve_pins()?)?
+            );
         }
         Command::E2eReport {
             artifacts_dir,

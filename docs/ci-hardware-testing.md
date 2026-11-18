@@ -532,8 +532,12 @@ different TheRock SDK version (`current` tracks the channel's latest;
 `n-1`/`n-2` pin the prior two final releases, read at run time from the
 release channel's package indexes by
 [`xtask/src/rocm_releases.rs`](../xtask/src/rocm_releases.rs)). The lookup
-merges the ROCm 7 and ROCm 10 indexes and fails the leg if either is
-unreachable, so a new release moves the pins with no edit.
+merges the ROCm 7 and ROCm 10 indexes and fails if either is unreachable
+(each listing is fetched with up to three `curl` retries), so a new release
+moves the pins with no edit. The `changes` job resolves the pins once with
+`cargo xtask release-pins` and hands them to every leg as `E2E_RELEASE_PINS`,
+so all legs of one run pin the same versions even if a release is published
+mid-run.
 Off a release-branch push the matrix resolves to `[current]` only, so an
 ordinary PR run is unaffected. Each leg uploads its own artifact (the
 `-n-1`/`-n-2` suffix above); the pre-warm's runtime-key design lets all three
