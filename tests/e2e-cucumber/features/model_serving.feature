@@ -256,6 +256,11 @@ Feature: Model serving
   # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
   # set resolves on one GPU too and it stays ungated.
+  #
+  # Needs a job that can reach more than one GPU, counted by what the kernel
+  # exposes to the job rather than the cards on the bus, so it skips on lanes
+  # that grant a job a single GPU even when the host has several. That is a
+  # known coverage gap.
   @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
     When the user serves a model pinned past the ROCR-reindexed visible set
