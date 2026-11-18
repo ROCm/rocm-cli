@@ -553,13 +553,21 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         // whole context, so the one tool call a small model reaches for when
         // asked what it can run ended the turn with a provider error. The
         // verbose dump is still reachable, but only when it was asked for.
+        //
+        // Both measure the host the same way `Command::Model` in `main.rs`
+        // does. An assistant asked what this machine can run must get the
+        // answer a person typing `rocm model` gets, and the recommendation
+        // list is narrowed to the host's memory — so passing no host facts
+        // here would hand the assistant the unnarrowed list while the terminal
+        // showed the narrowed one.
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
         {
+            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_text_with_context_and_host(
                 Some(paths),
-                None,
-                None,
+                gpu_gib,
+                host_ram_gib,
             ))
         }
         [command, flag]
@@ -567,10 +575,11 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command.eq_ignore_ascii_case("models"))
                 && flag.eq_ignore_ascii_case("--verbose") =>
         {
+            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_verbose_text_with_context_and_host(
                 Some(paths),
-                None,
-                None,
+                gpu_gib,
+                host_ram_gib,
             ))
         }
         [command] if command.eq_ignore_ascii_case("daemon") => {
@@ -1382,8 +1391,15 @@ mod tests {
         .expect("read-only rocm_command model should run");
         let text = mcp_tool_result_text(&result);
 
-        // The same recipes, from the same renderer `rocm model` calls.
-        let curated = render_model_registry_text_with_context_and_host(Some(&paths), None, None);
+        // The same recipes, from the same renderer `rocm model` calls, measured
+        // the same way. Only a measured host narrows the list, so this cannot
+        // tell a matching narrowing from two unmeasured hosts where the test
+        // process reads no GPU -- `model-catalog-09` is the guard for that, on
+        // a lane that can plant a capacity. What this still pins is that the
+        // tool returns the curated listing rather than the verbose dump.
+        let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
+        let curated =
+            render_model_registry_text_with_context_and_host(Some(&paths), gpu_gib, host_ram_gib);
         assert!(
             text.contains(curated.trim()),
             "the tool must return what `rocm model` prints:\n{text}"

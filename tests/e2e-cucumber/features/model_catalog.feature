@@ -90,3 +90,14 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     Then the recommendations are not narrowed to this machine
     And the user is told the list is not specific to it
+
+  # An assistant answering "what can this machine run" reads the same listing
+  # through its tools. Same renderer, different caller -- so the host has to be
+  # measured on both paths, and a caller that passes none hands the assistant
+  # the unnarrowed list while the terminal shows the narrowed one.
+  @id:model-catalog-assistant-is-told-what-the-user-is-told @requires-os:linux
+  Scenario: model-catalog-09 - An assistant is told what the user is told
+    Given a machine whose GPU has room for only the smaller models
+    When the user asks which models are recommended
+    And an assistant on the same machine asks the same question through its tools
+    Then the assistant is given the same recommendations the user saw

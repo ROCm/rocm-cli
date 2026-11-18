@@ -254,12 +254,14 @@ fn plant_gpu_capacity_gib(world: &mut E2eWorld, total_gib: u32) {
         .push(("ROCM_E2E_FORCE_GPU_TOTAL_GIB", total_gib.to_string().into()));
 }
 
-/// 8 GiB: above the four small GGUF/safetensors recipes, below every recipe
-/// the `featured` flag used to select, which is the defect these scenarios are
+/// Above the four small GGUF/safetensors recipes, below every recipe the
+/// `featured` flag used to select, which is the defect these scenarios are
 /// about.
+const SMALL_GPU_TOTAL_GIB: u32 = 8;
+
 #[given("a machine whose GPU has room for only the smaller models")]
 async fn a_small_gpu_machine(world: &mut E2eWorld) {
-    plant_gpu_capacity_gib(world, 8);
+    plant_gpu_capacity_gib(world, SMALL_GPU_TOTAL_GIB);
 }
 
 #[given("a machine whose GPU is too small for any curated model")]
@@ -272,6 +274,45 @@ async fn a_tiny_gpu_machine(world: &mut E2eWorld) {
 #[given("a machine whose GPU memory cannot be read")]
 async fn an_unmeasured_machine(world: &mut E2eWorld) {
     let _ = world;
+}
+
+/// The same question through the assistant's tool, on the same machine.
+///
+/// The capacity is planted again because `command_env` is for the *next* `rocm`
+/// invocation and the user's own run already consumed it; without this the
+/// assistant would be asked on an unmeasured host, which matches an unnarrowed
+/// reply whether or not the tool path measures anything.
+#[when("an assistant on the same machine asks the same question through its tools")]
+async fn assistant_asks_the_same_question(world: &mut E2eWorld) {
+    let user_saw = world
+        .cli_output
+        .take()
+        .expect("the user's own listing must be captured first");
+    plant_gpu_capacity_gib(world, SMALL_GPU_TOTAL_GIB);
+    let arguments = serde_json::json!({ "args": ["model"] }).to_string();
+    let (stdout, _, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["mcp-call", "rocm_command", "--arguments-json", &arguments],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+    world.cli_outputs = Some(vec![user_saw]);
+}
+
+#[then("the assistant is given the same recommendations the user saw")]
+async fn assert_the_assistant_matches_the_user(world: &mut E2eWorld) {
+    let user_saw = world
+        .cli_outputs
+        .as_ref()
+        .and_then(|outputs| outputs.first())
+        .expect("the user's listing was not captured")
+        .clone();
+    let assistant_saw = catalog_text_from_the_tool(world);
+    assert!(
+        assistant_saw.contains(user_saw.trim()),
+        "an assistant asked what this machine can run must be given the answer the user was \
+         given.\nthe user saw:\n{user_saw}\nthe assistant saw:\n{assistant_saw}"
+    );
 }
 
 #[when("the user asks which models are recommended")]
