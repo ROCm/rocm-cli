@@ -375,6 +375,32 @@ fallback paired an architecture line with the wrong GPU. On that machine
 `rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
 discrete card does have ROCm support, so the whole-machine claim is false.
 
+On Linux, check that each GPU keeps its own identity when the ROCm runtime
+cannot see all of them. On a host with two or more AMD GPUs and ROCm installed,
+hide one card from the runtime and inspect:
+
+```bash
+ROCR_VISIBLE_DEVICES=0 rocm examine --json
+```
+
+Match the `gpus[]` entries by `pci_id` against `lspci -D`. Every listed card
+must keep its own `gfx_target`, name and `is_apu`. The hidden card keeps the
+`gfx_target` the kernel gives it, and does **not** carry the visible card's
+model name or verdict; it may show the kernel-topology placeholder name. A
+hidden card carrying another card's name, target or `is_apu` means `rocminfo`'s
+agents were paired with the wrong GPU.
+
+Then run `rocm examine --json` once with no override set, and once with
+`HSA_OVERRIDE_GFX_VERSION` set to a value that names a different target from
+every card's own (on a gfx1151 or gfx1103 host, `11.0.0`, which names gfx1100;
+an override that names a card's own target cannot show anything). Every card's
+`gfx_target` must be the same in both runs, the native one, and an integrated
+GPU must still read `is_apu: true`. To read the native target from the kernel
+instead, `grep gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties`
+gives a decimal value per GPU node: major is `v / 10000`, minor is
+`(v / 100) % 100` and stepping is `v % 100`, with minor and stepping written as
+hex digits, so `110001` is gfx1101 and `90010` is gfx90a.
+
 ## 2b. Bare-Metal Driver Install
 
 On a real apt/dnf/zypper Linux host:
@@ -1189,8 +1215,12 @@ Expected result:
   that was open when you pressed `q` (the Esc menu, Options, Detail, Theme
   Picker, Help, …) is closed along with the prompt, not restored. A manager
   overlay (Services, the Serve wizard, …) can never be the thing that was
-  open in this state at all: its own `q` closes that overlay first, so the
-  prompt only ever opens with none of them open.
+  open in this state at all: its own `q` is consumed by that overlay first, so
+  the prompt only ever opens with none of them open. For most overlays that `q`
+  closes them outright; on the Serve wizard's console for a launch that is
+  still starting, it opens that wizard's own "leave the running serve?"
+  confirmation instead, and only answering `y` there leaves — so reaching this
+  quit prompt from it takes one extra keystroke.
 - Confirming (`y`/Enter) exits immediately, and `rocm services list --all`
   afterward still shows the model as `ready`/`running` — quitting never
   stops it.
@@ -1563,6 +1593,68 @@ On some GPU families `rocm install sdk` installs vLLM itself
 `expected_divergence` block appear at the end of that command, a step earlier;
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
+
+### 6d. Naming the engine instead of editing the error
+
+Take the failing line from 6a without any `vllm` in it (the
+`torch.OutOfMemoryError: HIP out of memory ...` line from
+`rocm services logs <service-id>`), and diagnose it as is, then with the engine
+named:
+
+```bash
+rocm diagnose --symptom '<the line, unedited>' --json
+rocm diagnose --symptom '<the line, unedited>' --engine vllm --json
+```
+
+Expected result:
+
+- The first reports no vLLM out-of-memory cause: the line alone could be any
+  PyTorch program's.
+- The second reports `fix-16-vllm-oom`, with the same score and evidence as
+  `rocm diagnose --symptom 'vllm: <the line>' --json`, and its `provenance`
+  holds `"engine": "vllm"` and your line exactly as you passed it once the
+  JSON is decoded. A line with non-ASCII text in it (an accented path, a
+  box-drawing character) prints as `\uXXXX` escapes, and every byte of the
+  output is ASCII; `python -c "import json,sys;
+  print(json.load(sys.stdin)['provenance']['symptom'])"` prints it back as
+  you pasted it.
+- `--engine lemonade` (or any other value) is refused with a usage error that
+  lists `vllm`, and nothing is diagnosed. `--engine` with neither `--symptom`
+  nor `--symptom-file` is refused too.
+- In bash, `rocm diagnose --symptom-file - --engine vllm --json <<'EOF'`, then
+  the line and `EOF`, gives the same result as the second command, and its
+  `provenance.symptom` is your line without the heredoc's final line break.
+
+Then ask what a report would carry, with a line that names something of yours
+(a home-directory path or the host name) appended to the paste:
+
+```bash
+rocm diagnose --engine vllm --report \
+  --symptom '<the line> at /home/<you>/serve.py on <host>'
+```
+
+Expected result: the report (or, on hardware not on the compatibility matrix,
+the refusal) and the mail link under it carry no part of your paste and no
+`provenance`. On bare-metal Linux with a GPU on the matrix, its `entry` is
+`fix-16-vllm-oom`, which is the only thing the paste contributes (WSL is not
+inspected for a report yet, and native Windows has no vLLM entry). It says
+nothing has been sent. Do not add `--send` for this check unless you mean to
+open a mail.
+
+Last, the text report, with no `--json`:
+
+```bash
+rocm diagnose --symptom '<the line, unedited>' --engine vllm
+```
+
+Expected result: the first line names the engine. On Linux and WSL it reads
+`Engine: vllm (named with --engine; every non-blank line of the symptom was
+read as vllm's).` and the vLLM out-of-memory cause follows. The line says how
+the symptom was read, not that anything matched: with an unrelated paste (a
+plain Python traceback) it is the same line and no vLLM cause follows. On native
+Windows it reads `Engine: vllm (named with --engine; no entry for vllm exists
+on this OS, so the flag changed nothing).`, and the rest of the report is the
+same as without `--engine`.
 
 ## 7. vLLM Endpoint Key Coverage
 
@@ -2173,3 +2265,78 @@ Expected result:
   could not be started: it was not found; nothing was changed.`, exits 4, and
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
+
+## 18. Settings Changed From Several Terminals At Once
+
+Commands that change settings take turns on `config.json`, so none of them
+undoes another's change. Scenario `config-12` checks this on the mock lane; this
+is the same check by hand. It runs on a scratch config, data and cache folder,
+set only inside the loops, so your own settings and audit log are untouched and
+your shell is left as it was. The scratch folder is removed at the end.
+
+In PowerShell:
+
+```powershell
+$scratch = Join-Path $env:TEMP "rocm-config-race"
+$jobs = @(
+  @('set-default-engine', 'lemonade', 'aim', 'default_engine'),
+  @('set-telemetry', 'local', 'off', 'telemetry.mode'),
+  @('set-permissions', 'ask', 'full-access', 'permissions.mode')
+) | ForEach-Object {
+  Start-Job -ArgumentList $_, $scratch -ScriptBlock {
+    param($w, $scratch)
+    $env:ROCM_CLI_CONFIG_DIR = "$scratch\config"
+    $env:ROCM_CLI_DATA_DIR = "$scratch\data"
+    $env:ROCM_CLI_CACHE_DIR = "$scratch\cache"
+    $lost = 0
+    $failed = 0
+    for ($i = 0; $i -lt 50; $i++) {
+      $value = $w[1 + ($i % 2)]
+      if ($i -gt 0) {
+        $json = Get-Content "$scratch\config\config.json" -Raw | ConvertFrom-Json
+        $found = $json
+        foreach ($part in $w[3].Split('.')) { $found = $found.$part }
+        $previous = ($w[1 + (($i - 1) % 2)]).Replace('-', '_')
+        if ($found -ne $previous) { $lost++ }
+      }
+      rocm config $w[0] $value | Out-Null
+      if ($LASTEXITCODE -ne 0) { $failed++ }
+    }
+    "$($w[0]): lost $lost, failed $failed"
+  }
+}
+$jobs | Wait-Job | Receive-Job
+Get-ChildItem "$scratch\config" | Select-Object -ExpandProperty Name
+Remove-Item -Recurse -Force $scratch
+```
+
+In WSL or on Linux (needs `jq`):
+
+```bash
+scratch=$(mktemp -d)
+writer() {  # setter, its two values, where the setting sits in config.json
+  local lost=0 failed=0 i value previous
+  for i in $(seq 0 49); do
+    if [ $((i % 2)) -eq 0 ]; then value=$2 previous=$3; else value=$3 previous=$2; fi
+    if [ "$i" -gt 0 ] && [ "$(jq -r "$4" "$scratch/config/config.json")" != "${previous//-/_}" ]; then
+      lost=$((lost + 1))
+    fi
+    ROCM_CLI_CONFIG_DIR=$scratch/config ROCM_CLI_DATA_DIR=$scratch/data \
+      ROCM_CLI_CACHE_DIR=$scratch/cache rocm config "$1" "$value" >/dev/null \
+      || failed=$((failed + 1))
+  done
+  echo "$1: lost $lost, failed $failed"
+}
+writer set-default-engine lemonade aim .default_engine &
+writer set-telemetry local off .telemetry.mode &
+writer set-permissions ask full-access .permissions.mode &
+wait
+ls "$scratch/config"
+rm -rf "$scratch"
+```
+
+Expected result:
+
+- Each loop prints `lost 0, failed 0`.
+- The scratch config folder lists `config.json` and `config.json.lock`; the
+  lock file is expected and stays beside the settings.

@@ -458,7 +458,7 @@ Windows. The Vulkan driver version is not shown.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT | --symptom-file PATH] [--top N] [--json] [--distro [NAME] | --report [--send]]
+rocm diagnose [--symptom TEXT [--engine vllm] | --symptom-file PATH [--engine vllm]] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
@@ -518,6 +518,23 @@ position.
   contribute to, once the text contributed to any match in the report. That
   includes one past `--top`, so all the rows shown can carry the line when the
   only match the text contributed to was cut off.
+- `--engine` names the engine the symptom came from (only `vllm` is
+  accepted; it needs `--symptom` or `--symptom-file`). An engine's own error
+  is often a line any program could print, such as a PyTorch out-of-memory
+  error, and the vLLM entry claims only lines that name vLLM. With
+  `--engine vllm`, every non-blank line of the symptom is taken as vLLM's, so
+  the error is matched without editing it. The text report opens with a line
+  naming the engine; where no entry on this OS reads it (native Windows has
+  no vLLM entry), that line says the flag changed nothing. The `--json`
+  diagnosis records the engine and the symptom, exactly as given once the
+  JSON is decoded (for `--symptom-file`, the text read, minus the one
+  trailing line break), under `provenance`. On the wire `--json` is ASCII:
+  any non-ASCII character in the paste is written as a `\uXXXX` escape, so a
+  Windows console shows no mojibake and any JSON parser reads the paste back
+  unchanged. A `--report` never carries either: it names only the cause
+  the diagnosis established, so a pasted log's paths or host names stay out
+  of what you might mail. Writing `vllm` into the symptom text still works
+  too.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
@@ -1975,7 +1992,15 @@ Settings live in `config.json` in the config directory and are replaced in one
 step, so an interrupted save leaves the previous file rather than a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
+it back to `config.json` before running another command. Commands that change
+settings at the same time, from two terminals or a script, take turns: each
+reads the file only once the previous change is saved, so none of them undoes
+another's change. One that waits more than 30 seconds for its turn stops with
+an error saying it did not save its change to the file. The
+turn-taking goes through `config.json.lock` beside the file, so a config
+directory where that file cannot be created, such as a read-only one, refuses
+every settings change. The lock file can stay there and must not be deleted
+while a command is running. If the file exists
 but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records

@@ -31,7 +31,8 @@ use rocm_core::{
 use rocm_engine_protocol::{EngineMethod, InstallRequest, InstallResponse};
 
 use crate::engine_install_env::{
-    engine_manages_own_runtime, env_root_for_engine_install, runtime_key_for_python,
+    engine_manages_own_runtime, env_root_for_engine_install, record_engine_install,
+    runtime_key_for_python,
 };
 use crate::engine_ipc::engine_request_with_env_root;
 use crate::runtimes_cmd::{
@@ -167,7 +168,7 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
 
     ensure_openmpi_for_vllm(approved)?;
 
-    let mut config = RocmCliConfig::load(paths)?;
+    let config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
     let response = match engine_request_with_env_root::<_, InstallResponse>(
         Some(paths),
@@ -210,14 +211,12 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
     if response.managed_env == Some(false) {
         println!("  note: external runtime");
     } else {
-        let engine_config = config.engine_config_mut(engine);
-        engine_config.last_installed_runtime_id = Some(finalized.runtime_key.clone());
-        engine_config.last_installed_env_id = Some(response.env_id.clone());
-        if engine_config.preferred_runtime_id.is_none() && engine_config.preferred_env_id.is_none()
-        {
-            engine_config.preferred_env_id = Some(response.env_id.clone());
-        }
-        config.save(paths)?;
+        record_engine_install(
+            paths,
+            engine,
+            &finalized.runtime_key,
+            Some(&response.env_id),
+        )?;
 
         settle_engine_install(paths, engine, &finalized.runtime_key, &response)?;
     }
@@ -1039,21 +1038,22 @@ pub(crate) fn finalize_successful_sdk_install(
     let Some(manifest) = newest_installed_runtime_manifest(paths)? else {
         return Ok(None);
     };
-    let mut config = RocmCliConfig::load(paths)?;
-    config.setup.completed = true;
-    config.setup.therock_venv = Some(manifest.install_root.clone());
-    config.save(paths)?;
+    let config = RocmCliConfig::update(paths, |config| {
+        config.setup.completed = true;
+        config.setup.therock_venv = Some(manifest.install_root.clone());
+        Ok(config.clone())
+    })?;
 
     let activation_paths = paths
         .clone()
         .with_managed_root(manifest.install_root.clone(), false);
+    // `activate_runtime` loads the settings again under the config lock and
+    // records only the activation in them; the setup fields were saved above.
     if paths.config_dir != activation_paths.config_dir
         || paths.data_dir != activation_paths.data_dir
     {
         recover_setup_runtime_registration(paths, &config)?;
-        let mut current_config = RocmCliConfig::load(paths)?;
-        current_config.setup.completed = true;
-        current_config.setup.therock_venv = Some(manifest.install_root.clone());
+        let mut current_config = config.clone();
         // This activation re-activates in the caller's original root. The
         // user-facing reconciliation report comes from the activation against
         // `activation_paths` below, so the result here is intentionally discarded.
@@ -1062,9 +1062,7 @@ pub(crate) fn finalize_successful_sdk_install(
 
     recover_setup_runtime_registration(&activation_paths, &config)?;
 
-    let mut config = RocmCliConfig::load(&activation_paths)?;
-    config.setup.completed = true;
-    config.setup.therock_venv = Some(manifest.install_root.clone());
+    let mut config = config;
     let activation = activate_runtime(&activation_paths, &mut config, &manifest.runtime_key)?;
 
     Ok(Some(SdkInstallFinalization {

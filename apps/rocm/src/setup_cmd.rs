@@ -35,13 +35,13 @@ use crate::therock;
 
 pub(crate) fn setup(command: Option<SetupCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let mut config = RocmCliConfig::load(&paths)?;
     match command.unwrap_or(SetupCommand::Status) {
         SetupCommand::Status => {
+            let config = RocmCliConfig::load(&paths)?;
             print!("{}", render_setup_status_text(&paths, &config)?);
         }
         SetupCommand::Reset { yes: _ } => {
-            print!("{}", reset_setup_prompt_state(&paths, &mut config)?);
+            print!("{}", reset_setup_prompt_state(&paths)?);
         }
     }
     Ok(())
@@ -97,10 +97,12 @@ pub(crate) fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig)
     Ok(output)
 }
 
-fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Result<String> {
-    config.onboarding_dismissed = false;
-    config.setup.completed = false;
-    config.save(paths)?;
+fn reset_setup_prompt_state(paths: &AppPaths) -> Result<String> {
+    RocmCliConfig::update(paths, |config| {
+        config.onboarding_dismissed = false;
+        config.setup.completed = false;
+        Ok(())
+    })?;
     Ok([
         "Onboarding will not reopen automatically - open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
@@ -133,7 +135,7 @@ mod tests {
         config.provider_config_mut("openai").enabled = true;
         config.save(&paths)?;
 
-        let rendered = reset_setup_prompt_state(&paths, &mut config)?;
+        let rendered = reset_setup_prompt_state(&paths)?;
 
         // The claim itself (onboarding only opens via an explicit `n` on the
         // Observe tab, never automatically) is proven by

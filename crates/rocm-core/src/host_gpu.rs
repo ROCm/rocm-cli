@@ -71,6 +71,7 @@ use linux::detect_linux_amdgpu_driver_version;
 use linux::detect_linux_primary_gpu_name;
 pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
+pub(crate) use linux::pci_bus_device_function;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;

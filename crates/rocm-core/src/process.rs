@@ -672,11 +672,30 @@ impl FileLock {
     /// Fails when the lock file cannot be created/locked, or when another
     /// holder keeps it for the whole timeout.
     pub fn acquire_bounded(path: impl Into<PathBuf>, timeout: Duration) -> Result<Self> {
+        let path = path.into();
+        match Self::try_acquire_within(&path, timeout)? {
+            Some(lock) => Ok(lock),
+            None => bail!(
+                "timed out after {timeout:?} waiting for the lock at {path}; another \
+                 `rocm serve` launch or `rocmd` recovery is mid-transaction. Retry in a \
+                 moment, and check `rocm services` for a stuck launch.",
+                path = path.display()
+            ),
+        }
+    }
+
+    /// Like [`Self::acquire_bounded`], but `Ok(None)` once `timeout` has
+    /// elapsed with another holder still in place, so the caller words the
+    /// timeout for its own lock.
+    ///
+    /// # Errors
+    /// Fails when the lock file cannot be created or locked.
+    pub fn try_acquire_within(path: impl Into<PathBuf>, timeout: Duration) -> Result<Option<Self>> {
         let (file, path) = Self::open(path.into())?;
         let deadline = Instant::now() + timeout;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Self { file, path }),
+                Ok(()) => return Ok(Some(Self { file, path })),
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(error)) => {
                     return Err(anyhow::Error::new(error)
@@ -685,19 +704,15 @@ impl FileLock {
             }
             let now = Instant::now();
             if now >= deadline {
-                bail!(
-                    "timed out after {timeout:?} waiting for the lock at {path}; another \
-                     `rocm serve` launch or `rocmd` recovery is mid-transaction. Retry in a \
-                     moment, and check `rocm services` for a stuck launch.",
-                    path = path.display()
-                );
+                return Ok(None);
             }
             thread::sleep(FILE_LOCK_BOUNDED_POLL.min(deadline - now));
         }
     }
 }
 
-/// Polling interval used while waiting on [`FileLock::acquire_bounded`].
+/// Polling interval used while waiting on [`FileLock::acquire_bounded`] and
+/// [`FileLock::try_acquire_within`].
 const FILE_LOCK_BOUNDED_POLL: Duration = Duration::from_millis(25);
 
 /// Total time `rocmd`'s automatic recovery waits for the launch lock.

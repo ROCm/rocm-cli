@@ -93,11 +93,11 @@ pub use command_capture::{
     CommandCapture, CommandOutcome, command_capture_text, run_rocm_capture_with_env,
 };
 pub use config::{
-    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
-    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
-    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
-    WatcherUserConfig, builtin_watcher, builtin_watchers,
+    AutomationsConfig, BuiltinWatcherSpec, CONFIG_LOCK_TIMEOUT, ConfigLock, DashboardConfig,
+    DashboardDaemonConfig, DashboardTuiConfig, EngineUserConfig, ManagedToolConfig,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig,
+    RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig,
+    WatcherMode, WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
 pub use confirm::{interactive_terminal, require_yes_or_interactive};
 pub use crypto::{
@@ -105,8 +105,9 @@ pub use crypto::{
     verify_rsa_pkcs1_sha256_signature,
 };
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, Route, VLLM_IMPORT_CANONICAL_SYMPTOM,
-    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
+    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
     render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
     vllm_oom_symptom_is_diagnosable,
 };
