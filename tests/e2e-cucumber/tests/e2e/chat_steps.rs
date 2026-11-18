@@ -28,6 +28,15 @@ async fn setup_model_server(world: &mut E2eWorld) {
     world.mock = Some(mock);
 }
 
+#[given(expr = "the model endpoint serves {string} and the CLI registered {string}")]
+async fn register_served_alias(world: &mut E2eWorld, served: String, registered: String) {
+    let mock = MockServer::start(&served).await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(registered);
+    world.mock = Some(mock);
+    world.register_mock_service();
+}
+
 #[given("the model is registered with the CLI")]
 async fn register_model_with_cli(world: &mut E2eWorld) {
     world.register_mock_service();
@@ -111,6 +120,26 @@ async fn user_pipes_oneshot_chat(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[when("the user lists running services as JSON")]
+async fn list_services_as_json(world: &mut E2eWorld) {
+    world.cli_output = Some(crate::run_rocm_ok(world, &["services", "list", "--json"]));
+}
+
+#[then(expr = "the registered model has status {string}")]
+async fn assert_registered_model_status(world: &mut E2eWorld, status: String) {
+    let output = world
+        .cli_output
+        .as_deref()
+        .expect("no services query was run");
+    let records: Vec<serde_json::Value> = serde_json::from_str(output).expect("service list JSON");
+    assert_eq!(records.len(), 1, "{output}");
+    assert_eq!(
+        records[0]["model_ref"].as_str(),
+        world.model_name.as_deref()
+    );
+    assert_eq!(records[0]["status"], status, "{output}");
+}
 
 #[then("the served model is listed")]
 async fn assert_model_listed(world: &mut E2eWorld) {

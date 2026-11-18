@@ -872,7 +872,11 @@ fn validate_model_recipe_engine_record(
 }
 
 pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
-    builtin_model_catalog_document().recipes.clone()
+    builtin_model_recipe_entries().to_vec()
+}
+
+pub(crate) fn builtin_model_recipe_entries() -> &'static [ModelRecipeRecord] {
+    &builtin_model_catalog_document().recipes
 }
 
 /// The curated fallback catalog shipped inside the binary. It is authored as JSON

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::atomic_write::write_file_atomically;
-use crate::model_catalog::builtin_model_recipes;
+use crate::model_catalog::builtin_model_recipe_entries;
 use crate::net::{http_get_text_with_auth, http_post_json_with_auth};
 use crate::process::FileLock;
 use crate::service_record::{
@@ -491,19 +491,28 @@ fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
 fn model_refs_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
-    if left.eq_ignore_ascii_case(right) || model_ref_basename(left).eq_ignore_ascii_case(right) {
-        return true;
-    }
-    if model_ref_basename(right).eq_ignore_ascii_case(left)
-        || model_ref_basename(left).eq_ignore_ascii_case(model_ref_basename(right))
+    if left.eq_ignore_ascii_case(right)
+        || model_ref_family_matches(left, right)
+        || model_ref_family_matches(right, left)
     {
         return true;
     }
-    builtin_model_recipes().into_iter().any(|recipe| {
-        (recipe.matches_ref(left) || recipe.matches_ref(right))
-            && (recipe.matches_ref(left) && recipe.matches_ref(right))
-    }) || model_ref_family_matches(left, right)
-        || model_ref_family_matches(right, left)
+
+    // Only fall back to basenames when the catalog cannot identify both names.
+    // An alias can be the basename of a different recipe (e.g. qwen3-32b).
+    let mut left_known = false;
+    let mut right_known = false;
+    for recipe in builtin_model_recipe_entries() {
+        let matches_left = recipe.matches_ref(left);
+        let matches_right = recipe.matches_ref(right);
+        if matches_left && matches_right {
+            return true;
+        }
+        left_known |= matches_left;
+        right_known |= matches_right;
+    }
+    !(left_known && right_known)
+        && model_ref_basename(left).eq_ignore_ascii_case(model_ref_basename(right))
 }
 
 fn model_ref_basename(value: &str) -> &str {

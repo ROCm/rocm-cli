@@ -52,3 +52,14 @@ Feature: Native HTTP networking
     When the user serves a model bound to a non-canonical host without an explicit port
     Then serving is refused before any engine starts
     And the user is told to pass an explicit port for that host
+
+  @id:networking-model-alias-readiness
+  Scenario Outline: networking-05 - The listed service must match the recipe owning the served alias
+    Given the model endpoint serves "qwen3-32b" and the CLI registered "<recipe>"
+    When the user lists running services as JSON
+    Then the registered model has status "<status>"
+
+    Examples:
+      | recipe             | status   |
+      | Qwen/Qwen3-32B     | starting |
+      | Qwen/Qwen3-32B-FP8 | ready    |
