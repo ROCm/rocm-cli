@@ -1365,16 +1365,17 @@ directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather 
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
-With the vLLM engine, an endpoint bound to a public interface
+With the vLLM and AIM engines, an endpoint bound to a public interface
 (`--allow-public-bind`), or served with `--require-api-key`, answers only
 clients that present its API key as an `Authorization: Bearer` header, on every
 route the server answers, not just the OpenAI `/v1` API — including vLLM's own
 `/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
-CORS preflights: the `/health` liveness check stays open. The AIM engine runs
-the same vLLM server inside its container but does not install this check, so
-a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
-leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
-without the key.
+CORS preflights: the `/health` liveness check stays open. An AIM container gets
+this check through `AIM_ENGINE_ARGS`; one whose image does not apply it fails to
+start and its container is removed, rather than serving with only `/v1`
+protected. A key-protected AIM launch also refuses to start when it cannot read
+the image's config, or when `AIM_ENGINE_ARGS` (from `--engine-env` or the image)
+is not a JSON object or already names a `middleware`.
 
 Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
 key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
