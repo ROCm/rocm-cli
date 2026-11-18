@@ -106,8 +106,9 @@ pub use crypto::{
     verify_rsa_pkcs1_sha256_signature,
 };
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, Route, VLLM_IMPORT_CANONICAL_SYMPTOM,
-    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
+    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
     render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
     vllm_oom_symptom_is_diagnosable,
 };

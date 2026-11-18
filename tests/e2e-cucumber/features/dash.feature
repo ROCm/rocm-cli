@@ -970,5 +970,33 @@ Feature: Interactive dashboard
     Then no loaded model is displayed and none are reported as discovered
     When the user selects engine status in the Serving view
     Then Lemonade returns to the managed installation status without external availability
+
+  # ROCMAI-1042: on a short terminal the Esc menu drew its bordered modal and
+  # nothing inside it — the wordmark plus all three rows did not fit, and the
+  # only guard was all-or-nothing. The selection stayed live behind the empty
+  # box, so ↑/↓ and Enter still worked on rows nobody could see.
+  #
+  # dash-34 already opens this menu, but only at the default geometry, where
+  # the logo layout fits and the bug is invisible. The unit sweep beside
+  # `ui/menu.rs` covers every height against the layout functions; this is the
+  # one place the real event loop, the real SIGWINCH resize and the real
+  # terminal are in the picture, which is where the empty box was actually
+  # seen.
+  #
+  # The box at this size holds two of the three rows, so what is asserted is
+  # the SELECTED row — drawn with its cursor and its whole label, before and
+  # after a move. That covers both halves of the fix: the fallback draws
+  # instead of returning, and its width floor keeps what it draws legible.
+  @id:dash-esc-menu-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-55 - The Esc menu still shows its selected action on a terminal too short for the logo
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user shrinks the terminal below the Esc menu's logo layout
+    And the user presses Escape
+    Then the dashboard menu shows Options as the selected action
+    When the user moves the dashboard menu selection down
+    Then the dashboard menu shows Help as the selected action
+    When the user presses Escape
+    Then the dashboard menu is closed
     When the user quits the dashboard
     Then the dashboard exits successfully

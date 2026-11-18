@@ -458,7 +458,7 @@ Windows. The Vulkan driver version is not shown.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT | --symptom-file PATH] [--top N] [--json] [--distro [NAME] | --report [--send]]
+rocm diagnose [--symptom TEXT [--engine vllm] | --symptom-file PATH [--engine vllm]] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
@@ -518,6 +518,23 @@ position.
   contribute to, once the text contributed to any match in the report. That
   includes one past `--top`, so all the rows shown can carry the line when the
   only match the text contributed to was cut off.
+- `--engine` names the engine the symptom came from (only `vllm` is
+  accepted; it needs `--symptom` or `--symptom-file`). An engine's own error
+  is often a line any program could print, such as a PyTorch out-of-memory
+  error, and the vLLM entry claims only lines that name vLLM. With
+  `--engine vllm`, every non-blank line of the symptom is taken as vLLM's, so
+  the error is matched without editing it. The text report opens with a line
+  naming the engine; where no entry on this OS reads it (native Windows has
+  no vLLM entry), that line says the flag changed nothing. The `--json`
+  diagnosis records the engine and the symptom, exactly as given once the
+  JSON is decoded (for `--symptom-file`, the text read, minus the one
+  trailing line break), under `provenance`. On the wire `--json` is ASCII:
+  any non-ASCII character in the paste is written as a `\uXXXX` escape, so a
+  Windows console shows no mojibake and any JSON parser reads the paste back
+  unchanged. A `--report` never carries either: it names only the cause
+  the diagnosis established, so a pasted log's paths or host names stay out
+  of what you might mail. Writing `vllm` into the symptom text still works
+  too.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such

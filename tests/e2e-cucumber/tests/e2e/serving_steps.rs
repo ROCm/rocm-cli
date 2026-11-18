@@ -4268,12 +4268,13 @@ async fn user_serves_model_requiring_api_key(world: &mut E2eWorld) {
 // early against an engine that never binds a port, so driving that path here
 // would cost the full 45s timeout for no extra coverage).
 
-/// Engine the scripted-engine scenarios launch under. Lemonade specifically:
-/// it is the only built-in engine whose "no active ROCm runtime configured"
-/// guard in `serve_cmd.rs` is unconditionally skipped (it manages its own
-/// runtime), so reaching the scripted dispatch only needs the no-GPU
-/// pre-flight and the self-managed-install call bypassed — not a fake ROCm
-/// runtime too. See `scripted_engine_death` in `serve_cmd.rs`.
+/// Engine the scripted-engine scenarios launch under. Lemonade because it
+/// manages its own runtime, so `serve_cmd.rs`'s "no active ROCm runtime
+/// configured" guard is skipped for it and reaching the scripted dispatch
+/// needs only the no-GPU pre-flight and the self-managed-install call
+/// bypassed — not a fake ROCm runtime too. Not the *only* engine that would
+/// do: `engine_manages_own_runtime` (`engine_install_env.rs`) answers true
+/// for `aim` as well. See `scripted_engine_death` in `serve_cmd.rs`.
 const SCRIPTED_ENGINE: &str = "lemonade";
 /// A short recipe name `resolve_lemonade_model_ref` resolves purely locally
 /// (no network, no GPU) — the same model `serve-18` already relies on this

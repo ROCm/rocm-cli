@@ -224,12 +224,14 @@ pub(crate) fn run_attached_service(
             // does not mean a crash (ROCMAI-541): check the manifest's stop
             // marker (`stop_requested_unix_ms`, set before any such external
             // stop signals anything — see
-            // `stop_internal_managed_service_confirmed_with`) and its
-            // `stopped` status before concluding one — see
-            // `managed_service_stop_was_requested`'s doc comment for why
-            // `rocmd`'s own restart-recovery watcher needs no such carve-out
-            // here. Only when neither is present is this an unexplained exit
-            // — i.e. a crash.
+            // `stop_internal_managed_service_confirmed_with`) and the settled
+            // marker that stop leaves behind (`settled_stop_unix_ms`) before
+            // concluding one. Not the record's status: see
+            // `managed_service_stop_was_requested`'s doc comment for why the
+            // status is no evidence at all, and for why `rocmd`'s own
+            // restart-recovery watcher needs no carve-out here. Only when
+            // neither marker is present is this an unexplained exit — i.e. a
+            // crash.
             if stop_seen_while_attached || managed_service_stop_was_requested(paths, &service_id) {
                 println!("server process exited");
                 println!("  service_id: {service_id}");

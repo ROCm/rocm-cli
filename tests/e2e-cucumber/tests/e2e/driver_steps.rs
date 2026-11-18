@@ -190,11 +190,63 @@ async fn assert_driver_plan_verifies_download(world: &mut E2eWorld) {
         .expect("plan verifies the download");
     let install = commands
         .iter()
-        .position(|line| line.contains("apt-get install -y '/tmp/"))
+        .position(|line| line.contains("apt-get install -y '") && line.contains("rocdxg-roct_"))
         .expect("plan installs the package");
     assert!(
         check < install,
         "digest must be checked before the root install:\n{output}"
+    );
+}
+
+#[then("the driver plan installs only a package no other local user could have replaced")]
+async fn assert_driver_plan_stages_privately(world: &mut E2eWorld) {
+    // The package's maintainer scripts run as root. A fixed name in the shared,
+    // world-writable `/tmp` lets another local user pre-create the file, let
+    // the genuine download pass the digest check, and swap it before the
+    // install reads it. The file root installs has to sit in a directory only
+    // root can write, and be the very file the digest was checked against.
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(
+        !output.contains("/tmp/"),
+        "the plan stages the package in shared /tmp:\n{output}"
+    );
+    let lines: Vec<&str> = output.lines().map(str::trim).collect();
+    let install = lines
+        .iter()
+        .find(|line| line.contains("apt-get install -y '") && line.contains("rocdxg-roct_"))
+        .expect("plan installs the package");
+    let installed = install
+        .split('\'')
+        .nth(1)
+        .expect("installed path is single-quoted");
+    // Ruling out `/tmp` is not enough: `/dev/shm` and `/var/tmp` are
+    // world-writable too. Only root can create entries under `/var/cache`.
+    assert!(
+        installed.starts_with("/var/cache/") && !installed.contains("/../"),
+        "the package is not staged under a root-only system directory: {installed}\n{output}"
+    );
+    let staging_dir = installed
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .expect("installed path has a directory");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("install -d -m 0755 -o root -g root")
+                && line.contains(&format!("'{staging_dir}'"))),
+        "the install directory is not made root-only first:\n{output}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("mktemp -d")
+            && line.contains("curl ")
+            && line.ends_with(&format!("'{installed}'"))),
+        "the download is not staged through a private directory:\n{output}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("sha256sum -c -") && line.contains(&format!("'{installed}'"))),
+        "the digest is not checked on the file root installs:\n{output}"
     );
 }
 

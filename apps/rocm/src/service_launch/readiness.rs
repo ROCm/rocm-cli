@@ -523,8 +523,14 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 }
 
 /// Whether the on-disk manifest shows this exit was something other than a
-/// crash: an operator-requested stop in flight or already confirmed
-/// (`stop_requested_unix_ms`), or a status that already reads `stopped`.
+/// crash: an operator-requested stop either still in flight
+/// (`stop_requested_unix_ms`) or already confirmed
+/// (`settled_stop_unix_ms`).
+///
+/// Two markers, and no status term. The record's `status` is deliberately NOT
+/// evidence here - any concurrent reader can write `stopped` onto a record
+/// naming dead pids, which is what relabelled a crash as a clean stop and
+/// reproduced ROCMAI-541 inside its own fix. See the long account below.
 ///
 /// `AttachOutcome::Stop` only ever fires from *this* attached session's own
 /// keystroke reader (Ctrl-C) — it says nothing about a stop triggered any
@@ -535,7 +541,7 @@ pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Pa
 /// which is what lands here, in `ServerExited`, rather than `Stop`, and is
 /// otherwise indistinguishable from a crash (ROCMAI-541). `rocmd`'s own
 /// restart-recovery watcher (`restart_managed_service` in
-/// `apps/rocmd/src/watchers.rs`) is a different case: it only ever fires once
+/// `apps/rocmd/src/supervise.rs`) is a different case: it only ever fires once
 /// the manifest or the endpoint already shows the service dead or
 /// unreachable on its own, and reacts by clearing `stop_requested_unix_ms`
 /// and re-exec'ing a fresh supervisor — it does not itself signal the old
@@ -596,16 +602,18 @@ pub(crate) const fn record_shows_stop_was_requested(record: &ManagedServiceRecor
     record.stop_requested_unix_ms.is_some() || record.settled_stop_unix_ms.is_some()
 }
 
-/// The marker half of [`managed_service_stop_was_requested`], without its
-/// `status == "stopped"` term.
+/// The live half of [`managed_service_stop_was_requested`]: the in-flight
+/// marker only, without its confirmed-stop term (`settled_stop_unix_ms`).
 ///
-/// For the one caller whose own precondition is a `stopped` record: a restart
-/// completes a confirmed stop before it respawns, and `record_restarted_child`
-/// does not publish `running` until after the new child clears its early-exit
-/// window. Inside that window the manifest still reads `stopped` because *this
-/// restart* stopped it, so the full predicate fires unconditionally and reports
-/// every early crash as a deliberate stop — dropping the exit status and log
-/// tail, and leaving the engine state file unstamped.
+/// For the one caller whose own precondition is a stop this process just
+/// performed: a restart confirms a stop before it respawns, and that
+/// confirmation *settles* the marker into `settled_stop_unix_ms`.
+/// `record_restarted_child` does not publish `running` until the new child
+/// clears its early-exit window, so inside that window the settled field is
+/// still set from *this restart's own* stop — and the full predicate would
+/// therefore fire unconditionally, reporting every early crash as a deliberate
+/// stop, dropping the exit status and log tail and leaving the engine state
+/// file unstamped.
 ///
 /// The marker alone is sound evidence here precisely because that preceding
 /// stop cleared it (`stop_internal_managed_service_confirmed_with`): anything

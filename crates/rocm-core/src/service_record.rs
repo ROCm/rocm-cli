@@ -116,7 +116,7 @@ pub struct ManagedServiceRecord {
     ///
     /// | Writer | When |
     /// | --- | --- |
-    /// | `settle_pending_stop_key_cleanup` (`managed_service_status.rs`) | A liveness refresh consumes the marker off a record naming no process. |
+    /// | `settle_pending_stop_key_cleanup` (`managed_service_status.rs`) | A liveness refresh consumes the marker — either off a record naming no process, or off one whose every recorded process it has just confirmed gone. The second branch performs the same move the next row describes, from the refresh path rather than the stop's. |
     /// | `stop_internal_managed_service_confirmed_with` (`service_control.rs`) | A stop confirms every recorded process gone and moves its own marker here. |
     /// | `rocmd`'s stop (`apps/rocmd/src/service.rs`) | The same move, on the daemon's path. |
     /// | [`Self::reset_for_restart`] | Clears it — a relaunch is no longer the stop settled under it. |

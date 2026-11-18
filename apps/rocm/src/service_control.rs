@@ -811,10 +811,11 @@ fn ensure_restarted_child_survives_startup(
 /// `restart_readiness_timeout()` (45s) elapsed and `record_restart_readiness`
 /// noticed, where Unix answered in 200ms.
 ///
-/// Uses the MARKER-only predicate, not the full
-/// `managed_service_stop_was_requested`: `record_restarted_child` has not run
-/// yet, so the manifest still reads `stopped` from this restart's own confirmed
-/// stop, and the status term would fire on every early crash. See
+/// Uses the live-MARKER-only predicate, not the full
+/// `managed_service_stop_was_requested`: this restart confirmed its own stop
+/// before respawning, which settled that stop into `settled_stop_unix_ms`, and
+/// `record_restarted_child` has not run yet — so the full predicate's
+/// settled-stop term would fire on every early crash. See
 /// `managed_service_stop_marker_present`'s doc comment.
 ///
 /// # Errors
@@ -2400,12 +2401,12 @@ mod tests {
     /// ROCMAI-541 on the restart's *early-exit* branch, which no test used
     /// to drive at all.
     ///
-    /// The branch runs before `record_restarted_child` publishes `running`, so
-    /// the manifest still reads `stopped` from the restart's own confirmed
+    /// The branch runs before `record_restarted_child` publishes `running`,
+    /// while `settled_stop_unix_ms` still holds the restart's own confirmed
     /// stop. Checking the full `managed_service_stop_was_requested` there made
-    /// its `status == "stopped"` term fire on *every* early crash: the restart
-    /// bailed "was stopped while it was restarting", stamped nothing `failed`,
-    /// and threw away the exit status and log tail the pre-fix code printed.
+    /// its settled-stop term fire on *every* early crash: the restart bailed
+    /// "was stopped while it was restarting", stamped nothing `failed`, and
+    /// threw away the exit status and log tail the pre-fix code printed.
     #[cfg(not(windows))]
     #[test]
     fn a_restarted_child_that_dies_immediately_is_a_crash_not_a_stop() -> Result<()> {
