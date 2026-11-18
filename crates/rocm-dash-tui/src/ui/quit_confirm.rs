@@ -264,6 +264,36 @@ mod tests {
         state
     }
 
+    /// [`serving_dashboard`] with `extra` further managed instances, so the
+    /// prompt's body is long enough to exceed the old flat-70%-capped-at-24
+    /// popup at a chosen height.
+    ///
+    /// The one-instance fixture cannot show the height growth at all: its body
+    /// fits inside the old baseline even at 14 rows, so "it fits" is true with
+    /// the growth removed and the fit assertion proves nothing. Each extra
+    /// instance adds its own `rocm services stop <id> --yes` line.
+    fn serving_dashboard_with(extra: usize) -> AppState {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        let mut ids: Vec<String> = vec!["svc-managed".to_owned()];
+        ids.extend((0..extra).map(|i| format!("svc-managed-{i}")));
+        for id in &ids {
+            state.instances.insert(
+                id.clone(),
+                Instance {
+                    container_id: id.clone(),
+                    model_name: "Qwen2.5-7B".to_string(),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        with_registry_probe(&mut state, true, &refs);
+        state.open_quit_confirm();
+        state
+    }
+
     /// Paint the whole dashboard at `rows` high and flatten it, the way a user
     /// reads the screen rather than the way the body is built.
     fn painted_at(state: &mut AppState, rows: u16) -> String {
@@ -424,8 +454,15 @@ mod tests {
     /// examine report's own `a_report_that_fits_shows_no_scroll_hint`.
     #[test]
     fn a_prompt_that_fits_offers_no_scrolling() {
-        let mut state = serving_dashboard();
-        let painted = painted_at(&mut state, 40);
+        // Seven managed instances and 24 rows, both chosen from a measurement
+        // rather than picked: this body needs ~21 rows (it still overflows at
+        // 20), and the pre-ROCMAI-1050 popup here was min(70% of 24, 24) = 16.
+        // So it fits ONLY because of the height growth. The one-instance body
+        // at 40 rows, which this test used before, fit under the old baseline
+        // even at 14 rows -- every assertion held with the growth deleted, so
+        // the test could not tell the new sizing from the old.
+        let mut state = serving_dashboard_with(6);
+        let painted = painted_at(&mut state, 24);
         assert!(
             painted.contains("rocm services stop svc-managed --yes"),
             "the whole body must be on screen at this height: {painted}"
