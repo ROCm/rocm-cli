@@ -1648,7 +1648,32 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
-### 6c. The tensorizer upgrade on Python 3.14
+### 6c. A vLLM compiled extension that did not load
+
+Needs a Linux host whose glibc is older than the managed vLLM wheel was built
+against (for example Debian 12, glibc 2.36, with a wheel that needs 2.38). The
+behaviour is described in
+[Compiled extension load failures](vllm.md#compiled-extension-load-failures).
+
+```bash
+rocm serve <model> --engine vllm --verbose --foreground
+```
+
+Expected result:
+
+- The serve fails, and the startup failure message ends with
+  `Detected a vLLM compiled extension that failed to load (...)`. The line in
+  the parentheses is the `Failed to import from vllm._...` warning, which names
+  the missing `GLIBC_2.NN` or library, even though the echoed 80-line tail
+  above it shows only the API server's traceback.
+- It then prints `rocm diagnose --symptom '...'`. Paste that line unchanged: it
+  must report `fix-23-vllm-extension-load` first.
+- `rocm fix fix-23-vllm-extension-load` prints the plan and exits 0 without
+  changing anything. Running its step 2 inside `rocm engines shell vllm` raises
+  the loader's own `ImportError` for the extension that failed.
+- A serve that fails for any other reason does not print the paragraph.
+
+### 6d. The tensorizer upgrade on Python 3.14
 
 Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only
 published vLLM build for that line). On a fresh runtime:
@@ -1674,7 +1699,7 @@ On some GPU families `rocm install sdk` installs vLLM itself
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
 
-### 6d. Naming the engine instead of editing the error
+### 6e. Naming the engine instead of editing the error
 
 Take the failing line from 6a without any `vllm` in it (the
 `torch.OutOfMemoryError: HIP out of memory ...` line from

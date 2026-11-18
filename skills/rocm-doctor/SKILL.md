@@ -239,7 +239,7 @@ passes — the GPU is AMD or no vendor was named.
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   Only four fixes have a runner the CLI executes itself. The other 24 are
+   Only four fixes have a runner the CLI executes itself. The other 25 are
    **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm fix
    <id>` just prints the plan for the user to run themselves — no prompt, and the
    CLI never performs those. In a diagnosis, `fix.auto_applicable` is true only
@@ -336,7 +336,7 @@ never name one of these apps. Use the list below.
 
 ## vLLM startup failures
 
-Two vLLM engine failures are in the catalog. Both are **print-only**: `rocm fix`
+Three vLLM engine failures are in the catalog. All three are **print-only**: `rocm fix`
 prints the plan and the user runs it. Say so first, in one short sentence at the
 start of the reply, before relaying a multi-step plan.
 
@@ -356,7 +356,21 @@ start of the reply, before relaying a multi-step plan.
   and have the user check the engine's torch version first, as the printed plan
   does, before the engine reinstall it ends with. It is not a group membership
   change, so do not suggest `render` or `video` group edits for it.
-- **Native Windows** gets no match from either entry, which is correct because
+- **An op missing from `torch.ops` at engine start** (`fix-23-vllm-extension-load`,
+  Linux and WSL2): `AttributeError: '_OpNamespace' '_C' object has no attribute
+  '...'`. One of vLLM's compiled extensions did not load, often because it needs
+  a newer glibc than the host has. Pass that error line **with its log context**,
+  or the command `rocm serve` printed; the warning `Failed to import from
+  vllm._...` that names the cause also matches. The context matters: every
+  PyTorch-ecosystem library with a `_C` extension raises the identical line, so
+  the entry needs the text to identify vLLM somewhere (the word `vllm`, the
+  `(EngineCore pid=...)` prefix the real line carries, or a vLLM extension name
+  such as `_rocm_C`). If a bare `AttributeError` line gets no match, ask for the
+  surrounding log lines rather than concluding there is nothing to find. Relay
+  the plan: it finds which extension fails and why, inside
+  `rocm engines shell vllm`. Do not suggest an engine reinstall, which
+  fetches the same wheel, or group edits.
+- **Native Windows** gets no match from any of them, which is correct because
   the vLLM engine does not run there. Do not route that user to an issue tracker.
   Relay what the CLI itself says for vLLM on native Windows (`rocm serve` and
   `rocm engines install vllm`): vLLM is not supported there, so use WSL or Linux,

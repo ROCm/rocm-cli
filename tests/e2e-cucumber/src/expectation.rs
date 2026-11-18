@@ -116,9 +116,10 @@ pub struct ScenarioDecl {
     pub requires_wsl: bool,
     /// `@requires-oom-fault-injection`: the scenario drives the test-only
     /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
-    /// to fabricate a GPU-less launch (one that OOMs, or one that becomes ready
-    /// and then fails its smoke test), so it can only run against a binary
-    /// compiled with that feature. `xtask e2e` builds it in when it builds the
+    /// to fabricate a GPU-less launch in one of the modes that hook offers — see
+    /// `e2e_simulate_oom_launch` in `apps/rocm/src/service_launch/readiness.rs`
+    /// for the set, which grows — so it can only run against a binary compiled
+    /// with that feature. `xtask e2e` builds it in when it builds the
     /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
     /// test a prebuilt shipping release binary that has the hook compiled out —
     /// there the real GPU-required serve pre-flight would run instead. Skipped
