@@ -6102,6 +6102,18 @@ fi
              must cover that with a quarter to spare or a slow fetch is cut off mid-retry and \
              the queue lanes go missing from the report"
         );
+        // ...and leaves the job's own cap room for the steps after it: a fetch that
+        // used all of its time must not push the report and the wiki publish past
+        // the job's timeout, which would lose them for the sake of the queue lanes.
+        let job_cap = job_scalar(job, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the report job has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap + 5 * 60 <= job_cap,
+            "the queue fetch step ({cap}s) must leave the report job ({job_cap}s) at least five \
+             minutes for the steps after it"
+        );
     }
 
     #[test]
