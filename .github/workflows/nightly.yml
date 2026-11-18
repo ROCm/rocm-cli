@@ -1391,12 +1391,12 @@ jobs:
           # queued this long after the run started is given up on.
           QUEUE_DEADLINE_MINUTES: ${{ inputs.queue_deadline_minutes || '60' }}
           # A leg that started is waited for, but not past this: the queue
-          # deadline plus the longest lane's timeout-minutes (120) plus slack.
+          # deadline plus the longest lane's timeout-minutes (140) plus slack.
           HARD_DEADLINE_MINUTES: "240"
           # The longest lane's timeout-minutes. The script refuses a queue
           # deadline that, plus this, would pass the hard deadline, so a
           # dispatch input cannot abandon a lane that is still running.
-          LANE_RUN_MINUTES: "120"
+          LANE_RUN_MINUTES: "140"
           LANES: |
             e2e-gpu-nightly=E2E tests (MI300X, incl. nightly-only)
             e2e-gpu-nightly-strix=E2E tests (Strix Halo, incl. nightly-only)
