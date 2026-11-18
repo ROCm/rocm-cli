@@ -1499,11 +1499,12 @@ jobs:
         continue-on-error: true
         # Bounds the whole step: each log read has its own timeout, but a run of
         # many jobs on a stalled storage hop would still outlast the job's.
-        # One job's reads alone can take 3 x 120s + 3 x 5s (about 6.3 minutes), so
-        # a cap below that cuts the fetch off inside the retries it exists to
-        # allow, and the queue lanes go missing from the report; a contract test
-        # holds the cap above that budget and well under the report job's cap,
-        # which the later steps need room in to still build the report.
+        # One job's log read can take attempts x (--max-time + pause), so a cap
+        # below that cuts the fetch off inside the retries it exists to allow
+        # and the queue lanes go missing from the report; and the cap must leave
+        # the report job's own cap room for the steps after it. Both are held by
+        # nightly_queue_fetch_timeout_outlasts_one_jobs_retry_budget in
+        # xtask/src/workflow_contract.rs, which reads the budget from this script.
         timeout-minutes: 8
         env:
           GH_TOKEN: ${{ github.token }}
