@@ -48,6 +48,8 @@ prek install -t pre-push    # heavier checks on push (clippy + tests of the crat
 
 `prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), the module map (`cargo xtask check-architecture-doc`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
 
+`prek` shows a passing hook without its output unless the hook is `verbose`, so a hook that skipped reads as passed; the hooks below that can skip say so. `prek run --all-files` runs every commit-stage hook over the whole tree, not the pre-push hooks, and some of them rewrite files, so start from a clean working tree and read the diff it leaves.
+
 The pre-push hooks (`cargo clippy`, the e2e harness clippy and `cargo test`) check only the crates your push affects: the crates whose files changed plus every crate that depends on them, selected the way CI's `cargo xtask affected` does. They check the whole workspace when a change cannot be confined to specific crates (the lockfile, the root manifest, the toolchain file, `clippy.toml`, workflow files, a doc an xtask test reads, or a path no crate owns), and when the affected crates cannot be determined at all, for example because the remote branch tip is not fetched locally or the pushed range lists no changed files. They also add the crates whose tests read files from outside their own crate, as CI's selection does: any Rust file adds `xtask`, whose contract tests scan every source file, `README.md`, `docs/` and `skills/` add `rocm` and `xtask`, and `skills/rocm-doctor/` adds `e2e-cucumber`, which the hooks only lint: the hook's `cargo test` never includes `e2e-cucumber`, so the hook never runs its `skill_reference` test; CI runs it in the Linux test job and in the Windows debug job, whose build and test steps run for any change under `skills/`.
 
 Each step prints the scope it chose and why. A step that already passed on this exact content is skipped, and says so: after a green run it records a stamp keyed on the git tree hash of `HEAD`, the exact cargo command (so a pass for a narrow selection never covers a wider one), the toolchain and the `CARGO_*` and `RUST*` environment, under the clone's `.git` directory where every worktree shares it, so a retried push, a manual run before the push or an amend that only rewords the message does not pay for the same checks twice. Stamps are only used and written when the working tree is clean (cargo checks the working tree, not the pushed commit, and an untracked file can hide a missing `git add`), expire after seven days, and do not cover your user-level cargo configuration, installed tools, files git ignores or flaky tests. A skip shows that this tree passed those checks earlier, not that they ran during this push; the `cargo test --workspace` and `cargo clippy --workspace` commands you run by hand are unaffected, and `--rerun` gives a fresh run when you want proof the checks ran for this push. `cargo xtask pre-push-check <step> --rerun`, or `ROCM_PRE_PUSH_RERUN=1` for the hook, ignores them, drops this step's earlier pass so a failed rerun cannot leave it to skip the next run, and records a fresh pass when the step succeeds; `SKIP=<hook id>` still skips a hook outright, and the commit-signature hook runs on every push. A push that changes no Rust file runs none of the cargo steps, whatever else it changes (a lockfile-only push included), except that a change to `clippy.toml` runs the two clippy steps.
@@ -56,10 +58,10 @@ A green hook is an early warning and not the gate: on pull requests CI lints the
 
 The manifest hooks only run when you change the dependency graph. They *rewrite* the generated file instead of only reporting that it is stale. When that happens, the commit stops so you can re-stage the refreshed file.
 
-The `THIRD_PARTY_NOTICES.txt` hook also needs the pinned generator. Without it, the hook skips and CI remains the gate for that hook, but the AGENTS.md section 8 gate needs it:
+The `THIRD_PARTY_NOTICES.txt` hook needs `cargo-about` at the pinned version. Without it the hook skips, and CI's `third-party-notices` job is the gate. To install it:
 
 ```bash
-cargo install cargo-about@0.9.1 --locked --features cli   # for THIRD_PARTY_NOTICES.txt and `cargo xtask tpn --check`
+cargo install cargo-about@0.9.1 --locked --features cli   # pinned to match the CI third-party-notices job
 ```
 
 The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, including untracked files that aren't gitignored, so an unrelated unheadered file (even one not yet committed) can block an otherwise-unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is. `prek` runs it like the others, but doesn't provision the `hawkeye` binary. Unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version may run whatever that version's own license-header rules happen to be, which may disagree with CI, or may reject `licenserc.toml` outright. For example, `hawkeye` 6.x rejects this repository's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code:
@@ -75,6 +77,8 @@ The Markdown-links hook (`lychee`) runs on every commit, over the whole reposito
 ```bash
 cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
 ```
+
+The PowerShell hook (`powershell-script-analyzer`) lints `.ps1` files with PSScriptAnalyzer through `cargo xtask powershell-lint`. It skips with a message on a non-Windows host, and on Windows when no PowerShell is found or the one it picks (`pwsh`, else `powershell`) lacks the PSScriptAnalyzer module. The `powershell-lint` CI job is the gate. To lint locally on Windows, install the module with `Install-Module PSScriptAnalyzer -Scope CurrentUser`; `cargo xtask powershell-lint --shell pwsh` forces a run on another host, where PowerShell Core can report edition-specific differences that do not match CI.
 
 ### Workspace layout
 
@@ -111,14 +115,14 @@ see `docs/aim-catalog.md` for the refresh process and staleness warning.
 | Rust (all crates) | `cargo test` |
 | Lint and format check | `prek run --all-files` |
 
-See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps. [AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md) has the minimum quality gate; this table lists only some of its commands.
+See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps. [AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md) says how hooks and CI gate a change, including the end-to-end scenarios that `cargo test` skips.
 
 ## Making changes
 
 1. **Fork** the repository and create a branch from `main`.
 2. **Make your changes.** Keep commits focused, with one logical change per commit.
 3. **Add or update tests** for any new behavior.
-4. **Run at least the minimum quality gate** ([AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md), "Verification Matrix For This Repo"), plus the suites relevant to your change, before opening a PR.
+4. **Install the hooks and run the tests relevant to your change** before opening a PR. CI gates the pull request ([AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md)).
 5. **Open a pull request** against `main` with a clear title and description following the Conventional Commits format.
 
 ### Commit signing and sign-off
