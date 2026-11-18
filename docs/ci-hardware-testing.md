@@ -540,8 +540,12 @@ jobs, which wait on every lane, never ran.
   ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
   once every lane leg has finished or can be given up on: a leg still queued
   after `QUEUE_DEADLINE_MINUTES` (60, or the `queue_deadline_minutes` dispatch
-  input) is abandoned, and a leg that started is waited for but abandoned at
-  `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold the wait either.
+  input) is abandoned unless another leg of the same lane has started or
+  finished (a pool with one runner serves a lane's `release` and `nightly` legs
+  one after the other, so the queued leg is waiting its turn, not unserved).
+  A leg that started, or that is queued behind a started sibling, is waited for
+  but abandoned at `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold
+  the wait either.
   A lane that starts just inside the queue deadline still has its full
   `timeout-minutes`, so the script refuses a queue deadline that, plus
   `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole

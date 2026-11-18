@@ -14,7 +14,10 @@
 #
 #   - a lane leg that has completed is done;
 #   - a leg still queued QUEUE_DEADLINE_MINUTES after it was created is
-#     abandoned (no runner took it);
+#     abandoned (no runner took it), unless another leg of the same lane has
+#     started or finished: that proves the pool has a runner, and the queued
+#     leg is only waiting its turn behind it on a single-runner pool, so it
+#     is held to the hard deadline instead;
 #   - a leg that started is waited for (its own `timeout-minutes` bounds it),
 #     but anything unfinished HARD_DEADLINE_MINUTES after it was created is
 #     abandoned too, so this job cannot wait unboundedly on a hung runner.
@@ -95,11 +98,11 @@ lanes_json=$(
 # shellcheck disable=SC2016  # jq program, not shell
 evaluate='
   def age: ($now - (.created_at | fromdateiso8601));
-  def leg_state:
+  def leg_state($lane_started):
     if .status == "completed" then "done"
     elif age >= $hard then "abandoned"
     elif .status == "in_progress" then "running"
-    elif age >= $queue then "abandoned"
+    elif age >= $queue and ($lane_started | not) then "abandoned"
     else "waiting" end;
   def owner($job):
     [ $lanes[] | . as $l | select($job.name == $l.name or ($job.name | startswith($l.name + " ("))) ]
@@ -108,7 +111,8 @@ evaluate='
   | ($jobs | map(. as $job | . + {lane_id: (owner($job).id // null)})) as $owned
   | [ $lanes[] | . as $lane
       | ($owned | map(select(.lane_id == $lane.id))) as $legs
-      | ($legs | map(leg_state)) as $states
+      | ($legs | any(.status == "in_progress" or .status == "completed")) as $started
+      | ($legs | map(leg_state($started))) as $states
       | { id: $lane.id,
           abandoned: [ range(0; $legs | length) | select($states[.] == "abandoned") | $legs[.].name ],
           result:

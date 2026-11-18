@@ -2715,6 +2715,45 @@ jobs:
 
     #[test]
     #[cfg(unix)]
+    fn settle_does_not_abandon_a_leg_queued_behind_its_started_sibling() {
+        if !settle_has_jq() {
+            return;
+        }
+        // A single-runner pool: the `release` leg runs while the `nightly` leg
+        // waits for the same runner. Past the queue deadline the queued leg is
+        // waiting its turn, not unserved, so it is not abandoned.
+        let serial = listed_job("Lane A (gpu) (release)", "in_progress", None)
+            + &listed_job("Lane A (gpu) (nightly)", "queued", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"));
+        let (code, log, output, _, calls) =
+            run_settle_with(&[&serial, &finished], 130, "lane-a=Lane A (gpu)\n", "120");
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "the queued leg must be waited for: {log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+
+        // A sibling that already finished counts as started too.
+        let after_first = listed_job("Lane A (gpu) (release)", "completed", Some("success"))
+            + &listed_job("Lane A (gpu) (nightly)", "queued", None);
+        let (code, log, _, _, calls) = run_settle_with(
+            &[&after_first, &finished],
+            130,
+            "lane-a=Lane A (gpu)\n",
+            "120",
+        );
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "{log}");
+
+        // The hard deadline still ends the wait on a queued leg whose sibling hung.
+        let (code, log, output, _, calls) =
+            run_settle_with(&[&serial], 301, "lane-a=Lane A (gpu)\n", "120");
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 1, "{log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "abandoned");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn settle_reports_skipped_cancelled_and_unknown_lanes_distinctly() {
         if !settle_has_jq() {
             return;

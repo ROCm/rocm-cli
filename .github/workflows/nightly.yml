@@ -1359,9 +1359,10 @@ jobs:
   # 24 hours and held the report and readiness jobs (which `needs` every lane)
   # back with it. This job stands in for the lanes in those `needs`: it polls
   # this run's job list and settles once every lane leg has finished or can be
-  # given up on -- a leg still queued after QUEUE_DEADLINE_MINUTES, or one
-  # unfinished after HARD_DEADLINE_MINUTES. Legs that started are waited for,
-  # so a slow lane still lands in the report. The report then covers whatever
+  # given up on -- a leg still queued after QUEUE_DEADLINE_MINUTES (unless a
+  # sibling leg of its lane started), or one unfinished after
+  # HARD_DEADLINE_MINUTES. Legs that started are waited for, so a slow lane
+  # still lands in the report. The report then covers whatever
   # finished, and the lanes given up on show as gaps (see lane_results).
   # .github/scripts/settle-e2e-lanes.sh holds the logic; the lanes are listed
   # here by display name, and a contract test checks the list against the jobs.
