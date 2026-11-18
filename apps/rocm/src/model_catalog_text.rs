@@ -1208,12 +1208,28 @@ mod tests {
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
         assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
-        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
-        assert!(rendered.contains("Qwen/Qwen3.6-27B"));
-        assert!(rendered.contains("BF16"));
+        // The Instinct group's featured recipes are vLLM-only, which native
+        // Windows cannot serve at any size, so the group belongs in the listing
+        // exactly where the platform gate allows vLLM. Asserted both ways
+        // rather than skipped on Windows, so the gate is pinned on the platform
+        // it actually fires on. vLLM's rule-out does not consult Docker.
+        let vllm_allowed =
+            engine_ruled_out_by_platform_with("vllm", || false) == PlatformRuleOut::Allowed;
+        for vllm_only in [
+            "AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)",
+            "Qwen/Qwen3.6-27B",
+            "BF16",
+        ] {
+            assert_eq!(
+                rendered.contains(vllm_only),
+                vllm_allowed,
+                "`{vllm_only}` belongs in the listing exactly where vLLM is allowed \
+                 (allowed here: {vllm_allowed}):\n{rendered}"
+            );
+        }
         // Multi-GPU-only models are not featured (single-GPU serving only).
         assert!(!rendered.contains("GLM-5.2"));
         assert!(!rendered.contains("DeepSeek-V4-Flash"));
