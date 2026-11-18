@@ -205,6 +205,10 @@ fn host_accelerator_memory(
 /// honest on this branch: the pool an integrated part allocates from is not
 /// readable here yet.
 pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(forced_gib) = simulated_listing_gpu_gib() {
+        return (Some(forced_gib), rocm_core::detect_system_ram_gib());
+    }
     let vram = gpu_vram_usage();
     let host_gpu_summary = detect_host_gpu_summary(None);
     let accelerator = classify_accelerator_memory(
@@ -221,6 +225,31 @@ pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
         _ => None,
     };
     (gpu_gib, rocm_core::detect_system_ram_gib())
+}
+
+/// E2E hook: `ROCM_E2E_FORCE_GPU_TOTAL_GIB` states outright how much GPU memory
+/// the listing is selected against, overriding every measurement above.
+///
+/// Without it the narrowed listing has no live coverage anywhere. The mock lane
+/// has no GPU, so `usable_amd_gpu_indices` reports none and
+/// [`classify_accelerator_memory`] correctly discards any planted row as a card
+/// no mask makes visible; the GPU lanes cannot be made small, and the MI300X box
+/// has no `amd-smi` and an unreadable `mem_info_vram_total`, so it measures
+/// nothing either. Planting raw telemetry therefore reaches no verdict on any
+/// available lane -- only stating the verdict does.
+///
+/// What that costs: the scenarios behind this hook exercise the selection and
+/// the notices, not the measurement. `classify_accelerator_memory` keeps its own
+/// unit tests for the measurement, which this deliberately bypasses rather than
+/// re-stages. Compiled only into the `e2e-test-hooks` binary.
+#[cfg(feature = "e2e-test-hooks")]
+fn simulated_listing_gpu_gib() -> Option<f64> {
+    let total_gib: u32 = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(f64::from(total_gib))
 }
 
 /// The pure classification behind [`host_accelerator_memory`], split out so it

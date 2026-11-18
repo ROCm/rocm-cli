@@ -326,6 +326,14 @@ async fn user_asks_for_recommendations(world: &mut E2eWorld) {
 /// Every offered row carries its own fit verdict, so the listing states the
 /// claim this asserts rather than the test inferring it from model names --
 /// which would go stale the moment the catalog changes.
+///
+/// What this cannot reach: a recipe declaring no GPU minimum carries no verdict
+/// at all, and the per-platform cap drops those recipes anyway, since they sort
+/// last. So reading an undeclared minimum as "fits anything" is invisible from
+/// here and is pinned by
+/// `a_host_too_small_for_anything_is_offered_nothing_rather_than_the_wrong_thing`
+/// instead -- naming a large model here would assert something the cap already
+/// made true, which passes whether the fit rule is right or not.
 #[then("every model offered is one this machine can run")]
 async fn assert_every_offer_fits(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");

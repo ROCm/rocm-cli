@@ -708,45 +708,10 @@ const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (callers then fall back to service-state-only auto-selection).
 pub(crate) fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
     #[cfg(feature = "e2e-test-hooks")]
-    if let Some(forced) = simulated_gpu_capacity() {
-        return Some(forced);
-    }
-    #[cfg(feature = "e2e-test-hooks")]
     if let Some(forced) = simulated_low_vram_usage() {
         return Some(forced);
     }
     gpu_vram_usage_amd_smi().or_else(gpu_vram_usage_sysfs)
-}
-
-/// E2E hook: `ROCM_E2E_FORCE_GPU_TOTAL_GIB` reports one idle GPU of that
-/// capacity, overriding the real telemetry.
-///
-/// Separate from [`simulated_low_vram_usage`] because the two say different
-/// things. That one fixes a 24 GiB card and varies how *full* it is, for the
-/// low-VRAM warning; this one fixes the card as empty and varies how *large* it
-/// is, which is what `rocm model`'s recommendations are selected on.
-///
-/// Without it the narrowed listing has no live coverage anywhere: the no-GPU
-/// lane reports no capacity at all, and the GPU lanes cannot be made small --
-/// the MI300X box has no `amd-smi` and an unreadable `mem_info_vram_total`, so
-/// it measures nothing either. A hook is the only way the "this machine can run
-/// these and not those" behaviour is reachable from a test.
-///
-/// Used idle (`used_mb: 0`) on purpose: occupancy is the other hook's subject,
-/// and a near-full card here would make a capacity scenario fail for a reason
-/// it is not about. Compiled only into the `e2e-test-hooks` binary.
-#[cfg(feature = "e2e-test-hooks")]
-fn simulated_gpu_capacity() -> Option<Vec<GpuVramUsage>> {
-    let total_gib: u64 = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(vec![GpuVramUsage {
-        index: 0,
-        used_mb: 0,
-        total_mb: total_gib * 1024,
-    }])
 }
 
 /// E2E hook: when `ROCM_E2E_FORCE_LOW_VRAM` names a GPU ordinal, report that GPU
