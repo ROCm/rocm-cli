@@ -149,10 +149,13 @@ const OPENAI_FIXTURES: &[Fixture] = &[
     ),
     // `error` with no message: a placeholder stands in for it.
     (
-        "data: {\"error\":{}}\n\n",
+        "data: {\"error\":{\"code\":500}}\n\n",
         &[],
         Some("OpenAI-compatible provider stream failed: unknown OpenAI-compatible stream error"),
     ),
+    // An empty `error` object alone is not an error (only a non-empty object or
+    // string is), so the stream just ends.
+    ("data: {\"error\":{}}\n\n", &[("", true)], None),
     // A payload that is JSON but not an object is no event and no error.
     (
         "data: 42\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",

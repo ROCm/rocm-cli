@@ -4289,9 +4289,9 @@ What is detected, and what is not:
   answer with no `data:` line at all (HTML, plain JSON, an empty body); a
   close-delimited stream cut after a token; and a complete stream with no
   `content` token, which is deliberately not a failure (a reasoning model can
-  spend its whole small budget first, as the readiness probe also allows for). The metric rows read `n/a` when
-  no content token arrived first; tokens that did arrive in a close-delimited cut
-  are measured.
+  spend its whole small budget first, as the readiness probe also allows for).
+  The metric rows read `n/a` when no content token arrived first; tokens that
+  did arrive in a close-delimited cut are measured.
 - Known limitation: the reason shown is whatever the provider call reported, and
   some of its errors are not the engine's, for example the `/v1/models` re-list
   before the request ("no ready managed service"), an unreadable services-directory
