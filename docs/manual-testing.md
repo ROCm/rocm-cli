@@ -372,6 +372,32 @@ fallback paired an architecture line with the wrong GPU. On that machine
 `rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
 discrete card does have ROCm support, so the whole-machine claim is false.
 
+On Linux, check that each GPU keeps its own identity when the ROCm runtime
+cannot see all of them. On a host with two or more AMD GPUs and ROCm installed,
+hide one card from the runtime and inspect:
+
+```bash
+ROCR_VISIBLE_DEVICES=0 rocm examine --json
+```
+
+Match the `gpus[]` entries by `pci_id` against `lspci -D`. Every listed card
+must keep its own `gfx_target`, name and `is_apu`. The hidden card keeps the
+`gfx_target` the kernel gives it, and does **not** carry the visible card's
+model name or verdict; it may show the kernel-topology placeholder name. A
+hidden card carrying another card's name, target or `is_apu` means `rocminfo`'s
+agents were paired with the wrong GPU.
+
+Then run `rocm examine --json` once with no override set, and once with
+`HSA_OVERRIDE_GFX_VERSION` set to a value that names a different target from
+every card's own (on a gfx1151 or gfx1103 host, `11.0.0`, which names gfx1100;
+an override that names a card's own target cannot show anything). Every card's
+`gfx_target` must be the same in both runs, the native one, and an integrated
+GPU must still read `is_apu: true`. To read the native target from the kernel
+instead, `grep gfx_target_version /sys/class/kfd/kfd/topology/nodes/*/properties`
+gives a decimal value per GPU node: major is `v / 10000`, minor is
+`(v / 100) % 100` and stepping is `v % 100`, with minor and stepping written as
+hex digits, so `110001` is gfx1101 and `90010` is gfx90a.
+
 ## 2b. Bare-Metal Driver Install
 
 On a real apt/dnf/zypper Linux host:

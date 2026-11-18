@@ -42,9 +42,14 @@ pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
 use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};
-pub use linux_gpus::gfx_is_apu_family;
 use linux_gpus::{
     GpuProbeSources, probe_gpus_after_lspci, probe_gpus_lspci, summarise_gpu_categories,
+};
+pub use linux_gpus::{KERNEL_TOPOLOGY_GPU_NAME, gfx_is_apu_family};
+#[cfg(any(test, feature = "test-support"))]
+pub use linux_gpus::{
+    TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103,
+    TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING,
 };
 use rocm_install_probe::probe_rocm_install;
 pub(crate) use windows::parse_dotted_version;
@@ -54,8 +59,12 @@ use windows::{
 use wsl::probe_wsl;
 pub use wsl::{parse_wsl_distro_list, probe_wsl_distro_from_host};
 
-/// A single GPU as enumerated by `lspci`/`rocminfo` (Linux) or the display
-/// inventory (Windows).
+/// A single GPU, as the examination enumerated it.
+///
+/// On Linux from `lspci`, the kernel's KFD topology (or its sysfs fallback)
+/// and `rocminfo`; on Windows from the display inventory. `is_apu` is `None`
+/// when nothing said which package it is; see `examine::linux_gpus`'s
+/// `apu_verdict_from_target` for the Linux rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Gpu {
     pub name: String,
