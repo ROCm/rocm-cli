@@ -12,13 +12,14 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::AppPaths;
 use crate::user_runtime_dir;
+use crate::{AppPaths, FileLock};
 
 /// Automation watcher review mode: how much autonomy a watcher has to act on
 /// its own trigger without a human approving first.
@@ -613,6 +614,104 @@ struct LegacyDashTui {
     chat_auth_header: Option<String>,
 }
 
+/// How long a change to `config.json` waits for another one to finish.
+///
+/// A holder keeps [`ConfigLock`] for one load, an in-memory change and one
+/// atomic write (plus, for a runtime activation, rollback or uninstall, a read
+/// of the runtime registry and a write of the active-runtime marker), which
+/// takes milliseconds. Nothing slow runs under it: an activation checks the
+/// live servers before taking it. A wait this long means something is wrong,
+/// and failing with an error that says so beats a command that hangs.
+pub const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+thread_local! {
+    /// The `config.json` locks this thread holds, by lock-file path. A second
+    /// [`RocmCliConfig::lock`] on the same file from the same thread would wait
+    /// for itself, so it fails at once instead.
+    static HELD_CONFIG_LOCKS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The right to change `config.json`, held from the load to the save.
+///
+/// A save replaces `config.json` atomically, but a command that
+/// loads the settings, changes one field and saves them all back would still
+/// drop a change another `rocm` process saved in between: the last writer
+/// wins. Every such sequence runs under this lock, taken with
+/// [`RocmCliConfig::lock`] (or for one closure with [`RocmCliConfig::update`]),
+/// and loads the settings only after taking it, so each change starts from
+/// the one before it.
+///
+/// It is an OS file lock on [`AppPaths::config_lock_path`], beside
+/// `config.json` rather than in the data folder: `config.json` itself records
+/// where the data folder is, so two commands can disagree about the data folder
+/// but never about the config file. The lock is released when this guard is
+/// dropped, and by the operating system when the process exits, so a crashed
+/// command never leaves the settings locked. It is exclusive between threads
+/// as well as processes. Reading the settings needs no lock.
+///
+/// The guard stays on the thread that took it (it is not `Send`): which locks
+/// a thread holds is tracked per thread, so a guard dropped on another thread
+/// would leave the first one believing it still held the lock.
+#[derive(Debug)]
+pub struct ConfigLock {
+    paths: AppPaths,
+    lock: FileLock,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ConfigLock {
+    /// The settings as they are now, read under this lock.
+    ///
+    /// # Errors
+    /// As [`RocmCliConfig::load`]: an unreadable `config.json` is an error, so
+    /// nothing derived from it is saved over it.
+    pub fn load(&self) -> Result<RocmCliConfig> {
+        RocmCliConfig::load(&self.paths)
+    }
+
+    /// Write `config` as the settings, replacing `config.json` in one step so
+    /// that [`RocmCliConfig::load`] can always read it back (the guarantees
+    /// and their limits on Windows are on `RocmCliConfig::write_file`).
+    ///
+    /// # Errors
+    /// When the settings would not load back, or the file cannot be written;
+    /// the existing file is then left as it was, except for the Windows
+    /// part-way replace that function describes.
+    pub fn save(&self, config: &RocmCliConfig) -> Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        if FAIL_LOCKED_SAVES.with(std::cell::Cell::get) {
+            bail!(
+                "failed to write {}: simulated failure",
+                self.paths.config_path().display()
+            );
+        }
+        config.write_file(&self.paths)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FAIL_LOCKED_SAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: make every [`ConfigLock::save`] on this thread fail (`true`) or
+/// write again (`false`), so a test can fail the save of a change that loads
+/// the settings itself, such as a runtime activation, while the load works.
+///
+/// Compiled only for this crate's tests and under the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fail_config_lock_saves_on_this_thread(fail: bool) {
+    FAIL_LOCKED_SAVES.with(|flag| flag.set(fail));
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let held = self.lock.path().to_path_buf();
+        HELD_CONFIG_LOCKS.with(|locks| locks.borrow_mut().retain(|path| *path != held));
+    }
+}
+
 impl RocmCliConfig {
     /// Read `config.json`, or the defaults when there is none yet.
     ///
@@ -644,6 +743,90 @@ impl RocmCliConfig {
         serde_json::from_slice(&bytes).map_err(|error| unreadable("parse", &error))
     }
 
+    /// Load the settings, apply `change` and save them, as one step no other
+    /// `rocm` thread or process can interleave with (see [`ConfigLock`]).
+    ///
+    /// The settings are loaded after the lock is taken, so `change` sees every
+    /// change saved before it and nothing saved meanwhile is lost. When `change`
+    /// fails, nothing is saved. An unreadable `config.json` fails the update
+    /// before `change` runs and is left as it is.
+    ///
+    /// # Errors
+    /// When the lock is not free within [`CONFIG_LOCK_TIMEOUT`], when the
+    /// settings cannot be loaded or saved, or when `change` fails.
+    pub fn update<T>(paths: &AppPaths, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        Self::update_within(paths, CONFIG_LOCK_TIMEOUT, change)
+    }
+
+    fn update_within<T>(
+        paths: &AppPaths,
+        timeout: Duration,
+        change: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let lock = Self::lock_within(paths, timeout)?;
+        let mut config = lock.load()?;
+        let value = change(&mut config)?;
+        lock.save(&config)?;
+        Ok(value)
+    }
+
+    /// Take [`ConfigLock`], for a change that must hold it across more than
+    /// one closure, such as a runtime activation that writes `config.json` and
+    /// the active-runtime marker together. Load through the returned lock, not
+    /// before taking it.
+    ///
+    /// # Errors
+    /// When another holder keeps the lock for [`CONFIG_LOCK_TIMEOUT`] (the
+    /// error says the change this lock was for was not saved), when this
+    /// thread already holds it, or when the lock file cannot be created, as in
+    /// a read-only config folder.
+    pub fn lock(paths: &AppPaths) -> Result<ConfigLock> {
+        Self::lock_within(paths, CONFIG_LOCK_TIMEOUT)
+    }
+
+    fn lock_within(paths: &AppPaths, timeout: Duration) -> Result<ConfigLock> {
+        let lock_path = paths.config_lock_path();
+        let config_path = paths.config_path();
+        if HELD_CONFIG_LOCKS.with(|locks| locks.borrow().contains(&lock_path)) {
+            bail!(
+                "internal error: this thread already holds the lock on {}, so waiting for it \
+                 again would never end",
+                config_path.display()
+            );
+        }
+        let Some(lock) = FileLock::try_acquire_within(&lock_path, timeout)? else {
+            bail!(
+                "another rocm command kept {} locked for {timeout:?} while changing it, so \
+                 this command stopped waiting and did not save its change to that file. Do \
+                 not delete {}: the lock is released when the command holding it exits",
+                config_path.display(),
+                lock_path.display()
+            );
+        };
+        HELD_CONFIG_LOCKS.with(|locks| locks.borrow_mut().push(lock_path));
+        Ok(ConfigLock {
+            paths: paths.clone(),
+            lock,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Write the config without the config lock, for tests that set up a
+    /// `config.json` before the code under test runs.
+    ///
+    /// Compiled only for this crate's tests and under the `test-support`
+    /// feature: production code changes the settings through [`Self::update`]
+    /// or [`Self::lock`], since saving settings loaded earlier would undo
+    /// whatever another `rocm` command saved since. It writes as
+    /// [`ConfigLock::save`] does.
+    ///
+    /// # Errors
+    /// As [`ConfigLock::save`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn save(&self, paths: &AppPaths) -> Result<()> {
+        self.write_file(paths)
+    }
+
     /// Write the config so that [`Self::load`] can always read it back.
     ///
     /// - The bytes are parsed back before anything is written. A value that
@@ -668,7 +851,7 @@ impl RocmCliConfig {
     ///   contents stay in the `config.json.tmp-*` file the error names. Until
     ///   it is renamed back there is no `config.json`, which `load` reads as
     ///   "no settings".
-    pub fn save(&self, paths: &AppPaths) -> Result<()> {
+    fn write_file(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
@@ -773,19 +956,8 @@ impl RocmCliConfig {
         paths: &AppPaths,
         legacy: &Path,
     ) -> Result<Option<PathBuf>> {
-        if !legacy.is_file() {
+        if !legacy.is_file() || config_path_is_occupied(paths)? {
             return Ok(None);
-        }
-        // `symlink_metadata`, not `exists`/`is_file`: a directory, or a link
-        // whose target is missing, is something the user put there, not an
-        // empty slot to migrate into.
-        match fs::symlink_metadata(paths.config_path()) {
-            Ok(_) => return Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to check {}", paths.config_path().display()));
-            }
         }
 
         let raw = fs::read_to_string(legacy)
@@ -851,8 +1023,30 @@ impl RocmCliConfig {
         config.default_engine = parsed.default_engine.clone();
         config.engines = parsed.engines.clone();
 
-        config.save(paths)?;
+        // Checked again under the config lock, held to the save, so a
+        // `config.json` another command wrote since the first check is never
+        // replaced by the migrated one.
+        let lock = Self::lock(paths)?;
+        if config_path_is_occupied(paths)? {
+            return Ok(None);
+        }
+        lock.save(&config)?;
         Ok(Some(legacy.to_path_buf()))
+    }
+}
+
+/// Whether anything at all is at the `config.json` path.
+///
+/// `symlink_metadata`, not `exists`/`is_file`: a directory, or a link whose
+/// target is missing, is something the user put there, not an empty slot to
+/// migrate into.
+fn config_path_is_occupied(paths: &AppPaths) -> Result<bool> {
+    match fs::symlink_metadata(paths.config_path()) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to check {}", paths.config_path().display()))
+        }
     }
 }
 
@@ -1685,5 +1879,542 @@ last_installed_runtime_id = "therock-release"
         );
         assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
         Ok(())
+    }
+
+    // ── Concurrent changes ─────────────────────────────────────────
+
+    /// The engine entry `writer` adds at `step` in [`add_engine_entries`].
+    fn writer_entry(writer: &str, step: usize) -> String {
+        format!("{writer}-{step}")
+    }
+
+    /// `count` updates from `writer`, each adding its own engine entry. A lost
+    /// update shows up afterwards as a missing entry.
+    fn add_engine_entries(paths: &AppPaths, writer: &str, count: usize) -> Result<()> {
+        for step in 0..count {
+            RocmCliConfig::update(paths, |config| {
+                config.engine_config_mut(&writer_entry(writer, step));
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn missing_entries(paths: &AppPaths, writers: &[String], count: usize) -> Result<Vec<String>> {
+        let config = RocmCliConfig::load(paths)?;
+        Ok(writers
+            .iter()
+            .flat_map(|writer| (0..count).map(move |step| writer_entry(writer, step)))
+            .filter(|entry| config.engine_config(entry).is_none())
+            .collect())
+    }
+
+    /// Updates from several threads at once lose nothing: every entry each
+    /// thread added is in the file at the end. Without the lock, a thread that
+    /// loaded before another saved writes its stale copy back over that save.
+    #[test]
+    fn concurrent_updates_from_threads_keep_every_change() -> Result<()> {
+        const STEPS: usize = 25;
+        let (root, paths) = temp_app_paths("config-update-threads");
+        let writers: Vec<String> = (0..4).map(|n| format!("thread{n}")).collect();
+        std::thread::scope(|scope| {
+            // Every writer is started before any is joined, so they overlap.
+            let mut handles = Vec::new();
+            for writer in &writers {
+                handles.push(scope.spawn(|| add_engine_entries(&paths, writer, STEPS)));
+            }
+            handles
+                .into_iter()
+                .try_for_each(|handle| handle.join().expect("writer thread panicked"))
+        })?;
+        let missing = missing_entries(&paths, &writers, STEPS)?;
+        let _ = fs::remove_dir_all(&root);
+        assert!(missing.is_empty(), "updates were lost: {missing:?}");
+        Ok(())
+    }
+
+    const UPDATE_CHILD_ROOT_ENV: &str = "ROCM_CORE_TEST_CONFIG_UPDATE_ROOT";
+    const UPDATE_CHILD_WRITER_ENV: &str = "ROCM_CORE_TEST_CONFIG_UPDATE_WRITER";
+    const UPDATE_CHILD_STEPS: usize = 20;
+
+    fn paths_under(root: &Path) -> AppPaths {
+        AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by concurrent_updates_from_processes_keep_every_change"]
+    fn config_update_child_writer() -> Result<()> {
+        let (Ok(root), Ok(writer)) = (
+            std::env::var(UPDATE_CHILD_ROOT_ENV),
+            std::env::var(UPDATE_CHILD_WRITER_ENV),
+        ) else {
+            return Ok(());
+        };
+        add_engine_entries(&paths_under(Path::new(&root)), &writer, UPDATE_CHILD_STEPS)
+    }
+
+    /// The thread test across processes, which is how the lost updates were
+    /// found: `rocm config set-*` loops run side by side. Each child is this
+    /// test binary running [`config_update_child_writer`].
+    #[test]
+    fn concurrent_updates_from_processes_keep_every_change() -> Result<()> {
+        let (root, _) = temp_app_paths("config-update-processes");
+        let paths = paths_under(&root);
+        let writers: Vec<String> = (0..3).map(|n| format!("process{n}")).collect();
+        let exe = std::env::current_exe()?;
+        let children = writers
+            .iter()
+            .map(|writer| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "config::tests::config_update_child_writer",
+                        "--exact",
+                        "--ignored",
+                        "--test-threads",
+                        "1",
+                    ])
+                    .env(UPDATE_CHILD_ROOT_ENV, &root)
+                    .env(UPDATE_CHILD_WRITER_ENV, writer)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let mut failed = Vec::new();
+        for (writer, mut child) in writers.iter().zip(children) {
+            let status = child.wait()?;
+            if !status.success() {
+                failed.push(format!("{writer}: {status}"));
+            }
+        }
+        let missing = missing_entries(&paths, &writers, UPDATE_CHILD_STEPS)?;
+        let _ = fs::remove_dir_all(&root);
+        assert!(failed.is_empty(), "writer processes failed: {failed:?}");
+        assert!(missing.is_empty(), "updates were lost: {missing:?}");
+        Ok(())
+    }
+
+    /// An update that starts while another is between its load and its save
+    /// waits for that save and starts from it. Deterministic, unlike the two
+    /// tests above: the first update is held open until the second has had its
+    /// chance to finish. The wait only bounds how long the second is given to
+    /// get through wrongly, so a slow machine can make this pass, never fail.
+    #[test]
+    fn an_update_waits_for_the_one_in_progress_and_keeps_its_change() -> Result<()> {
+        use std::sync::mpsc;
+
+        let (root, paths) = temp_app_paths("config-update-waits");
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        let paths_ref = &paths;
+        let early = std::thread::scope(|scope| -> Result<bool> {
+            let first = scope.spawn(move || {
+                RocmCliConfig::update(paths_ref, |config| {
+                    config.default_engine = Some("vllm".to_owned());
+                    inside_tx.send(()).expect("test thread listens");
+                    release_rx.recv().expect("test thread releases the update");
+                    Ok(())
+                })
+            });
+            inside_rx
+                .recv()
+                .expect("the first update reaches its change");
+            let second = scope.spawn(move || {
+                let result = RocmCliConfig::update(paths_ref, |config| {
+                    config.telemetry.mode = TELEMETRY_MODE_OFF.to_owned();
+                    Ok(())
+                });
+                let _ = done_tx.send(());
+                result
+            });
+            let early = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+            release_tx.send(()).expect("first update waits for release");
+            first.join().expect("first update panicked")?;
+            second.join().expect("second update panicked")?;
+            Ok(early)
+        })?;
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !early,
+            "the second update finished while the first was between its load and its save"
+        );
+        assert_eq!(loaded.default_engine.as_deref(), Some("vllm"));
+        assert_eq!(loaded.telemetry.mode, TELEMETRY_MODE_OFF);
+        Ok(())
+    }
+
+    /// The timeout error says the change was not saved, and it was not: the
+    /// change never ran and the bytes on disk are the ones from before.
+    #[test]
+    fn an_update_that_cannot_get_the_lock_says_so_and_changes_nothing() -> Result<()> {
+        use std::sync::mpsc;
+
+        let (root, paths) = temp_app_paths("config-update-timeout");
+        RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        }
+        .save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut ran = false;
+        let paths_ref = &paths;
+        let outcome = std::thread::scope(|scope| -> Result<Result<()>> {
+            let holder = scope.spawn(move || -> Result<()> {
+                let _lock = RocmCliConfig::lock(paths_ref)?;
+                held_tx.send(()).expect("test thread listens");
+                release_rx.recv().expect("test thread releases the lock");
+                Ok(())
+            });
+            held_rx.recv().expect("the holder takes the lock");
+            let outcome =
+                RocmCliConfig::update_within(&paths, Duration::from_millis(100), |config| {
+                    ran = true;
+                    config.default_engine = Some("lemonade".to_owned());
+                    Ok(())
+                });
+            release_tx.send(()).expect("holder waits for release");
+            holder.join().expect("holder panicked")?;
+            Ok(outcome)
+        })?;
+        let after = fs::read(paths.config_path())?;
+        let _ = fs::remove_dir_all(&root);
+
+        let message = format!("{:#}", outcome.expect_err("the lock was held"));
+        assert!(
+            message.contains(&paths.config_path().display().to_string())
+                && message.contains("did not save its change to that file")
+                && message.contains("Do not delete"),
+            "{message}"
+        );
+        assert!(!ran, "the change ran without the lock");
+        assert_eq!(
+            after, before,
+            "config.json changed although the update failed"
+        );
+        Ok(())
+    }
+
+    /// Taking the lock twice on one thread would wait for itself until the
+    /// timeout; it fails at once instead, and the lock is free again once the
+    /// first guard is dropped.
+    #[test]
+    fn a_nested_config_lock_fails_at_once_instead_of_waiting_for_itself() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-lock-nested");
+        let held = RocmCliConfig::lock(&paths)?;
+        let nested = RocmCliConfig::update(&paths, |_| Ok(()));
+        drop(held);
+        let after_release = RocmCliConfig::update(&paths, |config| {
+            config.default_engine = Some("vllm".to_owned());
+            Ok(())
+        });
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        let message = format!("{:#}", nested.expect_err("nested lock must fail"));
+        assert!(message.contains("already holds the lock"), "{message}");
+        after_release?;
+        assert_eq!(loaded.default_engine.as_deref(), Some("vllm"));
+        Ok(())
+    }
+
+    /// The guard cannot be moved to another thread, where dropping it would
+    /// leave this thread's record of held locks behind. This compiles only
+    /// while `ConfigLock` is not `Send`: for a `Send` type both impls apply
+    /// and the call is ambiguous.
+    #[test]
+    fn a_config_lock_guard_is_not_send() {
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        #[allow(dead_code)]
+        struct IsSend;
+        impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+        <ConfigLock as AmbiguousIfSend<_>>::check();
+    }
+
+    const HOLDER_CHILD_ROOT_ENV: &str = "ROCM_CORE_TEST_CONFIG_LOCK_HOLDER_ROOT";
+
+    #[test]
+    #[ignore = "spawned as a child process by a_killed_holder_releases_the_config_lock"]
+    fn config_lock_child_holder() -> Result<()> {
+        let Ok(root) = std::env::var(HOLDER_CHILD_ROOT_ENV) else {
+            return Ok(());
+        };
+        let root = PathBuf::from(root);
+        let _lock = RocmCliConfig::lock(&paths_under(&root))?;
+        fs::write(root.join("held"), b"")?;
+        // Held until the parent kills this process; never released by a drop.
+        std::thread::sleep(Duration::from_mins(2));
+        Ok(())
+    }
+
+    /// The README's promise behind "do not delete the lock file": a command
+    /// that dies while holding the lock does not leave the settings locked.
+    /// A child process takes the lock and is killed without releasing it; the
+    /// lock is busy while it lives and free once it is gone.
+    #[test]
+    fn a_killed_holder_releases_the_config_lock() -> Result<()> {
+        let (root, _) = temp_app_paths("config-lock-killed-holder");
+        fs::create_dir_all(&root)?;
+        let paths = paths_under(&root);
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "config::tests::config_lock_child_holder",
+                "--exact",
+                "--ignored",
+                "--test-threads",
+                "1",
+            ])
+            .env(HOLDER_CHILD_ROOT_ENV, &root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_mins(1);
+        while !root.join("held").exists() && std::time::Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let held = root.join("held").exists();
+        let while_alive =
+            held.then(|| RocmCliConfig::lock_within(&paths, Duration::from_millis(100)).map(drop));
+        child.kill()?;
+        child.wait()?;
+        let after_kill = RocmCliConfig::lock_within(&paths, Duration::from_secs(10)).map(drop);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(held, "the child process never took the lock");
+        let while_alive = while_alive.expect("checked only once the child held the lock");
+        assert!(
+            while_alive.is_err(),
+            "the lock was free while the child process held it"
+        );
+        after_kill.map_err(|error| error.context("the killed holder left the lock taken"))?;
+        Ok(())
+    }
+
+    /// The legacy migration checks again, under the lock, that no
+    /// `config.json` has appeared: one written by another command after the
+    /// first check is kept, and the migration reports nothing migrated.
+    ///
+    /// The lock is held while the migration starts, so it passes its first
+    /// check and waits; `config.json` is written and the lock released. A slow
+    /// machine can make the migration reach its first check only after the
+    /// write, which passes without testing the second check, never fails.
+    #[test]
+    fn a_legacy_migration_keeps_a_config_written_while_it_waited() -> Result<()> {
+        let (root, paths) = temp_app_paths("migrate-dash-raced");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(&legacy, "default_engine = \"vllm\"\n")?;
+        let written = RocmCliConfig {
+            default_engine: Some("lemonade".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let held = RocmCliConfig::lock(&paths)?;
+        let migrated = std::thread::scope(|scope| -> Result<Option<PathBuf>> {
+            let migration =
+                scope.spawn(|| RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy));
+            std::thread::sleep(Duration::from_millis(300));
+            held.save(&written)?;
+            drop(held);
+            migration.join().expect("migration thread panicked")
+        })?;
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(migrated, None, "the migration replaced a newer config.json");
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
+        Ok(())
+    }
+
+    /// An unreadable `config.json` stops the update before the change runs and
+    /// is left byte for byte as it was, so defaults are never saved over the
+    /// user's settings.
+    #[test]
+    fn an_update_of_an_unreadable_config_leaves_the_file_alone() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-update-unreadable");
+        fs::create_dir_all(&paths.config_dir)?;
+        let damaged: &[u8] = b"{\n  \"default_engine\": \"vllm\",\n  \"setup\": {\n    \"therock_v";
+        fs::write(paths.config_path(), damaged)?;
+        let mut ran = false;
+        let outcome = RocmCliConfig::update(&paths, |config| {
+            ran = true;
+            config.telemetry.mode = TELEMETRY_MODE_OFF.to_owned();
+            Ok(())
+        });
+        let after = fs::read(paths.config_path())?;
+        let _ = fs::remove_dir_all(&root);
+
+        let message = format!("{:#}", outcome.expect_err("an unreadable config must fail"));
+        assert!(message.contains("Repair that file"), "{message}");
+        assert!(!ran, "the change ran on settings that were never loaded");
+        assert_eq!(after, damaged, "the unreadable config.json was rewritten");
+        Ok(())
+    }
+
+    /// When the change itself fails, nothing is saved: a field it set before
+    /// failing never reaches the file, which keeps its bytes from before.
+    #[test]
+    fn an_update_whose_change_fails_saves_nothing() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-update-change-fails");
+        RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        }
+        .save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+        let outcome = RocmCliConfig::update(&paths, |config| -> Result<()> {
+            config.default_engine = Some("lemonade".to_owned());
+            bail!("the change refused")
+        });
+        let after = fs::read(paths.config_path())?;
+        let _ = fs::remove_dir_all(&root);
+
+        let message = format!("{:#}", outcome.expect_err("the change failed"));
+        assert!(message.contains("the change refused"), "{message}");
+        assert_eq!(after, before, "a failed change was saved");
+        Ok(())
+    }
+
+    /// Production code changes `config.json` only under [`ConfigLock`]. Saving
+    /// through the lock is `lock.save(&config)`, which names no paths, so a
+    /// `.save(` whose argument mentions `paths` saves settings without the
+    /// lock, and loses whatever another command saved since they were loaded.
+    /// So does `RocmCliConfig::save(&config, &paths)`, and so does writing,
+    /// renaming or copying onto `config_path()` directly. This reads the
+    /// sources of the apps, crates, engines and `xtask`, cut at their test
+    /// modules. The fixture files below are test-only modules, declared under
+    /// `#[cfg(test)]` where they are used.
+    ///
+    /// What it does not catch: a save whose paths variable is named something
+    /// else, code after a test module that is named differently, or a
+    /// `lock.save(&settings)` of settings loaded before the lock was taken.
+    /// The last is what each locked change's own test catches (they pass a
+    /// stale copy in and check that the change on disk survives); review
+    /// catches the rest. This catches the ordinary way of adding such a writer.
+    #[test]
+    fn production_code_saves_the_config_only_under_its_lock() {
+        fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("source folder readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        /// `source` up to its test module, without `//` comments.
+        fn production_code(source: &str) -> String {
+            // An inline test module only: an out-of-line `mod tests;` is a
+            // declaration, and the production code after it is scanned.
+            let end = [
+                "#[cfg(test)]\nmod tests {",
+                "#[cfg(test)]\npub(crate) mod tests {",
+            ]
+            .iter()
+            .filter_map(|marker| source.find(marker))
+            .min()
+            .unwrap_or(source.len());
+            source[..end]
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        /// The argument text of every `.save(` call in `code`.
+        fn save_arguments(code: &str) -> Vec<&str> {
+            code.match_indices(".save(")
+                .map(|(at, call)| {
+                    let rest = &code[at + call.len()..];
+                    &rest[..rest.find(')').unwrap_or(rest.len())]
+                })
+                .collect()
+        }
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the crate sits two levels below the workspace root");
+        let mut roots = vec![
+            workspace.join("apps/rocm/src"),
+            workspace.join("apps/rocmd/src"),
+            workspace.join("xtask/src"),
+        ];
+        for parent in ["crates", "engines"] {
+            for member in fs::read_dir(workspace.join(parent))
+                .expect("workspace folder readable")
+                .flatten()
+            {
+                let src = member.path().join("src");
+                if src.is_dir() {
+                    roots.push(src);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        for root in &roots {
+            rust_files(root, &mut sources);
+        }
+        assert!(sources.len() > 100, "the scan found the source tree");
+
+        // Test-only modules, each declared under `#[cfg(test)]` where it is used.
+        let fixtures = [
+            "apps/rocm/src/test_support.rs",
+            "apps/rocm/src/therock/python_config_props.rs",
+            "crates/rocm-core/src/config_proptests.rs",
+            "crates/rocm-core/src/persisted_paths_props.rs",
+        ];
+        let mut findings = Vec::new();
+        for path in sources {
+            let relative = path
+                .strip_prefix(workspace)
+                .expect("source under the workspace")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if fixtures.contains(&relative.as_str()) {
+                continue;
+            }
+            let code = production_code(&fs::read_to_string(&path).expect("source readable"));
+            for argument in save_arguments(&code) {
+                if argument.contains("paths") {
+                    findings.push(format!("{relative}: .save({argument})"));
+                }
+            }
+            for line in code.lines() {
+                let line = line.trim();
+                let direct_write = line.contains("config_path()")
+                    && [
+                        "fs::write(",
+                        "write_file_atomically(",
+                        "fs::rename(",
+                        "fs::copy(",
+                    ]
+                    .iter()
+                    .any(|write| line.contains(write));
+                if line.contains("RocmCliConfig::save(") || direct_write {
+                    findings.push(format!("{relative}: {line}"));
+                }
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "these save the config without its lock; load and save through \
+             `RocmCliConfig::update` or `RocmCliConfig::lock` instead: {findings:?}"
+        );
     }
 }

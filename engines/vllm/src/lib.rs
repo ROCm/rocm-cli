@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 mod discover_builds;
+mod endpoint_auth;
 mod install;
 mod process;
 mod repair;
@@ -190,8 +191,7 @@ pub fn run_cli() -> Result<()> {
             gpu_selection: crate::process::parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
-            let envelope = read_request()?;
-            print_json(&handle_envelope(envelope))?;
+            print_json(&answer_stdio(&read_request()?))?;
         }
         CommandKind::ServeHttp {
             service_id,
@@ -260,6 +260,11 @@ pub fn builtin_serve_http(
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    // Refuse a request made for a protocol this engine cannot serve before its
+    // payload is read: in another protocol the payload may mean something else.
+    if let Some(refusal) = rocm_engine_protocol::incompatible_request_response(&envelope) {
+        return refusal;
+    }
     match envelope.method {
         EngineMethod::Detect => {
             deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |_| {
@@ -309,12 +314,18 @@ where
             Ok(response) => EngineResponseEnvelope::success(response),
             Err(error) => EngineResponseEnvelope::failure("request_failed", error.to_string()),
         },
-        Err(error) => EngineResponseEnvelope::failure("invalid_payload", error.to_string()),
+        Err(error) => EngineResponseEnvelope::failure(
+            rocm_engine_protocol::INVALID_PAYLOAD_CODE,
+            error.to_string(),
+        ),
     }
 }
 
 fn detect_response() -> DetectResponse {
-    let runtime = crate::runtime::resolve_vllm_runtime(None);
+    detect_response_for(crate::runtime::resolve_vllm_runtime(None))
+}
+
+fn detect_response_for(runtime: anyhow::Result<crate::runtime::VllmRuntime>) -> DetectResponse {
     let installed = runtime.is_ok();
     let mut notes = Vec::new();
     if cfg!(windows) {
@@ -328,6 +339,15 @@ fn detect_response() -> DetectResponse {
             "vLLM command resolved from {}; no CPU fallback is used",
             runtime.source
         ));
+    }
+    // Installed is not usable: a vLLM built against another torch resolves and
+    // reports a version, yet cannot start. Say so here rather than at serve time.
+    let extension_problem = runtime
+        .as_ref()
+        .filter(|_| !cfg!(windows))
+        .and_then(crate::process::vllm_extension_import_problem);
+    if let Some(problem) = extension_problem.as_ref() {
+        notes.push(problem.clone());
     }
 
     DetectResponse {
@@ -348,19 +368,35 @@ fn detect_response() -> DetectResponse {
             .map(|version| format!("vllm {version}")),
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![EngineDeviceAvailability {
-            kind: "rocm_gpu".to_owned(),
-            available: installed && !cfg!(windows),
-            reason: if cfg!(windows) {
-                Some(windows_unsupported_message().to_owned())
-            } else if installed {
-                None
-            } else {
-                Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
-            },
-        }],
+        available_devices: vec![rocm_gpu_availability(
+            installed,
+            cfg!(windows),
+            extension_problem,
+        )],
         capabilities: capabilities(),
         notes,
+    }
+}
+
+/// The `rocm_gpu` device entry. An installed vLLM whose compiled extensions
+/// cannot import is not available, and says why.
+fn rocm_gpu_availability(
+    installed: bool,
+    windows: bool,
+    extension_problem: Option<String>,
+) -> EngineDeviceAvailability {
+    EngineDeviceAvailability {
+        kind: "rocm_gpu".to_owned(),
+        available: installed && !windows && extension_problem.is_none(),
+        reason: if windows {
+            Some(windows_unsupported_message().to_owned())
+        } else if let Some(problem) = extension_problem {
+            Some(problem)
+        } else if installed {
+            None
+        } else {
+            Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
+        },
     }
 }
 
@@ -379,12 +415,21 @@ pub(crate) const fn windows_unsupported_message() -> &'static str {
     "vLLM ROCm serving is supported by rocm-cli only on Linux/WSL; native Windows vLLM is skipped. No CPU fallback is used."
 }
 
-fn read_request() -> Result<EngineRequestEnvelope> {
+/// The request text on stdin, read to its end. It is decoded by
+/// [`answer_stdio`], which judges its protocol version first.
+fn read_request() -> Result<String> {
     let mut buffer = String::new();
     std::io::stdin()
         .read_to_string(&mut buffer)
         .context("failed to read stdin for engine request")?;
-    serde_json::from_str(&buffer).context("failed to parse engine request envelope")
+    Ok(buffer)
+}
+
+/// The answer to the request `text` read on stdin: its protocol version is
+/// judged before its method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), then it is handled.
+fn answer_stdio(text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle_envelope)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -401,6 +446,44 @@ mod tests {
     use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
     use serde_json::json;
 
+    #[cfg(unix)]
+    #[test]
+    fn detect_reports_a_runtime_whose_extensions_do_not_import_as_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let python = dir.path().join("python");
+        // Not `fs::write` then run: a concurrent test's fork can keep the write fd
+        // open, and the run fails with `Text file busy`.
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            "#!/bin/sh\necho '{\"failures\": [{\"module\": \"vllm._rocm_C\", \"error\": \"undefined symbol: x\"}]}'\n",
+        )
+        .expect("write stand-in interpreter");
+        let runtime = crate::runtime::VllmRuntime {
+            python_executable: Some(python),
+            ..crate::runtime::VllmRuntime::for_test()
+        };
+        let detect = detect_response_for(Ok(runtime));
+        assert!(detect.installed);
+        let device = &detect.available_devices[0];
+        assert!(!device.available);
+        assert!(
+            device
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("vllm._rocm_C")),
+            "{:?}",
+            device.reason
+        );
+        assert!(
+            detect
+                .notes
+                .iter()
+                .any(|note| note.contains("undefined symbol: x")),
+            "{:?}",
+            detect.notes
+        );
+    }
+
     #[test]
     fn engine_recipe_launch_args_forward_required_flags() {
         let hint = EngineRecipeHint {
@@ -414,6 +497,28 @@ mod tests {
         assert_eq!(
             engine_recipe_launch_args(Some(&hint)),
             vec!["--enable-auto-tool-choice".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_installed_vllm_with_an_extension_problem_is_not_available() {
+        let ready = rocm_gpu_availability(true, false, None);
+        assert!(ready.available);
+        assert_eq!(ready.reason, None);
+
+        let broken = rocm_gpu_availability(true, false, Some("extensions do not import".into()));
+        assert!(!broken.available);
+        assert_eq!(broken.reason.as_deref(), Some("extensions do not import"));
+
+        let missing = rocm_gpu_availability(false, false, None);
+        assert!(!missing.available);
+        assert!(missing.reason.is_some());
+
+        let windows = rocm_gpu_availability(true, true, Some("ignored".into()));
+        assert!(!windows.available);
+        assert_eq!(
+            windows.reason.as_deref(),
+            Some(windows_unsupported_message())
         );
     }
 
@@ -457,36 +562,56 @@ mod tests {
         ];
 
         for (method, payload) in success_cases {
-            let response = handle_envelope(EngineRequestEnvelope { method, payload });
+            let response = handle_envelope(EngineRequestEnvelope::new(method, payload));
             assert!(
                 response.ok,
                 "expected protocol method to return a typed success envelope: {:?}",
                 response.error
             );
+            assert_eq!(
+                response.protocol_version.as_deref(),
+                Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+            );
         }
 
-        let endpoint = handle_envelope(EngineRequestEnvelope {
-            method: EngineMethod::Endpoint,
-            payload: json!({
+        let endpoint = handle_envelope(EngineRequestEnvelope::new(
+            EngineMethod::Endpoint,
+            json!({
                 "service_id": service_id.as_str()
             }),
-        });
+        ));
         assert!(!endpoint.ok);
+        assert_eq!(
+            endpoint.protocol_version.as_deref(),
+            Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+        );
         assert_eq!(
             endpoint.error.as_ref().map(|error| error.code.as_str()),
             Some("request_failed")
         );
 
         for method in [EngineMethod::Install, EngineMethod::Launch] {
-            let response = handle_envelope(EngineRequestEnvelope {
-                method,
-                payload: json!({}),
-            });
+            let response = handle_envelope(EngineRequestEnvelope::new(method, json!({})));
             assert!(!response.ok);
             assert_eq!(
+                response.protocol_version.as_deref(),
+                Some(rocm_engine_protocol::ENGINE_PROTOCOL_VERSION)
+            );
+            assert_eq!(
                 response.error.as_ref().map(|error| error.code.as_str()),
-                Some("invalid_payload")
+                Some(rocm_engine_protocol::INVALID_PAYLOAD_CODE)
             );
         }
+    }
+
+    /// The engine protocol contract, the same check every engine runs: see
+    /// [`rocm_engine_protocol::engine_contract`].
+    #[test]
+    fn stdio_answers_hold_the_engine_protocol_contract() {
+        rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+            "vllm",
+            answer_stdio,
+            handle_envelope,
+        );
     }
 }

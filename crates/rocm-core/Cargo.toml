@@ -16,9 +16,10 @@ workspace = true
 e2e-test-hooks = []
 # Compiles test helpers so a dependent crate's tests can use them: the
 # `foreign_temp_probe` probe, `atomic_write::stage_owner_only_file_unpublished`
-# (the leftover a killed owner-only store leaves) and, on Windows,
-# `owner_only_file::owner_only_dacl_mismatch` (reads a file's DACL back).
-# Enabled only from a `[dev-dependencies]` entry; never in a shipped build.
+# (the leftover a killed owner-only store leaves), the examine scenarios'
+# planted `lspci` lines (`rocm_core::examine::TEST_FIXTURE_LSPCI_LINE_*`) and,
+# on Windows, `owner_only_file::owner_only_dacl_mismatch` (reads a file's DACL
+# back). Enabled only from a `[dev-dependencies]` entry; never in a shipped build.
 test-support = []
 
 [build-dependencies]

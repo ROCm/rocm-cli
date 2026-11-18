@@ -51,22 +51,27 @@ use crate::{AutomationsCommand, format_bytes};
 
 pub(crate) fn automations(command: Option<AutomationsCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let mut config = RocmCliConfig::load(&paths)?;
     match command.unwrap_or(AutomationsCommand::List) {
         AutomationsCommand::List => {
+            let config = RocmCliConfig::load(&paths)?;
             print!("{}", render_automations_text(&paths, &config)?);
         }
         AutomationsCommand::Enable { watcher, mode } => {
+            // Loaded, changed and saved under the config lock (see
+            // `RocmCliConfig::update`), so a concurrent settings change survives.
+            // Refused before the lock is taken, so a refusal writes nothing.
             let Some(spec) = builtin_watcher(&watcher) else {
                 bail!("unknown watcher: {watcher}");
             };
-            let entry = config.watcher_config_mut(spec.id);
-            entry.enabled = true;
-            if let Some(mode) = mode {
-                entry.mode = Some(mode.into());
-            }
-            config.automations.daemon_enabled = true;
-            config.save(&paths)?;
+            let config = RocmCliConfig::update(&paths, |config| {
+                let entry = config.watcher_config_mut(spec.id);
+                entry.enabled = true;
+                if let Some(mode) = mode {
+                    entry.mode = Some(mode.into());
+                }
+                config.automations.daemon_enabled = true;
+                Ok(config.clone())
+            })?;
             println!("automation watcher enabled");
             println!("  watcher: {}", spec.id);
             println!("  mode: {}", config.effective_watcher_mode(spec).as_str());
@@ -81,17 +86,19 @@ pub(crate) fn automations(command: Option<AutomationsCommand>) -> Result<()> {
             let Some(spec) = builtin_watcher(&watcher) else {
                 bail!("unknown watcher: {watcher}");
             };
-            let entry = config.watcher_config_mut(spec.id);
-            entry.enabled = false;
-            if !config
-                .automations
-                .watchers
-                .values()
-                .any(|watcher| watcher.enabled)
-            {
-                config.automations.daemon_enabled = false;
-            }
-            config.save(&paths)?;
+            RocmCliConfig::update(&paths, |config| {
+                let entry = config.watcher_config_mut(spec.id);
+                entry.enabled = false;
+                if !config
+                    .automations
+                    .watchers
+                    .values()
+                    .any(|watcher| watcher.enabled)
+                {
+                    config.automations.daemon_enabled = false;
+                }
+                Ok(())
+            })?;
             println!("automation watcher disabled");
             println!("  watcher: {}", spec.id);
             println!("  config: {}", paths.config_path().display());

@@ -179,8 +179,12 @@ All of those checks happen before activation. Run the current host's set with
 The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to
 `apt-get install`, which runs its maintainer scripts as root. rocm-cli therefore
 carries a SHA-256 digest for each published ROCDXG release and checks the
-download against it before the install step; on a mismatch the plan stops before
-anything runs as root. Verification is on by default and needs nothing set.
+package against it before the install step; on a mismatch the plan stops before
+the package's maintainer scripts run. The check is made on a copy root has
+placed in `/var/cache/rocm-cli/rocdxg/`, which only root can write, and that
+same file is what `apt-get install` reads, so no other local user can change
+the package between the check and the install. Verification is on by default
+and needs nothing set.
 
 `ROCM_CLI_ROCDXG_SHA256` supplies a digest for a release rocm-cli has none for,
 and overrides the pinned digest for one it does:
@@ -290,6 +294,13 @@ untrusted host; rocm-cli always resolves the hardcoded default base instead.
 Set the gate and the specific base variable together, and only in tests or
 deliberate manual QA against a fixture server. The `therock-next` E2E scenarios
 use exactly this pairing to exercise next-layout dispatch hermetically.
+
+A wheel install records the pip index it resolved from, including an overridden
+base, in the runtime's manifest as `index_url`. `rocm engines install vllm` reads
+that value back for a ROCm 10.2 runtime and fetches the SDK's own torch stack from
+it, without checking its scheme or host, so an override used for one install keeps
+being used for that runtime's later vLLM installs, after the override is unset.
+Remove and reinstall the runtime, or edit its manifest, to stop that.
 
 ## ComfyUI Source Archive Override
 

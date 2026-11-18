@@ -20,6 +20,18 @@ runtime check, download, or launch; `rocm engines list` shows the same decision
 as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
 serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
+On Linux and WSL, an installed vLLM is also checked by importing its compiled
+extensions (`vllm._C`, `vllm._rocm_C`, `vllm._C_stable_libtorch`) after `torch`,
+in the runtime's own Python. A wheel built against a different torch than the
+one beside it fails that import: `rocm engines list` then shows
+`runtime: installed, not usable` with the failing module, and
+`rocm serve --engine vllm` starts no server: the engine process exits before starting
+vLLM, and `rocm logs` for the service shows the same guidance. The check is
+best-effort and reports nothing when it cannot run (a vLLM found through
+`ROCM_CLI_VLLM_COMMAND` or on `PATH`, where no Python interpreter is known, a
+`torch` that does not import, a probe that fails for another reason
+or exceeds one minute); an extension absent from the wheel is not a failure.
+
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
@@ -109,15 +121,33 @@ SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
 vLLM install then refuses that runtime; re-running the install with
 `--python-version 3.14` moves it back.
 
-This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
-through *different* rows: they pin different vLLM minors and read vLLM from
-different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
-host from 10.0's production index. Both rows take their torch stack from the
-same `whl-next` index, which is also where `rocm install sdk` resolves either
-SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
-resolves its own torch, torchvision, and torchaudio pins fresh from the row's
-own static version prefixes, instead of reusing what the SDK install resolved.
-The SDK install might have resolved a different torch version than the row pins.
+This route is selected by `major.minor`, so `10.0.0`, `10.1.0` and `10.2.0`
+discover through *different* rows, each pinning its own vLLM minor. `10.0.0` reads
+vLLM from the production index; `10.1.0` and `10.2.0` read it from a separate
+staging host, where AMD stages their vLLM builds. The `10.0.0` and `10.1.0` rows
+take their torch stack from the stable `whl-next` index, which is also where
+`rocm install sdk` resolves those SDKs' own `+rocmX.Y` torch from. For those two
+rows vLLM's discovery is independent of the SDK install: it resolves its own
+torch, torchvision, and torchaudio pins fresh from the row's own static version
+prefixes, instead of reusing what the SDK install resolved. The SDK install might
+have resolved a different torch version than the row pins.
+
+The `10.2.0` row does not discover its torch stack: it keeps the torch,
+torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,
+torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`), checks them
+against the row's series and the SDK's ROCm line, and realigns to those exact
+builds from the index the SDK was installed from (the one its runtime manifest
+records, so a nightly SDK uses the nightly index and a release SDK the release
+one; the row's nightly index when no manifest for the SDK's interpreter recorded
+one or the registry could not be read, and the install output says which). A series match
+would not work there: the nightly index serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
+`+rocm10.3` build. The staging host's `+rocm10.2.0rcN` torch is not used: it
+requires `rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that
+staging does not serve. The row has been installed and imported (`import
+vllm._C`) against a 10.2 SDK. A GPU serve has been run on WSL2 only with the
+runtime linked to its own `librocdxg.so`, never against a release SDK, and the 10.2 vLLM
+wheel is published for `linux_x86_64` only. The nightly channel resolves to
+ROCm 10.3, which has no vLLM build and no row.
 
 One value flows the other way. A row's exact torchaudio pin, where it has one
 instead of a series, is also the hardware-verified build `rocm install sdk` pins
@@ -407,6 +437,11 @@ rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
 # for the full breakdown of a busy GPU versus a model that is too large, pass the error to diagnose
 rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
 ```
+
+The `vllm: ` in that symptom is what lets the diagnosis claim the line for
+vLLM: the line on its own is what any PyTorch program prints. To diagnose your
+own failing line without editing it, name the engine instead:
+`rocm diagnose --symptom '<the error>' --engine vllm`.
 
 ## Engine import failures
 

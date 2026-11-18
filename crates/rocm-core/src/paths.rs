@@ -265,6 +265,14 @@ impl AppPaths {
         self.config_dir.join("config.json")
     }
 
+    /// Lock file serializing every load-change-save of [`Self::config_path`]
+    /// (see [`ConfigLock`](crate::ConfigLock)). Beside the config file, not in
+    /// the data folder, because the config file records where the data folder
+    /// is.
+    pub fn config_lock_path(&self) -> PathBuf {
+        self.config_dir.join("config.json.lock")
+    }
+
     pub fn services_dir(&self) -> PathBuf {
         self.data_dir.join("services")
     }

@@ -8,9 +8,17 @@
 ## folder is vendored verbatim into the amd/skills catalog, whose skills carry
 ## no headers. The licence is stated in the skill's own skill-card.md instead.
 
+## The header text is a template rendered per file. PowerShell files get an ASCII
+## `(c)` instead of the copyright sign: a file with any non-ASCII byte needs a
+## BOM, and install.ps1 cannot have one because a BOM breaks `irm ... | iex`. The
+## other PowerShell files follow so the whole family reads the same.
 [header]
 text = """
+{% if attrs.filename is endingwith(".ps1") or attrs.filename is endingwith(".psm1") or attrs.filename is endingwith(".psd1") -%}
+Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+{%- else -%}
 Copyright © Advanced Micro Devices, Inc., or its affiliates.
+{%- endif %}
 
 SPDX-License-Identifier: MIT
 """
@@ -21,6 +29,9 @@ includes = [
   "**/*.py",
   "**/*.sh",
   "**/*.md",
+  "**/*.ps1",
+  "**/*.psm1",
+  "**/*.psd1",
 ]
 
 excludes = [
@@ -35,3 +46,12 @@ excludes = [
 [[rules]]
 extensions = ["md"]
 style_out = "xml"
+
+## hawkeye has no built-in comment syntax for PowerShell: without this rule a
+## .ps1/.psm1/.psd1 file is reported `unsupported` and silently skipped (exit 0),
+## so `includes` alone would not enforce anything. Only `hawkeye check
+## --fail-on-unknown` turns that into a failure, and neither the CI job nor the
+## prek hook passes the flag.
+[[rules]]
+extensions = ["ps1", "psm1", "psd1"]
+style_out = "script"

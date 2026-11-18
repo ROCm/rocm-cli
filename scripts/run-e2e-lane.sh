@@ -22,6 +22,11 @@
 #                  both (default "release nightly")
 #   E2E_LANE_WORK  where the build and runtimes go (default /var/tmp/e2e-lane)
 #   LANE_OUT       where reported files go (default /out)
+#   E2E_EXPECT_GPU whether the lane has a GPU (default 1: every queue lane is
+#                  given one); the suite fails rather than passing with every
+#                  GPU scenario skipped. Set but empty, it leaves the lane
+#                  undeclared, which switches that check off. See
+#                  tests/e2e-cucumber/README.md.
 
 set -euo pipefail
 
@@ -39,6 +44,7 @@ if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
 fi
 
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
+export E2E_EXPECT_GPU="${E2E_EXPECT_GPU-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
 # The channels are checked before anything is built, so a typo costs nothing.

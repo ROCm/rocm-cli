@@ -144,8 +144,15 @@ pub enum AcceleratorMemory {
     /// `rocm` binary) is the only place the carve-out is still in hand.
     ///
     /// A ceiling is not an allocation. The operating system, the compositor and
-    /// every other process draw on the same memory, so this can never reach
+    /// every other process draw on the same memory, so a recipe that was
+    /// actually weighed against this pool can never reach
     /// [`ModelVerdict::Ready`] -- see `assess_model_readiness`.
+    ///
+    /// "Weighed against it" is the whole condition, and it is narrower than
+    /// "runs on an APU". A recipe that declares no `min_gpu_mem_gb` was never
+    /// compared with the pool, and a `cpu_only` recipe never allocates from it;
+    /// both stay `Ready` here. Seven shipped `gpu_required` recipes have no
+    /// minimum today, so this is the common case rather than a corner.
     Unified {
         gtt_total_gib: f64,
         vram_carveout_gib: Option<f64>,
@@ -1970,7 +1977,12 @@ mod tests {
         cpu_only.canonical_model_id = CPU_ONLY_REF.to_owned();
         cpu_only.aliases.clear();
         cpu_only.device_policy = "cpu_only".to_owned();
-        cpu_only.min_gpu_mem_gb = None;
+        // Deliberately declares a GPU minimum even though it never uses the
+        // GPU, so `required.is_some()` is TRUE here and `requires_gpu` is the
+        // only term left holding this recipe out of the shared-pool downgrade.
+        // With `None` the test passed on `required.is_some()` alone and stayed
+        // green with `requires_gpu(recipe)` deleted.
+        cpu_only.min_gpu_mem_gb = Some(8);
         // Cleared so the system-RAM softening cannot be what moves the verdict.
         cpu_only.recommended_system_ram_gb = None;
         registry.recipes.push(cpu_only);

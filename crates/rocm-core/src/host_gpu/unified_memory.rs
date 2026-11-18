@@ -34,9 +34,11 @@
 //! fits".
 //!
 //! Reading it is only half the job: the figure is a *ceiling on a pool shared
-//! with the operating system*, not an allocation, which is why
-//! [`crate::model_readiness::AcceleratorMemory::Unified`] can never reach
-//! [`crate::model_readiness::ModelVerdict::Ready`].
+//! with the operating system*, not an allocation, which is why a recipe
+//! weighed against [`crate::model_readiness::AcceleratorMemory::Unified`] can
+//! never reach [`crate::model_readiness::ModelVerdict::Ready`]. A recipe that
+//! declares no GPU memory minimum was never weighed against it, and a
+//! `cpu_only` one never allocates from it; both still reach `Ready`.
 //!
 //! The caller decides *whether* the figure applies. Both files exist on a
 //! discrete card too, and summing a GTT aperture into a discrete GPU's VRAM

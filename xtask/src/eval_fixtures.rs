@@ -261,8 +261,9 @@ fn replies_for(root: &Path, case: &Case, recorded: &rocm_core::Examination) -> R
         .host
         .map_or_else(|| recorded.clone(), |host| examination_for(recorded, host));
     let report = rocm_core::run_diagnose(examination, &case.symptom);
+    // The same rendering `rocm diagnose --json` prints, ASCII on the wire.
     let diagnose_json = Reply::ok(
-        serde_json::to_string_pretty(&report).context("failed to render the diagnosis")? + "\n",
+        rocm_core::render_diagnose_json(&report).context("failed to render the diagnosis")? + "\n",
     );
     let diagnose_text = Reply::ok(rocm_core::render_diagnose_text(&report, 5));
     let (version, fix_json) = match case.cli {

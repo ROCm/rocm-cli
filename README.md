@@ -458,7 +458,7 @@ Windows. The Vulkan driver version is not shown.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT | --symptom-file PATH] [--top N] [--json] [--distro [NAME] | --report [--send]]
+rocm diagnose [--symptom TEXT [--engine vllm] | --symptom-file PATH [--engine vllm]] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
@@ -518,6 +518,23 @@ position.
   contribute to, once the text contributed to any match in the report. That
   includes one past `--top`, so all the rows shown can carry the line when the
   only match the text contributed to was cut off.
+- `--engine` names the engine the symptom came from (only `vllm` is
+  accepted; it needs `--symptom` or `--symptom-file`). An engine's own error
+  is often a line any program could print, such as a PyTorch out-of-memory
+  error, and the vLLM entry claims only lines that name vLLM. With
+  `--engine vllm`, every non-blank line of the symptom is taken as vLLM's, so
+  the error is matched without editing it. The text report opens with a line
+  naming the engine; where no entry on this OS reads it (native Windows has
+  no vLLM entry), that line says the flag changed nothing. The `--json`
+  diagnosis records the engine and the symptom, exactly as given once the
+  JSON is decoded (for `--symptom-file`, the text read, minus the one
+  trailing line break), under `provenance`. On the wire `--json` is ASCII:
+  any non-ASCII character in the paste is written as a `\uXXXX` escape, so a
+  Windows console shows no mojibake and any JSON parser reads the paste back
+  unchanged. A `--report` never carries either: it names only the cause
+  the diagnosis established, so a pasted log's paths or host names stay out
+  of what you might mail. Writing `vllm` into the symptom text still works
+  too.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
@@ -890,7 +907,7 @@ old date is a hint to look at the driver, not a finding that it is broken. See
 Manage multiple side-by-side ROCm runtimes:
 
 ```
-rocm runtimes list
+rocm runtimes list [--json]
 rocm runtimes activate <runtime-key> [--restart-services [--yes]]
 rocm runtimes rollback [--restart-services [--yes]]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
@@ -923,6 +940,13 @@ Runtimes are told apart by the packages they were installed from, not by
 version alone, so one version can appear more than once: a `--devel` install
 and a plain one of the same version are two separate runtimes, as are two
 installs that resolved different GPU device payloads.
+
+`list --json` prints the same listing as one JSON document on stdout for
+scripts: each runtime with its key, version, mode, status and toolchain, its
+`provenance` as an object with the same four facts, and `active` and
+`rollback_target` flags in place of the `*` and `-` markers. Unset values,
+including a provenance fact the text shows as `unrecorded`, are `null`. Fields
+may be added in later releases; existing ones are not renamed or removed.
 
 `activate` and `rollback` change which runtime the next install or server
 picks up. A server that is already running is not moved: it keeps serving on
@@ -1169,7 +1193,8 @@ has two minutes in all, so on a slow link it can take that long to fail. No
 token is sent, so a gated or private repository cannot be read.
 It then estimates weights, plus the KV cache at `--context-size` (default 4096)
 and `--kv-cache-type` (default `f16`), plus a compute buffer and a runtime
-reserve, against this GPU's dedicated VRAM:
+reserve, against this GPU's dedicated VRAM — or, on an integrated GPU, against
+the shared memory pool its engine allocates from:
 
 ```
 rocm diagnose --model owner/repo:Q4_K_M --context-size 32768 --kv-cache-type q8_0
@@ -1353,6 +1378,25 @@ automatically unless you supply one. The key is kept in a file under the data
 directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather than
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
+
+With the vLLM engine, an endpoint bound to a public interface
+(`--allow-public-bind`), or served with `--require-api-key`, answers only
+clients that present its API key as an `Authorization: Bearer` header, on every
+route the server answers, not just the OpenAI `/v1` API — including vLLM's own
+`/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
+CORS preflights: the `/health` liveness check stays open. The AIM engine runs
+the same vLLM server inside its container but does not install this check, so
+a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
+leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
+without the key.
+
+Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
+key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
+and latency figures empty and keeps showing a warning such as
+`vllm scrape: 1 failed (last: transport: GET http://<host>:<port>/metrics: status 401 Unauthorized)`.
+
+`rocm bench load` sends no API key, so it cannot benchmark a key-protected
+endpoint on any engine.
 
 `--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
 server-wide sampling defaults for the launched engine. They apply only to
@@ -1932,7 +1976,15 @@ Settings live in `config.json` in the config directory and are replaced in one
 step, so an interrupted save leaves the previous file rather than a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
+it back to `config.json` before running another command. Commands that change
+settings at the same time, from two terminals or a script, take turns: each
+reads the file only once the previous change is saved, so none of them undoes
+another's change. One that waits more than 30 seconds for its turn stops with
+an error saying it did not save its change to the file. The
+turn-taking goes through `config.json.lock` beside the file, so a config
+directory where that file cannot be created, such as a read-only one, refuses
+every settings change. The lock file can stay there and must not be deleted
+while a command is running. If the file exists
 but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records

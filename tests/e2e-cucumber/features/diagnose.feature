@@ -915,7 +915,8 @@ Feature: Diagnosing failures and listing fixes
   # paste is diagnosed (not investigated further; the console is started with
   # cursor inheritance, which waits on a reply the screen emulator does not
   # send). That leaves the Windows half of the hint (Ctrl-Z then Enter) without
-  # an e2e check; docs/manual-testing.md section 13 covers it by hand.
+  # an e2e check; docs/manual-testing.md's "Pasting An Error Into `rocm diagnose`"
+  # section covers it by hand.
   @id:diagnose-a-paste-at-the-terminal-is-explained-and-diagnosed @requires-os:linux
   Scenario: diagnose-60 - Pasting the error at the terminal is explained, and the paste is diagnosed when the user ends it
     Given a pasted error containing quotes, a command substitution and a leading minus sign
@@ -1054,6 +1055,119 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed
     And the fix's catalog entry is printed, but not the device setting it would save
 
+  # ROCMAI-955. A vLLM error is often an ordinary PyTorch line that does not say
+  # vLLM, and the vLLM entry will not claim a line that does not, so the
+  # rocm-doctor skill tells an agent to write `vllm: ` in front of the user's
+  # paste (it moves to naming the engine in a later change). The user can now
+  # say where the paste came from instead, and the paste is used, and reported,
+  # exactly as given. @requires-os:linux for the reason given on
+  # diagnose-36: the vLLM entry is not in the native Windows catalog. Writing
+  # `vllm` into the paste still matches as before; diagnose-36 covers that form.
+  @id:diagnose-named-engine-matches-the-paste-unedited @requires-os:linux
+  Scenario: diagnose-71 - A pasted vLLM error is matched as vLLM's when the user names the engine, and not edited
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from
+    Then the diagnosis identifies the vLLM startup OOM
+    And the symptom in the report is exactly what the user pasted
+
+  # The record of where the paste came from does not depend on whether this
+  # machine's catalog has an entry for that engine, so it holds on every lane,
+  # native Windows included.
+  @id:diagnose-named-engine-is-recorded-in-the-report
+  Scenario: diagnose-72 - The report says which engine the user named and keeps the paste as given
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from
+    Then the report says the user named vLLM as the source of the symptom
+    And the symptom in the report is exactly what the user pasted
+
+  # Only the engines the catalog tells apart are accepted. An engine `rocm
+  # serve` knows but the catalog does not would change nothing, so it is
+  # refused rather than accepted and silently ignored.
+  @id:diagnose-unknown-engine-is-refused
+  Scenario: diagnose-73 - Naming an engine the diagnosis cannot tell apart is refused
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming an engine the diagnosis does not know
+    Then the CLI refuses the engine, names the ones it accepts, and diagnoses nothing
+
+  # `--engine` makes the diagnosis repeat the user's paste, verbatim, and
+  # `--report` is built from that diagnosis. A paste can carry the user's own
+  # paths and host names, and the report is the document printed for mailing,
+  # so the paste must not reach it: the report names the cause it established
+  # and nothing the user typed. The machine is simulated as in diagnose-58, a
+  # Linux host whose only GPU is on the compatibility matrix, so a real report
+  # is prepared on every Linux lane (WSL2 included, GPU or not) and the check
+  # runs against it, not against a refusal that never quotes the paste. Native
+  # Windows cannot be simulated this way; the payload unit test
+  # `a_shared_report_never_carries_the_pasted_symptom_or_its_provenance` holds
+  # the same property on every platform.
+  @id:diagnose-named-engine-paste-stays-out-of-the-report @requires-os:linux
+  Scenario: diagnose-74 - A report asked for with a named engine carries nothing the user pasted
+    Given a simulated Linux machine whose only GPU is a released one
+    And a user who pasted a vLLM error that names their own machine
+    When the user asks the CLI what a report would carry, naming vLLM as the engine the error came from
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+    And nothing the user pasted appears in what the CLI printed
+
+  # `--engine` needs a symptom, and `--symptom-file` supplies one as much as
+  # `--symptom` does, so the two are accepted together. The paste is piped in
+  # with the line break a shell or editor adds at the end; the symptom the
+  # report records is the text as `--symptom-file` reads it, with that one line
+  # break removed and nothing else changed. Holds on every lane: the record of
+  # where the paste came from does not depend on this machine's catalog.
+  @id:diagnose-named-engine-takes-a-piped-paste
+  Scenario: diagnose-75 - A vLLM error piped to the diagnosis is taken as vLLM's when the user names the engine
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user pipes it to the diagnosis, naming vLLM as the engine it came from
+    Then the report says the user named vLLM as the source of the symptom
+    And the symptom in the report is exactly what the user pasted
+
+  # The text report says which engine `--engine` named, and whether any entry on
+  # this machine reads it. Linux and WSL2 have the vLLM out-of-memory entry, so
+  # the line says the symptom was read as vLLM's, and the step checks that
+  # the vLLM entry is in the report. Native Windows has no vLLM entry, so the
+  # line says the flag changed nothing (diagnose-77), and that step checks that
+  # the report is otherwise the one the same paste gets without the flag. The
+  # line is derived from the catalog table the checks run from, not from a list
+  # of operating systems, so each half runs on the lanes its claim is about.
+  @id:diagnose-named-engine-is-stated-in-the-text-report @requires-os:linux
+  Scenario: diagnose-76 - The text report names the engine and says the symptom was read as that engine's
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from
+    Then the report says the symptom was read as vLLM's, and the vLLM out-of-memory cause is reported
+
+  @id:diagnose-named-engine-without-an-entry-says-it-changed-nothing @requires-os:windows
+  Scenario: diagnose-77 - On a machine with no entry for the named engine, the text report says the flag changed nothing
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from
+    Then the report says no entry for vLLM exists on this OS, and the diagnosis is the one without the flag
+
+  # `provenance.symptom` repeats the paste verbatim, and a paste can hold text
+  # no catalog message does: an accented path, the box-drawing characters a
+  # `rich` traceback frames itself with, an emoji. On a Windows console using
+  # the OEM code page raw UTF-8 shows as mojibake, so `--json` is ASCII on the
+  # wire: each non-ASCII character is written as a `\u` escape, which every JSON
+  # parser decodes back to the identical text. Holds on every lane. The paste
+  # goes in through a file because a shell would get to it first otherwise.
+  @id:diagnose-named-engine-json-is-ascii-and-keeps-the-paste
+  Scenario: diagnose-78 - A pasted error with non-ASCII text is printed as ASCII JSON and reads back unchanged
+    Given a user whose pasted vLLM error contains non-ASCII text, saved to a file
+    When the user asks the CLI to diagnose that file in machine-readable form, naming vLLM as the engine
+    Then every byte the CLI printed is ASCII
+    And the symptom in the report reads back exactly as the file held it
+
+  # The line in diagnose-76 says how the symptom was read, not that it matched.
+  # With an error that has nothing to do with vLLM (a plain Python traceback)
+  # the same line appears, and the report holds no vLLM cause: naming the engine
+  # never makes a paste match on its own. Linux and WSL2, where the vLLM entry
+  # exists and so reads the engine; native Windows says the flag changed nothing
+  # instead (diagnose-77).
+  @id:diagnose-named-engine-claims-no-match-for-an-unrelated-paste @requires-os:linux
+  Scenario: diagnose-79 - Naming vLLM for an error that is not vLLM's says how it was read and reports no vLLM cause
+    Given a user who pasted a Python error that has nothing to do with vLLM
+    When the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from
+    Then the report says the symptom was read as vLLM's, and no vLLM cause is reported
+
   # ROCMAI-912. An APU has no private VRAM: every adapter query reports the
   # fixed BIOS carve-out as the device's memory (512 MiB on a Ryzen 7 4700U,
   # ~4 GiB on a Strix Halo) while the engine allocates out of system memory the
@@ -1071,7 +1185,7 @@ Feature: Diagnosing failures and listing fixes
   # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
   # it can have (see the PR text).
   @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
-  Scenario: diagnose-71 - An integrated GPU is judged on the pool it allocates from, not its carve-out
+  Scenario: diagnose-80 - An integrated GPU is judged on the pool it allocates from, not its carve-out
     Given a machine whose only GPU shares system memory, with the pool it may use readable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1087,7 +1201,7 @@ Feature: Diagnosing failures and listing fixes
   # `amd-smi` already answered here, with the wrong pool, and would answer
   # identically forever.
   @id:diagnose-model-an-unreadable-shared-pool-is-said-not-guessed @requires-os:linux
-  Scenario: diagnose-72 - An integrated GPU whose pool cannot be read is told so, not given a number
+  Scenario: diagnose-81 - An integrated GPU whose pool cannot be read is told so, not given a number
     Given a machine whose only GPU shares system memory, with the pool it may use unreadable
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1102,7 +1216,7 @@ Feature: Diagnosing failures and listing fixes
   # planted machine carries a large aperture beside a small VRAM figure, so a
   # verdict reached on either wrong number is visible in the report.
   @id:diagnose-model-a-discrete-card-is-never-credited-with-the-aperture @requires-os:linux
-  Scenario: diagnose-73 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
+  Scenario: diagnose-82 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
     Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1123,10 +1237,10 @@ Feature: Diagnosing failures and listing fixes
   # withholds every row first, and the answer is "GPU memory unmeasured" before
   # the aperture is ever consulted -- so the scenario plants a stub `amd-smi`
   # reporting the one compute device, alongside the two cards in sysfs. The
-  # premise it rests on is diagnose-71: the same APU with the same readable
+  # premise it rests on is diagnose-80: the same APU with the same readable
   # 60 GiB aperture, alone, does get a figure.
   @id:diagnose-model-two-amd-cards-leave-the-pool-unattributable @requires-os:linux
-  Scenario: diagnose-74 - An integrated GPU beside a second AMD card is credited with neither pool
+  Scenario: diagnose-83 - An integrated GPU beside a second AMD card is credited with neither pool
     Given a machine whose integrated GPU shares system memory beside a second AMD card
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form
@@ -1151,7 +1265,7 @@ Feature: Diagnosing failures and listing fixes
   # happily against a shared-pool check someone had deleted outright; the
   # second is the premise that makes the first mean something.
   @id:diagnose-model-a-cpu-only-recipe-is-not-softened-by-a-pool-it-never-uses @requires-os:linux
-  Scenario: diagnose-75 - A CPU-only recipe is not softened by a shared pool it never allocates from
+  Scenario: diagnose-84 - A CPU-only recipe is not softened by a shared pool it never allocates from
     Given a machine whose only GPU shares system memory, with the pool it may use readable
     And a recipe catalog offering the smallest curated model CPU-only beside a copy that needs the GPU
     When the user asks the CLI whether the CPU-only recipe would run, in machine-readable form
@@ -1169,12 +1283,12 @@ Feature: Diagnosing failures and listing fixes
   # pool is free. The note is the only place a reader is told which kind of
   # number they are looking at, and it reaches `--json` on the estimate itself.
   #
-  # Same planted APU as diagnose-71, same tiny GGUF as diagnose-49. The
+  # Same planted APU as diagnose-80, same tiny GGUF as diagnose-49. The
   # aperture is asserted as the figure compared against, not merely that some
   # note exists: a host that fell back to `cannot_estimate` would carry no
   # figure at all and this scenario would be describing nothing.
   @id:diagnose-model-a-gguf-estimate-says-its-pool-is-shared @requires-os:linux
-  Scenario: diagnose-76 - A GGUF estimate on an integrated GPU is told the figure is a shared ceiling, not free memory
+  Scenario: diagnose-85 - A GGUF estimate on an integrated GPU is told the figure is a shared ceiling, not free memory
     Given a machine whose only GPU shares system memory, with the pool it may use readable
     And a user asking about a small GGUF file on this machine
     When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form

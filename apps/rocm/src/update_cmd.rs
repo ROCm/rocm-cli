@@ -398,10 +398,12 @@ fn apply_runtime_update_with(
         installed.install_root.display()
     );
     if activate {
-        // No `config.save` after this: `activate_runtime` already persisted the
-        // same struct and nothing mutates it in between, so a second write can
+        // No `config.save` after this: `activate_runtime` already saved the
+        // activation, starting from the settings on disk under the config lock,
+        // and hands back in `config` what it left there. A second write could
         // only fail after an activation that fully succeeded — sending the user
-        // to re-run a command that already worked.
+        // to re-run a command that already worked — or undo a change another
+        // command saved since.
         let activation = activate_runtime(paths, config, &installed.runtime_key)?;
         append_update_activate_summary(&mut output, &activation);
     } else {

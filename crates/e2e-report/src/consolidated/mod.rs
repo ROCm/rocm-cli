@@ -194,6 +194,14 @@ const MOCK_GATES_PR: &str = "gates the PR";
 /// See [`MOCK_GATES_PR`].
 const OTHER_LANES_NON_BLOCKING: &str = "non-blocking";
 
+/// Heading of the platform-level attention list (lane-check failures; in the
+/// markdown summary also stale `@expected-failure` tags and regressions).
+/// Distinct from [`SCENARIO_ATTENTION_HEADING`], so a report with both lists
+/// never shows two identical headings. Shared by both renderers.
+const PLATFORM_ATTENTION_HEADING: &str = "Needs attention: platforms";
+/// Heading of the expectation grid's per-scenario attention list.
+const SCENARIO_ATTENTION_HEADING: &str = "Needs attention: scenarios";
+
 /// One platform column of the reconciled (scenario-id × platform) grid.
 struct GridColumn {
     /// Platform identity from the manifest (e.g. "mi300x", "strix-halo", "mock").
@@ -571,12 +579,17 @@ struct ReconciledTally {
     skip: u32,
     /// Cells that need a human: unexpected-fail, XPASS, or ran-when-N/A.
     problems: u32,
+    /// The harness failed the run after it finished (`lane_failure` in
+    /// `platform.json`), e.g. because no scenario executed. No cell shows that:
+    /// a run whose every scenario resolved to skip has only skip cells.
+    lane_failed: bool,
 }
 
 impl ReconciledTally {
-    /// `true` when nothing needs attention (no unexpected-fail / XPASS / ran-when-NA).
+    /// `true` when nothing needs attention: no unexpected-fail / XPASS /
+    /// ran-when-NA cell, and no failed lane check.
     const fn ok(&self) -> bool {
-        self.problems == 0
+        self.problems == 0 && !self.lane_failed
     }
 
     const fn status_text(&self) -> &'static str {
@@ -592,7 +605,10 @@ fn reconciled_tally(
     manifest: &PlatformManifest,
     actual: &std::collections::HashMap<String, bool>,
 ) -> ReconciledTally {
-    let mut t = ReconciledTally::default();
+    let mut t = ReconciledTally {
+        lane_failed: manifest.lane_failure.is_some(),
+        ..ReconciledTally::default()
+    };
     for exp in &manifest.expectations {
         match CellOutcome::reconcile(&exp.expected, exp.flaky, actual.get(&exp.id).copied()) {
             CellOutcome::Pass => t.pass += 1,
@@ -662,6 +678,12 @@ impl PlatformReport {
         }
     }
 
+    /// Why the harness's post-run lane check failed this run, from
+    /// `platform.json`; `None` when it passed or the artifact predates it.
+    fn lane_failure(&self) -> Option<&str> {
+        self.manifest.as_ref()?.lane_failure.as_deref()
+    }
+
     /// The channel that governs this platform's rendering. See
     /// [`resolve_channel`].
     fn effective_channel(&self) -> Option<&str> {
@@ -713,9 +735,11 @@ impl PlatformReport {
     /// Display counts for the summary table, reconciliation-aware so the numbers
     /// agree with [`Self::status_text`]. Returns `(total, pass, fail, skip,
     /// xfail)`. With a `platform.json`, `fail` counts only cells needing
-    /// attention (unexpected-fail / XPASS / ran-when-NA) — a known bug failing as
-    /// expected lands in `xfail`, not `fail`. Without one, falls back to raw
-    /// junit stats.
+    /// attention (unexpected-fail / XPASS / ran-when-NA / no result) — a known
+    /// bug failing as expected lands in `xfail`, not `fail`. A post-run lane
+    /// failure (`lane_failure`) has no cell, so such a row can read `FAIL`
+    /// with a `fail` of 0. Without a `platform.json`, falls back to raw junit
+    /// stats.
     const fn display_counts(&self) -> (u32, u32, u32, u32, u32) {
         if let Some(t) = &self.tally {
             let total = t.pass + t.xfail + t.skip + t.problems;
@@ -765,6 +789,32 @@ pub struct PlatformReports {
     reports: Vec<PlatformReport>,
     grid: Grid,
     scenarios: ScenarioReference,
+}
+
+/// One platform's health as the consolidated report renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformStatus {
+    /// Whether the row is green.
+    pub ok: bool,
+    /// The Status cell: `PASS`, `FAIL` or `EMPTY`.
+    pub status: &'static str,
+    /// The recorded lane-check failure, if any.
+    pub lane_failure: Option<String>,
+}
+
+/// Load one platform's `report.json` (and its sibling `platform.json`) the way
+/// the consolidated report does, and return its status.
+///
+/// Public so the harness that writes `platform.json` can test that what it
+/// writes is read back as intended, keeping producer and consumer tied.
+#[must_use]
+pub fn platform_status(label: &str, report_json: &Path) -> PlatformStatus {
+    let report = PlatformReport::load(label.to_owned(), report_json);
+    PlatformStatus {
+        ok: report.ok(),
+        status: report.status_text(),
+        lane_failure: report.lane_failure().map(str::to_owned),
+    }
 }
 
 /// Parse every `(label, json_path)` input into a [`PlatformReport`], in input
@@ -895,6 +945,237 @@ mod tests {
         let r = PlatformReport::load("gone".into(), Path::new("/no/such/report.json"));
         assert_eq!(r.stats.total, 0);
         assert_eq!(r.status_text(), "EMPTY");
+    }
+
+    /// The artifact a lane uploads when the harness's PRE-run check refuses to
+    /// run (a failed capability probe, a declared GPU the probe did not find,
+    /// an invalid `E2E_EXPECT_GPU`): `run_suite` in
+    /// `tests/e2e-cucumber/tests/e2e.rs` creates `report.json` empty before it
+    /// calls `lane_verdict::preflight`, and exits there before writing
+    /// `platform.json`; on every self-hosted lane that ran its suite, the
+    /// report upload step (and the WSL lanes' copy-out from the guest) is
+    /// gated on `always()`, so that empty file is what arrives. That lane must
+    /// read as needing attention, never green. A POST-run lane-check failure
+    /// writes `platform.json` with `lane_failure` instead; see the tests below.
+    ///
+    /// The report code already behaved this way before the harness could exit
+    /// early, so this is not a regression test; it pins that behaviour because
+    /// the early exit now relies on it to keep a refused lane off green in the grid.
+    #[test]
+    fn a_lane_that_stopped_before_any_scenario_is_not_ok() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = dir.path().join("report.json");
+        std::fs::write(&report, "").expect("write empty report.json");
+        let r = PlatformReport::load("e2e-gpu-report".into(), &report);
+        assert!(r.manifest.is_none(), "no platform.json was written");
+        assert!(!r.ok(), "an empty run must not count as healthy");
+        assert_eq!(r.status_text(), "EMPTY");
+    }
+
+    /// `platform.json` for a lane whose every resolved scenario was a skip,
+    /// with or without a recorded post-run lane failure.
+    fn all_skip_platform(lane_failure: Option<&str>) -> String {
+        let failure = lane_failure.map_or(String::new(), |reason| {
+            format!(r#""lane_failure": {},"#, serde_json::json!(reason))
+        });
+        format!(
+            r#"{{"platform_slug":"mi300x","capability":{{"effective_serve_engine":"vllm"}},{failure}
+                "expectations":[{{"id":"serve-a","feature":"Serving","expected":"skip"}}]}}"#
+        )
+    }
+
+    /// The regression: a GPU lane on which every scenario resolved to skip
+    /// was failed by the harness ("no @requires-gpu (or @requires-multi-gpu)
+    /// scenario executed"), yet
+    /// its row read PASS, since a skip cell is not a problem.
+    #[test]
+    fn an_all_skip_lane_the_harness_failed_reads_fail_with_its_reason() {
+        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                      @requires-multi-gpu) scenario executed (1 resolved, none ran)";
+        let (_dir, report) = write_platform("[]", &all_skip_platform(Some(reason)));
+        let r = PlatformReport::load("e2e-gpu-report".into(), &report);
+        assert!(!r.ok());
+        assert_eq!(r.status_text(), "FAIL");
+        assert_eq!(r.lane_failure(), Some(reason));
+        assert_eq!(
+            platform_status("e2e-gpu-report", &report),
+            PlatformStatus {
+                ok: false,
+                status: "FAIL",
+                lane_failure: Some(reason.to_owned()),
+            }
+        );
+    }
+
+    /// Unchanged: an all-skip lane the harness did not fail (an undeclared or
+    /// `E2E_EXPECT_GPU=0` lane) stays green.
+    #[test]
+    fn an_all_skip_lane_without_a_lane_failure_still_reads_pass() {
+        let (dir, report) = write_platform("[]", &all_skip_platform(None));
+        let r = PlatformReport::load("e2e-gpu-report".into(), &report);
+        assert!(r.ok());
+        assert_eq!(r.status_text(), "PASS");
+        assert_eq!(r.lane_failure(), None);
+
+        // ...and neither rendering shows any lane-failure element. (The legend
+        // and the explanation paragraph name the heading in prose, so the
+        // checks are on the elements themselves.)
+        let bundle = load_platform_reports(&[("e2e-gpu-report".to_owned(), report)]);
+        let md = markdown::consolidated_summary_markdown(&bundle);
+        assert!(!md.contains("### Needs attention: platforms"), "{md}");
+        assert!(!md.contains("**Lane check failed**"), "{md}");
+        let html_out = dir.path().join("out.html");
+        html::generate_consolidated(&bundle, &html_out, &html::RunMeta::default())
+            .expect("html written");
+        let html = std::fs::read_to_string(&html_out).expect("html read");
+        assert!(
+            !html.contains("<h3>Needs attention: platforms</h3>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<td class="status-pass">PASS</td>"#),
+            "the Status cell carries no tooltip:\n{html}"
+        );
+        assert!(!html.contains(r#"<p class="lane-failure">"#), "{html}");
+    }
+
+    /// A `-n` filter that matched nothing: no expectations were resolved and
+    /// nothing ran, and the harness recorded "0 scenarios executed".
+    #[test]
+    fn a_zero_expectation_lane_reads_fail_only_with_a_recorded_failure() {
+        let failed =
+            r#"{"platform_slug":"mock","lane_failure":"0 scenarios executed","expectations":[]}"#;
+        let (_dir, report) = write_platform("[]", failed);
+        let r = PlatformReport::load("e2e-report".into(), &report);
+        assert!(!r.ok());
+        assert_eq!(r.status_text(), "FAIL");
+
+        let (_dir2, report) = write_platform("[]", r#"{"platform_slug":"mock","expectations":[]}"#);
+        let r = PlatformReport::load("e2e-report".into(), &report);
+        assert!(r.ok(), "no recorded failure keeps today's reading");
+        assert_eq!(r.status_text(), "PASS");
+    }
+
+    /// Both renderings name the reason, not just a FAIL.
+    #[test]
+    fn a_recorded_lane_failure_is_named_in_the_summary_and_the_html() {
+        // A newline, markup characters and a quote, so both the markdown's
+        // newline folding and the HTML escaping are exercised.
+        let reason = "0 scenarios executed\nsee <stderr> & \"tail\"";
+        let html_reason = "0 scenarios executed\nsee &lt;stderr&gt; &amp; &quot;tail&quot;";
+        let (dir, report) = write_platform("[]", &all_skip_platform(Some(reason)));
+        let bundle = load_platform_reports(&[("e2e-gpu-report".to_owned(), report)]);
+
+        let md = markdown::consolidated_summary_markdown(&bundle);
+        assert!(
+            md.contains(
+                "\n### Needs attention: platforms\n\n- **Lane check failed** in _MI300X \
+                 Linux_: 0 scenarios executed see <stderr> & \"tail\"\n"
+            ),
+            "{md}"
+        );
+        // A CRLF, or any run of whitespace, folds to one space too. Defensive:
+        // no current producer of `lane_failure` emits CR or LF.
+        let (_crlf_dir, crlf_report) =
+            write_platform("[]", &all_skip_platform(Some("first\r\n  second")));
+        let crlf_md = markdown::consolidated_summary_markdown(&load_platform_reports(&[(
+            "e2e-gpu-report".to_owned(),
+            crlf_report,
+        )]));
+        assert!(crlf_md.contains("Linux_: first second\n"), "{crlf_md}");
+
+        let html_out = dir.path().join("out.html");
+        html::generate_consolidated(&bundle, &html_out, &html::RunMeta::default())
+            .expect("html written");
+        let html = std::fs::read_to_string(&html_out).expect("html read");
+        // The Status cell's tooltip.
+        assert!(
+            html.contains(&format!(
+                r#"<td class="status-fail" title="{html_reason}">FAIL</td>"#
+            )),
+            "status tooltip:\n{html}"
+        );
+        // The platform section's paragraph.
+        assert!(
+            html.contains(&format!(
+                r#"<p class="lane-failure"><b>Lane check failed: </b>{html_reason}</p>"#
+            )),
+            "lane failure paragraph:\n{html}"
+        );
+        // The platform-level attention list.
+        assert!(
+            html.contains(&format!(
+                r"<h3>Needs attention: platforms</h3><ul><li><b>Lane check failed</b> in <code>MI300X Linux</code>: {html_reason}</li></ul>"
+            )),
+            "attention list:\n{html}"
+        );
+        // ...styled, so it reads as a failure.
+        assert!(
+            html.contains(".lane-failure {"),
+            "CSS rule for .lane-failure"
+        );
+        // The legend says where the reason is.
+        assert!(
+            html.contains(
+                "or when the harness failed the lane after the run (for example, no scenario \
+                 executed); the reason is listed under \u{201c}Needs attention: platforms\u{201d} \
+                 and in the platform's section."
+            ),
+            "legend:\n{html}"
+        );
+    }
+
+    /// A lane on which scenarios ran and passed, but which the harness still
+    /// failed (on a GPU lane, no GPU scenario among them): its row
+    /// reads FAIL with a Fail count of 0, since no cell failed. Rows of exactly
+    /// this shape are what `total_e2e_failures` in xtask counts as failures.
+    #[test]
+    fn a_lane_that_ran_scenarios_and_was_failed_reads_fail_with_zero_failed_cells() {
+        let reason = "this lane declares a GPU (E2E_EXPECT_GPU=1) but no @requires-gpu (or \
+                      @requires-multi-gpu) scenario executed (3 resolved, none ran)";
+        let platform = format!(
+            r#"{{"platform_slug":"mi300x","lane_failure":{},"expectations":[
+                {{"id":"examine-a","feature":"F","expected":"pass"}}]}}"#,
+            serde_json::json!(reason)
+        );
+        let (_dir, report) = write_platform(
+            &feature_json(&[(&["id:examine-a"], &["passed"])]),
+            &platform,
+        );
+        let r = PlatformReport::load("e2e-gpu-report".into(), &report);
+        assert_eq!(r.display_counts(), (1, 1, 0, 0, 0));
+        assert!(!r.ok());
+        assert_eq!(r.status_text(), "FAIL");
+        let bundle = load_platform_reports(&[("e2e-gpu-report".to_owned(), report)]);
+        let md = markdown::consolidated_summary_markdown(&bundle);
+        assert!(
+            md.contains("| MI300X | Linux | 1 | 1 | 0 | 0 | n/a | FAIL |"),
+            "{md}"
+        );
+        assert!(md.contains("| **Total** | | 1 | 1 | 0 | 0 | 0 | |"), "{md}");
+    }
+
+    /// Both attention lists can appear in one summary, under different
+    /// headings, each once.
+    #[test]
+    fn the_two_attention_lists_have_distinct_headings() {
+        let platform = r#"{"platform_slug":"mi300x","lane_failure":"0 scenarios executed",
+            "expectations":[{"id":"examine-a","feature":"F","expected":"pass"}]}"#;
+        let (_dir, report) =
+            write_platform(&feature_json(&[(&["id:examine-a"], &["failed"])]), platform);
+        let bundle = load_platform_reports(&[("e2e-gpu-report".to_owned(), report)]);
+        let md = markdown::consolidated_summary_markdown(&bundle);
+        assert_eq!(
+            md.matches("### Needs attention: platforms\n").count(),
+            1,
+            "{md}"
+        );
+        assert_eq!(
+            md.matches("### Needs attention: scenarios\n").count(),
+            1,
+            "{md}"
+        );
+        assert_eq!(md.matches("### Needs attention\n").count(), 0, "{md}");
     }
 
     #[test]
@@ -1765,8 +2046,8 @@ mod tests {
     #[test]
     fn renderers_take_the_pr_gating_phrases_from_the_shared_constants() {
         // What this proves, and what it does not. The rendered text is pinned
-        // verbatim by `summary_explanation_paragraphs_are_unchanged` (markdown)
-        // and `legend_mock_and_other_platform_items_are_unchanged` (HTML), and
+        // verbatim by `summary_explanation_paragraphs_are_pinned` (markdown)
+        // and `legend_mock_and_other_platform_items_are_pinned` (HTML), and
         // each of those also asserts that the rendered output contains
         // `MOCK_GATES_PR` and `OTHER_LANES_NON_BLOCKING`; together they catch a
         // renderer that hardcodes the words while a constant's value moves on.

@@ -661,6 +661,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Diagnose {
             symptom,
             symptom_file,
+            engine,
             top,
             json,
             distro,
@@ -674,6 +675,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 .map_err(|error| clap_exit_code(symptom_input::usage_error(&error)))?;
             let model = model.map(|model_ref| {
                 diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            let symptom = symptom.map(|text| diagnose_cmd::SymptomQuery {
+                text,
+                engine: engine.map(Into::into),
             });
             diagnose(symptom, top, json, distro, model, report, send)
         }
@@ -757,6 +762,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let arguments = serde_json::from_str(arguments_json.trim_start_matches('\u{feff}'))
                 .with_context(|| format!("failed to parse arguments JSON for `{name}`"))?;
+            let arguments = chat::mcp_call_cli_arguments(&name, arguments)?;
             let value = chat::run_internal_mcp_call(&paths, &name, arguments, allow_mutation)?;
             println!("{}", serde_json::to_string(&value)?);
             Ok(())
