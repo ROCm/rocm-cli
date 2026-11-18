@@ -229,7 +229,8 @@ new proposes nothing. The previous lock is not handed to uv as version preferenc
 indexes that does not converge, as successive runs alternate between AMD's
 mirrored version of a package and PyPI's. AMD's indexes publish no
 upload times and uv treats an undated file as too new, so the AMD-only
-projects they serve — those matching `vendor-packages` in `profiles.toml` — are
+projects they serve — those matching `vendor-packages` in `profiles.toml`,
+listed by the `uv.toml` indexes whose host is one of its `vendor-hosts` — are
 exempted (`--exclude-newer-package <name>=false`). Everything else, including
 the common packages AMD's indexes mirror from PyPI, stays under the cooldown.
 An AMD-only dependency missing from `vendor-packages` makes the update fail

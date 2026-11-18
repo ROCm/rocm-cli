@@ -224,16 +224,18 @@ fn package_problems(
         // A lock is written by a job that ran upstream code, and the update's
         // summary shows versions and a short digest but no URLs or hosts, so a
         // repointed download would otherwise go unseen.
-        if !from_vendor && host != PYPI_FILES_HOST {
-            out.push(format!(
-                "{name}: {url} is served by {host}, which is neither {PYPI_FILES_HOST} nor one of {}",
-                profiles.policy.vendor_hosts.join(", ")
-            ));
-        }
+        // An AMD-only package off AMD's hosts gets the one problem that says
+        // so, whether the host is PyPI's or a foreign one; repeating it as a
+        // foreign host would report one artifact twice.
         if vendor && !from_vendor {
             out.push(format!(
                 "{name}: AMD-only package taken from {host}, not from {}",
                 profiles.policy.vendor_hosts.join(" or ")
+            ));
+        } else if !from_vendor && host != PYPI_FILES_HOST {
+            out.push(format!(
+                "{name}: {url} is served by {host}, which is neither {PYPI_FILES_HOST} nor one of {}",
+                profiles.policy.vendor_hosts.join(", ")
             ));
         }
     }
@@ -594,12 +596,13 @@ linux = "x86_64-manylinux_2_28"
     /// lookalike that merely ends with it is someone else's.
     #[test]
     fn a_lookalike_of_an_amd_host_is_not_amd() {
-        let found = problems_of(&lock_text("2.13.0+rocm10.1.0", "evilstable.repo.amd.com"));
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("AMD-only package taken from evilstable.repo.amd.com")),
-            "{found:?}"
+        // One problem per artifact: the AMD-only rule already names the host,
+        // so the generic foreign-host problem does not repeat it.
+        assert_eq!(
+            problems_of(&lock_text("2.13.0+rocm10.1.0", "evilstable.repo.amd.com")),
+            [
+                "torch: AMD-only package taken from evilstable.repo.amd.com, not from stable.repo.amd.com"
+            ]
         );
     }
 

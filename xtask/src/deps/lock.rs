@@ -124,7 +124,10 @@ fn run_with(
     fs::create_dir_all(work)?;
     let uv_config = root.join(&profiles.policy.uv_config);
     // Every resolution has a cutoff, so the exemptions always apply.
-    let exemptions = cooldown_exemptions(&profiles, undated_index_projects(&uv_config, uv)?);
+    let exemptions = cooldown_exemptions(
+        &profiles,
+        undated_index_projects(&uv_config, &profiles, uv)?,
+    );
     let new_cutoff = cutoff_before(now, options.cooldown_days.unwrap_or(0));
     let cleared: Vec<String> = uv_env_to_clear(env_keys.into_iter());
 
@@ -379,8 +382,15 @@ fn cooldown_exemptions(profiles: &Profiles, served: BTreeSet<String>) -> BTreeSe
         .collect()
 }
 
-/// Project names served by the non-PyPI indexes in `uv_config`.
-fn undated_index_projects(uv_config: &Path, uv: &dyn Uv) -> Result<BTreeSet<String>> {
+/// Project names served by the indexes in `uv_config` whose host is one of
+/// the policy's `vendor-hosts`. Those are the undated indexes the exemptions
+/// exist for; any other index (PyPI, or a mirror someone adds) contributes
+/// nothing, so it cannot exempt a package from the cutoff.
+fn undated_index_projects(
+    uv_config: &Path,
+    profiles: &Profiles,
+    uv: &dyn Uv,
+) -> Result<BTreeSet<String>> {
     let config: toml::Table = toml::from_str(&fs::read_to_string(uv_config)?)
         .with_context(|| format!("invalid {}", uv_config.display()))?;
     let mut projects = BTreeSet::new();
@@ -389,16 +399,14 @@ fn undated_index_projects(uv_config: &Path, uv: &dyn Uv) -> Result<BTreeSet<Stri
         let Some(url) = index.get("url").and_then(toml::Value::as_str) else {
             continue;
         };
-        if is_pypi(url) {
+        let on_vendor_host = pylock::https_host(url)
+            .is_some_and(|host| profiles.policy.vendor_hosts.iter().any(|v| v == host));
+        if !on_vendor_host {
             continue;
         }
         projects.extend(simple_index_projects(&uv.index_page(url)?));
     }
     Ok(projects)
-}
-
-fn is_pypi(url: &str) -> bool {
-    pylock::https_host(url).is_some_and(|host| host == "pypi.org" || host.ends_with(".pypi.org"))
 }
 
 /// Project names linked from a PEP 503 simple-index root page.
@@ -560,14 +568,6 @@ linux = "x86_64-manylinux_2_28"
         assert_eq!(uv_version("uv 0.13.6\n"), Some("0.13.6"));
         assert_eq!(uv_version("ruff 0.13.6\n"), None);
         assert_eq!(uv_version(""), None);
-    }
-
-    #[test]
-    fn only_pypi_hosts_are_skipped_when_listing_indexes() {
-        assert!(is_pypi("https://pypi.org/simple/"));
-        assert!(is_pypi("https://test.pypi.org/simple/"));
-        assert!(!is_pypi("https://stable.repo.amd.com/rocm/whl-next/"));
-        assert!(!is_pypi("https://mirror.example/pypi.org/simple/"));
     }
 
     #[test]
@@ -1015,6 +1015,70 @@ linux = "x86_64-manylinux_2_28"
             assert!(args.contains(&"rocm-sdk-core=false".to_owned()), "{args:?}");
             assert!(!args.contains(&"numpy=false".to_owned()), "{args:?}");
         }
+    }
+
+    /// Only an index on a `vendor-hosts` host makes a project cutoff-exempt:
+    /// an AMD-only name served by any other non-PyPI index (a mirror, a cache)
+    /// keeps the cooldown, and that index's page is not even fetched.
+    #[test]
+    fn an_index_off_the_vendor_hosts_exempts_nothing() {
+        let root = workspace();
+        fs::write(
+            root.path().join("runtimes/uv.toml"),
+            "[[index]]\nurl = \"https://mirror.example/simple/\"\n\n[[index]]\nurl = \"https://vendor.example/simple/\"\n\n[[index]]\nurl = \"https://pypi.org/simple/\"\n",
+        )
+        .unwrap();
+        let uv = FakeUv::new("0.13.6");
+        let served = undated_index_projects(
+            &root.path().join("runtimes/uv.toml"),
+            &Profiles::load(root.path()).unwrap(),
+            &uv,
+        )
+        .unwrap();
+        assert_eq!(
+            served.into_iter().collect::<Vec<_>>(),
+            ["numpy", "rocm", "rocm-sdk-core"],
+            "only the vendor index is listed (FakeUv refuses any other URL)"
+        );
+    }
+
+    /// An index page that cannot be fetched stops the run before any profile
+    /// is resolved, so no lock is written or replaced.
+    #[test]
+    fn an_unfetchable_index_page_touches_no_lock() {
+        struct IndexDown(FakeUv);
+        impl Uv for IndexDown {
+            fn version(&self) -> Result<String> {
+                self.0.version()
+            }
+            fn compile(&self, command: Command) -> Result<()> {
+                self.0.compile(command)
+            }
+            fn index_page(&self, url: &str) -> Result<String> {
+                anyhow::bail!("{url}: connection refused")
+            }
+        }
+        let root = workspace();
+        let locks = root.path().join("runtimes/locks");
+        let p_lock = locks.join("pylock.p-linux.toml");
+        fs::write(&p_lock, "old").unwrap();
+        let uv = IndexDown(FakeUv::new("0.13.6"));
+        let err = run_with(
+            root.path(),
+            &root.path().join("work"),
+            &plain(),
+            &uv,
+            vec![],
+            now(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("https://vendor.example/simple/: connection refused"),
+            "{err:#}"
+        );
+        assert!(uv.0.calls.borrow().is_empty(), "nothing was resolved");
+        assert_eq!(fs::read_to_string(&p_lock).unwrap(), "old");
+        assert!(!locks.join("pylock.q-linux.toml").exists());
     }
 
     #[test]

@@ -145,14 +145,16 @@ impl Profiles {
         Ok(strays)
     }
 
-    /// Hex SHA-256 of the per-profile inputs the `(name, os)` lock is resolved
-    /// from: the profile's Python version, the platform it is resolved for,
-    /// its requirements (in a fixed order) and the text of `uv.toml`. Not
-    /// covered: `policy.vendor-packages`, which sets the cutoff exemptions, so
-    /// an edit to it is caught by the `runtime-locks` re-lock, not offline. `deps lock`
-    /// records it in the lock's header and `deps check` recomputes it, so an
-    /// edited input is caught offline even when the old lock still happens to
-    /// satisfy the requirements.
+    /// Hex SHA-256 of every input the `(name, os)` lock is resolved from: the
+    /// profile's Python version, the platform it is resolved for, its
+    /// requirements (in a fixed order), its ROCm line, the policy's
+    /// `vendor-packages` (also in a fixed order) and the text of `uv.toml`.
+    /// `deps lock` records it in the lock's header and `deps check` recomputes
+    /// it, so an edit to any of them is caught offline even when the old lock
+    /// still happens to satisfy the requirements. `policy.vendor-hosts` is not
+    /// hashed: it decides which indexes' projects are exempt from the cutoff,
+    /// and an edit to it that changes a lock is caught by the `runtime-locks`
+    /// re-lock, not offline.
     pub(crate) fn inputs_digest(&self, name: &str, os: &str, uv_config: &str) -> String {
         use sha2::Digest as _;
         let profile = &self.profile[name];
