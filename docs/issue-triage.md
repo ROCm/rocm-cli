@@ -22,7 +22,7 @@ does not close, edit or comment on an issue except for one `needs-info` comment
 | `priority:P0` to `priority:P3` | model, against the rubric in [issue-triage.txt](../.github/prompts/issue-triage.txt) |
 | assignee | round-robin over [triage-maintainers.txt](../.github/triage-maintainers.txt): the issue number modulo the list length, skipping the reporter |
 
-Missing labels are created on first use. An issue that already has a priority
+Missing labels are created on first use; an existing label keeps its colour and description. An issue that already has a priority
 or area label, `needs-info` or an assignee is left alone for that part, so re-running
 the workflow does not stack labels or reassign.
 

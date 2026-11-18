@@ -90,13 +90,35 @@ NEW_LABELS = {
 }
 
 
+# The ``**Heading**`` lines of ``.github/ISSUE_TEMPLATE/bug_report.md``. Only
+# these start a section: a reporter's own bold line (``**1. Install**``) is
+# part of the section it sits in.
+TEMPLATE_HEADINGS = frozenset(
+    {
+        "current behavior",
+        "expected behavior",
+        "steps to reproduce",
+        "possible solution",
+        "your environment",
+        "relevant log output",
+        "additional context",
+    }
+)
+
+
 def parse_sections(body: str) -> dict[str, str]:
-    """Split a template body on its ``**Heading**`` lines."""
+    """Split a template body on the template's own ``**Heading**`` lines.
+
+    A line inside a fenced code block is never a heading.
+    """
     sections: dict[str, str] = {}
     current: str | None = None
+    fenced = False
     for line in body.splitlines():
-        m = re.fullmatch(r"\s*\*\*(.+?)\*\*\s*", line)
-        if m:
+        if re.match(r"\s*(```|~~~)", line):
+            fenced = not fenced
+        m = None if fenced else re.fullmatch(r"\s*\*\*(.+?)\*\*\s*", line)
+        if m and m.group(1).strip().lower() in TEMPLATE_HEADINGS:
             current = m.group(1).strip().lower()
             sections[current] = ""
         elif current is not None:
@@ -148,6 +170,11 @@ def missing_info(body: str, labels: set[str]) -> list[str]:
 
 def platform_labels(body: str) -> list[str]:
     value = field_value(body, "Platform").lower()
+    # The template's own `Linux / WSL2 / Windows` line, never edited, names all
+    # three but is no report of a platform; a report that really names all
+    # three keeps its labels.
+    if re.fullmatch(r"linux\s*/\s*wsl2?\s*/\s*windows", value):
+        return []
     found = []
     if re.search(r"\bwsl", value):
         found.append("platform:wsl")
@@ -155,17 +182,15 @@ def platform_labels(body: str) -> list[str]:
         found.append("platform:linux")
     if re.search(r"\bwindows\b", value):
         found.append("platform:windows")
-    # The template's own `Linux / WSL2 / Windows` line, never edited, names all
-    # three; that is no report of a platform.
-    return [] if len(found) == 3 else found
+    return found
 
 
 def load_maintainers(path: Path = MAINTAINERS_FILE) -> list[str]:
     logins = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            logins.append(line)
+        login = line.split("#", 1)[0].strip()
+        if login:
+            logins.append(login)
     return logins
 
 
@@ -283,19 +308,23 @@ def ensure_labels(repo: str, names: list[str]) -> None:
     for name in names:
         if name in NEW_LABELS:
             color, description = NEW_LABELS[name]
-            # --force updates an existing label instead of failing on it.
-            gh(
-                "label",
-                "create",
-                name,
-                "--repo",
-                repo,
-                "--color",
-                color,
-                "--description",
-                description,
-                "--force",
-            )
+            # Without --force an existing label keeps the colour and description
+            # a maintainer gave it; gh fails on it, which is not an error here.
+            try:
+                gh(
+                    "label",
+                    "create",
+                    name,
+                    "--repo",
+                    repo,
+                    "--color",
+                    color,
+                    "--description",
+                    description,
+                )
+            except RuntimeError as err:
+                if "already exists" not in str(err):
+                    raise
 
 
 def apply(repo: str, number: int, decided: dict) -> None:
@@ -399,6 +428,41 @@ def self_test() -> int:
     )
     assert missing_info(raw_template, {"bug"}) == ["steps to reproduce"]
     assert platform_labels(raw_template) == []
+    # A reporter's own bold lines and fenced code do not end the steps section.
+    bold_steps = (
+        "**Steps to reproduce**\n**1. Install**\nrocm install sdk\n**2. Serve**\n"
+        "```\n**3. Fenced**\n```\nrocm serve qwen\n\n**Your environment**\n"
+        "- rocm-cli version (`rocm --version`): 0.4.1\n"
+    )
+    assert missing_info(bold_steps, {"bug"}) == []
+    assert "rocm serve qwen" in parse_sections(bold_steps)["steps to reproduce"]
+    # Boundaries: 9 characters of steps is too few, 10 is enough; `*` bullets
+    # count; a platform word inside another word is no platform.
+    nine, ten = "x" * 9, "x" * 10
+    env = "\n**Your environment**\n- rocm-cli version: 1\n"
+    assert missing_info(f"**Steps to reproduce**\n{nine}\n{env}", {"bug"}) == [
+        "steps to reproduce"
+    ]
+    assert missing_info(f"**Steps to reproduce**\n{ten}\n{env}", {"bug"}) == []
+    assert field_value("* Platform: Windows", "Platform") == "Windows"
+    assert platform_labels("- Platform: Windows 11 + WSL2, also native Linux") == [
+        "platform:wsl",
+        "platform:linux",
+        "platform:windows",
+    ]
+    assert platform_labels("- Platform: Sawslinuxwindowsx") == []
+    # A nested object ends at the last `}`, not the first.
+    assert parse_response('{"type": "bug", "x": {"a": 1}}') == {"type": "bug"}
+    # The model supplying `bug` for a template-written issue asks for info.
+    templ = {
+        "number": 8,
+        "body": thin_body,
+        "labels": [],
+        "user": {"login": "rep"},
+        "assignees": [],
+    }
+    got = plan(templ, {"type": "bug"}, team)
+    assert got["labels"] == ["bug", "needs-info"] and got["comment"], got
     # A free-form `bug` report is not held to the template's fields.
     free_form = "rocm serve crashes on gfx1151 with 0.4.1, run `rocm serve foo`."
     assert missing_info(free_form, {"bug"}) == []

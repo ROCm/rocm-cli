@@ -13,3 +13,5 @@ siloteemu
 volen-silo
 jussielo-amd
 michaelroy-amd
+johnl-amd
+amd-mkarvir
