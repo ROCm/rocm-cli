@@ -1216,12 +1216,15 @@ mod tests {
         // exactly where the platform gate allows vLLM. Asserted both ways
         // rather than skipped on Windows, so the gate is pinned on the platform
         // it actually fires on. vLLM's rule-out does not consult Docker.
+        //
+        // Matched as a whole row, not by model id: the closing guidance names
+        // `Qwen/Qwen3.6-27B` as its `rocm serve` example and is printed whatever
+        // the platform, so a bare id is present even where the row is not.
         let vllm_allowed =
             engine_ruled_out_by_platform_with("vllm", || false) == PlatformRuleOut::Allowed;
         for vllm_only in [
             "AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)",
-            "Qwen/Qwen3.6-27B",
-            "BF16",
+            "Qwen/Qwen3.6-27B  BF16",
         ] {
             assert_eq!(
                 rendered.contains(vllm_only),
