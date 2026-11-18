@@ -207,15 +207,16 @@ fn package_args<'a>(packages: Option<impl Iterator<Item = &'a str>>) -> Vec<Stri
 /// - `*.rs`: xtask's contract tests scan every Rust source file in the repo
 ///   (`ascii_output_contract`, `env_mutation_contract`) and the pinned-key test
 ///   reads `apps/rocm/src/therock/fetch.rs`.
-/// - `README.md`, `docs/`, `skills/`: `rocm`'s `advised_commands` test checks
-///   every `rocm ...` command shown there, `rocm` compiles in the assistant
-///   skill, and xtask's tests read the pinned release key under `docs/keys` and
-///   other docs.
+/// - `docs/`, `skills/`: `rocm`'s `advised_commands` test checks every
+///   `rocm ...` command shown there, `rocm` compiles in the assistant skill,
+///   and xtask's tests read the pinned release key under `docs/keys` and other
+///   docs. `README.md` is read the same way but needs no row: it is in
+///   [`affected::XTASK_READ_DOCS`], so `select` already sends it to the whole
+///   workspace, as it does every other doc in that list.
 /// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
 ///   although it lives in the e2e crate.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
-    ("README.md", &["rocm", "xtask"]),
     ("docs/", &["rocm", "xtask"]),
     ("skills/", &["rocm", "xtask"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
@@ -918,16 +919,20 @@ mod tests {
 
     #[test]
     fn docs_and_skills_select_the_crates_whose_tests_read_them() {
-        for path in [
-            "README.md",
-            "docs/testing.md",
-            "skills/rocm-cli-assistant/SKILL.md",
-        ] {
+        for path in ["docs/testing.md", "skills/rocm-cli-assistant/SKILL.md"] {
             let names = selected_names(&[path]);
             assert!(names.contains("rocm"), "{path}: {names:?}");
             assert!(names.contains("xtask"), "{path}: {names:?}");
             assert!(!names.contains("rocm-core"), "{path}: {names:?}");
         }
+    }
+
+    /// README.md is read by `rocm`'s and xtask's tests like the docs above, but
+    /// it is in `XTASK_READ_DOCS`, so it reaches the whole workspace rather
+    /// than only those two crates, and needs no `CROSS_CRATE_READS` row.
+    #[test]
+    fn readme_selects_the_whole_workspace() {
+        assert_eq!(selected(&["README.md"]), Selection::Workspace);
     }
 
     #[test]

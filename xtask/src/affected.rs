@@ -137,11 +137,27 @@ pub fn reverse_closure(
 ///   test reads.
 /// - `docs/ci-hardware-testing.md` and `tests/e2e-cucumber/README.md`: both
 ///   read by `hardware_testing_docs_cover_all_self_hosted_platforms` (xtask).
+/// - `README.md`, `docs/wsl.md` and `skills/rocm-doctor/reference.md`: read by
+///   `the_ci_host_floor_is_the_documented_product_floor` (xtask), which ties
+///   the CI runner's glibc/`GLIBCXX` pair to the one they state.
+///   `reference.md` is also read by xtask's `eval_fixtures` tests.
+/// - `skills/rocm-doctor/SKILL.md`: read with `reference.md` by xtask's
+///   `eval_fixtures` tests, which fail when the skill quotes text a replayed
+///   eval case pins.
+/// - `docs/nightly-on-the-queue.md`: read by
+///   `the_queue_doc_states_its_channels_and_its_remaining_gap` and its
+///   neighbours in `workflow_contract.rs`, which hold what it says about the
+///   queue-run workflow's schedule, secrets and uploaded artifacts.
 pub(crate) const XTASK_READ_DOCS: &[&str] = &[
     "MANIFEST.md",
     "CONTRIBUTING.md",
     "docs/ci-hardware-testing.md",
     "tests/e2e-cucumber/README.md",
+    "README.md",
+    "docs/wsl.md",
+    "skills/rocm-doctor/reference.md",
+    "skills/rocm-doctor/SKILL.md",
+    "docs/nightly-on-the-queue.md",
 ];
 
 /// True for changed files that force a full-workspace run: anything that can
@@ -625,10 +641,40 @@ mod tests {
     }
 
     #[test]
+    fn select_product_floor_docs_force_workspace() {
+        // README.md, docs/wsl.md and the rocm-doctor reference state the
+        // glibc/GLIBCXX pair that
+        // the_ci_host_floor_is_the_documented_product_floor ties to the CI
+        // runner's; unlike ordinary Markdown (see select_docs_only_is_empty)
+        // an edit to one alone must run that test, not resolve to
+        // `Selection::Empty`.
+        let g = graph();
+        for doc in [
+            "README.md",
+            "docs/wsl.md",
+            "skills/rocm-doctor/reference.md",
+            // Not a floor doc, but read beside reference.md by eval_fixtures.
+            "skills/rocm-doctor/SKILL.md",
+            // Not a floor doc either: workflow_contract reads it for the
+            // queue-run workflow's schedule, secrets and artifacts.
+            "docs/nightly-on-the-queue.md",
+        ] {
+            assert_eq!(
+                select(&[doc.to_string()], &g),
+                Selection::Workspace,
+                "{doc}"
+            );
+        }
+    }
+
+    #[test]
     fn select_docs_only_is_empty() {
         let g = graph();
         assert_eq!(
-            select(&["README.md".to_string(), "docs/guide.md".to_string()], &g),
+            select(
+                &["SECURITY.md".to_string(), "docs/guide.md".to_string()],
+                &g
+            ),
             Selection::Empty
         );
     }
@@ -649,7 +695,7 @@ mod tests {
         let sel = select(
             &[
                 "engines/engine/src/lib.rs".to_string(),
-                "README.md".to_string(),
+                "docs/guide.md".to_string(),
             ],
             &g,
         );

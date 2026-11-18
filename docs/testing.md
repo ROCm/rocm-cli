@@ -1135,7 +1135,9 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
+`tests/e2e-cucumber/README.md`, [README.md](../README.md), [wsl.md](wsl.md),
+the rocm-doctor skill's [reference.md](../skills/rocm-doctor/reference.md) and
+[SKILL.md](../skills/rocm-doctor/SKILL.md), [nightly-on-the-queue.md](nightly-on-the-queue.md)). Two further rules add `xtask`, which holds
 the proptest seed guard and which no other crate depends on: a changed file under
 a `proptest-regressions` directory, and a changed Rust file whose diff adds or
 removes a line containing `proptest!` (found with `git diff -G`). On `main`
@@ -1160,8 +1162,11 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
 
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
 so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
-file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
-test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
+file), `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
+test reads them and `rocm` compiles in the assistant skill; `README.md`, `docs/wsl.md`,
+`docs/nightly-on-the-queue.md`, `docs/ci-hardware-testing.md` and the rocm-doctor skill's [reference.md](../skills/rocm-doctor/reference.md) and
+[SKILL.md](../skills/rocm-doctor/SKILL.md) need no widening, since as docs an xtask test reads
+they already select the whole workspace), and the e2e PowerShell fixture also
 selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
 [prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
 `include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
@@ -4383,11 +4388,46 @@ that the private download directory is removed. A failed install also exits
 non-zero and removes that directory, and a good download installs once and
 exits zero. It is Unix-only.
 
-The eight native Linux GPU preflights are one script,
+The native Linux GPU preflights, in four jobs and the shared-queue lane, are
+one script,
 [`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
 with its own `GPU_PREFLIGHT_MIN_FREE_GIB` (16 on the discrete lanes, 8 on
-Strix). It applies two gates, because neither sees what the other does: a
-bounded wait on free memory, and then `reclaim-gpu.sh --assert-clear`. The
+Strix). It first runs
+[`host-baseline.sh`](../.github/scripts/host-baseline.sh), which fails the lane
+at once, without retrying, when the runner's glibc or libstdc++ is older than
+the glibc/`GLIBCXX` pair of the product's supported floor in
+[README.md](../README.md); the OpenSSL version that floor also names is not
+checked (see
+[ci-hardware-testing.md](ci-hardware-testing.md#self-hosted-runner-baseline)).
+[`host_baseline_contract.rs`](../xtask/src/host_baseline_contract.rs) drives
+that script under stubbed `getconf` and `ldconfig` — at, above and below the
+floor, versions that a string comparison gets wrong, multilib hosts that list
+an old 32-bit libstdc++ first, a cache with two x86-64 copies, a cache of
+thousands of entries, an `ldconfig` found only in sbin, an os-release path
+that is a directory (passed over for the next file, or for "unknown"), and
+hosts where a value cannot be read — and fails when its floor and the one in
+`README.md` disagree, or when a place that restates its glibc/`GLIBCXX` pair — [wsl.md](wsl.md), the WSL distro check and its fix recipe in `rocm-core`,
+or the rocm-doctor skill's [reference.md](../skills/rocm-doctor/reference.md)
+— disagrees with `README.md`. Only the pair is compared: the Ubuntu release
+name is not.
+In [`workflow_contract.rs`](../xtask/src/workflow_contract.rs),
+`preflight_fails_a_host_below_the_baseline_without_querying_the_gpu` holds that
+a failing baseline stops the preflight before `rocm-smi` is asked anything,
+`preflight_runs_the_host_baseline_once_however_many_polls_it_takes` that it is
+not retried with the GPU wait,
+`preflight_bounds_a_host_baseline_that_never_returns` that its 15s bound,
+pinned in the source as `BASELINE_TIMEOUT_SECS=15` on the one `timeout` call,
+fails the preflight,
+`preflight_fails_when_the_host_baseline_could_not_be_run` that a baseline that
+never ran fails it too, and
+`preflight_stops_on_the_real_host_baseline_below_the_floor` that the real
+script, on a host whose stubbed `getconf` reports glibc 2.37, stops the real
+preflight with its own verdict before `rocm-smi` is asked anything;
+`preflight_runs_the_real_host_baseline` is a smoke test of the same pair on the
+real host, which on CI's runners exercises only the path that meets the floor.
+Then it applies two GPU gates, because neither sees what the
+other does: a bounded wait on free memory, and then
+`reclaim-gpu.sh --assert-clear`. The
 memory floor is a fixed number of GiB against whatever pool `rocm-smi` reports,
 so its sensitivity is set by the pool's size rather than by what a serve holds —
 against a ~62 GiB Strix GTT aperture it trips only past ~54 GiB held, and

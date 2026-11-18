@@ -172,6 +172,30 @@ jobs:
               # `heavy`-gated) doesn't silently skip the test that reads it.
               - 'docs/ci-hardware-testing.md'
               - 'tests/e2e-cucumber/README.md'
+              # the_ci_host_floor_is_the_documented_product_floor (xtask) reads
+              # the glibc/libstdc++ floor the first three state, and xtask's
+              # eval_fixtures tests read the rocm-doctor skill's two files; same
+              # gap as above, so all four are in `forces_full_workspace` too.
+              - 'README.md'
+              - 'docs/wsl.md'
+              - 'skills/rocm-doctor/reference.md'
+              - 'skills/rocm-doctor/SKILL.md'
+              # workflow_contract (xtask) reads this for the queue-run
+              # workflow's schedule, secrets and artifacts; same gap as above.
+              - 'docs/nightly-on-the-queue.md'
+              # Scripts xtask's tests read or run: the GPU preflight, the host
+              # baseline, the reclaim and lane scripts, and the release gate.
+              # No crate owns them, so `cargo xtask affected` sends an edit to
+              # one to the whole workspace, but only if the rust-gated jobs run
+              # at all. Exact paths, one per script:
+              # scripts_xtask_tests_read_are_in_the_rust_filter (xtask) fails
+              # when xtask names a script missing here, or this lists one xtask
+              # no longer names.
+              - '.github/scripts/gpu-preflight.sh'
+              - '.github/scripts/host-baseline.sh'
+              - 'scripts/reclaim-gpu.sh'
+              - 'scripts/run-e2e-lane.sh'
+              - 'scripts/release_readiness.py'
               # `cargo xtask check-architecture-doc` (clippy job) compares this
               # module map with the source tree; deleting or rewording an entry
               # can break it though no *.rs file moved.
