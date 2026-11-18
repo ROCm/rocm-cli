@@ -54,12 +54,13 @@ Feature: Native HTTP networking
     And the user is told to pass an explicit port for that host
 
   @id:networking-model-alias-readiness
-  Scenario Outline: networking-05 - The listed service must match the recipe owning the served alias
-    Given the model endpoint serves "qwen3-32b" and the CLI registered "<recipe>"
+  Scenario: networking-05 - An alias for another recipe leaves the service starting
+    Given the model endpoint serves "qwen3-32b" and the CLI registered "Qwen/Qwen3-32B"
     When the user lists running services as JSON
-    Then the registered model has status "<status>"
+    Then the registered model has status "starting"
 
-    Examples:
-      | recipe             | status   |
-      | Qwen/Qwen3-32B     | starting |
-      | Qwen/Qwen3-32B-FP8 | ready    |
+  @id:networking-model-alias-owner-ready
+  Scenario: networking-06 - An alias for the registered recipe marks the service ready
+    Given the model endpoint serves "qwen3-32b" and the CLI registered "Qwen/Qwen3-32B-FP8"
+    When the user lists running services as JSON
+    Then the registered model has status "ready"
