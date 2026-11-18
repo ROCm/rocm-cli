@@ -1183,7 +1183,7 @@ Feature: Diagnosing failures and listing fixes
   # lane rather than whatever GPU the runner has. Linux-gated because the
   # simulation seam re-roots Linux paths only; the Windows source is covered by
   # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
-  # it can have (see the PR text).
+  # it can have: no CI lane runs a Windows APU.
   @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
   Scenario: diagnose-80 - An integrated GPU is judged on the pool it allocates from, not its carve-out
     Given a machine whose only GPU shares system memory, with the pool it may use readable

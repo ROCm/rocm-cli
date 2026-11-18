@@ -131,17 +131,14 @@ pub enum AcceleratorMemory {
     /// measurements of driver and BIOS policy on this machine -- not installed
     /// RAM, and not a fraction of it.
     ///
-    /// `vram_carveout_gib` is what `amd-smi` reported as `total_vram`: the fixed
-    /// BIOS carve-out (512 MiB on a Ryzen 7 4700U, ~4 GiB on a Strix Halo). It
-    /// is never the figure a recipe minimum is compared against — doing so
-    /// refuses nearly every curated model on machines that serve them — and
-    /// **nothing reads it today**. It is reserved for a report that shows the
-    /// two figures side by side, which would be the place to explain why the
-    /// number `amd-smi` prints differs from the one the verdict used; no
-    /// renderer does that yet, and this enum carries no `Serialize`, so the
-    /// field cannot reach `--json` either. Carried rather than dropped because
-    /// the classification that fills it in (`classify_accelerator_memory` in the
-    /// `rocm` binary) is the only place the carve-out is still in hand.
+    /// The BIOS carve-out `amd-smi` reports as `total_vram` (512 MiB on a
+    /// Ryzen 7 4700U, ~4 GiB on a Strix Halo) is deliberately NOT carried here.
+    /// It is never the figure a recipe minimum is compared against — doing so
+    /// refuses nearly every curated model on machines that serve them — and no
+    /// renderer shows the two figures side by side yet. A field nothing reads
+    /// is a field that cannot be wrong in a way any test would catch, so it is
+    /// added when a reader exists; `classify_accelerator_memory` in the `rocm`
+    /// binary still has the carve-out in hand at that point.
     ///
     /// A ceiling is not an allocation. The operating system, the compositor and
     /// every other process draw on the same memory, so a recipe that was
@@ -153,10 +150,7 @@ pub enum AcceleratorMemory {
     /// compared with the pool, and a `cpu_only` recipe never allocates from it;
     /// both stay `Ready` here. Seven shipped `gpu_required` recipes have no
     /// minimum today, so this is the common case rather than a corner.
-    Unified {
-        gtt_total_gib: f64,
-        vram_carveout_gib: Option<f64>,
-    },
+    Unified { gtt_total_gib: f64 },
     /// An APU whose pool could not be read on this particular host: the figure
     /// was absent or unparseable. See
     /// [`UndeterminedReason::UnifiedMemoryUnreadable`] for what that means and
@@ -1721,7 +1715,6 @@ mod tests {
             gtt_total_gib: 60.0,
             // A carve-out far below the recipe's minimum: were THIS the figure
             // compared against, the verdict would be `Blocked`.
-            vram_carveout_gib: Some(0.5),
         });
         assert_eq!(
             ample.verdict,
@@ -1755,7 +1748,6 @@ mod tests {
         // this is not occupancy a reboot would clear.
         let starved = ask(AcceleratorMemory::Unified {
             gtt_total_gib: 0.25,
-            vram_carveout_gib: Some(0.5),
         });
         assert_eq!(
             starved.verdict,
@@ -1796,7 +1788,6 @@ mod tests {
         let apu = HostFacts {
             accelerator_memory: AcceleratorMemory::Unified {
                 gtt_total_gib: 60.0,
-                vram_carveout_gib: Some(0.5),
             },
             // Above every recipe's recommendation, so the system-RAM softening
             // is not what produces the verdict or the plan below.
@@ -1915,7 +1906,6 @@ mod tests {
                 // the shared-pool gate is the only thing that could soften it.
                 accelerator_memory: AcceleratorMemory::Unified {
                     gtt_total_gib: minimum * 4.0,
-                    vram_carveout_gib: Some(0.5),
                 },
                 // Below the recommendation, so the system-RAM check softens
                 // first and writes the remediation this test is about.
@@ -2000,7 +1990,6 @@ mod tests {
         let apu = HostFacts {
             accelerator_memory: AcceleratorMemory::Unified {
                 gtt_total_gib: 60.0,
-                vram_carveout_gib: Some(4.0),
             },
             system_ram_gib: Some(4096.0),
         };
@@ -2064,7 +2053,6 @@ mod tests {
         let apu = HostFacts {
             accelerator_memory: AcceleratorMemory::Unified {
                 gtt_total_gib: 60.0,
-                vram_carveout_gib: Some(4.0),
             },
             // Large enough that the system-RAM check cannot be what softens it.
             system_ram_gib: Some(4096.0),

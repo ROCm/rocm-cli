@@ -5886,6 +5886,15 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   are pure functions tested on every platform; the FFI around them is not
   exercised by any test.
 
+  Two more scenarios cover the rules that decide when the shared-pool cap does
+  *not* apply. `diagnose-84` asks about a `cpu_only` recipe on the same planted
+  APU and requires the verdict to stay `ready` with no GPU remediation: a recipe
+  that never allocates from the accelerator cannot be made worse by what that
+  accelerator's pool is shared with. `diagnose-85` asks the GGUF estimator about
+  a file on that host and requires the estimate to say the figure it compared
+  against is a shared ceiling rather than free memory, so the weaker claim is
+  visible to a user reading the estimate rather than only to the verdict.
+
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question

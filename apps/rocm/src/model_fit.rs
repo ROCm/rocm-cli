@@ -273,16 +273,7 @@ fn classify_accelerator_memory(
         // answered with the wrong pool and would answer identically forever.
         return AcceleratorMemory::UnifiedMemoryUnreadable;
     };
-    AcceleratorMemory::Unified {
-        gtt_total_gib,
-        // Carried for the report only. Taken from the mask-visible rows for the
-        // same reason the discrete branch above narrows by them.
-        vram_carveout_gib: vram
-            .iter()
-            .filter(|usage| usable_indices.is_none_or(|indices| indices.contains(&usage.index)))
-            .map(|usage| usage.total_mb as f64 / 1024.0)
-            .reduce(f64::max),
-    }
+    AcceleratorMemory::Unified { gtt_total_gib }
 }
 
 /// Assess a model against this host, with `serve`'s own engine decision.
@@ -734,7 +725,6 @@ mod tests {
             result,
             AcceleratorMemory::Unified {
                 gtt_total_gib: 60.0,
-                vram_carveout_gib: Some(4.0),
             },
             "the aperture is the pool and the carve-out is only a label: {result:?}"
         );
@@ -937,7 +927,6 @@ mod tests {
 
         let apu = ask(AcceleratorMemory::Unified {
             gtt_total_gib: minimum + 48.0,
-            vram_carveout_gib: Some(0.5),
         });
         assert_eq!(
             apu.verdict,
@@ -959,7 +948,6 @@ mod tests {
         assert_eq!(
             ask(AcceleratorMemory::Unified {
                 gtt_total_gib: minimum / 4.0,
-                vram_carveout_gib: Some(0.5),
             })
             .verdict,
             rocm_core::model_readiness::ModelVerdict::Blocked

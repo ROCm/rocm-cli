@@ -176,12 +176,14 @@ impl FromStr for KvCacheType {
 #[serde(rename_all = "snake_case")]
 pub enum EstimateOutcome {
     /// The estimated total is within the memory the host's engine would
-    /// allocate from: a discrete card's dedicated VRAM, or — since this PR —
-    /// the ceiling on the shared pool an APU draws on
+    /// allocate from: a discrete card's dedicated VRAM, or the ceiling on the
+    /// shared pool an APU draws on
     /// ([`crate::model_readiness::AcceleratorMemory::Unified`]). Against a
     /// shared pool this is weaker than it sounds: the ceiling is not an
-    /// allocation, nothing here measured how much of it is free, and the
-    /// verdict beside it is `Degraded` for exactly that reason. The total
+    /// allocation and nothing here measured how much of it is free. The
+    /// `Degraded` cap that goes with a shared pool is applied separately, by
+    /// `assess_model_readiness`, and only to a catalog recipe that declares a
+    /// GPU memory minimum — this estimate does not set it. The total
     /// compared is the sum of the parts as the report shows them, each in whole
     /// MiB rounded up, so it can be a few MiB above `total_bytes`.
     Fits,
@@ -1720,7 +1722,6 @@ mod tests {
             (
                 AcceleratorMemory::Unified {
                     gtt_total_gib: 24.0,
-                    vram_carveout_gib: Some(0.5),
                 },
                 true,
             ),
@@ -1761,7 +1762,6 @@ mod tests {
                 gtt_total_gib: 24.0,
                 // Far below the model's own weights: were THIS the figure
                 // compared against, the outcome below could not be `Fits`.
-                vram_carveout_gib: Some(0.5),
             },
         );
         assert_eq!(
