@@ -793,6 +793,8 @@ linux = "x86_64-manylinux_2_28"
         assert_eq!(rocm_line("2.13.0"), None);
         assert_eq!(rocm_line("1.0+cu128"), None);
         assert_eq!(rocm_line("1.0+rocmx"), None);
+        // `rocm` inside a segment rather than opening one is not a ROCm tag.
+        assert_eq!(rocm_line("1.0+introcm10.1.0"), None);
     }
 
     #[test]
