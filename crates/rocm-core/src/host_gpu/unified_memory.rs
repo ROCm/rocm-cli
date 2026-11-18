@@ -323,11 +323,29 @@ mod dxgi {
             return None;
         }
         let factory = factory.cast::<*const c_void>();
-        let adapters = collect(factory);
+        let scan = collect(factory);
         // SAFETY: `factory` is the interface the call above produced, used for
         // the last time on the line before.
         unsafe { release(factory) };
-        Some(adapters)
+        // A scan that stopped early saw an unknown number of further adapters.
+        // Reporting the partial list would let a two-adapter host read as a
+        // one-adapter host, which is the exact shape the single-AMD-adapter
+        // rule exists to refuse -- so an incomplete scan is "could not read",
+        // not "read, and here is what there was".
+        scan.complete.then_some(scan.adapters)
+    }
+
+    /// What one `EnumAdapters1` walk saw, and whether it saw all of it.
+    ///
+    /// The completeness flag is load-bearing rather than diagnostic: a scan cut
+    /// short by an HRESULT is indistinguishable from a finished one by the list
+    /// alone, and a truncated list on an APU-plus-discrete host looks exactly
+    /// like a single-adapter host -- which [`amd_shared_system_memory`] would
+    /// then attribute a budget to instead of refusing it. Only
+    /// `DXGI_ERROR_NOT_FOUND` means "that was all of them".
+    struct AdapterScan {
+        adapters: Vec<DxgiAdapter>,
+        complete: bool,
     }
 
     /// The enumeration loop, with the factory already created.
@@ -335,7 +353,7 @@ mod dxgi {
     /// Never fails as a whole: an adapter whose description cannot be read is
     /// skipped, because one uncooperative adapter must not hide the budget of
     /// the one the question is about.
-    fn collect(factory: ComObject) -> Vec<DxgiAdapter> {
+    fn collect(factory: ComObject) -> AdapterScan {
         let mut adapters = Vec::new();
         for index in 0..MAX_ADAPTERS {
             let mut adapter: *mut c_void = std::ptr::null_mut();
@@ -347,10 +365,19 @@ mod dxgi {
                 ((*vtbl).enum_adapters1)(factory.cast(), index, &raw mut adapter)
             };
             if hr == DXGI_ERROR_NOT_FOUND {
-                break;
+                // The one ending that means "that was all of them".
+                return AdapterScan {
+                    adapters,
+                    complete: true,
+                };
             }
             if hr < 0 || adapter.is_null() {
-                break;
+                // Any other failure ends the scan without saying how many
+                // adapters it did not reach.
+                return AdapterScan {
+                    adapters,
+                    complete: false,
+                };
             }
             let adapter = adapter.cast::<*const c_void>();
             // SAFETY: `adapter` is a live `IDXGIAdapter1` and `desc` is a live
@@ -372,7 +399,12 @@ mod dxgi {
             // used for the last time above.
             unsafe { release(adapter) };
         }
-        adapters
+        // Ran out of iterations before `DXGI_ERROR_NOT_FOUND`: there may be
+        // further adapters this never asked about.
+        AdapterScan {
+            adapters,
+            complete: false,
+        }
     }
 }
 
