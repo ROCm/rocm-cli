@@ -1460,7 +1460,7 @@ jobs:
           fetch_job_log() {
             local job="$1" attempt
             for attempt in 1 2 3; do
-              curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              curl -fsSL --connect-timeout 15 --max-time 120 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part && return 0
               echo "::notice::queue run ${candidate}: reading the log of job ${job} failed (attempt ${attempt} of 3)"
               sleep 5

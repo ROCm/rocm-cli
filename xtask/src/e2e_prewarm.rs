@@ -979,7 +979,7 @@ fn write_engine_marker(runtimes_dir: &Path, reason: &str) -> Result<()> {
 ///
 /// Narrow on purpose, and temporary: nightly SDKs carry a 10.3 version, vLLM
 /// has no 10.3 wheels, and the discover table in
-/// `engines/vllm/src/discover_builds.rs` has rows for 10.0 and 10.1 only, so
+/// `engines/vllm/src/discover_builds.rs` has no row for it (its newest is 10.2), so
 /// the refusal has hit every MI lane's nightly channel since #1033 pointed the
 /// unpinned nightly at the nightly index. REMOVE this, the marker and its
 /// reader once vLLM wheels for the 10.3 SDK are published and that table has a

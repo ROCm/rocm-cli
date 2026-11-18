@@ -5142,7 +5142,7 @@ fi
             "actions/runs/${candidate}/jobs?per_page=100",
             // curl, not `gh api`: gh refuses a log holding terminal escape
             // sequences, which is what rejected run 44002836099.
-            "curl -fsSL -H \"Authorization: Bearer ${GH_TOKEN}\"",
+            "curl -fsSL --connect-timeout 15 --max-time 120 -H \"Authorization: Bearer ${GH_TOKEN}\"",
             "/logs\" > queue-results/job.log.part",
             // A rejected run says why, on a line of its own: run 44002836099 was
             // rejected and the log could not say which filter did it.
