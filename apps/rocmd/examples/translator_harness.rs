@@ -53,6 +53,6 @@ fn main() -> anyhow::Result<()> {
     record.write()?;
     println!("READY {service_id} anthropic={url}");
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        std::thread::sleep(Duration::from_hours(1));
     }
 }

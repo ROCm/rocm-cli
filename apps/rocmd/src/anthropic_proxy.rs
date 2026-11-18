@@ -808,6 +808,56 @@ fn tool_use_blocks(calls: &[Value]) -> Result<Vec<Value>, ProxyError> {
         .collect()
 }
 
+/// PROTOTYPE (ROCMAI-489): `turns` with every `system`-role turn's text moved
+/// into the user turn before it, as a text block at its end; or, with no user
+/// turn before it, to the start of the next one. A request still needs a user
+/// or assistant turn.
+fn merge_system_turns(turns: &[Value]) -> Result<Vec<Value>, ProxyError> {
+    let role = |turn: &Value| turn.get("role").and_then(Value::as_str).map(str::to_owned);
+    let as_blocks = |content: &Value| -> Result<Vec<Value>, ProxyError> {
+        Ok(match content {
+            Value::Array(blocks) => blocks.clone(),
+            other => vec![json!({ "type": "text", "text": text_of(other, "messages")? })],
+        })
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(turns.len());
+    let mut pending: Vec<Value> = Vec::new();
+    for turn in turns {
+        if role(turn).as_deref() == Some("system") {
+            let content = turn
+                .get("content")
+                .ok_or_else(|| ProxyError::invalid("messages: each message needs `content`"))?;
+            let text = text_of(content, "system message")?;
+            if text.is_empty() {
+                continue;
+            }
+            let block = json!({ "type": "text", "text": text });
+            match out.last_mut() {
+                Some(previous) if role(previous).as_deref() == Some("user") => {
+                    let mut blocks = as_blocks(&previous["content"])?;
+                    blocks.push(block);
+                    previous["content"] = Value::Array(blocks);
+                }
+                _ => pending.push(block),
+            }
+            continue;
+        }
+        let mut turn = turn.clone();
+        if !pending.is_empty() && role(&turn).as_deref() == Some("user") {
+            let mut blocks = std::mem::take(&mut pending);
+            blocks.extend(as_blocks(turn.get("content").unwrap_or(&Value::Null))?);
+            turn["content"] = Value::Array(blocks);
+        }
+        out.push(turn);
+    }
+    if out.is_empty() {
+        return Err(ProxyError::invalid(
+            "messages: needs at least one user or assistant turn",
+        ));
+    }
+    Ok(out)
+}
+
 /// Translate an Anthropic Messages request into an OpenAI chat-completions one.
 fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, ProxyError> {
     let object = request
@@ -835,36 +885,20 @@ fn anthropic_to_openai(request: &Value, served_model: &str) -> Result<Value, Pro
 
     let mut messages = Vec::with_capacity(turns.len() + 1);
     // PROTOTYPE (ROCMAI-489): Claude Code also sends `system`-role turns inside
-    // `messages`, after the user turn. Many local chat templates refuse a
-    // system message that is not first, so their text joins the leading system
-    // prompt instead of keeping its place. A request still needs at least one
-    // user or assistant turn.
-    let is_system = |turn: &&Value| turn.get("role").and_then(Value::as_str) == Some("system");
-    let mut system_text = match object.get("system").filter(|value| !value.is_null()) {
-        Some(system) => text_of(system, "system")?,
-        None => String::new(),
-    };
-    for turn in turns.iter().filter(is_system) {
-        let content = turn
-            .get("content")
-            .ok_or_else(|| ProxyError::invalid("messages: each message needs `content`"))?;
-        let text = text_of(content, "system message")?;
+    // `messages`, re-sent on every request. Many local chat templates refuse a
+    // system message that is not first, and folding the text into the leading
+    // system prompt would change the prompt's start on every turn, so an
+    // engine's prompt cache could never be reused. The text joins the user
+    // turn just before it instead (or the next one), which leaves the system
+    // prompt, the tools and the earlier history byte-identical between turns.
+    let turns = merge_system_turns(turns)?;
+    if let Some(system) = object.get("system").filter(|value| !value.is_null()) {
+        let text = text_of(system, "system")?;
         if !text.is_empty() {
-            if !system_text.is_empty() {
-                system_text.push_str("\n\n");
-            }
-            system_text.push_str(&text);
+            messages.push(json!({ "role": "system", "content": text }));
         }
     }
-    if !turns.iter().any(|turn| !is_system(&turn)) {
-        return Err(ProxyError::invalid(
-            "messages: needs at least one user or assistant turn",
-        ));
-    }
-    if !system_text.is_empty() {
-        messages.push(json!({ "role": "system", "content": system_text }));
-    }
-    for turn in turns.iter().filter(|turn| !is_system(turn)) {
+    for turn in &turns {
         let role = turn
             .get("role")
             .and_then(Value::as_str)
@@ -1673,22 +1707,38 @@ mod tests {
     }
 
     #[test]
-    fn system_role_turns_join_the_leading_system_prompt() {
-        let out = translate(&json!({
-            "max_tokens": 8,
-            "system": "Be brief.",
-            "messages": [
-                {"role": "user", "content": "x"},
-                {"role": "system", "content": [{"type": "text", "text": "Reminder."}]},
-            ],
-        }))
-        .unwrap();
+    fn a_system_turn_joins_the_user_turn_before_it_and_the_system_prompt_is_untouched() {
+        let request = |reminder: &str| {
+            json!({
+                "max_tokens": 8,
+                "system": "Be brief.",
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "x"},
+                    {"role": "system", "content": [{"type": "text", "text": reminder}]},
+                ],
+            })
+        };
+        let out = translate(&request("Reminder one.")).unwrap();
         assert_eq!(
-            out["messages"],
-            json!([
-                {"role": "system", "content": "Be brief.\n\nReminder."},
-                {"role": "user", "content": "x"},
-            ])
+            out["messages"][0],
+            json!({"role": "system", "content": "Be brief."})
+        );
+        assert_eq!(out["messages"].as_array().unwrap().len(), 4);
+        assert!(
+            out["messages"][3]["content"]
+                .to_string()
+                .contains("Reminder one."),
+            "{}",
+            out["messages"][3]
+        );
+        // A different reminder changes only the last turn: the prefix an
+        // engine caches (system prompt and earlier turns) stays identical.
+        let other = translate(&request("Reminder two.")).unwrap();
+        assert_eq!(
+            out["messages"].as_array().unwrap()[..3],
+            other["messages"].as_array().unwrap()[..3]
         );
     }
 
