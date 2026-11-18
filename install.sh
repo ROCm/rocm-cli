@@ -499,6 +499,12 @@ configure_fish_path() {
 # FISH_COMPLETIONS_MARKER in apps/rocm/src/uninstall.rs.
 FISH_COMPLETIONS_MARKER='# rocm-cli fish completions for '
 
+# $1 quoted for a POSIX shell, so a printed command line can be run as printed
+# whatever the path holds: each ' becomes '\'' inside single quotes.
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # Whether file $1 is a regular file this installer (any install folder) wrote:
 # not a link, and starting with the marker line.
 is_installer_completions() {
@@ -542,8 +548,8 @@ install_fish_completions() {
   else
     info "note: could not install fish completions"
     info "to try again, run the installer again, or run:"
-    info "mkdir -p '${completions_dir}'"
-    info "'${INSTALL_DIR}/rocm' completions fish > '${completions_path}'"
+    info "mkdir -p $(sh_quote "${completions_dir}")"
+    info "$(sh_quote "${INSTALL_DIR}/rocm") completions fish > $(sh_quote "${completions_path}")"
     info "(a file written that way has no installer marker, so rocm uninstall leaves it)"
   fi
 }

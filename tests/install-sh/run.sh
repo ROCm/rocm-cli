@@ -410,9 +410,9 @@ fi
 # cleanly with the PATH block on record and writes no completion file. The
 # failure here clears by itself (the stub works on its second run), and the
 # printed advice, run as printed from a bare environment in a home whose name
-# holds a space, then creates the file.
+# holds a space and a quote, then creates the file.
 for mode in fail-once empty-once; do
-  comp_home="${WORK}/homes/spaced home ${mode}"
+  comp_home="${WORK}/homes/spaced it's home ${mode}"
   comp_log="${WORK}/completions-${mode}.log"
   comp_path="${comp_home}/.config/fish/completions/rocm.fish"
   comp_record="${comp_home}/.local/bin/.rocm-cli-path-edit"
