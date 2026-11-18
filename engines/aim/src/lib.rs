@@ -155,11 +155,7 @@ pub fn run_cli() -> Result<()> {
             engine_recipe: None,
             gpu_selection: crate::process::parse_gpu_selection_arg(gpu.as_deref())?,
         })?),
-        CommandKind::Stdio => {
-            let envelope = read_request()?;
-            let response = handle_envelope(envelope);
-            print_json(&response)
-        }
+        CommandKind::Stdio => print_json(&answer_stdio(&read_request()?)),
         CommandKind::ServeHttp {
             service_id,
             model_ref,
@@ -229,6 +225,11 @@ pub fn builtin_serve_http(
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    // Refuse a request made for a protocol this engine cannot serve before its
+    // payload is read: in another protocol the payload may mean something else.
+    if let Some(refusal) = rocm_engine_protocol::incompatible_request_response(&envelope) {
+        return refusal;
+    }
     match envelope.method {
         EngineMethod::Detect => {
             deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |request| {
@@ -269,7 +270,10 @@ where
     let request: T = match serde_json::from_value(payload) {
         Ok(request) => request,
         Err(error) => {
-            return EngineResponseEnvelope::failure("invalid_payload", error.to_string());
+            return EngineResponseEnvelope::failure(
+                rocm_engine_protocol::INVALID_PAYLOAD_CODE,
+                error.to_string(),
+            );
         }
     };
     match handler(request) {
@@ -413,12 +417,21 @@ pub(crate) const fn windows_gpu_unsupported_message() -> &'static str {
 serving is skipped."
 }
 
-fn read_request() -> Result<EngineRequestEnvelope> {
+/// The request text on stdin, read to its end. It is decoded by
+/// [`answer_stdio`], which judges its protocol version first.
+fn read_request() -> Result<String> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .context("failed to read engine stdio request")?;
-    serde_json::from_str(&input).context("failed to parse engine stdio request")
+    Ok(input)
+}
+
+/// The answer to the request `text` read on stdin: its protocol version is
+/// judged before its method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), then it is handled.
+fn answer_stdio(text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle_envelope)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -427,4 +440,20 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     serde_json::to_writer_pretty(&mut handle, value)?;
     writeln!(handle)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    /// The engine protocol contract, the same check every engine runs: see
+    /// [`rocm_engine_protocol::engine_contract`].
+    #[test]
+    fn stdio_answers_hold_the_engine_protocol_contract() {
+        rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+            "aim",
+            answer_stdio,
+            handle_envelope,
+        );
+    }
 }

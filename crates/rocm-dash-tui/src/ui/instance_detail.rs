@@ -63,25 +63,35 @@ pub(super) fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &T
         return 0;
     }
 
-    // Vertical: summary (4 lines: status/id/port/tp · model/gpus/tpw/gen · partition/quant/vram · freshness)
+    // Vertical: summary (4 lines: status/id/port/tp · model/gpus/tpw/gen · partition/quant/vram · freshness,
+    // taller when a line wraps at this width: the last line is the one that
+    // qualifies the rate, so it must never be what falls off)
     // | recent throughput (recent non-idle ticks, ROCMAI-196) | body (min) | footer (1)
     let snap_ts = state.latest.as_ref().map(|s| s.timestamp);
     let activity = recent_activity_rows(&state.history, &inst.container_id, RECENT_ACTIVITY_CAP);
     let has_observed_throughput = has_observed_throughput(&state.history, &inst.container_id);
-    let (activity_h, visible_rows) = activity_layout(activity.len(), inner.height);
+    let summary = summary_lines(inner.width, inst, snap_ts, theme);
+    let summary_h = u16::try_from(
+        Paragraph::new(summary.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width),
+    )
+    .unwrap_or(u16::MAX)
+    .clamp(SUMMARY_ROWS, (inner.height / 2).max(SUMMARY_ROWS));
+    let (activity_h, visible_rows) = activity_layout(activity.len(), inner.height, summary_h);
     let total_rows = activity.len();
     let activity = &activity[..visible_rows];
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(summary_h),
             Constraint::Length(activity_h),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(inner);
 
-    render_summary(f, chunks[0], inst, snap_ts, theme);
+    render_summary(f, chunks[0], summary);
     render_recent_activity(
         f,
         chunks[1],
@@ -95,6 +105,9 @@ pub(super) fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &T
     render_footer(f, chunks[3], inst, theme, max_scroll > 0);
     max_scroll
 }
+
+/// Rows of the summary block when none of its lines wraps.
+const SUMMARY_ROWS: u16 = 4;
 
 /// Max rows shown in the detail modal's "recent throughput" summary.
 const RECENT_ACTIVITY_CAP: usize = 5;
@@ -120,8 +133,8 @@ fn body_floor(inner_h: u16) -> u16 {
 /// budget, so a capped panel shows fewer (newest) rows instead of being
 /// handed rows it can't draw. A panel too short for its header plus one row
 /// (or the placeholder line) collapses to `(0, 0)` so the body gets the rows.
-fn activity_layout(n_rows: usize, inner_h: u16) -> (u16, usize) {
-    let avail = inner_h.saturating_sub(4 + 1 + body_floor(inner_h));
+fn activity_layout(n_rows: usize, inner_h: u16, summary_h: u16) -> (u16, usize) {
+    let avail = inner_h.saturating_sub(summary_h + 1 + body_floor(inner_h));
     // 2 border rows + (1 header row + 1 per entry), or 1 placeholder row when
     // there's none yet; `panel::bento` adds a top-padding row once the box is
     // tall enough (`padding_for`), which is reused here rather than re-derived.
@@ -153,7 +166,10 @@ pub(crate) struct ActivityRow {
 /// `container_id` had non-zero generation throughput — i.e. was actually
 /// serving, not idle. These are per-tick samples, not discrete serving runs.
 /// The live "gen:" gauge in `render_summary` already covers the idle case, so
-/// idle ticks are skipped. Repeated Held ticks of one scrape collapse to one row. Returns up to `cap` rows, newest first.
+/// idle ticks are skipped. A Lemonade last-request rate
+/// ([`rocm_dash_core::metrics::Instance::gen_tps_last_request`]) is not serving
+/// either: it is one finished request's rate re-reported on every tick, so it is
+/// skipped like an idle tick. Repeated Held ticks of one scrape collapse to one row. Returns up to `cap` rows, newest first.
 /// Pure — exposed for tests.
 pub(crate) fn recent_activity_rows(
     history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
@@ -169,7 +185,7 @@ pub(crate) fn recent_activity_rows(
         else {
             continue;
         };
-        if !inst.gen_tps.is_some_and(|v| v.is_finite() && v > 0.0) {
+        if !inst.live_gen_tps().is_some_and(|v| v > 0.0) {
             continue;
         }
         // A Held tick repeats an earlier scrape; age it from when the
@@ -297,18 +313,17 @@ fn render_recent_activity(
     f.render_widget(table, inner);
 }
 
-fn render_summary(
-    f: &mut Frame,
-    area: Rect,
+fn summary_lines(
+    width: u16,
     inst: &Instance,
     snap_ts: Option<DateTime<Utc>>,
     theme: &Theme,
-) {
+) -> Vec<Line<'static>> {
     let (status_color, status_text) = status_meta(inst.status, theme);
     let muted = Style::default().fg(theme.muted);
     let fg = Style::default().fg(theme.fg);
 
-    let id_w = (area.width as usize).saturating_sub(16).max(8);
+    let id_w = (width as usize).saturating_sub(16).max(8);
     let container_id = trunc(&inst.container_id, id_w);
     let partition = inst.partition_info.as_deref().unwrap_or("-");
     let quant = inst.quantization.as_deref().unwrap_or("-");
@@ -356,13 +371,16 @@ fn render_summary(
             Span::styled("tok/W: ", muted),
             Span::styled(
                 format::tokens_per_watt_cell(
-                    inst.tokens_per_watt,
+                    inst.live_tokens_per_watt(),
                     inst.gen_tps_observation.as_ref(),
                 ),
                 Style::default().fg(theme.accent),
             ),
             Span::raw("  "),
-            Span::styled("gen: ", muted),
+            Span::styled(
+                format!("{}: ", format::gen_rate_label(inst.gen_tps_last_request)),
+                muted,
+            ),
             Span::styled(
                 format::gen_tps_compact(inst.gen_tps, inst.gen_tps_observation.as_ref()),
                 fg,
@@ -387,7 +405,10 @@ fn render_summary(
             Span::styled(observed_str, Style::default().fg(theme.muted)),
         ]),
     ];
+    lines
+}
 
+fn render_summary(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -600,7 +621,8 @@ fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scro
 mod tests {
     use super::*;
     use crate::ui::tabs::instances::tests::{
-        SNAP_SECS, buffer_text, mk_inst, mk_inst_obs, mk_snap, mk_state, obs, state_with_snap,
+        SNAP_SECS, buffer_text, last_req_inst, mk_inst, mk_inst_obs, mk_snap, mk_state, obs,
+        state_with_snap,
     };
     use chrono::TimeZone;
     use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
@@ -1019,6 +1041,56 @@ mod tests {
     }
 
     #[test]
+    fn detail_names_a_last_request_rate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (last_request, label) in [(true, "last req: 37.5 tok/s"), (false, "gen: 37.5 tok/s")] {
+            let state = state_with_snap(last_req_inst("rate-detail", last_request));
+            let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+            term.draw(|f| {
+                draw_detail(f, f.area(), &state, &state.theme);
+            })
+            .unwrap();
+            let out = buffer_text(&term);
+            assert!(out.contains(label), "{label:?} missing:\n{out}");
+            assert_eq!(out.contains("last req:"), last_request, "{out}");
+            // The value already carries its unit, so the label must not repeat it.
+            assert!(!out.contains("tok/s:"), "unit doubled:\n{out}");
+        }
+    }
+
+    /// The summary block grows with a wrapped line: at no width may the line that
+    /// qualifies the rate (freshness and age) fall off the bottom, whatever the
+    /// rate's label length (`last req:` once pushed it out at 97-102 columns).
+    #[test]
+    fn detail_keeps_the_freshness_line_at_every_width() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for last_request in [true, false] {
+            let mut inst = last_req_inst("a-realistic-container-id-0123456789", last_request);
+            inst.model_name = "gpt-oss-20b-mxfp4-instruct".into();
+            inst.gpu_ids = vec!["0".into(), "1".into()];
+            inst.partition_info = Some("SPX/NPS1".into());
+            let state = state_with_snap(inst);
+            for width in 80..=200u16 {
+                let mut term = Terminal::new(TestBackend::new(width, 48)).unwrap();
+                term.draw(|f| {
+                    draw_detail(f, f.area(), &state, &state.theme);
+                })
+                .unwrap();
+                let out = buffer_text(&term);
+                assert!(
+                    out.contains("gen freshness:") && out.contains("observed:"),
+                    "last_request={last_request} width={width}:
+{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn detail_held_shows_held_freshness_label() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1149,6 +1221,35 @@ mod tests {
             "newest activity must come first"
         );
         assert_eq!(rows[1].gen_tps, Some(10.0));
+    }
+
+    /// An idle Lemonade server keeps reporting its last request's rate. That is
+    /// data (so the panel says "idle", not "no throughput data"), but it is not
+    /// activity, and must not be listed as an unlabelled tok/s sample.
+    #[test]
+    fn a_last_request_rate_is_not_listed_as_recent_activity() {
+        let mut idle_lemonade = mk_inst("x");
+        idle_lemonade.gen_tps = Some(45.0);
+        idle_lemonade.gen_tps_last_request = true;
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        for tick in 0..3 {
+            let mut snap = mk_snap(vec![idle_lemonade.clone()]);
+            snap.timestamp = Utc.timestamp_opt(1_700_000_000 + 30 * tick, 0).unwrap();
+            history.push_back(snap);
+        }
+        assert!(recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP).is_empty());
+        assert!(
+            has_observed_throughput(&history, "id-x"),
+            "the rate was reported, so the panel reads idle, not no data"
+        );
+        // The same readings as a live rate are activity.
+        idle_lemonade.gen_tps_last_request = false;
+        let mut live = std::collections::VecDeque::new();
+        live.push_back(mk_snap(vec![idle_lemonade]));
+        assert_eq!(
+            recent_activity_rows(&live, "id-x", RECENT_ACTIVITY_CAP).len(),
+            1
+        );
     }
 
     #[test]
@@ -1529,8 +1630,8 @@ mod tests {
     fn activity_layout_never_exceeds_budget_and_keeps_newest_rows() {
         for inner_h in 0..=60u16 {
             for n in 0..=RECENT_ACTIVITY_CAP {
-                let (h, k) = activity_layout(n, inner_h);
-                let avail = inner_h.saturating_sub(4 + 1 + body_floor(inner_h));
+                let (h, k) = activity_layout(n, inner_h, SUMMARY_ROWS);
+                let avail = inner_h.saturating_sub(SUMMARY_ROWS + 1 + body_floor(inner_h));
                 assert!(h <= avail, "n={n} inner_h={inner_h}: h={h} > {avail}");
                 assert!(k <= n);
                 if n > 0 && h > 0 {
@@ -1543,16 +1644,16 @@ mod tests {
             }
         }
         // Spacious: all five rows. Mid band: partial, but sized to match.
-        assert_eq!(activity_layout(5, 48).1, 5);
-        let (h, k) = activity_layout(5, 24);
+        assert_eq!(activity_layout(5, 48, SUMMARY_ROWS).1, 5);
+        let (h, k) = activity_layout(5, 24, SUMMARY_ROWS);
         assert!(
             (1..5).contains(&k),
             "mid-height band shows a partial panel: {k}"
         );
         assert!(h > 0);
         // Placeholder: shown when it fits, collapsed otherwise.
-        assert_eq!(activity_layout(0, 48), (3, 0));
-        assert_eq!(activity_layout(0, 8), (0, 0));
+        assert_eq!(activity_layout(0, 48, SUMMARY_ROWS), (3, 0));
+        assert_eq!(activity_layout(0, 8, SUMMARY_ROWS), (0, 0));
     }
 
     #[test]

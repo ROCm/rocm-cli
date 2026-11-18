@@ -116,7 +116,8 @@ pub struct ScenarioDecl {
     pub requires_wsl: bool,
     /// `@requires-oom-fault-injection`: the scenario drives the test-only
     /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
-    /// to fabricate a GPU-less OOM launch, so it can only run against a binary
+    /// to fabricate a GPU-less launch (one that OOMs, or one that becomes ready
+    /// and then fails its smoke test), so it can only run against a binary
     /// compiled with that feature. `xtask e2e` builds it in when it builds the
     /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
     /// test a prebuilt shipping release binary that has the hook compiled out —
@@ -174,7 +175,9 @@ pub struct ScenarioDecl {
     /// per-engine canary on the fast path, so it is skipped on ordinary per-PR /
     /// on-demand runs and only runs in the merge queue, which opts in via
     /// `E2E_MERGE_QUEUE`. Keeps the PR feedback loop short while still exercising
-    /// the full serve matrix (on every lane but MI300X) before a change lands.
+    /// the heavy serves before a change lands. Only the Windows Strix and WSL2
+    /// lanes run in the merge queue; the native Linux GPU lanes (MI300X,
+    /// Strix Ubuntu) do not.
     pub merge_queue: bool,
 }
 
@@ -479,6 +482,12 @@ pub struct PlatformManifest<'a> {
     pub capability: &'a HostCapability,
     /// Component versions (OS/ROCm/vLLM/lemonade) for the report heading.
     pub versions: crate::capability::PlatformVersions,
+    /// Why the post-run lane check failed the run
+    /// (`lane_verdict::post_run_verdict`), so the consolidated report shows the
+    /// lane as failed even when every scenario it resolved was a skip. Left out
+    /// when the check passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_failure: Option<String>,
     pub expectations: Vec<ResolvedScenario>,
 }
 
@@ -742,6 +751,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -755,6 +766,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -768,6 +781,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: false,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -790,6 +805,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: "wsl_rocdxg_ready".into(),
+                probe_error: None,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -806,6 +823,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -821,6 +840,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -834,6 +855,8 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
             },
         }
     }
@@ -1196,10 +1219,11 @@ serve_timeout_secs = 90
     #[test]
     fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
         // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
-        // may each wait out a 1200s readiness cap. Run per-PR on the Strix Ubuntu
-        // pool they pushed the job (~25 min otherwise) into its 45 min cap on every
-        // run. They must resolve to Skip unless the nightly opt-in is set, and must
-        // still be reachable (not Skip for the nightly reason) when it is.
+        // may each wait out a 1200s readiness cap. Run on every PR on the Strix
+        // Ubuntu pool (before that lane left the PR path) they pushed the job
+        // (~25 min otherwise) into its 45 min cap on every run. They must
+        // resolve to Skip unless the nightly opt-in is set, and must still be
+        // reachable (not Skip for the nightly reason) when it is.
         let m = Expectations::default();
         for prefix in ["serve-26 -", "serve-27 -"] {
             let d = ScenarioDecl::from_tags(&model_serving_tags(prefix));
@@ -2116,6 +2140,36 @@ reason = "unrelated open bug"
         ));
     }
 
+    /// What the lane-verdict notes say about `@requires-gpu` scenarios (see
+    /// `lane_verdict::preflight_verdict`): `has_amd_gpu` alone decides their
+    /// skip, other gates aside. `resolve` takes no lane declaration, so
+    /// `E2E_EXPECT_GPU` does not enter into it.
+    #[test]
+    fn requires_gpu_runs_where_the_probe_found_a_gpu_and_skips_where_it_did_not() {
+        let m = Expectations::default();
+        let d = decl(&["id:gpu-premise", "requires-gpu"]);
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let with_gpu = cap("strix-ubuntu");
+        assert!(with_gpu.has_amd_gpu);
+        assert_eq!(
+            resolve(&d, &with_gpu, &m, included),
+            Expectation::ExpectPass
+        );
+        let without_gpu = HostCapability {
+            has_amd_gpu: false,
+            ..with_gpu
+        };
+        assert!(matches!(
+            resolve(&d, &without_gpu, &m, included),
+            Expectation::Skip { .. }
+        ));
+    }
+
     #[test]
     fn non_gpu_scenario_always_runs() {
         let m = Expectations::default();
@@ -2353,7 +2407,8 @@ flaky = true
         ));
     }
 
-    /// The two rows for Lemonade 11.5.1's failed backend alignment apply to native
+    /// The two rows for the Windows Lemonade backend problems (written while 11.5.1
+    /// was pinned, kept until a nightly shows them stale) apply to native
     /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
     /// default engine is vLLM, where the engine named is what decides), and they are not
     /// `flaky` (an XPASS means the cause is gone and the row is stale). Neither sets

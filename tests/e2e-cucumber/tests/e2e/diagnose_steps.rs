@@ -7,6 +7,11 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::lifecycle_steps;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
+// The note the text report prints under a cause the paste did not contribute
+// to (diagnose-63/-64) is read from the library's own constant rather than
+// typed again here, so the real binary's output is held to the one string the
+// renderer prints from.
+use rocm_core::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE;
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -43,13 +48,13 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// found". This one needs only `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 
-/// The recipe used to prove a failed helper command is explained on stderr with
-/// exit code 4. `fix-4-render-group` is the only AUTO recipe whose command-failure
-/// branch this suite can force deterministically: its helper (`usermod`, run
-/// directly as root or via `sudo` otherwise) is resolved off `$PATH`, so a
-/// scenario-controlled `$PATH` (see `command_fails_bin_dir`) can stand a fake
-/// `usermod`/`sudo` in for it, unconditionally failing, without needing real
-/// root or touching real group membership.
+/// The recipe used to prove a failed or timed-out helper command is explained
+/// on stderr with exit code 4. `fix-4-render-group` is the only AUTO recipe whose
+/// command-failure branch this suite can force deterministically: its helper
+/// (`usermod`, run directly as root or via `sudo` otherwise) is resolved off
+/// `$PATH`, so a scenario-controlled `$PATH` (see `command_fails_bin_dir`) can
+/// stand a fake `usermod`/`sudo` in for it, failing or never finishing, without
+/// needing real root or touching real group membership.
 const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
 /// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
@@ -269,6 +274,26 @@ fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
         .join("fake-bin")
 }
 
+/// Where the fake `usermod`/`sudo` record each call, one `<name> <args>` line
+/// per call. Outside [`command_fails_bin_dir`] so it is not on the CLI's PATH.
+fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin-calls.log")
+}
+
+/// The `$USER` the render-group scenarios run the fix as.
+const RENDER_GROUP_USER: &str = "e2e-test-user";
+
+/// The line `fix-4-render-group` prints once the user was added. Built from
+/// the same user the scenario sets, and absent from every failure path.
+fn render_group_success_line() -> String {
+    format!("Added {RENDER_GROUP_USER} to render,video.")
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a user who hit a known ROCm failure")]
@@ -306,6 +331,126 @@ async fn user_pasted_a_capture_with_a_foreign_oom(world: &mut E2eWorld) {
     );
 }
 
+/// A vLLM startup OOM as a user pastes it from the engine log: two lines, and
+/// neither names vLLM, which is what made the old prefix necessary. The leading
+/// line and the trailing spaces are there so "exactly as pasted" has something
+/// to lose: a paste trimmed, split or re-joined would no longer compare equal.
+const UNNAMED_VLLM_OOM_PASTE: &str = "INFO Loading model weights took 14.9 GiB\n\
+     torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB  ";
+
+#[given("a user who pasted a vLLM out-of-memory error that does not name vLLM")]
+async fn user_pasted_unnamed_vllm_oom(world: &mut E2eWorld) {
+    world.model_name = Some(UNNAMED_VLLM_OOM_PASTE.to_string());
+}
+
+/// The parts of [`PASTE_NAMING_THE_MACHINE`] that belong to the user's own
+/// machine. None of them is a catalog word, so none can appear in a report
+/// except by being copied from the paste.
+const PASTED_MACHINE_DETAILS: [&str; 3] = ["e2e-paste-user", "e2e-paste-host", "e2e-paste-token"];
+
+/// A vLLM startup OOM as pasted from a log that also names the user's home
+/// directory, host and a token: the shape of paste that must not reach a
+/// report meant for sharing.
+const PASTE_NAMING_THE_MACHINE: &str = "torch.OutOfMemoryError: HIP out of memory. \
+     Tried to allocate 2.00 GiB\n\
+     File \"/home/e2e-paste-user/serve.py\" on e2e-paste-host, HF_TOKEN=e2e-paste-token";
+
+/// A vLLM out-of-memory paste with non-ASCII text in it: an accented path
+/// (two UTF-8 bytes), a box-drawing character (three) and an emoji beyond the
+/// Basic Multilingual Plane (four, a surrogate pair once escaped).
+const NON_ASCII_VLLM_PASTE: &str = "torch.OutOfMemoryError: HIP out of memory. \
+     Tried to allocate 2.00 GiB\n\u{2502} File \"/home/jos\u{e9}/caf\u{e9}/serve.py\" \u{1f525}";
+
+/// Where [`NON_ASCII_VLLM_PASTE`] is saved, inside the scenario's own root.
+fn non_ascii_paste_file(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("engine-paste.txt")
+}
+
+/// Saved with the final line break an editor adds, which `--symptom-file`
+/// removes, so the symptom the report records is the paste itself.
+#[given("a user whose pasted vLLM error contains non-ASCII text, saved to a file")]
+async fn user_saved_non_ascii_vllm_paste(world: &mut E2eWorld) {
+    std::fs::write(
+        non_ascii_paste_file(world),
+        format!("{NON_ASCII_VLLM_PASTE}\n"),
+    )
+    .expect("failed to save the paste");
+    world.model_name = Some(NON_ASCII_VLLM_PASTE.to_string());
+}
+
+#[when(
+    "the user asks the CLI to diagnose that file in machine-readable form, naming vLLM as the engine"
+)]
+async fn user_diagnoses_non_ascii_file_naming_vllm(world: &mut E2eWorld) {
+    let path = non_ascii_paste_file(world).display().to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom-file",
+            &path,
+            "--engine",
+            "vllm",
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("every byte the CLI printed is ASCII")]
+async fn assert_stdout_is_ascii(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().expect("no diagnose output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0:\n{stdout}\n{:?}",
+        world.cli_stderr
+    );
+    let stray: Vec<char> = stdout.chars().filter(|c| !c.is_ascii()).collect();
+    assert!(
+        stray.is_empty(),
+        "--json must be ASCII on the wire, so a Windows console on the OEM code page shows \
+         no mojibake; found {stray:?} in:\n{stdout}"
+    );
+}
+
+#[then("the symptom in the report reads back exactly as the file held it")]
+async fn assert_symptom_reads_back_exactly(world: &mut E2eWorld) {
+    let pasted = world.model_name.clone().expect("no symptom set");
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/symptom")
+            .and_then(serde_json::Value::as_str)
+            .map(str::as_bytes),
+        Some(pasted.as_bytes()),
+        "decoded, the recorded symptom must be the paste byte for byte:\n{output}"
+    );
+}
+
+/// A plain Python failure with no out-of-memory text in it and nothing to do
+/// with vLLM.
+#[given("a user who pasted a Python error that has nothing to do with vLLM")]
+async fn user_pasted_unrelated_python_error(world: &mut E2eWorld) {
+    world.model_name = Some(
+        "Traceback (most recent call last):\n  File \"train.py\", line 3, in <module>\n\
+         ZeroDivisionError: division by zero"
+            .to_string(),
+    );
+}
+
+#[given("a user who pasted a vLLM error that names their own machine")]
+async fn user_pasted_vllm_error_naming_their_machine(world: &mut E2eWorld) {
+    world.model_name = Some(PASTE_NAMING_THE_MACHINE.to_string());
+}
+
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
@@ -329,6 +474,16 @@ async fn user_chose_override_fix(world: &mut E2eWorld) {
 #[given("a user who has chosen the fix for ROCm missing from PATH")]
 async fn user_chose_path_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-6-path".to_string());
+}
+
+#[given("a user who has chosen the fix for a missing render group")]
+async fn user_chose_render_group_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen the fix for a framework wheel built for another ROCm release")]
+async fn user_chose_wheel_mismatch_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-8-wheel-rocm".to_string());
 }
 
 #[then(
@@ -451,6 +606,45 @@ async fn assert_notes_name_the_runtime_only_case(world: &mut E2eWorld) {
     );
 }
 
+#[then(
+    "the printed verify line checks the user belongs to the group that owns the GPU compute device, and shows that group"
+)]
+async fn assert_render_group_verify_shows_the_kfd_owner(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // The cause tells the user to join the group that owns `/dev/kfd`, which
+    // need not be `render`, so the check has to accept that group and show
+    // it. Text only: the line needs a Linux host to run, and
+    // `the_render_group_verify_accepts_the_group_that_owns_kfd` in
+    // crates/rocm-core/src/diagnose/linux.rs runs it with stand-in tools. That
+    // `rocm diagnose` prints this same line is held by
+    // `the_render_group_fix_verify_matches_the_catalog_copy` there; both read
+    // one constant.
+    assert!(
+        verify.starts_with("groups ")
+            && verify.contains("stat -c %G /dev/kfd")
+            && verify.contains("ls -l /dev/kfd"),
+        "the verify line must check the group that owns /dev/kfd and list it: {verify}"
+    );
+}
+
+#[then("the printed title names the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_title_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let title = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Fix:"))
+        .unwrap_or_else(|| panic!("the preview printed no Fix: line:\n{output}"))
+        .trim();
+    // Text only. The comparison the title describes, `X.Y` and not the bare
+    // major, is held by `the_wheel_mismatch_compares_the_x_y_release_and_says_so`
+    // in crates/rocm-core/src/diagnose/host.rs.
+    assert!(
+        title.contains("X.Y") && !title.contains("major"),
+        "the title must name the X.Y release it compares: {title}"
+    );
+}
+
 /// Every `Verify` line the preview printed: the plain one and the Linux one.
 fn printed_verify_lines(output: &str) -> Vec<&str> {
     output
@@ -518,23 +712,47 @@ async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
 
 #[given("a user who has approved a fix whose helper command will fail")]
 async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
+    plant_render_group_helpers(world, "exit 1");
+}
+
+#[given("a user who has approved a fix whose helper command never finishes")]
+async fn user_approved_fix_that_never_finishes(world: &mut E2eWorld) {
+    // `exec`, so the process `rocm` started *is* the sleep: the executor stops
+    // only its direct child, and a `sleep` left as the shell's own child would
+    // outlive the scenario by ten minutes. The absolute path because the
+    // scenario's PATH holds only the stand-ins.
+    plant_render_group_helpers(world, "exec /bin/sleep 600");
+}
+
+/// Stands fake `usermod`/`sudo` scripts in for the fix's helper on a `$PATH`
+/// holding nothing else. Each appends `<name> <args>` to
+/// [`render_group_helper_log`] and then runs `tail`, so a scenario can say
+/// both what the CLI reported and what it asked the helper to do.
+fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
     let bin_dir = command_fails_bin_dir(world);
     std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
+    let log = render_group_helper_log(world);
+    let log = log.to_str().expect("the scenario root is UTF-8");
+    assert!(
+        !log.contains('\''),
+        "the helper log path is single-quoted in the stand-in script: {log}"
+    );
     // `usermod` only has to exist for the `which` probe; the command actually run
     // -- `usermod` directly if already root, `sudo usermod ...` otherwise -- goes
-    // through one of these two scripts either way, and both fail unconditionally.
+    // through one of these two scripts either way.
     for name in ["usermod", "sudo"] {
         let script = bin_dir.join(name);
-        rocm_core::fake_executable::write_fake_executable(&script, "#!/bin/sh\nexit 1\n")
+        let body = format!("#!/bin/sh\necho \"{name} $*\" >> '{log}'\n{tail}\n");
+        rocm_core::fake_executable::write_fake_executable(&script, body)
             .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
     }
     // Restricting `$PATH` to only the fakes above also makes the recipe's
     // root-detection deterministic: it shells out to `id -u`, which is not on
     // this PATH, so the spawn itself fails and reads as "not root" regardless of
-    // who runs the suite -- the same `sudo usermod` branch fails on every host,
+    // who runs the suite -- the same `sudo usermod` branch runs on every host,
     // CI or developer machine, root or not.
     world.command_env.push(("PATH", bin_dir.into_os_string()));
-    world.command_env.push(("USER", "e2e-test-user".into()));
+    world.command_env.push(("USER", RENDER_GROUP_USER.into()));
     world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
@@ -574,16 +792,41 @@ async fn user_on_windows_with_hip_sdk_and_no_powershell(world: &mut E2eWorld) {
     world
         .command_env
         .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    deny_powershell(world);
+    world.model_name = Some(PATH_FIX_ID.to_string());
+}
+
+#[given("a Windows host where PowerShell cannot be found")]
+async fn windows_host_without_powershell(world: &mut E2eWorld) {
+    deny_powershell(world);
+}
+
+#[given("a user who has chosen the fix that hides the integrated GPU")]
+async fn user_chose_igpu_fix(world: &mut E2eWorld) {
+    world.model_name = Some(MUTATING_FIX_ID.to_string());
+}
+
+/// Gives the CLI an empty `PATH`, so its own PowerShell reads cannot start.
+///
+/// It denies PowerShell only. The CLI starts both programs by bare name, and
+/// on Windows Rust's `Command` looks for a bare name in the CLI's own
+/// directory, then the system directory (System32), then the Windows
+/// directory, and only then in the CLI's `PATH` (empty here). `setx.exe` is in
+/// System32, so it is still found; `powershell.exe` is in a subdirectory of
+/// System32 that only `PATH` reaches, so it is not. What keeps each
+/// scenario off the runner's real User environment, should the read guard
+/// regress, is the scenario's own: fix-6 (diagnose-39) writes through
+/// PowerShell, which cannot start; fix-2 (diagnose-69) would read both scopes
+/// as unset and find nothing to clear; fix-9 (diagnose-70) is only previewed.
+fn deny_powershell(world: &mut E2eWorld) {
     // An empty child PATH means the CLI's own `Command::new("powershell")`
     // cannot resolve the binary at all -- `powershell.exe` lives under
     // `System32\WindowsPowerShell\v1.0`, which Windows does NOT search
     // unconditionally the way it does System32 itself, so this is a real
     // instance of the "PowerShell missing" cause `ps_env_scope`'s doc comment
-    // names, not a faked one. Nothing here touches the real machine's
-    // User-scope PATH, so no capture/restore is needed: the read never gets
-    // far enough to risk it.
+    // names, not a faked one. No capture/restore is needed: see above for why
+    // none of the three scenarios can write the real User environment.
     world.command_env.push(("PATH", std::ffi::OsString::new()));
-    world.model_name = Some(PATH_FIX_ID.to_string());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -617,6 +860,164 @@ async fn user_diagnoses_json(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["diagnose", "--symptom", &symptom, "--json"]);
     world.cli_output = Some(stdout);
     world.cli_rc = Some(rc);
+}
+
+/// Diagnose the scenario's symptom, naming `engine` as where it came from.
+/// Keeps stdout, stderr and the exit code apart: a refusal is judged on all
+/// three.
+fn diagnose_naming_engine(world: &mut E2eWorld, engine: &str) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            &symptom,
+            "--engine",
+            engine,
+            "--json",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from")]
+async fn user_diagnoses_naming_vllm(world: &mut E2eWorld) {
+    diagnose_naming_engine(world, "vllm");
+}
+
+/// Text mode, twice: with `--engine vllm`, and without it as the baseline the
+/// "changed nothing" claim is checked against. `cli_outputs` holds the two
+/// stdouts in that order.
+#[when(
+    "the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from"
+)]
+async fn user_diagnoses_as_text_naming_vllm(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (named, named_stderr, rc) = crate::run_rocm(
+        world,
+        &["diagnose", "--symptom", &symptom, "--engine", "vllm"],
+    );
+    let (unnamed, _, unnamed_rc) = crate::run_rocm(world, &["diagnose", "--symptom", &symptom]);
+    assert_eq!(unnamed_rc, 0, "the baseline diagnosis must run:\n{unnamed}");
+    world.cli_outputs = Some(vec![named.clone(), unnamed]);
+    world.cli_output = Some(named);
+    world.cli_stderr = Some(named_stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The text report with `--engine` and the one without it, after checking the
+/// named run exited 0.
+fn named_and_unnamed_text(world: &E2eWorld) -> (String, String) {
+    let outputs = world.cli_outputs.clone().expect("no diagnose outputs");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query):\n{}",
+        outputs[0]
+    );
+    (outputs[0].clone(), outputs[1].clone())
+}
+
+#[then(
+    "the report says the symptom was read as vLLM's, and the vLLM out-of-memory cause is reported"
+)]
+async fn assert_text_says_matched_as_vllm(world: &mut E2eWorld) {
+    let (named, unnamed) = named_and_unnamed_text(world);
+    assert_eq!(
+        named.lines().next(),
+        Some(
+            "Engine: vllm (named with --engine; every non-blank line of the symptom was \
+             read as vllm's)."
+        ),
+        "the text report must open by naming the engine it took the symptom as:\n{named}"
+    );
+    assert!(
+        named.contains("fix-16-vllm-oom"),
+        "the line says the symptom was read as vLLM's, and this paste is a vLLM OOM, so the vLLM cause must be there:\n{named}"
+    );
+    assert!(
+        !unnamed.contains("fix-16-vllm-oom"),
+        "without the flag the unnamed paste must not reach the vLLM cause, or the flag was not \
+         what made the difference:\n{unnamed}"
+    );
+}
+
+/// The line diagnose-79 expects is the one diagnose-76 expects: it says how
+/// the symptom was read. What differs is the outcome beside it.
+#[then("the report says the symptom was read as vLLM's, and no vLLM cause is reported")]
+async fn assert_text_says_read_as_vllm_without_a_match(world: &mut E2eWorld) {
+    let (named, _) = named_and_unnamed_text(world);
+    assert_eq!(
+        named.lines().next(),
+        Some(
+            "Engine: vllm (named with --engine; every non-blank line of the symptom was \
+             read as vllm's)."
+        ),
+        "the text report must open by saying how it read the symptom:\n{named}"
+    );
+    assert!(
+        !named.contains("fix-16-vllm-oom"),
+        "nothing in this paste is vLLM's, so naming the engine must not produce a vLLM cause:\n{named}"
+    );
+}
+
+#[then(
+    "the report says no entry for vLLM exists on this OS, and the diagnosis is the one without the flag"
+)]
+async fn assert_text_says_flag_changed_nothing(world: &mut E2eWorld) {
+    let (named, unnamed) = named_and_unnamed_text(world);
+    let first = named.lines().next().unwrap_or_default();
+    assert_eq!(
+        first,
+        "Engine: vllm (named with --engine; no entry for vllm exists on this OS, so the flag \
+         changed nothing).",
+        "the text report must say the named engine is read by nothing here:\n{named}"
+    );
+    let rest = named
+        .strip_prefix(first)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .unwrap_or_else(|| panic!("the engine line must be followed by a blank line:\n{named}"));
+    assert_eq!(
+        rest, unnamed,
+        "the line says the flag changed nothing, so the rest of the report must be the one \
+         without it"
+    );
+}
+
+/// Piped on standard input with the `\n` a shell or editor adds at the end,
+/// which `--symptom-file` removes; the paste itself goes in unchanged, so the
+/// recorded symptom has to equal it exactly.
+#[when("the user pipes it to the diagnosis, naming vLLM as the engine it came from")]
+async fn user_pipes_symptom_naming_vllm(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
+        world,
+        &[
+            "diagnose",
+            "--symptom-file",
+            "-",
+            "--engine",
+            "vllm",
+            "--json",
+        ],
+        &format!("{symptom}\n"),
+        &[],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `lemonade` because it is an engine `rocm serve --engine` accepts: the
+/// refusal is about what the diagnosis tells apart, not about a typo.
+#[when(
+    "the user asks the CLI to diagnose that symptom, naming an engine the diagnosis does not know"
+)]
+async fn user_diagnoses_naming_unknown_engine(world: &mut E2eWorld) {
+    diagnose_naming_engine(world, "lemonade");
 }
 
 #[when("the user asks the CLI which fixes it offers")]
@@ -674,7 +1075,25 @@ async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
 #[when("the user asks the CLI to apply the approved fix")]
 async fn user_applies_approved_fix(world: &mut E2eWorld) {
     let fix_id = world.model_name.clone().expect("no fix id set");
-    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--yes"]);
+    // Off the executor: in diagnose-68 the fix waits out its one-minute
+    // timeout, which would otherwise stall every concurrent scenario.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env_off_executor(world, &["fix", &fix_id, "--yes"]).await;
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user previews that fix for the second GPU")]
+async fn user_previews_fix_for_second_gpu(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    // `--dry-run` and no `--yes`: even a fix that wrongly went past its read
+    // would stop at the preview, and failing that, at the consent gate (stdin
+    // is piped), before running `setx` on the runner.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["fix", &fix_id, "--device-index", "1", "--dry-run"],
+    );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -915,6 +1334,56 @@ async fn assert_no_vllm_oom_reported(world: &mut E2eWorld) {
             diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
         }),
         "another engine's OOM must not be attributed to vLLM:\n{output}"
+    );
+}
+
+#[then("the symptom in the report is exactly what the user pasted")]
+async fn assert_report_keeps_the_paste_verbatim(world: &mut E2eWorld) {
+    let pasted = world.model_name.clone().expect("no symptom set");
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/symptom")
+            .and_then(serde_json::Value::as_str),
+        Some(pasted.as_str()),
+        "the report must carry the paste byte for byte, with nothing added:\n{output}"
+    );
+}
+
+#[then("the report says the user named vLLM as the source of the symptom")]
+async fn assert_report_names_vllm_as_source(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    assert_eq!(
+        report
+            .pointer("/provenance/engine")
+            .and_then(serde_json::Value::as_str),
+        Some("vllm"),
+        "the report must record the engine the user named:\n{output}"
+    );
+}
+
+#[then("the CLI refuses the engine, names the ones it accepts, and diagnoses nothing")]
+async fn assert_unknown_engine_refused(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    // clap's usage-error exit code.
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "an unknown engine is a usage error:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("lemonade") && stderr.contains("vllm"),
+        "the refusal must name the rejected value and the accepted one:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "nothing may be diagnosed when the engine is refused:\n{stdout}"
     );
 }
 
@@ -1674,13 +2143,90 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
     );
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        stderr.contains("usermod exited") && stderr.contains("group membership NOT changed"),
+        stderr.contains("usermod exited 1; group membership NOT changed."),
         "the command-failure explanation must be on stderr:\n{stderr}"
     );
     let stdout = world.cli_output.as_deref().unwrap_or("");
     assert!(
         !stdout.contains("group membership NOT changed"),
         "the command-failure explanation must not also be on stdout:\n{stdout}"
+    );
+    // "NOT changed" is a claim about state: it holds only for a change that
+    // was asked for, refused, and not then reported as made.
+    assert!(
+        !stdout.contains(&render_group_success_line()),
+        "a failed helper must not be followed by the success line:\n{stdout}"
+    );
+    assert_render_group_helper_was_asked(world);
+}
+
+#[then(
+    "the CLI reports on stderr, with exit code 4, that the helper was stopped after a minute, how to check the change and which fix to re-run"
+)]
+async fn assert_command_timeout_reported_on_stderr(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a helper stopped at the deadline is a failed attempt, exit 4:\n{stdout}\n{stderr}"
+    );
+    // Not run as root (see `plant_render_group_helpers`), so the command is
+    // `sudo usermod`; the bound is the fix's own one-minute RUN_TIMEOUT.
+    let expected = format!(
+        "sudo usermod timed out after 60s and was stopped; group membership may or may not have \
+         changed. Check with `id -nG {RENDER_GROUP_USER}`, then re-run \
+         `rocm fix {COMMAND_FAILURE_FIX_ID}` if it did not."
+    );
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "expected the timeout line on stderr:\n  {expected}\ngot:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("timed out"),
+        "the timeout explanation must not also be on stdout:\n{stdout}"
+    );
+}
+
+#[then("the CLI claims neither that the change was made nor that nothing changed")]
+async fn assert_no_claim_about_the_unfinished_change(world: &mut E2eWorld) {
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    // The CLI stopped `sudo`, not `usermod`, so either claim could be false.
+    assert!(
+        !combined.contains("NOT changed"),
+        "a stopped helper may have made the change; the CLI must not say it did not:\n{combined}"
+    );
+    assert!(
+        !combined.contains(&render_group_success_line()),
+        "a stopped helper may not have made the change; the CLI must not say it did:\n{combined}"
+    );
+}
+
+#[then("the helper was asked to add the user to the render and video groups")]
+async fn assert_render_group_helper_asked(world: &mut E2eWorld) {
+    assert_render_group_helper_was_asked(world);
+}
+
+/// The stand-in's log shows the CLI asked to add [`RENDER_GROUP_USER`] to the
+/// render and video groups, via `sudo` or directly.
+fn assert_render_group_helper_was_asked(world: &E2eWorld) {
+    let log_path = render_group_helper_log(world);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!(
+            "the helper stand-in was never run ({}: {e}), so the reported outcome is about a \
+             command that did not happen",
+            log_path.display()
+        )
+    });
+    let asked = format!("usermod -a -G render,video {RENDER_GROUP_USER}");
+    assert!(
+        log.lines()
+            .any(|line| line == format!("sudo {asked}") || line == asked),
+        "expected the helper to be asked `{asked}`; it recorded:\n{log}"
     );
 }
 
@@ -1737,24 +2283,104 @@ async fn assert_path_fix_prepended_with_apostrophe_intact(world: &mut E2eWorld) 
 
 #[then("the CLI aborts the PATH fix with exit code 4 and changes nothing")]
 async fn assert_path_fix_aborts_on_unreadable_path(world: &mut E2eWorld) {
-    let output = world.cli_output.as_deref().unwrap_or("");
+    // Exit 4 -- the same code as a write failure -- rather than a failed read
+    // being silently treated as an empty PATH (ROCMAI-449).
+    assert_read_failure_stops_the_fix(
+        world,
+        "PATH",
+        &["Plan: prepend", "This only takes effect in NEW shells"],
+    );
+}
+
+#[then(
+    "the CLI stops with exit code 4, saying it could not read the saved override and that nothing was changed"
+)]
+async fn assert_override_fix_aborts_on_unreadable_scope(world: &mut E2eWorld) {
+    assert_read_failure_stops_the_fix(
+        world,
+        "HSA_OVERRIDE_GFX_VERSION",
+        &["Cleared from User scope"],
+    );
+}
+
+#[then("the CLI does not report the override as already gone")]
+async fn assert_override_not_reported_gone(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    for claim in ["No persistent HSA_OVERRIDE_GFX_VERSION", "You're done"] {
+        assert!(
+            !stdout.contains(claim),
+            "a value that could not be read must not be reported as absent ({claim:?}):\n{stdout}"
+        );
+    }
+}
+
+#[then(
+    "the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed"
+)]
+async fn assert_igpu_fix_aborts_on_unreadable_scope(world: &mut E2eWorld) {
+    // Nothing after the read is listed here: this is a dry run, so the lines a
+    // fix that went on would print are the preview, which the next step checks.
+    assert_read_failure_stops_the_fix(world, "HIP_VISIBLE_DEVICES", &[]);
+}
+
+#[then("the fix's catalog entry is printed, but not the device setting it would save")]
+async fn assert_no_device_setting_plan(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    // `rocm fix` prints the catalog entry before the runner reads anything,
+    // so a stopped dry run still shows it; the docs say exactly that. The
+    // `Fix:` line is the one `print_recipe` opens the entry with.
+    let fix_id = world.model_name.as_deref().expect("no fix id set");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("Fix:") && line.contains(fix_id)),
+        "the catalog entry for {fix_id} must still be printed on stdout:\n{stdout}"
+    );
+    // The runner's own preview, whatever its heading says: the concrete
+    // `setx` for the index the When step passed and the dry-run marker. The
+    // catalog entry's `Commands:` lists `setx HIP_VISIBLE_DEVICES <dGPU-index>`,
+    // a template, so only the concrete index is forbidden.
+    for line in [
+        "Plan: persist HIP_VISIBLE_DEVICES",
+        "already sets HIP_VISIBLE_DEVICES",
+        "setx HIP_VISIBLE_DEVICES 1",
+        "(dry-run; not executed)",
+    ] {
+        assert!(
+            !stdout.contains(line),
+            "a failed read must stop the fix before it plans or judges a write ({line:?}):\n{stdout}"
+        );
+    }
+}
+
+/// A Windows fix whose User-scope read of `var` could not complete exits 4
+/// with the one line that says so and that nothing was changed, and prints
+/// none of `after`, the lines only a fix that went on would print.
+fn assert_read_failure_stops_the_fix(world: &E2eWorld, var: &str, after: &[&str]) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert_eq!(
         world.cli_rc,
         Some(4),
-        "a failed PATH read must abort with exit code 4 -- the same code as a \
-         write failure -- rather than being silently treated as an empty PATH \
-         (ROCMAI-449):\n{output}\n{stderr}"
+        "a read that did not complete must stop the fix with exit 4:\n{stdout}\n{stderr}"
     );
-    let combined = format!("{output}\n{stderr}");
+    // How PowerShell failed to start is the host's to say (not found, or a
+    // spawn error), so the middle of the line is not pinned.
+    let start = format!("Could not read the current User {var}: PowerShell ");
+    let end = "; nothing was changed.";
     assert!(
-        combined.contains("Could not read the current User PATH"),
-        "expected the abort message naming the failed read:\n{combined}"
+        stderr
+            .lines()
+            .any(|line| line.starts_with(&start) && line.ends_with(end)),
+        "expected a stderr line `{start}...{end}`:\n{stderr}"
     );
-    assert!(
-        !combined.contains("Plan: prepend"),
-        "a failed read must abort before any write plan is printed:\n{combined}"
-    );
+    let combined = format!("{stdout}\n{stderr}");
+    for line in after {
+        assert!(
+            !combined.contains(line),
+            "a failed read must stop the fix before {line:?}:\n{combined}"
+        );
+    }
 }
 
 // ── `rocm diagnose --model` ────────────────────────────────────────
@@ -2452,6 +3078,55 @@ async fn user_asks_what_a_report_would_carry_json(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Text mode, not `--json`: it prints the report and the mail link that
+/// `--send` would offer, so both surfaces a paste could leak into are read.
+/// No `--send`, so nothing is opened or sent.
+#[when(
+    "the user asks the CLI what a report would carry, naming vLLM as the engine the error came from"
+)]
+async fn user_asks_for_a_report_naming_vllm(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    // With the scenario's environment, so a simulated machine planted by a
+    // Given step is the one examined.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            &symptom,
+            "--engine",
+            "vllm",
+            "--report",
+        ],
+    );
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("nothing the user pasted appears in what the CLI printed")]
+async fn assert_paste_absent_from_report(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // A refusal is fixed text that never quotes the paste, so sweeping one
+    // proves nothing. The scenario plants a machine whose report is prepared;
+    // require that report (`cli_version` is a field only a `Report` carries,
+    // see `answer_names_nothing_identifying`) before sweeping it.
+    assert!(
+        out.contains("a report would carry") && out.contains("cli_version"),
+        "no report was prepared, so there is nothing to check the paste against; the \
+         simulated released GPU should have produced one:\n{out}"
+    );
+    for detail in PASTED_MACHINE_DETAILS {
+        assert!(
+            !out.contains(detail),
+            "{detail:?} from the user's paste reached what a report would carry:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("provenance"),
+        "the diagnosis's provenance reached what a report would carry:\n{out}"
+    );
+}
+
 #[then("the CLI either shows the whole report or says why it will not prepare one")]
 async fn report_is_shown_or_refused(world: &mut E2eWorld) {
     let out = world.cli_output.clone().expect("no CLI output");
@@ -2797,6 +3472,90 @@ async fn assert_exit_codes_published(world: &mut E2eWorld) {
             "the published exit codes are missing `{name}`:\n{catalog:#}"
         );
     }
+    // A name without a meaning leaves the caller guessing just the same, so
+    // every published code needs a description that says something.
+    for name in codes.keys() {
+        let description = catalog["exit_code_descriptions"][name]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !description.trim().is_empty(),
+            "exit code `{name}` is published without a description:\n{catalog:#}"
+        );
+    }
+}
+
+/// The catalog `rocm fix --json` printed earlier in the scenario. The steps
+/// that run the CLI again after it keep their output local, so it stays here.
+fn published_catalog(world: &E2eWorld) -> serde_json::Value {
+    let output = world.cli_output.as_ref().expect("no catalog was read");
+    serde_json::from_str(output).expect("catalog parses")
+}
+
+/// The code the catalog publishes for `name`, and its description.
+fn published_exit_code(catalog: &serde_json::Value, name: &str) -> (i32, String) {
+    let code = catalog["exit_codes"][name]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no exit code published for `{name}`:\n{catalog:#}"));
+    let description = catalog["exit_code_descriptions"][name]
+        .as_str()
+        .unwrap_or_else(|| panic!("no description published for `{name}`:\n{catalog:#}"))
+        .to_owned();
+    (
+        i32::try_from(code).expect("an exit code fits i32"),
+        description,
+    )
+}
+
+/// Whether some line of `stderr` starts with `prefix`. The description promises
+/// a line, not the start of stderr: a one-time `rocm:` notice printed at startup
+/// can come before either refusal.
+fn has_line_starting_with(stderr: &str, prefix: &str) -> bool {
+    stderr.lines().any(|line| line.starts_with(prefix))
+}
+
+#[then("asking for a fix it does not offer exits with the code the catalog describes for that")]
+async fn assert_unknown_fix_exits_as_published(world: &mut E2eWorld) {
+    let catalog = published_catalog(world);
+    let (code, description) = published_exit_code(&catalog, "unknown_id");
+    let (_stdout, stderr, rc) = crate::run_rocm(world, &["fix", "fix-does-not-exist"]);
+    assert_eq!(
+        rc, code,
+        "an unknown fix-id must exit with the code the catalog publishes for it; stderr:\n{stderr}"
+    );
+    // The description names the message that sets this refusal apart; the
+    // refusal has to actually print it, or the advice sends a caller looking
+    // for a line that never comes.
+    let marker = "Unknown fix-id:";
+    assert!(
+        description.contains(marker) && has_line_starting_with(&stderr, marker),
+        "the description must name `{marker}`, and a stderr line must start with it.\n\
+         description: {description}\nstderr:\n{stderr}"
+    );
+}
+
+#[then(
+    "a malformed command line exits with that same code, as the catalog warns, and is told apart by its message"
+)]
+async fn assert_usage_error_shares_the_unknown_id_code(world: &mut E2eWorld) {
+    let catalog = published_catalog(world);
+    let (code, description) = published_exit_code(&catalog, "unknown_id");
+    assert!(
+        description.contains("malformed command line") && description.contains("`error:`"),
+        "the catalog must warn that a usage error exits {code} too, and say how to spot it:\n\
+         {description}"
+    );
+    let (_stdout, stderr, rc) = crate::run_rocm(world, &["fix", "--no-such-option"]);
+    assert_eq!(
+        rc, code,
+        "a malformed `rocm fix` command line must exit {code}, as the catalog warns; stderr:\n{stderr}"
+    );
+    // A line for the `error:`, the whole of stderr for the absence: the
+    // unknown-id message must appear nowhere in a usage error.
+    assert!(
+        has_line_starting_with(&stderr, "error:") && !stderr.contains("Unknown fix-id:"),
+        "a usage error must be distinguishable by its message, as the catalog says:\n{stderr}"
+    );
 }
 
 #[then("the CLI refuses and explains that the two cannot be combined")]
@@ -2993,6 +3752,53 @@ fn diagnose_verify_line(output: &str, fix_id: &str) -> String {
         })
         .trim()
         .to_owned()
+}
+
+#[when("the user diagnoses this machine with a ROCm runtime library load failure")]
+async fn user_diagnoses_runtime_library_load_failure(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "libamdhip64.so.6: cannot open shared object file",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the wheel mismatch cause and its plan name the X.Y release, not the major version")]
+async fn assert_wheel_mismatch_cause_names_the_release(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // The symptom alone raises this cause on every OS it is scoped to, whatever
+    // the host's own ROCm, so every lane sees the block. Text only: the
+    // comparison it describes is held by
+    // `the_wheel_mismatch_compares_the_x_y_release_and_says_so` in
+    // crates/rocm-core/src/diagnose/host.rs.
+    let block = cause_block(output, "fix-8-wheel-rocm");
+    assert!(
+        !block.is_empty(),
+        "no `fix-8-wheel-rocm` cause was reported:\n{output}"
+    );
+    // Only the title and the plan: they are what describe the comparison, and
+    // another line of the block may say "major" about something else.
+    let header = block[0];
+    assert!(
+        header.contains("X.Y release") && !header.contains("major"),
+        "the cause's title must name the X.Y release: {header}"
+    );
+    let plan = block
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("plan:"))
+        .unwrap_or_else(|| panic!("the cause printed no plan:\n{}", block.join("\n")));
+    assert!(
+        plan.contains("X.Y release") && !plan.contains("major"),
+        "the plan must name the X.Y release: {plan}"
+    );
 }
 
 #[given("a Linux machine whose shell has a GPU override set")]
@@ -4101,5 +4907,189 @@ async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
         reported,
         super::examine_steps::expected_leading_version(reference),
         "the report's cli_version does not follow from the ref ({first_line})"
+    );
+}
+
+// ── Which causes the pasted error contributed to (diagnose-62/-63/-64) ─────
+
+/// The entry an unneeded GPU override in the environment raises. It reads the
+/// environment and a page-fault paste, never an ISA error.
+const ENV_MISCONFIG_FIX_ID: &str = "fix-2-unset-override";
+
+/// The entry [`KNOWN_SYMPTOM`] scores. No host state scores it on its own.
+const PASTE_FIX_ID: &str = "fix-1-arch";
+
+#[given("a machine with a known misconfiguration in its environment")]
+async fn machine_with_env_misconfiguration(world: &mut E2eWorld) {
+    // `rocm diagnose` examines its own environment, so setting the override on
+    // the CLI child is the whole setup, on every platform the entry covers.
+    world
+        .command_env
+        .push(("HSA_OVERRIDE_GFX_VERSION", "11.0.0".into()));
+}
+
+#[given("a pasted error that describes a different failure")]
+async fn pasted_error_for_a_different_failure(world: &mut E2eWorld) {
+    world.model_name = Some(KNOWN_SYMPTOM.to_owned());
+}
+
+/// Run `rocm diagnose` with `paste` as the symptom, or with no `--symptom` at
+/// all when it is `None`.
+fn run_diagnose(world: &mut E2eWorld, paste: Option<&str>, json: bool) {
+    let mut args = vec!["diagnose", "--top", "50"];
+    if let Some(paste) = paste {
+        args.extend(["--symptom", paste]);
+    }
+    if json {
+        args.push("--json");
+    }
+    // The planted host holds for the whole scenario, and diagnose-64 asks
+    // twice, but running a command consumes the scenario environment. Put it
+    // back so the second run examines the same host as the first.
+    let host_env = world.command_env.clone();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    world.command_env = host_env;
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn diagnose_with_paste(world: &mut E2eWorld, json: bool) {
+    let paste = world.model_name.clone().expect("no paste set");
+    run_diagnose(world, Some(&paste), json);
+}
+
+#[when("the user asks for a diagnosis with that paste, in machine-readable form")]
+async fn user_diagnoses_paste_json(world: &mut E2eWorld) {
+    diagnose_with_paste(world, true);
+}
+
+#[when("the user asks for a diagnosis with that paste")]
+async fn user_diagnoses_paste_text(world: &mut E2eWorld) {
+    diagnose_with_paste(world, false);
+}
+
+#[when("the user asks for a diagnosis without pasting an error, in machine-readable form")]
+async fn user_diagnoses_without_paste_json(world: &mut E2eWorld) {
+    run_diagnose(world, None, true);
+}
+
+#[when("the user asks for a diagnosis without pasting an error")]
+async fn user_diagnoses_without_paste_text(world: &mut E2eWorld) {
+    run_diagnose(world, None, false);
+}
+
+/// The listed causes of the JSON report, each as `(id, symptom_matched)`,
+/// failing the step when the run failed or any entry lacks a boolean field.
+fn symptom_matched_by_id(world: &E2eWorld) -> Vec<(String, bool)> {
+    let stdout = world.cli_output.as_deref().expect("no diagnose output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose failed:\n{stdout}\n{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("diagnose --json is not JSON ({e}):\n{stdout}"));
+    let matched = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `matched` list:\n{report:#}"));
+    matched
+        .iter()
+        .map(|d| {
+            let flag = d["symptom_matched"].as_bool().unwrap_or_else(|| {
+                panic!("every listed cause says whether the paste contributed to it:\n{d:#}")
+            });
+            (d["id"].as_str().unwrap_or_default().to_owned(), flag)
+        })
+        .collect()
+}
+
+/// `symptom_matched` of the entry `id`, failing the step when it is not listed.
+fn symptom_matched_of(world: &E2eWorld, id: &str) -> bool {
+    let listed = symptom_matched_by_id(world);
+    listed
+        .iter()
+        .find(|(listed_id, _)| listed_id == id)
+        .map_or_else(
+            || panic!("{id} was not listed: {listed:?}"),
+            |(_, flag)| *flag,
+        )
+}
+
+#[then("the paste is reported as not contributing to the misconfiguration on the machine")]
+async fn assert_paste_did_not_contribute_to_env_misconfig(world: &mut E2eWorld) {
+    assert!(
+        !symptom_matched_of(world, ENV_MISCONFIG_FIX_ID),
+        "{ENV_MISCONFIG_FIX_ID} comes from the environment alone, so the paste must not \
+         be credited with it"
+    );
+}
+
+#[then("the paste is reported as contributing to the cause it describes")]
+async fn assert_paste_contributed_to_its_cause(world: &mut E2eWorld) {
+    assert!(
+        symptom_matched_of(world, PASTE_FIX_ID),
+        "{PASTE_FIX_ID} is scored from the paste, so the paste must be credited with it"
+    );
+}
+
+#[then("every listed cause is reported as not contributed to by a paste")]
+async fn assert_no_cause_credited_without_a_paste(world: &mut E2eWorld) {
+    let listed = symptom_matched_by_id(world);
+    assert!(
+        listed.iter().any(|(id, _)| id == ENV_MISCONFIG_FIX_ID),
+        "the planted misconfiguration must be listed, or this asserts nothing: {listed:?}"
+    );
+    assert!(
+        listed.iter().all(|(_, flag)| !flag),
+        "nothing was pasted, so no cause may be credited to a paste: {listed:?}"
+    );
+}
+
+#[then("the misconfiguration on the machine is marked as found from the host alone")]
+async fn assert_env_misconfig_marked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "diagnose failed:\n{output}");
+    let block = cause_block(output, ENV_MISCONFIG_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "{ENV_MISCONFIG_FIX_ID} was not reported:\n{output}"
+    );
+    assert!(
+        block
+            .iter()
+            .any(|line| line.trim() == SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+        "the cause the paste did not contribute to must say so:\n{output}"
+    );
+}
+
+#[then("the cause the pasted error describes carries no such mark")]
+async fn assert_paste_cause_unmarked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    let block = cause_block(output, PASTE_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "{PASTE_FIX_ID} was not reported:\n{output}"
+    );
+    assert!(
+        !block
+            .iter()
+            .any(|line| line.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE)),
+        "the cause the paste contributed to must not be marked as found without it:\n{output}"
+    );
+}
+
+#[then("no listed cause is marked as found from the host alone")]
+async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "diagnose failed:\n{output}");
+    assert!(
+        !cause_block(output, ENV_MISCONFIG_FIX_ID).is_empty(),
+        "the planted misconfiguration must be reported, or this asserts nothing:\n{output}"
+    );
+    assert!(
+        !output.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+        "with nothing pasted the mark would sit on every cause and say nothing:\n{output}"
     );
 }

@@ -182,6 +182,12 @@ pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
     }
 }
 
+/// Request termination of `pid`: `SIGTERM` on Unix, `TerminateProcess` on Windows.
+///
+/// It neither waits for the process to exit nor escalates, so on Unix a process
+/// that ignores `SIGTERM` keeps running, and a `wait` on it afterwards can block
+/// forever. To stop a process and know it is gone, use
+/// [`crate::terminate_verified`].
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 pub fn terminate_process(pid: u32) -> Result<()> {
@@ -207,6 +213,12 @@ pub fn terminate_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Request termination of `pid`: `SIGTERM` on Unix, `TerminateProcess` on Windows.
+///
+/// It neither waits for the process to exit nor escalates, so on Unix a process
+/// that ignores `SIGTERM` keeps running, and a `wait` on it afterwards can block
+/// forever. To stop a process and know it is gone, use
+/// [`crate::terminate_verified`].
 #[cfg(not(windows))]
 #[allow(unsafe_code)] // libc FFI
 pub fn terminate_process(pid: u32) -> Result<()> {
@@ -226,6 +238,11 @@ pub fn terminate_process(pid: u32) -> Result<()> {
 /// launcher PID leaves those workers reparented to init, where they keep the
 /// model resident and the device memory pinned. Walking the descendant tree and
 /// signalling each process avoids that leak.
+///
+/// Like [`terminate_process`], this only sends the request: it does not wait
+/// for the processes to exit and does not escalate to `SIGKILL`. Use
+/// [`crate::terminate_verified`] with [`crate::KillScope::Tree`] to stop a tree
+/// and know it is gone.
 #[cfg(not(windows))]
 #[allow(unsafe_code)] // libc FFI
 pub fn terminate_process_tree(pid: u32) -> Result<()> {
@@ -348,7 +365,8 @@ fn read_parent_pid(pid: u32) -> Option<u32> {
 /// Terminate `pid` together with every transitive child process.
 ///
 /// The Windows implementation falls back to terminating the single process; the
-/// engines that rely on descendant cleanup are Unix-only.
+/// engines that rely on descendant cleanup are Unix-only. It does not wait for
+/// the process to exit; see [`crate::terminate_verified`].
 #[cfg(windows)]
 pub fn terminate_process_tree(pid: u32) -> Result<()> {
     terminate_process(pid)

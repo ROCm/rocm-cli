@@ -142,7 +142,7 @@ fn label_for_root_report(dir: &Path) -> String {
 
 /// Strips the literal `${{ matrix.channel }}` template segment a channel
 /// matrix inserts into its artifact names — nightly's six GPU lanes and, per
-/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s per-PR `[release, nightly]` leg — so
+/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s `[release, nightly]` leg — so
 /// a name like `e2e-gpu-${{ matrix.channel }}-report` compares as its
 /// canonical `e2e-gpu-report` base. This scan is text-based over the raw
 /// workflow source and does not simulate matrix expansion, so the template
@@ -202,13 +202,12 @@ mod tests {
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
         "e2e-gpu-report",
+        "e2e-gpu-selfhosted-report",
         "e2e-gpu-n-1-report",
         "e2e-gpu-n-2-report",
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
         "e2e-gpu-w7900-report",
-        "e2e-gpu-w7900-n-1-report",
-        "e2e-gpu-w7900-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-ubuntu-n-1-report",
         "e2e-gpu-strix-ubuntu-n-2-report",
@@ -301,7 +300,10 @@ mod tests {
             // its own breadth-over-versions tradeoff -- so strip the `-n-1`/
             // `-n-2` legs before comparing; the `current` leg's name is
             // unaffected by the matrix and must still match nightly's.
-            for suffix in ["-n-1-report", "-n-2-report"] {
+            // `-selfhosted` is the same MI300X silicon on a self-hosted runner,
+            // beside the queue's `e2e-gpu-report` on a pull request; nightly
+            // runs the one MI300X lane under that base name.
+            for suffix in ["-n-1-report", "-n-2-report", "-selfhosted-report"] {
                 for name in &mut names {
                     if let Some(rest) = name.strip_suffix(suffix) {
                         *name = format!("{rest}-report");

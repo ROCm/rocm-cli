@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::{
     Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
@@ -90,7 +90,11 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             || (is_held(&inst.ttft_observation) && inst.ttft_ms.is_some_and(f64::is_finite))
             || (is_held(&inst.tpot_observation) && inst.tpot_ms.is_some_and(f64::is_finite))
     });
-    let (table_area, legend_area) = if any_held {
+    let any_last_req = instances
+        .iter()
+        .take(visible_rows)
+        .any(|inst| inst.gen_tps_last_request && inst.gen_tps.is_some_and(f64::is_finite));
+    let (table_area, legend_area) = if any_held || any_last_req {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -113,8 +117,12 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rows = instances.iter().enumerate().map(|(i, inst)| {
         let model = trunc(&inst.model_name, 22);
         let tps = format::gen_tps_cell(inst.gen_tps, inst.gen_tps_observation.as_ref());
-        let tpw =
-            format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref());
+        // A last-request rate has no efficiency to show: the figure beside it
+        // is idle board power over a finished request, not a current rate.
+        let tpw = format::tokens_per_watt_cell(
+            inst.live_tokens_per_watt(),
+            inst.gen_tps_observation.as_ref(),
+        );
         let ttft = format::latency_cell(inst.ttft_ms, inst.ttft_observation.as_ref());
         let tpot = format::latency_cell(inst.tpot_ms, inst.tpot_observation.as_ref());
         let power = inst
@@ -171,7 +179,13 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if let Some(legend_area) = legend_area {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format::HELD_LEGEND,
+                match (any_held, any_last_req) {
+                    (true, true) => {
+                        format!("{}  ·  {}", format::HELD_LEGEND, format::LAST_REQ_LEGEND)
+                    }
+                    (true, false) => format::HELD_LEGEND.to_owned(),
+                    _ => format::LAST_REQ_LEGEND.to_owned(),
+                },
                 Style::default().fg(theme.muted),
             ))),
             legend_area,
@@ -179,13 +193,16 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 }
 
-/// Sort instances deterministically by container_name so that an index from
-/// AppState always maps to the same row in the table.
+/// Sort instances deterministically by container_name, then container_id, so
+/// that an index from AppState always maps to the same row in the table. The id
+/// matters: every external Lemonade model shares the name `lemonade`.
 pub(in crate::ui) fn sorted_instances(
     instances: &std::collections::HashMap<String, Instance>,
 ) -> Vec<&Instance> {
     let mut v: Vec<&Instance> = instances.values().collect();
-    v.sort_by(|a, b| a.container_name.cmp(&b.container_name));
+    v.sort_by(|a, b| {
+        (&a.container_name, &a.container_id).cmp(&(&b.container_name, &b.container_id))
+    });
     v
 }
 
@@ -206,20 +223,34 @@ pub(in crate::ui) const fn status_meta(
 
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let body = if state.conn.is_in_process() {
-        "no instance registry on this platform · vLLM containers aren't available here"
+        "no managed services running · serve one from 3 Serving · vLLM containers aren't available here"
     } else {
         match &state.conn {
             ConnState::Connected { .. } => {
-                "no instances · start daemon with --enable-docker on a host with vLLM containers"
+                "no serving models discovered · open Serving to launch a managed model or check an external endpoint"
             }
             _ => "waiting for daemon…",
         }
     };
     let inner = panel::bento(f, area, Some("Instances"), BoxRole::Neutral, false, theme);
+    // Wrapped, not one clipped line. An unwrapped `Paragraph` truncates at the
+    // panel's right edge rather than wrapping, and the longer branches here
+    // outrun the columns an 80-column terminal leaves usable inside this
+    // border: the in-process one (94 chars) stopped dead at
+    // "· vLLM containers ar", and the `Connected` one (99) runs well past the
+    // same cliff, losing the half that names the external-endpoint path. The
+    // narrower the pane, the more of the remedy goes too.
+    // `Wrap { trim: false }` is what every other prose paragraph in this UI
+    // uses (`ui/tabs/pane.rs`, `ui/tabs/hardware.rs`, `ui/help_modal.rs`,
+    // `ui/warnings_modal.rs`, `ui/approval.rs`), so the empty state now
+    // behaves like the rest of them; shortening the string instead would have
+    // had to drop either the remedy or the vLLM explanation, and would only
+    // move the width at which the clipping returns.
     let p = Paragraph::new(Line::from(Span::styled(
         body,
         Style::default().fg(theme.muted),
-    )));
+    )))
+    .wrap(Wrap { trim: false });
     f.render_widget(p, inner);
 }
 
@@ -230,6 +261,7 @@ pub(in crate::ui) mod tests {
 
     pub(in crate::ui) fn mk_inst(name: &str) -> Instance {
         Instance {
+            managed: false,
             container_id: format!("id-{name}"),
             container_name: name.to_string(),
             status: InstanceStatus::Running,
@@ -246,6 +278,7 @@ pub(in crate::ui) mod tests {
             waiting_reqs: None,
             gen_tps: None,
             gen_tps_observation: None,
+            gen_tps_last_request: false,
             tokens_per_watt: None,
             power_w: None,
             ttft_ms: None,
@@ -273,25 +306,68 @@ pub(in crate::ui) mod tests {
         use ratatui::backend::TestBackend;
 
         // The Windows in-process collector (see `ConnState::is_in_process`)
-        // has no instance registry at all, ever — distinct from "a real
-        // daemon is connected but nothing is running" or "still connecting".
+        // has no daemon: its instances come only from the managed-service
+        // registry, so an empty list means nothing is served — distinct from
+        // "a real daemon is connected but nothing is running" or "still
+        // connecting".
         let mut state = mk_state(HashMap::new(), 0);
         state.conn = ConnState::Connected {
             host: "localhost".into(),
             version: ConnState::in_process_version("0.0.0"),
         };
+        // 80 columns — a realistic terminal, the same width
+        // `ui/tabs/mod.rs`'s panel test uses — NOT a width picked to make the
+        // assertion pass. The message is 94 chars and the panel's border and
+        // padding narrow that further, so at 80 columns it survives only
+        // because `draw_empty` wraps: unwrapped, the render stops dead at
+        // "· vLLM containers ar" and the user is never told why the vLLM
+        // containers they are looking for cannot appear here.
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
             .unwrap();
         let grid = buffer_text(&term);
+        // Asserted whole, tab digit included. `ActiveTab::from_digit` maps '3'
+        // to Serving today; a tab reorder that left this line behind would send
+        // the user to the wrong tab, and nothing else here would catch it.
+        // Read back through `flatten_wrapped_prose` because the message now
+        // occupies more than one row: asserting only the first row's worth
+        // would be the same mistake as widening the backend.
+        let flat = flatten_wrapped_prose(&grid);
         assert!(
-            grid.contains("no instance registry on this platform"),
-            "should name the platform limitation, not claim a daemon could be started; got:\n{grid}"
+            flat.contains(
+                "no managed services running · serve one from 3 Serving · vLLM containers aren't available here"
+            ),
+            "should say nothing is served AND where to serve one from instead, not claim a daemon could be started; got:\n{grid}"
         );
         assert!(
             !grid.contains("start daemon"),
             "must not suggest starting a daemon that doesn't exist on this platform; got:\n{grid}"
         );
+    }
+
+    /// Read a rendered panel back as the one sentence the user reads.
+    ///
+    /// A wrapped `Paragraph` lays its prose across several buffer rows, each
+    /// padded to the terminal's width and fenced by the panel's box-drawing
+    /// border. Treating every border glyph and every run of blanks as a single
+    /// space rejoins the rows at exactly the single spaces the source string
+    /// had, so a wrapped message can still be asserted verbatim — and a
+    /// *clipped* one still cannot, because the clipped characters are simply
+    /// not in the buffer to rejoin. Only U+2500–U+257F (box drawing) is
+    /// blanked, so the message's own `·` (U+00B7) survives.
+    fn flatten_wrapped_prose(grid: &str) -> String {
+        grid.chars()
+            .map(|c| {
+                if matches!(u32::from(c), 0x2500..=0x257F) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -339,6 +415,28 @@ pub(in crate::ui) mod tests {
         );
     }
 
+    /// Every external Lemonade model on an endpoint shares the container name
+    /// `lemonade`, so the name alone leaves their order to the map's hash order,
+    /// and the selection index would land on a different model from one frame
+    /// to the next. The id breaks the tie.
+    #[test]
+    fn sorted_instances_breaks_a_name_tie_by_id() {
+        for _ in 0..32 {
+            // A fresh map each pass: each one gets its own hash seed.
+            let mut m = HashMap::new();
+            for id in ["lemonade-m-c", "lemonade-m-a", "lemonade-m-b"] {
+                let mut inst = mk_inst("lemonade");
+                inst.container_id = id.into();
+                m.insert(inst.container_id.clone(), inst);
+            }
+            let ids: Vec<&str> = sorted_instances(&m)
+                .iter()
+                .map(|i| i.container_id.as_str())
+                .collect();
+            assert_eq!(ids, ["lemonade-m-a", "lemonade-m-b", "lemonade-m-c"]);
+        }
+    }
+
     #[test]
     fn selected_instance_lookup_by_sorted_index() {
         // HashMap insertion order is irrelevant — sorted_instances orders by name.
@@ -357,6 +455,7 @@ pub(in crate::ui) mod tests {
             services_past_attempts: 0,
             managed_registry_probe: None,
             launcher_hosted: false,
+            lemonade_managed_installed: None,
             connect: "test".into(),
             conn: ConnState::Initial,
             latest: None,
@@ -977,5 +1076,128 @@ pub(in crate::ui) mod tests {
             out.contains("0 ") || out.contains("0\n") || out.contains("0*"),
             "zero gen_tps must render as '0', not '—'; got:\n{out}"
         );
+    }
+
+    pub(in crate::ui) fn last_req_inst(name: &str, last_request: bool) -> Instance {
+        let mut inst = mk_inst_obs(name, Some(37.5), Some(obs(ObservationFreshness::Fresh, 0)));
+        inst.gen_tps_last_request = last_request;
+        inst
+    }
+
+    #[test]
+    fn table_labels_a_last_request_rate_and_only_then() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (last_request, expect_legend) in [(true, true), (false, false)] {
+            let state = state_with_snap(last_req_inst("rate", last_request));
+            let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+                .unwrap();
+            let out = buffer_text(&term);
+            assert!(out.contains("38"), "the value itself still shows:\n{out}");
+            assert_eq!(
+                out.contains(format::LAST_REQ_LEGEND),
+                expect_legend,
+                "last_request={last_request}:\n{out}"
+            );
+        }
+    }
+
+    /// The legend explains a rate that is on screen: a last-request flag on a row
+    /// with no finite rate has nothing to explain.
+    #[test]
+    fn table_has_no_last_request_legend_without_a_rate_to_explain() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for gen_tps in [None, Some(f64::NAN)] {
+            let mut inst = last_req_inst("rate", true);
+            inst.gen_tps = gen_tps;
+            let state = state_with_snap(inst);
+            let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+                .unwrap();
+            let out = buffer_text(&term);
+            assert!(
+                !out.contains(format::LAST_REQ_LEGEND),
+                "gen_tps={gen_tps:?}:
+{out}"
+            );
+        }
+    }
+
+    /// A held rate that is also a last-request rate shows both legends, joined.
+    #[test]
+    fn table_shows_the_held_and_last_request_legends_together() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "both",
+            Some(37.5),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.gen_tps_last_request = true;
+        let state = state_with_snap(inst);
+        // 80 columns is the width that matters: the joined legend must fit.
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        let both = format!("{}  ·  {}", format::HELD_LEGEND, format::LAST_REQ_LEGEND);
+        assert!(out.contains(&both), "{out}");
+    }
+
+    /// The legend wording is what the user reads (and what the e2e screen
+    /// scenario looks for): it must name Lemonade and the last-request rate.
+    #[test]
+    fn the_last_request_legend_names_what_it_explains() {
+        assert_eq!(
+            format::LAST_REQ_LEGEND,
+            "Lemonade: last req tok/s, not live"
+        );
+    }
+
+    /// An efficiency derived from a last-request rate is not shown on the row,
+    /// whether or not the rate itself is (replayed recordings can carry one).
+    #[test]
+    fn table_leaves_out_an_efficiency_derived_from_a_last_request_rate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for gen_tps in [Some(37.5), None] {
+            let mut inst = last_req_inst("rate", true);
+            inst.gen_tps = gen_tps;
+            inst.tokens_per_watt = Some(0.12);
+            let state = state_with_snap(inst);
+            let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+                .unwrap();
+            let out = buffer_text(&term);
+            assert!(
+                !out.contains("0.12"),
+                "gen_tps={gen_tps:?}:
+{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connected_empty_state_names_the_external_endpoint_path_at_80_columns() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = mk_state(HashMap::new(), 0);
+        state.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "0.0.0".into(),
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let grid = buffer_text(&term);
+        assert!(grid.contains("external"), "{grid}");
+        assert!(grid.contains("endpoint"), "{grid}");
     }
 }

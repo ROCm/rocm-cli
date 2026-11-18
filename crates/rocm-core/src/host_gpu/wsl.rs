@@ -193,7 +193,7 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 /// Deliberately not routed through [`host_path`]: these are programs this
 /// process executes, not files it reads to describe the machine, and a
 /// simulated host root holds no working linker to run.
-pub(crate) fn ldconfig_cache() -> Option<String> {
+pub fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
         if let Some(text) = capture_optional_command(program, &["-p"]) {
             return Some(text);
@@ -258,7 +258,8 @@ fn librocdxg_on_loader_path(ld_library_path: Option<&str>, exists: impl Fn(&Path
 /// a `libhsa-runtime64`.
 ///
 /// The runtime opens `librocdxg.so` by name, and TheRock builds it with
-/// `RUNPATH $ORIGIN`, so the loader looks in the runtime's own directory before it
+/// an `$ORIGIN` search path (a `DT_RPATH` in the wheel runtimes' `libhsa-runtime64`,
+/// per `readelf -d`), so the loader looks in the runtime's own directory before it
 /// asks the linker cache or `LD_LIBRARY_PATH`. A tarball under
 /// `/opt/rocm-<version>` keeps the two side by side and registers neither, which
 /// is why a working install read as missing while those were the only sources

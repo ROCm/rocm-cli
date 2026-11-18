@@ -1,4 +1,4 @@
-# Ruff configuration for the Python helper scripts (scripts/) and engine workers.
+# Ruff configuration for every Python file in the repository.
 # Formatting uses Ruff's defaults (88-column, double quotes), which the
 # `ruff-format` pre-commit hook enforces.
 
@@ -15,7 +15,44 @@ select = [
     "SIM", # flake8-simplify
     "C4",  # flake8-comprehensions
     "RUF", # Ruff-specific rules
+    "ARG", # flake8-unused-arguments
+    "BLE", # flake8-blind-except
+    "SLF", # flake8-self (private-member access)
+    "PL",  # Pylint (PLC/PLE/PLR/PLW)
 ]
 ignore = [
     "E501", # line length is enforced by the formatter; long comments/URLs are fine
+    #
+    # Pylint refactor metrics, ignored for every file: acting on them means
+    # restructuring existing scripts, which enabling the rule families does not do.
+    "PLR0912", # too-many-branches
+    "PLR0913", # too-many-arguments
+    "PLR0915", # too-many-statements
+    #
+    # Not a refactor metric: it flags inline numeric literals in comparisons, and
+    # replacing them with named constants is a separate cleanup.
+    "PLR2004", # magic-value-comparison
 ]
+
+[lint.per-file-ignores]
+# A waived rule checks nothing anywhere in that file, so new code in these files
+# is reviewed by hand against the rule stated on the entry.
+#
+# A blind `except` must report the failure, fall back, or keep the error for a
+# later message.
+"scripts/comfyui_therock_gpu_test.py" = ["BLE001"] # blind-except
+"scripts/therock_sdk_install_test.py" = ["BLE001"] # blind-except
+"scripts/vllm_therock_gpu_test.py" = ["BLE001"]    # blind-except
+# Function-level imports belong to the self-test only; a module global rebound
+# here is restored in a `finally`.
+"scripts/vllm_route_check.py" = ["PLC0415", "PLW0603"] # import-outside-top-level + global-statement
+# The skills/rocm-doctor/ entries stay waived rather than edited: a change there on
+# main opens a "Bump rocm-doctor" pull request in amd/skills through its nightly
+# workflow (see the `skills/rocm-doctor/` part of AGENTS.md).
+#
+# ARG001 covers only the unused `workspace` and `case` parameters of setup() and
+# teardown(); any other unused argument in the file is removed. `_active` is the
+# only module global the hooks rebind.
+"skills/rocm-doctor/evals/hooks.py" = ["ARG001", "PLW0603"] # unused-function-argument + global-statement
+# A `subprocess.run` here has its returncode asserted by the test.
+"skills/rocm-doctor/evals/test_hooks.py" = ["PLW1510"] # subprocess-run-without-check

@@ -11,8 +11,9 @@
 //! crate root by `lib.rs`.
 
 use super::{
-    CellOutcome, Grid, LEGEND_ENTRIES, MOCK_GATES_PR, OTHER_LANES_NON_BLOCKING, PlatformReports,
-    ScenarioReference, platform_cell,
+    CellOutcome, Grid, LEGEND_ENTRIES, MOCK_GATES_PR, OTHER_LANES_NON_BLOCKING,
+    PLATFORM_ATTENTION_HEADING, PlatformReports, SCENARIO_ATTENTION_HEADING, ScenarioReference,
+    platform_cell,
 };
 use crate::command_coverage::command_coverage_markdown;
 
@@ -113,13 +114,26 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
          reproduces); **Skip** = not applicable on this platform (e.g. a GPU-only \
          scenario on Mock); **Fail** = unexpected — a scenario that should pass but \
          failed, or a known bug that unexpectedly passed (its tag is now stale). \
-         **Status** is PASS unless a platform has any Fail.\n",
+         **Status** is PASS unless a platform has any Fail, or the harness failed \
+         its lane check after the run (listed under {PLATFORM_ATTENTION_HEADING}).\n",
     );
 
-    // Call out anything that needs a human: XPASS (fixed bug, stale tag) and
+    // Call out anything that needs a human: a failed post-run lane check
+    // (`lane_failure` in platform.json), XPASS (fixed bug, stale tag) and
     // untagged failures in a known-bugs run.
     let mut notes = Vec::new();
     for r in reports {
+        if let Some(reason) = r.lane_failure() {
+            // Written by the harness's `finish_run` from `post_run_verdict`'s
+            // fixed strings, so not escaped; folded onto the bullet's line.
+            // Carrying a pre-run reason (which quotes probe stderr) into the
+            // report would need escaping here.
+            notes.push(format!(
+                "- **Lane check failed** in _{}_: {}",
+                r.label,
+                reason.split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
+        }
         for name in &r.xfail.xpass {
             notes.push(format!(
                 "- **XPASS** in _{}_: `{}` is tagged `@expected-failure` but passed — remove the tag.",
@@ -136,7 +150,7 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
         }
     }
     if !notes.is_empty() {
-        out.push_str("\n### Needs attention\n\n");
+        let _ = write!(out, "\n### {PLATFORM_ATTENTION_HEADING}\n\n");
         for n in notes {
             out.push_str(&n);
             out.push('\n');
@@ -244,7 +258,7 @@ fn expectation_grid_markdown(grid: &Grid, scenarios: &ScenarioReference) -> Stri
     // Needs-attention list from reconciliation problems.
     let problems = grid.problems();
     if !problems.is_empty() {
-        out.push_str("\n### Needs attention\n\n");
+        let _ = write!(out, "\n### {SCENARIO_ATTENTION_HEADING}\n\n");
         for (platform_label, id, outcome, detail) in problems {
             let bug = detail
                 .and_then(|d| d.bug.as_deref())
@@ -360,12 +374,14 @@ mod tests {
             b.path().to_path_buf(),
         )];
         let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
-        assert!(md.contains("Needs attention"));
-        assert!(md.contains("XPASS"));
+        assert!(
+            md.contains("\n### Needs attention: platforms\n\n- **XPASS** in _"),
+            "the XPASS bullet must sit directly under the platform attention heading:\n{md}"
+        );
     }
 
     #[test]
-    fn summary_explanation_paragraphs_are_unchanged() {
+    fn summary_explanation_paragraphs_are_pinned() {
         // Pins the explanatory text under the summary table byte for byte, so
         // building it from shared fragments (see `MOCK_GATES_PR`) cannot
         // change a character of what the step summary shows. This pins the text
@@ -394,7 +410,12 @@ mod tests {
              reproduces); **Skip** = not applicable on this platform (e.g. a GPU-only \
              scenario on Mock); **Fail** = unexpected — a scenario that should pass but \
              failed, or a known bug that unexpectedly passed (its tag is now stale). \
-             **Status** is PASS unless a platform has any Fail.\n";
+             **Status** is PASS unless a platform has any Fail, or the harness failed \
+             its lane check after the run (listed under Needs attention: platforms).\n";
+        // Pins the wording only. That a lane-check failure turns Status FAIL and
+        // is listed under "Needs attention: platforms" is proved by
+        // `consolidated::tests::an_all_skip_lane_the_harness_failed_reads_fail_with_its_reason`
+        // and `consolidated::tests::a_recorded_lane_failure_is_named_in_the_summary_and_the_html`.
         assert!(
             md.contains(expected),
             "summary explanation text changed:\n{md}"
@@ -409,6 +430,10 @@ mod tests {
         assert!(
             md.contains(OTHER_LANES_NON_BLOCKING),
             "summary must render OTHER_LANES_NON_BLOCKING ({OTHER_LANES_NON_BLOCKING:?}):\n{md}"
+        );
+        assert!(
+            md.contains(&format!("(listed under {PLATFORM_ATTENTION_HEADING})")),
+            "summary must render PLATFORM_ATTENTION_HEADING ({PLATFORM_ATTENTION_HEADING:?}):\n{md}"
         );
     }
 
@@ -778,7 +803,7 @@ mod tests {
         let platform = r#"{
             "platform_slug": "mi300x",
             "capability": {"effective_serve_engine": "vllm"},
-            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"11.5.1"},
+            "versions": {"os":"Ubuntu 24.04.3 LTS","rocm":"7.13.0","vllm":"0.23.0+rocm723","lemonade":"2026.44.1"},
             "expectations": [
                 {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
             ]
@@ -790,7 +815,7 @@ mod tests {
             "Ubuntu 24.04.3 LTS",
             "ROCm 7.13.0",
             "vLLM 0.23.0+rocm723",
-            "lemonade 11.5.1",
+            "lemonade 2026.44.1",
         ] {
             assert!(md.contains(token), "matrix cell missing {token:?}:\n{md}");
         }

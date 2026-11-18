@@ -11,8 +11,10 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Compiles `fake_engine`, a stand-in engine child for tests, into the `rocm` and
-# `rocmd` test builds. Never enabled in a release build.
+# Compiles the test-only modules into the test builds that turn it on (`rocm`,
+# `rocmd`, and the `lemonade`, `vllm` and `aim` engines): `fake_engine`, a
+# stand-in engine child (Unix only), and `engine_contract`, the shared engine
+# protocol contract check. Never enabled in a release build.
 test-support = []
 
 [dependencies]
@@ -22,6 +24,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The leftover a killed owner-only key store leaves, for the tests of the
+# cleanups that remove it (`atomic_write::stage_owner_only_file_unpublished`).
+rocm-core = { path = "../rocm-core", features = ["test-support"] }
 # Property tests for the engine protocol decoders (`tests/protocol_properties.rs`).
 proptest = { version = "1", default-features = false, features = ["std"] }
 

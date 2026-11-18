@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::runtime::{
     VllmRuntime, ensure_therock_compat_shims, runtime_bin_paths, runtime_has_discover_build,
-    therock_library_path_entries_for_launch,
+    therock_library_path_entries, therock_library_path_entries_for_launch,
 };
 use crate::startup_diagnostics::startup_log_context;
 use crate::{ServeHttpRequest, engine_recipe_launch_args};
@@ -127,6 +127,78 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     })
 }
 
+/// Tear down a server that never became ready: stop its process tree, reap it,
+/// and record the service as `failed`. A state file that cannot be written is
+/// reported on stderr rather than returned, so the readiness failure stays the
+/// error the caller reports.
+///
+/// A server still held unreaped is stopped with [`stop_spawned_server`] and
+/// [`STOP_GRACE`]. When that stop is not confirmed, the reason is written to
+/// stderr and the server is killed (`SIGKILL`): this process owns it and has not
+/// reaped it, so its PID cannot belong to anyone else. That kill is what bounds
+/// the wait after an `Unverified` stop, which signals nothing. The wait that
+/// follows is therefore bounded on every path but one: a server that survives
+/// `SIGKILL`, such as one in uninterruptible sleep in the kernel, is waited on
+/// until it leaves that state. A process under a server whose stop was not
+/// confirmed is not reached by the kill.
+///
+/// The readiness poll may already have reaped the server, because it exited
+/// before becoming ready. Its PID may then belong to an unrelated process, so
+/// nothing is signalled, and any worker it left running is not reached either:
+/// a reaped process can no longer be walked for its children.
+fn fail_unready_server(child: &mut std::process::Child, state_path: &Path) {
+    fail_unready_server_with(child, state_path, |pid| {
+        stop_spawned_server(pid, STOP_GRACE)
+    });
+}
+
+/// [`fail_unready_server`] with the stop supplied by the caller, so a test can
+/// drive an outcome a real process cannot be made to produce on demand.
+fn fail_unready_server_with(
+    child: &mut std::process::Child,
+    state_path: &Path,
+    stop: impl FnOnce(u32) -> rocm_core::TerminationOutcome,
+) {
+    let already_reaped = matches!(child.try_wait(), Ok(Some(_)));
+    if !already_reaped {
+        let outcome = stop(child.id());
+        if let Some(reason) = outcome.unconfirmed_reason() {
+            eprintln!(
+                "Warning: process {} was not confirmed stopped: {reason}. Killing it; processes under it are not reached by that kill.",
+                child.id()
+            );
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+    if let Err(error) = crate::state::write_terminal_state(state_path, "failed") {
+        eprintln!(
+            "Warning: could not record the vLLM service as failed in {}: {error:#}",
+            state_path.display()
+        );
+    }
+}
+
+/// Force-stop the server tree this process spawned and still holds as an
+/// unreaped child.
+///
+/// `SIGTERM` to the whole tree, then `SIGKILL` for whatever outlives `grace`, so
+/// the call returns within about twice `grace`. That alone does not bound a
+/// following `child.wait()`: an `Unverified` outcome means nothing was signalled,
+/// and a server that survives `SIGKILL` outlives the stop (`TimedOut`), so the
+/// caller handles both ([`fail_unready_server_with`]). The identity is captured
+/// here, which is safe only while the caller holds the unreaped child: until it
+/// is reaped its PID cannot be reused. [`fail_unready_server_with`] checks
+/// that before calling it.
+fn stop_spawned_server(pid: u32, grace: Duration) -> rocm_core::TerminationOutcome {
+    rocm_core::terminate_verified(
+        &rocm_core::ProcessIdentity::capture(pid),
+        STOP_SCOPE,
+        grace,
+        true,
+    )
+}
+
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
     let runtime = crate::runtime::resolve_vllm_runtime(request.runtime_id.as_deref())?;
@@ -143,10 +215,12 @@ pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         request.log_path.as_deref(),
     ) {
         // Terminate the whole vLLM process tree so the EngineCore worker (which
-        // holds the GPU allocation) does not survive and leak device memory.
-        let _ = rocm_core::terminate_process_tree(child.id());
-        let _ = child.wait();
-        crate::state::write_terminal_state(&request.state_path, "failed")?;
+        // holds the GPU allocation) does not survive and leak device memory, and
+        // escalate so a server ignoring SIGTERM is killed rather than waited on.
+        // The teardown still blocks on a server that survives SIGKILL, such as
+        // one in uninterruptible sleep in the kernel. A server that already
+        // exited is not signalled; see `fail_unready_server`.
+        fail_unready_server(&mut child, &request.state_path);
         return Err(e);
     }
 
@@ -176,6 +250,14 @@ fn spawn_vllm_server(
     if !matches!(request.device_policy, DevicePolicy::GpuRequired) {
         bail!("vLLM launch requires ROCm GPU execution; no CPU fallback is used");
     }
+
+    // Before the host-library checks below: a torch that cannot import because a
+    // library is missing reports nothing here, so those checks still give their
+    // own guidance, and a wheel that does not match its torch is named first. The
+    // gate probes with the launch's loader path, so it runs the shim step (which
+    // is idempotent) here, and a check below that then refuses the launch has
+    // already run it.
+    require_importable_extensions(runtime)?;
 
     // Fail fast when the OpenMPI runtime is missing. vLLM's ROCm torch wheel
     // dlopen()s the OpenMPI libraries during `import torch`; without them the
@@ -235,25 +317,19 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut command = ProcessCommand::new(&runtime.command);
-    command
-        .args(vllm_serve_args(
-            &request.model_ref,
-            &request.host,
-            request.port,
-            vllm_enforce_eager_enabled(),
-            request.engine_recipe.as_ref(),
-        ))
-        .stdin(Stdio::null());
-    // When `rocm serve` protects a public endpoint, the key arrives via the
-    // environment / key file (never argv). Hand it to vLLM as `VLLM_API_KEY` so
-    // its OpenAI server rejects unauthenticated requests; passing it through the
-    // env keeps it out of the process table.
-    if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
-        command.env("VLLM_API_KEY", api_key);
-    }
-    apply_therock_env(&mut command, runtime)?;
-    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
+    // When `rocm serve` protects an endpoint, the key arrives via the key file
+    // (never argv). It reaches vLLM through the environment, which keeps it out
+    // of the process table, and is enforced on every route by the middleware
+    // `endpoint_auth` installs: vLLM's own `VLLM_API_KEY` check alone leaves
+    // routes such as `/invocations` open.
+    let api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let mut command = vllm_server_command(
+        request,
+        runtime,
+        api_key.as_deref(),
+        || Ok(crate::endpoint_auth::module_dir(&AppPaths::discover()?)),
+        vllm_enforce_eager_enabled(),
+    )?;
     if let Some(log_path) = log_path {
         let log = fs::File::create(log_path)
             .with_context(|| format!("failed to create {}", log_path.display()))?;
@@ -273,6 +349,40 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             None => base,
         }
     })
+}
+/// The `vllm serve` command for `request`, short of where its output goes:
+/// argv, TheRock environment and GPU visibility, plus, with an `api_key`, the
+/// endpoint-key protection: the `--middleware` argument, `VLLM_API_KEY`, and
+/// the middleware module written to `module_dir()` and put at the front of
+/// `PYTHONPATH`. `--middleware` depends on the other two: vLLM has to import
+/// the module from `PYTHONPATH`, and the middleware refuses to construct
+/// without `VLLM_API_KEY`. So all three are built in one place and asserted
+/// together by one test. `module_dir` is consulted only for a keyed launch.
+fn vllm_server_command(
+    request: &ServeHttpRequest,
+    runtime: &VllmRuntime,
+    api_key: Option<&str>,
+    module_dir: impl FnOnce() -> Result<PathBuf>,
+    enforce_eager: bool,
+) -> Result<ProcessCommand> {
+    let mut command = ProcessCommand::new(&runtime.command);
+    command
+        .args(vllm_serve_args(
+            &request.model_ref,
+            &request.host,
+            request.port,
+            enforce_eager,
+            request.engine_recipe.as_ref(),
+            api_key.is_some(),
+        ))
+        .stdin(Stdio::null());
+    apply_therock_env(&mut command, runtime)?;
+    // After `apply_therock_env`, which may set its own `PYTHONPATH` entry.
+    if let Some(api_key) = api_key {
+        crate::endpoint_auth::protect_endpoint(&mut command, api_key, &module_dir()?)?;
+    }
+    rocm_engine_protocol::apply_gpu_visibility(&mut command, &request.gpu_indices);
+    Ok(command)
 }
 /// Explain a spawn that failed on a script whose `#!` interpreter is gone.
 ///
@@ -404,12 +514,31 @@ pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRunt
 /// Same as [`apply_therock_env`], with the `libmpi_cxx` probe
 /// [`ensure_therock_compat_shims`] takes injectable, so a test can exercise
 /// the whole "no shim needed" hand-off into `LD_LIBRARY_PATH` without
-/// depending on this host's own OpenMPI/compiler state. Production code
-/// always goes through [`apply_therock_env`].
+/// depending on this host's own OpenMPI/compiler state. The launch path always
+/// goes through [`apply_therock_env`]; the read-only form is
+/// [`apply_therock_env_read_only`].
 fn apply_therock_env_with(
     command: &mut ProcessCommand,
     runtime: &VllmRuntime,
     ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Result<()> {
+    apply_therock_env_using(command, runtime, |runtime| {
+        let compat_shim = ensure_therock_compat_shims(runtime, ensure_mpi_cxx_compat);
+        therock_library_path_entries_for_launch(runtime, compat_shim)
+    })
+}
+
+/// [`apply_therock_env`] for a caller that only reads: the same environment, but
+/// the compat-shim step (which writes a `libmpi_cxx` stub and removes a stale
+/// numa symlink) is not run, and the loader path is derived without it.
+fn apply_therock_env_read_only(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+    apply_therock_env_using(command, runtime, therock_library_path_entries)
+}
+
+fn apply_therock_env_using(
+    command: &mut ProcessCommand,
+    runtime: &VllmRuntime,
+    library_path_entries: impl FnOnce(&VllmRuntime) -> Vec<PathBuf>,
 ) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
     if runtime_has_discover_build(runtime) {
@@ -437,16 +566,151 @@ fn apply_therock_env_with(
         );
     }
     if !cfg!(windows) {
-        let compat_shim = ensure_therock_compat_shims(runtime, ensure_mpi_cxx_compat);
         command.env(
             "LD_LIBRARY_PATH",
             prepend_path_entries(
-                &therock_library_path_entries_for_launch(runtime, compat_shim),
+                &library_path_entries(runtime),
                 std::env::var_os("LD_LIBRARY_PATH"),
             )?,
         );
     }
     Ok(())
+}
+/// Imports vLLM's compiled extensions the way the server will (after torch, and
+/// in the serve gate in the server's own environment, see [`ProbeEnv`]).
+///
+/// `import torch` first: the extensions link against libtorch and fail to load
+/// without it, which would blame vLLM for a missing import order. A torch that
+/// does not import is a different failure with its own checks, so it reports
+/// nothing here instead of being charged to the extensions.
+const VLLM_EXTENSION_PROBE_SCRIPT: &str = r#"import importlib, json
+failures = []
+try:
+    import torch  # noqa: F401
+except Exception:
+    print(json.dumps({"failures": []}))
+    raise SystemExit(0)
+for name in ("vllm._C", "vllm._rocm_C", "vllm._C_stable_libtorch"):
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError as error:
+        # Only the extension itself being absent means it is not built into
+        # this wheel (`_rocm_C` on a non-ROCm build): vLLM carries on without
+        # it. A module the extension needs being missing is a broken install.
+        if error.name != name:
+            failures.append({"module": name, "error": str(error)[:400]})
+    except ImportError as error:
+        failures.append({"module": name, "error": str(error)[:400]})
+print(json.dumps({"failures": failures}))
+"#;
+/// How long the extension probe may run. Importing torch takes seconds on a warm
+/// cache and longer cold; a hang must not stall `rocm engines list` past this.
+const VLLM_EXTENSION_PROBE_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Why vLLM's compiled extensions cannot be imported in `runtime`, or `None`
+/// when they import or the check could not run.
+///
+/// A wheel built against a different torch than the one beside it installs and
+/// reports a version, yet its `_C`/`_rocm_C` fail with undefined `c10::hip`
+/// symbols; the server then dies deep in engine start-up with an unrelated
+/// `AttributeError`. This surfaces the cause up front. Best-effort: any trouble
+/// running the probe yields `None`, never a false alarm.
+///
+/// This is the read-only form `detect` uses (see [`ProbeEnv`]).
+pub(crate) fn vllm_extension_import_problem(runtime: &VllmRuntime) -> Option<String> {
+    extension_import_problem_within(runtime, VLLM_EXTENSION_PROBE_TIMEOUT, ProbeEnv::ReadOnly)
+}
+
+/// Which environment the extension probe runs in.
+#[derive(Clone, Copy)]
+enum ProbeEnv {
+    /// `detect`, which `rocm engines list` and the assistant's read-only
+    /// engines tool reach: nothing in the runtime is written. The loader path
+    /// comes from a listing of the compat directory, so `import torch` can fail
+    /// when a needed stub was not written yet, or when a stale `libnuma.so.1`
+    /// link is there. The probe reports a torch failure as nothing, so a listing
+    /// can read `ready` for a broken wheel until a launch has fixed the shims.
+    ReadOnly,
+    /// The serve gate: the probe gets `apply_therock_env`'s loader path and runs
+    /// the same shim step a successful launch runs (whether or not serve then goes
+    /// ahead), so it cannot pass on a torch that only imports once the shims exist.
+    Launch,
+}
+
+/// `rocm serve` refuses to launch a vLLM that cannot load its extensions.
+fn require_importable_extensions(runtime: &VllmRuntime) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    match extension_import_problem_within(runtime, VLLM_EXTENSION_PROBE_TIMEOUT, ProbeEnv::Launch) {
+        Some(problem) => bail!("{problem}"),
+        None => Ok(()),
+    }
+}
+
+fn extension_import_problem_within(
+    runtime: &VllmRuntime,
+    timeout: Duration,
+    env: ProbeEnv,
+) -> Option<String> {
+    let python = absolute_probe_python(runtime.python_executable.as_ref()?);
+    let mut command = ProcessCommand::new(&python);
+    command.arg("-c").arg(VLLM_EXTENSION_PROBE_SCRIPT);
+    // `python -c` puts the working directory first on `sys.path`, which the
+    // `vllm serve` launcher does not: run from a vLLM source checkout, or any
+    // directory holding a `torch/` or `vllm/`, the probe would import that
+    // instead of the install. The interpreter's own directory holds no packages.
+    if let Some(dir) = python.parent().filter(|dir| dir.is_dir()) {
+        command.current_dir(dir);
+    }
+    // Python writes `__pycache__` for what it imports unless told not to.
+    command.env("PYTHONDONTWRITEBYTECODE", "1");
+    match env {
+        ProbeEnv::ReadOnly => apply_therock_env_read_only(&mut command, runtime),
+        ProbeEnv::Launch => apply_therock_env(&mut command, runtime),
+    }
+    .ok()?;
+    let output = rocm_core::process::run_with_timeout(command, timeout, "vLLM extension probe")
+        .ok()
+        .filter(|output| output.status.success())?;
+    extension_import_problem_from_probe(&String::from_utf8_lossy(&output.stdout), runtime)
+}
+
+/// The interpreter as an absolute path. The probe runs from the interpreter's
+/// directory, and a relative program path is resolved against the new working
+/// directory, so a relative `ROCM_CLI_VLLM_PYTHON` would otherwise fail to spawn
+/// and read as "the check could not run". Not canonicalized: a venv interpreter
+/// is a symlink whose own path is what finds the venv.
+fn absolute_probe_python(python: &Path) -> PathBuf {
+    std::path::absolute(python).unwrap_or_else(|_| python.to_path_buf())
+}
+
+/// Reads the probe's JSON into the guidance a user can act on.
+fn extension_import_problem_from_probe(output: &str, runtime: &VllmRuntime) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(output.lines().rev().find(|line| !line.trim().is_empty())?).ok()?;
+    let failures = value.get("failures")?.as_array()?;
+    if failures.is_empty() {
+        return None;
+    }
+    let details = failures
+        .iter()
+        .filter_map(|failure| {
+            Some(format!(
+                "{}: {}",
+                failure.get("module")?.as_str()?,
+                failure.get("error")?.as_str()?
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "vLLM is installed in runtime `{}` but its compiled extensions do not import ({details}). \
+This usually means the vLLM wheel was built against a different torch than the one in this \
+runtime, so serving would fail during engine start-up. Install a vLLM build that matches the \
+runtime's torch (for example from source against it), or switch to a runtime vLLM supports.",
+        runtime.runtime_id
+    ))
 }
 /// The venv root a runtime's vLLM lives in, derived from its own python
 /// executable (`<venv>/bin/python` → `<venv>`) rather than the TheRock SDK
@@ -516,7 +780,8 @@ fn apply_vllm_rocm10_discover_env(
     command.env("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE");
     Ok(())
 }
-/// Full argument vector for `vllm serve`, as spawned by [`spawn_vllm_server`].
+/// Full argument vector for `vllm serve`, as built into the launch command by
+/// [`vllm_server_command`].
 ///
 /// Kept as a pure function so the exact argv can be asserted in tests: memory
 /// and graph-mode flags materially change how much VRAM vLLM claims, and a
@@ -526,12 +791,16 @@ fn apply_vllm_rocm10_discover_env(
 /// supply a default — vLLM's own default applies unless the user asks for a
 /// specific fraction via `rocm serve --gpu-memory-utilization`, which arrives
 /// here through the engine recipe's `required_flags`.
+///
+/// `require_api_key` adds the `--middleware` that enforces the endpoint key on
+/// every route (see [`crate::endpoint_auth`]).
 fn vllm_serve_args(
     model_ref: &str,
     host: &str,
     port: u16,
     enforce_eager: bool,
     engine_recipe: Option<&EngineRecipeHint>,
+    require_api_key: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "serve".to_owned(),
@@ -549,6 +818,9 @@ fn vllm_serve_args(
         args.push("--enforce-eager".to_owned());
     }
     args.extend(engine_recipe_launch_args(engine_recipe));
+    if require_api_key {
+        args.extend(crate::endpoint_auth::middleware_args());
+    }
     args
 }
 /// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
@@ -583,7 +855,10 @@ fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
         .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
 }
 
-fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Result<OsString> {
+pub(crate) fn prepend_path_entries(
+    entries: &[PathBuf],
+    current: Option<OsString>,
+) -> Result<OsString> {
     let mut parts = Vec::new();
     for entry in entries {
         if !entry.as_os_str().is_empty() && !parts.iter().any(|part: &PathBuf| part == entry) {
@@ -815,7 +1090,7 @@ mod tests {
 
     #[test]
     fn vllm_serve_args_omit_gpu_memory_utilization_without_override() {
-        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None);
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None, false);
 
         assert_eq!(
             args,
@@ -842,7 +1117,14 @@ mod tests {
             ..EngineRecipeHint::default()
         };
 
-        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, true, Some(&hint));
+        let args = vllm_serve_args(
+            "facebook/opt-125m",
+            "127.0.0.1",
+            8000,
+            true,
+            Some(&hint),
+            false,
+        );
 
         let position = args
             .iter()
@@ -850,6 +1132,178 @@ mod tests {
             .expect("explicit utilization must reach the spawned argv");
         assert_eq!(args.get(position + 1).map(String::as_str), Some("0.35"));
         assert!(args.contains(&"--enforce-eager".to_owned()));
+    }
+    #[test]
+    fn vllm_serve_args_install_the_auth_middleware_when_a_key_is_required() {
+        let args = vllm_serve_args("facebook/opt-125m", "0.0.0.0", 8000, false, None, true);
+
+        let position = args
+            .iter()
+            .position(|arg| arg == "--middleware")
+            .expect("a keyed endpoint must be launched with the auth middleware");
+        assert_eq!(
+            args.get(position + 1).map(String::as_str),
+            Some(crate::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("api-key")),
+            "the key itself must never reach argv: {args:?}"
+        );
+    }
+    #[test]
+    fn vllm_serve_args_omit_the_auth_middleware_without_a_key() {
+        let args = vllm_serve_args("facebook/opt-125m", "127.0.0.1", 8000, false, None, false);
+        assert!(
+            !args.iter().any(|arg| arg == "--middleware"),
+            "an unkeyed endpoint must not load the middleware, which refuses to construct \
+             without a key: {args:?}"
+        );
+    }
+    fn keyed_launch_request() -> ServeHttpRequest {
+        ServeHttpRequest {
+            service_id: "svc-vllm".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "0.0.0.0".to_owned(),
+            port: 8000,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: vec![1],
+            runtime_id: None,
+            env_id: None,
+            state_path: PathBuf::from("state.json"),
+            log_path: None,
+            engine_recipe: None,
+        }
+    }
+    #[test]
+    fn keyed_vllm_server_command_installs_middleware_key_and_pythonpath_together() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let module_dir = temp.path().join("python");
+        // A ROCm 10 discover runtime, whose TheRock environment sets its own
+        // `PYTHONPATH` entry (`amd_smi` in the venv). The middleware directory
+        // has to be prepended after that, or the TheRock value replaces it.
+        let venv = temp.path().join("venv");
+        let site_packages = venv.join("lib").join("python3.12").join("site-packages");
+        fs::create_dir_all(&site_packages)?;
+        let runtime = test_vllm_runtime(
+            Some(venv.join("bin").join("python")),
+            Some("10.0.0".to_owned()),
+        );
+        let command = vllm_server_command(
+            &keyed_launch_request(),
+            &runtime,
+            Some("secret-key"),
+            || Ok(module_dir.clone()),
+            false,
+        )?;
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let position = args
+            .iter()
+            .position(|arg| arg == "--middleware")
+            .expect("a keyed launch must pass the auth middleware to vllm serve");
+        assert_eq!(
+            args.get(position + 1).map(String::as_str),
+            Some(crate::endpoint_auth::MIDDLEWARE_IMPORT_PATH)
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("secret-key")),
+            "the key must never reach argv: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--enforce-eager"),
+            "enforce_eager was false: {args:?}"
+        );
+        assert_eq!(
+            crate::endpoint_auth::env_of(&command, "VLLM_API_KEY"),
+            Some("secret-key".into()),
+            "the middleware and vLLM's own check both read the key from VLLM_API_KEY"
+        );
+        let pythonpath = crate::endpoint_auth::env_of(&command, "PYTHONPATH")
+            .expect("a keyed launch must put the middleware directory on PYTHONPATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&pythonpath).collect();
+        let amd_smi = site_packages
+            .join("_rocm_sdk_core")
+            .join("share")
+            .join("amd_smi");
+        assert_eq!(
+            entries.get(..2),
+            Some(&[module_dir.clone(), amd_smi][..]),
+            "vLLM imports the middleware by module name, so its directory goes first, \
+             ahead of the runtime's own entry, which is kept: {entries:?}"
+        );
+        assert_eq!(
+            crate::endpoint_auth::env_of(&command, "HIP_VISIBLE_DEVICES"),
+            Some("1".into()),
+            "the GPU the request selected must still be applied to a keyed launch"
+        );
+        assert!(
+            module_dir.join("rocm_cli_vllm_auth.py").is_file(),
+            "the middleware module must be written where PYTHONPATH points"
+        );
+        Ok(())
+    }
+    #[test]
+    fn vllm_server_command_forwards_enforce_eager() -> Result<()> {
+        let command = vllm_server_command(
+            &keyed_launch_request(),
+            &VllmRuntime::for_test(),
+            None,
+            || panic!("an unkeyed launch must not need the middleware directory"),
+            true,
+        )?;
+        assert!(
+            command.get_args().any(|arg| arg == "--enforce-eager"),
+            "enforce_eager was true: {:?}",
+            command.get_args().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+    #[test]
+    fn unkeyed_vllm_server_command_carries_no_key_protection() -> Result<()> {
+        // The same TheRock runtime as the keyed test, so `PYTHONPATH` has a value
+        // of its own that a stray middleware entry would be prepended to.
+        let temp = tempfile::tempdir()?;
+        let venv = temp.path().join("venv");
+        let site_packages = venv.join("lib").join("python3.12").join("site-packages");
+        fs::create_dir_all(&site_packages)?;
+        let runtime = test_vllm_runtime(
+            Some(venv.join("bin").join("python")),
+            Some("10.0.0".to_owned()),
+        );
+        let command = vllm_server_command(
+            &keyed_launch_request(),
+            &runtime,
+            None,
+            || panic!("an unkeyed launch must not need the middleware directory"),
+            false,
+        )?;
+        assert!(
+            !command.get_args().any(|arg| arg == "--middleware"),
+            "an unkeyed launch must not load the middleware, which refuses to start without a key"
+        );
+        assert_eq!(crate::endpoint_auth::env_of(&command, "VLLM_API_KEY"), None);
+        let pythonpath = crate::endpoint_auth::env_of(&command, "PYTHONPATH")
+            .expect("the TheRock runtime sets its own PYTHONPATH entry");
+        let entries: Vec<PathBuf> = std::env::split_paths(&pythonpath).collect();
+        let amd_smi = site_packages
+            .join("_rocm_sdk_core")
+            .join("share")
+            .join("amd_smi");
+        // The runtime's own value: its entry ahead of whatever PYTHONPATH this
+        // process inherited.
+        let expected: Vec<PathBuf> = std::env::split_paths(&prepend_path_entries(
+            &[amd_smi],
+            std::env::var_os("PYTHONPATH"),
+        )?)
+        .collect();
+        assert_eq!(
+            entries, expected,
+            "an unkeyed launch keeps the runtime's PYTHONPATH exactly, with no middleware directory"
+        );
+        Ok(())
     }
     #[test]
     fn resolve_model_echoes_matching_engine_recipe() -> Result<()> {
@@ -929,6 +1383,422 @@ mod tests {
             .flatten();
         assert_eq!(target_device, Some(std::ffi::OsStr::new("rocm")));
         Ok(())
+    }
+    #[test]
+    fn extension_probe_with_no_failures_reports_no_problem() {
+        let runtime = test_vllm_runtime(None, None);
+        assert_eq!(
+            extension_import_problem_from_probe(r#"{"failures": []}"#, &runtime),
+            None
+        );
+        assert_eq!(
+            extension_import_problem_from_probe("not json", &runtime),
+            None
+        );
+    }
+    #[test]
+    fn extension_probe_failures_name_the_module_symbol_and_runtime() {
+        let runtime = test_vllm_runtime(None, None);
+        let problem = extension_import_problem_from_probe(
+            r#"{"failures": [{"module": "vllm._C", "error": "undefined symbol: _ZN3c103hip19getCurrentHIPStreamEa"}]}"#,
+            &runtime,
+        )
+        .expect("a failing extension is a problem");
+        assert!(problem.contains("vllm._C"), "{problem}");
+        assert!(problem.contains("getCurrentHIPStreamEa"), "{problem}");
+        assert!(problem.contains("`test`"), "{problem}");
+        assert!(problem.contains("different torch"), "{problem}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_check_runs_the_probe_with_the_runtimes_python() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Stands in for the interpreter: answers only to `-c <probe script>` (see
+        // `stand_in_python`) and prints a failing probe.
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._rocm_C", "error": "undefined symbol: x"}]}'"#,
+        )?;
+        let runtime = test_vllm_runtime(Some(python), None);
+        let problem = vllm_extension_import_problem(&runtime).expect("the probe failure surfaces");
+        assert!(problem.contains("vllm._rocm_C"), "{problem}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn stand_in_python(dir: &Path, body: &str) -> Result<PathBuf> {
+        // Never `fs::write` then run: another test thread's fork can hold the
+        // write fd open and the first run fails with `Text file busy`, which the
+        // best-effort probe turns into a silent `None`.
+        let python = dir.join("python");
+        // The stand-in answers only when invoked the way the probe invokes an
+        // interpreter (`-c <the probe script>`), so mangling that argv fails
+        // the tests that go through the production command.
+        let argv_guard = "[ \"$1\" = \"-c\" ] || exit 97\ncase \"$2\" in *vllm._C_stable_libtorch*) ;; *) exit 97 ;; esac";
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            format!("#!/bin/sh\n{argv_guard}\n{body}\n"),
+        )?;
+        Ok(python)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_a_vllm_whose_extensions_do_not_import() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._C", "error": "undefined symbol: x"}]}'"#,
+        )?;
+        let request = ServeHttpRequest {
+            service_id: "svc-vllm".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11439,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: None,
+            env_id: None,
+            state_path: dir.path().join("state.json"),
+            log_path: None,
+            engine_recipe: None,
+        };
+        // Through the launch path itself, so removing the gate from it fails here
+        // rather than only the helper's own test.
+        let error = spawn_vllm_server(&request, &test_vllm_runtime(Some(python), None), None)
+            .expect_err("a failing extension blocks serve")
+            .to_string();
+        assert!(error.contains("vllm._C"), "{error}");
+        assert!(error.contains("do not import"), "{error}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_extension_probe_does_not_block_serve() -> Result<()> {
+        let clean = tempfile::tempdir()?;
+        // The marker proves the stand-in passed its argv guard and really ran:
+        // without it a probe that never started would read as a clean one.
+        let marker = clean.path().join("ran");
+        let python = stand_in_python(
+            clean.path(),
+            &format!(r#"touch '{}'; echo '{{"failures": []}}'"#, marker.display()),
+        )?;
+        require_importable_extensions(&test_vllm_runtime(Some(python), None))?;
+        assert!(marker.exists(), "the probe interpreter was never run");
+        Ok(())
+    }
+    #[test]
+    fn a_relative_interpreter_path_is_made_absolute_for_the_probe() {
+        let relative = Path::new("venv/bin/python");
+        let absolute = absolute_probe_python(relative);
+        assert!(absolute.is_absolute(), "{}", absolute.display());
+        assert!(absolute.ends_with(relative), "{}", absolute.display());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_runs_from_the_interpreters_directory_not_the_callers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Reports where it ran, so the failure text shows the working directory.
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo "{\"failures\": [{\"module\": \"vllm._C\", \"error\": \"cwd=$(pwd -P)\"}]}""#,
+        )?;
+        let problem = vllm_extension_import_problem(&test_vllm_runtime(Some(python.clone()), None))
+            .expect("the stand-in reports a failure");
+        let ran_in = python.parent().expect("parent").canonicalize()?;
+        assert!(
+            problem.contains(&format!("cwd={}", ran_in.display())),
+            "{problem}"
+        );
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_probe_exit_reports_nothing_even_with_failures_on_stdout() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'; exit 1"#,
+        )?;
+        assert_eq!(
+            extension_import_problem_within(
+                &test_vllm_runtime(Some(python), None),
+                Duration::from_secs(20),
+                ProbeEnv::Launch
+            ),
+            None
+        );
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_result_is_the_last_non_empty_line_of_its_output() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo 'import-time log line'; echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'; echo; echo"#,
+        )?;
+        let problem = extension_import_problem_within(
+            &test_vllm_runtime(Some(python), None),
+            Duration::from_secs(20),
+            ProbeEnv::Launch,
+        )
+        .expect("trailing blank lines do not hide the result");
+        assert!(problem.contains("vllm._C: x"), "{problem}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_long_probe_error_is_cut_to_what_fits_in_guidance() -> Result<()> {
+        let out = run_probe_script("", &[("_C", "raise ImportError('y' * 5000)")])?;
+        let problem = extension_import_problem_from_probe(&out, &test_vllm_runtime(None, None))
+            .expect("a failing _C is a problem");
+        // Exactly the first 400 characters of the error survive.
+        assert!(problem.contains(&"y".repeat(400)), "{problem}");
+        assert!(!problem.contains(&"y".repeat(401)), "{problem}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_check_gives_up_on_a_hung_probe() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(dir.path(), "exec sleep 30")?;
+        let started = Instant::now();
+        let problem = extension_import_problem_within(
+            &test_vllm_runtime(Some(python), None),
+            Duration::from_millis(200),
+            ProbeEnv::Launch,
+        );
+        assert_eq!(problem, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the probe was not stopped at its deadline"
+        );
+        Ok(())
+    }
+    /// Runs the probe script under `python3` against stub `torch` and `vllm`
+    /// modules, returning its stdout. Panics when there is no `python3`: these
+    /// are the only tests of the script itself, so they must not pass unrun.
+    #[cfg(unix)]
+    fn run_probe_script(torch: &str, extensions: &[(&str, &str)]) -> Result<String> {
+        let dir = tempfile::tempdir()?;
+        let vllm = dir.path().join("vllm");
+        fs::create_dir(&vllm)?;
+        fs::write(dir.path().join("torch.py"), torch)?;
+        fs::write(vllm.join("__init__.py"), "")?;
+        for (module, body) in extensions {
+            fs::write(vllm.join(format!("{module}.py")), body)?;
+        }
+        let output = ProcessCommand::new("python3")
+            .arg("-c")
+            .arg(VLLM_EXTENSION_PROBE_SCRIPT)
+            .env("PYTHONPATH", dir.path())
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("python3 is required to run the probe-script tests: {error}")
+            });
+        assert!(output.status.success(), "{output:?}");
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_script_reports_each_extension_that_fails_to_load() -> Result<()> {
+        let runtime = test_vllm_runtime(None, None);
+        let fails = "raise ImportError('undefined symbol: boom')";
+        // `_C` fails to load; a `_rocm_C` that is merely absent is not a mismatch.
+        let out = run_probe_script("", &[("_C", fails)])?;
+        let problem =
+            extension_import_problem_from_probe(&out, &runtime).expect("a failing _C is a problem");
+        assert!(
+            problem.contains("vllm._C: undefined symbol: boom"),
+            "{problem}"
+        );
+        assert!(!problem.contains("_rocm_C"), "{problem}");
+        // The ROCm extension, which the issue is about, is probed on its own.
+        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", fails)])?;
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a failing _rocm_C is a problem");
+        assert!(
+            problem.contains("vllm._rocm_C: undefined symbol: boom"),
+            "{problem}"
+        );
+        // So is the stable-libtorch extension: dropping it from the probe would
+        // let a wheel that only that one breaks read as healthy.
+        let out = run_probe_script("", &[("_C", ""), ("_C_stable_libtorch", fails)])?;
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a failing _C_stable_libtorch is a problem");
+        assert!(
+            problem.contains("vllm._C_stable_libtorch: undefined symbol: boom"),
+            "{problem}"
+        );
+        // A dependency's missing-module error is cut like any other error.
+        let out = run_probe_script("", &[("_C", "__import__('m' * 5000)")])?;
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a missing dependency of _C is a problem");
+        assert!(problem.contains(&"m".repeat(380)), "{problem}");
+        assert!(!problem.contains(&"m".repeat(400)), "{problem}");
+        // Two failing extensions are both named, joined by `; `.
+        let out = run_probe_script("", &[("_C", fails), ("_rocm_C", fails)])?;
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("two failing extensions are a problem");
+        assert!(
+            problem
+                .contains("vllm._C: undefined symbol: boom; vllm._rocm_C: undefined symbol: boom"),
+            "{problem}"
+        );
+        // An extension that is present but needs a module that is missing is a
+        // broken install, not an extension absent from the wheel.
+        let out = run_probe_script("", &[("_C", "import a_module_vllm_needs_but_lacks")])?;
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a missing dependency of _C is a problem");
+        assert!(
+            problem.contains("a_module_vllm_needs_but_lacks"),
+            "{problem}"
+        );
+        // Everything loads.
+        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", "")])?;
+        assert_eq!(extension_import_problem_from_probe(&out, &runtime), None);
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_script_stops_at_a_torch_that_does_not_import() -> Result<()> {
+        let fails = "raise ImportError('undefined symbol: boom')";
+        let out = run_probe_script("raise ImportError('no torch')", &[("_C", fails)])?;
+        // Exactly the empty report: the extensions are not tried (and so not blamed).
+        assert_eq!(out.trim(), r#"{"failures": []}"#);
+        // Whatever torch raises on import, not only an `ImportError`: an
+        // unrelated torch failure is never charged to the extensions.
+        let out = run_probe_script("raise RuntimeError('torch is broken')", &[("_C", fails)])?;
+        assert_eq!(out.trim(), r#"{"failures": []}"#);
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_runs_with_the_runtimes_sdk_environment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Reports a failure only when the TheRock environment reached the interpreter.
+        let python = stand_in_python(
+            dir.path(),
+            r#"if [ -n "$ROCM_CLI_THEROCK_RUNTIME_ID" ]; then echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'; else echo '{"failures": []}'; fi"#,
+        )?;
+        let mut runtime = test_vllm_runtime(Some(python), None);
+        runtime.sdk_root = Some(dir.path().to_path_buf());
+        assert!(vllm_extension_import_problem(&runtime).is_some());
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_read_only_extension_probe_leaves_the_compat_dir_alone() -> Result<()> {
+        // `rocm engines list` and the assistant's read-only engines tool reach the
+        // probe, so it must not run the compat-shim step, which removes a stale
+        // numa symlink and may write a `libmpi_cxx` stub in the runtime.
+        let (_guard, runtime, compat_dir, stale_shim) = probe_runtime_with_stale_shim(
+            |_stale_shim, sdk| {
+                // Fails only when `<sdk>/lib` is on `LD_LIBRARY_PATH`.
+                format!(
+                    r#"case "$LD_LIBRARY_PATH" in *"{}"*) echo '{{"failures": [{{"module": "vllm._C", "error": "x"}}]}}';; *) echo '{{"failures": []}}';; esac"#,
+                    sdk.join("lib").display()
+                )
+            },
+        )?;
+        let before = dir_names(&compat_dir)?;
+        let problem = vllm_extension_import_problem(&runtime);
+        // The stand-in fails only when the SDK's lib dir reached `LD_LIBRARY_PATH`,
+        // so a probe that never ran, or ran without that path, reads as `None`.
+        assert!(problem.is_some(), "the probe saw no SDK library path");
+        assert!(
+            stale_shim.symlink_metadata().is_ok(),
+            "the probe ran the compat-shim step"
+        );
+        assert_eq!(dir_names(&compat_dir)?, before);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_serve_gate_probes_after_the_launch_environment_ran_the_shim_step() -> Result<()> {
+        // The stand-in reports a failure only once the stale numa link is gone, so
+        // the gate refuses only when the shim step ran before the probe started.
+        // (The gate's loader path is `apply_therock_env`'s, which its own tests pin.)
+        let (_guard, runtime, _compat_dir, _stale_shim) = probe_runtime_with_stale_shim(
+            |stale_shim, _sdk| {
+                format!(
+                    r#"if [ -L '{}' ]; then echo '{{"failures": []}}'; else echo '{{"failures": [{{"module": "vllm._C", "error": "launch-env"}}]}}'; fi"#,
+                    stale_shim.display()
+                )
+            },
+        )?;
+        let error = require_importable_extensions(&runtime).expect_err("the gate refuses");
+        assert!(error.to_string().contains("launch-env"), "{error}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_does_not_let_python_write_bytecode_into_the_runtime() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo "{\"failures\": [{\"module\": \"vllm._C\", \"error\": \"pydwb=$PYTHONDONTWRITEBYTECODE\"}]}""#,
+        )?;
+        let runtime = test_vllm_runtime(Some(python), None);
+        let listed = vllm_extension_import_problem(&runtime).expect("the stand-in fails");
+        assert!(listed.contains("pydwb=1"), "{listed}");
+        let gate = require_importable_extensions(&runtime).expect_err("the gate refuses");
+        assert!(gate.to_string().contains("pydwb=1"), "{gate}");
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn dir_names(dir: &Path) -> Result<Vec<String>> {
+        let mut names = fs::read_dir(dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+    /// A runtime whose compat dir holds a stale `libnuma.so.1` symlink, and whose
+    /// stand-in interpreter runs the body `body(stale_shim, sdk_root)` returns.
+    #[cfg(target_os = "linux")]
+    fn probe_runtime_with_stale_shim(
+        body: impl FnOnce(&Path, &Path) -> String,
+    ) -> Result<(tempfile::TempDir, VllmRuntime, PathBuf, PathBuf)> {
+        let guard = tempfile::tempdir()?;
+        let env = guard.path().to_path_buf();
+        let bin = env.join("bin");
+        fs::create_dir_all(&bin)?;
+        let sdk = env.join("sdk");
+        let compat_dir = env.join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        let stale_shim = compat_dir.join("libnuma.so.1");
+        std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
+        let python = stand_in_python(&bin, &body(&stale_shim, &sdk))?;
+        let runtime = VllmRuntime {
+            python_executable: Some(python),
+            sdk_root: Some(sdk),
+            ..VllmRuntime::for_test()
+        };
+        Ok((guard, runtime, compat_dir, stale_shim))
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_interpreter_path_still_runs_the_probe() -> Result<()> {
+        // Through `vllm_extension_import_problem` itself: the probe runs from the
+        // interpreter's directory, so a relative program path would not spawn and
+        // the check would silently report nothing.
+        let dir = tempfile::tempdir_in(std::env::current_dir()?)?;
+        stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'"#,
+        )?;
+        let relative = Path::new(dir.path().file_name().expect("tempdir name")).join("python");
+        assert!(relative.is_relative());
+        let problem = vllm_extension_import_problem(&test_vllm_runtime(Some(relative), None));
+        assert!(problem.is_some(), "a relative interpreter was never run");
+        Ok(())
+    }
+    #[test]
+    fn extension_check_is_silent_without_a_python_executable() {
+        assert_eq!(
+            vllm_extension_import_problem(&test_vllm_runtime(None, None)),
+            None
+        );
     }
     #[test]
     fn stop_scope_includes_vllm_workers() {
@@ -1204,5 +2074,299 @@ mod tests {
             .flatten();
         assert_eq!(flag, Some(std::ffi::OsStr::new("TRUE")));
         Ok(())
+    }
+
+    /// Spawn `sh -c script`, which prints one line once it is ready, and return
+    /// the child with that line.
+    #[cfg(target_os = "linux")]
+    fn spawn_ready(script: &str) -> (std::process::Child, String) {
+        use std::io::BufRead;
+        let mut child = ProcessCommand::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("read readiness line");
+        (child, line.trim().to_owned())
+    }
+
+    /// `SIGKILL` `identity` if it is still that process, so a failing test does
+    /// not leave a stray process behind.
+    #[cfg(target_os = "linux")]
+    fn kill_if_running(identity: &rocm_core::ProcessIdentity) {
+        if rocm_core::identity_state(identity) == rocm_core::IdentityState::Matches {
+            let _ = ProcessCommand::new("kill")
+                .args(["-KILL", &identity.pid.to_string()])
+                .status();
+        }
+    }
+
+    /// The `sh` script for a server that ignores `SIGTERM` and has a worker that
+    /// ignores it too (`SIG_IGN` survives `exec`). The inner shell prints its
+    /// PID once it runs, which is after the outer trap is set.
+    #[cfg(target_os = "linux")]
+    const TRAPPING_TREE: &str = r#"trap '' TERM; sh -c "echo \$\$; exec sleep 300" & wait"#;
+
+    /// Run `teardown` on a fresh [`TRAPPING_TREE`] in a thread, bounded so a
+    /// teardown that hangs fails the test instead, and return the reaped server's
+    /// exit status, whether the worker is gone, and how long the teardown took.
+    #[cfg(target_os = "linux")]
+    fn tear_down_trapping_tree(
+        bound: Duration,
+        teardown: impl FnOnce(&mut std::process::Child) + Send + 'static,
+    ) -> (std::process::ExitStatus, bool, Duration) {
+        let (mut child, worker_pid) = spawn_ready(TRAPPING_TREE);
+        let worker = rocm_core::ProcessIdentity::capture(worker_pid.parse().expect("worker pid"));
+        let server = rocm_core::ProcessIdentity::capture(child.id());
+        let (done, finished) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            teardown(&mut child);
+            let _ = done.send(started.elapsed());
+            child
+        });
+        let elapsed = finished.recv_timeout(bound);
+        if elapsed.is_err() {
+            // Unblock the teardown's `wait` so the test fails rather than hangs.
+            kill_if_running(&worker);
+            kill_if_running(&server);
+        }
+        let mut child = thread.join().expect("teardown thread");
+        let worker_gone = matches!(
+            rocm_core::identity_state(&worker),
+            rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
+        );
+        kill_if_running(&worker);
+        let elapsed =
+            elapsed.unwrap_or_else(|_| panic!("the teardown did not return within {bound:?}"));
+        let status = child
+            .try_wait()
+            .expect("try_wait")
+            .expect("the teardown reaps the server");
+        (status, worker_gone, elapsed)
+    }
+
+    /// The readiness-failure teardown with a real stop and a short grace: a
+    /// server that ignores `SIGTERM`, and its worker, are killed, the teardown
+    /// returns within about twice the grace period, and the service is recorded
+    /// as failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_kills_a_tree_that_ignores_sigterm_and_records_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let grace = Duration::from_millis(500);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let thread_state_path = state_path.clone();
+
+        let (status, worker_gone, _) =
+            // The margin is wide: the bound only turns a hang into a failure, and a
+            // loaded host can be slow to run the stop.
+            tear_down_trapping_tree(grace * 2 + Duration::from_secs(10), move |child| {
+                fail_unready_server_with(child, &thread_state_path, |pid| {
+                    stop_spawned_server(pid, grace)
+                });
+            });
+
+        assert_eq!(status.signal(), Some(9), "{status}");
+        assert!(
+            worker_gone,
+            "the worker under the server must be stopped too"
+        );
+        let state = crate::state::read_service_state(&state_path).expect("state");
+        assert_eq!(state["status"], "failed");
+    }
+
+    /// `fail_unready_server` itself, as `serve_http` calls it: the production
+    /// grace passes before the escalation, then the tree is killed and the
+    /// service recorded as failed. Takes about [`STOP_GRACE`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_escalates_after_the_stop_grace() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let thread_state_path = state_path.clone();
+
+        let (status, worker_gone, elapsed) =
+            tear_down_trapping_tree(STOP_GRACE * 2 + Duration::from_secs(5), move |child| {
+                fail_unready_server(child, &thread_state_path);
+            });
+
+        assert!(
+            elapsed >= STOP_GRACE,
+            "the server must get the whole stop grace before SIGKILL: {elapsed:?}"
+        );
+        assert_eq!(status.signal(), Some(9), "{status}");
+        assert!(
+            worker_gone,
+            "the worker under the server must be stopped too"
+        );
+        let state = crate::state::read_service_state(&state_path).expect("state");
+        assert_eq!(state["status"], "failed");
+    }
+
+    /// A server the readiness poll already reaped is not signalled: its PID may
+    /// belong to another process by now.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_does_not_signal_a_server_the_readiness_poll_reaped() {
+        let mut child = ProcessCommand::new("true")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let mut signalled = Vec::new();
+
+        fail_unready_server_with(&mut child, &state_path, |pid| {
+            signalled.push(pid);
+            rocm_core::TerminationOutcome::Forced
+        });
+
+        assert!(
+            signalled.is_empty(),
+            "a reaped server's PID must not be signalled: {signalled:?}"
+        );
+        let state = crate::state::read_service_state(&state_path).expect("state");
+        assert_eq!(state["status"], "failed");
+    }
+
+    /// What `fail_unready_server` writes to stderr, read from the real stderr of
+    /// a process running it, together with the state it describes. The test
+    /// re-runs itself in a child process (selected by an environment variable),
+    /// because a warning on this process's stderr cannot be read back here.
+    ///
+    /// - A stop that sends nothing and reports `Unverified` is warned about, and
+    ///   the server is then killed and reaped rather than waited on.
+    /// - A state file that cannot be written is warned about, and the teardown
+    ///   still completes.
+    /// - A confirmed stop is not warned about and is not followed by a kill, and
+    ///   the server is reaped before the teardown returns.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_unready_server_reports_on_stderr_and_kills_a_server_it_could_not_confirm_stopped() {
+        use std::os::unix::process::ExitStatusExt;
+        const ARM: &str = "ROCM_TEST_VLLM_UNREADY_TEARDOWN_ARM";
+        if let Some(dir) = std::env::var_os(ARM) {
+            let dir = std::path::PathBuf::from(dir);
+            // Bounded, so a teardown that fails to kill it ends within 30 s
+            // instead of hanging the parent.
+            let (mut child, _) = spawn_ready("echo ready; exec sleep 30");
+            let pid = child.id();
+            let state_path = dir.join("state.json");
+            fail_unready_server_with(&mut child, &state_path, |_| {
+                rocm_core::TerminationOutcome::Unverified
+            });
+            let signal = child
+                .try_wait()
+                .expect("try_wait")
+                .and_then(|status| status.signal());
+            // On lines of their own: the harness has already printed the test's
+            // name without a line break.
+            println!("\nunverified={pid} signal={signal:?}");
+
+            // A state path that is a directory cannot be written as a file.
+            let (mut child, _) = spawn_ready("echo ready; exec sleep 30");
+            let unwritable = dir.join("unwritable");
+            std::fs::create_dir(&unwritable).expect("create the unwritable path");
+            fail_unready_server_with(&mut child, &unwritable, |pid| {
+                stop_spawned_server(pid, Duration::from_millis(500))
+            });
+            println!(
+                "\nunwritable reaped={}",
+                child.try_wait().expect("try_wait").is_some()
+            );
+
+            // A confirmed stop that leaves the server to exit by itself, with a
+            // status only that exit produces: a kill would end it with signal 9,
+            // and a teardown that did not wait would return while it still runs.
+            let (mut child, _) = spawn_ready("echo ready; sleep 1; exit 7");
+            let pid = child.id();
+            fail_unready_server_with(&mut child, &dir.join("confirmed.json"), |_| {
+                rocm_core::TerminationOutcome::Graceful
+            });
+            let status = child
+                .try_wait()
+                .expect("try_wait")
+                .map(|status| (status.code(), status.signal()));
+            println!("\nconfirmed={pid} status={status:?}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = ProcessCommand::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "process::tests::fail_unready_server_reports_on_stderr_and_kills_a_server_it_could_not_confirm_stopped",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(ARM, dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("re-run the test arm in a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        let pid: u32 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("unverified="))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("no unverified= line in: {stdout}"));
+
+        assert!(
+            stdout.contains(&format!("unverified={pid} signal=Some(9)")),
+            "a server whose stop was not confirmed is killed: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "Warning: process {pid} was not confirmed stopped: its identity could not be \
+                 confirmed, so it was not signalled. Killing it; processes under it are not \
+                 reached by that kill."
+            )),
+            "{stderr}"
+        );
+        let state =
+            crate::state::read_service_state(&dir.path().join("state.json")).expect("state");
+        assert_eq!(state["status"], "failed");
+
+        let confirmed: u32 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("confirmed="))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("no confirmed= line in: {stdout}"));
+        assert!(
+            stdout.contains(&format!(
+                "confirmed={confirmed} status=Some((Some(7), None))"
+            )),
+            "a confirmed stop is neither followed by a kill nor left unreaped: {stdout}"
+        );
+        assert!(
+            !stderr.contains(&format!("process {confirmed} was not confirmed stopped")),
+            "a confirmed stop must not warn: {stderr}"
+        );
+        let state =
+            crate::state::read_service_state(&dir.path().join("confirmed.json")).expect("state");
+        assert_eq!(state["status"], "failed");
+
+        assert!(stdout.contains("unwritable reaped=true"), "{stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "Warning: could not record the vLLM service as failed in {}",
+                dir.path().join("unwritable").display()
+            )),
+            "{stderr}"
+        );
     }
 }

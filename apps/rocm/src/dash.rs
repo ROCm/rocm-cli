@@ -58,10 +58,11 @@ pub fn runner_options(
         instance_tick: Duration::from_secs_f64(d.instance_tick_secs),
         disable_vllm_metrics: false,
         vllm_metrics_host: "127.0.0.1".into(),
-        // Lemonade discovery stays opt-in (mirrors a no-flag embedded daemon).
-        enable_lemonade: false,
-        lemonade_host: "127.0.0.1".into(),
-        lemonade_port: 13305,
+        // Read-only discovery of local external Lemonade; managed registry
+        // discovery remains independent of this switch.
+        enable_lemonade: d.enable_lemonade,
+        lemonade_host: d.lemonade_host.clone(),
+        lemonade_port: d.lemonade_port,
         persist_dir: Some(paths.telemetry_state_dir()),
         // D7 seam consumer: managed services from `rocm serve --managed`.
         services_dir: Some(paths.services_dir()),
@@ -211,9 +212,11 @@ fn runtime_summaries(paths: &AppPaths, config: &RocmCliConfig) -> Vec<RuntimeSum
     let active_key = config.active_runtime_key.as_deref();
     let prev_key = config.previous_runtime_key.as_deref();
     let default_id = config.default_runtime_id.as_deref();
-    // Mirror `render_runtimes_text`: a runtime is active by an explicit
-    // active_runtime_key, or — absent one — by being the single manifest whose
-    // runtime_id matches the configured default_runtime_id.
+    // The dash matches exactly: a runtime is active when its key equals
+    // active_runtime_key, or, with no active_runtime_key, when it is the single
+    // runtime whose id equals default_runtime_id; it is the rollback target
+    // when its key equals previous_runtime_key. docs/json-output.md compares
+    // these rules with what `rocm runtimes list` marks.
     let default_matches: Vec<&str> = manifests
         .iter()
         .filter(|m| Some(m.runtime_id.as_str()) == default_id)
@@ -256,6 +259,29 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
             mode: config.effective_watcher_mode(w).as_str().to_string(),
         })
         .collect()
+}
+
+/// Read-only managed-engine inventory, independent of GPU telemetry and
+/// endpoint liveness. An unavailable detect response means unknown, not absent.
+fn lemonade_managed_installed(paths: &AppPaths) -> Option<bool> {
+    let detect = crate::engine_ipc::engine_request::<_, rocm_engine_protocol::DetectResponse>(
+        Some(paths),
+        "lemonade",
+        rocm_engine_protocol::EngineMethod::Detect,
+        &rocm_engine_protocol::DetectRequest::default(),
+    )
+    .ok();
+    managed_installed_from_detect(detect.as_ref())
+}
+
+/// Pure verdict over a Detect result: `None` when Detect failed (unknown, not
+/// absent); otherwise installed only counts when the runtime is managed. A
+/// legacy response without `managed_env` is not proof of a managed install.
+fn managed_installed_from_detect(
+    detect: Option<&rocm_engine_protocol::DetectResponse>,
+) -> Option<bool> {
+    let detect = detect?;
+    Some(detect.installed && detect.managed_env == Some(true))
 }
 
 /// Resolve the TUI args from the unified config + environment.
@@ -328,6 +354,7 @@ pub fn resolved_args(
         // `resolved_args` itself has no opinion, so this always starts `false`
         // here.
         launcher_hosted: false,
+        lemonade_managed_installed: lemonade_managed_installed(paths),
     }
 }
 
@@ -345,8 +372,9 @@ pub fn resolved_args(
 /// `rocm_dash_tui::client`'s `#[cfg(windows)]` arm does connect and stream
 /// live GPU/CPU/memory every tick but — by design, there being no
 /// `rocmdashd` unix socket to source one from (`maybe_spawn_embedded_daemon`
-/// is unix-only) — never sends an instance snapshot, so
-/// `AppState::instances` never gets a first one there.
+/// is unix-only) — never sends an instance snapshot, so this probe is also
+/// where `AppState::instances` comes from there: the dashboard polls it
+/// (`ManagedRegistrySnapshot::instances`) once a second off the UI thread.
 ///
 /// **Known divergence, same shape as [`services_past_attempts`]'s:** this
 /// reads the record's raw on-disk `status`, not process liveness. A service
@@ -366,9 +394,29 @@ impl ManagedRegistryProbe for LiveManagedRegistryProbe {
         let discovery = discover_managed_services(&records);
         ManagedRegistrySnapshot {
             has_live_service: discovery.svcs.iter().any(|svc| svc.status.is_serving()),
+            instances: managed_instances(&discovery),
             managed_ids: discovery.seen,
         }
     }
+}
+
+/// The live managed services as dashboard instances with no telemetry yet —
+/// the same mapping the daemon applies to a newly discovered service.
+fn managed_instances(
+    discovery: &rocm_dash_daemon::registry::ManagedDiscovery,
+) -> Vec<rocm_dash_core::metrics::Instance> {
+    discovery
+        .svcs
+        .iter()
+        .map(|svc| {
+            rocm_dash_core::traits::merge_instance(
+                svc,
+                &rocm_dash_core::traits::InstanceSample::default(),
+                0,
+                0,
+            )
+        })
+        .collect()
 }
 
 /// Managed-service records that are no longer running, read from the same
@@ -706,18 +754,7 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
 fn launcher_serving_instances(paths: &AppPaths) -> Vec<rocm_dash_core::metrics::Instance> {
     use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
     let records = load_service_records(&paths.services_dir());
-    discover_managed_services(&records)
-        .svcs
-        .into_iter()
-        .map(|svc| rocm_dash_core::metrics::Instance {
-            container_id: svc.container_id,
-            container_name: svc.container_name,
-            model_name: svc.model_name,
-            status: svc.status,
-            port: svc.port,
-            ..Default::default()
-        })
-        .collect()
+    managed_instances(&discover_managed_services(&records))
 }
 
 /// Entry point for a focused launcher flow (Set up / Serve / Diagnose).
@@ -1080,6 +1117,63 @@ async fn maybe_spawn_embedded_daemon(
 mod tests {
     use super::*;
 
+    fn detect(installed: bool, managed_env: Option<bool>) -> rocm_engine_protocol::DetectResponse {
+        let mut v = serde_json::json!({
+            "installed": installed, "env_id": null, "python_version": null,
+            "torch_version": null, "transformers_version": null,
+            "available_devices": [], "notes": [],
+            "capabilities": {"cpu": false, "rocm_gpu": false, "openai_compatible": true,
+                "tool_calling": false, "quantized_models": "", "reasoning_parser": false}
+        });
+        if let Some(m) = managed_env {
+            v["managed_env"] = m.into();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn managed_installed_verdict_follows_detect_result() {
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(true)))),
+            Some(true)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(false)))),
+            Some(false)
+        );
+        // Legacy response without the ownership field proves nothing managed.
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, None))),
+            Some(false)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(false, Some(true)))),
+            Some(false)
+        );
+        // A failed Detect is unknown, never "not installed".
+        assert_eq!(managed_installed_from_detect(None), None);
+    }
+
+    #[test]
+    fn lemonade_discovery_defaults_and_overrides_reach_daemon() {
+        let default = runner_options(&RocmCliConfig::default(), &paths(), false);
+        assert!(default.enable_lemonade);
+        assert_eq!(default.lemonade_host, "127.0.0.1");
+        assert_eq!(default.lemonade_port, 13305);
+        let config: RocmCliConfig = serde_json::from_str(
+            r#"{
+            "dashboard": {"daemon": {"enable_lemonade": false,
+                "lemonade_host": "localhost", "lemonade_port": 14567}}
+        }"#,
+        )
+        .unwrap();
+        let overridden = runner_options(&config, &paths(), false);
+        assert!(!overridden.enable_lemonade);
+        assert_eq!(overridden.lemonade_host, "localhost");
+        assert_eq!(overridden.lemonade_port, 14567);
+        assert_eq!(overridden.services_dir, Some(paths().services_dir()));
+    }
+
     fn cfg() -> RocmCliConfig {
         RocmCliConfig::default()
     }
@@ -1297,6 +1391,61 @@ mod tests {
             !probe_snapshot(&args).has_live_service,
             "the probe must reflect the current registry state, not a one-shot snapshot"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows has no daemon, so the dashboard's instance list comes from the
+    /// probe's `instances` (see `AppState::push_host_gpu_snapshot`). A ready
+    /// Lemonade record must come through with its model and port; a stopped
+    /// record and one with no bound port must not.
+    #[test]
+    fn live_registry_probe_carries_the_live_managed_instances() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "probe-instances-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"lemonade-qwen","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M","port":11436,"status":"ready","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("stopped.json"),
+            br#"{"service_id":"lemonade-old","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct","port":11435,"status":"stopped","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"lemonade-unbound","engine":"lemonade","port":0,"status":"ready","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        let instances = probe_snapshot(&args).instances;
+        assert_eq!(
+            instances.len(),
+            1,
+            "only the live, bound record: {instances:?}"
+        );
+        let inst = &instances[0];
+        assert_eq!(inst.container_id, "lemonade-qwen");
+        assert_eq!(inst.model_name, "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M");
+        assert_eq!(inst.port, Some(11436));
+        assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1915,6 +2064,9 @@ mod tests {
         assert_eq!(inst.model_name, "meta-llama/Llama-3.1-8B");
         assert_eq!(inst.port, Some(11435));
         assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
+        // Registry records are owned by this CLI; the flag must survive the map
+        // so lifecycle surfaces treat the launcher row as managed.
+        assert!(inst.managed, "registry-owned record must stay managed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -37,7 +37,17 @@ ureq = { version = "2.12", features = ["json", "native-certs"] }
 # extractor's dependency surface small.
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Reads the version nodes the host's libc.so.6 and libssl.so.3 define, to
+# refuse a host older than the pinned `lemond` needs (`src/host_libraries.rs`).
+# 0.37 with only the ELF reader: `backtrace` already links this version into
+# `rocm`, so it adds no crate there. The standalone `rocm-engine-lemonade`
+# binary has no `backtrace`, so for it `object` is one new crate.
+object = { version = "0.37", default-features = false, features = ["read_core", "elf"] }
+
 [dev-dependencies]
+# The shared engine protocol contract check (`engine_contract`).
+rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
 rocm-core = { path = "../../crates/rocm-core", features = ["test-support"] }
 # Archive-extraction property tests; see `crates/rocm-core/src/archive_props.rs`.
 proptest = { version = "1", default-features = false, features = ["std"] }

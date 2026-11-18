@@ -34,20 +34,35 @@
 
 # --- EAI-7219: short-name expansion (vLLM does not show an expanded name) ---
 # What the lane logs show, so the scope below is not read as more than it is:
-# lemonade DOES print the full name (`resolved model: Qwen/Qwen2.5-1.5B-Instruct`)
-# on the Strix Halo Ubuntu and Windows lanes, and vLLM's stdout is empty -- the run
-# stopped before it printed a serve plan, so the plan's name line was never
-# reached. EAI-7219 as reported describes the other shape: a vLLM plan that prints
-# `resolved model: qwen2.5`, the alias left unexpanded; the lane logs have not
-# shown it. The steps used to discard stderr, so the cause of the empty stdout was
-# not known. The first lane run that reported it (run 41811714290: Strix Halo
-# Ubuntu release and nightly, and MI300X) shows vLLM stopping at "no active ROCm
-# runtime is configured", before any alias handling, so on those lanes the rows are
-# red for a missing runtime and not for this bug. On native Windows the stop is the
-# up-front vLLM refusal (ROCMAI-823), a designed refusal and not this bug either.
+# lemonade prints the full name on the Strix Halo Ubuntu and Windows lanes, and
+# vLLM's stdout is empty -- the run stopped before it printed a serve plan, so the
+# plan's name line was never reached. vLLM is therefore the whole of what keeps
+# these rows red.
+#
+# ROCMAI-863's pre-launch refusal does NOT reach these rows, though an earlier
+# revision of this comment said it did. That was written when `qwen2.5` expanded
+# to the bare `Qwen/Qwen2.5-1.5B-Instruct`, which ships no GGUF; #1044 then gave
+# that recipe a per-engine ref, so lemonade is handed
+# `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M` with the variant already pinned and
+# the refusal has nothing to fire on. The lemonade half still prints its name.
+# EAI-7219 as reported describes
+# the other shape: a vLLM plan that prints `resolved model: qwen2.5`, the alias
+# left unexpanded; the lane logs have not shown it. The steps used to discard
+# stderr, so the cause of the empty stdout was not known. The first lane run
+# that reported it (run 41811714290: Strix Halo Ubuntu release and nightly, and
+# MI300X) shows vLLM stopping at "no active ROCm runtime is configured", before
+# any alias handling, so on those lanes the rows are red for a missing runtime
+# and not for this bug. On native Windows the stop is the up-front vLLM refusal
+# (ROCMAI-823), a designed refusal and not this bug either.
 # The rows keep their all-hosts scope until the scenarios get a managed runtime or
 # are gated on the engine and the rows are narrowed to the real bug; their reasons
 # name both shapes so neither becomes a false claim.
+#
+# Looking forward rather than back, and not yet observed on any lane: the catalog
+# now gives `qwen2.5` a per-engine model id, so the name lemonade prints is
+# expected to become `Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M` while vLLM keeps
+# `Qwen/Qwen2.5-1.5B-Instruct`. The two differing is by design, which is why
+# serve-02 asks each engine to expand the alias rather than to agree on a name.
 [["serve-short-name-expansion"]]
 when = {}
 bug = "EAI-7219"
@@ -56,7 +71,7 @@ reason = "A vLLM serve of a short name shows no expanded full model name: it eit
 [["serve-short-name-consistent-across-engines"]]
 when = {}
 bug = "EAI-7219"
-reason = "A vLLM serve of a short name does not resolve to lemonade's full model name: it either stops before printing a serve plan or prints the alias unexpanded."
+reason = "A serve of a short name does not show the full model name the engine will serve: vLLM either stops before printing a serve plan or prints the alias unexpanded, and the lemonade half is only reached once that stops happening."
 
 # ROCMAI-898 tracks multiple Strix Halo Ubuntu Lemonade serve signatures (first
 # tracked as GitHub issue ROCm/rocm-cli#897, since closed; ROCMAI-898 is the open
@@ -176,6 +191,16 @@ reason = "Lemonade serving fails on the Strix Halo Ubuntu lanes, so the model ne
 serve_timeout_secs = 90
 flaky = true
 
+# The dashboard journey does the same real lemonade serve as serve-lemonade-inference,
+# so on a Linux lemonade host it is just as intermittent. The bounded serve timeout
+# makes a stuck serve fail this one scenario instead of stalling the whole lane.
+[["dash-lemonade-managed-inference-journey"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "ROCMAI-898"
+reason = "The managed Lemonade serve on Linux is intermittent: it can reach ready and then shut down, or never become ready, so the journey cannot be relied on to complete."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "vllm" }
@@ -218,10 +243,10 @@ reason = "Lemonade managed serve never exposes the model: observed backend argum
 serve_timeout_secs = 90
 flaky = true
 
-# --- Lemonade 11.5.1 cannot align its llama.cpp backend to a ROCm 7.14.x SDK ---
+# --- Lemonade 11.5.1 could not align its llama.cpp backend to a ROCm 7.14.x SDK ---
 # `rocm engines install lemonade` tries to align Lemonade's `llamacpp:rocm`
-# backend with the active ROCm SDK. Lemonade 11.5.1, the pin in
-# `runtime-deps.toml`, downloads the TheRock tarball it pairs with the backend
+# backend with the active ROCm SDK. Lemonade 11.5.1, which `runtime-deps.toml`
+# pinned when these rows were written, downloads the TheRock tarball it pairs with the backend
 # only from https://repo.amd.com/rocm/tarball/, a path the 7.14.x tarballs are not
 # published to (AMD's 7.14 install guide uses /rocm/tarball-multi-arch/), so the
 # download answers HTTP 403 for `therock-dist-<os>-<family>-7.14.1.tar.gz`. The
@@ -244,12 +269,21 @@ flaky = true
 # `serve_timeout_secs`: serve-06's own `@serve-timeout:2400` tag takes precedence
 # over a row, so a shorter wait here would have no effect, and the failing
 # serve-06 still holds the Windows lane for the full 2400s wait.
+#
+# The pin is now Lemonade 2026.44.1, which fetches TheRock from AMD's whl-next
+# wheel index or its core tarball location, and whose pinned llama.cpp build
+# (b11580) ships a ROCm 7.14 archive. So both rows may now XPASS. That has not
+# been observed yet: both scenarios are `@nightly`, which pull-request lanes do
+# not run. A stale XPASS on the first Windows nightly run after the 2026.44.1 pin
+# lands means the cause is gone, and the row is deleted then, in a follow-up by
+# the author of the 2026.44.1 pin. ROCMAI-899 is already closed; the row stays
+# until that nightly shows the XPASS.
 [["runtime-lemonade-backend-alignment-reported"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-899"
-reason = "Lemonade 11.5.1 fetches TheRock only from repo.amd.com/rocm/tarball/, where 7.14.x is not published (HTTP 403), so its backend cannot be aligned to a 7.14.x SDK and the install reverts to the pinned 7.13 backend."
+reason = "Observed with Lemonade 11.5.1, which fetched TheRock only from repo.amd.com/rocm/tarball/, where 7.14.x is not published (HTTP 403), so its backend could not be aligned to a 7.14.x SDK and the install reverted to the pinned 7.13 backend. Not yet re-checked with the 2026.44.1 pin, which fetches TheRock elsewhere; delete this row if the Windows nightly lane reports it as a stale XPASS."
 
 [["serve-large-model-inference"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-900"
-reason = "The Windows large-model serve crashes in the SDK's Tensile library on the first inference request; the pinned ROCm 7.13 backend runs against the 7.14.1 SDK because Lemonade 11.5.1 cannot align it (suspected cause, not reproduced off Windows)."
+reason = "The Windows large-model serve crashed in the SDK's Tensile library on the first inference request while Lemonade 11.5.1 was pinned: its ROCm 7.13 backend ran against the 7.14.1 SDK because 11.5.1 could not align it (suspected cause, not reproduced off Windows). Not yet re-checked with the 2026.44.1 pin; delete this row if the Windows nightly lane reports it as a stale XPASS."

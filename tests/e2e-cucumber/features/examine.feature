@@ -540,7 +540,7 @@ Feature: GPU detection and system inspection
     And the inspection's driver detail says the library is missing from the linker cache
 
   # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
-  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # name and searches its own `$ORIGIN` directory, so the loader finds it from the runtime's own
   # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
   # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
   # control is `examine-33`, the same machine with the library alone.
@@ -733,6 +733,67 @@ Feature: GPU detection and system inspection
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
 
+  # A ROCm wheel ships `librocdxg.so.1` beside `libhsa-runtime64`, but the HSA
+  # runtime opens `librocdxg.so`, a name the wheel does not ship, so on WSL2 it
+  # loads the host's librocdxg and never the copy it was built with. A 10.2 or
+  # newer nightly runtime then fails at first GPU use against a host
+  # `rocdxg-roct` 1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`), while
+  # `driver_status` still reads `wsl_rocdxg_ready`. The inspection lists such a
+  # copy; the control is the same runtime with `librocdxg.so` beside it. The
+  # install side of the same change (`rocm install sdk` linking the name) needs a
+  # real wheel download and is covered by unit tests only.
+  @id:examine-lists-a-runtime-librocdxg-its-runtime-does-not-load @requires-os:linux
+  Scenario: examine-49 - The inspection lists a managed runtime's librocdxg that its own runtime does not load
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection lists that runtime's librocdxg as one its own runtime does not load
+
+  @id:examine-lists-no-runtime-librocdxg-when-the-runtime-loads-its-own @requires-os:linux
+  Scenario: examine-50 - The inspection lists nothing when the runtime has librocdxg.so beside its own copy
+    Given a WSL machine with a managed runtime that has librocdxg.so beside its own copy
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The advice names a command: it has to exist and has to clear the finding.
+  @id:examine-runtime-librocdxg-advice-clears-the-finding @requires-os:linux
+  Scenario: examine-51 - Running the command the inspection advises clears the runtime librocdxg finding
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The finding is advice about the WSL loader path; a native host with the same
+  # runtime gets none.
+  @id:examine-lists-no-runtime-librocdxg-off-wsl @requires-os:linux
+  Scenario: examine-52 - The inspection lists no runtime librocdxg on a machine that is not WSL
+    Given a machine that is not WSL with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # A broken `librocdxg.so` link is as bad as none: the loader's open() fails on
+  # it as on a missing file and the runtime loads the host's copy (observed with
+  # LD_DEBUG=libs on the 10.2 nightly, which still exited 139). The inspection
+  # lists it, and the advised command (which must replace a dangling link, so a
+  # plain `ln -s` is not enough) leaves the name reading as the runtime's own copy.
+  @id:examine-lists-a-dangling-runtime-librocdxg-link-and-the-advice-clears-it @requires-os:linux
+  Scenario: examine-53 - A dangling librocdxg.so link is listed and the advised command replaces it
+    Given a WSL machine with a managed runtime whose librocdxg.so is a link to a missing file
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists that runtime's librocdxg as one its own runtime does not load
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # `examine` reports the active runtime's channel, package source, source layout
+  # and exact GPU target in the same words and from the same manifest fields as
+  # the `provenance:` line `rocm runtimes list` prints for it
+  # (`runtime-lifecycle-22`). The planted manifest needs no GPU or download, so
+  # this runs on the mock lane.
+  @id:examine-reports-where-the-active-runtime-came-from
+  Scenario: examine-54 - Examining the system says where the active runtime came from
+    Given the active runtime is a nightly runtime installed for one exact GPU
+    When the user inspects the system
+    Then the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from
+
   # Whether a GPU is integrated decides what a user sees: `rocm diagnose`
   # raises `fix-9-igpu-dgpu` from `is_apu` only on a host with both an
   # integrated and a discrete AMD GPU, and on a single-GPU host whose target is
@@ -753,7 +814,7 @@ Feature: GPU detection and system inspection
   # adds is covered one level down: on a real host its agents are dropped by
   # ROCm/rocm-cli#393, so the folds it feeds cannot be reached from here.)
   @id:examine-tells-integrated-gpus-from-discrete-ones @requires-os:linux
-  Scenario: examine-49 - The inspection tells integrated GPUs from discrete ones by the part they are
+  Scenario: examine-55 - The inspection tells integrated GPUs from discrete ones by the part they are
     Given a machine whose PCI bus lists a Radeon RX 7900 XTX and four integrated AMD GPUs
     When the user inspects that machine in machine-readable form
     Then the inspection names each GPU's architecture and reports only the RX 7900 XTX as discrete
@@ -771,7 +832,7 @@ Feature: GPU detection and system inspection
   # stand-in `lspci` lists the two GPUs, a stand-in `rocminfo` lists no agents,
   # and the simulated host root carries a kernel topology node for each card.
   @id:examine-classifies-an-igpu-from-the-kernel-topology @requires-os:linux
-  Scenario: examine-50 - An integrated GPU that only the kernel identifies is reported as integrated
+  Scenario: examine-56 - An integrated GPU that only the kernel identifies is reported as integrated
     Given a machine with a Raven Ridge integrated GPU and a discrete AMD GPU that only the kernel identifies
     When the user inspects that machine in machine-readable form
     Then the inspection reports the Raven Ridge GPU as an integrated gfx902 and the other card as discrete
@@ -781,10 +842,10 @@ Feature: GPU detection and system inspection
   # ships no `pciutils`, so the kernel's topology is the only list of GPUs. A
   # card listed from the topology alone used to carry no verdict whatever its
   # architecture, so such a host reported neither an integrated nor a discrete
-  # GPU. Simulated as `examine-50` is, with a stand-in `lspci` that lists
+  # GPU. Simulated as `examine-56` is, with a stand-in `lspci` that lists
   # nothing and no PCI address on either topology node.
   @id:examine-classifies-gpus-only-the-kernel-lists @requires-os:linux
-  Scenario: examine-51 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
+  Scenario: examine-57 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
     Given a machine whose only list of GPUs is the kernel's, naming a Strix Halo integrated GPU and a Radeon RX 9070 XT
     When the user inspects that machine in machine-readable form
     Then the inspection reports the Strix Halo GPU as integrated and the RX 9070 XT as discrete

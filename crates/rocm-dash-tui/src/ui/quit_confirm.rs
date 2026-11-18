@@ -88,11 +88,11 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
     quit_confirm_body_with(state, &snapshot)
 }
 
-/// Body text for the quit-confirm prompt: name the models still serving
-/// (mirroring the serving rows of the Serving tab's "Running now" listing in
-/// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
-/// styled spans; that listing also shows starting services, which this gate
-/// deliberately does not count), and how to stop each one that this host's own registry
+/// Body text for the quit-confirm prompt: name every model still serving,
+/// managed or not (the Serving tab's "Managed running" listing in
+/// `tabs::pane::live_lines`'s `OpenServices` arm is managed-only, and also shows
+/// starting services, which this gate deliberately does not count, so this
+/// listing can be longer or shorter than it), and how to stop each one that this host's own registry
 /// manages (a live read, passed in as `snapshot` so the caller controls how
 /// many times the registry is actually read — see `quit_confirm_request`) —
 /// not a blanket command, since a Docker- or Lemonade-discovered instance
@@ -140,11 +140,10 @@ pub(super) fn quit_confirm_body_with(
     let mut body = Vec::new();
     if total == 0 {
         // `total == 0` here only because `nothing_is_currently_being_served_with`
-        // returned `false` above: either the startup-race fallback (issue
-        // #145) is active — the daemon's first snapshot hasn't landed yet —
-        // or the connection never will succeed at all (Windows: the
-        // dashboard-embedded daemon client's connect path is unix-only, so
-        // `instances` stays empty for the whole session). `instances` can't
+        // returned `false` above: the startup-race fallback (issue #145) is
+        // active — the daemon's first snapshot hasn't landed yet, or (Windows,
+        // which has no daemon and refills `instances` from the registry each
+        // tick) a service was registered since the last tick. `instances` can't
         // name anything in either case, but the live registry read
         // (`managed_ids`) needs no daemon snapshot — it is this host's own
         // `rocm serve` registry, read straight off disk — so it can still
@@ -190,10 +189,10 @@ pub(super) fn quit_confirm_body_with(
         // `values()` happened to yield, so the listing is at least stable
         // across renders. `s` does not focus "the Nth instance named here":
         // `quit_confirm_open_services_key` always focuses the FIRST managed,
-        // still-serving row in `service_rows`' own order, which can include
-        // an unmanaged (Docker/Lemonade) entry this listing also shows ahead
-        // of it — so the row `s` focuses need not be the Nth line printed
-        // below.
+        // still-serving row in `service_rows`' own order, and `service_rows`
+        // lists managed services only — so the row `s` focuses need not be the
+        // Nth line printed below, because this listing can also show an
+        // unmanaged (Docker/Lemonade) entry that the overlay does not.
         let mut sorted: Vec<_> = running().collect();
         sorted.sort_by(|a, b| a.container_id.cmp(&b.container_id));
         for i in sorted.into_iter().take(5) {
@@ -248,11 +247,10 @@ mod tests {
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
-        // On a host whose daemon client never sends an instance snapshot
-        // (Windows — it connects and streams live GPU/CPU/memory every tick,
-        // but has no `rocmdashd` socket to source an instance list from, so
-        // `has_received_snapshot` never flips for the whole session),
-        // `instances` never fills, so without this the quit prompt
+        // Before `instances` has been filled (the daemon's first snapshot
+        // has not landed, or on Windows the registry gained a service since
+        // the last registry poll), `has_received_snapshot` is false and
+        // `instances` is empty, so without this the quit prompt
         // could only ever print the generic "a model was serving" sentence —
         // no model name (expected: `instances` is the only source for that),
         // but also no stop command and no id, even though the live registry
@@ -379,6 +377,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -411,6 +410,41 @@ mod tests {
         assert_eq!(launcher.title, dashboard.title);
     }
 
+    /// Just started: the registry names the instance but the broadcast has not
+    /// marked it managed yet. The prompt must not offer `s` (the Services overlay
+    /// has no row for it); it still prints the command that stops it.
+    #[test]
+    fn quit_confirm_request_does_not_offer_s_for_an_instance_the_broadcast_has_not_marked_managed()
+    {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-new".to_string(),
+            Instance {
+                container_id: "svc-new".to_string(),
+                model_name: "m".to_string(),
+                managed: false,
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-new"]);
+        let request = quit_confirm_request(&state, true);
+        assert!(
+            !request.body.iter().any(|l| l.contains("Press s")),
+            "{:?}",
+            request.body
+        );
+        assert!(
+            request
+                .body
+                .iter()
+                .any(|l| l.contains("rocm services stop svc-new --yes")),
+            "{:?}",
+            request.body
+        );
+    }
+
     #[test]
     fn quit_confirm_request_offers_the_stop_hint_only_for_the_dashboard_with_something_stoppable() {
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
@@ -419,6 +453,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -481,6 +516,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 model_name: "Qwen2.5-7B".to_string(),
                 status: InstanceStatus::Running,
                 ..Default::default()
@@ -563,8 +599,8 @@ mod tests {
         // `values()` happens to yield. This does not mean `s`
         // (`AppState::quit_confirm_open_services_key`) focuses the Nth
         // bullet printed here: it always focuses the FIRST managed,
-        // still-serving row in `service_rows`' own order, which can include
-        // an unmanaged entry this listing also shows.
+        // still-serving row in `service_rows`' own order, and `service_rows`
+        // lists managed services only.
         // `quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line`
         // inserts ids (`svc-0`..`svc-5`) that already sort the same way
         // whether by id or insertion order, so it can't catch a regression

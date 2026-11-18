@@ -193,7 +193,7 @@ pub(crate) fn maybe_auto_install_sdk_preferred_engine(
                 engine,
                 runtime_python_for_key(paths, &finalized.runtime_key).as_deref(),
                 &finalized.runtime_key,
-                // The engine install failed, so no alignment ran and any
+                // The engine install failed, so no alignment ran and any torch
                 // divergence found here is a real one.
                 &[],
             );
@@ -247,20 +247,25 @@ enum EngineDependencyCheck {
     ///
     /// `expected` carries any divergence the install made on purpose that shares the
     /// run with a genuine violation. It is reported separately rather than folded in
-    /// because the remedy differs: reinstalling the engine repairs `violations` and
-    /// destroys `expected`, so naming that remedy is only safe while `expected` is
-    /// empty.
+    /// because the remedy differs: reinstalling the engine repairs `violations` but
+    /// would undo a torch divergence, so naming that remedy is only safe while
+    /// `expected` holds no torch divergence. A tensorizer divergence does not rule
+    /// it out: the reinstall re-checks tensorizer and upgrades it again.
     Violated {
         violations: Vec<String>,
         expected: Vec<String>,
     },
     /// The only unmet requirements are ones the install deliberately diverged from.
     ///
-    /// Torch alignment leaves the runtime holding the SDK's build of the release
-    /// the engine pins, which the engine's exact-pin metadata cannot express. The
-    /// distinction matters because the remedy for a real violation — reinstalling
-    /// the engine — is precisely what would undo the alignment and restore a
-    /// runtime that cannot open a device.
+    /// Two installs do this. Torch alignment leaves the runtime holding the SDK's
+    /// build of the release the engine pins, and the tensorizer upgrade leaves
+    /// vLLM's runtime holding a newer tensorizer than the one it pins because the
+    /// pinned one cannot be imported; the engine's exact-pin metadata cannot
+    /// express either. The distinction matters for torch: the remedy for a real
+    /// violation — reinstalling the engine — would undo a torch divergence and
+    /// restore a runtime that cannot open a device. A tensorizer divergence does not
+    /// rule the reinstall out: the install re-checks tensorizer and upgrades it
+    /// again.
     ExpectedDivergence(Vec<String>),
     /// The check itself could not run (no usable `uv`, unreadable environment).
     NotVerified(String),
@@ -854,27 +859,28 @@ fn engine_dependency_check(
 /// Each line is judged on its own subject: a genuine violation elsewhere in the
 /// same run says nothing about the package the install deliberately diverged on,
 /// and must not drag it along. Lumping the two together loses the distinction
-/// exactly where it matters most — the remedy for the genuine violation would
-/// reinstall the engine and undo the alignment.
+/// exactly where it matters most for torch — the remedy for the genuine violation
+/// would reinstall the engine and undo the alignment. A tensorizer divergence is
+/// judged by what is installed, not by `diverged`: the reinstall is a fine remedy
+/// beside it, because the install upgrades tensorizer again.
 fn classify_dependency_details(details: Vec<String>, diverged: &[&str]) -> EngineDependencyCheck {
     if details.is_empty() {
         return EngineDependencyCheck::Satisfied;
     }
-    if diverged.is_empty() {
-        return EngineDependencyCheck::Violated {
-            violations: details,
-            expected: Vec::new(),
-        };
-    }
     // A line whose subject cannot be parsed is not evidence of a divergence, so it
     // stays a violation: the conservative side keeps saying something is wrong.
+    //
+    // The tensorizer override is judged by what is installed, not by the caller's
+    // list: the engine install makes it on its own, whether or not torch was
+    // realigned, and it is a divergence in every one of those runs.
     let (expected, violations): (Vec<String>, Vec<String>) =
         details.into_iter().partition(|detail| {
-            rocm_core::violation_subject(detail).is_some_and(|subject| {
-                diverged
-                    .iter()
-                    .any(|package| subject.package.eq_ignore_ascii_case(package))
-            })
+            rocm_core::vllm_tensorizer_override_installed(detail).is_some()
+                || rocm_core::violation_subject(detail).is_some_and(|subject| {
+                    diverged
+                        .iter()
+                        .any(|package| subject.package.eq_ignore_ascii_case(package))
+                })
         });
     if violations.is_empty() {
         EngineDependencyCheck::ExpectedDivergence(expected)
@@ -884,6 +890,43 @@ fn classify_dependency_details(details: Vec<String>, diverged: &[&str]) -> Engin
             expected,
         }
     }
+}
+
+/// Whether an expected-divergence line is the tensorizer override rather than the
+/// torch alignment, which decides which explanation the report points at.
+fn is_tensorizer_divergence(detail: &str) -> bool {
+    rocm_core::vllm_tensorizer_override_installed(detail).is_some()
+}
+
+/// The line that says why a tensorizer divergence is kept, printed with the
+/// divergence itself so a later install, which prints no upgrade warning, still
+/// carries its own explanation.
+///
+/// It names the release the runtime actually holds, read from the same
+/// `uv pip check` line the divergence was accepted from, and claims only what
+/// that line and the accepted rule establish: vLLM pins an older tensorizer, and
+/// the installed one is at or above the fixed release. It does not state the
+/// Python version, which the rule does not look at.
+fn tensorizer_divergence_note(expected: &[String]) -> Option<String> {
+    let installed = expected
+        .iter()
+        .find_map(|detail| rocm_core::vllm_tensorizer_override_installed(detail))?;
+    // Parsed from a `uv pip check` line, so flattened like the other values here.
+    // The override rule only accepts letters, digits and dots, so this cannot change
+    // the value today; it stays as a guard against a looser rule.
+    let installed = sanitize_log_value(&installed);
+    Some(format!(
+        "  note: vLLM pins an older tensorizer release; this runtime has tensorizer {installed}, at or above the fixed release {}, which the vLLM install keeps, so `uv pip check` reports vLLM's pin as unmet",
+        rocm_core::TENSORIZER_PYTHON314_FIX
+    ))
+}
+
+/// Whether any expected divergence is something other than the tensorizer
+/// upgrade, that is, the torch alignment that the `torch_alignment` block explains.
+fn has_torch_divergence(expected: &[String]) -> bool {
+    expected
+        .iter()
+        .any(|detail| !is_tensorizer_divergence(detail))
 }
 
 fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck) -> String {
@@ -910,19 +953,31 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
             for detail in expected {
                 let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
             }
-            if expected.is_empty() {
-                let _ = writeln!(
-                    output,
-                    "  action: rocm engines install {engine} --reinstall"
-                );
-            } else {
-                // The reinstall would repair the violations above and reinstate the
-                // engine's own build of the diverged package, restoring a runtime
-                // that cannot open a device. Naming a remedy that trades one defect
-                // for a worse one is not worth the convenience.
+            if let Some(note) = tensorizer_divergence_note(expected) {
+                let _ = writeln!(output, "{note}");
+            }
+            // A reinstall repairs the violations above. It also re-checks tensorizer
+            // and upgrades it again, so a tensorizer divergence alone does not make
+            // it unsafe. A torch divergence does: the reinstall would reinstate the
+            // engine's own torch build, which cannot open a device against the SDK,
+            // and naming a remedy that trades one defect for a worse one is not
+            // worth the convenience; the torch_alignment block above says why.
+            //
+            // Proven by e2e scenario `vllm-tensorizer-13` (vllm_tensorizer.feature):
+            // it starts from a genuine violation beside the upgraded tensorizer that
+            // only a `--reinstall` clears, takes the command to run from this very
+            // `action:` line, and checks the violation is gone and tensorizer was
+            // upgraded again after vLLM's own pin came back. Scenario 12 shows the
+            // plain repair pass does the same.
+            if has_torch_divergence(expected) {
                 let _ = writeln!(
                     output,
                     "  action: repair the violations above without reinstalling {engine}; a reinstall would undo the divergence kept on purpose (see torch_alignment above)"
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "  action: rocm engines install {engine} --reinstall"
                 );
             }
         }
@@ -931,15 +986,28 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
             for detail in details {
                 let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
             }
-            // Deliberately not the reinstall remedy. It does not apply to
-            // either state that reaches here: a reinstall realigns torch again
+            if let Some(note) = tensorizer_divergence_note(details) {
+                let _ = writeln!(output, "{note}");
+            }
+            // Deliberately not the reinstall remedy. It does not apply to any
+            // state that reaches here. For torch, a reinstall realigns it again
             // and reproduces the SDK build, and where the user has opted out of
-            // that realignment it would undo the decision they made. Which of
-            // the two this is, the block above has already said.
-            let _ = writeln!(
-                output,
-                "  action: none; this torch stack is kept on purpose (see torch_alignment above)"
-            );
+            // that realignment it would undo the decision they made; which of
+            // the two this is, the torch_alignment block above has already said.
+            // For tensorizer, a reinstall is harmless but unnecessary: it puts
+            // vLLM's own pin back and the install then upgrades tensorizer again,
+            // and the note printed just above says why the divergence exists.
+            if has_torch_divergence(details) {
+                let _ = writeln!(
+                    output,
+                    "  action: none; this torch stack is kept on purpose (see torch_alignment above)"
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "  action: none; this tensorizer is kept on purpose (see the note above)"
+                );
+            }
         }
     }
     output
@@ -1169,6 +1237,186 @@ pub(crate) mod tests {
         assert!(
             !rendered.contains("action: rocm engines install vllm --reinstall"),
             "the reinstall remedy does not apply to a deliberate divergence: {rendered}"
+        );
+    }
+
+    const TENSORIZER_UNMET: &str =
+        "The package `vllm` requires `tensorizer==2.10.1`, but `2.12.1` is installed";
+
+    #[test]
+    fn the_tensorizer_upgrade_is_an_expected_divergence_without_any_torch_alignment() {
+        // The install upgrades vLLM's pinned tensorizer. `diverged` is empty here:
+        // torch was not touched.
+        let outcome = classify_dependency_details(vec![TENSORIZER_UNMET.to_owned()], &[]);
+
+        assert!(
+            matches!(&outcome, EngineDependencyCheck::ExpectedDivergence(d) if d.len() == 1),
+            "{outcome:?}"
+        );
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("  dependency_check: expected_divergence\n"));
+        assert!(rendered.contains("this tensorizer is kept on purpose"));
+        assert!(
+            !rendered.contains("torch_alignment") && !rendered.contains("--reinstall"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_tensorizer_divergence_explains_itself_without_an_upgrade_warning() {
+        // A repeat install prints no upgrade warning, so the block carries its own
+        // reason and the action line points at that note.
+        let outcome = classify_dependency_details(vec![TENSORIZER_UNMET.to_owned()], &[]);
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+
+        assert!(
+            rendered.contains("  note: vLLM pins an older tensorizer release; this runtime has tensorizer 2.12.1, at or above the fixed release 2.12.1, which the vLLM install keeps, so `uv pip check` reports vLLM's pin as unmet"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  action: none; this tensorizer is kept on purpose (see the note above)\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_note_names_the_tensorizer_the_runtime_actually_holds() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `tensorizer==2.10.1`, but `2.13.0` is installed"
+                    .to_owned(),
+            ],
+            &[],
+        );
+
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(
+            rendered.contains(
+                "this runtime has tensorizer 2.13.0, at or above the fixed release 2.12.1"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_version_with_control_characters_is_a_violation_and_is_flattened_when_printed() {
+        // A local segment may only hold letters, digits and dots, so such a version
+        // is not the override and no divergence note prints it; it is a plain
+        // violation, whose line is flattened like every other value here.
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `tensorizer==2.10.1`, but `2.12.1+x\ny` is installed"
+                    .to_owned(),
+            ],
+            &[],
+        );
+
+        assert!(
+            matches!(outcome, EngineDependencyCheck::Violated { .. }),
+            "{outcome:?}"
+        );
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("`2.12.1+x y` is installed"), "{rendered}");
+        assert!(!rendered.contains("\ny"), "{rendered}");
+    }
+
+    #[test]
+    fn another_packages_tensorizer_pin_is_not_the_vllm_override() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `lemonade` requires `tensorizer==2.10.1`, but `2.12.1` is installed"
+                    .to_owned(),
+            ],
+            &[],
+        );
+
+        assert!(
+            matches!(outcome, EngineDependencyCheck::Violated { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_torch_and_a_tensorizer_divergence_together_keep_both_explanations() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
+                TENSORIZER_UNMET.to_owned(),
+            ],
+            &["torch"],
+        );
+
+        assert!(
+            matches!(&outcome, EngineDependencyCheck::ExpectedDivergence(d) if d.len() == 2),
+            "{outcome:?}"
+        );
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(
+            rendered.contains("  note: vLLM pins an older tensorizer release"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "action: none; this torch stack is kept on purpose (see torch_alignment above)"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_pin_on_a_newer_tensorizer_than_the_one_installed_is_still_a_violation() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `tensorizer==2.13.0`, but `2.12.1` is installed"
+                    .to_owned(),
+            ],
+            &[],
+        );
+
+        assert!(
+            matches!(outcome, EngineDependencyCheck::Violated { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_tensorizer_older_than_the_fix_is_still_a_violation() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `tensorizer==2.10.1`, but `2.9.0` is installed"
+                    .to_owned(),
+            ],
+            &[],
+        );
+
+        assert!(
+            matches!(outcome, EngineDependencyCheck::Violated { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_violation_next_to_the_tensorizer_upgrade_advises_the_reinstall_that_keeps_it() {
+        // A reinstall repairs numpy and re-checks tensorizer, which it upgrades
+        // again, so unlike a torch divergence it is the right remedy here.
+        let outcome = classify_dependency_details(
+            vec![
+                TENSORIZER_UNMET.to_owned(),
+                "The package `vllm` requires `numpy==2.0.0`, but `1.26.0` is installed".to_owned(),
+            ],
+            &[],
+        );
+
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("  dependency_check: violated\n"));
+        assert!(rendered.contains("  violation: The package `vllm` requires `numpy"));
+        assert!(rendered.contains("  divergence: The package `vllm` requires `tensorizer"));
+        assert!(rendered.contains("  note: vLLM pins an older tensorizer release"));
+        assert!(
+            rendered.contains("  action: rocm engines install vllm --reinstall\n"),
+            "{rendered}"
         );
     }
 

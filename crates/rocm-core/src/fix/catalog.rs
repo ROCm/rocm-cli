@@ -23,6 +23,23 @@ use super::runners;
 /// apart in wording before they shared this constant.
 pub(crate) const COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED: &str = "Neither option is recommended over the other: which is right depends on which stack you mean to keep, and removing the wrong one breaks a working environment.";
 
+/// fix-4's verify line, shared verbatim by this recipe and the `Fix` that
+/// `diagnose/linux.rs`'s `check_4_render_group` builds, so `rocm fix` and
+/// `rocm diagnose` cannot tell the user to check two different things. The two
+/// copies had drifted: only the diagnosis listed `/dev/kfd`.
+///
+/// What its exit status checks: that the user is in the group that owns
+/// `/dev/kfd` (as `stat -c %G` names it), or in `render` or `video`, and that
+/// `/dev/kfd` exists. The owning group is in the pattern because the diagnosis
+/// tells the user to join that group, which need not be `render`. When `stat`
+/// fails or `/dev/kfd` is missing, that alternative is empty and matches no
+/// line `groups` prints, and `ls` then fails. An owner shown as `UNKNOWN` (a
+/// GID with no name) adds only a literal `UNKNOWN`. It checks membership, not
+/// the device's mode, and it does not check `rocminfo`: `rocminfo | head`
+/// reports `head`'s status. `ls -l /dev/kfd` prints the owning group and mode
+/// for the user to read. The `\$` keeps the anchor literal in sh, bash and fish.
+pub(crate) const RENDER_GROUP_VERIFY: &str = r#"groups | tr ' ' '\n' | grep -E "^($(stat -c %G /dev/kfd 2>/dev/null)|render|video)\$" && ls -l /dev/kfd && rocminfo | head -n 5"#;
+
 /// One operating system a recipe applies on, and what it does there.
 ///
 /// Scope and class are held together rather than in two parallel lists because
@@ -153,6 +170,15 @@ impl FixRecipe {
     }
 }
 
+/// The ids of the recipes whose runners name themselves in a recovery line
+/// ("re-run `rocm fix <id>`"). One constant serves the catalog entry and the
+/// runner's message, so the command a stopped fix tells the user to re-run is
+/// always a recipe that exists.
+pub(super) const UNSET_OVERRIDE_ID: &str = "fix-2-unset-override";
+pub(super) const RENDER_GROUP_ID: &str = "fix-4-render-group";
+pub(super) const PATH_ID: &str = "fix-6-path";
+pub(super) const IGPU_DGPU_ID: &str = "fix-9-igpu-dgpu";
+
 /// The recipe registry. Mirrors the diagnosis catalog; only the small, safe
 /// fixes carry a `runner`, and what each one does can differ by platform.
 pub(super) const RECIPES: &[FixRecipe] = &[
@@ -162,7 +188,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         rationale: "Your GPU's gfx target is not in the framework wheel's compiled kernel list. Re-install the framework from an index that includes this gfx, OR rebuild llama.cpp with AMDGPU_TARGETS=<gfx>.",
         commands: &[
             "# PyTorch (Linux): a nightly often carries kernels a release has not shipped yet.",
-            "# Pick the nightly for the ROCm major you have, not an older one.",
+            "# Pick the nightly for the ROCm X.Y release you have, not an older one.",
             "pip uninstall -y torch torchvision torchaudio",
             "pip install --pre torch torchvision torchaudio \\",
             "  --index-url https://download.pytorch.org/whl/nightly/rocm7.14",
@@ -187,7 +213,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-2-unset-override",
+        fix_id: UNSET_OVERRIDE_ID,
         title: "Unset HSA_OVERRIDE_GFX_VERSION",
         rationale: "HSA_OVERRIDE_GFX_VERSION is set, but your GPU now has a native wheel. The override hides the real gfx and causes page faults / OUT_OF_REGISTERS at runtime.",
         commands: &[
@@ -241,14 +267,14 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-4-render-group",
+        fix_id: RENDER_GROUP_ID,
         title: "Add user to render/video groups",
         rationale: "The current user can't open /dev/kfd because they aren't in the render group. Adding the user is the safe, standard fix.",
         commands: &["sudo usermod -a -G render,video \"$USER\""],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: true,
-        verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && rocminfo | head -n 5",
+        verify: RENDER_GROUP_VERIFY,
         verify_linux: None,
         notes: &[],
         doc_url: None,
@@ -279,7 +305,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-6-path",
+        fix_id: PATH_ID,
         title: "Add the ROCm/HIP bin directory to PATH",
         rationale: "Linux: ROCm is installed but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
         commands: &[
@@ -342,15 +368,15 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     },
     FixRecipe {
         fix_id: "fix-8-wheel-rocm",
-        title: "Reinstall the framework against the system ROCm/HIP major",
+        title: "Reinstall the framework against the system ROCm/HIP X.Y release",
         rationale: "The framework's bundled HIP version doesn't match the system ROCm (Linux) or HIP SDK (Windows). libamdhip64.so.X / amdhip64_X.dll load failures are the usual signal.",
         commands: &[
             "pip uninstall -y torch torchvision torchaudio",
-            "# Linux: install the index for the ROCm major `rocm examine` reports:",
+            "# Linux: install the index for the ROCm X.Y release `rocm examine` reports:",
             "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14",
             "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:",
             "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0",
-            "# Windows: use TheRock's wheels matching your HIP SDK major:",
+            "# Windows: use TheRock's wheels matching your HIP SDK X.Y release:",
             "#   https://github.com/ROCm/TheRock",
         ],
         needs_sudo: false,
@@ -366,7 +392,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-9-igpu-dgpu",
+        fix_id: IGPU_DGPU_ID,
         title: "Hide the iGPU with HIP_VISIBLE_DEVICES",
         rationale: "Both an APU iGPU and a discrete AMD GPU are visible. Pin the runtime to the dGPU so the iGPU doesn't destabilise it.",
         commands: &[
@@ -483,7 +509,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         title: "Install the AMD HIP SDK for Windows",
         rationale: "Your framework links against HIP but the HIP SDK isn't installed on this host. The runtime DLLs (amdhip64_X.dll, hipblas.dll, hsa-runtime64.dll) and hipInfo.exe ship inside the SDK installer.",
         commands: &[
-            "# Download and install the HIP SDK (matched to your framework's HIP major):",
+            "# Download and install the HIP SDK (matched to your framework's HIP X.Y release):",
             "#   https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html",
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.",
         ],
@@ -715,7 +741,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-wsl-5-distro-too-old",
         title: "Move to a distro release the WSL path supports",
-        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked against, so the engine cannot start there at all. This is a hard floor, not a recommendation.",
+        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor the pinned Lemonade embeddable is linked against (newer Lemonade releases need more), so the engine cannot start there at all. This is a hard floor, not a recommendation.",
         commands: &[
             "# From Windows, install a supported distro alongside the current one:",
             "#   wsl --install -d Ubuntu-24.04",
