@@ -676,6 +676,61 @@ fn in_band_stream_errors_are_not_reported_as_a_clean_finish() {
     }
 }
 
+/// The message comes from `error.message`, then a string `error`, then a
+/// top-level `message`, each tried only if the one before is not a string; with
+/// none the placeholder is used.
+#[test]
+fn in_band_error_message_falls_back_tier_by_tier() {
+    for (line, expected) in [
+        ("{\"error\":{\"code\":500},\"message\":\"top\"}", "top"),
+        (
+            "{\"error\":{},\"message\":\"top\",\"object\":\"error\"}",
+            "top",
+        ),
+        (
+            "{\"error\":[1,2],\"message\":\"top\",\"object\":\"error\"}",
+            "top",
+        ),
+        ("{\"error\":\"plain\",\"message\":\"top\"}", "plain"),
+        (
+            "{\"error\":{\"message\":\"inner\"},\"message\":\"top\"}",
+            "inner",
+        ),
+        (
+            "{\"error\":{\"code\":500}}",
+            "unknown OpenAI-compatible stream error",
+        ),
+    ] {
+        let body = format!("data: {line}\n\n");
+        let (_, error) = openai_outcome(&[body.as_bytes()]);
+        assert_eq!(
+            error.as_deref(),
+            Some(format!("OpenAI-compatible provider stream failed: {expected}").as_str()),
+            "wrong message for {line}"
+        );
+    }
+}
+
+/// A falsy `error` field next to real content is not a failure, so a server that
+/// sends one does not have its stream failed.
+#[test]
+fn a_falsy_error_field_does_not_fail_the_stream() {
+    for falsy in ["null", "false", "0", "\"\"", "[]", "{}"] {
+        let body = format!(
+            "data: {{\"error\":{falsy},\"choices\":[{{\"delta\":{{\"content\":\"ok\"}}}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let (events, error) = openai_outcome(&[body.as_bytes()]);
+        assert_eq!(error, None, "error: {falsy} failed the stream");
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.content.as_str())
+                .collect::<String>(),
+            "ok"
+        );
+    }
+}
+
 /// After an in-band error the emitter reads no further line, even in the same
 /// chunk: the caller's callback is not called again and a later error does not
 /// replace the first.

@@ -4287,9 +4287,9 @@ What is detected, and what is not:
   that follows content tokens. The reason shown is the server's own message.
 - Not detected (no failure is reported and the status reads `ready`): a `200`
   answer with no `data:` line at all (HTML, plain JSON, an empty body); a
-  close-delimited stream cut after a token; and a complete stream with no `content` token, which is
-  deliberately not a failure (a reasoning model can spend its whole small budget
-  first, as the readiness probe also allows for). The metric rows read `n/a` when
+  close-delimited stream cut after a token; and a complete stream with no
+  `content` token, which is deliberately not a failure (a reasoning model can
+  spend its whole small budget first, as the readiness probe also allows for). The metric rows read `n/a` when
   no content token arrived first; tokens that did arrive in a close-delimited cut
   are measured.
 - Known limitation: the reason shown is whatever the provider call reported, and

@@ -463,16 +463,24 @@ fn parse_openai_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
     // Servers such as vLLM report a mid-generation failure in-band, as a
     // `{"error": ...}` payload or a bare `{"object": "error", ...}` one, and
     // then still end the stream with `[DONE]`. Skipping it would present the
-    // text produced so far as a complete answer. `"error": null` is not one.
-    let has_error = payload.get("error").is_some_and(|error| !error.is_null())
+    // text produced so far as a complete answer. Only the shapes those servers
+    // send count: a non-empty object or string under `error`. `null`, `false`,
+    // `0`, `""`, `[]` and `{}` are not an error.
+    let error = payload.get("error").filter(|error| match error {
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::String(text) => !text.is_empty(),
+        _ => false,
+    });
+    let has_error = error.is_some()
         || payload.get("object").and_then(serde_json::Value::as_str) == Some("error");
     if has_error {
-        let error = payload.get("error").filter(|error| !error.is_null());
+        // Each tier is resolved to a string before the next is tried, so an
+        // `error` object with no string `message` still yields a top-level one.
         let message = error
             .and_then(|error| error.get("message"))
-            .or(error)
-            .or_else(|| payload.get("message"))
             .and_then(serde_json::Value::as_str)
+            .or_else(|| error.and_then(serde_json::Value::as_str))
+            .or_else(|| payload.get("message").and_then(serde_json::Value::as_str))
             .unwrap_or("unknown OpenAI-compatible stream error");
         bail!("OpenAI-compatible provider stream failed: {message}");
     }
