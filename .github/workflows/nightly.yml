@@ -1419,6 +1419,9 @@ jobs:
       # leaving the queue's GPUs out without a word.
       - name: Fetch the latest queue results
         continue-on-error: true
+        # Bounds the whole step: each log read has its own timeout, but a run of
+        # many jobs on a stalled storage hop would still outlast the job's.
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
