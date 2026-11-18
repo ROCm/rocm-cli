@@ -88,7 +88,9 @@ save_results() {
 # of, and a note of how it ended in `${out}/lane-status.txt`, so a failure that
 # stops the script before or between suites, or a signal that ends it, still
 # leaves something to read. `lane.log` is the harness's, not written here. The
-# lane's status stays the one it was ending with; a failed write only warns.
+# lane's status stays the one it was ending with (the trap does not exit); a
+# failed write only warns. A signal that ends the script writes no note: bash
+# reports no status to the trap then.
 channel_running=""
 channels_failed=""
 lane_end() {
@@ -109,11 +111,8 @@ lane_end() {
     } 2>/dev/null ||
       echo "warning: could not write ${out}/lane-status.txt" >&2
   fi
-  exit "${rc}"
 }
 trap lane_end EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
 
 # One tree on one filesystem: uv only hardlinks out of its cache into a runtime
 # on the same mount, and copies every file otherwise (see e2e-selfhosted.yml).
