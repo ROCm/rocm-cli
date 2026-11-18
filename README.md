@@ -228,7 +228,9 @@ cargo build --release
 This produces the two binaries under `target/release/`:
 
 - `rocm`: the CLI and interactive interfaces
-- `rocmd`: the background telemetry daemon used by the dashboard
+- `rocmd`: the background daemon: it runs the watchers and the managed-service
+  supervisor, and serves the MCP tools (the dashboard's telemetry daemon runs
+  inside `rocm dash` itself, not in `rocmd`)
 
 Run without installing:
 
@@ -299,8 +301,24 @@ the legacy full-screen setup assistant has been retired.
 ### The dashboard (`rocm dash`)
 
 The full-screen telemetry dashboard shows every instrument and action on one screen.
-It auto-starts an embedded `rocmd` daemon when none is running, then presents
-five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+On Linux/WSL it runs its telemetry daemon inside the dashboard itself, with no
+separate service to start. Several dashboards open at once share one daemon,
+and when the dashboard running it closes, one that is still open takes it
+over, so the others reconnect and keep their chart history. After that
+hand-off the GPU figures can stay empty for a while (up to about 15 seconds on
+some hosts) while the new daemon detects the GPU again. A dashboard that
+reconnects to the same daemon can show up to about 30 recent chart points
+twice, a known issue. If the daemon was failing when you quit the dashboard
+(it could not start, or stopped serving and had not recovered), and no other
+dashboard's daemon is serving by then, the dashboard says why after you quit
+it, however you opened it (`rocm dash`, interactive `rocm chat`, or the bare
+`rocm` launcher), and also when you end it with Ctrl-C or it gets SIGINT or
+SIGTERM. If the dashboard's own supervision of its telemetry daemon crashes,
+that is reported even when another dashboard's daemon is serving, when you
+quit the dashboard; on Ctrl-C or a signal it is only written to the log
+files under the data directory's `logs` folder, as it happens. The
+dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys
+`1`–`5`):
 
 | Tab | What it shows |
 |---|---|
