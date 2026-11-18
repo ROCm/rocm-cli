@@ -30,7 +30,7 @@ This workflow adds OSS safety and verification guardrails on top of normal dev f
 
 - Solve the reported problem, not an adjacent symptom.
 - Be explicit about what is verified versus assumed.
-- Never silently skip verification; if a check cannot run, state it clearly.
+- Never silently skip verification; if a check you are expected to run cannot run, state it clearly (§8 says which those are).
 - Surface options and tradeoffs when multiple approaches are valid.
 - Require explicit user approval for high-blast-radius actions:
   - force-pushes
@@ -442,24 +442,15 @@ that is kept current.
 verbatim into the chat system prompt with `include_str!`, so the YAML
 frontmatter a published skill needs would end up inside that prompt.
 
-## 8) Verification Matrix For This Repo
+## 8) Verification: Hooks And CI Gate
 
-Minimum quality gate before upstream-ready status:
+Gating is automated in two tiers, and the PR author is responsible for the checks passing. A check the tiers run is not listed here as a command to run by hand: a hand-kept list drifts from what they run.
 
-```bash
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
-cargo test --workspace --all-targets
-prek run --all-files
-cargo xtask tpn --check
-cargo xtask e2e
-cargo xtask smoke
-```
+- Hooks run the fast checks at commit and the heavier Rust checks at push. Install them as [CONTRIBUTING.md](CONTRIBUTING.md) says, which owns how the hooks behave; [`.pre-commit-config.yaml`](.pre-commit-config.yaml) owns which hook runs at which stage and on which files. A hook that skipped is a check CI still runs, so it needs no disclosure: saying exactly what was not run applies to the by-hand checks below.
+- CI is the authority: the workflows under `.github/workflows/` (start at [`ci.yml`](.github/workflows/ci.yml)) own what runs where and when, [`docs/ci-hardware-testing.md`](docs/ci-hardware-testing.md) covers the lanes with GPUs, and §12 says to drive it to green.
+- `cargo test` does not run the e2e scenarios §3 requires: the `e2e` target of [`tests/e2e-cucumber`](tests/e2e-cucumber/Cargo.toml) sets `test = false`, and the same setting leaves the harness out of the workspace clippy run, which CI covers with a step of its own. `cargo xtask e2e` runs the scenarios (`cargo xtask e2e -- -n <regex>` selects some while you write them); CI runs them, and the path filters in `ci.yml` decide which pull requests. A green run does not show that a gated scenario ran: see §3 and [the e2e README](tests/e2e-cucumber/README.md).
 
-- `cargo test` skips the scenarios §3 requires: the `e2e` target of [`tests/e2e-cucumber`](tests/e2e-cucumber/Cargo.toml) sets `test = false`. The same setting leaves the harness out of the workspace clippy run, hence the separate `-p e2e-cucumber` line. CI runs both clippy invocations.
-- A green `cargo xtask e2e` does not show that a gated scenario ran (§3 says what to put in the PR text); after a plain run, `tests/e2e-cucumber/results/platform.json` (written from `PlatformManifest` in [`expectation.rs`](tests/e2e-cucumber/src/expectation.rs)) lists each skipped scenario with its reason. A filtered `-n` or `--tags` run is not the minimum quality gate, and neither is a run with `ROCM_CLI_BINARY` set, which tests that prebuilt binary instead of building the change (`e2e_binaries_from` in [`e2e.rs`](xtask/src/e2e.rs)).
-- `prek run --all-files` rewrites files in some hooks, so start from a clean working tree, read the diff it leaves, and re-run the lines above it if it rewrote anything. Some hooks need a tool installed locally (see [CONTRIBUTING.md](CONTRIBUTING.md)); a hook that skips, or fails for want of its tool, is a check that did not run, so say exactly what was not run (below). prek shows a skipped hook as passed unless the hook is `verbose` in [`.pre-commit-config.yaml`](.pre-commit-config.yaml): `powershell-script-analyzer` skips on a non-Windows host that way.
-- `cargo xtask tpn --check` is the `third-party-notices` CI job's command. It is a separate line because the `cargo-tpn` hook inside prek skips silently without the pinned `cargo-about`; run directly, the command fails loudly without it (`run` in [`tpn.rs`](xtask/src/tpn.rs)), which is a check that did not run (below).
+Beyond the hooks and CI, the by-hand checks you owe are the live acceptance runs and manual checks that [`docs/testing.md`](docs/testing.md) and [`docs/manual-testing.md`](docs/manual-testing.md) give for the area you touched, for example the live GPU run of [`vllm_therock_gpu_test.py`](scripts/vllm_therock_gpu_test.py) without `--self-test` (CI already runs its self-test). A GPU is optional but recommended for engine work; where you have one, those runs must pass, and otherwise they are expected to fail gracefully with clear messaging. If such a check could not run, say exactly what was not run and why in the PR text. A check you find yourself running by hand every time belongs in a hook or a CI job, so add it there instead of to this file.
 
 Deleting or weakening a test is a change in its own right: every crate has a committed
 coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops
@@ -477,20 +468,6 @@ check still fails. A scenario that is the only pre-merge guard for a seam no uni
 reaches says so in a comment beside it, as
 `@id:therock-next-09-wheel-devel-adds-the-toolchain` does; when such a scenario slows or
 destabilizes a neighbor, fix the neighbor at its own layer instead of moving the guard.
-
-When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
-
-- focused Rust test groups for touched modules
-- engine-specific GPU self-tests (`--self-test`) or live GPU tests when hardware is available
-- release gate checks for release-path changes (`python scripts/release_readiness.py --self-test`,
-  and the install-lifecycle scenarios: `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e`)
-
-**Execution environment expectations:**
-
-- By default, tests run on the developer's local machine (Linux or Windows, GPU optional but recommended for engine tests)
-- GPU tests must pass on hardware if available locally; otherwise, they are expected to fail gracefully with clear messaging
-- CI gates run on dedicated hardware and may have different results than local runs; use CI as the authoritative verification
-- If a required check cannot run locally (e.g., GPU not available), say exactly what was not run and why in PR description
 
 ## 9) Release Trust And Signing Requirements
 
@@ -555,10 +532,6 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
-After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6
-and §11's review-fix commit rules before pushing. Round-trips spent on a scenario number
-out of sequence or a clippy lint cost more than running them first.
-
 ## 13) Upstream Pre-flight Checklist
 
 Run this checklist before any upstream push, PR update, issue update, or public reply:
@@ -568,7 +541,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 3. Issue reproduced; fix validated against same repro plus boundaries — *§3*
 4. Regression test added and passing at the appropriate level — *§3*
 5. User-observable behavior covered by a scenario (or its absence justified) — *§3*
-6. Required local gates run (or explicitly documented gaps) — *§8*
+6. Hooks installed; any by-hand check that could not run named in the PR text — *§8*
 7. Leak scan completed across diff and non-diff text surfaces — *§2*
 8. Employer identity (if required), DCO sign-off, and commit-signing requirements preserved — *§2*
 9. Scope remains one logical change at correct layer — *§11*
@@ -595,7 +568,7 @@ This workflow is advisory and human-enforced. Violations are addressed through:
 
 - **Pre-push review**: Activate this workflow before pushing; review each step
 - **Code review**: Upstream maintainers may request alignment if issues are found
-- **CI gates**: Section 8 checks block CI; ensure all pass before opening PR
+- **CI gates**: required CI checks block merges; once the PR is open, drive every check to green (§12)
 - **Incident response**: If a leak or policy violation reaches upstream, document the root cause and adjust workflow
 
 This file defines OSS safety, verification, and publication guardrails for rocm-cli.
