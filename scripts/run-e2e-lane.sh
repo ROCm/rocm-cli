@@ -93,6 +93,7 @@ save_results() {
 # reports no status to the trap then.
 channel_running=""
 channels_failed=""
+# shellcheck disable=SC2329 # run by the EXIT trap, which shellcheck cannot follow
 lane_end() {
   local rc=$?
   trap - EXIT
