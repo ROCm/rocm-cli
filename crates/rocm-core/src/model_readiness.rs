@@ -25,11 +25,15 @@
 //!   is where the first one lands.
 //! - Memory the CLI **could not measure** is not memory the host **does not
 //!   have**. See [`AcceleratorMemory`].
-//! - No telemetry at all is not the same gap as telemetry that names the
-//!   *wrong pool*: an APU's `amd-smi` reading is real, it just is not the
-//!   figure its engine allocates from, and the CLI cannot read that figure
-//!   today. Conflating the two hands an APU user a remediation that can never
-//!   work. See [`AcceleratorMemory::UnifiedMemoryUnreadable`].
+//! - A measured **ceiling** on memory shared with the operating system is not a
+//!   dedicated pool. An APU's engine allocates from system memory, and the
+//!   figure that bounds it is readable ([`AcceleratorMemory::Unified`]) — but it
+//!   describes what the machine would allow at best, not what is free, so a
+//!   model that fits under it is [`ModelVerdict::Degraded`], never
+//!   [`ModelVerdict::Ready`]. Where even that figure is missing, the `amd-smi`
+//!   carve-out reading is still the wrong pool and still has no remediation, so
+//!   it stays apart from "no telemetry at all":
+//!   [`AcceleratorMemory::UnifiedMemoryUnreadable`].
 //!
 //! A model outside the catalog has no recipe, so it is reported
 //! [`UndeterminedReason::ModelNotCurated`], never blocked. When it is a GGUF the
@@ -87,11 +91,19 @@ pub enum UndeterminedReason {
     ModelNotCurated,
     /// The host's accelerator memory could not be measured.
     AcceleratorMemoryUnknown,
-    /// The host is an APU: telemetry exists, but it names the BIOS carve-out
-    /// rather than the pool its engine allocates from, and the CLI cannot yet
-    /// read that pool. Distinct from [`Self::AcceleratorMemoryUnknown`]
-    /// because the remediation is different -- there is no command that makes
-    /// this readable today, so none is offered.
+    /// The host is an APU, and the figure for the pool its engine allocates
+    /// from was absent or unparseable on this machine.
+    ///
+    /// The pool itself *is* readable -- `mem_info_gtt_total` on Linux,
+    /// `DXGI_ADAPTER_DESC1::SharedSystemMemory` on Windows, both read by
+    /// [`crate::host_gpu::detect_host_unified_memory_gib`] -- so a host that
+    /// lands here has a specific, local gap: an older kernel that does not
+    /// expose the file, a container that does not pass the DRM device through,
+    /// or a driver that answered with a figure too small to be a pool. The
+    /// `amd-smi` carve-out reading is still there and still names the wrong
+    /// pool, which is why this stays distinct from
+    /// [`Self::AcceleratorMemoryUnknown`]: running `amd-smi` again would answer
+    /// identically forever, so that remediation is not offered here.
     UnifiedMemoryUnreadable,
 }
 
@@ -109,27 +121,65 @@ pub enum AcceleratorMemory {
     /// the machine and the other is a gap in what the CLI can see, and they do
     /// not deserve the same verdict.
     Unknown,
-    /// An APU: `amd-smi` telemetry exists, but it reports the fixed BIOS
-    /// carve-out (often ~4 GiB) as `total_vram`, while the allocator serves the
-    /// model out of GTT-backed system memory. That figure is not readable by
-    /// anything in this binary today, so there is no number to compare a
-    /// recipe minimum against, and no command to run that would produce one.
+    /// An APU, whose engine allocates from a pool of system memory shared with
+    /// the operating system rather than from private VRAM.
     ///
-    /// Distinct from [`AcceleratorMemory::Unknown`]: that variant means no
-    /// telemetry at all, so "run `amd-smi metric --json`" is a real next step.
-    /// Here `amd-smi` already ran and answered -- it just named the wrong
-    /// pool -- so the same remediation would send a Strix Halo user in a
-    /// circle forever.
+    /// `gtt_total_gib` is that pool's measured ceiling: the kernel's
+    /// `mem_info_gtt_total` aperture cap on Linux, the WDDM
+    /// `DXGI_ADAPTER_DESC1::SharedSystemMemory` budget on Windows. Both are read
+    /// by [`crate::host_gpu::detect_host_unified_memory_gib`], and both are
+    /// measurements of driver and BIOS policy on this machine -- not installed
+    /// RAM, and not a fraction of it.
+    ///
+    /// The BIOS carve-out `amd-smi` reports as `total_vram` (512 MiB on a
+    /// Ryzen 7 4700U, ~4 GiB on a Strix Halo) is deliberately NOT carried here.
+    /// It is never the figure a recipe minimum is compared against — doing so
+    /// refuses nearly every curated model on machines that serve them — and no
+    /// renderer shows the two figures side by side yet. A field nothing reads
+    /// is a field that cannot be wrong in a way any test would catch, so it is
+    /// added when a reader exists; `classify_accelerator_memory` in the `rocm`
+    /// binary still has the carve-out in hand at that point.
+    ///
+    /// A ceiling is not an allocation. The operating system, the compositor and
+    /// every other process draw on the same memory, so a recipe that was
+    /// actually weighed against this pool can never reach
+    /// [`ModelVerdict::Ready`] -- see `assess_model_readiness`.
+    ///
+    /// "Weighed against it" is the whole condition, and it is narrower than
+    /// "runs on an APU". A recipe that declares no `min_gpu_mem_gb` was never
+    /// compared with the pool, and a `cpu_only` recipe never allocates from it;
+    /// both stay `Ready` here. Seven shipped `gpu_required` recipes have no
+    /// minimum today, so this is the common case rather than a corner.
+    Unified { gtt_total_gib: f64 },
+    /// An APU whose pool could not be read on this particular host: the figure
+    /// was absent or unparseable. See
+    /// [`UndeterminedReason::UnifiedMemoryUnreadable`] for what that means and
+    /// why it is still not [`AcceleratorMemory::Unknown`].
     UnifiedMemoryUnreadable,
 }
 
 impl AcceleratorMemory {
     /// The figure to compare a recipe minimum against, when there is one.
+    ///
+    /// A unified pool answers with its ceiling. That is a real measurement and a
+    /// comparison against it is worth making -- a model above the aperture
+    /// cannot fit however free the machine is -- but clearing it does not make
+    /// the model `Ready`, because the pool is shared. The verdict side of that
+    /// is in `assess_model_readiness`, not here.
     pub(crate) const fn measured_gib(self) -> Option<f64> {
         match self {
-            Self::Dedicated(gib) => Some(gib),
+            Self::Dedicated(gib)
+            | Self::Unified {
+                gtt_total_gib: gib, ..
+            } => Some(gib),
             Self::None | Self::Unknown | Self::UnifiedMemoryUnreadable => None,
         }
+    }
+
+    /// Whether the figure above is a ceiling on memory shared with the
+    /// operating system rather than a dedicated pool.
+    pub(crate) const fn is_shared_pool(self) -> bool {
+        matches!(self, Self::Unified { .. })
     }
 }
 
@@ -513,16 +563,16 @@ fn assess(
                 AcceleratorMemory::UnifiedMemoryUnreadable
             ) =>
         {
-            // The APU case: telemetry is not missing, it names the wrong pool,
-            // and there is no command that makes the right one readable today.
-            // Offering "run amd-smi again" here would be false -- amd-smi
-            // already ran, answered, and will answer identically forever.
+            // The APU case where even the aperture could not be read. The
+            // `amd-smi` telemetry is not missing, it names the wrong pool, and
+            // offering "run amd-smi again" would be false -- it already ran,
+            // answered, and will answer identically forever.
             readiness.verdict = ModelVerdict::Undetermined;
             readiness.undetermined_reason = Some(UndeterminedReason::UnifiedMemoryUnreadable);
             readiness.evidence.push(format!(
-                "this recipe needs {}, but this host has no dedicated VRAM and the CLI cannot \
-                 yet read the memory pool its engine allocates from; there is nothing to run \
-                 today that would change this answer",
+                "this recipe needs {}, but this host has no dedicated VRAM and the figure for \
+                 the memory pool its engine allocates from could not be read here; there is \
+                 nothing to run today that would change this answer",
                 format_gib(required)
             ));
             readiness.fix = None;
@@ -544,6 +594,17 @@ fn assess(
                 format_gib(required),
                 format_gib(available)
             ));
+            // A ceiling below the minimum blocks as firmly as a small card
+            // does: nothing frees memory past an aperture the driver will not
+            // hand out. Said plainly so the figure is not mistaken for
+            // occupancy a reboot would clear.
+            if host.accelerator_memory.is_shared_pool() {
+                readiness.evidence.push(
+                    "that figure is the whole pool this host's integrated GPU may draw on, so \
+                     freeing memory would not raise it"
+                        .to_owned(),
+                );
+            }
             if offer_alternatives {
                 readiness.alternatives = alternatives_for(Some(recipe), registry, host, engine_for);
             }
@@ -588,6 +649,80 @@ fn assess(
             verify: format!("rocm diagnose --model {model_ref}"),
             ..Fix::default()
         });
+    }
+
+    // A measured ceiling on a shared pool is not an allocation. The operating
+    // system, the compositor and every other process draw on the same memory,
+    // and nothing here measured how much of it is free, so clearing the
+    // comparison above is as far as this can go. `Degraded` is exactly the word
+    // for "it will run, but below what the recipe assumes it has", and unlike
+    // `Ready` it does not promise a load that may in fact fail.
+    //
+    // Last, so it never speaks over `Blocked` or `Undetermined` -- those
+    // already answered -- and so a host the system-RAM check above has already
+    // softened still gets this said about it, keeping that check's own
+    // remediation rather than replacing it with one about a different problem.
+    //
+    // Gated on `requires_gpu` for the same reason the "no GPU is visible" check
+    // above is: a `cpu_only` recipe never allocates from the accelerator pool,
+    // so what that pool is shared with says nothing about whether it will run.
+    //
+    // Gated on `required.is_some()` as well, because `requires_gpu` alone is not
+    // enough: it only asks `device_policy != "cpu_only"`, so a `gpu_required`
+    // recipe that declares no `min_gpu_mem_gb` still passes it. That recipe
+    // takes the `(None, _)` arm above and arrives here `Ready` with no GPU
+    // comparison having been made at all, so softening it to `Degraded` would
+    // rest on a measurement nothing performed. This is not hypothetical: seven
+    // recipes in the shipped catalog have exactly that shape today, and on an
+    // APU with a readable pool every one of them was being stamped `Degraded`
+    // and handed a remediation for a comparison that never happened. The two
+    // terms answer different questions -- "does it use the GPU" and "did we
+    // weigh it against the pool" -- and only the second licenses this verdict.
+    if host.accelerator_memory.is_shared_pool()
+        && requires_gpu(recipe)
+        && required.is_some()
+        && matches!(
+            readiness.verdict,
+            ModelVerdict::Ready | ModelVerdict::Degraded
+        )
+    {
+        let was_ready = readiness.verdict == ModelVerdict::Ready;
+        readiness.verdict = ModelVerdict::Degraded;
+        readiness.evidence.push(
+            "this host's integrated GPU has no dedicated VRAM: that figure is the ceiling on a \
+             pool it shares with the operating system, not memory set aside for the model, so \
+             how much of it is free depends on what else is running"
+                .to_owned(),
+        );
+        if was_ready {
+            // Deliberately no `verify`. This `Degraded` is not occupancy a user
+            // can clear: it is forced by the branch above whenever the pool is
+            // shared and the recipe needs the GPU, because only the aperture
+            // was measured and nothing here reads free memory. A
+            // `rocm diagnose --model …` verify line would therefore reprint
+            // this same verdict however much the user freed, which reads as a
+            // check that was not satisfied rather than one that cannot be --
+            // and the renderer omits an empty `verify` entirely, so nothing is
+            // promised that cannot be delivered. The note says the limit out
+            // loud instead of leaving the reader to discover it by re-running.
+            //
+            // What IS left is a real next step: the load itself. `rocm serve`
+            // is the only thing on this host that resolves the question, and
+            // the summary says so rather than implying this check will.
+            readiness.fix = Some(Fix {
+                summary: "nothing here is broken: serve it and let the engine answer, having \
+                          closed what else is using memory"
+                    .to_owned(),
+                commands: vec![format!("rocm serve {model_ref}")],
+                notes: vec![
+                    "this check compared the model against the pool's ceiling and cannot read \
+                     how much of the pool is free, so asking it again reports the same thing \
+                     however much you close; the load is what settles it"
+                        .to_owned(),
+                ],
+                ..Fix::default()
+            });
+        }
     }
 
     readiness
@@ -1503,11 +1638,14 @@ mod tests {
     }
 
     /// An APU's `amd-smi` telemetry names the wrong pool (the BIOS carve-out,
-    /// not what the engine allocates from), and there is no command that makes
-    /// the right pool readable today. This is `Undetermined`, not `Blocked` --
-    /// the model might well fit -- and it must not be conflated with the
-    /// no-telemetry-at-all case, whose remediation (`amd-smi metric --json`)
-    /// would send an APU user in a circle forever.
+    /// not what the engine allocates from), and on *this* host the right pool
+    /// could not be read either -- an older kernel with no `mem_info_gtt_total`,
+    /// a container with no DRM device passed through. This is `Undetermined`,
+    /// not `Blocked` -- the model might well fit -- and it must not be conflated
+    /// with the no-telemetry-at-all case, whose remediation
+    /// (`amd-smi metric --json`) would send an APU user in a circle forever.
+    /// The host whose pool IS readable is
+    /// [`an_apu_with_a_readable_pool_is_degraded_never_ready`].
     #[test]
     fn an_apu_with_no_readable_pool_is_undetermined_with_no_dead_end_command() {
         let registry = builtin_model_recipe_registry();
@@ -1543,6 +1681,396 @@ mod tests {
              end: {:?}",
             readiness.fix
         );
+    }
+
+    /// An APU whose pool WAS read is judged on it -- and on that figure alone,
+    /// never on the carve-out beside it -- but cannot be called `Ready`.
+    ///
+    /// The three answers this pins apart are the whole point of the variant: a
+    /// model under the ceiling is `Degraded` (it will run, but the pool is
+    /// shared with the operating system and nothing measured what is free), one
+    /// over it is `Blocked` (no amount of freeing raises an aperture the driver
+    /// will not hand out), and the same arithmetic on a dedicated card is
+    /// `Ready`. Without the last of the three, `Degraded` could be coming from
+    /// the system-RAM softening instead and the test would prove nothing.
+    #[test]
+    fn an_apu_with_a_readable_pool_is_degraded_never_ready() {
+        let registry = builtin_model_recipe_registry();
+        let catalog = ModelCatalogSource::Available(&registry);
+        let ask = |accelerator_memory| {
+            assess_model_readiness(
+                SMALL_MODEL_REF,
+                &catalog,
+                &HostFacts {
+                    accelerator_memory,
+                    // Above every recipe's recommendation, so the system-RAM
+                    // softening cannot be what produces `Degraded` below.
+                    system_ram_gib: Some(4096.0),
+                },
+                &engine_choice,
+            )
+        };
+
+        let ample = ask(AcceleratorMemory::Unified {
+            gtt_total_gib: 60.0,
+            // A carve-out far below the recipe's minimum: were THIS the figure
+            // compared against, the verdict would be `Blocked`.
+        });
+        assert_eq!(
+            ample.verdict,
+            ModelVerdict::Degraded,
+            "a pool shared with the operating system is a ceiling, not an allocation, so it \
+             cannot promise READY: {:?}",
+            ample.evidence
+        );
+        assert_eq!(
+            ample.available_gpu_memory_gib,
+            Some(60.0),
+            "the verdict is reached against the pool, not the carve-out beside it"
+        );
+        assert!(
+            ample
+                .evidence
+                .iter()
+                .any(|line| line.contains("shares with the operating system")),
+            "`degraded` without the reason reads as a property of the model: {:?}",
+            ample.evidence
+        );
+
+        // The premise: the same arithmetic on a dedicated card IS ready, so the
+        // assertion above is about the shared pool and not about this recipe.
+        assert_eq!(
+            ask(AcceleratorMemory::Dedicated(60.0)).verdict,
+            ModelVerdict::Ready
+        );
+
+        // And a ceiling genuinely below the minimum blocks, with the reason:
+        // this is not occupancy a reboot would clear.
+        let starved = ask(AcceleratorMemory::Unified {
+            gtt_total_gib: 0.25,
+        });
+        assert_eq!(
+            starved.verdict,
+            ModelVerdict::Blocked,
+            "{:?}",
+            starved.evidence
+        );
+        assert!(
+            starved
+                .evidence
+                .iter()
+                .any(|line| line.contains("freeing memory would not raise it")),
+            "a refusal on an aperture has to say freeing memory will not help, or the user \
+             closes applications and asks again: {:?}",
+            starved.evidence
+        );
+    }
+
+    /// The shared-pool plan offers no check that can never pass.
+    ///
+    /// This `Degraded` is forced by the host, not by anything the user is
+    /// doing: the branch fires whenever the pool is shared and the recipe needs
+    /// the GPU, because only the aperture is measured and free memory never is.
+    /// A `verify` of `rocm diagnose --model …` -- which is what this plan
+    /// carried -- therefore reprints the identical verdict however much the
+    /// user closes, so the reader is sent round a loop with no exit and is left
+    /// to conclude they failed to free enough.
+    ///
+    /// The first assertion is the premise, run rather than asserted from the
+    /// source: the same question asked twice of the same host gives the same
+    /// answer, so no `verify` naming this check could ever clear. The rest pins
+    /// what is offered instead -- a command that genuinely resolves it, and a
+    /// note that states the limit rather than hiding it behind a re-run.
+    #[test]
+    fn the_shared_pool_plan_names_no_check_that_can_never_clear() {
+        let registry = builtin_model_recipe_registry();
+        let catalog = ModelCatalogSource::Available(&registry);
+        let apu = HostFacts {
+            accelerator_memory: AcceleratorMemory::Unified {
+                gtt_total_gib: 60.0,
+            },
+            // Above every recipe's recommendation, so the system-RAM softening
+            // is not what produces the verdict or the plan below.
+            system_ram_gib: Some(4096.0),
+        };
+        let ask = || assess_model_readiness(SMALL_MODEL_REF, &catalog, &apu, &engine_choice);
+
+        let first = ask();
+        assert_eq!(
+            first.verdict,
+            ModelVerdict::Degraded,
+            "{:?}",
+            first.evidence
+        );
+        // The premise. Nothing in this host's facts carries occupancy, so the
+        // second answer cannot differ -- which is precisely why a `verify` that
+        // re-asks it is a dead end.
+        assert_eq!(
+            ask().verdict,
+            first.verdict,
+            "premise failed: re-asking changed the verdict, so a verify line naming this check \
+             would not be a dead end after all and this test is guarding nothing"
+        );
+
+        let fix = first.fix.as_ref().expect("a plan for a softened verdict");
+        assert!(
+            fix.verify.is_empty(),
+            "the plan offers a check to run after it; the only verdict this host can give is the \
+             one above, so whatever it names will reproduce it forever: {:?}",
+            fix.verify
+        );
+        assert!(
+            !fix.verify.contains("diagnose") && !fix.summary.contains("rocm diagnose"),
+            "the dead-end check came back by another route: {fix:?}"
+        );
+        assert!(
+            fix.commands
+                .iter()
+                .any(|command| command.starts_with("rocm serve")),
+            "with no check to offer, the plan has to name the one thing that does settle it: \
+             {:?}",
+            fix.commands
+        );
+        assert!(
+            fix.notes
+                .iter()
+                .any(|note| note.contains("cannot read how much of the pool is free")),
+            "the reader is owed the reason this cannot be checked again, or they will read the \
+             missing verify line as an oversight: {:?}",
+            fix.notes
+        );
+
+        // Non-vacuity: a dedicated card of the same size is `Ready` and gets no
+        // plan at all, so the assertions above are about the shared pool rather
+        // than about every plan this function builds.
+        let dedicated = assess_model_readiness(
+            SMALL_MODEL_REF,
+            &catalog,
+            &HostFacts {
+                accelerator_memory: AcceleratorMemory::Dedicated(60.0),
+                system_ram_gib: Some(4096.0),
+            },
+            &engine_choice,
+        );
+        assert_eq!(dedicated.verdict, ModelVerdict::Ready);
+        assert!(dedicated.fix.is_none(), "{:?}", dedicated.fix);
+    }
+
+    /// A `cpu_only` recipe is not softened for a pool it never allocates from.
+    ///
+    /// The shared-pool check is the last thing `assess` does, and it used to
+    /// fire on the host alone: any `Ready`/`Degraded` verdict on an APU was
+    /// downgraded, told "this host's integrated GPU has no dedicated VRAM" and
+    /// handed a plan about freeing memory and serving. For a
+    /// `cpu_only` recipe that is a remediation for a device the model does not
+    /// touch -- and one attached to evidence no earlier branch put in the
+    /// report, since a recipe with no GPU minimum takes the `(None, _)` arm and
+    /// arrives here `Ready` with no GPU figure at all. The "no GPU is visible"
+    /// gate a few dozen lines above already consults `requires_gpu`; this one
+    /// did not.
+    ///
+    /// A host softened by the system-RAM check first keeps that check's own
+    /// remediation when the shared-pool gate fires afterwards.
+    ///
+    /// The gate sets a `fix` only `if was_ready`, precisely so it cannot speak
+    /// over a remediation an earlier check already wrote -- its own `Degraded`
+    /// has no `verify`, because nothing here reads free memory, so replacing a
+    /// system-RAM fix with it would take away the one actionable step the user
+    /// had. Nothing combined the two before: every shared-pool test had ample
+    /// RAM, and every system-RAM test had a dedicated card.
+    #[test]
+    fn a_host_already_softened_for_system_ram_keeps_that_remediation() {
+        let registry = builtin_model_recipe_registry();
+        let recipe = registry
+            .recipes
+            .iter()
+            .find(|recipe| recipe.matches_ref(SMALL_MODEL_REF))
+            .expect("the smallest curated recipe");
+        let recommended = f64::from(
+            recipe
+                .recommended_system_ram_gb
+                .expect("premise: this recipe must recommend system RAM"),
+        );
+        let minimum = f64::from(
+            recipe
+                .min_gpu_mem_gb
+                .expect("premise: this recipe must declare a GPU minimum"),
+        );
+
+        let catalog = ModelCatalogSource::Available(&registry);
+        let readiness = assess_model_readiness(
+            SMALL_MODEL_REF,
+            &catalog,
+            &HostFacts {
+                // Ample for the recipe, so the GPU comparison itself passes and
+                // the shared-pool gate is the only thing that could soften it.
+                accelerator_memory: AcceleratorMemory::Unified {
+                    gtt_total_gib: minimum * 4.0,
+                },
+                // Below the recommendation, so the system-RAM check softens
+                // first and writes the remediation this test is about.
+                system_ram_gib: Some(recommended / 2.0),
+            },
+            &engine_choice,
+        );
+
+        assert_eq!(
+            readiness.verdict,
+            ModelVerdict::Degraded,
+            "premise: both softenings must fire, or this asserts nothing: {:?}",
+            readiness.evidence
+        );
+        let fix = readiness
+            .fix
+            .as_ref()
+            .expect("the system-RAM remediation must survive the shared-pool gate");
+        assert!(
+            fix.summary.contains("system RAM"),
+            "the shared-pool gate overwrote the system-RAM remediation with its own: {fix:?}"
+        );
+        assert!(
+            !fix.verify.is_empty(),
+            "the system-RAM fix has a verify the user can run; the gate's own Degraded has \
+             none, so an empty one means it was replaced: {fix:?}"
+        );
+        assert!(
+            readiness
+                .evidence
+                .iter()
+                .any(|line| line.contains("no dedicated VRAM")),
+            "premise: the shared-pool gate must also have fired: {:?}",
+            readiness.evidence
+        );
+    }
+
+    /// `cpu_only` is a schema-validated `device_policy`
+    /// (`validate_model_device_policy`), so this is reachable through the
+    /// public `assess_model_readiness`. No shipped recipe pairs it with an
+    /// absent minimum today, which is why the recipe is synthesised from a real
+    /// one rather than looked up -- and why this was untested.
+    #[test]
+    fn a_cpu_only_recipe_is_not_degraded_by_a_shared_pool_it_never_uses() {
+        const CPU_ONLY_REF: &str = "cpu-only-probe";
+        const GPU_REF: &str = "gpu-probe";
+
+        let mut registry = builtin_model_recipe_registry();
+        // Cloned from a catalog recipe so every field this assessment does not
+        // care about is still catalog-shaped; only the two that make the
+        // untested combination are overridden.
+        let template = registry
+            .recipes
+            .iter()
+            .find(|recipe| recipe.matches_ref(SMALL_MODEL_REF))
+            .expect("the smallest curated recipe")
+            .clone();
+        let mut cpu_only = template.clone();
+        cpu_only.canonical_model_id = CPU_ONLY_REF.to_owned();
+        cpu_only.aliases.clear();
+        cpu_only.device_policy = "cpu_only".to_owned();
+        // Deliberately declares a GPU minimum even though it never uses the
+        // GPU, so `required.is_some()` is TRUE here and `requires_gpu` is the
+        // only term left holding this recipe out of the shared-pool downgrade.
+        // With `None` the test passed on `required.is_some()` alone and stayed
+        // green with `requires_gpu(recipe)` deleted.
+        cpu_only.min_gpu_mem_gb = Some(8);
+        // Cleared so the system-RAM softening cannot be what moves the verdict.
+        cpu_only.recommended_system_ram_gb = None;
+        registry.recipes.push(cpu_only);
+        // The non-vacuity half: the same host, the same synthetic shape, but a
+        // policy that does need the GPU. Without it this test would pass just
+        // as happily against a shared-pool check someone had deleted outright.
+        let mut gpu_required = template;
+        gpu_required.canonical_model_id = GPU_REF.to_owned();
+        gpu_required.aliases.clear();
+        gpu_required.device_policy = "gpu_required".to_owned();
+        gpu_required.recommended_system_ram_gb = None;
+        registry.recipes.push(gpu_required);
+
+        let catalog = ModelCatalogSource::Available(&registry);
+        let apu = HostFacts {
+            accelerator_memory: AcceleratorMemory::Unified {
+                gtt_total_gib: 60.0,
+            },
+            system_ram_gib: Some(4096.0),
+        };
+
+        let cpu = assess_model_readiness(CPU_ONLY_REF, &catalog, &apu, &engine_choice);
+        assert_eq!(
+            cpu.verdict,
+            ModelVerdict::Ready,
+            "a recipe that never allocates from the accelerator cannot be made worse by what \
+             that accelerator's pool is shared with: {:?}",
+            cpu.evidence
+        );
+        assert!(
+            !cpu.evidence
+                .iter()
+                .any(|line| line.contains("no dedicated VRAM")),
+            "the report volunteered GPU evidence for a `cpu_only` recipe: {:?}",
+            cpu.evidence
+        );
+        assert!(
+            cpu.fix.is_none(),
+            "nothing is wrong here, so there is nothing to remediate -- least of all freeing \
+             memory for a device this model does not use: {:?}",
+            cpu.fix
+        );
+
+        let gpu = assess_model_readiness(GPU_REF, &catalog, &apu, &engine_choice);
+        assert_eq!(
+            gpu.verdict,
+            ModelVerdict::Degraded,
+            "premise failed: this host must still soften a recipe that DOES need the GPU, or \
+             the assertion above proves only that the check is gone: {:?}",
+            gpu.evidence
+        );
+    }
+
+    /// A `gpu_required` recipe that declares no GPU minimum is never weighed
+    /// against the pool, so the shared-pool softening has nothing to rest on.
+    ///
+    /// Driven off the **shipped catalog**, not a synthetic recipe, because the
+    /// point is that this shape is live: seven recipes carry
+    /// `device_policy: "gpu_required"` with no `min_gpu_mem_gb` today. A
+    /// synthetic stand-in would still pass if the catalog stopped containing
+    /// any, and the bug only matters while it does.
+    #[test]
+    fn a_gpu_recipe_with_no_declared_minimum_is_not_degraded_by_a_pool_it_was_never_weighed_against()
+     {
+        let registry = builtin_model_recipe_registry();
+        let unmeasured: Vec<&ModelRecipeRecord> = registry
+            .recipes
+            .iter()
+            .filter(|recipe| recipe.device_policy != "cpu_only" && recipe.min_gpu_mem_gb.is_none())
+            .collect();
+        assert!(
+            !unmeasured.is_empty(),
+            "premise gone: no shipped recipe needs the GPU without declaring a minimum, so this \
+             test no longer exercises the shape it was written for"
+        );
+
+        let catalog = ModelCatalogSource::Available(&registry);
+        let apu = HostFacts {
+            accelerator_memory: AcceleratorMemory::Unified {
+                gtt_total_gib: 60.0,
+            },
+            // Large enough that the system-RAM check cannot be what softens it.
+            system_ram_gib: Some(4096.0),
+        };
+
+        for recipe in unmeasured {
+            let readiness =
+                assess_model_readiness(&recipe.canonical_model_id, &catalog, &apu, &engine_choice);
+            assert!(
+                !readiness
+                    .evidence
+                    .iter()
+                    .any(|line| line.contains("no dedicated VRAM")),
+                "{}: the report claimed the pool was too small for a model it never sized: {:?}",
+                recipe.canonical_model_id,
+                readiness.evidence
+            );
+        }
     }
 
     /// The sibling gap -- no telemetry at all -- keeps its own remediation.

@@ -251,10 +251,10 @@ Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
 for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
 every pull request that changes Rust, and the merge queue and post-merge runs
 test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
-selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
-a file it reads, so a pull request that touches nothing but
-`crates/rocm-dash-tui` does not run this test on Linux. The module-import
-contract above has the same property.
+selects `xtask` for any Rust change too, because its contract tests scan every
+source file (see [CI test selection](#ci-test-selection)), so a pull request that
+touches nothing but `crates/rocm-dash-tui` runs this test on Linux as well. The
+module-import contract above has the same property.
 
 ### Tests that run a fake executable
 
@@ -693,13 +693,14 @@ cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_th
 ```
 
 The pull-request affected-crates selection (see [CI test selection](#ci-test-selection))
-adds `xtask` when a changed file is under a `proptest-regressions` directory or
-when the diff of a changed Rust file adds or removes a line containing
-`proptest!`, so a property test moved inside `apps/rocm` alone still runs this
-check on the pull request, whether or not its seed moved with it. The other
-source-scan contracts do not have this rule; they still meet a change confined to
-a crate that `xtask` does not depend on in the merge queue, which runs the whole
-workspace. To prove a moved seed is read,
+adds `xtask` when a changed file is under a `proptest-regressions` directory, and
+for any changed Rust file (the `*.rs` entry of `CROSS_CRATE_READS`, see
+[Pre-push hook scope](#pre-push-hook-scope)), so a property test moved inside
+`apps/rocm` alone still runs this check on the pull request, whether or not its
+seed moved with it. The same `*.rs` entry runs the other source-scan contracts
+in `xtask` for any Rust change; a change confined to non-Rust files of a crate
+that `xtask` does not depend on meets them only in the merge queue, which runs
+the whole workspace. To prove a moved seed is read,
 append a deliberately unparsable line to it, run the test with `--nocapture`
 (`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
 `unparsable line, ignoring` warning naming that path, and remove the line.
@@ -1132,8 +1133,9 @@ cargo test -p xtask every_self_hosted_lane_declares_whether_it_has_a_gpu
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
-`cargo nextest run` over only the crates a change can reach — the changed crates
-plus their transitive dependents, derived from the workspace dependency graph by:
+`cargo nextest run` over only the crates a change can reach — the changed crates,
+the crates whose tests read a changed file from outside their own directory, plus
+their transitive dependents, derived from the workspace dependency graph by:
 
 ```bash
 cargo xtask affected --base origin/main
@@ -1144,11 +1146,26 @@ or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
 file, the workspace root manifest, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
-the proptest seed guard and which no other crate depends on: a changed file under
-a `proptest-regressions` directory, and a changed Rust file whose diff adds or
-removes a line containing `proptest!` (found with `git diff -G`). On `main`
-and in the merge queue the full workspace always runs. The minimum quality gate in
+`tests/e2e-cucumber/README.md`). A changed file under a `proptest-regressions`
+directory adds `xtask`, which holds the proptest seed guard and which no other
+crate depends on. The selection is then widened by the files tests read from outside their crate
+(`CROSS_CRATE_READS`, described under [Pre-push hook scope](#pre-push-hook-scope)):
+any Rust file adds `xtask`, and `README.md`, `docs/` and `skills/` add `rocm` and
+`xtask`, so a pull request that edits only a doc still runs the tests that read
+it. On `main` and in the merge queue the full workspace always runs.
+
+Before any of that, the `changes` job decides which jobs run at all. It sorts
+the changed files into path categories (`rust`, `heavy`, `lint`, `tpn`, `docs`,
+`skills`, and `serve` for the GPU lanes) defined once in the
+[classify-changes](../.github/actions/classify-changes/action.yml) action, which
+both [ci.yml](../.github/workflows/ci.yml) and
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) use. A job gated on
+a category skips when the pull request touches nothing in it. A changed file that
+no category names, and that is not in the action's `inert` list (files no gated
+job reads, such as `CODE_OF_CONDUCT.md` or the issue templates), turns every
+category on and prints a notice naming the file, so a new kind of file runs the
+full suite until someone adds it to the categories whose jobs read it. Off pull
+requests every category is on. The minimum quality gate in
 [AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
 that also narrows the local pre-push hooks (next section).
 
@@ -1168,17 +1185,30 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
   `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
 
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
-so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
-file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
-test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
-selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
-[prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
-`include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
-covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
-whose path is written out (an `include_str!` literal, or a `CARGO_MANIFEST_DIR` chain ending in
-literal `.join("...")` segments) is checked file by file, but a test that derives the repo root in
-one place and joins the rest elsewhere (xtask's `repo_root()` helper) is only recorded as reading
-through the root. For that case the test checks that the crate is a declared reader, not which files
+so the selection is widened, in the hook and in CI's `test` job alike: any Rust file also selects
+`xtask` (its contract tests scan every source file), `README.md`, `docs/` and `skills/` also select
+`rocm` and `xtask` (the advised-commands test reads them and `rocm` compiles in the assistant
+skill), `skills/rocm-doctor/` also selects `e2e-cucumber` (its `skill_reference` test parses the
+skill's catalog table; CI runs that test in the `test` job's `cargo nextest` over the selection
+and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose steps run when the
+`heavy` category matches, as every `skills/` change does, while the hook's `test`
+step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
+e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+[cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
+`include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
+code (not in comments or string literals) that leave their crate and fails unless each one is
+covered both by the table and by the `rust` category of the `changes` job (so the job that runs
+the reader is not skipped), and fails on a path Windows resolves differently (a component ending
+in `.` or a space), so a new cross-crate read cannot be added without a decision. A second test
+holds every table entry to that `rust` category.
+The scan has limits. A path held in a const (`.github/scripts/gpu-preflight.sh`, read through
+`SHARED_PREFLIGHT`) is not seen at all; its `rust` glob is pinned only by a per-glob sample test,
+which checks the glob is there, not that a test reads the file. And a read whose path is
+written out (an `include_str!` literal, a `CARGO_MANIFEST_DIR` chain ending in literal
+`.join("...")` segments, or `repo_root().join("...")` with a literal path) is checked file by
+file, but a test that derives the repo root in one place and joins the rest elsewhere (the result
+of xtask's `repo_root()` helper stored and joined later, or joined with a computed path) is only
+recorded as reading through the root. For that case the test checks that the crate is a declared reader, not which files
 it reads, so a test that starts reading a new kind of file of another crate needs its
 `CROSS_CRATE_READS` entry added by hand.
 
@@ -1191,9 +1221,11 @@ filter, as before, including a lockfile-only push.
 
 The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
 job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
-`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
-every change, and in the merge queue and on `main`, where the Linux `test` job is forced to
-`--workspace`.
+`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job when
+the `changes` job's `heavy` category matches (any Rust file does, as do `skills/`, scripts and
+workflow files, but a change only to prose docs such as `README.md` or `docs/*.md`, outside
+`docs/keys/`, does not), and in the merge queue
+and on `main`, where the Linux `test` job is forced to `--workspace`.
 
 Known limits, unchanged by the narrowing: the steps check the working tree rather than the pushed
 commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
@@ -6339,7 +6371,8 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   Hugging Face token variable set, and checks that the listing, `HEAD` and
   range requests carry no `Authorization` or `Cookie` header.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
-  host-memory states (dedicated, none, unknown, APU), what is attached to a
+  host-memory states (dedicated, none, unknown, an APU's measured shared pool,
+  an APU whose pool could not be read), what is attached to a
   curated or non-GGUF answer (nothing beyond a note on a flag that did not
   apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
   reference quoted for a shell), the plan a sized estimate keeps when it
@@ -6354,6 +6387,46 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   and the note for a mask on a host whose GPUs differ in memory. Both are unit
   tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
   lane has GPUs of different sizes.
+- The APU memory pool (ROCMAI-912). An APU has no private VRAM: every adapter
+  query reports the fixed BIOS carve-out while the engine allocates from system
+  memory, so the pool a recipe minimum is compared against is read separately by
+  `detect_host_unified_memory_gib` in
+  [unified_memory.rs](../crates/rocm-core/src/host_gpu/unified_memory.rs).
+  Scenarios `diagnose-81`, `diagnose-82`, `diagnose-83` and `diagnose-84` plant a
+  simulated host
+  (`ROCM_CLI_TEST_HOST_ROOT`) carrying a KFD node and a DRM card with both
+  counters, so they run on the ungated lane and describe the same machine
+  whatever GPU the runner has: an APU judged on its aperture and reported
+  `degraded` because the pool is shared, an APU whose aperture is absent told so
+  rather than handed a fabricated figure, a discrete card judged on its own
+  VRAM with the aperture beside it ignored, and a host showing two AMD DRM cards
+  credited with neither card's aperture. `diagnose-84` needs one thing the other
+  three do not: a stub `amd-smi` on `PATH` reporting the single compute device,
+  plus the `ROCM_E2E_KFD_DEVICE` seam so the pre-flight will launch it. Without
+  it the sysfs VRAM fallback's own, older ordinal-ambiguity guard
+  (`read_drm_vram_usage` in [gpu_policy.rs](../apps/rocm/src/gpu_policy.rs))
+  withholds every row as soon as a second AMD card appears, and the host is
+  classified "GPU memory unmeasured" before the aperture rule is ever consulted —
+  so a two-card scenario planted through the host root alone would pass while
+  exercising nothing. The host this rule actually decides for is an APU beside an
+  AMD display adapter ROCm does not enumerate, which is what the stub models.
+  The Linux reader has its own planted
+  tree in [linux.rs](../crates/rocm-core/src/host_gpu/linux.rs). **The Windows
+  source has unit coverage only**: it reads
+  `DXGI_ADAPTER_DESC1::SharedSystemMemory` through COM, the host-simulation seam
+  re-roots Linux paths only, and no Windows lane runs on an APU whose pool
+  differs from its carve-out. The adapter choice and the implausible-reading rule
+  are pure functions tested on every platform; the FFI around them is not
+  exercised by any test.
+
+  Two more scenarios cover the rules that decide when the shared-pool cap does
+  *not* apply. `diagnose-85` asks about a `cpu_only` recipe on the same planted
+  APU and requires the verdict to stay `ready` with no GPU remediation: a recipe
+  that never allocates from the accelerator cannot be made worse by what that
+  accelerator's pool is shared with. `diagnose-86` asks the GGUF estimator about
+  a file on that host and requires the estimate to say the figure it compared
+  against is a shared ceiling rather than free memory, so the weaker claim is
+  visible to a user reading the estimate rather than only to the verdict.
 
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes

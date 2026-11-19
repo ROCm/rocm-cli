@@ -2435,11 +2435,13 @@ const OVERSIZED_MODEL_REF: &str = "glm5";
 /// The smallest curated recipe (2 GiB minimum). Any machine that measured
 /// dedicated GPU memory can serve it, so the "ready" half of diagnose-22 holds
 /// on every discrete-GPU lane rather than only the Instinct one. An APU lane
-/// does not qualify for that half even though `amd-smi` telemetry exists
-/// there too: it names the BIOS carve-out, not the pool the engine allocates
-/// from, so those hosts report no measured figure and land in the
-/// "could not measure" half instead, alongside hosts with no GPU at all and
-/// hosts with no telemetry whatsoever.
+/// reaches that half too, on the `degraded` branch it allows: its measured
+/// figure is the shared pool read by `rocm_core::detect_host_unified_memory_gib`
+/// (`amd-smi`'s own reading there is the BIOS carve-out, not the pool the
+/// engine allocates from), and a ceiling on memory shared with the operating
+/// system can never promise `ready`. Only an APU whose pool could not be read
+/// at all lands in the "could not measure" half, alongside hosts with no GPU
+/// and hosts with no telemetry whatsoever.
 const SMALLEST_MODEL_REF: &str = "qwen-smoke";
 
 /// A recipe index path that cannot exist, used to make the catalog source
@@ -2618,12 +2620,15 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
     // here, and reporting a memory verdict instead would be true and useless.
     // A third has a GPU whose memory it could not read at all, which is a gap
     // in what the CLI can see and must not be dressed up as a verdict about
-    // the model. The fourth is an APU: `amd-smi` telemetry exists, but it
-    // names the BIOS carve-out rather than the pool the engine allocates
-    // from, and there is no command that makes the right pool readable today
-    // -- so that gap earns its own reason, distinct from the no-telemetry-at-
-    // all case, and no dead-end remediation. None of the four may be reported
-    // as "this model is too big for you".
+    // the model. The fourth is an APU whose shared pool could not be read on
+    // this particular host (an older kernel with no `mem_info_gtt_total`, a
+    // container with no DRM device passed through): `amd-smi` telemetry
+    // exists, but it names the BIOS carve-out rather than the pool the engine
+    // allocates from, and running it again would answer identically forever --
+    // so that gap earns its own reason, distinct from the no-telemetry-at-all
+    // case, and no dead-end remediation. An APU whose pool IS readable never
+    // reaches this step: it reports a figure, and diagnose-81 covers it.
+    // None of the four may be reported as "this model is too big for you".
     let evidence = model_field(&model, "evidence").to_string();
     match model_verdict(&model) {
         "blocked" => {
@@ -2705,8 +2710,9 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
                 );
                 assert!(
                     model_field(&model, "fix").is_null(),
-                    "there is no command that makes the APU's pool readable today; offering one \
-                     would be a dead end: {model:#}"
+                    "nothing this host can run makes its pool readable -- `amd-smi` already ran \
+                     and named the carve-out, and would answer identically forever; offering a \
+                     command would be a dead end: {model:#}"
                 );
             }
             other => panic!(
@@ -2792,9 +2798,12 @@ async fn assert_fitting_model_is_ready(world: &mut E2eWorld) {
     if available < required {
         return;
     }
-    // `degraded` is allowed alongside `ready`: a machine whose system RAM is
-    // below the recipe's recommendation still runs it, and calling that a
-    // failure would make the scenario a test of the runner's RAM.
+    // `degraded` is allowed alongside `ready` for two reasons, and both are
+    // properties of the lane rather than of the model: a machine whose system
+    // RAM is below the recipe's recommendation still runs it, and an APU's
+    // measured figure is a ceiling on memory shared with the operating system,
+    // which never promises `ready` (ROCMAI-912). Calling either a failure would
+    // make this scenario a test of the runner's hardware.
     assert!(
         matches!(model_verdict(&model), "ready" | "degraded"),
         "this machine measured {available} GiB against a {required} GiB recipe, so the model runs \
@@ -2926,64 +2935,28 @@ pub(crate) fn xtask_command() -> std::process::Command {
     }
 }
 
-/// A ref that exists only in the synthetic catalog [`user_asks_about_a_ram_degraded_model`]
-/// signs and points the CLI at.
-const DEGRADED_MODEL_REF: &str = "e2e-fixtures/ram-degraded";
-
-/// A recipe that needs almost no GPU memory -- so it clears the fit check on
-/// any lane that measured a GPU at all -- but recommends more system RAM than
-/// any real test host has, so the RAM softening is the only thing left that
-/// can fire. Built fresh per scenario (mirrors the signed-catalog pattern in
-/// `artifact_steps.rs`) because no built-in recipe can produce this
-/// combination: every built-in recipe's RAM recommendation scales with its
-/// GPU requirement, and `detect_system_ram_gib` has no env-var override to
-/// fake the other side of the comparison.
-#[given("a user asking about a model that recommends far more system RAM than this host has")]
-async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
+/// Write `document` as a signed recipe index under the scenario's own root and
+/// point the CLI's three index environment variables at it.
+///
+/// Signing is not optional: a configured index that fails verification is read
+/// as an unreachable catalog, and every scenario below would then be asserting
+/// about that instead of about its recipes. `stem` names the files so two
+/// fixtures in one scenario cannot overwrite each other.
+fn sign_recipe_index_and_point_cli(world: &mut E2eWorld, stem: &str, document: &serde_json::Value) {
     let root = world
         .isolated_root
         .as_ref()
         .expect("no isolated root")
         .path()
         .to_path_buf();
-    let index = root.join("degraded-recipes.json");
-    let signature = root.join("degraded-recipes.json.sig");
-    let public_key = root.join("degraded-recipe-public.pem");
-    let private_key = root.join("degraded-recipe-private.pem");
+    let index = root.join(format!("{stem}-recipes.json"));
+    let signature = root.join(format!("{stem}-recipes.json.sig"));
+    let public_key = root.join(format!("{stem}-recipe-public.pem"));
+    let private_key = root.join(format!("{stem}-recipe-private.pem"));
 
-    let document = serde_json::json!({
-        "schema_version": 1,
-        "source": "e2e-ram-degraded",
-        "recipes": [{
-            "canonical_model_id": DEGRADED_MODEL_REF,
-            "aliases": [],
-            "task": "chat",
-            "source": "signed_recipe_index",
-            "revision": "main",
-            "loader": "transformers",
-            "trust_remote_code": false,
-            "dtype": "float16",
-            "device_policy": "gpu_required",
-            "min_gpu_mem_gb": 1,
-            "recommended_system_ram_gb": 999_999,
-            "artifacts": [],
-            "engine_recipes": [],
-            "manual_alternatives": [],
-            "featured": false,
-            "chat_template_mode": "auto",
-            // `lemonade`, not `vllm`: this scenario carries no platform tag and
-            // runs on every lane, including native Windows, where vLLM has no
-            // adapter and would be ruled out before the RAM softening this
-            // scenario exists to exercise ever runs -- turning the expected
-            // `degraded` into `blocked` on exactly the lane that also measures
-            // a GPU. `lemonade` is not ruled out on any lane this suite runs.
-            "preferred_engines": ["lemonade"],
-            "warnings": []
-        }]
-    });
     std::fs::write(
         &index,
-        serde_json::to_vec_pretty(&document).expect("failed to serialize recipe fixture"),
+        serde_json::to_vec_pretty(document).expect("failed to serialize recipe fixture"),
     )
     .expect("failed to write recipe fixture");
 
@@ -3019,6 +2992,53 @@ async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
         "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
         public_key.into_os_string(),
     ));
+}
+
+/// A ref that exists only in the synthetic catalog [`user_asks_about_a_ram_degraded_model`]
+/// signs and points the CLI at.
+const DEGRADED_MODEL_REF: &str = "e2e-fixtures/ram-degraded";
+
+/// A recipe that needs almost no GPU memory -- so it clears the fit check on
+/// any lane that measured a GPU at all -- but recommends more system RAM than
+/// any real test host has, so the RAM softening is the only thing left that
+/// can fire. Built fresh per scenario (mirrors the signed-catalog pattern in
+/// `artifact_steps.rs`) because no built-in recipe can produce this
+/// combination: every built-in recipe's RAM recommendation scales with its
+/// GPU requirement, and `detect_system_ram_gib` has no env-var override to
+/// fake the other side of the comparison.
+#[given("a user asking about a model that recommends far more system RAM than this host has")]
+async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-ram-degraded",
+        "recipes": [{
+            "canonical_model_id": DEGRADED_MODEL_REF,
+            "aliases": [],
+            "task": "chat",
+            "source": "signed_recipe_index",
+            "revision": "main",
+            "loader": "transformers",
+            "trust_remote_code": false,
+            "dtype": "float16",
+            "device_policy": "gpu_required",
+            "min_gpu_mem_gb": 1,
+            "recommended_system_ram_gb": 999_999,
+            "artifacts": [],
+            "engine_recipes": [],
+            "manual_alternatives": [],
+            "featured": false,
+            "chat_template_mode": "auto",
+            // `lemonade`, not `vllm`: this scenario carries no platform tag and
+            // runs on every lane, including native Windows, where vLLM has no
+            // adapter and would be ruled out before the RAM softening this
+            // scenario exists to exercise ever runs -- turning the expected
+            // `degraded` into `blocked` on exactly the lane that also measures
+            // a GPU. `lemonade` is not ruled out on any lane this suite runs.
+            "preferred_engines": ["lemonade"],
+            "warnings": []
+        }]
+    });
+    sign_recipe_index_and_point_cli(world, "degraded", &document);
     world.model_name = Some(DEGRADED_MODEL_REF.to_string());
 }
 
@@ -5133,5 +5153,691 @@ async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
     assert!(
         !output.contains(SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
         "with nothing pasted the mark would sit on every cause and say nothing:\n{output}"
+    );
+}
+
+// ── An integrated GPU's shared memory pool (ROCMAI-912) ────────────
+
+/// `gfx_target_version` for gfx1151 (Strix Halo), in the kernel's decimal
+/// encoding: major 11, minor 5, step 1.
+const GFX1151_TARGET_VERSION: u32 = 110_501;
+
+/// `gfx_target_version` for gfx1100 (Radeon RX 7900 / PRO W7900), a discrete
+/// part that `gfx_is_apu_family` does not match.
+const GFX1100_TARGET_VERSION: u32 = 110_000;
+
+/// A 4.5 GiB BIOS carve-out, in bytes: what every adapter query reports as an
+/// APU's memory, and what a fit check must NOT be reached against.
+///
+/// Deliberately **not** a whole number of GiB. `format_gib` renders a whole
+/// figure with no decimal at all (`format_gib_renders_a_whole_number_with_no_decimal`
+/// pins `format_gib(8.0) == "8 GiB"`), so a 4 GiB carve-out reaches the report
+/// as the bare string `"4 GiB"` -- which any recipe minimum of 4 GiB produces
+/// too. An assertion that the carve-out is absent could then not tell the two
+/// apart. `"4.5 GiB"` can only have come from this fixture. See
+/// [`carve_out_as_rendered`].
+const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+
+/// A 60 GiB aperture, in bytes: a Strix-Halo-shaped `mem_info_gtt_total`. Far
+/// enough from the carve-out that a verdict reached against the wrong one is
+/// unmistakable in the report.
+const APERTURE_BYTES: u64 = 60 * 1024 * 1024 * 1024;
+
+/// A second AMD card's `mem_info_gtt_total`, in bytes. Different from
+/// [`APERTURE_BYTES`] so that a reader which picked one card over the other --
+/// whichever `read_dir` reached last -- names a figure the report can be
+/// checked for, rather than the same number either way.
+const SECOND_CARD_APERTURE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Plant a single-GPU machine under the simulated host root
+/// (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by `e2e-test-hooks` builds), as
+/// one KFD compute node plus one amdgpu DRM card.
+///
+/// The DRM card is what carries the memory counters, and planting it is what
+/// makes the scenario describe the same machine on every lane: with no
+/// `/dev/kfd` under the root, the `amd-smi` pre-flight declines, so the CLI
+/// falls back to these sysfs counters instead of the runner's real telemetry.
+/// `mem_info_vram_used` is planted too, because the fallback drops a card whose
+/// occupancy it cannot read rather than guessing it is empty.
+///
+/// `gtt_total` is `None` for the host whose aperture is unreadable.
+fn plant_single_gpu_with_memory(
+    world: &mut E2eWorld,
+    gfx_target_version: u32,
+    vram_total_bytes: u64,
+    gtt_total_bytes: Option<u64>,
+) {
+    let host = simulated_host_root(world);
+
+    // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
+    // GPU rather than a CPU node.
+    let node = host.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        format!("cpu_cores_count 0\nsimd_count 256\ngfx_target_version {gfx_target_version}\n"),
+    )
+    .expect("failed to write the planted KFD node properties");
+
+    plant_amd_drm_card(world, "card0", vram_total_bytes, gtt_total_bytes);
+
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+
+    // An `lspci` listing an empty bus, ahead of any real one, so the PCI probe
+    // succeeds on every runner without describing the runner's own cards -- the
+    // same reason `machine_with_an_unsupported_gpu` plants one.
+    let bin = shared_pool_bin_dir(world);
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+/// The simulated host root this cluster's fixtures plant under, derived rather
+/// than carried on the World so every helper here agrees on it.
+fn simulated_host_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root")
+}
+
+/// The PATH directory this cluster's fake executables live in. One directory,
+/// prepended once by [`plant_single_gpu_with_memory`]: a second `PATH` entry on
+/// `command_env` would replace the first rather than extend it.
+fn shared_pool_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("shared-pool-bin")
+}
+
+/// Plant one amdgpu DRM card under the simulated host root.
+///
+/// `mem_info_vram_used` is planted for every card, because the sysfs VRAM
+/// fallback drops a card whose occupancy it cannot read rather than guessing it
+/// is empty. `gtt_total` is `None` for the host whose aperture is unreadable.
+fn plant_amd_drm_card(
+    world: &E2eWorld,
+    card: &str,
+    vram_total_bytes: u64,
+    gtt_total_bytes: Option<u64>,
+) {
+    let device = simulated_host_root(world).join(format!("sys/class/drm/{card}/device"));
+    std::fs::create_dir_all(&device).expect("failed to create the planted DRM card");
+    // The AMD PCI vendor id, which is what marks this as an amdgpu card.
+    std::fs::write(device.join("vendor"), "0x1002\n").expect("failed to plant the vendor id");
+    std::fs::write(
+        device.join("mem_info_vram_total"),
+        format!("{vram_total_bytes}\n"),
+    )
+    .expect("failed to plant the VRAM total");
+    std::fs::write(device.join("mem_info_vram_used"), "0\n").expect("failed to plant the VRAM use");
+    if let Some(gtt) = gtt_total_bytes {
+        std::fs::write(device.join("mem_info_gtt_total"), format!("{gtt}\n"))
+            .expect("failed to plant the GTT aperture");
+    }
+}
+
+/// Bytes as the GiB figure the report carries.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// A planted byte count exactly as an evidence line would spell it.
+///
+/// Mirrors both branches of `rocm_core::model_readiness::format_gib`, which is
+/// `pub(crate)` and so cannot be called from the E2E binary -- including the
+/// one that renders a whole number with no decimal at all
+/// (`format_gib_renders_a_whole_number_with_no_decimal` pins
+/// `format_gib(8.0) == "8 GiB"`). Deriving the string from the fixture is the
+/// point: the guard in [`assert_unreadable_shared_pool_claims_no_figure`] used
+/// to carry a hand-typed `"offers 4.0 GiB"`, a form `format_gib` never produces
+/// for a whole-GiB figure, so it matched nothing and could not fail however
+/// wrong the report got.
+fn as_rendered(bytes: u64) -> String {
+    let value = gib(bytes);
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0} GiB")
+    } else {
+        format!("{:.1} GiB", (value * 10.0).floor() / 10.0)
+    }
+}
+
+/// The carve-out as the report would spell it.
+///
+/// [`CARVE_OUT_BYTES`] is deliberately not a whole number of GiB, and the
+/// `assert` keeps it that way: a bare `"4 GiB"` is also what a recipe minimum
+/// of 4 GiB renders as, and an assertion that the carve-out is absent could not
+/// tell the two apart.
+fn carve_out_as_rendered() -> String {
+    assert!(
+        gib(CARVE_OUT_BYTES).fract().abs() > f64::EPSILON,
+        "CARVE_OUT_BYTES must not be a whole number of GiB, or the figure below is ambiguous \
+         against a recipe minimum of the same size; see its doc comment"
+    );
+    as_rendered(CARVE_OUT_BYTES)
+}
+
+#[given("a machine whose only GPU shares system memory, with the pool it may use readable")]
+async fn machine_with_a_readable_shared_pool(world: &mut E2eWorld) {
+    plant_single_gpu_with_memory(
+        world,
+        GFX1151_TARGET_VERSION,
+        CARVE_OUT_BYTES,
+        Some(APERTURE_BYTES),
+    );
+}
+
+#[given("a machine whose only GPU shares system memory, with the pool it may use unreadable")]
+async fn machine_with_an_unreadable_shared_pool(world: &mut E2eWorld) {
+    // Same machine, minus `mem_info_gtt_total`: the shape an older kernel or a
+    // container with no DRM device passed through presents.
+    plant_single_gpu_with_memory(world, GFX1151_TARGET_VERSION, CARVE_OUT_BYTES, None);
+}
+
+#[given("a machine whose integrated GPU shares system memory beside a second AMD card")]
+async fn machine_with_two_amd_cards(world: &mut E2eWorld) {
+    // The APU, exactly as diagnose-81 plants it: its aperture IS readable, so
+    // a verdict of 60 GiB is what this host would get on its own. That is the
+    // premise -- the scenario is about what the second card takes away.
+    plant_single_gpu_with_memory(
+        world,
+        GFX1151_TARGET_VERSION,
+        CARVE_OUT_BYTES,
+        Some(APERTURE_BYTES),
+    );
+    // The second AMD card, with an aperture of its own. A different figure from
+    // the first on purpose: either card's number appearing in the report would
+    // name a pool, and the whole point is that neither may be attributed to the
+    // device the verdict answers for.
+    plant_amd_drm_card(
+        world,
+        "card1",
+        8 * 1024 * 1024 * 1024,
+        Some(SECOND_CARD_APERTURE_BYTES),
+    );
+    // And `amd-smi` answering for one GPU, which is what makes this host reach
+    // the APU branch at all.
+    //
+    // Not decoration. The sysfs VRAM fallback the other three scenarios rely on
+    // withholds every row once it finds a second AMD card (its own, older
+    // ordinal-ambiguity guard, `read_drm_vram_usage`), so a two-card host with
+    // no `amd-smi` never gets as far as asking which pool it allocates from --
+    // it is classified as "GPU memory unmeasured" and the aperture rule has
+    // nothing to say. The hosts where this rule is the one that decides are the
+    // ones where `amd-smi` enumerates a single compute device while sysfs shows
+    // two AMD cards: an APU beside a display adapter ROCm does not enumerate.
+    // That is the machine planted here.
+    plant_amd_smi_reporting_one_gpu(world, CARVE_OUT_BYTES);
+}
+
+/// Put an `amd-smi` on PATH that reports exactly one GPU of `total_vram_bytes`,
+/// and let the pre-flight launch it.
+///
+/// `rocm-core` refuses to spawn `amd-smi` at all unless its KFD device node
+/// opens (it can block unkillably against a wedged one), and the simulated host
+/// root cannot provide that node -- the pre-flight deliberately keeps the real
+/// `/dev/kfd`'s veto. `ROCM_E2E_KFD_DEVICE` is the seam that moves it, honoured
+/// only by `e2e-test-hooks` builds; `examine.feature` uses the same one. Here it
+/// is pointed at an ordinary planted file, which opens.
+///
+/// The stub answers `metric` and fails anything else, so the examination's own
+/// probes see what they see today on these hosts (no usable `amd-smi`) and only
+/// the VRAM reading changes.
+///
+/// `HOME` is redirected too, and that is not incidental.
+/// `resolve_amd_smi_binary` looks in `$HOME/.rocm/runtimes/registry` *before*
+/// `PATH`, because the binary ships inside the managed SDK wheel and is not on
+/// `PATH` on a real install. The harness isolates `ROCM_CLI_DATA_DIR` but
+/// deliberately not `HOME`, so on any lane with a managed ROCm SDK installed --
+/// which is every self-hosted GPU lane -- the runner's own `amd-smi` would
+/// answer here and the scenario would describe that machine instead of the
+/// planted one. Pointing `HOME` at this scenario's own empty root is what keeps
+/// the stub the only `amd-smi` in reach, and so keeps this scenario the same
+/// scenario on every lane.
+fn plant_amd_smi_reporting_one_gpu(world: &mut E2eWorld, total_vram_bytes: u64) {
+    let total_mb = total_vram_bytes / (1024 * 1024);
+    let payload = format!(
+        r#"{{"gpu_data":[{{"gpu":0,"mem_usage":{{"used_vram":{{"value":0}},"total_vram":{{"value":{total_mb}}}}}}}]}}"#
+    );
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = metric ]; then\n    printf '%s' \
+         '{payload}'\n    exit 0\n  fi\ndone\nexit 1\n"
+    );
+    rocm_core::fake_executable::write_fake_executable(
+        &shared_pool_bin_dir(world).join("amd-smi"),
+        &script,
+    )
+    .expect("failed to write the fake amd-smi");
+
+    let host = simulated_host_root(world);
+    let device = host.join("kfd-device-stand-in");
+    // Planted twice, on purpose. `kfd_readable` requires the device to open
+    // both as written AND re-rooted under `ROCM_CLI_TEST_HOST_ROOT`: a
+    // simulated root may make the gate decline, never make it allow, which is
+    // what stops a test hook from launching `amd-smi` on a machine with no GPU.
+    // Both seams are in play in this scenario, so both copies have to exist --
+    // with only the first, the gate declines, `amd-smi` is never spawned, and
+    // the host reads as "GPU memory unmeasured". That is a verdict this
+    // scenario's `Then` would otherwise have accepted while exercising nothing,
+    // and it is what the `undetermined_reason` assertion in
+    // `assert_no_cards_aperture_is_attributed` exists to catch.
+    let rerooted = host.join(
+        device
+            .strip_prefix("/")
+            .expect("the isolated root is an absolute path"),
+    );
+    std::fs::create_dir_all(
+        rerooted
+            .parent()
+            .expect("the re-rooted device path has a parent"),
+    )
+    .expect("failed to create the re-rooted KFD device directory");
+    for copy in [&device, &rerooted] {
+        std::fs::write(copy, b"").expect("failed to plant the KFD device stand-in");
+    }
+    world
+        .command_env
+        .push(("ROCM_E2E_KFD_DEVICE", device.into_os_string()));
+
+    let home = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("shared-pool-home");
+    std::fs::create_dir_all(&home).expect("failed to create the scenario's home directory");
+    world.command_env.push(("HOME", home.into_os_string()));
+}
+
+#[given("a machine whose only GPU is a discrete card that also reports a system-memory aperture")]
+async fn machine_with_a_discrete_card_and_an_aperture(world: &mut E2eWorld) {
+    // 8 GiB of real VRAM beside the same 60 GiB aperture the APU above has.
+    // The driver reports `mem_info_gtt_total` for a discrete card too; the
+    // point is that it must not reach the verdict.
+    plant_single_gpu_with_memory(
+        world,
+        GFX1100_TARGET_VERSION,
+        8 * 1024 * 1024 * 1024,
+        Some(APERTURE_BYTES),
+    );
+}
+
+#[then("the memory the answer was reached against is the shared pool, not the carve-out")]
+async fn assert_the_verdict_used_the_shared_pool(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    let measured = measured_gpu_gib(&model).unwrap_or_else(|| {
+        panic!(
+            "an APU whose aperture is readable must report a measured figure, not nothing: \
+             {model:#}"
+        )
+    });
+    assert!(
+        (measured - gib(APERTURE_BYTES)).abs() < 0.01,
+        "the verdict must be reached against the {} GiB aperture; {} GiB is the {} GiB \
+         carve-out or something else entirely: {model:#}",
+        gib(APERTURE_BYTES),
+        measured,
+        gib(CARVE_OUT_BYTES)
+    );
+}
+
+#[then("the model is reported as degraded, because the pool is shared rather than set aside")]
+async fn assert_shared_pool_is_degraded_with_its_reason(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "degraded",
+        "a ceiling on memory shared with the operating system is not an allocation, so it \
+         cannot promise READY -- and the model clears it, so it is not BLOCKED either: {model:#}"
+    );
+    // The verdict word alone would also be produced by the system-RAM
+    // softening, which has nothing to do with the shared pool, so the reason is
+    // asserted too (AGENTS.md section 3: the message and the state together).
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        evidence.contains("shares with the operating system"),
+        "the report has to say why it will not call this ready, or `degraded` reads as a \
+         property of the model: {evidence}"
+    );
+}
+
+#[then(
+    "the reason given is that the shared pool could not be read, and no memory figure is claimed"
+)]
+async fn assert_unreadable_shared_pool_claims_no_figure(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "unified_memory_unreadable",
+        "this host is an APU whose pool could not be read -- not a host with no telemetry at \
+         all, whose remedy is to run `amd-smi` again: {model:#}"
+    );
+    assert_eq!(
+        measured_gpu_gib(&model),
+        None,
+        "nothing measured the pool, so no figure may be claimed for it -- installed system RAM \
+         least of all, which over-estimates in the one direction that produces a wrong \
+         \"it fits\": {model:#}"
+    );
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // Anchor first. The guard below says a string is absent, which an empty
+    // evidence list -- or a report whose shape changed out from under this
+    // step -- would also satisfy. This is the sentence the
+    // `UnifiedMemoryUnreadable` branch really emits; the branch does not use
+    // the "...and this host offers {}" template the old guard was written
+    // against at all.
+    let said_so = "the figure for the memory pool its engine allocates from could not be read \
+                   here";
+    assert!(
+        evidence.iter().any(|line| line.contains(said_so)),
+        "the report must say the pool could not be read, in its own words, or everything below \
+         is asserted against a report that said something else entirely: {model:#}"
+    );
+    // And the carve-out must not have been smuggled in as the answer either --
+    // in any line, spelled the way the report would spell it.
+    let carve_out = carve_out_as_rendered();
+    assert!(
+        !evidence.iter().any(|line| line.contains(&carve_out)),
+        "the BIOS carve-out ({carve_out}) is not this host's pool and must not be reported as \
+         one: {model:#}"
+    );
+}
+
+#[then("neither card's aperture is offered as the pool the model would use")]
+async fn assert_no_cards_aperture_is_attributed(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // Non-vacuity, and the load-bearing assertion of the scenario. "Could not
+    // determine" alone would ALSO be the answer if the stub `amd-smi` had never
+    // run: the host would then have no VRAM rows at all and be classified
+    // `accelerator_memory_unknown` ("run `amd-smi` again"), which has nothing to
+    // do with the aperture. `unified_memory_unreadable` is only reachable
+    // through the APU branch -- the single compute device WAS seen, the host IS
+    // an APU, and the one thing missing is a pool that could be attributed to
+    // it. That is this rule and no other.
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "unified_memory_unreadable",
+        "the answer has to be withheld for want of an attributable pool, not for want of \
+         telemetry: a reason of `accelerator_memory_unknown` means the fixture's `amd-smi` never \
+         answered and this scenario exercised the VRAM fallback's guard instead of the \
+         aperture's: {model:#}"
+    );
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (whose, bytes) in [
+        ("the integrated GPU's", APERTURE_BYTES),
+        ("the second card's", SECOND_CARD_APERTURE_BYTES),
+    ] {
+        let figure = as_rendered(bytes);
+        assert!(
+            !evidence.iter().any(|line| line.contains(&figure)),
+            "{whose} aperture ({figure}) reached the report. The aperture is per device and the \
+             verdict answers for one of them, so on a host showing two AMD cards there is no way \
+             to tell from here which figure belongs to the part the engine would use -- handing \
+             back either one names a pool the model may never see: {model:#}"
+        );
+    }
+    // The premise the two assertions above rest on: diagnose-81 plants the same
+    // APU with the same readable 60 GiB aperture and DOES get a figure, so what
+    // is withheld here is withheld because of the second card and not because
+    // the fixture simply has nothing to report.
+    assert_eq!(
+        measured_gpu_gib(&model),
+        None,
+        "no figure may be claimed at all, not merely a different one: {model:#}"
+    );
+}
+
+#[then("the memory the answer was reached against is the card's own VRAM alone")]
+async fn assert_a_discrete_card_is_judged_on_its_vram(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    let measured = measured_gpu_gib(&model)
+        .unwrap_or_else(|| panic!("a discrete card's VRAM is measured: {model:#}"));
+    assert!(
+        (measured - 8.0).abs() < 0.01,
+        "a discrete card is judged on its 8 GiB of VRAM: 68 GiB would mean the aperture was \
+         added to it (and every model would then fit), {} GiB that it replaced it: {model:#}",
+        gib(APERTURE_BYTES)
+    );
+    assert_eq!(
+        model_verdict(&model),
+        "ready",
+        "8 GiB of dedicated VRAM clears this recipe, and a dedicated card is not a shared \
+         pool, so it stays READY: {model:#}"
+    );
+}
+
+/// A ref that exists only in the catalog [`catalog_with_a_cpu_only_copy`] signs:
+/// the smallest curated recipe with its device policy changed to `cpu_only` and
+/// its GPU minimum removed.
+const CPU_ONLY_MODEL_REF: &str = "e2e-fixtures/cpu-only-probe";
+
+#[given(
+    "a recipe catalog offering the smallest curated model CPU-only beside a copy that needs the GPU"
+)]
+async fn catalog_with_a_cpu_only_copy(world: &mut E2eWorld) {
+    // Planted rather than looked up: every one of the 49 shipped recipes is
+    // `gpu_required` or `gpu_preferred`, so `cpu_only` -- a device policy the
+    // index schema validates and accepts (`validate_model_device_policy`) --
+    // cannot be reached through the built-in catalog at all. A signed index is
+    // the only way the CLI loads any other one.
+    let gpu_required = rocm_core::resolve_builtin_model_recipe(SMALLEST_MODEL_REF)
+        .expect("the smallest curated recipe");
+    // The premise the GPU half of this scenario rests on, pinned where it is
+    // read rather than assumed: this copy has to be a recipe the shared-pool
+    // softening is allowed to speak about, which means needing the GPU *and*
+    // declaring a minimum the pool was actually weighed against.
+    assert!(
+        gpu_required.device_policy != "cpu_only" && gpu_required.min_gpu_mem_gb.is_some(),
+        "the curated recipe this scenario copies must need the GPU and declare a minimum, or \
+         the second half asserts a softening that was never licensed: {gpu_required:?}"
+    );
+    let mut cpu_only = gpu_required.clone();
+    cpu_only.canonical_model_id = CPU_ONLY_MODEL_REF.to_owned();
+    // Cleared so the two copies do not collide on a shared alias, which the
+    // index's own uniqueness check would reject outright.
+    cpu_only.aliases.clear();
+    cpu_only.device_policy = "cpu_only".to_owned();
+    cpu_only.min_gpu_mem_gb = None;
+    // Cleared so the system-RAM softening -- a different rule, with a different
+    // remediation -- cannot be what moves this verdict off `ready`.
+    cpu_only.recommended_system_ram_gb = None;
+    // Cleared because they name curated refs this trimmed index does not carry,
+    // so leaving them would only put unresolvable suggestions in the report.
+    cpu_only.manual_alternatives.clear();
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-cpu-only-on-a-shared-pool",
+        "recipes": [gpu_required, cpu_only],
+    });
+    sign_recipe_index_and_point_cli(world, "cpu-only", &document);
+}
+
+/// Ask `rocm` a question on the scenario's planted machine, and leave that
+/// machine planted for the next question.
+///
+/// Not a convenience. `scenario_command` **takes** `command_env` rather than
+/// borrowing it, so everything a `Given` planted reaches exactly one child
+/// process: a scenario that asks two questions of the *same* host gets the
+/// planted machine for the first and the runner's own for the second. That is
+/// not a failure a reader would recognise as one, it is a silent change of
+/// subject. Before this helper existed, the second half of diagnose-85
+/// answered about whatever GPU the runner itself has, out of the built-in
+/// catalog, while reading as though it answered about the planted APU and the
+/// planted recipe — and on a runner with a large dedicated card that is a
+/// different verdict, reported as if it were the planted host's. Restoring the
+/// environment is what keeps both halves of the scenario about one machine.
+fn ask_again_on_the_same_planted_machine(
+    world: &mut E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let planted = world.command_env.clone();
+    let result = crate::run_rocm_with_scenario_env(world, args);
+    world.command_env = planted;
+    result
+}
+
+#[when("the user asks the CLI whether the CPU-only recipe would run, in machine-readable form")]
+async fn user_asks_whether_the_cpu_only_recipe_would_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = ask_again_on_the_same_planted_machine(
+        world,
+        &["diagnose", "--model", CPU_ONLY_MODEL_REF, "--json"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when(
+    "the user asks the CLI whether the copy that needs the GPU would run, in machine-readable form"
+)]
+async fn user_asks_whether_the_gpu_copy_would_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = ask_again_on_the_same_planted_machine(
+        world,
+        &["diagnose", "--model", SMALLEST_MODEL_REF, "--json"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the model is reported ready, with no GPU evidence and nothing to remediate")]
+async fn assert_cpu_only_recipe_is_untouched_by_the_pool(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "ready",
+        "a recipe that never allocates from the accelerator cannot be made worse by what that \
+         accelerator's pool is shared with: {model:#}"
+    );
+    let evidence = model_field(&model, "evidence")
+        .as_array()
+        .expect("evidence is not an array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // Anchor. The guard below says a sentence is absent, which a report whose
+    // shape changed -- or whose model section stopped being this recipe at all
+    // -- would satisfy just as well.
+    assert!(
+        evidence.iter().any(
+            |line| line.contains("declares no GPU memory minimum") && line.contains("cpu_only")
+        ),
+        "this has to be the CPU-only recipe's own report, or everything below is asserted \
+         against some other model's: {model:#}"
+    );
+    // And against the planted machine, not the runner's. The host's memory is
+    // reported whatever the device policy, so the aperture appearing here is
+    // what says the shared-pool branch had something to fire on and declined
+    // -- without it, a lane (or a leaked fixture) with no shared pool at all
+    // would satisfy every assertion below while exercising nothing.
+    let measured = measured_gpu_gib(&model)
+        .unwrap_or_else(|| panic!("the planted APU's pool is readable: {model:#}"));
+    assert!(
+        (measured - gib(APERTURE_BYTES)).abs() < 0.01,
+        "this answer has to be about the planted {} GiB shared pool; {measured} GiB is some \
+         other machine's memory: {model:#}",
+        gib(APERTURE_BYTES)
+    );
+    assert!(
+        !evidence
+            .iter()
+            .any(|line| line.contains("no dedicated VRAM")),
+        "the report volunteered GPU evidence for a recipe whose engine allocates from system \
+         memory: {model:#}"
+    );
+    assert!(
+        model_field(&model, "fix").is_null(),
+        "nothing here is broken, so there is nothing to remediate -- least of all closing \
+         programs to free memory for a device this model does not use: {model:#}"
+    );
+}
+
+#[then("the estimate is compared against the shared pool's ceiling, and says the pool is shared")]
+async fn assert_gguf_estimate_names_its_pool_as_shared(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    let estimate = estimate_section(&model);
+    // Non-vacuity first, and the reason this is asserted rather than the note
+    // alone: a planted host that reached `cannot_estimate` carries no
+    // `available_gib` at all, and a scenario that only looked for the absence
+    // of a wrong word would pass against that while exercising nothing. The
+    // aperture being the figure compared against is what says the shared-pool
+    // branch is the one that ran.
+    let available = estimate["available_gib"].as_f64().unwrap_or_else(|| {
+        panic!(
+            "this APU's pool is readable, so the estimate has a figure to compare against; \
+             `cannot_estimate` here means the fixture never reached the shared-pool branch: \
+             {estimate:#}"
+        )
+    });
+    assert!(
+        (available - gib(APERTURE_BYTES)).abs() < 0.01,
+        "the estimate must be compared against the {} GiB pool the engine allocates from; {} \
+         GiB is the {} GiB carve-out or something else entirely: {estimate:#}",
+        gib(APERTURE_BYTES),
+        available,
+        gib(CARVE_OUT_BYTES)
+    );
+    assert_eq!(
+        estimate["available_is_shared_pool"],
+        serde_json::Value::Bool(true),
+        "the figure above is a shared ceiling, and the flag is what lets a reader tell it from \
+         dedicated VRAM without re-deriving it: {estimate:#}"
+    );
+    let notes = estimate["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the estimate carries no notes: {estimate:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    // The flag is machine-readable; this is the only place a person reading the
+    // figures is told which kind of number sits beside them. Both are asserted
+    // because a renderer that dropped the note would still set the flag.
+    assert!(
+        notes.iter().any(|note| note
+            .contains("the ceiling on a pool it shares with the operating system")
+            && note.contains("how much is free depends on what else is running")),
+        "a bare \"fits\" against a shared ceiling reads as \"this much memory is waiting for \
+         it\", and nothing here measured how much of the pool is free, so the estimate has to \
+         say so: {notes:#?}"
     );
 }

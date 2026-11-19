@@ -1204,8 +1204,10 @@ models that would run here instead.
 true:
 
 - The recipe catalog could not be read.
-- This machine's GPU memory could not be measured. This includes an integrated
-  GPU (APU), where the CLI can't yet read the memory pool the engine uses.
+- This machine's GPU memory could not be measured. On an integrated GPU (APU)
+  that means the shared memory pool its engine allocates from could not be read
+  on this host, which is a narrower statement than "no reading at all" and is
+  reported as such.
 - The model is not one of the curated recipes. [`rocm model --verbose`](#curated-models)
   lists all of them, including recipes hidden from the default list.
 
@@ -1213,6 +1215,14 @@ None of these says anything about whether the model fits, so none of them is
 reported as though it did. `rocm serve` still accepts a model outside the
 catalog, but for anything other than a GGUF, `diagnose` cannot tell you in
 advance how it will go.
+
+An integrated GPU whose pool **can** be read is judged on that pool — the
+memory its engine actually allocates from, not the small VRAM carve-out the
+BIOS reserves. That pool is shared with the operating system, so it is a
+ceiling and not an allocation: a model that fits under it is answered
+`degraded` rather than `ready`, with the reason, because nothing here measures
+how much of the pool is free. A model larger than the ceiling is `blocked`, and
+the report says that freeing memory will not raise it.
 
 #### A GGUF model outside the catalog
 
@@ -1240,7 +1250,8 @@ has two minutes in all, so on a slow link it can take that long to fail. No
 token is sent, so a gated or private repository cannot be read.
 It then estimates weights, plus the KV cache at `--context-size` (default 4096)
 and `--kv-cache-type` (default `f16`), plus a compute buffer and a runtime
-reserve, against this GPU's dedicated VRAM:
+reserve, against this GPU's dedicated VRAM — or, on an integrated GPU, against
+the shared memory pool its engine allocates from:
 
 ```
 rocm diagnose --model owner/repo:Q4_K_M --context-size 32768 --kv-cache-type q8_0
@@ -1286,7 +1297,8 @@ which size the compute buffer, is treated the same way (reason
 `missing_metadata`, with the figures). Another
 GPU, engine build or batch size can miss by more, so leave headroom. The figures
 are compared with the total dedicated VRAM of the GPU with the most of it that
-ROCm can see, the same figure a curated model's minimum is compared with, not
+ROCm can see — or, on an integrated GPU, with the shared memory pool its engine
+allocates from — the same figure a curated model's minimum is compared with, not
 with what other processes have left free. When a device-visibility variable
 (`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) is set on
 a host whose GPUs differ in memory, the report says that the mapping between the
@@ -1303,12 +1315,14 @@ at all, so nothing is fetched for it, and `--context-size` and `--kv-cache-type`
 are ignored along with `--model`; a note on stderr names the flags that were
 ignored.
 
-On an integrated GPU (APU), where the CLI can't read the memory
-pool the engine uses, and on a host with no GPU or an unreadable one, the
-answer stays `undetermined` but still shows what the file needs. Layouts the
-formula does not describe (a file that is one shard of a split model, latent
-attention, a model with no attention layers) are reported as such rather than
-estimated.
+On an integrated GPU (APU) the comparison is made against the shared pool its
+engine allocates from, with a note that the figure is a ceiling on memory the
+operating system draws on too, so a `fits` there means "the machine would allow
+this at best". On a host with no GPU, an unreadable one, or an APU whose pool
+could not be read, the answer stays `undetermined` but still shows what the
+file needs. Layouts the formula does not describe (a file that is one shard of a
+split model, latent attention, a model with no attention layers) are reported as
+such rather than estimated.
 
 ### Curated models
 
