@@ -24,6 +24,7 @@ mod cli_report;
 mod comfyui;
 mod config_cmd;
 mod dash;
+mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
@@ -60,7 +61,9 @@ mod runtime_services;
 mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
+mod serve_device_probe;
 mod serve_port;
+mod serve_progress;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;

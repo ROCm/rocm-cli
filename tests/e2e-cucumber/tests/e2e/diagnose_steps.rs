@@ -33,6 +33,17 @@ const ENGINE_IMPORT_SYMPTOM: &str =
 /// The catalog entry [`ENGINE_IMPORT_SYMPTOM`] must reach.
 const ENGINE_IMPORT_FIX_ID: &str = "fix-17-torch-dlpack";
 
+/// The line a vLLM engine logs when one of its compiled extensions did not load
+/// and the engine then calls an op that extension registers, copied from a real
+/// launch (ROCMAI-1058). Pasted as is, apostrophes and process prefix included,
+/// because that is what a user copies out of the log.
+const EXTENSION_LOAD_SYMPTOM: &str = "(EngineCore pid=629513) ERROR 11-16 11:48:44 \
+     [core.py:1374] AttributeError: '_OpNamespace' '_C' object has no attribute \
+     'get_cuda_view_from_cpu_tensor'";
+
+/// The catalog entry [`EXTENSION_LOAD_SYMPTOM`] must reach.
+const EXTENSION_LOAD_FIX_ID: &str = "fix-23-vllm-extension-load";
+
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
 /// recipes gate on host state (e.g. `$USER`) and return non-zero even for a
@@ -140,6 +151,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     // `rocm fix` has to resolve that id -- by naming the problem and changing
     // nothing. Leaving it out here would let the two published forms drift.
     "info-20-gpu-no-rocm-support",
+    "fix-23-vllm-extension-load",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -454,6 +466,11 @@ async fn user_pasted_vllm_error_naming_their_machine(world: &mut E2eWorld) {
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
+}
+
+#[given("a user who hit a vLLM compiled-extension load failure")]
+async fn user_hit_extension_load_failure(world: &mut E2eWorld) {
+    world.model_name = Some(EXTENSION_LOAD_SYMPTOM.to_string());
 }
 
 #[given("a user who has chosen the fix for the engine-startup import failure")]
@@ -1487,6 +1504,33 @@ async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
 
 #[then("the CLI reports the engine-startup import failure as an established cause")]
 async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
+    assert_established_cause(world, ENGINE_IMPORT_FIX_ID, "engine-startup import failure");
+}
+
+#[then("the CLI reports the vLLM compiled-extension load failure as an established cause")]
+async fn assert_extension_load_failure_established(world: &mut E2eWorld) {
+    assert_established_cause(
+        world,
+        EXTENSION_LOAD_FIX_ID,
+        "vLLM compiled-extension load failure",
+    );
+}
+
+#[then("the CLI can act on the fix named for the vLLM compiled-extension load failure")]
+async fn assert_extension_load_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_matched(&report, EXTENSION_LOAD_FIX_ID, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+/// Asserts that diagnose exited 0 and that `fix_id` cleared the threshold the
+/// report itself publishes. Shared by the steps for the symptom-driven engine
+/// entries.
+fn assert_established_cause(world: &E2eWorld, fix_id: &str, what: &str) {
     assert_eq!(
         world.cli_rc,
         Some(0),
@@ -1505,17 +1549,15 @@ async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
         .and_then(|m| m.as_array())
         .expect("diagnose JSON has no 'matched' array")
         .iter()
-        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(ENGINE_IMPORT_FIX_ID))
+        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(fix_id))
         .and_then(|d| d.get("score"))
         .and_then(serde_json::Value::as_i64)
-        .unwrap_or_else(|| {
-            panic!("the catalog did not recognise the engine-startup import failure:\n{output}")
-        });
+        .unwrap_or_else(|| panic!("the catalog did not recognise the {what}:\n{output}"));
     // Below the bar the entry is presented among the sub-threshold noise it was
     // added to outrank, which is the state the report was in before it existed.
     assert!(
         score >= threshold,
-        "{ENGINE_IMPORT_FIX_ID} scored {score}, under the report's own threshold \
+        "{fix_id} scored {score}, under the report's own threshold \
          of {threshold}, so it is not an established cause:\n{output}"
     );
 }

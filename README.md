@@ -228,7 +228,9 @@ cargo build --release
 This produces the two binaries under `target/release/`:
 
 - `rocm`: the CLI and interactive interfaces
-- `rocmd`: the background telemetry daemon used by the dashboard
+- `rocmd`: the background daemon: it runs the watchers and the managed-service
+  supervisor, and serves the MCP tools (the dashboard's telemetry daemon runs
+  inside `rocm dash` itself, not in `rocmd`)
 
 Run without installing:
 
@@ -299,8 +301,24 @@ the legacy full-screen setup assistant has been retired.
 ### The dashboard (`rocm dash`)
 
 The full-screen telemetry dashboard shows every instrument and action on one screen.
-It auto-starts an embedded `rocmd` daemon when none is running, then presents
-five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+On Linux/WSL it runs its telemetry daemon inside the dashboard itself, with no
+separate service to start. Several dashboards open at once share one daemon,
+and when the dashboard running it closes, one that is still open takes it
+over, so the others reconnect and keep their chart history. After that
+hand-off the GPU figures can stay empty for a while (up to about 15 seconds on
+some hosts) while the new daemon detects the GPU again. A dashboard that
+reconnects to the same daemon can show up to about 30 recent chart points
+twice, a known issue. If the daemon was failing when you quit the dashboard
+(it could not start, or stopped serving and had not recovered), and no other
+dashboard's daemon is serving by then, the dashboard says why after you quit
+it, however you opened it (`rocm dash`, interactive `rocm chat`, or the bare
+`rocm` launcher), and also when you end it with Ctrl-C or it gets SIGINT or
+SIGTERM. If the dashboard's own supervision of its telemetry daemon crashes,
+that is reported even when another dashboard's daemon is serving, when you
+quit the dashboard; on Ctrl-C or a signal it is only written to the log
+files under the data directory's `logs` folder, as it happens. The
+dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys
+`1`–`5`):
 
 | Tab | What it shows |
 |---|---|
@@ -1412,25 +1430,42 @@ Likewise, an explicit `--port` that differs from the port the running service
 is already on is refused rather than silently ignored; omit `--port` to reuse
 the running service, or stop it first to serve on the new port.
 
-By default the server runs in the background under ROCm CLI's supervision and
-prints a deployment summary: a progress indicator while it starts, then a table
+By default the server runs in the background under ROCm CLI's supervision.
+For a fresh launch in a terminal it first prints the service id, how to follow its log
+(`rocm logs --service <service-id> --follow`) and, for a public bind, the
+API key. While it starts, the status line follows the engine: a download, a weight
+load, or the latest log line, until the server is ready or that wait fails
+(the engine exits, a download stops advancing, or the startup deadline
+passes). When the server is ready it prints a deployment summary: a table
 with the status, the engine and the backend device the engine reports (for
 example `rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)`
-where the engine pinned no GPU ordinal). It is read back from the running
+where the engine pinned no GPU ordinal), the full inference endpoint, the
+API-qualified model name, and a quick smoke test (time to first token and
+approximate tokens per second). The device is read back from the running
 engine, so it is that engine's own account of the backend it was launched on
-rather than an independent measurement of the hardware. The summary also carries
-the full inference endpoint, the API-qualified model name, and a quick smoke
-test (time to first token and approximate tokens per second). `rocm services`
-reports the same `device` for each running service.
-
-On an interactive terminal, if the smoke test cannot complete, the summary is
-headed `(smoke test failed)`, shows the status as `started, smoke test failed`
-instead of `ready`, and a note gives the reason and points at
+rather than an independent measurement of the hardware. `rocm services`
+reports the same `device` for each running service. On an
+interactive terminal, if the smoke test cannot complete, the summary is headed
+`(smoke test failed)`, shows the status as `started, smoke test failed` instead
+of `ready`, and a note gives the reason and points at
 `rocm logs --service <id>`. ROCm CLI does not stop the server, and the command
 still exits 0. Which failures are detected, and which still read as `ready`, is
 listed under
 [Serve Smoke Test Failure](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md#serve-smoke-test-failure)
-in the testing guide.
+in the testing guide. A model that is still loading is not reported as a finished "not
+ready" summary. The wait fails, and `rocm serve` exits non-zero, when the
+engine reports failure or its process exits, when a download percent stops
+advancing for 3 minutes (a line at 100% counts as loading), when the endpoint has not listed the model and there is no engine log for
+5 minutes, when a load log line stops changing for 5 minutes with the endpoint
+not yet listing the model, or after 30 minutes in all. A stall leaves the server running:
+the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and the background helper does not
+restart a live server for being slow until those 30 minutes pass. Engine log
+lines shown on the status line have credentials (the endpoint key, `--api-key`
+and token values, `hf_` tokens) masked. Once the server lists the model, the wait
+checks whether it can answer with a one-token request, first right away and
+then at growing intervals up to every 15 seconds. Piped output, or a stderr that is not a terminal (`2>log`), keeps
+the 45-second wait and reports the server as it stood then.
 
 The device line is omitted when the engine cannot say yet. A server is reported
 ready as soon as it answers, which can be before it has finished loading the
@@ -1458,8 +1493,8 @@ can:
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
-`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), with
+no CLI-side stall limit or deadline, instead of the default wait above; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
