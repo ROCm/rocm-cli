@@ -922,6 +922,66 @@ mod tests {
         }
     }
 
+    /// ROCMAI-1050 at the launcher's own `draw_approval_scrolled` call site.
+    ///
+    /// Every other regression test for the height growth and the overflow
+    /// notice renders through `ui::draw`, the dashboard's call site. The key
+    /// routing is shared (`resolve_quit_confirm_key`), but this call site has
+    /// its own few lines of render glue — the `&quit_confirm_request(...)`,
+    /// the scroll it passes down and the `max_scroll` it writes back — and a
+    /// transposed argument there would not necessarily fail to compile. The
+    /// pre-existing test next to this one renders at a roomy 24 rows and then
+    /// only checks that short sizes do not panic, which a silently cut body
+    /// would also satisfy.
+    ///
+    /// Both directions are asserted. At twelve rows the body must still reach
+    /// the user *and* say there is more; at twenty-four it must not claim
+    /// there is more when everything fits, which is what a notice wired to
+    /// fire unconditionally would do.
+    #[test]
+    fn launcher_quit_prompt_on_a_short_terminal_shows_its_body_and_says_there_is_more() {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = base();
+        // Enough serving instances that the body cannot fit a short window:
+        // each contributes its own "stop it first" bullet and command line.
+        for i in 0..7 {
+            s.instances.insert(
+                format!("vllm-{i}"),
+                Instance {
+                    container_id: format!("vllm-{i}"),
+                    managed: true,
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: (0..7).map(|i| format!("vllm-{i}")).collect(),
+                ..Default::default()
+            },
+        )));
+        s.open_quit_confirm();
+
+        let short = render(&s, 0, 100, 12);
+        assert!(
+            short.contains("rocm services stop vllm-0 --yes"),
+            "the remediation must still reach the user on a short terminal, not be cut: {short:?}"
+        );
+        assert!(
+            short.contains("More to read") && short.contains("PgUp/PgDn"),
+            "and the body that does not fit must say so and name the keys: {short:?}"
+        );
+
+        let roomy = render(&s, 0, 100, 24);
+        assert!(
+            !roomy.contains("More to read"),
+            "a body that fits must not claim there is more to read: {roomy:?}"
+        );
+    }
+
     #[test]
     fn launcher_quit_key_exits_immediately_when_idle() {
         // Regression guard (issue #145): the overwhelmingly common case —

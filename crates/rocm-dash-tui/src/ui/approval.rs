@@ -183,8 +183,11 @@ fn draw_approval_inner(
     theme: &Theme,
 ) -> u16 {
     // The geometry this dialog has always had. On a roomy screen it is still
-    // the final answer, so every caller renders exactly as before there.
-    let baseline = centered_rect(72, 70, 96, 24, area);
+    // the final answer, so every caller renders exactly as before there. The
+    // cap is `POPUP_MAX_ROWS`, the same constant the grown height below is
+    // clamped to: as two literals they could drift, and a dialog that grew
+    // past the height it is allowed to have is exactly that drift.
+    let baseline = centered_rect(72, 70, 96, POPUP_MAX_ROWS, area);
 
     let body: Vec<Line> = req
         .body
@@ -218,9 +221,13 @@ fn draw_approval_inner(
         return 0;
     }
 
+    // `FOOTER_ROWS`, not a literal 2: this split must reserve exactly what the
+    // height computation above already subtracted for the buttons and the
+    // "More to read" row, or the body is sized against one number and drawn
+    // against another.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(FOOTER_ROWS)])
         .split(inner);
 
     let total = paragraph.line_count(rows[0].width);
