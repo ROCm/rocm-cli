@@ -6,6 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How many benchmark rows a daemon keeps for a late-joining client, and how
+/// many a dashboard holds.
+///
+/// One number for both: a dashboard that reconnects
+/// clears its rows and takes the daemon's replay as the whole list, which loses
+/// nothing only while the daemon keeps at least as many as the dashboard shows.
+pub const BENCH_HISTORY_CAP: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PassFail {

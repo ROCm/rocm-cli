@@ -185,6 +185,9 @@ runs:
             # so a canonical-key-only change must trigger the heavy job that runs
             # `cargo xtask verify-pinned-keys`.
             - 'docs/keys/**'
+            # The issue-triage self-test (scripts/triage_issue.py) checks this
+            # prompt against the labels it applies.
+            - '.github/prompts/issue-triage.txt'
             - '.github/workflows/**'
             - '.github/actions/**'
           # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
@@ -267,7 +270,9 @@ runs:
           # issue and pull request templates, code ownership, the security
           # scanners' configuration (read only by
           # their own workflows, which do not use this action), the release
-          # narrative prompt (read only by nightly.yml) and agent instructions.
+          # narrative prompt (read only by nightly.yml), the issue-triage
+          # maintainer list (read only by issue-triage.yml, not by the
+          # triage self-test) and agent instructions.
           # The jobs that run on every pull request (license headers, links,
           # prek, commit signatures) still check them. Matching one turns
           # nothing on; it only stops the file from forcing a full run. When
@@ -281,7 +286,8 @@ runs:
             - '.github/CODEOWNERS'
             - '.github/ISSUE_TEMPLATE/**'
             - '.github/pull_request_template.md'
-            - '.github/prompts/**'
+            - '.github/prompts/release-readiness-narrative.txt'
+            - '.github/triage-maintainers.txt'
             - '.github/scan_tools_configs/**'
           # Every changed file, for the catch-all below.
           all:

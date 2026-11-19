@@ -68,7 +68,7 @@ pub(crate) use helper_autostart::{
     ensure_background_helper_running, ensure_background_helper_running_quiet,
 };
 pub(crate) use launch_transaction::{managed_service_reuse_refusal, no_usable_gpu_refusal};
-pub(crate) use readiness::e2e_simulate_oom_launch;
+pub(crate) use readiness::{e2e_simulate_oom_launch, e2e_simulate_startup_exit};
 #[cfg(not(windows))]
 pub(crate) use spawn::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,

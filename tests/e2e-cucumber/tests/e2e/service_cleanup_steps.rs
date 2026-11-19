@@ -530,9 +530,10 @@ async fn refuses_running(world: &mut E2eWorld) {
         combined.contains("cannot be removed while it is running"),
         "the refusal must say why, got:\n{combined}"
     );
-    assert!(
-        combined.contains(&format!("rocm services stop {SERVICE_ID} --yes")),
-        "the refusal must name the stop command, got:\n{combined}"
+    assert_eq!(
+        rocm_core::recovery_hint::try_command(world.cli_stderr.as_deref().unwrap_or("")),
+        Some(format!("rocm services stop {SERVICE_ID} --yes").as_str()),
+        "the refusal must end by naming the stop command, got:\n{combined}"
     );
 }
 
@@ -940,8 +941,9 @@ async fn refuses_and_names_force(world: &mut E2eWorld) {
         "{combined}"
     );
     // The command the refusal names is the one the next step runs.
-    assert!(
-        combined.contains(&format!("rocm services remove {SERVICE_ID} --force --yes")),
+    assert_eq!(
+        rocm_core::recovery_hint::try_command(world.cli_stderr.as_deref().unwrap_or("")),
+        Some(format!("rocm services remove {SERVICE_ID} --force --yes").as_str()),
         "{combined}"
     );
 }
@@ -971,8 +973,9 @@ async fn refuses_force(world: &mut E2eWorld) {
         combined.contains("--force removes a record only when"),
         "{combined}"
     );
-    assert!(
-        combined.contains(&format!("rocm services stop {SERVICE_ID} --yes")),
+    assert_eq!(
+        rocm_core::recovery_hint::try_command(world.cli_stderr.as_deref().unwrap_or("")),
+        Some(format!("rocm services stop {SERVICE_ID} --yes").as_str()),
         "{combined}"
     );
 }

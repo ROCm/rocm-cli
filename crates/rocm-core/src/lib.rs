@@ -48,6 +48,7 @@ mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
+pub mod recovery_hint;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
@@ -93,11 +94,11 @@ pub use command_capture::{
     CommandCapture, CommandOutcome, command_capture_text, run_rocm_capture_with_env,
 };
 pub use config::{
-    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
-    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
-    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
-    WatcherUserConfig, builtin_watcher, builtin_watchers,
+    AutomationsConfig, BuiltinWatcherSpec, CONFIG_LOCK_TIMEOUT, ConfigLock, DashboardConfig,
+    DashboardDaemonConfig, DashboardTuiConfig, EngineUserConfig, ManagedToolConfig,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig,
+    RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig,
+    WatcherMode, WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
 pub use confirm::{interactive_terminal, require_yes_or_interactive};
 pub use crypto::{
@@ -106,10 +107,11 @@ pub use crypto::{
 };
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
-    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
+    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
     diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
-    render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
-    vllm_oom_symptom_is_diagnosable,
+    render_report_text as render_diagnose_text, vllm_extension_load_symptom_is_diagnosable,
+    vllm_import_symptom_is_diagnosable, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
@@ -124,7 +126,7 @@ pub use download::{
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
-    JSON_STATE_LOCK_FILE_NAME, JsonStateFileRefused, JsonStateRefusal,
+    JSON_STATE_LOCK_FILE_NAME, JsonStateFileRefused, JsonStateRefusal, SERVE_STARTUP_DEADLINE,
     engine_state_inference_verified, json_state_lock_path, managed_service_endpoint_model_ready,
     managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
     openai_chat_completion_status, openai_models_endpoint_has_model, write_json_state_file,

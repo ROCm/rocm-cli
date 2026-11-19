@@ -193,6 +193,39 @@ irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 As on Linux, this is the binary's channel only. The ROCm SDK channel is chosen
 separately with `rocm install sdk --channel`.
 
+### Try a pull request's build
+
+CI builds a bundle for each pull request that changes code, and the installers
+can install it by pull request number. The pull request's CI run shows the
+exact command on its summary page, under "Try this PR's build". This needs the
+[GitHub CLI](https://cli.github.com) signed in (`gh auth login`, or
+`GH_TOKEN` set), because GitHub only serves workflow artifacts to signed-in
+users.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- pr-1234
+```
+
+```powershell
+$env:ROCM_CLI_CHANNEL = "pr-1234"
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+Remove-Item Env:ROCM_CLI_CHANNEL
+```
+
+The installer installs the build of the pull request's latest commit and
+prints the commit and the CI run it came from, with the run's result. Whether
+a failed run still has a build depends on the platform: the Linux build is a
+separate job, so a failing test elsewhere in the run leaves it in place, but a
+failure in the lint or formatting checks that gate it leaves none, and the
+Windows build is packaged after that job's install lifecycle checks, so a
+failure there leaves none either. Builds are unsigned and unreviewed, so only the download's checksum is
+verified, and asking for a signature (`ROCM_CLI_REQUIRE_SIGNATURE=1`, or a
+signing key) fails instead of being skipped. They are kept for 7 days, so an
+older pull request needs a new push or a re-run. `ROCM_CLI_GITHUB_REPO` points
+the lookup at a fork. `ROCM_CLI_DOWNLOAD_BASE` cannot be combined with a pull
+request channel in either installer, nor can `ROCM_CLI_ARCHIVE` or
+`ROCM_CLI_DOWNLOAD_ONLY` in `install.sh`, the only one that has them.
+
 ### Verify the installation
 
 Open a new terminal so the updated `PATH` takes effect, then run:
@@ -228,7 +261,9 @@ cargo build --release
 This produces the two binaries under `target/release/`:
 
 - `rocm`: the CLI and interactive interfaces
-- `rocmd`: the background telemetry daemon used by the dashboard
+- `rocmd`: the background daemon: it runs the watchers and the managed-service
+  supervisor, and serves the MCP tools (the dashboard's telemetry daemon runs
+  inside `rocm dash` itself, not in `rocmd`)
 
 Run without installing:
 
@@ -299,8 +334,24 @@ the legacy full-screen setup assistant has been retired.
 ### The dashboard (`rocm dash`)
 
 The full-screen telemetry dashboard shows every instrument and action on one screen.
-It auto-starts an embedded `rocmd` daemon when none is running, then presents
-five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+On Linux/WSL it runs its telemetry daemon inside the dashboard itself, with no
+separate service to start. Several dashboards open at once share one daemon,
+and when the dashboard running it closes, one that is still open takes it
+over, so the others reconnect and keep their chart history. After that
+hand-off the GPU figures can stay empty for a while (up to about 15 seconds on
+some hosts) while the new daemon detects the GPU again. A dashboard that
+reconnects to the same daemon can show up to about 30 recent chart points
+twice, a known issue. If the daemon was failing when you quit the dashboard
+(it could not start, or stopped serving and had not recovered), and no other
+dashboard's daemon is serving by then, the dashboard says why after you quit
+it, however you opened it (`rocm dash`, interactive `rocm chat`, or the bare
+`rocm` launcher), and also when you end it with Ctrl-C or it gets SIGINT or
+SIGTERM. If the dashboard's own supervision of its telemetry daemon crashes,
+that is reported even when another dashboard's daemon is serving, when you
+quit the dashboard; on Ctrl-C or a signal it is only written to the log
+files under the data directory's `logs` folder, as it happens. The
+dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys
+`1`–`5`):
 
 | Tab | What it shows |
 |---|---|
@@ -1365,16 +1416,17 @@ directory that only your user account can read. Set `ROCM_SERVE_API_KEY` rather 
 passing `--api-key`, so the secret stays out of your shell history and the
 process table.
 
-With the vLLM engine, an endpoint bound to a public interface
+With the vLLM and AIM engines, an endpoint bound to a public interface
 (`--allow-public-bind`), or served with `--require-api-key`, answers only
 clients that present its API key as an `Authorization: Bearer` header, on every
 route the server answers, not just the OpenAI `/v1` API — including vLLM's own
 `/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
-CORS preflights: the `/health` liveness check stays open. The AIM engine runs
-the same vLLM server inside its container but does not install this check, so
-a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
-leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
-without the key.
+CORS preflights: the `/health` liveness check stays open. An AIM container gets
+this check through `AIM_ENGINE_ARGS`; one whose image does not apply it fails to
+start and its container is removed, rather than serving with only `/v1`
+protected. A key-protected AIM launch also refuses to start when it cannot read
+the image's config, or when `AIM_ENGINE_ARGS` (from `--engine-env` or the image)
+is not a JSON object or already names a `middleware`.
 
 Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
 key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
@@ -1405,10 +1457,16 @@ Likewise, an explicit `--port` that differs from the port the running service
 is already on is refused rather than silently ignored; omit `--port` to reuse
 the running service, or stop it first to serve on the new port.
 
-By default the server runs in the background under ROCm CLI's supervision and
-prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). On an
+By default the server runs in the background under ROCm CLI's supervision.
+For a fresh launch in a terminal it first prints the service id, how to follow its log
+(`rocm logs --service <service-id> --follow`) and, for a public bind, the
+API key. While it starts, the status line follows the engine: a download, a weight
+load, or the latest log line, until the server is ready or that wait fails
+(the engine exits, a download stops advancing, or the startup deadline
+passes). When the server is ready it prints a deployment summary: a table
+with the status, the full inference endpoint, the API-qualified model name,
+and a quick smoke test (time to first token and approximate tokens per
+second). On an
 interactive terminal, if the smoke test cannot complete, the summary is headed
 `(smoke test failed)`, shows the status as `started, smoke test failed` instead
 of `ready`, and a note gives the reason and points at
@@ -1416,9 +1474,22 @@ of `ready`, and a note gives the reason and points at
 still exits 0. Which failures are detected, and which still read as `ready`, is
 listed under
 [Serve Smoke Test Failure](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md#serve-smoke-test-failure)
-in the testing guide. Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+in the testing guide. A model that is still loading is not reported as a finished "not
+ready" summary. The wait fails, and `rocm serve` exits non-zero, when the
+engine reports failure or its process exits, when a download percent stops
+advancing for 3 minutes (a line at 100% counts as loading), when the endpoint has not listed the model and there is no engine log for
+5 minutes, when a load log line stops changing for 5 minutes with the endpoint
+not yet listing the model, or after 30 minutes in all. A stall leaves the server running:
+the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and the background helper does not
+restart a live server for being slow until those 30 minutes pass. Engine log
+lines shown on the status line have credentials (the endpoint key, `--api-key`
+and token values, `hf_` tokens) masked. Once the server lists the model, the wait
+checks whether it can answer with a one-token request, first right away and
+then at growing intervals up to every 15 seconds. Piped output, or a stderr that is not a terminal (`2>log`), keeps
+the 45-second wait and reports the server as it stood then. Control returns
+to your shell with the server still running; manage it later with
+`rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1436,8 +1507,8 @@ can:
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
-`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), with
+no CLI-side stall limit or deadline, instead of the default wait above; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
@@ -1898,8 +1969,25 @@ downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
 launched is running or still starting, and its dry run says so; stop it with
 `rocm comfyui stop` first. This is checked before the download and again just
 before the code is replaced, so a ComfyUI started during the download is
-caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
-reinstall says so and is not refused, since `stop` cannot read it either. If a
+caught too. If rocm-cli's saved record of that ComfyUI cannot be parsed (a
+`running.json` that is truncated, empty or otherwise not a record rocm-cli
+wrote), the reinstall says so and is not refused, since the record names no
+process that `stop` could stop either. `status` and
+the answer to `rocm "what is the comfyui status"` then report the running state
+as unknown, naming the file, and `logs` still shows the saved logs. To tell
+whether anything else might be the ComfyUI it started, `status`, that answer
+and `rocm comfyui stop` check only ComfyUI's default address,
+`http://127.0.0.1:8188`. If nothing answers there, `rocm comfyui stop` moves
+the record aside to `running.json.unreadable` in the same `state` folder
+(replacing one moved there before) without stopping any process. If something
+does answer, rocm-cli cannot tell whether that is the ComfyUI it started, so
+`stop` leaves the record in place and exits non-zero, saying to stop what
+answers there yourself and run `rocm comfyui stop` again, or, if what answers
+is not that ComfyUI, to move the record aside yourself. A reinstall over such a
+record does not wait for any of this: it goes ahead even if a ComfyUI is still
+running from the folder, and may replace its code under it. A `running.json`
+that cannot be read at all (permission denied, say), or something other than a
+file at its path, is reported as an error rather than as no record. If a
 reinstall is interrupted part-way, or stops part-way (because a file it must
 delete or move is in use, say), `start` refuses to launch the half-replaced
 folder, and `start`, `status`, the answer to
@@ -1962,7 +2050,15 @@ Settings live in `config.json` in the config directory and are replaced in one
 step, so an interrupted save leaves the previous file rather than a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
+it back to `config.json` before running another command. Commands that change
+settings at the same time, from two terminals or a script, take turns: each
+reads the file only once the previous change is saved, so none of them undoes
+another's change. One that waits more than 30 seconds for its turn stops with
+an error saying it did not save its change to the file. The
+turn-taking goes through `config.json.lock` beside the file, so a config
+directory where that file cannot be created, such as a read-only one, refuses
+every settings change. The lock file can stay there and must not be deleted
+while a command is running. If the file exists
 but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
@@ -2018,14 +2114,19 @@ do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
 Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
 exits with code 0. Any other answer cancels the same way, after a line saying
 that the answer was not understood and is treated as no. Use `--dry-run` to only
-list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
-is a separate opt-in for development builds. At a terminal, a dry run that finds
+list, and `--yes` to skip the confirmation. There is no `--force`: passing it is refused,
+ending with a `Try:` line that repeats your command with `--yes` in its place.
+`--force-dev-binaries` is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
 (its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
 with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
 nothing to remove. Outside an interactive terminal, when there is something to
-remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
+remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`;
+the refusal ends with a `Try:` line that is the same command with `--yes` added.
+Run either `Try:` line in the same environment as the refused command: it
+repeats the flags, not variables such as `HOME` or `ROCM_CLI_CONFIG_DIR` set in
+front of the command, and without them it removes the default folders.
 Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.

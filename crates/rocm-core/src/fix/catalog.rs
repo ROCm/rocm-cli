@@ -957,6 +957,47 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         applies_on: DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS,
         runner: None,
     },
+    // Print-only: the remedy is a different distro or a system package, and
+    // neither is something the CLI should change for the user.
+    FixRecipe {
+        fix_id: "fix-23-vllm-extension-load",
+        title: "Find why a vLLM compiled extension did not load (op missing from torch.ops)",
+        rationale: "vLLM imports some of its compiled extensions inside a try that only logs a warning, so the engine starts without them and fails later, at the first call to an op the missing extension registers: AttributeError: '_OpNamespace' '_C' object has no attribute '<op>'. The cause is whatever stopped the extension loading. The common one is a wheel built against a newer glibc than the host has (`version `GLIBC_2.NN' not found`), which no reinstall changes; the other is a system library the extension links that is not installed.",
+        commands: &[
+            "# --- step 1 of 3, in YOUR shell ---",
+            "# Opens an INTERACTIVE subshell with the engine's environment active,",
+            "# and does not return until you leave it. Run this line on its own.",
+            "rocm engines shell vllm",
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---",
+            "# Import every vLLM op library. The first one that fails raises the",
+            "# loader's error, which vLLM itself only logged as a warning.",
+            "python -c \"import importlib, pathlib, torch, vllm; [importlib.import_module('vllm.' + p.name.split('.')[0]) for p in sorted(pathlib.Path(vllm.__file__).parent.glob('_*.so'))]; print('every vllm extension loads')\"",
+            "# The C library version this host has:",
+            "ldd --version | head -n 1",
+            "# Then leave the subshell:",
+            "exit",
+            "# --- step 3 of 3, back in YOUR OWN shell ---",
+            "# If the error says version `GLIBC_2.NN' not found, the wheel was built",
+            "# against a newer glibc than this host has. Run the engine on a distro",
+            "# whose glibc is at least 2.NN (Ubuntu 24.04 ships 2.39), on the host,",
+            "# in a container or in a WSL distro.",
+            "# If it says a library cannot be opened, install the distro package",
+            "# that provides that library.",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> --engine vllm",
+        verify_linux: None,
+        notes: &[
+            "vLLM logs the cause near the top of the startup log, as a warning that starts with `Failed to import from vllm.`, and carries on. The AttributeError comes later, from the first call to an op that extension registers.",
+            "Reinstalling the engine fetches the same wheel, built against the same glibc, so it does not fix a glibc version error.",
+        ],
+        doc_url: None,
+        // Matches `check_23_vllm_extension_load`'s `["linux", "wsl"]`.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
+        runner: None,
+    },
 ];
 
 /// Assert that a recipe whose steps span more than one shell says which shell
@@ -1601,12 +1642,30 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 22 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 23 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
-        // fix-21-msvc-redist-outdated, fix-22-display-driver-old and the
-        // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL
-        // ones.
-        assert_eq!(count, 29, "expected 29 catalog entries");
+        // fix-21-msvc-redist-outdated, fix-22-display-driver-old,
+        // fix-23-vllm-extension-load and the informational
+        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
+        assert_eq!(count, 30, "expected 30 catalog entries");
+    }
+
+    #[test]
+    fn the_extension_load_recipe_is_print_only_on_the_engine_hosts() {
+        // The remedy is another distro or a system package. Neither is a change
+        // the CLI makes for the user, so there is no runner and no host where
+        // it is anything but print-only.
+        let recipe = find_recipe("fix-23-vllm-extension-load")
+            .expect("fix-23-vllm-extension-load must be in the catalog");
+        assert!(recipe.runner.is_none());
+        assert_eq!(recipe.os_scope(), vec!["linux", "wsl"]);
+        for os in recipe.os_scope() {
+            assert_eq!(
+                recipe.platform(os).map(|p| p.class),
+                Some(FixClass::PrintOnly),
+                "{os}: fix-23 must stay print-only"
+            );
+        }
     }
 
     /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.
