@@ -77,15 +77,20 @@ env:
 # prompt, legible failure. Raise a value if a job legitimately grows into it.
 jobs:
   # Decide which file categories a change touches so unaffected jobs can skip
-  # their expensive work. Filtering runs ONLY on pull_request; on push and in the
-  # merge queue every category is forced true, so post-merge `main` and queued
-  # PRs always run the full suite. That keeps the skip from ever starving a
-  # required check in the merge queue (a never-produced required check stalls the
-  # queue forever — see the `commit-signatures` note below). Each path-filter
-  # output folds in `.github/workflows/**`, so any change to CI itself triggers a
-  # full run; the `windows` output is not a path filter, but it is true on every
-  # event except a manual dispatch that did not ask for binaries, so a change to CI
-  # always runs the Windows jobs too.
+  # their expensive work. The categories and their path globs live in the
+  # shared .github/actions/classify-changes action, which e2e-selfhosted.yml's
+  # `changes` job uses too. Filtering narrows ONLY a pull_request run; on push
+  # and in the merge queue every category is forced true, so post-merge `main`
+  # and queued PRs always run the full suite. That keeps the skip from ever
+  # starving a required check in the merge queue (a never-produced required
+  # check stalls the queue forever — see the `commit-signatures` note below). A
+  # pull request that changes a file no category names, and that the action's
+  # `inert` list (files no gated job reads) does not name either, is forced to
+  # the full suite too, with a notice naming the file. Every path category includes
+  # `.github/workflows/**` and `.github/actions/**`, so any change to CI itself
+  # triggers a full run; the `windows` output is not a path filter, but it is
+  # true on every event except a manual dispatch that did not ask for binaries,
+  # so a change to CI always runs the Windows jobs too.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
     timeout-minutes: 20
@@ -97,173 +102,29 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      # `<filter> || <fallback>`: the filter result on PRs (empty string when the
-      # filter step is skipped off-PR), otherwise the forced 'true'.
-      rust: ${{ steps.filter.outputs.rust || steps.all.outputs.forced }}
-      heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
-      lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
-      tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
-      docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
-      skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
+      # Each is the string 'true' or 'false' (see the action's outputs).
+      # Compared with `== 'true'`, never `||`-chained: the string 'false' is
+      # truthy in an expression.
+      rust: ${{ steps.classify.outputs.rust == 'true' }}
+      heavy: ${{ steps.classify.outputs.heavy == 'true' }}
+      lint: ${{ steps.classify.outputs.lint == 'true' }}
+      tpn: ${{ steps.classify.outputs.tpn == 'true' }}
+      docs: ${{ steps.classify.outputs.docs == 'true' }}
+      skills: ${{ steps.classify.outputs.skills == 'true' }}
       # Whether the Windows jobs run at all: every event except a manual dispatch
       # that did not ask for PR-style binaries. Both Windows work jobs gate on this
       # and the `windows-build-and-test` aggregator derives its expected skip from
       # it, so "skipped on purpose" has one spelling and cannot drift between them.
       windows: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true' }}
     steps:
+      # The local action below is read from the checked-out workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Filter changed paths (pull requests only)
-        id: filter
-        if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        with:
-          filters: |
-            # Rust-only checks (fmt, clippy, coverage).
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              # `cargo xtask eval-fixtures --check` compares these recordings with
-              # what the compiled catalog says, and `cargo test -p xtask` runs the
-              # eval hook's own tests. A hand edit to a recording, to the hook, to
-              # its tests or to the dataset must run them, though no *.rs file moved.
-              - 'skills/rocm-doctor/evals/**'
-              # The examination every replayed diagnosis runs over: an edit to it
-              # changes what `eval-fixtures --check` expects.
-              - 'tests/remote-ssh/examination.json'
-              - 'rust-toolchain*'
-              # Configures which lints fire in tests; an edit to it alone
-              # changes what clippy reports.
-              - 'clippy.toml'
-              # clippy runs `cargo xtask manifest --check` against this file;
-              # pinned_tool_versions_match_across_docs_and_workflows (xtask)
-              # also reads its cargo-about pin.
-              - 'MANIFEST.md'
-              # The committed per-crate coverage floors. Listed so that lowering
-              # a floor re-runs the gate that floor controls, instead of being
-              # the one edit the coverage job never sees.
-              - 'coverage-floors.toml'
-              # rocm-deps compiles the pins into constants, so a pin change is a
-              # source change even though no *.rs file moved.
-              - 'runtime-deps.toml'
-              # A proptest saved-failure file is read by the seed guard in xtask
-              # (`cargo xtask affected` adds xtask when one changes). Renaming or
-              # deleting one moves no *.rs file, so without this entry a seed-only
-              # change would skip every rust-gated job.
-              - '**/proptest-regressions/**'
-              # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
-              # this file's hawkeye/cargo-about pins. This entry only gates
-              # whether the rust-flagged jobs run at all; `cargo xtask affected`
-              # treats Markdown as ignorable by default and would otherwise skip
-              # the `Test (nextest)` step for a pin-only edit here (the coverage
-              # job isn't affected-narrowed, so it alone would still catch a
-              # drift, but invisibly). CONTRIBUTING.md is listed in
-              # `forces_full_workspace` (xtask/src/affected.rs) for the same
-              # reason MANIFEST.md already is, so nextest runs too.
-              - 'CONTRIBUTING.md'
-              # hardware_testing_docs_cover_all_self_hosted_platforms (xtask)
-              # reads this file and the one below it; same
-              # `Selection::Empty`/invisible-coverage gap as CONTRIBUTING.md
-              # above, so both are in `forces_full_workspace` too and need the
-              # same rust-filter entry. tests/e2e-cucumber/README.md also
-              # matches `heavy` below, so the Windows lane's full workspace
-              # run backstops this entry on its own; it's listed here anyway
-              # so the Linux `test` job (which is `rust`-gated, not
-              # `heavy`-gated) doesn't silently skip the test that reads it.
-              - 'docs/ci-hardware-testing.md'
-              - 'tests/e2e-cucumber/README.md'
-              # `cargo xtask check-architecture-doc` (clippy job) compares this
-              # module map with the source tree; deleting or rewording an entry
-              # can break it though no *.rs file moved.
-              - 'docs/architecture.md'
-              # license_headers_hook_has_no_file_type_filter (xtask) reads this
-              # file's license-headers hook config; an edit here that reopens the
-              # file-type-filter gap must still run that test on the PR.
-              - '.pre-commit-config.yaml'
-              - '.github/workflows/**'
-            # build-and-test runs cargo, the smoke gate and the remaining
-            # python/shell self-tests, plus the install-lifecycle E2E (`cargo
-            # xtask package` + the real installer), so it depends on the Rust
-            # set, the packaging xtask, the lifecycle feature/steps, and the
-            # installer inputs.
-            heavy:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              # The Windows lane's clippy steps gate on this filter.
-              - 'clippy.toml'
-              - 'runtime-deps.toml'
-              - 'scripts/**'
-              - 'xtask/**'
-              - 'engines/**'
-              - '**/*.py'
-              - '**/*.sh'
-              - '**/*.ps1'
-              - '**/*.feature'
-              - 'tests/e2e-cucumber/**'
-              # The containerised control-channel lane; its Dockerfile matches
-              # none of the extension globs above.
-              - 'tests/remote-ssh/**'
-              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
-              # rocm_doctor_skill.feature scenarios parse its catalog table and
-              # compare it to `rocm fix`. A skill-only edit must therefore run
-              # the E2E job, which gates on `heavy`.
-              - 'skills/**'
-              - 'install*'
-              # Pinned-key consistency compares docs/keys/* against the installers,
-              # so a canonical-key-only change must trigger the heavy job that runs
-              # `cargo xtask verify-pinned-keys`.
-              - 'docs/keys/**'
-              - '.github/workflows/**'
-            # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
-            # dependency tree, the cargo-about config/template, the generator, or
-            # the generated file itself.
-            tpn:
-              - 'Cargo.lock'
-              - '**/Cargo.toml'
-              - 'about.toml'
-              - 'about.hbs'
-              - 'THIRD_PARTY_NOTICES.txt'
-              - 'xtask/**'
-              - '.github/workflows/**'
-            # Python / Shell / PowerShell lint job.
-            lint:
-              - 'scripts/**'
-              - 'engines/**'
-              - '**/*.py'
-              - '**/*.sh'
-              - '**/*.ps1'
-              - 'ruff.toml'
-              - 'PSScriptAnalyzerSettings.psd1'
-              - '.github/workflows/**'
-            # Sphinx docs site: the doc sources themselves, plus README.md,
-            # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
-            # single-source via MyST `{include}` directives, plus the build
-            # config/toolchain pins.
-            docs:
-              - 'docs/rocm-docs/**'
-              - 'README.md'
-              - 'CONTRIBUTING.md'
-              - 'docs/vllm.md'
-              - 'docs/wsl.md'
-              - '.readthedocs.yaml'
-              - '.github/workflows/**'
-
-            # Published Agent Skills, graded by skillscope. The dataset and the
-            # skill's prose are one unit — a prompt can stop matching because the
-            # description changed — so any edit under skills/ re-runs the check.
-            skills:
-              - 'skills/**'
-              - '.github/workflows/**'
-
-      - name: Force full run off pull requests
-        id: all
-        if: github.event_name != 'pull_request'
-        run: echo "forced=true" >> "$GITHUB_OUTPUT"
+      - name: Classify changed paths
+        id: classify
+        uses: ./.github/actions/classify-changes
 
   # Advisory nudge: if a PR references a bug that still has an expected-failure
   # (xfail) row in expectations.toml, remind the author to clear it. Otherwise a
@@ -547,17 +408,22 @@ jobs:
 
   # Fine-grained test selection (the second half of smarter CI; the path-based
   # job skip is the `changes` job above). Runs cargo's unit + integration tests
-  # for only the crates a change can reach — the changed crates plus their
-  # transitive dependents, computed by `cargo xtask affected` from the workspace
+  # for only the crates a change can reach — the changed crates, the crates
+  # whose tests read a changed file from outside their own directory (any Rust
+  # file adds xtask; README.md, docs/ and skills/ add rocm and xtask; see
+  # CROSS_CRATE_READS in xtask/src/cross_crate_reads.rs), plus their transitive
+  # dependents, computed by `cargo xtask affected` from the workspace
   # dependency graph — instead of the whole workspace.
   #
   # Merge-queue safety: the narrowing happens ONLY on pull_request. On push and
   # in the merge queue the selection is forced to `--workspace`, so post-merge
   # `main` and every queued PR run the full suite — a required check is never
-  # starved and the queue cannot stall. The full Windows suite
-  # (the windows-debug job) also runs the whole workspace on every change, so it
-  # backstops any crate a graph-based selection could miss (e.g. an integration
-  # test that drives another crate only at runtime).
+  # starved and the queue cannot stall. The full Windows suite (the
+  # windows-debug job, which runs when `windows` is true, as it is on every
+  # event but a dispatch that asks for no binaries) also runs the whole
+  # workspace whenever the `heavy` category matches (every Rust change does), so
+  # it backstops any crate a graph-based selection could miss (e.g. an
+  # integration test that drives another crate only at runtime).
   #
   # This job is deliberately left off sccache, unlike the other compile-heavy
   # jobs. On pull requests it compiles a crate subset, and a subset resolves Cargo
@@ -1302,9 +1168,9 @@ jobs:
     runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 20
     # Always-on: prek is the cheapest gate (no compile) and its hygiene hooks run
-    # on every file type, so it is relevant to any change — including docs-only
-    # PRs that match no `changes` category. Like license-headers and
-    # commit-signatures, it is not gated.
+    # on every file type, so it is relevant to any change — including one whose
+    # only files are in the `changes` action's `inert` category. Like
+    # license-headers, docs-links and commit-signatures, it is not gated.
     # Exception: a manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
     steps:
@@ -1835,8 +1701,9 @@ jobs:
     runs-on: ubuntu-24.04 # one LTS: docs build only, nothing here depends on the image
     timeout-minutes: 20
     needs: [changes]
-    # A manual E2E dispatch only exercises the E2E jobs; skip the rest. Off a
-    # dispatch, `needs.changes` never ran, so short-circuit on event_name first.
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest. `changes`
+    # forces every category on for a dispatch, so `docs` is 'true' there and the
+    # event check is what skips this job.
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.docs == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2066,8 +1933,9 @@ jobs:
     needs:
       - changes
       - e2e
-    # Consolidate whatever ran. On dispatch `heavy` is unset, so also run when the
-    # trigger was manual; `always()` still lets it collect partial/failed tiers.
+    # Consolidate whatever ran. `changes` forces `heavy` on for a dispatch; the
+    # dispatch clause also runs the report when `changes` itself failed and left
+    # `heavy` empty. `always()` still lets it collect partial/failed tiers.
     if: >-
       always()
       && (needs.changes.outputs.heavy == 'true'

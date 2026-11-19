@@ -481,7 +481,7 @@ signing public key (`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, else
 current release key, so CI verifies against the key users pin. The release and
 nightly workflows always run it; pull-request CI runs it when a
 change matches the `heavy` path filter in
-[ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
+[classify-changes](../.github/actions/classify-changes/action.yml), which covers `docs/keys/`, the
 installers, every Rust source and `xtask/`. It reads the one assignment
 the installer actually uses, so each slot must be assigned exactly once as a
 plain declaration, and `install.sh` must mark both of its slots `readonly`.

@@ -68,8 +68,8 @@ pub enum Expectation {
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
-    /// `@requires-multi-gpu`: the scenario's premise is a host with MORE THAN ONE
-    /// AMD GPU present, so a single-GPU host is not a weaker version of it — it
+    /// `@requires-multi-gpu`: the scenario's premise is a job that can reach MORE
+    /// THAN ONE AMD GPU, so a single-GPU host is not a weaker version of it — it
     /// is a different situation in which the assertion does not hold. Skipped
     /// wherever the probed device count is not known to exceed one.
     ///
@@ -543,8 +543,9 @@ pub struct Included {
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-docker`
 ///    scenario without a usable container runtime, a `@requires-gpu` scenario on
-///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
-///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
+///    a host with no AMD GPU, a `@requires-multi-gpu` scenario where the kernel
+///    exposes no more than one to this job, or the count could not be read, a
+///    `@requires-bare-metal` scenario on WSL2, a
 ///    `@requires-os:<os>` scenario on a different OS, a
 ///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
 ///    a scenario whose effective engine can't start, or a vLLM-serving scenario
@@ -597,7 +598,8 @@ pub fn resolve(
     }
     if decl.requires_multi_gpu && cap.amd_gpu_count.is_none_or(|count| count <= 1) {
         // An unknown count skips as well: the premise is "more than one device
-        // is present", and a host that cannot be counted has not shown that.
+        // is exposed to this job", and a host that cannot be counted has not
+        // shown that.
         // Running there is what turned a real multi-GPU assertion into a
         // single-GPU failure in the first place.
         let detected = cap.amd_gpu_count.map_or_else(
@@ -773,6 +775,12 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
+                // A job reaching all eight of an MI300X host's GPUs. This is
+                // not the real MI300X lane, whose job has seen one KFD GPU
+                // node (docs/ci-hardware-testing.md, "GPU visibility on the
+                // hardware pool"), so a test resolving `ExpectPass` for a
+                // `@requires-multi-gpu` scenario here does not mean that lane
+                // runs it.
                 amd_gpu_count: Some(8),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
@@ -821,16 +829,17 @@ mod tests {
             // it from bare metal. That is precisely why `@requires-os:linux`
             // cannot stand in for `@requires-bare-metal`.
             //
-            // The device COUNT is unknown on every WSL host: that platform
-            // reaches the GPU through `/dev/dxg`, exposing neither a KFD
-            // topology nor an amdgpu DRM card for the count probe to read. So
-            // `@requires-multi-gpu` skips there whatever the hardware is.
+            // The device COUNT is 0 on every WSL host: that platform reaches
+            // the GPU through `/dev/dxg`, exposing neither a KFD topology nor
+            // an amdgpu DRM card, and with no `/dev/kfd` the count probe reads
+            // that as an authoritative zero. So `@requires-multi-gpu` skips
+            // there whatever the hardware is.
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: None,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -849,7 +858,7 @@ mod tests {
                 is_wsl: true,
                 gfx_target: None,
                 has_amd_gpu: false,
-                amd_gpu_count: None,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
@@ -867,7 +876,7 @@ mod tests {
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
-                amd_gpu_count: None,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -1520,7 +1529,7 @@ serve_timeout_secs = 90
     /// must RUN where one exists and SKIP where it does not — a gate that only
     /// ever skips would silently retire the assertion everywhere.
     #[test]
-    fn requires_multi_gpu_runs_only_where_a_second_device_is_present() {
+    fn requires_multi_gpu_runs_only_where_a_second_device_is_reachable() {
         let m = Expectations::default();
         let d = decl(&[
             "id:serve-rocr-reindexed-gpu-index-rejected",
@@ -1528,9 +1537,18 @@ serve_timeout_secs = 90
             "requires-multi-gpu",
             "requires-os:linux",
         ]);
-        // MI300X has eight devices → the premise holds → the scenario runs.
+        // A job reaching eight devices holds the premise, so the scenario runs.
         assert_eq!(
             resolve(&d, &cap("mi300x"), &m, Included::default()),
+            Expectation::ExpectPass
+        );
+        // Exactly two is the boundary: the smallest count that holds the premise.
+        let two = HostCapability {
+            amd_gpu_count: Some(2),
+            ..cap("mi300x")
+        };
+        assert_eq!(
+            resolve(&d, &two, &m, Included::default()),
             Expectation::ExpectPass
         );
         // Strix Halo has exactly one. `@requires-gpu` is satisfied there, which
@@ -1539,17 +1557,34 @@ serve_timeout_secs = 90
             resolve(&d, &cap("strix-ubuntu"), &m, Included::default()),
             Expectation::Skip { .. }
         ));
-        // No GPU at all, and a host whose count could not be probed (WSL), skip
-        // too: neither has SHOWN a second device.
-        for host in ["mock", "wsl2"] {
-            assert!(
-                matches!(
-                    resolve(&d, &cap(host), &m, Included::default()),
-                    Expectation::Skip { .. }
-                ),
-                "{host} must not run a multi-GPU scenario"
-            );
-        }
+        // No GPU at all skips too, on `@requires-gpu` before the count is read.
+        assert_eq!(
+            resolve(&d, &cap("mock"), &m, Included::default()),
+            Expectation::Skip {
+                reason: "requires an AMD GPU; none detected on this host".to_owned(),
+            }
+        );
+        // WSL passes `@requires-gpu` but exposes no KFD topology or amdgpu DRM
+        // card to count, so counts 0 and skips too: it has not SHOWN a second
+        // device. Its reason is not pinned: "0 detected" is the count the gate
+        // read, not a statement about the devices behind `/dev/dxg`.
+        assert!(matches!(
+            resolve(&d, &cap("wsl2"), &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
+        // A host whose count could not be read (non-Linux, or a `/dev/kfd`
+        // whose topology and DRM class are both unreadable) skips as well,
+        // even on hardware that might have several devices.
+        let uncounted = HostCapability {
+            amd_gpu_count: None,
+            ..cap("mi300x")
+        };
+        assert_eq!(
+            resolve(&d, &uncounted, &m, Included::default()),
+            Expectation::Skip {
+                reason: "requires more than one AMD GPU; the count could not be probed".to_owned(),
+            }
+        );
     }
 
     /// The tag line of a scenario in a real `.feature` file, by `@id:` slug.
@@ -1625,10 +1660,7 @@ serve_timeout_secs = 90
         else {
             panic!("a single-GPU host must skip a multi-GPU scenario");
         };
-        assert!(
-            reason.contains("more than one") && reason.contains('1'),
-            "reason should name the shortfall, got: {reason}"
-        );
+        assert_eq!(reason, "requires more than one AMD GPU; 1 detected");
     }
 
     #[test]

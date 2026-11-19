@@ -266,6 +266,17 @@ Feature: Model serving
   # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
   # set resolves on one GPU too and it stays ungated.
+  #
+  # KNOWN GAP — lanes whose job reaches one GPU: `@requires-multi-gpu` (the
+  # gate in `resolve`, tests/e2e-cucumber/src/expectation.rs) counts with
+  # `probe_amd_gpu_count` (tests/e2e-cucumber/src/capability.rs) the GPUs the
+  # kernel exposes to the job (its KFD GPU nodes) rather than the cards on the
+  # bus, so this skips on a lane whose job reaches a single GPU even when the
+  # host has several. Where KFD lists no GPU node or cannot be read, the count
+  # falls back to the amdgpu DRM cards, which can describe the whole host.
+  # No lane is documented to run it: docs/ci-hardware-testing.md ("GPU
+  # visibility on the hardware pool") records a job seeing one KFD GPU node on
+  # the MI300X, MI350P and R9700 lanes, and no per-job count for the others.
   @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
     When the user serves a model pinned past the ROCR-reindexed visible set

@@ -17,13 +17,21 @@
 //! against, so when in doubt it runs everything.
 //!
 //! One rule adds a crate nothing depends on: a changed `proptest-regressions`
-//! file, or a Rust file whose diff adds or removes a `proptest!` line, selects
-//! `xtask`, which holds the seed guard that reads the whole tree (see
-//! `PROPTEST_GUARD_CRATE`).
+//! file selects `xtask`, which holds the seed guard that reads the whole tree
+//! (see `PROPTEST_GUARD_CRATE`). A changed Rust file reaches that guard through
+//! the `*.rs` entry of [`crate::cross_crate_reads::CROSS_CRATE_READS`], which
+//! selects `xtask` for every Rust change.
 //!
-//! As with [`crate::verify_commits`], the decision logic ([`select`],
-//! [`owning_crate`], [`reverse_closure`]) is pure and unit-tested without git or
-//! cargo; the I/O lives at the edges ([`load_graph`], [`changed_files`]).
+//! The command prints [`select_with_readers`]: that directory-based selection
+//! widened with the crates whose tests read a changed file from outside their
+//! own directory ([`crate::cross_crate_reads`]), such as the `rocm` and `xtask`
+//! tests that read `README.md`, `docs/` and `skills/`. The pre-push hook
+//! ([`crate::prepush`]) selects through the same function.
+//!
+//! As with [`crate::verify_commits`], the decision logic
+//! ([`select`], [`select_with_readers`], [`owning_crate`],
+//! [`reverse_closure`]) is pure and unit-tested without git or cargo; the I/O
+//! lives at the edges ([`load_graph`], [`printed_selection`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -31,6 +39,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+use crate::cross_crate_reads;
 
 /// Default base ref used when none is supplied on the command line. Matches
 /// [`crate::verify_commits`] so both commands diff against the same point.
@@ -119,17 +129,18 @@ pub fn reverse_closure(
     result
 }
 
-/// Markdown files an xtask test reads directly. Each belongs in this list,
-/// in ci.yml's `rust` paths-filter bucket, and in the "doc an xtask test
-/// reads" sentence in `docs/testing.md` —
-/// `forces_full_workspace_docs_are_in_the_rust_filter` (workflow_contract.rs)
-/// checks this list against ci.yml's copy.
-///
-/// Without a file also being in `forces_full_workspace` below, `is_ignorable`
-/// would mark it as ordinary Markdown and an edit to it alone would resolve
-/// to `Selection::Empty`; without the matching ci.yml filter entry, the
-/// rust-gated jobs don't run at all for that edit. Either way the test that
-/// reads the file silently never runs:
+/// Markdown files an xtask test reads directly. This list is the one place
+/// they are named for selection: `forces_full_workspace` below reads it, so an
+/// edit to one of them alone selects the whole workspace instead of being
+/// dropped by `is_ignorable` as ordinary Markdown (which would resolve to
+/// `Selection::Empty`). Each also belongs in the `rust` path filter of
+/// `.github/actions/classify-changes/action.yml`, or the rust-gated jobs do not
+/// run at all for that edit, and in the "doc an xtask test reads" sentence in
+/// `docs/testing.md`. `every_cross_crate_read_is_in_the_rust_filter`
+/// (workflow_contract.rs) checks this list against the filter, and
+/// `each_doc_an_xtask_test_reads_selects_the_whole_workspace` against that
+/// sentence and the selection. Without them the test that reads the file
+/// silently never runs:
 /// - `MANIFEST.md`: clippy runs `xtask manifest --check` against it, and it
 ///   carries the cargo-about pin that
 ///   `pinned_tool_versions_match_across_docs_and_workflows` (xtask) reads.
@@ -171,8 +182,9 @@ fn is_proptest_seed_file(file: &str) -> bool {
         .any(|segment| segment == "proptest-regressions")
 }
 
-/// True for changed files that cannot affect any Rust crate's build or tests, so
-/// they neither select a crate nor force a full run.
+/// True for changed files that no crate's build reads, so they neither select a
+/// crate by directory nor force a full run. A test can still read one from
+/// outside its crate; [`select_with_readers`] adds those readers back.
 fn is_ignorable(file: &str) -> bool {
     let is_markdown = std::path::Path::new(file)
         .extension()
@@ -180,32 +192,22 @@ fn is_ignorable(file: &str) -> bool {
     is_markdown || file.starts_with("docs/") || file == "LICENSE" || file.starts_with("LICENSE.")
 }
 
-/// [`select_with_proptest_sources`] for a caller that has only the changed-file
-/// names: a changed file under a `proptest-regressions` directory still selects
-/// the `xtask` seed guard, but a Rust file that moved a `proptest!` block is not
-/// recognised without its diff.
-pub fn select(changed_files: &[String], graph: &Graph) -> Selection {
-    select_with_proptest_sources(changed_files, &[], graph)
-}
-
-/// Pure selection logic: turn the changed-file list into a [`Selection`].
+/// Pure directory-based selection logic: turn the changed-file list into a
+/// [`Selection`]. Callers select through [`select_with_readers`].
 ///
-/// `proptest_sources` is the subset of changed Rust files whose diff adds or
-/// removes a `proptest!` line ([`proptest_source_files`]). It, and any changed
-/// file under a `proptest-regressions` directory, adds `xtask` to the selection
-/// so the seed guard runs on the pull request instead of only in the merge
-/// queue. When the graph has no `xtask` member the guard cannot be selected, so
-/// the answer is the whole workspace.
+/// A changed file under a `proptest-regressions` directory adds `xtask` to the
+/// selection so the seed guard runs on the pull request instead of only in the
+/// merge queue. When the graph has no `xtask` member the guard cannot be
+/// selected, so the answer is the whole workspace. A changed Rust file (one
+/// that moved a `proptest!` block, say) is not handled here: the `*.rs` entry
+/// of [`cross_crate_reads::CROSS_CRATE_READS`] adds `xtask` for it in
+/// [`select_with_readers`].
 ///
 /// Order matters — a single force-full file (e.g. `Cargo.lock`) outweighs any
 /// number of crate-attributable files. Files owned by a crate seed the changed
 /// set; ignorable files are dropped; anything left unattributed is treated as
 /// force-full, because an unrecognized path might affect anything.
-pub fn select_with_proptest_sources(
-    changed_files: &[String],
-    proptest_sources: &[String],
-    graph: &Graph,
-) -> Selection {
+pub fn select(changed_files: &[String], graph: &Graph) -> Selection {
     let mut changed_crates: BTreeSet<String> = BTreeSet::new();
     let mut saw_relevant = false;
 
@@ -213,7 +215,7 @@ pub fn select_with_proptest_sources(
         if forces_full_workspace(file) {
             return Selection::Workspace;
         }
-        if is_proptest_seed_file(file) || proptest_sources.contains(file) {
+        if is_proptest_seed_file(file) {
             if !graph
                 .crate_dirs
                 .iter()
@@ -240,6 +242,23 @@ pub fn select_with_proptest_sources(
         return Selection::Empty;
     }
     Selection::Packages(reverse_closure(&changed_crates, &graph.rev_deps))
+}
+
+/// The selection CI's `cargo xtask affected` and the pre-push hook use:
+/// [`select`], widened with the crates whose tests read a
+/// changed file from outside their own directory, and their dependents
+/// ([`cross_crate_reads::widen`] over [`cross_crate_reads::CROSS_CRATE_READS`]).
+///
+/// [`select`] alone treats Markdown and `docs/` as unable
+/// to affect any crate, so a pull request that edits only a doc a test reads
+/// would test nothing.
+pub fn select_with_readers(changed_files: &[String], graph: &Graph) -> Selection {
+    cross_crate_reads::widen(
+        select(changed_files, graph),
+        changed_files,
+        graph,
+        cross_crate_reads::CROSS_CRATE_READS,
+    )
 }
 
 // ---- I/O edges -------------------------------------------------------------
@@ -360,12 +379,6 @@ fn build_graph(metadata: &Metadata) -> Graph {
     }
 }
 
-/// List files changed in `base...HEAD` (three-dot: relative to the merge base,
-/// the same "what this branch changed" diff layer one filters on).
-fn changed_files(base: &str) -> Result<Vec<String>> {
-    changed_files_between(base, "HEAD")
-}
-
 /// List files changed in `base...head`.
 ///
 /// `--no-renames` makes a moved file list both its old and its new path.
@@ -400,37 +413,19 @@ pub(crate) fn scrub_git_env(cmd: &mut Command) -> &mut Command {
 
 /// [`changed_files_between`] in `dir` (the current directory when `None`).
 fn diff_name_only(dir: Option<&std::path::Path>, base: &str, head: &str) -> Result<Vec<String>> {
-    diff_names(dir, base, head, &[], &[])
+    diff_names(dir, base, head)
 }
 
-/// List the Rust files changed in `base...HEAD` whose diff adds or removes a
-/// line containing `proptest!` (git's `-G` pickaxe, so a block moved out of one
-/// file and into another lists both). The pattern also matches a longer name
-/// such as `my_proptest!`; an extra hit only adds `xtask` to the selection.
-fn proptest_source_files(dir: Option<&Path>, base: &str) -> Result<Vec<String>> {
-    diff_names(dir, base, "HEAD", &["-G", "proptest!"], &["*.rs"])
-}
-
-/// `git diff --name-only --no-renames <options> base...head [-- <pathspec>]` in
-/// `dir` (the current directory when `None`).
-fn diff_names(
-    dir: Option<&Path>,
-    base: &str,
-    head: &str,
-    options: &[&str],
-    pathspec: &[&str],
-) -> Result<Vec<String>> {
+/// `git diff --name-only --no-renames base...head` in `dir` (the current
+/// directory when `None`).
+fn diff_names(dir: Option<&Path>, base: &str, head: &str) -> Result<Vec<String>> {
     let range = format!("{base}...{head}");
     let mut git = Command::new("git");
     if let Some(dir) = dir {
         scrub_git_env(&mut git).arg("-C").arg(dir);
     }
     git.args(["diff", "--name-only", "--no-renames"])
-        .args(options)
         .arg(&range);
-    if !pathspec.is_empty() {
-        git.arg("--").args(pathspec);
-    }
     let output = git.output().context("failed to run `git diff`")?;
     if !output.status.success() {
         bail!(
@@ -450,11 +445,17 @@ fn diff_names(
 pub fn run(base: Option<String>) -> Result<()> {
     let base = base.unwrap_or_else(|| DEFAULT_BASE.to_string());
     let graph = load_graph()?;
-    let files = changed_files(&base)?;
-    let proptest_sources = proptest_source_files(None, &base)?;
-    let selection = select_with_proptest_sources(&files, &proptest_sources, &graph);
-    println!("{}", selection.to_cargo_args());
+    println!("{}", printed_selection(None, &base, &graph)?);
     Ok(())
+}
+
+/// The line [`run`] prints for the repository in `dir` (the current
+/// directory when `None`): the cargo flags for the files changed in
+/// `base...HEAD` (three-dot: relative to the merge base, what this branch
+/// changed), selected through [`select_with_readers`].
+fn printed_selection(dir: Option<&Path>, base: &str, graph: &Graph) -> Result<String> {
+    let files = diff_name_only(dir, base, "HEAD")?;
+    Ok(select_with_readers(&files, graph).to_cargo_args())
 }
 
 #[cfg(test)]
@@ -671,6 +672,71 @@ mod tests {
         assert_eq!(sel, Selection::Packages(want));
     }
 
+    /// A graph with the two crates whose tests read docs and skills from outside
+    /// their own directory, and a leaf that reads nothing.
+    fn reader_graph() -> Graph {
+        let crate_dirs = vec![
+            ("rocm".to_string(), "apps/rocm".to_string()),
+            ("xtask".to_string(), "xtask".to_string()),
+            ("leaf".to_string(), "crates/leaf".to_string()),
+        ];
+        let rev_deps = crate_dirs
+            .iter()
+            .map(|(name, _)| (name.clone(), Vec::new()))
+            .collect();
+        Graph {
+            crate_dirs,
+            rev_deps,
+        }
+    }
+
+    /// What `cargo xtask affected` prints is [`select_with_readers`]. A pull
+    /// request that edits only a doc or a skill a test reads selected nothing
+    /// there, so CI's `Test (affected crates)` job skipped the `rocm` and
+    /// `xtask` tests that read it (`docs/nightly-on-the-queue.md` is read by
+    /// `the_queue_doc_states_its_channels_and_its_remaining_gap`, and
+    /// `advised_commands` reads every `README.md`, `docs/` and `skills/` file).
+    #[test]
+    fn a_doc_or_skill_a_test_reads_selects_its_readers_in_ci() {
+        for path in [
+            "docs/nightly-on-the-queue.md",
+            "docs/testing.md",
+            "README.md",
+            "skills/rocm-cli-assistant/SKILL.md",
+        ] {
+            assert_eq!(
+                select_with_readers(&[path.to_string()], &reader_graph()),
+                Selection::Packages(names(&["rocm", "xtask"])),
+                "{path}"
+            );
+        }
+    }
+
+    /// The widening adds to the directory-based selection and keeps its other
+    /// rules: a crate's own change still selects it, and a force-full file
+    /// still runs the whole workspace.
+    #[test]
+    fn select_with_readers_adds_readers_to_the_directory_selection() {
+        let files = [
+            "crates/leaf/src/lib.rs".to_string(),
+            "docs/a.md".to_string(),
+        ];
+        assert_eq!(
+            select_with_readers(&files, &reader_graph()),
+            Selection::Packages(names(&["leaf", "rocm", "xtask"]))
+        );
+        let forced = ["docs/a.md".to_string(), "Cargo.lock".to_string()];
+        assert_eq!(
+            select_with_readers(&forced, &reader_graph()),
+            Selection::Workspace
+        );
+        // Markdown no test reads still selects nothing.
+        assert_eq!(
+            select_with_readers(&["CHANGELOG.md".to_string()], &reader_graph()),
+            Selection::Empty
+        );
+    }
+
     /// Run `git` in `dir` with a fixed identity and no signing, for the
     /// throwaway repositories below.
     fn git_in(dir: &std::path::Path, args: &[&str]) {
@@ -776,24 +842,30 @@ mod tests {
         assert_eq!(sel.to_cargo_args(), "-p app -p xtask");
     }
 
+    /// The seed guard's only route from a changed Rust file: no rule in
+    /// [`select`] adds `xtask` for one, so moving a `proptest!` block inside
+    /// `app` (whose seed stays behind) runs the guard only because the `*.rs`
+    /// entry of [`cross_crate_reads::CROSS_CRATE_READS`] selects `xtask`.
     #[test]
-    fn a_changed_proptest_source_selects_the_xtask_guard() {
-        // The case the guard exists for: a `proptest!` block moves between
-        // files inside one crate and the seed is forgotten, so no seed file is
-        // in the change at all; only the diff of the Rust files says so.
+    fn a_changed_rust_file_selects_the_proptest_guard_through_the_readers() {
         let files = [
             "apps/app/src/old.rs".to_string(),
             "apps/app/src/new.rs".to_string(),
         ];
         assert_eq!(
-            select_with_proptest_sources(&files, &files, &graph()),
-            Selection::Packages(names(&["app", "xtask"]))
-        );
-        // The same Rust change with no `proptest!` line in its diff does not.
-        assert_eq!(
-            select_with_proptest_sources(&files, &[], &graph()),
+            select(&files, &graph()),
             Selection::Packages(names(&["app"]))
         );
+        assert_eq!(
+            select_with_readers(&files, &graph()),
+            Selection::Packages(names(&["app", "xtask"]))
+        );
+        // Without an `xtask` member the reader cannot be selected, so the
+        // answer is the whole workspace rather than a skipped guard.
+        let mut g = graph();
+        g.crate_dirs.retain(|(name, _)| name != "xtask");
+        g.rev_deps.remove("xtask");
+        assert_eq!(select_with_readers(&files, &g), Selection::Workspace);
     }
 
     #[test]
@@ -804,11 +876,6 @@ mod tests {
         g.rev_deps.remove("xtask");
         let seed = ["apps/app/proptest-regressions/x.txt".to_string()];
         assert_eq!(select(&seed, &g), Selection::Workspace);
-        let src = ["apps/app/src/x.rs".to_string()];
-        assert_eq!(
-            select_with_proptest_sources(&src, &src, &g),
-            Selection::Workspace
-        );
     }
 
     #[test]
@@ -834,38 +901,55 @@ mod tests {
         );
     }
 
+    /// Every doc in [`XTASK_READ_DOCS`] is the one `docs/testing.md` names as "a
+    /// doc an xtask test reads", and an edit to it alone runs the whole
+    /// workspace through [`select_with_readers`], so a doc dropped from the
+    /// list (and left to `is_ignorable`) fails here.
     #[test]
-    fn proptest_source_files_lists_rust_files_whose_diff_touches_a_proptest_block() {
+    fn each_doc_an_xtask_test_reads_selects_the_whole_workspace() {
+        let testing = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs/testing.md"),
+        )
+        .expect("read docs/testing.md");
+        let marker = "a doc an xtask test reads \u{2014}";
+        let start = testing.find(marker).expect("the sentence naming the docs") + marker.len();
+        let sentence = &testing[start..start + testing[start..].find(')').expect("its end")];
+        let mut named: Vec<&str> = sentence.split('`').skip(1).step_by(2).collect();
+        named.sort_unstable();
+        let mut listed = XTASK_READ_DOCS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, named, "XTASK_READ_DOCS against docs/testing.md");
+        for doc in named {
+            assert_eq!(
+                select_with_readers(&[doc.to_string()], &graph()),
+                Selection::Workspace,
+                "an edit to {doc} alone"
+            );
+        }
+    }
+
+    /// What `cargo xtask affected` prints for a branch that edits only a doc
+    /// a test reads: CI's `Test (affected crates)` job runs those flags, so the
+    /// readers must be in them, not just in [`select_with_readers`]. This
+    /// drives [`printed_selection`], which builds the whole line [`run`]
+    /// prints; `run` itself only loads the real graph and prints that line.
+    #[test]
+    fn the_printed_selection_for_a_doc_only_branch_names_its_readers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         git_in(repo, &["init", "-q", "-b", "main"]);
-        std::fs::write(
-            repo.join("moved_from.rs"),
-            "proptest! { fn a() {} }\nfn keep() {}\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join("plain.rs"), "fn plain() {}\n").unwrap();
-        std::fs::write(repo.join("notes.md"), "proptest! is mentioned\n").unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::write(repo.join("docs/nightly-on-the-queue.md"), "a\n").unwrap();
         git_in(repo, &["add", "."]);
         git_in(repo, &["commit", "-q", "-m", "base"]);
         git_in(repo, &["checkout", "-q", "-b", "topic"]);
-        // The block moves out of one Rust file and into another. A Rust file
-        // whose diff has no proptest line, and a Markdown note that does but
-        // is not Rust, change too; neither may be listed.
-        std::fs::write(repo.join("moved_from.rs"), "fn keep() {}\n").unwrap();
-        std::fs::write(repo.join("moved_to.rs"), "proptest! { fn a() {} }\n").unwrap();
-        std::fs::write(repo.join("plain.rs"), "fn plain() { let _ = 1; }\n").unwrap();
-        std::fs::write(repo.join("notes.md"), "proptest! is mentioned again\n").unwrap();
-        git_in(repo, &["add", "."]);
-        git_in(repo, &["commit", "-q", "-m", "move"]);
+        std::fs::write(repo.join("docs/nightly-on-the-queue.md"), "b\n").unwrap();
+        git_in(repo, &["commit", "-q", "-am", "doc"]);
 
-        let mut got = proptest_source_files(Some(repo), "main").expect("diff");
-        got.sort();
-        assert_eq!(got, ["moved_from.rs", "moved_to.rs"]);
-        // The plain name-only diff, which the selector otherwise relies on,
-        // sees all four files: the narrowing above is what the `-G` adds.
-        let all = diff_name_only(Some(repo), "main", "topic").expect("diff");
-        assert_eq!(all.len(), 4, "{all:?}");
+        let printed = printed_selection(Some(repo), "main", &reader_graph()).expect("selection");
+        assert_eq!(printed, "-p rocm -p xtask");
     }
 
     #[test]
