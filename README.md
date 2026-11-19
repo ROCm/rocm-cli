@@ -25,7 +25,7 @@ full-screen terminal user interface (TUI) dashboard for GPU telemetry, model ser
 
 It ships as prebuilt binaries (`rocm` and `rocmd`) for Linux and Windows
 (x86_64), needs no Python, Rust, or existing ROCm install, and includes
-inference engine adapters for Lemonade and vLLM.
+inference engine adapters for Lemonade, vLLM, and AIM.
 
 <!-- GitHub-only: no docs/rocm-docs/ wrapper includes README text above the
 platform-support-table-start marker (docs/rocm-docs/install/installation.md is
@@ -36,9 +36,9 @@ For the full documentation, see the
 <!-- platform-support-table-start -->
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
-| Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
+| Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and the Lemonade, vLLM, and AIM engines |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM or AIM |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; AIM not yet verified |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 

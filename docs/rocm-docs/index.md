@@ -19,7 +19,7 @@ chat.
 
 It ships as prebuilt binaries (`rocm` and `rocmd`) for Linux and Windows
 (x86_64), needs no Python, Rust, or existing ROCm install, and includes
-inference engine adapters for Lemonade and vLLM.
+inference engine adapters for Lemonade, vLLM, and AIM.
 
 ```{important}
 **Tech Preview:** This software is provided as-is, without warranty or
