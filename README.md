@@ -1503,8 +1503,9 @@ the 45-second wait and reports the server as it stood then.
 The device line is omitted when the engine cannot say yet. A server is reported
 ready as soon as it answers, which can be before it has finished loading the
 model, and until then the engine does not know which device it ended up on;
-`rocm serve` waits a few seconds for it rather than holding your terminal, and
-`rocm services` shows it once it is known. The GPU name is omitted on a machine
+`rocm serve` waits for it rather than holding your terminal — up to about 14
+seconds worst case (a 6-second device probe, plus Lemonade's 8-second inference
+probe) — and `rocm services` shows it once it is known. The GPU name is omitted on a machine
 with more than one AMD GPU, where naming one of them could name the wrong one.
 
 Control returns to your shell with the server still running; manage it later
@@ -1754,10 +1755,13 @@ recorded one survived, a second stop can report the server stopped while that
 process still runs.
 
 `list` asks each running server which backend and GPU it is actually on, so it
-can take a few seconds rather than returning instantly. The query is capped in
-total — about 18 seconds worst case, however many servers are listed — and a
-server that does not answer in time simply has no `device` line rather than
-holding up the rest of the list. The same applies to asking about servers in
+can take a few seconds rather than returning instantly. With the built-in
+engines the query is capped in total — about 18 seconds worst case, however
+many servers are listed — and a server that does not answer in time simply has
+no `device` line rather than holding up the rest of the list. That cap is not
+universal: an external plugin engine is run as a child process and waited on
+without a deadline, so one that never exits can hold the listing indefinitely.
+Only the engines shipped here are bounded. The same applies to asking about servers in
 `rocm chat`, which prints the same list. `list --json` is unaffected: it emits
 the stored service records, which have no `device` field, asks no server
 anything, and returns as fast as it always did.
