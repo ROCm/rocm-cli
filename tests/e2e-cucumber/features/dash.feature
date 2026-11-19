@@ -1126,17 +1126,25 @@ Feature: Interactive dashboard
   # `focused_should_exit` ejection that hands control back to the menu — was
   # only ever asserted by unit tests against the helpers.
   #
-  # KNOWN GAP, deliberately not attempted here: the half of that policy that
-  # only shows up while a launch job is actually RUNNING in the console (Esc
-  # raising the leave confirmation, and approving it stopping the launch).
+  # KNOWN GAP, and it is a real one rather than a covered case: this scenario
+  # does NOT reach the half of that policy that only shows up while a launch
+  # job is actually RUNNING in the console (Esc raising the leave
+  # confirmation, and approving it stopping the launch). It opens the form and
+  # backs straight out, so it passes whether or not that behaviour works.
   # Reaching a running console means really spawning `rocm serve`, which on
   # the no-GPU lane this scenario runs on is refused in well under a second
   # (`serve-13`), so the console would already be terminal by the time a
   # keystroke landed — and no step in this harness drives a launch through
   # the wizard's console even on the GPU lane (dash-52 serves its model from
-  # a fixture, not from the form). That half is covered beside the code, in
-  # `ui/serve_wizard.rs`'s `focused_host_leave_says_it_stops_the_launch_and_actually_stops_it`,
-  # which asserts the rendered wording and the job's fate in one test.
+  # a fixture, not from the form). So no lane, gated or not, can currently
+  # drive it. AGENTS.md's e2e rule lists three ways out — an existing
+  # scenario, a gated lane, or a purely internal change — and none of them is
+  # this one, so the rule is left UNDISCHARGED rather than satisfied. The
+  # behaviour is covered a level down, in `ui/serve_wizard.rs`'s
+  # `focused_host_leave_says_it_stops_the_launch_and_actually_stops_it`, which
+  # asserts the rendered wording and the job's fate in one test — which that
+  # same rule says is not a substitute. Closing this needs harness work to
+  # drive a launch through the form on a GPU lane.
   #
   # What is asserted here is the route and the window it opens in: the form
   # arrives with the focused host's own "Esc  back to menu" footer (drawn by

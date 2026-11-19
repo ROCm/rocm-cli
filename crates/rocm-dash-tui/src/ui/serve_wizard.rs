@@ -2255,6 +2255,43 @@ mod tests {
         );
         on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
         assert!(wiz.is_none(), "approving leaves even with no job to watch");
+
+        // Rows 2 and 3 again, in a FOCUSED HOST — the only arm that reaches
+        // `cancel_job`, and the only one where the job may no longer be there
+        // to cancel. Rows 1-3 above all run with `focused_host == false`, so
+        // without these the stop-on-leave branch is exercised over a live job
+        // and nothing else.
+
+        // Row 4 — focused host, job finished under the open confirmation.
+        // Cancelling a terminal job must be a no-op rather than resurrecting a
+        // `Cancelled` status over its real outcome.
+        let (mut wiz, mut jobs) = wizard_on_running_console_in(ServeWizardState::focused_host());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        let finished = wiz.as_ref().unwrap().active_job.clone().unwrap();
+        jobs.apply(StateEvent::JobDone {
+            id: finished.clone(),
+            code: 0,
+        });
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(wiz.is_none(), "approving leaves the focused host");
+        assert_eq!(
+            jobs.job(&finished).map(|j| &j.status),
+            Some(&rocm_dash_core::state::JobStatus::Done { code: 0 }),
+            "a launch that already finished keeps its own outcome; leaving \
+             must not overwrite it with Cancelled"
+        );
+
+        // Row 5 — focused host, job evicted from the reducer before approving.
+        // There is nothing to cancel, and asking to cancel it must not panic.
+        let (mut wiz, mut jobs) = wizard_on_running_console_in(ServeWizardState::focused_host());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Esc));
+        wiz.as_mut().unwrap().active_job = Some("vanished".into());
+        assert!(jobs.job("vanished").is_none());
+        on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Char('y')));
+        assert!(
+            wiz.is_none(),
+            "approving leaves even when the job to stop is gone"
+        );
     }
 
     #[test]
@@ -2383,6 +2420,16 @@ mod tests {
             !screen.contains("Approve: leave this screen now."),
             "the dashboard's 'just leave the screen' promise must not survive \
              into a window that has no background:\n{screen}"
+        );
+        // The one thing leaving does NOT stop. `service_launch::spawn` starts a
+        // managed engine session-detached, so a server that already came up
+        // outlives this window holding its port and GPU. Unasserted, "leaving
+        // STOPS this launch" reads as stopping that server too, and the user
+        // goes looking for a port nothing released.
+        assert!(
+            screen.contains("keeps running"),
+            "the modal must say an already-started managed server survives \
+             leaving:\n{screen}"
         );
 
         // Approve: the overlay closes (tripping the focused-exit gate) AND the

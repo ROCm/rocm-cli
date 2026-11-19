@@ -313,12 +313,21 @@ mod tests {
             cmd: "sleep".into(),
             args: vec!["1".into()],
         });
-        // Ctrl+C cancels (returns effects).
+        // Ctrl+C cancels (returns effects). Assert the job's status too, not
+        // just the outcome variant: `cancel_job` is the single teardown every
+        // console job goes through, so a version of it that stopped applying
+        // `CancelJob` would still return `Cancelled(_)` here and leave the job
+        // running underneath.
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
             on_console_key("j", &mut s, ctrl_c),
             ConsoleOutcome::Cancelled(_)
         ));
+        assert_eq!(
+            s.job("j").map(|j| &j.status),
+            Some(&rocm_dash_core::state::JobStatus::Cancelled),
+            "Ctrl+C must actually cancel the job, not only report that it did"
+        );
         // `q` yields `Closed` regardless of job state. What the owning overlay
         // then does is its own choice (see `ConsoleExit`): all but one leave at
         // once, the serve wizard's still-starting launch asks first.
