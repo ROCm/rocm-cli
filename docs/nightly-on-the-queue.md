@@ -238,9 +238,10 @@ default command writes each channel's suite results to `/out/<channel>/results`.
 Widening what is collected is not the fix for a missing file; writing the file
 to `/out` is.
 
-The default command, when it exits non-zero, also writes `/out/lane-status.txt`
-(its exit status, the channel it was in and the channels that failed) and keeps
-the results of the channel it was running. Neither is written on a pass.
+The default command, when it exits non-zero once its arguments are accepted,
+also writes `/out/lane-status.txt` (its exit status and the channels that
+failed). It is not written on a pass, for a refused argument (a bad
+`E2E_CHANNELS` or a set `CARGO_BUILD_TARGET`), or when a signal is sent to the script itself.
 
 A lane passes when its command exits zero. Capturing the command's output into
 `lane.log` does not affect that status.

@@ -84,28 +84,23 @@ save_results() {
   fi
 }
 
-# A lane that exits non-zero keeps what it has: the channel it was in the middle
-# of, and a note of how it ended in `${out}/lane-status.txt`, so a failure that
-# stops the script before or between suites, or a signal that ends it, still
-# leaves something to read. `lane.log` is the harness's, not written here. The
-# lane's status stays the one it was ending with (the trap does not exit); a
-# failed write only warns. A signal that ends the script writes no note: bash
-# reports no status to the trap then.
-channel_running=""
+# A lane that exits non-zero after this point leaves a note of how it ended in
+# `${out}/lane-status.txt`, so a failure that stops the script before the channel
+# loop, or a channel that fails, still leaves something to read. The argument and channel checks above
+# run first and write nothing. `lane.log` is the harness's, not written here.
+# The lane's status stays the one it was ending with (the trap does not exit); a
+# failed write only warns. A signal sent to the script itself writes no note:
+# bash reports no status to the trap then.
 channels_failed=""
 # shellcheck disable=SC2329 # run by the EXIT trap, which shellcheck cannot follow
 lane_end() {
   local rc=$?
   trap - EXIT
   if [[ "${rc}" -ne 0 ]]; then
-    if [[ -n "${channel_running}" ]]; then
-      save_results "${channel_running}"
-    fi
     {
       mkdir -p "${out}" &&
         {
           echo "status=${rc}"
-          echo "channel_running=${channel_running}"
           echo "channels_failed=${channels_failed# }"
         } >"${out}/lane-status.txt" &&
         sync
@@ -257,10 +252,8 @@ status=0
 for channel in ${channels}; do
   echo "== channel ${channel}"
   rc=0
-  channel_running="${channel}"
   run_channel "${channel}" || rc=$?
   save_results "${channel}"
-  channel_running=""
   if [[ "${rc}" -ne 0 ]]; then
     channels_failed+=" ${channel}"
     echo "channel ${channel} failed (status ${rc})" >&2

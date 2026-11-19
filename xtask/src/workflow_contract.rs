@@ -12801,7 +12801,7 @@ esac
         assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
         assert_eq!(
             std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note"),
-            "status=3\nchannel_running=\nchannels_failed=release nightly\n",
+            "status=3\nchannels_failed=release nightly\n",
             "{log}"
         );
 
@@ -13177,7 +13177,7 @@ esac
         assert_eq!(rc, 1, "{log}");
         assert!(log.contains("CARGO_BUILD_TARGET is set"), "{log}");
         assert!(!log.contains("cargo fetch"), "{log}");
-        assert!(!out.join("release").exists());
+        assert!(!out.exists(), "{log}");
 
         let LaneRun { rc, log, .. } = run_lane(&LaneCase {
             machine: "aarch64",
