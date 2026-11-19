@@ -2769,7 +2769,10 @@ when the engine failed but its process is still up, the message names the
 stop command. Only a stall or the
 deadline leaves the server running for the background helper to supervise.
 Scenario `serve-64` in `model_serving.feature` drives it under a PTY. It
-needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
+needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only,
+and it is `@requires-os:linux` like every other PTY scenario (the harness's
+ConPTY path is not a validated contract; see `dash.feature`'s header), so the
+native-Windows GPU lane skips it;
 it checks the wait line, that the named `rocm logs --service` command runs,
 and that the serve exits 0 with the model listed. Scenario `serve-65` is the
 failure side on the no-GPU mock lane: with `ROCM_E2E_SIMULATE_STARTUP_EXIT=1`,
