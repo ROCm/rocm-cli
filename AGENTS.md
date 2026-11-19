@@ -532,6 +532,8 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
+A review-fix commit is pushed like any other: run the §13 checklist before pushing it.
+
 ## 13) Upstream Pre-flight Checklist
 
 Run this checklist before any upstream push, PR update, issue update, or public reply:
