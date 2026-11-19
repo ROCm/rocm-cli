@@ -393,15 +393,16 @@ fn render_chat_prompt_result_unsanitized(
             needs_install_folder: false,
         }
     };
-    let deterministic_summary = deterministic_chat_tool_summary(&tool_result.follow_up_text);
+    let deterministic_summary = deterministic_chat_tool_summary(paths, &tool_result.follow_up_text);
     if let Some(summary) = deterministic_summary.as_deref() {
         let _ = writeln!(output);
         let _ = writeln!(output, "ROCm CLI summary");
         let _ = writeln!(output, "{summary}");
     }
-    let follow_up_blocking_summary = deterministic_summary
-        .as_deref()
-        .filter(|_| deterministic_summary_can_stand_alone(&tool_result.follow_up_text));
+    let follow_up_blocking_summary = summary_that_can_answer_alone(
+        deterministic_summary.as_deref(),
+        &tool_result.follow_up_text,
+    );
     if should_request_local_tool_follow_up(provider, &tool_result, follow_up_blocking_summary) {
         let follow_up_messages = vec![
             providers::ChatMessage {
@@ -935,6 +936,17 @@ fn rocm_command_args_install_sdk_without_prefix(
         && chat_cli_arg_value(&args, "--prefix").is_none()
 }
 
+/// The deterministic summary, kept only when it answers the turn on its own.
+///
+/// Split out of the turn loop so a test composes the two the same way the loop
+/// does: a summary that cannot stand alone (the model listing's, which names
+/// three recipes out of the whole catalog) must not suppress the local model's
+/// own answer, and only [`deterministic_summary_can_stand_alone`] knows which
+/// those are.
+fn summary_that_can_answer_alone<'a>(summary: Option<&'a str>, tool_text: &str) -> Option<&'a str> {
+    summary.filter(|_| deterministic_summary_can_stand_alone(tool_text))
+}
+
 fn should_request_local_tool_follow_up(
     provider: &str,
     tool_result: &ChatToolRunResult,
@@ -1210,30 +1222,46 @@ runtime_state:
         ));
     }
 
+    /// Both `rocm model` listings summarize, and neither summary stands alone:
+    /// it names three recipes, so whatever was actually asked about the catalog
+    /// still goes to the local model. Composed through
+    /// `summary_that_can_answer_alone`, the way the turn loop composes them,
+    /// because the bug this guards is the two disagreeing about which text is a
+    /// model listing.
     #[test]
-    fn deterministic_model_tool_summary_suppresses_extra_local_model_follow_up() {
-        let tool_result = ChatToolRunResult {
-            approval: None,
-            follow_up_text: "\
-rocm_command:
-model recipes
-  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-"
-            .to_owned(),
-            ran_read_only_tool: true,
-            read_only_tool_error: false,
-            needs_install_folder: false,
-        };
-        let summary = deterministic_chat_tool_summary(&tool_result.follow_up_text);
-
-        assert!(summary.is_some());
-        assert!(!should_request_local_tool_follow_up(
-            "local",
-            &tool_result,
-            summary.as_deref()
-        ));
+    fn a_model_listing_summary_does_not_replace_the_local_model_answer() {
+        let (_root, paths) = test_paths("model-listing-follow-up");
+        for listing in [
+            crate::render_model_registry_text_with_context_and_host(Some(&paths), None, None),
+            crate::render_model_registry_verbose_text_with_context_and_host(
+                Some(&paths),
+                None,
+                None,
+            ),
+        ] {
+            let tool_result = ChatToolRunResult {
+                approval: None,
+                follow_up_text: format!("rocm_command:\n{listing}"),
+                ran_read_only_tool: true,
+                read_only_tool_error: false,
+                needs_install_folder: false,
+            };
+            let summary = deterministic_chat_tool_summary(&paths, &tool_result.follow_up_text);
+            assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.contains("Recommended local assistant: qwen")),
+                "the model listing the chat tool renders must summarize: {summary:?}"
+            );
+            assert!(
+                should_request_local_tool_follow_up(
+                    "local",
+                    &tool_result,
+                    summary_that_can_answer_alone(summary.as_deref(), &tool_result.follow_up_text)
+                ),
+                "a model listing summary must not stand in for the local model's answer"
+            );
+        }
     }
 
     #[test]

@@ -14,8 +14,9 @@ use std::path::Path;
 use maud::{Markup, html};
 
 use super::{
-    CellOutcome, Grid, LEGEND_ENTRIES, MOCK_GATES_PR, OTHER_LANES_NON_BLOCKING, PlatformReport,
-    PlatformReports, platform_cell,
+    CellOutcome, Grid, LEGEND_ENTRIES, MOCK_GATES_PR, OTHER_LANES_NON_BLOCKING,
+    PLATFORM_ATTENTION_HEADING, PlatformReport, PlatformReports, SCENARIO_ATTENTION_HEADING,
+    platform_cell,
 };
 use crate::components::{feature_group, now_utc, page_shell, stats_bar};
 
@@ -103,6 +104,7 @@ pub fn generate_consolidated(
             h2 { "Platforms" }
             (matrix_table(reports))
             (legend())
+            (lane_failures_html(reports))
 
             (expectation_grid_html(&bundle.grid))
 
@@ -193,7 +195,7 @@ pub(super) fn expectation_grid_html(grid: &Grid) -> Markup {
             }
         }
         @if !problems.is_empty() {
-            h3 { "Needs attention" }
+            h3 { (SCENARIO_ATTENTION_HEADING) }
             ul {
                 @for (platform_label, id, outcome, detail) in &problems {
                     li {
@@ -246,7 +248,8 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
                     td.num { (fail) }
                     td.num { (skip) }
                     td.num { @if xf > 0 || r.is_known_bugs { (xf) } @else { "n/a" } }
-                    td class=(if r.ok() { "status-pass" } else { "status-fail" }) {
+                    td class=(if r.ok() { "status-pass" } else { "status-fail" })
+                        title=[r.lane_failure()] {
                         (r.status_text())
                     }
                     td { (stats_bar(&r.stats)) }
@@ -288,10 +291,33 @@ fn legend() -> Markup {
                     " — PASS when the platform is in its expected state (every "
                     "expect-pass scenario passed and every known bug failed as "
                     "expected); FAIL on an unexpected failure or an XPASS (a known "
-                    "bug that unexpectedly passed — remove its @expected-failure tag)."
+                    "bug that unexpectedly passed — remove its @expected-failure tag), "
+                    "or when the harness failed the lane after the run (for example, no "
+                    "scenario executed); the reason is listed under \u{201c}"
+                    (PLATFORM_ATTENTION_HEADING) "\u{201d} and in the platform's section."
                 }
                 li { b { "Xfail" } " — count of known-bug scenarios that failed as expected." }
                 li { b { "Skip" } " — scenarios not applicable on this platform (not run)." }
+            }
+        }
+    }
+}
+
+/// The platforms the harness failed after their run, with each reason: a
+/// lane-check failure has no grid cell of its own (an all-skip lane has only
+/// skip cells), so it is listed here.
+fn lane_failures_html(reports: &[PlatformReport]) -> Markup {
+    let failed: Vec<(&str, &str)> = reports
+        .iter()
+        .filter_map(|r| r.lane_failure().map(|reason| (r.label.as_str(), reason)))
+        .collect();
+    html! {
+        @if !failed.is_empty() {
+            h3 { (PLATFORM_ATTENTION_HEADING) }
+            ul {
+                @for (label, reason) in &failed {
+                    li { b { "Lane check failed" } " in " code { (label) } ": " (reason) }
+                }
             }
         }
     }
@@ -309,6 +335,9 @@ fn platform_section(report: &PlatformReport) -> Markup {
                 span class=(format!("badge {badge_class}")) { (report.status_text()) }
                 span.platform-name { (report.label) }
                 span.elapsed { (report.stats.total) " scenarios" }
+            }
+            @if let Some(reason) = report.lane_failure() {
+                p.lane-failure { b { "Lane check failed: " } (reason) }
             }
             @if report.features.is_empty() {
                 p.empty-note { "No report.json data for this platform." }
@@ -328,7 +357,7 @@ mod tests {
     use crate::consolidated::{load_platform_reports, load_reports};
 
     #[test]
-    fn legend_mock_and_other_platform_items_are_unchanged() {
+    fn legend_mock_and_other_platform_items_are_pinned() {
         // Pins the two gating items byte for byte, so building them from shared
         // fragments (see `MOCK_GATES_PR`) cannot change what the HTML
         // report's legend says. Text only: that Mock is the required check and
@@ -365,12 +394,18 @@ mod tests {
         // now would be building the bundle's grid from `&[]` in
         // `load_platform_reports`. Give this one a platform.json via
         // write_platform and assert the grid heading actually renders.
-        let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
+        // `serve-b` fails though expected to pass, so the grid's attention
+        // list renders too.
+        let report = feature_json(&[
+            (&["id:serve-a"], &["passed"]),
+            (&["id:serve-b"], &["failed"]),
+        ]);
         let platform = r#"{
             "platform_slug": "mock",
             "capability": {"effective_serve_engine": "none"},
             "expectations": [
-                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"}
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"},
+                {"id":"serve-b","feature":"Serving","scenario":"serve-02 - second","expected":"pass"}
             ]
         }"#;
         let (_d, path) = write_platform(&report, platform);
@@ -383,6 +418,10 @@ mod tests {
         assert!(
             html.contains("Expectation grid (scenario × platform)"),
             "grid heading missing from output:\n{html}"
+        );
+        assert!(
+            html.contains(&format!("<h3>{SCENARIO_ATTENTION_HEADING}</h3>")),
+            "scenario attention heading missing from output:\n{html}"
         );
     }
 

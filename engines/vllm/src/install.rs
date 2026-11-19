@@ -13,13 +13,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::discover_builds::{
-    DiscoverVersion, VllmRocmDiscoverBuild, rocm_sdk_series_matches, vllm_rocm_discover_build,
+    DiscoverVersion, TorchStack, VllmRocmDiscoverBuild, rocm_sdk_series_matches, rocm_series,
+    vllm_rocm_discover_build,
 };
 use crate::repair::{RepairAssessment, assess_runtime_repair};
 use crate::runtime::{
     VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
-    resolve_managed_runtime_python, resolve_vllm_runtime, runtime_is_managed,
-    vllm_runtime_warnings,
+    recorded_sdk_index_url, resolve_managed_runtime_python, resolve_vllm_runtime,
+    runtime_is_managed, vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 use crate::wheel_builds::{
@@ -566,6 +567,104 @@ fn discover_pinned_requirement_for(
             )
         })
 }
+/// The row's torch, torchvision and torchaudio pins, in that order.
+///
+/// A [`TorchStack::Discover`] row resolves them from its index. A
+/// [`TorchStack::FromInstalledSdk`] row takes them from the runtime the SDK
+/// install already resolved, because the index it realigns from serves
+/// several ROCm lines at once and a series such as `torch==2.14.*` would pick
+/// the newest line's build (see [`TorchStack`]).
+fn torch_stack_pins(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    build: &VllmRocmDiscoverBuild,
+) -> Result<Vec<String>> {
+    match build.torch_stack {
+        TorchStack::Discover => ["torch", "torchvision", "torchaudio"]
+            .into_iter()
+            .map(|pkg| {
+                let version = match pkg {
+                    "torch" => DiscoverVersion::Series(build.torch_version_prefix),
+                    "torchvision" => DiscoverVersion::Series(build.torchvision_version_prefix),
+                    _ => build.torchaudio_version,
+                };
+                discover_pinned_requirement(uv, paths, python, build.torch_index_url, pkg, version)
+            })
+            .collect(),
+        TorchStack::FromInstalledSdk => {
+            let output = ProcessCommand::new(uv)
+                .args(uv_pip_freeze_args(python))
+                .envs(uv_command_env(paths))
+                .output()
+                .context("failed to launch `uv pip freeze` to read the SDK's torch stack")?;
+            if !output.status.success() {
+                bail!(
+                    "`uv pip freeze` failed for {}: {}",
+                    python.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            installed_torch_stack_pins(&String::from_utf8_lossy(&output.stdout), build)
+        }
+    }
+}
+
+/// Whether an installed `release` (a `uv pip freeze` version, with any `+local` part)
+/// satisfies `wanted`: a series takes any release inside it, an exact pin takes that
+/// release and no longer one, with the same meaning as PEP 440 `==release`.
+fn stack_release_matches(release: &str, wanted: DiscoverVersion) -> bool {
+    match wanted {
+        DiscoverVersion::Series(series) => release.starts_with(&format!("{series}.")),
+        DiscoverVersion::Exact(exact) => split_local_version(release).0 == exact,
+    }
+}
+/// [`torch_stack_pins`] for a [`TorchStack::FromInstalledSdk`] row, from the
+/// `uv pip freeze` output of the SDK runtime.
+///
+/// Each pin must belong to the row's torch, torchvision and torchaudio series
+/// and be built for the row's ROCm line, so a runtime whose torch is not the
+/// one the vLLM wheel was built against is refused instead of silently kept.
+fn installed_torch_stack_pins(freeze: &str, build: &VllmRocmDiscoverBuild) -> Result<Vec<String>> {
+    let wanted = [
+        ("torch", DiscoverVersion::Series(build.torch_version_prefix)),
+        (
+            "torchvision",
+            DiscoverVersion::Series(build.torchvision_version_prefix),
+        ),
+        ("torchaudio", build.torchaudio_version),
+    ];
+    wanted
+        .into_iter()
+        .map(|(pkg, wanted_release)| {
+            let prefix = format!("{pkg}==");
+            let pin = freeze
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(&prefix))
+                .with_context(|| {
+                    format!(
+                        "the ROCm SDK runtime has no `{pkg}` installed; vLLM for ROCm {} reuses \
+                         the SDK's own torch stack, so reinstall the SDK with `rocm install sdk`",
+                        build.rocm_sdk_version
+                    )
+                })?;
+            let release = &pin[prefix.len()..];
+            if !stack_release_matches(release, wanted_release) {
+                bail!(
+                    "the ROCm SDK runtime has `{pin}`, but vLLM for ROCm {} needs `{pkg}` {}",
+                    build.rocm_sdk_version,
+                    match wanted_release {
+                        DiscoverVersion::Series(series) => format!("{series}.x"),
+                        DiscoverVersion::Exact(release) => release.to_owned(),
+                    }
+                );
+            }
+            ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
+            Ok(pin.to_owned())
+        })
+        .collect()
+}
 /// Runs the dependency-resolving `uv pip install --dry-run` for the discovered
 /// vLLM pin and returns uv's report, without installing anything.
 ///
@@ -683,6 +782,32 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
         (!version.is_empty()).then(|| format!("{pkg}=={version}"))
     })
 }
+/// `err` with the fallbacks this install used appended, so a failure on a fallback
+/// names it. The cause comes first, so plain `{}` display leads with the uv failure and
+/// not with a note about how the pins or the index were chosen.
+fn with_fallback_notes(err: anyhow::Error, notes: &[String]) -> anyhow::Error {
+    if notes.is_empty() {
+        err
+    } else {
+        anyhow!(
+            "{err:#}\n\nFallbacks used during this install: {}",
+            notes.join(" ")
+        )
+    }
+}
+/// The index the torch stack is fetched from for `build`.
+///
+/// A [`TorchStack::FromInstalledSdk`] row reuses the SDK's own builds, so it asks for
+/// them from the index the SDK came from (`recorded`, from the runtime manifest) rather
+/// than the row's fixed one: the row serves nightly and release SDKs alike, and each
+/// one's torch lives only on its own index. A manifest that recorded none, and every
+/// row that discovers its stack, keeps the row's `torch_index_url`.
+fn torch_index_url_for(build: &VllmRocmDiscoverBuild, recorded: Option<&str>) -> String {
+    match (build.torch_stack, recorded) {
+        (TorchStack::FromInstalledSdk, Some(url)) => url.to_owned(),
+        _ => build.torch_index_url.to_owned(),
+    }
+}
 /// Builds the `uv pip install` argv for pinned torch alone, scoped to only
 /// `torch_index_url`.
 ///
@@ -712,7 +837,7 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
 fn vllm_rocm10_discover_torch_install_args(
     python: &Path,
     reinstall: bool,
-    build: &VllmRocmDiscoverBuild,
+    torch_index_url: &str,
     torch_pin: &str,
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -725,7 +850,7 @@ fn vllm_rocm10_discover_torch_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--index-url".to_owned());
-    args.push(build.torch_index_url.to_owned());
+    args.push(torch_index_url.to_owned());
     args
 }
 /// Builds the `uv pip install` argv that realigns torch, torchvision and
@@ -747,7 +872,7 @@ fn vllm_rocm10_discover_torch_install_args(
 /// exists to prevent.
 fn vllm_rocm10_discover_realign_install_args(
     python: &Path,
-    build: &VllmRocmDiscoverBuild,
+    torch_index_url: &str,
     pins: &[String],
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -762,7 +887,7 @@ fn vllm_rocm10_discover_realign_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--index-url".to_owned());
-    args.push(build.torch_index_url.to_owned());
+    args.push(torch_index_url.to_owned());
     args
 }
 /// Builds the `uv pip install` argv for pinned vllm/flash-attn/amd-aiter,
@@ -859,16 +984,49 @@ fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Resul
     let Some(local) = split_local_version(version).1 else {
         return Ok(());
     };
-    let Some(local_rocm) = local.strip_prefix("rocm") else {
+    let Some(matches) = local_rocm_matches(local, rocm_sdk_version) else {
         return Ok(());
     };
-    if rocm_sdk_series_matches(local_rocm, rocm_sdk_version) {
+    if matches {
         return Ok(());
     }
     bail!(
         "discovered `{pin}` for ROCm SDK {rocm_sdk_version}, but its `+{local}` build targets a \
          different ROCm release; the index for this ROCm line is serving another SDK's wheels"
     )
+}
+/// Whether the ROCm line a local version names is `rocm_sdk_version`'s, or `None` when
+/// it has no `rocm` segment at all. A dotted `rocm10.2.0` is read from its first `rocm` segment to the end
+/// of the local version, wherever it sits; a compact `rocm102` is the digits of that
+/// segment alone, so `rocm102` as the whole local version and `d20261110.rocm102` after
+/// other segments are both read.
+fn local_rocm_matches(local: &str, rocm_sdk_version: &str) -> Option<bool> {
+    let segments: Vec<&str> = local.split('.').collect();
+    let at = segments
+        .iter()
+        .position(|segment| segment.starts_with("rocm"))?;
+    let dotted = segments[at..].join(".");
+    if let Some(recorded) = dotted.strip_prefix("rocm")
+        && rocm_series(recorded).is_some()
+    {
+        return Some(rocm_sdk_series_matches(recorded, rocm_sdk_version));
+    }
+    // `.rocm102` names 10.2 with no dot between major and minor. A `rocm` segment
+    // that is neither spelling (`+rocm`, `+rocmabc`) names no line this SDK can be
+    // matched to, so it is a mismatch, not a pass.
+    Some(compact_rocm_local_segment(local).is_some_and(|compact| {
+        rocm_series(rocm_sdk_version)
+            .is_some_and(|(major, minor)| compact == format!("{major}{minor}"))
+    }))
+}
+/// The digits of a `rocm<digits>` segment in a dotted local version, e.g.
+/// `102` for `g5df63a720.d20261110.rocm102`: the spelling the 10.2 vLLM wheels
+/// use, with no dot between the ROCm major and minor.
+fn compact_rocm_local_segment(local: &str) -> Option<&str> {
+    local
+        .split('.')
+        .filter_map(|segment| segment.strip_prefix("rocm"))
+        .find(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 /// The PEP 425 interpreter tag of `python`, e.g. `cp314`.
 fn python_interpreter_tag(python: &Path) -> Result<String> {
@@ -953,37 +1111,37 @@ fn install_vllm_rocm10_discover(
     reinstall: bool,
     build: &VllmRocmDiscoverBuild,
 ) -> Result<VllmInstallOutcome> {
+    let mut notes: Vec<String> = Vec::new();
+    // Every failure after a fallback was taken names it, wherever it happens: a note
+    // kept only for the success path would be lost exactly when the fallback it
+    // describes is what failed.
+    match install_vllm_rocm10_discover_collecting(uv, paths, python, reinstall, build, &mut notes) {
+        Ok(pins) => Ok(VllmInstallOutcome { pins, notes }),
+        Err(err) => Err(with_fallback_notes(err, &notes)),
+    }
+}
+/// [`install_vllm_rocm10_discover`]'s sequence, recording each fallback it takes in
+/// `notes` as it goes and returning the pins installed.
+fn install_vllm_rocm10_discover_collecting(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    reinstall: bool,
+    build: &VllmRocmDiscoverBuild,
+    notes: &mut Vec<String>,
+) -> Result<Vec<String>> {
     ensure_discover_python_tag(python, build)?;
-    let torch = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torch",
-        DiscoverVersion::Series(build.torch_version_prefix),
-    )?;
-    // Discovered fresh from the same index and row as torch, rather than
-    // snapshotted from whatever the SDK install resolved earlier: that
-    // snapshot can pair with a *different* torch version than the one this
-    // row pins (the SDK's own install is unpinned and may have picked the
-    // newest torch/torchvision/torchaudio available, independently of each
-    // other), producing an ABI-incompatible triplet at realign time.
-    let torchvision = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torchvision",
-        DiscoverVersion::Series(build.torchvision_version_prefix),
-    )?;
-    let torchaudio = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torchaudio",
-        build.torchaudio_version,
-    )?;
+    // Discovered (or read from the SDK runtime) together, as one coherent set,
+    // rather than snapshotted from whatever the SDK install resolved earlier
+    // for a row that discovers: that snapshot can pair with a *different*
+    // torch version than the one this row pins, producing an ABI-incompatible
+    // triplet at realign time.
+    let mut torch_stack = torch_stack_pins(uv, paths, python, build)?.into_iter();
+    let (torch, torchvision, torchaudio) = (
+        torch_stack.next().context("torch pin")?,
+        torch_stack.next().context("torchvision pin")?,
+        torch_stack.next().context("torchaudio pin")?,
+    );
     let vllm = discover_pinned_requirement(
         uv,
         paths,
@@ -997,7 +1155,6 @@ fn install_vllm_rocm10_discover(
     // not fail the install: the real install below is the authority, and it
     // reports its own error. The reason is kept, because the series match is
     // exactly the choice this probe exists to improve on.
-    let mut notes: Vec<String> = Vec::new();
     let vllm_resolution = match resolve_vllm_dependencies(uv, paths, python, &vllm, &config_file) {
         Ok(resolution) => Some(resolution),
         Err(err) => {
@@ -1038,34 +1195,42 @@ fn install_vllm_rocm10_discover(
     // Two separate `uv pip install` calls, each scoped to exactly one index:
     // see `vllm_rocm10_discover_torch_install_args` for why combining both
     // indexes into one call is unsafe.
-    let torch_args = vllm_rocm10_discover_torch_install_args(python, reinstall, build, &pins[0]);
+    let torch_index_url = if build.torch_stack == TorchStack::FromInstalledSdk {
+        let recorded_index = recorded_sdk_index_url(paths, python);
+        match &recorded_index {
+            Ok(Some(_)) => {}
+            Ok(None) => notes.push(format!(
+                "no runtime manifest for this interpreter records a wheel index; the torch stack is \
+                 fetched from {}, which may not be the index the SDK was installed from",
+                build.torch_index_url
+            )),
+            Err(err) => notes.push(format!(
+                "could not read the runtime registry ({err:#}); the torch stack is fetched \
+                 from {}, which may not be the index the SDK was installed from",
+                build.torch_index_url
+            )),
+        }
+        torch_index_url_for(build, recorded_index.ok().flatten().as_deref())
+    } else {
+        build.torch_index_url.to_owned()
+    };
+    let torch_args =
+        vllm_rocm10_discover_torch_install_args(python, reinstall, &torch_index_url, &pins[0]);
     run_uv_pip_install(uv, paths, python, torch_args)?;
 
     let mut remaining_args =
         vllm_rocm10_discover_remaining_install_args(python, reinstall, &pins[3..]);
     remaining_args.push("--config-file".to_owned());
     remaining_args.push(config_file.display().to_string());
-    if let Err(err) = run_uv_pip_install(uv, paths, python, remaining_args) {
-        // A note kept only for the success path would be lost exactly when the
-        // fallback pins are what failed.
-        return Err(if notes.is_empty() {
-            err
-        } else {
-            // The cause first, so plain `{}` display leads with the uv failure
-            // and not with a note about how the pins were chosen.
-            anyhow!(
-                "{err:#}\n\nThe fallback pins were used because: {}",
-                notes.join(" ")
-            )
-        });
-    }
+    run_uv_pip_install(uv, paths, python, remaining_args)?;
 
     // The full-dependency resolve above can replace torch (and, pulling it in
     // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
     // force the whole stack back to the coherent trio discovered above. This
     // must run unconditionally, before the device-plugin discovery below: a
     // `uv pip freeze` failure there must not skip restoring the trio too.
-    let trio_realign_args = vllm_rocm10_discover_realign_install_args(python, build, &pins[..3]);
+    let trio_realign_args =
+        vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &pins[..3]);
     run_uv_pip_install(uv, paths, python, trio_realign_args)?;
 
     // The full-dependency resolve can also pull in an AMD device-kernel
@@ -1094,13 +1259,13 @@ fn install_vllm_rocm10_discover(
     }
     if !device_pins.is_empty() {
         let device_realign_args =
-            vllm_rocm10_discover_realign_install_args(python, build, &device_pins);
+            vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &device_pins);
         run_uv_pip_install(uv, paths, python, device_realign_args)?;
     }
 
     let mut pins = pins;
     pins.extend(device_pins);
-    Ok(VllmInstallOutcome { pins, notes })
+    Ok(pins)
 }
 #[cfg(test)]
 mod tests {
@@ -1650,7 +1815,12 @@ mod tests {
         let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
         let torch_pin = "torch==2.12.0+rocm10.0.0";
 
-        let args = vllm_rocm10_discover_torch_install_args(&python, false, build, torch_pin);
+        let args = vllm_rocm10_discover_torch_install_args(
+            &python,
+            false,
+            build.torch_index_url,
+            torch_pin,
+        );
         assert!(!args.contains(&"--reinstall".to_owned()));
         assert!(!args.contains(&"--reinstall-package".to_owned()));
         assert!(args.contains(&torch_pin.to_owned()));
@@ -1670,10 +1840,48 @@ mod tests {
              and hit a fatal 403 from a nonexistent sub-path"
         );
 
-        let args = vllm_rocm10_discover_torch_install_args(&python, true, build, torch_pin);
+        let args = vllm_rocm10_discover_torch_install_args(
+            &python,
+            true,
+            build.torch_index_url,
+            torch_pin,
+        );
         assert!(args.contains(&"--reinstall-package".to_owned()));
         assert!(args.contains(&"torch".to_owned()));
         assert!(!args.contains(&"--reinstall".to_owned()));
+    }
+    #[test]
+    fn an_installed_sdk_row_fetches_its_torch_stack_from_the_index_the_sdk_came_from() {
+        let python = PathBuf::from("/opt/venv/bin/python");
+        let release = "https://stable.repo.amd.com/rocm/whl-next";
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 has a discover row");
+        assert_eq!(ten_two.torch_stack, TorchStack::FromInstalledSdk);
+
+        // A release SDK's torch is not on the row's nightly index, so the row's own
+        // index must not be the one handed to uv.
+        let index = torch_index_url_for(ten_two, Some(release));
+        assert_eq!(index, release);
+        assert_ne!(index, ten_two.torch_index_url);
+        let pins = vec!["torch==2.14.0+rocm10.2.0".to_owned()];
+        let install = vllm_rocm10_discover_torch_install_args(&python, false, &index, &pins[0]);
+        let realign = vllm_rocm10_discover_realign_install_args(&python, &index, &pins);
+        for args in [&install, &realign] {
+            assert!(args.contains(&release.to_owned()), "{args:?}");
+            assert!(
+                !args.contains(&ten_two.torch_index_url.to_owned()),
+                "{args:?}"
+            );
+        }
+
+        // A manifest that recorded no index keeps the row's.
+        assert_eq!(torch_index_url_for(ten_two, None), ten_two.torch_index_url);
+        // A row that discovers its stack never takes the recorded index.
+        let ten_one = vllm_rocm_discover_build("10.1.0").expect("10.1 has a discover row");
+        assert_eq!(ten_one.torch_stack, TorchStack::Discover);
+        assert_eq!(
+            torch_index_url_for(ten_one, Some(release)),
+            ten_one.torch_index_url
+        );
     }
     #[test]
     fn vllm_rocm10_discover_remaining_install_args_use_only_the_vllm_index() {
@@ -1922,6 +2130,248 @@ exit 0
         Ok((outcome, calls))
     }
 
+    /// Runs `install_vllm_rocm10_discover` on the 10.2 row against a fake `uv`
+    /// whose `pip freeze` reports a release SDK's torch stack, with `prepare`
+    /// free to set up the runtime registry first. Returns the outcome and every
+    /// `uv` argv.
+    #[cfg(unix)]
+    fn run_ten_two_discover_with_fake_uv(
+        prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
+    ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
+        run_discover_row_with_fake_uv("10.2.0", None, prepare)
+    }
+    /// [`run_ten_two_discover_with_fake_uv`] for any row, optionally failing the
+    /// `fail_install`th real `uv pip install` (1 torch, 2 remaining deps, 3 trio
+    /// realign, 4 device realign; the dry-runs and `pip freeze` are not counted).
+    #[cfg(unix)]
+    fn run_discover_row_with_fake_uv(
+        row: &str,
+        fail_install: Option<u32>,
+        prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
+    ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+        prepare(&paths, &python)?;
+        let log = root.path().join("uv.log");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*|*"pip freeze"*) ;;
+  *)
+    n=$(cat "{count}" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "{count}"
+    if [ "$n" = "{fail_at}" ]; then echo 'error: boom' >&2; exit 1; fi
+    ;;
+esac
+case "$*" in
+  *--dry-run*--config-file*)
+    echo "Resolved 3 packages" >&2
+    ;;
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    case "$last" in
+      *'*'*) echo " + ${{pkg}}==9.9.9" >&2 ;;
+      *) echo " + ${{last}}" >&2 ;;
+    esac
+    ;;
+  *"pip freeze"*)
+    echo "torch==2.14.0+rocm10.2.0"
+    echo "torchvision==0.29.2+rocm10.2.0"
+    echo "torchaudio==2.11.1+rocm10.2.0"
+    echo "amd-torch-device-gfx1151==2.14.0+rocm10.2.0"
+    ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                count = root.path().join("uv.count").display(),
+                fail_at = fail_install.unwrap_or(0)
+            ),
+        )?;
+        let build = vllm_rocm_discover_build(row).expect("the row has a discover build");
+        let outcome = install_vllm_rocm10_discover(&uv, &paths, &python, true, build);
+        let calls = std::fs::read_to_string(&log)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Ok((outcome, calls))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_sdk_on_the_ten_two_row_gets_its_torch_stack_from_its_own_index() -> Result<()> {
+        let release = "https://stable.example/rocm/whl-next";
+        let (outcome, calls) = run_ten_two_discover_with_fake_uv(|paths, python| {
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            std::fs::create_dir_all(&registry)?;
+            std::fs::write(
+                registry.join("release.json"),
+                format!(
+                    r#"{{"python_executable":"{}","index_url":"{release}"}}"#,
+                    python.display()
+                ),
+            )?;
+            Ok(())
+        })?;
+        outcome?;
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+        // The torch install, the trio realign and the device realign are the real
+        // installs that name a torch-stack package; each must ask the SDK's index.
+        let torch_stack_installs: Vec<&String> = calls
+            .iter()
+            .filter(|call| !call.contains("--dry-run") && call.contains("--no-deps"))
+            .filter(|call| call.contains("torch"))
+            .collect();
+        assert_eq!(
+            torch_stack_installs.len(),
+            3,
+            "expected torch install, trio realign and device realign: {calls:?}"
+        );
+        for call in torch_stack_installs {
+            assert!(call.contains(&format!("--index-url {release}")), "{call}");
+            assert!(!call.contains(build.torch_index_url), "{call}");
+        }
+        Ok(())
+    }
+
+    /// Plants a runtime manifest for the interpreter, with `extra` JSON fields.
+    #[cfg(unix)]
+    fn plant_manifest(paths: &AppPaths, python: &Path, extra: &str) -> Result<()> {
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        std::fs::create_dir_all(&registry)?;
+        std::fs::write(
+            registry.join("runtime.json"),
+            format!(r#"{{"python_executable":"{}"{extra}}}"#, python.display()),
+        )?;
+        Ok(())
+    }
+    /// Makes the registry unreadable: a directory where a manifest file belongs
+    /// cannot be read as a file by anyone, root included, unlike a mode-000 registry.
+    #[cfg(unix)]
+    fn make_registry_unreadable(paths: &AppPaths) -> Result<()> {
+        let broken = paths
+            .data_dir
+            .join("runtimes")
+            .join("registry")
+            .join("broken.json");
+        std::fs::create_dir_all(broken)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ten_two_row_says_when_it_falls_back_to_its_own_index() -> Result<()> {
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+        let on_row_index = |calls: &[String]| {
+            calls
+                .iter()
+                .any(|call| call.contains(&format!("--index-url {}", build.torch_index_url)))
+        };
+
+        // A manifest that records no index (an older one, or an adopted runtime):
+        // the row's index, and the install says so.
+        let (outcome, calls) =
+            run_ten_two_discover_with_fake_uv(|paths, python| plant_manifest(paths, python, ""))?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("records a wheel index")),
+            "{notes:?}"
+        );
+        assert!(on_row_index(&calls));
+
+        // A registry that cannot be read: the same index, and the install says so.
+        let (outcome, calls) =
+            run_ten_two_discover_with_fake_uv(|paths, _| make_registry_unreadable(paths))?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not read the runtime registry")),
+            "{notes:?}"
+        );
+        assert!(on_row_index(&calls));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_row_that_discovers_its_stack_never_looks_at_the_registry_or_says_anything_about_it()
+    -> Result<()> {
+        // 10.1's index is fixed by design, so an unreadable registry or a manifest
+        // with no index is not something its install has a reason to mention.
+        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", None, |paths, _| {
+            make_registry_unreadable(paths)
+        })?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("registry") && !note.contains("wheel index")),
+            "{notes:?}"
+        );
+        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", None, |paths, python| {
+            plant_manifest(paths, python, "")
+        })?;
+        assert!(
+            outcome?
+                .notes
+                .iter()
+                .all(|note| !note.contains("wheel index"))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_step_on_the_fallback_index_names_the_fallback() -> Result<()> {
+        // Each real install in turn: the torch install, the remaining deps, the trio
+        // realign and the device realign all run after the index fell back.
+        for step in 1..=4 {
+            let (outcome, _) =
+                run_discover_row_with_fake_uv("10.2.0", Some(step), |paths, python| {
+                    plant_manifest(paths, python, "")
+                })?;
+            let err = format!("{:#}", outcome.expect_err("an install step fails"));
+            assert!(err.contains("boom"), "step {step}: {err}");
+            assert!(
+                err.contains("records a wheel index") && err.contains("Fallbacks used"),
+                "step {step}: the uv failure must carry the note about the index it ran \
+                 against: {err}"
+            );
+        }
+
+        // With the SDK's own index recorded there is nothing to add to the failure.
+        let (outcome, _) = run_discover_row_with_fake_uv("10.2.0", Some(1), |paths, python| {
+            plant_manifest(
+                paths,
+                python,
+                r#","index_url":"https://stable.example/whl""#,
+            )
+        })?;
+        let err = format!("{:#}", outcome.expect_err("the torch install fails"));
+        assert!(
+            err.contains("boom") && !err.contains("Fallbacks used"),
+            "{err}"
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn discovery_installs_the_companions_the_discovered_vllm_depends_on() -> Result<()> {
@@ -2120,6 +2570,102 @@ fi
         let rendered = format!("{err:#}");
         assert!(rendered.contains("10.1.0"), "{rendered}");
         assert!(rendered.contains("rocm10.0.0"), "{rendered}");
+    }
+    /// The 10.2 vLLM wheels spell their ROCm line `.rocm102`, not
+    /// `+rocm10.2.0`; the guard must still compare it.
+    #[test]
+    fn rocm_local_version_guard_compares_the_compact_rocm_spelling() {
+        let ten_two = "vllm==0.32.1.dev0+g5df63a720.d20261110.rocm102";
+        assert!(ensure_rocm_local_version_matches(ten_two, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(ten_two, "10.2.0a20261022").is_ok());
+        let err = ensure_rocm_local_version_matches(ten_two, "10.1.0")
+            .expect_err("a 10.2 wheel must not install onto a 10.1 SDK");
+        assert!(format!("{err:#}").contains("rocm102"), "{err:#}");
+        // A tagged release carries the compact spelling as the whole local version.
+        let bare = "vllm==0.32.1+rocm102";
+        assert!(ensure_rocm_local_version_matches(bare, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(bare, "10.1.0").is_err());
+        // A `rocm` segment that is neither spelling names no line, so it is no match.
+        for unreadable in [
+            "vllm==0.32.1+rocm",
+            "vllm==0.32.1+rocmabc",
+            "vllm==0.32.1+g5d.rocm.x",
+        ] {
+            assert!(
+                ensure_rocm_local_version_matches(unreadable, "10.2.0").is_err(),
+                "{unreadable}"
+            );
+        }
+        // And the dotted spelling is read as a series wherever its segment sits.
+        let late = "vllm==0.32.1+g5df63a720.rocm10.2.0";
+        assert!(ensure_rocm_local_version_matches(late, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(late, "10.3.0").is_err());
+        // And a 10.1 wheel must not slip onto a 10.2 SDK through the dotted spelling.
+        assert!(
+            ensure_rocm_local_version_matches("vllm==0.29.1.dev0+rocm10.1.0.gabc", "10.2.0")
+                .is_err()
+        );
+    }
+    /// A 10.2 runtime keeps the torch stack its SDK install resolved; a stack
+    /// from another series or another ROCm line is refused, not kept.
+    #[test]
+    fn installed_torch_stack_pins_reads_and_checks_the_sdk_stack() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let freeze = "flash-attn==2.8.3\ntorch==2.14.0+rocm10.2.0a20261022\n\
+                      torchaudio==2.11.1+rocm10.2.0a20261022\n\
+                      torchvision==0.29.2+rocm10.2.0a20261022\n";
+        assert_eq!(
+            installed_torch_stack_pins(freeze, ten_two).expect("coherent 10.2 stack"),
+            [
+                "torch==2.14.0+rocm10.2.0a20261022",
+                "torchvision==0.29.2+rocm10.2.0a20261022",
+                "torchaudio==2.11.1+rocm10.2.0a20261022",
+            ]
+        );
+        // The 10.1 torch an unpinned SDK install can leave behind is not 2.14's pair.
+        let old = freeze.replace("2.14.0+rocm10.2.0a20261022", "2.13.0+rocm10.2.0a20261022");
+        let err = installed_torch_stack_pins(&old, ten_two).expect_err("torch 2.13");
+        assert!(
+            format!("{err:#}").contains("needs `torch` 2.14.x"),
+            "{err:#}"
+        );
+        // Another ROCm line is refused by the same guard as every other pin.
+        let other_line = freeze.replace(
+            "torch==2.14.0+rocm10.2.0a20261022",
+            "torch==2.14.0+rocm10.3.0a20261110",
+        );
+        assert!(installed_torch_stack_pins(&other_line, ten_two).is_err());
+        // A runtime with no torch says what to do.
+        let err = installed_torch_stack_pins("flash-attn==2.8.3\n", ten_two).expect_err("no torch");
+        assert!(format!("{err:#}").contains("rocm install sdk"), "{err:#}");
+    }
+    /// An `Exact` torchaudio pin on a row that reuses the SDK's stack means that
+    /// release and no other (PEP 440 `==release`): the `+local` part is not
+    /// compared, and a longer release is not a match.
+    #[test]
+    fn installed_torch_stack_pins_treats_an_exact_pin_as_that_release() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let exact = |release: &'static str| VllmRocmDiscoverBuild {
+            torchaudio_version: DiscoverVersion::Exact(release),
+            ..*ten_two
+        };
+        let freeze = |torchaudio: &str| {
+            format!(
+                "torch==2.14.0+rocm10.2.0a20261022\ntorchvision==0.29.2+rocm10.2.0a20261022\n\
+                 torchaudio=={torchaudio}+rocm10.2.0a20261022\n"
+            )
+        };
+        let accepted = installed_torch_stack_pins(&freeze("2.11.0.2"), &exact("2.11.0.2"))
+            .expect("the exact release with its local version");
+        assert_eq!(accepted[2], "torchaudio==2.11.0.2+rocm10.2.0a20261022");
+        for installed in ["2.11.0.2.9", "2.11.0.3", "2.11.1"] {
+            assert!(
+                installed_torch_stack_pins(&freeze(installed), &exact("2.11.0.2")).is_err(),
+                "{installed} is not the release 2.11.0.2"
+            );
+        }
+        // A shorter pin does not accept the longer rebuild it is a prefix of.
+        assert!(installed_torch_stack_pins(&freeze("2.11.0.2"), &exact("2.11.0")).is_err());
     }
     /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
     /// arg-builder helpers in isolation: the remaining-deps install must use

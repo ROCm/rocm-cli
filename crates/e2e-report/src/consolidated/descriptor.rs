@@ -201,6 +201,17 @@ const KNOWN_PLATFORMS: &[KnownPlatform] = &[
         os: "Linux",
         slugs: &["mi300x"],
     },
+    // The same silicon, run on a self-hosted runner instead of on the shared GPU
+    // queue: a pull request's `e2e-gpu-report` is the queue's, so the self-hosted
+    // MI300X lane uploads under this name and renders beside it. No slug names it:
+    // the sidecar's `mi300x` is the queue's row, and a report with only a
+    // sidecar left cannot say which it came from.
+    KnownPlatform {
+        artifact: "e2e-gpu-selfhosted-report",
+        platform: "MI300X (self-hosted)",
+        os: "Linux",
+        slugs: &[],
+    },
     // The gfx target IS the slug for this lane: `platform_hardware_slug` has no
     // product-name mapping for it.
     KnownPlatform {
@@ -343,6 +354,7 @@ mod tests {
         for (name, platform, os) in [
             ("e2e-report", "Mock", "Linux"),
             ("e2e-gpu-report", "MI300X", "Linux"),
+            ("e2e-gpu-selfhosted-report", "MI300X (self-hosted)", "Linux"),
             ("e2e-gpu-rad3-report", "R9700", "Linux"),
             ("e2e-gpu-mi350p-report", "MI350P", "Linux"),
             ("e2e-gpu-w7900-report", "W7900", "Linux"),

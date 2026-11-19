@@ -163,6 +163,12 @@ mod tests {
             "The `©` is in a `#` shell comment of the installer `rocm remote \
              provision` uploads. The shell never echoes a comment.",
         ),
+        (
+            "crates/rocm-engine-protocol/src/rocm_cli_vllm_auth.py",
+            "The `©` is in the `#` copyright comment of the auth middleware \
+             module `rocm serve` writes for vLLM, native or in an AIM \
+             container, to import. Python never prints a comment.",
+        ),
     ];
 
     /// Individual literals that are out of scope, as
@@ -184,8 +190,13 @@ mod tests {
             SPINNER_LABEL,
         ),
         (
-            "apps/rocm/src/serve_cmd.rs",
-            "Starting {model} on {selected_engine}…",
+            "apps/rocm/src/serve_progress.rs",
+            "Starting {model} on {engine}…",
+            SPINNER_LABEL,
+        ),
+        (
+            "apps/rocm/src/serve_progress.rs",
+            "Waiting for {model} to serve…",
             SPINNER_LABEL,
         ),
         (

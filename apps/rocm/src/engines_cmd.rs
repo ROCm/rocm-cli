@@ -37,7 +37,7 @@ use serde::Deserialize;
 use crate::EnginesCommand;
 use crate::engine_install_env::{
     engine_manages_own_runtime, env_root_for_engine_install, env_root_for_runtime,
-    env_root_for_self_managed_engine,
+    env_root_for_self_managed_engine, record_engine_install,
 };
 use crate::engine_ipc::{engine_request, engine_request_with_env_root};
 use crate::engine_runtime_select::{
@@ -82,7 +82,7 @@ pub(crate) fn engines(command: EnginesCommand) -> Result<()> {
             // decision `engines list` reports as `unsupported_native_windows`.
             ensure_engine_allowed_on_platform(&engine, GatedEngineAction::Install)?;
             let paths = AppPaths::discover()?;
-            let mut config = RocmCliConfig::load(&paths)?;
+            let config = RocmCliConfig::load(&paths)?;
             let runtime_id =
                 resolve_engine_install_runtime_id(&paths, &config, &engine, runtime_id)?;
             let env_root = env_root_for_engine_install(&paths, &config, &engine, &runtime_id)?;
@@ -115,18 +115,7 @@ pub(crate) fn engines(command: EnginesCommand) -> Result<()> {
             if response.managed_env == Some(false) {
                 println!("  note: external runtime");
             } else {
-                let engine_config = config.engine_config_mut(&engine);
-                engine_config.last_installed_runtime_id = Some(runtime_id.clone());
-                engine_config.last_installed_env_id = Some(response.env_id.clone());
-                let mut seeded_preference = false;
-                if engine_config.preferred_runtime_id.is_none()
-                    && engine_config.preferred_env_id.is_none()
-                {
-                    engine_config.preferred_env_id = Some(response.env_id.clone());
-                    seeded_preference = true;
-                }
-                config.save(&paths)?;
-                let _ = seeded_preference;
+                record_engine_install(&paths, &engine, &runtime_id, Some(&response.env_id))?;
             }
             // Settle last, matching `maybe_auto_install_sdk_preferred_engine`. The
             // check blocks then print under the `engine:`/`runtime_id:`/`env_id:`
@@ -262,16 +251,12 @@ pub(crate) fn ensure_self_managed_engine_ready(
         Some(response)
     };
 
-    let engine_config = config.engine_config_mut(engine);
-    engine_config.last_installed_runtime_id = Some(runtime_id);
-    if let Some(response) = response {
-        engine_config.last_installed_env_id = Some(response.env_id.clone());
-        if engine_config.preferred_runtime_id.is_none() && engine_config.preferred_env_id.is_none()
-        {
-            engine_config.preferred_env_id = Some(response.env_id);
-        }
-    }
-    config.save(paths)?;
+    *config = record_engine_install(
+        paths,
+        engine,
+        &runtime_id,
+        response.as_ref().map(|response| response.env_id.as_str()),
+    )?;
     Ok(())
 }
 

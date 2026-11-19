@@ -1565,6 +1565,38 @@ mod tests {
         );
     }
 
+    /// The seam #1041 broke: the chat `model` tool's own output has to be
+    /// something `deterministic_chat_tool_summary` recognises, or the "ROCm CLI
+    /// summary" block silently stops appearing for model questions. Asserted
+    /// through this dispatch rather than against a renderer, so re-pointing
+    /// these arms at a different renderer fails here instead of in review.
+    #[test]
+    fn the_chat_model_tool_output_still_produces_the_deterministic_summary() {
+        let (_root, paths) = test_paths("chat-model-tool-summary");
+        for args in [
+            vec!["model".to_owned()],
+            vec!["models".to_owned()],
+            vec!["model".to_owned(), "--verbose".to_owned()],
+        ] {
+            let text = run_rocm_read_only_in_process(&paths, &args)
+                .unwrap_or_else(|error| panic!("`rocm {args:?}` must run in process: {error}"));
+            let summary = super::super::summaries::deterministic_chat_tool_summary(&paths, &text)
+                .unwrap_or_else(|| panic!("`rocm {args:?}` output must summarize, got:\n{text}"));
+            assert!(
+                summary.contains("Recommended local assistant: qwen"),
+                "`rocm {args:?}`: {summary}"
+            );
+            assert!(
+                summary.contains("Tiny smoke test: qwen-smoke"),
+                "`rocm {args:?}`: {summary}"
+            );
+            assert!(
+                summary.contains("8 GiB-class option: llama"),
+                "`rocm {args:?}`: {summary}"
+            );
+        }
+    }
+
     #[test]
     fn setup_status_renders_in_process() {
         let (_root, paths) = test_paths("setup-status-in-process");

@@ -106,6 +106,8 @@ definitions when no existing scenario already covers it:
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
+Run the scenarios with `cargo xtask e2e` (§8).
+
 **A message about the CLI's own behavior is asserted together with the behavior.** When a
 change adds or edits a line the CLI prints about what it just did, what it will do next,
 or what the user must do to recover, the covering test asserts the message *and* the
@@ -285,8 +287,9 @@ Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps
 
 Shared (`crates/rocm-core`):
 
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no, and writes to the stream it is given a newline when the input ended without one and a line saying so when the answer was neither yes nor no (declined either way). Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each behind `require_yes_or_interactive` (below); [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
-- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`require_yes_or_interactive(yes, action)`** — the guard in front of a mutating command that confirms with that `[y/N]` prompt. `Ok(true)` means `--yes` already approved it (skip the prompt), `Ok(false)` means there is no `--yes` but a terminal, so the caller still asks, and otherwise it bails with `"{action} requires --yes outside an interactive terminal"`. A new `--yes`-gated command reuses it instead of re-deriving the `yes` / `interactive_terminal()` / `bail!` sequence. Not for a refusal that deliberately differs: [`therock/consent.rs`](apps/rocm/src/therock/consent.rs)'s `sdk_install_approval` names two consents that are not interchangeable, and [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` has its own exit code and checks stdin only
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no, and writes to the stream it is given a newline when the input ended without one and a line saying so when the answer was neither yes nor no (declined either way). Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`consent.rs`](apps/rocm/src/therock/consent.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each behind `require_yes_or_interactive` (below) or, for `uninstall.rs`, its `_with` form; [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`require_yes_or_interactive(yes, action)`** — the guard in front of a mutating command that confirms with that `[y/N]` prompt. `Ok(true)` means `--yes` already approved it (skip the prompt), `Ok(false)` means there is no `--yes` but a terminal, so the caller still asks, and otherwise it bails with `"{action} requires --yes outside an interactive terminal"`. A new `--yes`-gated command reuses it instead of re-deriving the `yes` / `interactive_terminal()` / `bail!` sequence. A command whose refusal needs a `Try:` footer calls `require_yes_or_interactive_with(yes, action, probe)` (the probe injected, so a test takes either side) and passes the refusal through `advise` (below), as `uninstall.rs`'s `approval` does. Not for a refusal that deliberately differs: [`therock/consent.rs`](apps/rocm/src/therock/consent.rs)'s `sdk_install_approval` names two consents that are not interchangeable, and [`fix/consent.rs`](crates/rocm-core/src/fix/consent.rs)'s `confirm()` has its own exit code and checks stdin only
+- [`recovery_hint.rs`](crates/rocm-core/src/recovery_hint.rs)'s **`with_try`**/**`advise`**/**`try_command`**/**`without_backtrace`** — the `Try: <command>` footer a refusal ends with when one command clears it. Build it with `with_try(message, command)`, or `advise(error, command)` for an error a shared guard returned, rather than a hand-written `\n\nTry:` string, and read it back in a test with `try_command`. Not with `.context()`: `rocm` prints `Error: {e:?}`, which puts a context before its cause, so the footer would not come last. `advise` flattens the error into text, so never use it on one a caller downcasts. A test comparing a whole `{e:?}` rendering cuts anyhow's backtrace off with `without_backtrace` rather than its own `split_once`; the module docs say what each skips. Two-step advice (`rocm services prune`'s `Try:`/`Then:`) is not a footer and stays hand-written
 
 CLI:
 
@@ -432,10 +435,19 @@ frontmatter a published skill needs would end up inside that prompt.
 Minimum quality gate before upstream-ready status:
 
 ```bash
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
 cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+prek run --all-files
+cargo xtask tpn --check
+cargo xtask e2e
 cargo xtask smoke
 ```
+
+- `cargo test` skips the scenarios §3 requires: the `e2e` target of [`tests/e2e-cucumber`](tests/e2e-cucumber/Cargo.toml) sets `test = false`. The same setting leaves the harness out of the workspace clippy run, hence the separate `-p e2e-cucumber` line. CI runs both clippy invocations.
+- A green `cargo xtask e2e` does not show that a gated scenario ran (§3 says what to put in the PR text); after a plain run, `tests/e2e-cucumber/results/platform.json` (written from `PlatformManifest` in [`expectation.rs`](tests/e2e-cucumber/src/expectation.rs)) lists each skipped scenario with its reason. A filtered `-n` or `--tags` run is not the minimum quality gate, and neither is a run with `ROCM_CLI_BINARY` set, which tests that prebuilt binary instead of building the change (`e2e_binaries_from` in [`e2e.rs`](xtask/src/e2e.rs)).
+- `prek run --all-files` rewrites files in some hooks, so start from a clean working tree, read the diff it leaves, and re-run the lines above it if it rewrote anything. Some hooks need a tool installed locally (see [CONTRIBUTING.md](CONTRIBUTING.md)); a hook that skips, or fails for want of its tool, is a check that did not run, so say exactly what was not run (below). prek shows a skipped hook as passed unless the hook is `verbose` in [`.pre-commit-config.yaml`](.pre-commit-config.yaml): `powershell-script-analyzer` skips on a non-Windows host that way.
+- `cargo xtask tpn --check` is the `third-party-notices` CI job's command. It is a separate line because the `cargo-tpn` hook inside prek skips silently without the pinned `cargo-about`; run directly, the command fails loudly without it (`run` in [`tpn.rs`](xtask/src/tpn.rs)), which is a check that did not run (below).
 
 Deleting or weakening a test is a change in its own right: every crate has a committed
 coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops

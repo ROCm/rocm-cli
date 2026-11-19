@@ -115,6 +115,10 @@ pub struct E2eWorld {
     /// read from its stderr by the step that checks the refusal, for the step
     /// that follows that advice after other commands have replaced `cli_stderr`.
     pub suggested_settings_rename: Option<(String, String)>,
+    /// What `config-12`'s concurrent settings writers found: one line per
+    /// command that failed and per change a writer saw undone. Set by the When
+    /// step that runs them, read by its Then steps.
+    pub concurrent_settings_findings: Option<e2e::config_steps::ConcurrentSettingsFindings>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
@@ -155,8 +159,9 @@ pub struct E2eWorld {
     pub legacy_rocm_path: Option<PathBuf>,
     /// Per-scenario serve-readiness timeout override (seconds), set by the
     /// `before` hook from `expectations.toml` when this scenario is a known bug
-    /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
-    /// fail fast instead of burning the full cold-start window. `None` → the
+    /// with a `serve_timeout_secs` (which wins over a `@serve-timeout` tag), else
+    /// from that tag. Lets an xfail serve that never becomes ready fail fast
+    /// instead of burning the full cold-start window. `None` → the
     /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
     pub serve_timeout_override: Option<u64>,
     /// Whether `expectations.toml` marks this scenario a known bug on this host,
@@ -173,11 +178,22 @@ pub struct E2eWorld {
     /// from. Consumed by [`run_rocm_with_scenario_env`] like `command_env`; `None`
     /// leaves the harness's own working directory.
     pub command_dir: Option<PathBuf>,
+    /// `(request, HTTP status)` for each server route a step called directly,
+    /// in call order, for a later Then step to judge.
+    pub route_statuses: Vec<(String, u16)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
     /// the scenario. `None` for the non-interactive (piped `Command`) scenarios.
     pub tui: Option<e2e::tui_driver::TuiSession>,
+    /// A second dashboard open at the same time as `tui`, sharing its isolated
+    /// environment and so its telemetry socket (dash-56). Torn down in `Drop`
+    /// right after `tui`, for the same reasons.
+    pub second_tui: Option<e2e::tui_driver::TuiSession>,
+    /// How many dashboard connections to a telemetry daemon the client log
+    /// held when the first of two dashboards was quit (dash-56, dash-58), so a
+    /// later step can tell the surviving one has connected again.
+    pub dash_connections_before_quit: Option<usize>,
     /// Set by the "interactive chat uses an offline assistant" step so the chat
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
@@ -263,6 +279,9 @@ struct Resolution {
     engine: String,
     feature: String,
     scenario: String,
+    /// Tagged `@requires-gpu` or `@requires-multi-gpu`, for the post-run check
+    /// that a GPU-declaring lane executed at least one of them.
+    requires_gpu: bool,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -394,6 +413,7 @@ impl Default for E2eWorld {
             cli_elapsed: None,
             suggested_data_dir: None,
             suggested_settings_rename: None,
+            concurrent_settings_findings: None,
             remote_env: Vec::new(),
             launch_release: None,
             launch_stage: None,
@@ -405,7 +425,10 @@ impl Default for E2eWorld {
             expect_xfail: false,
             command_env: Vec::new(),
             command_dir: None,
+            route_statuses: Vec::new(),
             tui: None,
+            second_tui: None,
+            dash_connections_before_quit: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
             comfyui_baseline_distributions: None,
@@ -498,9 +521,11 @@ impl E2eWorld {
         if let Some(path) = &self.legacy_rocm_path {
             env.push(("ROCM_PATH", path.clone().into_os_string()));
         }
-        // When a scenario declares a longer serve-readiness window (via a
-        // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN per-engine readiness cap(s) to match. `rocm serve --managed`
+        // When a scenario declares a serve-readiness window (via a
+        // `@serve-timeout:<secs>` tag, or a matching xfail row's
+        // `serve_timeout_secs`, which wins over the tag and can be shorter →
+        // serve_timeout_override), also set the CLI's OWN per-engine readiness
+        // cap(s) to match, lowering them when the override is shorter. `rocm serve --managed`
         // otherwise kills/fails a server that isn't ready within its default (5
         // min, EAI-7393), which a large model's cold load legitimately exceeds —
         // so extending only the harness's poll (`model_is_ready`) isn't enough;
@@ -746,6 +771,9 @@ impl Drop for E2eWorld {
         if let Some(tui) = self.tui.take() {
             drop(tui);
         }
+        if let Some(tui) = self.second_tui.take() {
+            drop(tui);
+        }
         // Stop the automation daemon before the isolated directory it writes its
         // state and logs into is removed, so it never outlives the scenario.
         if let Some(daemon) = self.automation_daemon.take() {
@@ -815,6 +843,11 @@ impl Drop for E2eWorld {
         #[cfg(unix)]
         if self.isolated_root.is_some() {
             e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
+        }
+        // Likewise the telemetry socket's directory (dash-59).
+        #[cfg(unix)]
+        if let Some(root) = &self.isolated_root {
+            e2e::dash_steps::restore_telemetry_socket_dir_permissions(root.path());
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -986,6 +1019,37 @@ pub fn run_rocm_bounded(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> (String, String, i32) {
+    run_rocm_bounded_with_env(world, args, &[], timeout)
+}
+
+/// Like [`run_rocm_bounded`], but sets `envs` on the child on top of the
+/// scenario's isolated env, for a value that must not appear in the recorded
+/// argv (an endpoint API key).
+pub fn run_rocm_bounded_with_env(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
+    run_rocm_bounded_in(
+        &world.isolate_env(),
+        world.current_scenario.as_deref(),
+        args,
+        envs,
+        timeout,
+    )
+}
+
+/// [`run_rocm_bounded_with_env`] with the scenario's environment and name
+/// passed in rather than read from the world, for steps that run commands from
+/// several threads at once.
+pub fn run_rocm_bounded_in(
+    env: &[(&'static str, std::ffi::OsString)],
+    scenario: Option<&str>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
     use std::process::Stdio;
 
     let binary = rocm_binary();
@@ -994,7 +1058,10 @@ pub fn run_rocm_bounded(
     let err_path = dir.path().join("stderr");
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
-    world.isolate_cmd(&mut cmd);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.envs(envs.iter().copied());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(
         std::fs::File::create(&out_path).expect("stdout file"),
@@ -1030,7 +1097,7 @@ pub fn run_rocm_bounded(
             timeout.as_secs()
         );
     }
-    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    record_command(scenario, args, rc, &stdout);
     (stdout, stderr, rc)
 }
 
@@ -1399,8 +1466,11 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
     inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
 }
 
-/// Discover the served model id over `/models` and POST one chat completion to
-/// it, returning the decoded response.
+/// POST one chat completion to the scenario's served model, returning the
+/// decoded response.
+///
+/// The model is discovered over `/models` from `world.model_name`, so a router
+/// listing several models is not chatted with at its first entry.
 ///
 /// `tools` is merged into the request body for the tool-definitions scenario.
 /// The exchange itself lives in [`e2e_cucumber::chat_request`], which runs it
@@ -1437,7 +1507,14 @@ pub async fn request_chat_completion(
     } else {
         vec![first, retry]
     };
-    e2e_cucumber::chat_request::request_chat_completion(&endpoint, prompt, tools, &budgets).await
+    e2e_cucumber::chat_request::request_chat_completion(
+        &endpoint,
+        world.model_name.as_deref(),
+        prompt,
+        tools,
+        &budgets,
+    )
+    .await
 }
 
 pub async fn send_chat(world: &mut E2eWorld) {
@@ -1499,6 +1576,7 @@ async fn run_suite() {
     use e2e_cucumber::expectation::{
         Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
     };
+    use e2e_cucumber::lane_verdict;
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1558,6 +1636,19 @@ async fn run_suite() {
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
     );
+
+    // Refuse to run when the result could not mean anything: a probe that could
+    // not read the binary, or a lane that declares a GPU the probe did not find,
+    // would resolve every GPU scenario to skip and pass. See `lane_verdict`.
+    let preflight = lane_verdict::preflight(
+        std::env::var_os(lane_verdict::EXPECT_GPU_ENV).as_deref(),
+        cap.probe_error.as_deref(),
+        cap.has_amd_gpu,
+        &e2e_cucumber::capability::probe_facts_summary(cap),
+    )
+    .unwrap_or_else(|fatal| lane_failure(&fatal));
+    print_lane_notes(&preflight.notes);
+    let gpu_declaration = preflight.declaration;
 
     // Shared record of each scenario's resolved expectation, keyed by @id.
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
@@ -1622,10 +1713,10 @@ async fn run_suite() {
             let decl = ScenarioDecl::from_tags(&scenario.tags);
             if let Some(id) = &decl.id {
                 let engine = decl.effective_engine(cap);
-                // A `@serve-timeout:<secs>` tag on an expected-pass scenario (a
-                // genuinely slow serve, e.g. a large model) takes precedence;
-                // otherwise fall back to any xfail matrix override (fail-fast for
-                // a known-bug serve). Absent both → the step default.
+                // A matching xfail matrix override (fail-fast for a known-bug
+                // serve) takes precedence; otherwise a `@serve-timeout:<secs>` tag
+                // (a genuinely slow serve, e.g. a large model) applies. Absent
+                // both → the step default.
                 world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }
@@ -1681,6 +1772,7 @@ async fn run_suite() {
                             engine,
                             feature: feature.name.clone(),
                             scenario: scenario.name.clone(),
+                            requires_gpu: lane_verdict::needs_gpu(&decl),
                         },
                     );
                     // Two scenarios sharing an `@id` would silently overwrite each
@@ -1736,31 +1828,41 @@ async fn run_suite() {
     // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come
     // from the shared runtimes tree CI provides (E2E_SHARED_RUNTIMES_DIR) — absent
     // on mock (no runtime) and on local runs (per-scenario dirs already dropped),
-    // where those render as "n/a". Best-effort.
+    // where those render as "n/a". Best-effort. Collected before the lane check
+    // so that, once decided, nothing stands between it and platform.json.
     let shared = shared_runtimes_dir();
     let versions = e2e_cucumber::capability::collect_versions(shared.as_deref());
 
+    // A run with nothing to fail passes; check it executed something, and on
+    // a GPU-declaring lane something that needed the GPU. `resolutions` is empty
+    // when a cucumber `--name`/`--tags` filter replaced `filter_run`, and then
+    // which scenarios need a GPU is unknown. The verdict goes into platform.json,
+    // so the consolidated report shows a failed lane check as red.
+    let resolved: Vec<lane_verdict::ResolvedRun<'_>> = resolutions
+        .iter()
+        .map(|(id, r)| lane_verdict::ResolvedRun {
+            id,
+            feature: &r.feature,
+            scenario: &r.scenario,
+            engine: &r.engine,
+            expectation: &r.expectation,
+            needs_gpu: r.requires_gpu,
+        })
+        .collect();
+    let executed: Vec<&str> = actual.iter().map(|(id, _)| id.as_str()).collect();
+    let (post_run, manifest) =
+        lane_verdict::finish_run(cap, versions, &resolved, &executed, gpu_declaration);
+    print_lane_notes(&post_run.notes);
+
     // Write the platform.json sidecar (probed capability + every resolution,
-    // including skips) for the central report's expected-vs-actual grid.
-    let manifest = e2e_cucumber::expectation::PlatformManifest {
-        platform_slug: &cap.platform_slug,
-        capability: cap,
-        versions,
-        expectations: resolutions
-            .iter()
-            .map(|(id, r)| {
-                e2e_cucumber::expectation::ResolvedScenario::new(
-                    id,
-                    &r.feature,
-                    &r.scenario,
-                    &r.engine,
-                    &r.expectation,
-                )
-            })
-            .collect(),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let _ = std::fs::write(dir.join("platform.json"), json);
+    // including skips, + any lane failure) for the central report's grid.
+    let written = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| error.to_string())
+        .and_then(|json| {
+            std::fs::write(dir.join("platform.json"), json).map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        eprintln!("warning: could not write platform.json: {error}");
     }
 
     // Classify actual results against the matrix. A deterministic XPASS is
@@ -1805,7 +1907,7 @@ async fn run_suite() {
             "XPASS (flaky, tolerated): '{x}' passed this run; the intermittent bug remains tracked."
         );
     }
-    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() {
+    if lane_verdict::run_failed(stale_xpass.len(), unexpected_fail.len(), &post_run) {
         for x in &stale_xpass {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
@@ -1817,6 +1919,24 @@ async fn run_suite() {
                 "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
             );
         }
+        if let Some(fatal) = &post_run.fatal {
+            lane_failure(fatal);
+        }
         std::process::exit(1);
+    }
+}
+
+/// Print a lane-check failure (see `lane_verdict::failure_lines`) and exit
+/// non-zero.
+fn lane_failure(message: &str) -> ! {
+    for line in e2e_cucumber::lane_verdict::failure_lines(message) {
+        eprintln!("{line}");
+    }
+    std::process::exit(1);
+}
+
+fn print_lane_notes(notes: &[String]) {
+    for note in notes {
+        eprintln!("{}", e2e_cucumber::lane_verdict::note_line(note));
     }
 }

@@ -68,8 +68,8 @@ pub enum Expectation {
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
-    /// `@requires-multi-gpu`: the scenario's premise is a host with MORE THAN ONE
-    /// AMD GPU present, so a single-GPU host is not a weaker version of it — it
+    /// `@requires-multi-gpu`: the scenario's premise is a job that can reach MORE
+    /// THAN ONE AMD GPU, so a single-GPU host is not a weaker version of it — it
     /// is a different situation in which the assertion does not hold. Skipped
     /// wherever the probed device count is not known to exceed one.
     ///
@@ -116,9 +116,10 @@ pub struct ScenarioDecl {
     pub requires_wsl: bool,
     /// `@requires-oom-fault-injection`: the scenario drives the test-only
     /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
-    /// to fabricate a GPU-less launch (one that OOMs, or one that becomes ready
-    /// and then fails its smoke test), so it can only run against a binary
-    /// compiled with that feature. `xtask e2e` builds it in when it builds the
+    /// to fabricate a GPU-less launch in one of the modes that hook offers — see
+    /// `e2e_simulate_oom_launch` in `apps/rocm/src/service_launch/readiness.rs`
+    /// for the set, which grows — so it can only run against a binary compiled
+    /// with that feature. `xtask e2e` builds it in when it builds the
     /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
     /// test a prebuilt shipping release binary that has the hook compiled out —
     /// there the real GPU-required serve pre-flight would run instead. Skipped
@@ -264,6 +265,20 @@ impl ScenarioDecl {
         }
     }
 
+    /// Whether the scenario starts a model server, as opposed to only needing a
+    /// GPU: one that pins an engine does, and an unpinned one does when its id
+    /// says it serves, benchmarks or chats. By id because nothing else on a
+    /// declaration says so; a GPU scenario outside those groups (examine,
+    /// runtime, diagnose, ...) needs no serving engine and still runs.
+    pub fn starts_a_model_server(&self) -> bool {
+        self.requires_engine.is_some()
+            || self.id.as_deref().is_some_and(|id| {
+                ["serve-", "bench-", "chat-"]
+                    .iter()
+                    .any(|prefix| id.starts_with(prefix))
+            })
+    }
+
     /// The engine this scenario effectively serves with: an explicit
     /// `@requires-engine` pin, else the host's default serve engine. Mirrors the
     /// product precedence (explicit `--engine` first).
@@ -380,14 +395,17 @@ impl Expectations {
 
     /// The serve-readiness window a scenario runs with on this host, as the
     /// harness's `before` hook hands it to the serve steps
-    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): a
-    /// `@serve-timeout:<secs>` tag on an expected-pass scenario wins, else the
-    /// shortest matching xfail `serve_timeout_secs`. `None` for a scenario with
-    /// no `@id:` tag or with neither, which keeps the step default.
+    /// (`E2eWorld::serve_timeout_override`, read by `serve_and_wait`): the
+    /// shortest matching xfail `serve_timeout_secs` wins, else the
+    /// `@serve-timeout:<secs>` tag. A row means the serve is a known bug on this
+    /// host, so it must fail fast even when the scenario carries a long tag for
+    /// the hosts where it passes; the tag only lengthens an expected-pass serve.
+    /// `None` for a scenario with no `@id:` tag or with neither, which keeps the
+    /// step default.
     pub fn serve_timeout_override(&self, decl: &ScenarioDecl, cap: &HostCapability) -> Option<u64> {
         let id = decl.id.as_deref()?;
-        decl.serve_timeout_secs
-            .or_else(|| self.serve_timeout_for(id, cap, decl.effective_engine(cap)))
+        self.serve_timeout_for(id, cap, decl.effective_engine(cap))
+            .or(decl.serve_timeout_secs)
     }
 
     /// Whether any declared condition for this scenario matches this host — the
@@ -482,6 +500,12 @@ pub struct PlatformManifest<'a> {
     pub capability: &'a HostCapability,
     /// Component versions (OS/ROCm/vLLM/lemonade) for the report heading.
     pub versions: crate::capability::PlatformVersions,
+    /// Why the post-run lane check failed the run
+    /// (`lane_verdict::post_run_verdict`), so the consolidated report shows the
+    /// lane as failed even when every scenario it resolved was a skip. Left out
+    /// when the check passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_failure: Option<String>,
     pub expectations: Vec<ResolvedScenario>,
 }
 
@@ -522,11 +546,14 @@ pub struct Included {
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-docker`
 ///    scenario without a usable container runtime, a `@requires-gpu` scenario on
-///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
-///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
+///    a host with no AMD GPU, a `@requires-multi-gpu` scenario where the kernel
+///    exposes no more than one to this job, or the count could not be read, a
+///    `@requires-bare-metal` scenario on WSL2, a
 ///    `@requires-os:<os>` scenario on a different OS, a
 ///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
-///    or a scenario whose effective engine can't start.
+///    a scenario whose effective engine can't start, or a vLLM-serving scenario
+///    on a lane whose pre-warm recorded that vLLM has no build for its SDK
+///    ([`HostCapability::engine_not_applicable`]).
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
@@ -574,7 +601,8 @@ pub fn resolve(
     }
     if decl.requires_multi_gpu && cap.amd_gpu_count.is_none_or(|count| count <= 1) {
         // An unknown count skips as well: the premise is "more than one device
-        // is present", and a host that cannot be counted has not shown that.
+        // is exposed to this job", and a host that cannot be counted has not
+        // shown that.
         // Running there is what turned a real multi-GPU assertion into a
         // single-GPU failure in the first place.
         let detected = cap.amd_gpu_count.map_or_else(
@@ -636,6 +664,18 @@ pub fn resolve(
         };
     }
     let engine = decl.effective_engine(cap);
+    // The pre-warm could not put the engine in the shared runtime for a reason
+    // that is no failure of the lane (see `xtask e2e-prewarm`): the scenarios
+    // that need it are not applicable here, not red.
+    if decl.requires_gpu
+        && decl.starts_a_model_server()
+        && engine.eq_ignore_ascii_case("vllm")
+        && let Some(reason) = &cap.engine_not_applicable
+    {
+        return Expectation::Skip {
+            reason: format!("engine '{engine}' is not applicable on this lane: {reason}"),
+        };
+    }
     // A scenario that pins or defaults to a real engine and would actually serve
     // needs that engine to be startable here. We treat any GPU scenario with a
     // resolved engine as engine-gated; non-GPU scenarios never gate on engine.
@@ -738,6 +778,12 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
+                // A job reaching all eight of an MI300X host's GPUs. This is
+                // not the real MI300X lane, whose job has seen one KFD GPU
+                // node (docs/ci-hardware-testing.md, "GPU visibility on the
+                // hardware pool"), so a test resolving `ExpectPass` for a
+                // `@requires-multi-gpu` scenario here does not mean that lane
+                // runs it.
                 amd_gpu_count: Some(8),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
@@ -745,6 +791,9 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -758,6 +807,9 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -771,28 +823,35 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: false,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
             // it from bare metal. That is precisely why `@requires-os:linux`
             // cannot stand in for `@requires-bare-metal`.
             //
-            // The device COUNT is unknown on every WSL host: that platform
-            // reaches the GPU through `/dev/dxg`, exposing neither a KFD
-            // topology nor an amdgpu DRM card for the count probe to read. So
-            // `@requires-multi-gpu` skips there whatever the hardware is.
+            // The device COUNT is 0 on every WSL host: that platform reaches
+            // the GPU through `/dev/dxg`, exposing neither a KFD topology nor
+            // an amdgpu DRM card, and with no `/dev/kfd` the count probe reads
+            // that as an authoritative zero. So `@requires-multi-gpu` skips
+            // there whatever the hardware is.
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
-                amd_gpu_count: None,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: "wsl_rocdxg_ready".into(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -802,13 +861,16 @@ mod tests {
                 is_wsl: true,
                 gfx_target: None,
                 has_amd_gpu: false,
-                amd_gpu_count: None,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -817,13 +879,16 @@ mod tests {
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
-                amd_gpu_count: None,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -837,6 +902,9 @@ mod tests {
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
                 dir_permissions_bind: true,
+                driver_status: String::new(),
+                probe_error: None,
+                engine_not_applicable: None,
             },
         }
     }
@@ -1198,14 +1266,14 @@ serve_timeout_secs = 90
 
     #[test]
     fn aim_serve_scenarios_stay_off_the_per_pr_lanes() {
-        // serve-26/27 pull the AIM image and a 9B checkpoint on a cold runner and
+        // serve-26/27/63 pull the AIM image and a 9B checkpoint on a cold runner and
         // may each wait out a 1200s readiness cap. Run on every PR on the Strix
         // Ubuntu pool (before that lane left the PR path) they pushed the job
         // (~25 min otherwise) into its 45 min cap on every run. They must
         // resolve to Skip unless the nightly opt-in is set, and must still be
         // reachable (not Skip for the nightly reason) when it is.
         let m = Expectations::default();
-        for prefix in ["serve-26 -", "serve-27 -"] {
+        for prefix in ["serve-26 -", "serve-27 -", "serve-63 -"] {
             let d = ScenarioDecl::from_tags(&model_serving_tags(prefix));
             assert_eq!(d.requires_engine.as_deref(), Some("aim"), "{prefix}");
             assert!(d.nightly, "{prefix} must be @nightly");
@@ -1464,7 +1532,7 @@ serve_timeout_secs = 90
     /// must RUN where one exists and SKIP where it does not — a gate that only
     /// ever skips would silently retire the assertion everywhere.
     #[test]
-    fn requires_multi_gpu_runs_only_where_a_second_device_is_present() {
+    fn requires_multi_gpu_runs_only_where_a_second_device_is_reachable() {
         let m = Expectations::default();
         let d = decl(&[
             "id:serve-rocr-reindexed-gpu-index-rejected",
@@ -1472,9 +1540,18 @@ serve_timeout_secs = 90
             "requires-multi-gpu",
             "requires-os:linux",
         ]);
-        // MI300X has eight devices → the premise holds → the scenario runs.
+        // A job reaching eight devices holds the premise, so the scenario runs.
         assert_eq!(
             resolve(&d, &cap("mi300x"), &m, Included::default()),
+            Expectation::ExpectPass
+        );
+        // Exactly two is the boundary: the smallest count that holds the premise.
+        let two = HostCapability {
+            amd_gpu_count: Some(2),
+            ..cap("mi300x")
+        };
+        assert_eq!(
+            resolve(&d, &two, &m, Included::default()),
             Expectation::ExpectPass
         );
         // Strix Halo has exactly one. `@requires-gpu` is satisfied there, which
@@ -1483,17 +1560,34 @@ serve_timeout_secs = 90
             resolve(&d, &cap("strix-ubuntu"), &m, Included::default()),
             Expectation::Skip { .. }
         ));
-        // No GPU at all, and a host whose count could not be probed (WSL), skip
-        // too: neither has SHOWN a second device.
-        for host in ["mock", "wsl2"] {
-            assert!(
-                matches!(
-                    resolve(&d, &cap(host), &m, Included::default()),
-                    Expectation::Skip { .. }
-                ),
-                "{host} must not run a multi-GPU scenario"
-            );
-        }
+        // No GPU at all skips too, on `@requires-gpu` before the count is read.
+        assert_eq!(
+            resolve(&d, &cap("mock"), &m, Included::default()),
+            Expectation::Skip {
+                reason: "requires an AMD GPU; none detected on this host".to_owned(),
+            }
+        );
+        // WSL passes `@requires-gpu` but exposes no KFD topology or amdgpu DRM
+        // card to count, so counts 0 and skips too: it has not SHOWN a second
+        // device. Its reason is not pinned: "0 detected" is the count the gate
+        // read, not a statement about the devices behind `/dev/dxg`.
+        assert!(matches!(
+            resolve(&d, &cap("wsl2"), &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
+        // A host whose count could not be read (non-Linux, or a `/dev/kfd`
+        // whose topology and DRM class are both unreadable) skips as well,
+        // even on hardware that might have several devices.
+        let uncounted = HostCapability {
+            amd_gpu_count: None,
+            ..cap("mi300x")
+        };
+        assert_eq!(
+            resolve(&d, &uncounted, &m, Included::default()),
+            Expectation::Skip {
+                reason: "requires more than one AMD GPU; the count could not be probed".to_owned(),
+            }
+        );
     }
 
     /// The tag line of a scenario in a real `.feature` file, by `@id:` slug.
@@ -1569,10 +1663,7 @@ serve_timeout_secs = 90
         else {
             panic!("a single-GPU host must skip a multi-GPU scenario");
         };
-        assert!(
-            reason.contains("more than one") && reason.contains('1'),
-            "reason should name the shortfall, got: {reason}"
-        );
+        assert_eq!(reason, "requires more than one AMD GPU; 1 detected");
     }
 
     #[test]
@@ -1824,6 +1915,7 @@ serve_timeout_secs = 90
         let folded = HostCapability {
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            engine_not_applicable: None,
             ..cap("wsl2")
         };
         let both = decl(&[
@@ -1875,6 +1967,7 @@ serve_timeout_secs = 90
         // scenario run and pass without testing anything.
         let as_root = HostCapability {
             dir_permissions_bind: false,
+            engine_not_applicable: None,
             ..cap("wsl2")
         };
         match resolve(&d, &as_root, &m, none) {
@@ -1929,6 +2022,7 @@ serve_timeout_secs = 90
         );
         let host = HostCapability {
             dir_permissions_bind: false,
+            engine_not_applicable: None,
             ..cap("strix-windows")
         };
         assert_ne!(host.os_family, "linux", "fixture must fail the OS premise");
@@ -1965,6 +2059,7 @@ reason = "unrelated open bug"
         let folded = HostCapability {
             case_sensitive_fs: false,
             dir_permissions_bind: true,
+            engine_not_applicable: None,
             ..cap("strix-ubuntu")
         };
         assert!(matches!(
@@ -2116,6 +2211,36 @@ reason = "unrelated open bug"
                     merge_queue: false
                 }
             ),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    /// What the lane-verdict notes say about `@requires-gpu` scenarios (see
+    /// `lane_verdict::preflight_verdict`): `has_amd_gpu` alone decides their
+    /// skip, other gates aside. `resolve` takes no lane declaration, so
+    /// `E2E_EXPECT_GPU` does not enter into it.
+    #[test]
+    fn requires_gpu_runs_where_the_probe_found_a_gpu_and_skips_where_it_did_not() {
+        let m = Expectations::default();
+        let d = decl(&["id:gpu-premise", "requires-gpu"]);
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let with_gpu = cap("strix-ubuntu");
+        assert!(with_gpu.has_amd_gpu);
+        assert_eq!(
+            resolve(&d, &with_gpu, &m, included),
+            Expectation::ExpectPass
+        );
+        let without_gpu = HostCapability {
+            has_amd_gpu: false,
+            ..with_gpu
+        };
+        assert!(matches!(
+            resolve(&d, &without_gpu, &m, included),
             Expectation::Skip { .. }
         ));
     }
@@ -2361,9 +2486,9 @@ flaky = true
     /// was pinned, kept until a nightly shows them stale) apply to native
     /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
     /// default engine is vLLM, where the engine named is what decides), and they are not
-    /// `flaky` (an XPASS means the cause is gone and the row is stale). Neither sets
-    /// `serve_timeout_secs`: serve-06's own `@serve-timeout` tag takes precedence over a
-    /// row, so one would change nothing.
+    /// `flaky` (an XPASS means the cause is gone and the row is stale). Only serve-06's
+    /// row sets `serve_timeout_secs`, so the known-bad Windows serve stops waiting out the
+    /// scenario's 2400s tag.
     #[test]
     fn lemonade_alignment_rows_apply_only_to_native_windows_with_lemonade() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
@@ -2380,16 +2505,25 @@ flaky = true
             let entries = m.entries_for(id);
             assert_eq!(entries.len(), 1, "{id}");
             assert!(!entries[0].flaky, "{id} is deterministic");
-            assert_eq!(entries[0].serve_timeout_secs, None, "{id}");
         }
-        // The row cannot shorten serve-06's wait: its own tag wins, so the harness
-        // still hands the 2400s the feature file asks for.
+        assert_eq!(
+            m.entries_for("runtime-lemonade-backend-alignment-reported")[0].serve_timeout_secs,
+            None
+        );
+        // serve-06's row shortens the wait on the failing host and nowhere else: the
+        // harness hands the row's window on native Windows, and still the 2400s the
+        // feature file asks for on a host where the scenario is expected to pass.
         let tags = feature_tags(
             include_str!("../features/model_serving.feature"),
             "serve-large-model-inference",
         );
+        let decl = ScenarioDecl::from_tags(&tags);
         assert_eq!(
-            m.serve_timeout_override(&ScenarioDecl::from_tags(&tags), &cap("strix-windows")),
+            m.serve_timeout_override(&decl, &cap("strix-windows")),
+            Some(600)
+        );
+        assert_eq!(
+            m.serve_timeout_override(&decl, &cap("strix-ubuntu")),
             Some(2400)
         );
     }
@@ -2439,9 +2573,10 @@ flaky = true
     }
 
     #[test]
-    fn serve_timeout_override_prefers_the_tag_and_needs_an_id() {
+    fn serve_timeout_override_prefers_the_row_and_needs_an_id() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        // The row says 90s on this host; a `@serve-timeout` tag lengthens it.
+        // The row says 90s on this host; a `@serve-timeout` tag must not lengthen a
+        // known-bug serve back to the full window.
         let tagged = decl(&[
             "id:serve-stop-leaves-no-background-helper",
             "requires-engine:lemonade",
@@ -2449,6 +2584,11 @@ flaky = true
         ]);
         assert_eq!(
             m.serve_timeout_override(&tagged, &cap("strix-ubuntu")),
+            Some(90)
+        );
+        // Where no row matches the host, the tag is what lengthens the wait.
+        assert_eq!(
+            m.serve_timeout_override(&tagged, &cap("strix-windows")),
             Some(2400)
         );
         // No `@id:` tag, nothing to look up: the step default stays.
@@ -2465,5 +2605,120 @@ flaky = true
         assert!(glob_match("*dcgpu", "gfx94X-dcgpu"));
         assert!(!glob_match("gfx94*", "gfx1151"));
         assert!(glob_match("gfx1151", "gfx1151"));
+    }
+
+    /// The pre-warm recorded that vLLM cannot be installed into the runtime
+    /// (the unpinned nightly SDK has no vLLM wheels yet): the scenarios that
+    /// would serve with vLLM are not applicable, and nothing else changes.
+    #[test]
+    fn an_engine_the_prewarm_could_not_install_makes_its_scenarios_not_applicable() {
+        let m = eai7333_matrix();
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let mut mi300x = cap("mi300x");
+        let vllm_serve = decl(&["id:serve-default-engine-inference", "requires-gpu"]);
+        let not_serving = decl(&["id:runtime-x"]);
+        // A GPU scenario that only needs the GPU is not a vLLM scenario.
+        let gpu_only = decl(&["id:examine-detects-gpu", "requires-gpu"]);
+        // What does start one: a vLLM pin whatever the id says, and the id
+        // groups that serve, benchmark or chat on the host's default engine.
+        let pinned = decl(&[
+            "id:runtime-torch-alignment-opt-out",
+            "requires-gpu",
+            "requires-engine:vllm",
+        ]);
+        let bench = decl(&["id:bench-vllm-throughput", "requires-gpu"]);
+        let chat = decl(&["id:chat-reply", "requires-gpu"]);
+        assert!(!matches!(
+            resolve(&vllm_serve, &mi300x, &m, included),
+            Expectation::Skip { .. }
+        ));
+
+        mi300x.engine_not_applicable = Some("vllm has no build for this SDK".to_owned());
+
+        let Expectation::Skip { reason } = resolve(&vllm_serve, &mi300x, &m, included) else {
+            panic!("a vLLM scenario must be skipped");
+        };
+        assert!(
+            reason.contains("vllm has no build for this SDK"),
+            "{reason}"
+        );
+        assert_eq!(
+            resolve(&gpu_only, &mi300x, &m, included),
+            Expectation::ExpectPass,
+            "a GPU scenario that starts no server still runs"
+        );
+        for starts_a_server in [&pinned, &bench, &chat] {
+            assert!(
+                matches!(
+                    resolve(starts_a_server, &mi300x, &m, included),
+                    Expectation::Skip { .. }
+                ),
+                "{:?} starts a vLLM server and must be skipped",
+                starts_a_server.id
+            );
+        }
+        // A scenario that does not serve with vLLM is untouched, on the same host.
+        assert_eq!(
+            resolve(&not_serving, &mi300x, &m, included),
+            Expectation::ExpectPass
+        );
+        let lemonade = decl(&[
+            "id:serve-lemonade-x",
+            "requires-gpu",
+            "requires-engine:lemonade",
+        ]);
+        assert_eq!(
+            resolve(&lemonade, &mi300x, &m, included),
+            Expectation::ExpectPass
+        );
+    }
+
+    /// The not-applicable skip is for scenarios that serve with a real vLLM,
+    /// which is what `requires-gpu` says. The feature files also hold `serve-`,
+    /// `bench-` and `chat-` scenarios without it, which run against a mock
+    /// server; an engine the pre-warm could not install must not skip those.
+    #[test]
+    fn an_engine_the_prewarm_could_not_install_leaves_mock_scenarios_alone() {
+        let m = eai7333_matrix();
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let mut mi300x = cap("mi300x");
+        mi300x.engine_not_applicable = Some("vllm has no build for this SDK".to_owned());
+
+        // Their ids put them in the groups that start a model server, and the
+        // host defaults to vLLM: only the missing `requires-gpu` keeps them out.
+        for id in [
+            "id:serve-short-name-expansion",
+            "id:bench-load-reports-throughput",
+            "id:chat-served-model-discoverable",
+        ] {
+            let mock = decl(&[id]);
+            assert!(!mock.requires_gpu);
+            assert!(mock.starts_a_model_server(), "{id} must look like a server");
+            assert!(mock.effective_engine(&mi300x).eq_ignore_ascii_case("vllm"));
+            assert_eq!(
+                resolve(&mock, &mi300x, &m, included),
+                Expectation::ExpectPass,
+                "{id} runs against a mock and is not made not-applicable by the engine"
+            );
+            // The same scenario with `requires-gpu` is the one that is skipped.
+            let real = decl(&[id, "requires-gpu"]);
+            assert!(
+                matches!(
+                    resolve(&real, &mi300x, &m, included),
+                    Expectation::Skip { .. }
+                ),
+                "{id} with requires-gpu serves with the real engine and must be skipped"
+            );
+        }
     }
 }

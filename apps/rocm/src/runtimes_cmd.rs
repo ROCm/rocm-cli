@@ -49,8 +49,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
+use anyhow::{Context, Result, bail};
+use rocm_core::{AppPaths, ConfigLock, RocmCliConfig, require_yes_or_interactive};
 use serde::Serialize;
 
 use crate::runtime_adopt::{
@@ -464,8 +464,8 @@ impl ActivationSnapshot {
 
     /// Put the caller's in-memory config back, without touching disk.
     ///
-    /// Split out because the first write an activation makes is
-    /// `config.save`: when that is what failed, nothing reached disk and
+    /// Split out because the first write an activation makes is the config
+    /// save through the lock: when that is what failed, nothing reached disk and
     /// saving again would only produce a second failure to explain, but the
     /// caller still holds a config describing a runtime that was never
     /// activated.
@@ -481,9 +481,14 @@ impl ActivationSnapshot {
             .clone_from(&self.previous_runtime_key);
     }
 
-    fn restore(self, paths: &AppPaths, config: &mut RocmCliConfig) -> Result<()> {
+    fn restore(
+        self,
+        paths: &AppPaths,
+        lock: &ConfigLock,
+        config: &mut RocmCliConfig,
+    ) -> Result<()> {
         self.restore_in_memory(config);
-        config.save(paths)?;
+        lock.save(config)?;
         let path = active_runtime_marker_path(paths);
         match self.marker {
             // Written through the same atomic helper the forward path uses, not
@@ -507,20 +512,21 @@ impl ActivationSnapshot {
     }
 }
 
-/// Persist the config an activation just mutated, putting the caller's
-/// in-memory copy back if that write fails.
+/// Persist the config an activation just mutated, putting the in-memory copy
+/// back if that write fails.
 ///
-/// `config.save` is the FIRST of an activation's two writes, so a failure here
-/// leaves disk untouched — but not the caller's struct, which already names the
-/// runtime that was not activated. Callers keep using it: `rocm update --apply
-/// --activate` saves the same config again straight after, so an unrestored
-/// struct is a route to persisting an activation that was refused.
+/// The config save is the FIRST of an activation's two writes, so a failure
+/// here leaves disk untouched — but not the in-memory settings, which already
+/// name the runtime that was not activated and which [`activate_runtime`]
+/// hands back to its caller. Callers keep using them (to report what is
+/// active, for one), so unrestored settings would misreport an activation
+/// that was refused.
 fn save_activated_config(
-    paths: &AppPaths,
+    lock: &ConfigLock,
     config: &mut RocmCliConfig,
     snapshot: &ActivationSnapshot,
 ) -> Result<()> {
-    config.save(paths).map_err(|error| {
+    lock.save(config).map_err(|error| {
         snapshot.restore_in_memory(config);
         error.context(
             "failed to record the active ROCm runtime; the previously active runtime is still \
@@ -536,11 +542,12 @@ fn save_activated_config(
 /// command puts it right.
 fn restore_after_failed_activation(
     paths: &AppPaths,
+    lock: &ConfigLock,
     config: &mut RocmCliConfig,
     snapshot: ActivationSnapshot,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    match snapshot.restore(paths, config) {
+    match snapshot.restore(paths, lock, config) {
         Ok(()) => discard_failed_marker_replacement(error).context(
             "failed to record the active ROCm runtime; the previously active runtime is still \
              the active one",
@@ -1087,6 +1094,29 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
     Ok(runtimes_listing(paths, config)?.render_text())
 }
 
+/// Make the runtime `selector` names the active one: record it in
+/// `config.json` and in the active-runtime marker.
+///
+/// Both writes, and the read of the settings they start from, happen under the
+/// config lock (`RocmCliConfig::lock`), so a concurrent activation, rollback or
+/// settings change can neither be undone by this one nor leave `config.json`
+/// and the marker naming different runtimes. The caller's `config` is only an
+/// output: the activation starts from the settings on disk, and once it has
+/// loaded them under the lock, `config` is replaced with the settings it
+/// leaves there, whether it succeeds or fails. A failure before that (an
+/// unknown runtime, unreadable server records, the lock not free, an
+/// unreadable `config.json`) leaves `config` as it was. If the marker write
+/// fails and restoring the settings fails too, `config` holds the earlier
+/// settings while the file may still name the new runtime; the error says so.
+///
+/// The live servers are checked first, before the lock is taken: that check
+/// asks each running server over HTTP and can take seconds per server, and
+/// every other settings change would wait for it. It needs only the runtime
+/// registry and the target runtime, never the settings. The servers it finds
+/// on another runtime are the ones the report lists and `--restart-services`
+/// moves; a server started after the check is in neither. Holding the lock
+/// across the check would not close that gap, since starting a server does
+/// not take this lock.
 pub(crate) fn activate_runtime(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -1094,6 +1124,59 @@ pub(crate) fn activate_runtime(
 ) -> Result<RuntimeActivationResult> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let manifest = select_runtime_manifest(&manifests, selector)?;
+    validate_runtime_manifest_for_activation(manifest)?;
+    let runtime_key = manifest.runtime_key.clone();
+    let services = check_live_services(paths, &manifests, &runtime_key, "the switch to")?;
+    with_activation_lock(paths, config, |lock, config| {
+        activate_runtime_locked(paths, lock, config, &runtime_key, services)
+    })
+}
+
+/// The live servers an activation or rollback to `runtime_key` leaves on
+/// another runtime. Read before anything is written, so an unreadable services
+/// folder refuses the switch instead of half-applying it.
+fn check_live_services(
+    paths: &AppPaths,
+    manifests: &[therock::InstalledRuntimeManifest],
+    runtime_key: &str,
+    switch: &str,
+) -> Result<runtime_services::RuntimeServiceReconciliation> {
+    runtime_services::reconcile_services_for_runtime(paths, manifests, runtime_key).with_context(
+        || {
+            format!(
+                "the local server records could not be read, so {switch} `{runtime_key}` was not \
+                 made and the previously active runtime is unchanged"
+            )
+        },
+    )
+}
+
+/// Run an activation or rollback against the settings on disk, under the
+/// config lock, then hand the settings it left on disk back in `config`.
+fn with_activation_lock(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    activation: impl FnOnce(&ConfigLock, &mut RocmCliConfig) -> Result<RuntimeActivationResult>,
+) -> Result<RuntimeActivationResult> {
+    let lock = RocmCliConfig::lock(paths)?;
+    let mut current = lock.load()?;
+    let result = activation(&lock, &mut current);
+    *config = current;
+    result
+}
+
+/// The part of [`activate_runtime`] under the config lock. The registry is read
+/// again here, so a runtime removed since the live servers were checked is
+/// refused rather than activated.
+fn activate_runtime_locked(
+    paths: &AppPaths,
+    lock: &ConfigLock,
+    config: &mut RocmCliConfig,
+    runtime_key: &str,
+    services: runtime_services::RuntimeServiceReconciliation,
+) -> Result<RuntimeActivationResult> {
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, runtime_key)?;
     validate_runtime_manifest_for_activation(manifest)?;
     let current = current_runtime_manifest(config, &manifests);
     // Re-selecting the runtime already in use is a no-op to the user: they have
@@ -1126,23 +1209,12 @@ pub(crate) fn activate_runtime(
         )
     };
 
-    // Read the live services before anything is written, so an unreadable
-    // services folder refuses the activation instead of half-applying it.
-    let services =
-        runtime_services::reconcile_services_for_runtime(paths, &manifests, &manifest.runtime_key)
-            .with_context(|| {
-                format!(
-                    "the local server records could not be read, so the switch to `{}` was not \
-                     made and the previously active runtime is unchanged",
-                    manifest.runtime_key
-                )
-            })?;
     let snapshot = ActivationSnapshot::capture(paths, config);
 
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
     config.previous_runtime_key = previous_runtime_key.clone();
-    save_activated_config(paths, config, &snapshot)?;
+    save_activated_config(lock, config, &snapshot)?;
     if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
@@ -1156,7 +1228,7 @@ pub(crate) fn activate_runtime(
         },
     ) {
         return Err(restore_after_failed_activation(
-            paths, config, snapshot, error,
+            paths, lock, config, snapshot, error,
         ));
     }
 
@@ -1169,14 +1241,52 @@ pub(crate) fn activate_runtime(
     })
 }
 
+const NO_ROLLBACK_TARGET: &str =
+    "no previous runtime is recorded; activate another runtime before rollback";
+
+/// Switch back to the rollback target, under the config lock and with the
+/// caller's `config` as an output, as [`activate_runtime`] does. The live
+/// servers are checked first, outside the lock, against the target read from
+/// disk then; under the lock the target is read again and must not have
+/// changed in between.
 fn rollback_runtime(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
 ) -> Result<RuntimeActivationResult> {
+    let target = RocmCliConfig::load(paths)?
+        .previous_runtime_key
+        .context(NO_ROLLBACK_TARGET)?;
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let previous = select_runtime_manifest(&manifests, &target)?;
+    validate_runtime_manifest_for_activation(previous)?;
+    let runtime_key = previous.runtime_key.clone();
+    let services = check_live_services(paths, &manifests, &runtime_key, "the rollback to")?;
+    with_activation_lock(paths, config, |lock, config| {
+        rollback_runtime_locked(paths, lock, config, &target, services)
+    })
+}
+
+/// The part of [`rollback_runtime`] under the config lock. `checked_target` is
+/// the rollback target the live servers were checked for.
+fn rollback_runtime_locked(
+    paths: &AppPaths,
+    lock: &ConfigLock,
+    config: &mut RocmCliConfig,
+    checked_target: &str,
+    services: runtime_services::RuntimeServiceReconciliation,
+) -> Result<RuntimeActivationResult> {
     let previous_key = config
         .previous_runtime_key
         .clone()
-        .context("no previous runtime is recorded; activate another runtime before rollback")?;
+        .context(NO_ROLLBACK_TARGET)?;
+    if previous_key != checked_target {
+        bail!(
+            "another rocm command changed the rollback target from `{checked_target}` to \
+             `{previous_key}` while this one was checking the local servers, so the rollback was \
+             not made and the active runtime is unchanged; run `rocm runtimes rollback` again \
+             to roll back to `{previous_key}`"
+        );
+    }
     let manifests = therock::load_runtime_manifests(paths)?;
     let previous = select_runtime_manifest(&manifests, &previous_key)?;
     validate_runtime_manifest_for_activation(previous)?;
@@ -1190,21 +1300,12 @@ fn rollback_runtime(
         .map(|manifest| manifest.runtime_id.clone())
         .filter(|_| new_previous_key.is_some());
 
-    let services =
-        runtime_services::reconcile_services_for_runtime(paths, &manifests, &previous.runtime_key)
-            .with_context(|| {
-                format!(
-                    "the local server records could not be read, so the rollback to `{}` was not \
-                     made and the previously active runtime is unchanged",
-                    previous.runtime_key
-                )
-            })?;
     let snapshot = ActivationSnapshot::capture(paths, config);
 
     config.default_runtime_id = Some(previous.runtime_id.clone());
     config.active_runtime_key = Some(previous.runtime_key.clone());
     config.previous_runtime_key = new_previous_key.clone();
-    save_activated_config(paths, config, &snapshot)?;
+    save_activated_config(lock, config, &snapshot)?;
     if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
@@ -1218,7 +1319,7 @@ fn rollback_runtime(
         },
     ) {
         return Err(restore_after_failed_activation(
-            paths, config, snapshot, error,
+            paths, lock, config, snapshot, error,
         ));
     }
 
@@ -3685,7 +3786,7 @@ pub(crate) mod tests {
             b"{\"runtime_key\":\"written-by-someone-else\"}",
         )?;
 
-        snapshot.restore(&paths, &mut config)?;
+        snapshot.restore(&paths, &RocmCliConfig::lock(&paths)?, &mut config)?;
 
         let survived = fs::read(&marker_path)?;
         let _ = fs::remove_dir_all(&root);
@@ -3713,18 +3814,15 @@ pub(crate) mod tests {
             config.previous_runtime_key.as_deref(),
             Some(OLD_RUNTIME_KEY)
         );
-        // Same trick as `break_active_runtime_marker`, aimed at the config: the
-        // save's final rename onto a non-empty directory fails, which is the
-        // FIRST of an activation's two writes and so never reaches the
-        // marker-failure recovery path.
-        let config_path = paths.config_path();
-        fs::remove_file(&config_path)?;
-        fs::create_dir_all(&config_path)?;
-        fs::write(config_path.join("occupied.txt"), "not a config")?;
-
-        let error = activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)
-            .expect_err("a failed config save must fail the activation");
+        // The config save is the FIRST of an activation's two writes, so failing
+        // it never reaches the marker-failure recovery path. The activation
+        // loads the settings itself under the config lock, so the file has to
+        // stay readable: the save is failed through the lock's test seam.
+        rocm_core::config::fail_config_lock_saves_on_this_thread(true);
+        let outcome = activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY);
+        rocm_core::config::fail_config_lock_saves_on_this_thread(false);
         let _ = fs::remove_dir_all(&root);
+        let error = outcome.expect_err("a failed config save must fail the activation");
 
         let error = format!("{error:#}");
         assert!(
@@ -3735,15 +3833,140 @@ pub(crate) mod tests {
         assert_eq!(
             config.active_runtime_key.as_deref(),
             Some(NEW_RUNTIME_KEY),
-            "the caller goes on using this struct — `rocm update --apply \
-             --activate` saves it again right after — so a config left naming \
-             the runtime that was NOT activated is a route to persisting it"
+            "the caller goes on using the settings it is handed back, so \
+             settings naming the runtime that was NOT activated would \
+             misreport which one is active"
         );
         assert_eq!(
             config.previous_runtime_key.as_deref(),
             Some(OLD_RUNTIME_KEY),
             "the rollback target belongs to the activation that succeeded, not \
              to the one that failed before it wrote anything"
+        );
+        Ok(())
+    }
+
+    /// The live-server check, which asks each running server over HTTP and can
+    /// take seconds per server, runs before the config lock is taken, so other
+    /// settings changes do not wait for it. Checked by holding the lock on this
+    /// thread: a check made under the lock would fail on the nested lock
+    /// instead of on the unreadable services folder.
+    #[test]
+    fn activation_and_rollback_check_live_servers_before_taking_the_config_lock() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-services-before-lock");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        fs::create_dir_all(paths.services_dir().join("unreadable.json"))?;
+
+        let held = RocmCliConfig::lock(&paths)?;
+        let activation = activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY).map(drop);
+        let rollback = rollback_runtime(&paths, &mut config).map(drop);
+        drop(held);
+        let _ = fs::remove_dir_all(&root);
+
+        for (what, outcome) in [("activation", activation), ("rollback", rollback)] {
+            let message = format!(
+                "{:#}",
+                outcome.expect_err("the services folder is unreadable")
+            );
+            assert!(
+                message.contains("the local server records could not be read")
+                    && !message.contains("already holds the lock"),
+                "{what} checked the live servers under the config lock: {message}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An activation and a rollback start from the settings on disk, not from
+    /// the copy the caller holds: a setting another command saved after that
+    /// copy was read survives, and the caller gets the settings as saved.
+    #[test]
+    fn activation_and_rollback_keep_a_setting_saved_after_the_callers_copy() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-keeps-newer-setting");
+        paths.ensure()?;
+        let mut stale = activate_old_runtime(&paths)?;
+        RocmCliConfig::update(&paths, |config| {
+            config.telemetry.mode = rocm_core::TELEMETRY_MODE_OFF.to_owned();
+            Ok(())
+        })?;
+        activate_runtime(&paths, &mut stale, NEW_RUNTIME_KEY)?;
+        let after_activation = RocmCliConfig::load(&paths)?;
+        let handed_back = serde_json::to_value(&stale)?;
+
+        let mut stale_again = stale.clone();
+        RocmCliConfig::update(&paths, |config| {
+            config.default_engine = Some("vllm".to_owned());
+            Ok(())
+        })?;
+        rollback_runtime(&paths, &mut stale_again)?;
+        let after_rollback = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            after_activation.telemetry.mode,
+            rocm_core::TELEMETRY_MODE_OFF
+        );
+        assert_eq!(
+            after_activation.active_runtime_key.as_deref(),
+            Some(NEW_RUNTIME_KEY)
+        );
+        assert_eq!(handed_back, serde_json::to_value(&after_activation)?);
+        assert_eq!(after_rollback.default_engine.as_deref(), Some("vllm"));
+        assert_eq!(after_rollback.telemetry.mode, rocm_core::TELEMETRY_MODE_OFF);
+        assert_eq!(
+            after_rollback.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        Ok(())
+    }
+
+    /// The rollback checks the live servers for the target it read before
+    /// taking the lock. If another command changed the target in between, it
+    /// refuses and changes nothing, and running `rocm runtimes rollback` again,
+    /// as the error says, rolls back to the new target.
+    #[test]
+    fn a_rollback_whose_target_changed_meanwhile_is_refused() -> Result<()> {
+        let (root, paths) = test_paths("runtime-rollback-target-changed");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+
+        let lock = RocmCliConfig::lock(&paths)?;
+        let mut current = lock.load()?;
+        let refused = rollback_runtime_locked(
+            &paths,
+            &lock,
+            &mut current,
+            "the-target-checked-earlier",
+            runtime_services::RuntimeServiceReconciliation::default(),
+        )
+        .map(drop);
+        drop(lock);
+        let after_refusal = RocmCliConfig::load(&paths)?;
+        let again = rollback_runtime(&paths, &mut config).map(drop);
+        let after_again = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        let message = format!("{:#}", refused.expect_err("the target changed"));
+        assert!(
+            message.contains("changed the rollback target")
+                && message.contains("run `rocm runtimes rollback` again"),
+            "{message}"
+        );
+        assert_eq!(
+            after_refusal.active_runtime_key.as_deref(),
+            Some(NEW_RUNTIME_KEY)
+        );
+        assert_eq!(
+            after_refusal.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        again?;
+        assert_eq!(
+            after_again.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
         );
         Ok(())
     }
@@ -4041,7 +4264,7 @@ pub(crate) mod tests {
             config.active_runtime_key.as_deref(),
             Some(OLD_RUNTIME_KEY),
             "the caller's in-memory config must be restored too, or the next \
-             `config.save` on this path writes the state the restore just undid"
+             report from these settings names the state the restore just undid"
         );
         assert!(
             sentinel_survived,
@@ -4213,7 +4436,7 @@ pub(crate) mod tests {
         config.save(&paths)?;
         fs::write(&marker_path, b"{\"runtime_key\":\"half-applied\"}")?;
 
-        snapshot.restore(&paths, &mut config)?;
+        snapshot.restore(&paths, &RocmCliConfig::lock(&paths)?, &mut config)?;
 
         let persisted = RocmCliConfig::load(&paths)?;
         let after = fs::read(&marker_path)?;
@@ -4259,7 +4482,7 @@ pub(crate) mod tests {
         // file the restore actually replaces.
         let before_ino = fs::metadata(&marker_path)?.ino();
 
-        snapshot.restore(&paths, &mut config)?;
+        snapshot.restore(&paths, &RocmCliConfig::lock(&paths)?, &mut config)?;
 
         let after_ino = fs::metadata(&marker_path)?.ino();
         let leftovers: Vec<String> = fs::read_dir(
@@ -4311,7 +4534,7 @@ pub(crate) mod tests {
         activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)?;
         assert!(marker_path.is_file(), "the activation wrote a marker");
 
-        snapshot.restore(&paths, &mut config)?;
+        snapshot.restore(&paths, &RocmCliConfig::lock(&paths)?, &mut config)?;
 
         let marker_still_there = marker_path.exists();
         let persisted = RocmCliConfig::load(&paths)?;
@@ -4352,7 +4575,13 @@ pub(crate) mod tests {
             "the shared writer keeps the new marker when the old one is gone"
         );
 
-        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let error = restore_after_failed_activation(
+            &paths,
+            &RocmCliConfig::lock(&paths)?,
+            &mut config,
+            snapshot,
+            write_error,
+        );
         let rendered = format!("{error:#}");
         let restored_marker = fs::read(&marker_path)?;
         let leftovers = marker_temp_file_names(&paths)?;
@@ -4428,7 +4657,13 @@ pub(crate) mod tests {
         });
         let kept = marker_temp_file_names(&paths)?;
 
-        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let error = restore_after_failed_activation(
+            &paths,
+            &RocmCliConfig::lock(&paths)?,
+            &mut config,
+            snapshot,
+            write_error,
+        );
         let rendered = format!("{error:#}");
         let restored_marker = fs::read(active_runtime_marker_path(&paths))?;
         let still_there = marker_temp_file_names(&paths)?;
@@ -4472,7 +4707,13 @@ pub(crate) mod tests {
             fs::remove_file(runtimes_dir.join(name))?;
         }
 
-        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let error = restore_after_failed_activation(
+            &paths,
+            &RocmCliConfig::lock(&paths)?,
+            &mut config,
+            snapshot,
+            write_error,
+        );
         let rendered = format!("{error:#}");
         let _ = fs::remove_dir_all(&root);
 
@@ -4505,7 +4746,13 @@ pub(crate) mod tests {
         fs::create_dir_all(&config_path)?;
         fs::write(config_path.join("occupied.txt"), "not a config")?;
 
-        let error = restore_after_failed_activation(&paths, &mut config, snapshot, write_error);
+        let error = restore_after_failed_activation(
+            &paths,
+            &RocmCliConfig::lock(&paths)?,
+            &mut config,
+            snapshot,
+            write_error,
+        );
         let rendered = format!("{error:#}");
         let leftovers = marker_temp_file_names(&paths)?;
         let _ = fs::remove_dir_all(&root);
@@ -4551,6 +4798,7 @@ pub(crate) mod tests {
 
         let error = restore_after_failed_activation(
             &paths,
+            &RocmCliConfig::lock(&paths)?,
             &mut config,
             snapshot,
             anyhow::anyhow!("marker write failed"),

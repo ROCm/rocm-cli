@@ -222,6 +222,22 @@ Feature: Chat and endpoint detection
     Then the CLI refuses the request for its nested arguments
     And no tool result is printed
 
+  # PR #1041 pointed the chat `model` tool at the curated `rocm model` listing
+  # instead of the 58k-token `--verbose` dump, which was right: the dump was
+  # more than a locally served model's whole context. The deterministic "ROCm
+  # CLI summary" block was gated on a string only the dump printed, so it
+  # silently stopped appearing for model questions — and the curated listing is
+  # grouped by hardware target and names only large models, so on a small GPU
+  # the answer named nothing that fits. The block names the ~4 GiB local
+  # assistant by name, and this drives the real `rocm chat` turn end to end:
+  # the CLI's own fallback runs the model tool, so a regression in either the
+  # tool's renderer or the summary's gate shows up here.
+  @id:chat-model-question-shows-the-rocm-cli-summary
+  Scenario: chat-20 - Asking what models this machine can run shows the deterministic ROCm CLI summary
+    Given a local chat assistant that answers a model question in words
+    When the user asks in one-shot chat which models this machine can run
+    Then the chat shows a ROCm CLI summary naming the low-VRAM local assistant
+
   # A reply is model output, and model output is not trusted: it may carry
   # terminal escape sequences that conceal part of a line, retitle the window
   # or write the clipboard. `rocm chat --prompt` prints the reply to a terminal,
@@ -229,7 +245,7 @@ Feature: Chat and endpoint detection
   # plain text, the sequences and their payloads gone, and a sequence left
   # open costing only the rest of its own line. Runs on mock (no GPU).
   @id:chat-cli-reply-escapes-stripped
-  Scenario: chat-20 - The chat CLI shows a reply's hidden text instead of passing on its escape sequences
+  Scenario: chat-21 - The chat CLI shows a reply's hidden text instead of passing on its escape sequences
     Given a local chat assistant whose reply hides part of itself with terminal escape sequences
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI output carries no terminal escape sequence
@@ -245,7 +261,7 @@ Feature: Chat and endpoint detection
   # needs a `uv` to resolve), so the preview resolves without network or GPU.
   # Runs on mock (no GPU).
   @id:chat-assistant-value-unsafe-to-paste-refused
-  Scenario: chat-21 - A folder the chat assistant chose that a Windows shell would split is refused, not offered to paste
+  Scenario: chat-22 - A folder the chat assistant chose that a Windows shell would split is refused, not offered to paste
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     And a uv is already installed
     And a local chat assistant that asks to install ROCm into a folder whose name holds an ampersand
@@ -257,11 +273,11 @@ Feature: Chat and endpoint detection
 
   # The plan `natural_language_plan` returns for a request the assistant wrote
   # turns words of that request into the values on its `tool_call:` lines,
-  # which are offered to paste, so the plan is held to the rule chat-21's call
+  # which are offered to paste, so the plan is held to the rule chat-22's call
   # is: a folder with an ampersand in it is refused before the plan is shown.
   # Planning runs no install, so no pip index is needed. Runs on mock (no GPU).
   @id:chat-assistant-plan-unsafe-to-paste-refused
-  Scenario: chat-22 - A plan for the chat assistant's request that names a folder a Windows shell would split is refused, not shown
+  Scenario: chat-23 - A plan for the chat assistant's request that names a folder a Windows shell would split is refused, not shown
     Given a local chat assistant that asks for a plan to install ROCm into a folder whose name holds an ampersand
     When the user asks the chat assistant with ROCm tools a question in one-shot chat
     Then the CLI refuses the plan for the assistant's request

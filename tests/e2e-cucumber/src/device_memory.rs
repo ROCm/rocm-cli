@@ -585,7 +585,8 @@ const SMI_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// module is library code, and a normal dependency would be a new first-party
 /// edge that `cargo xtask check-crate-edges` makes a reviewed addition. The two
 /// can drift, so a change to either one's kill or drain behaviour should look at
-/// the other.
+/// the other. The same applies to `capability::output_within`, the capability
+/// probe's copy of these steps, which also keeps stderr and the exit status.
 pub fn bounded_stdout(mut command: Command, timeout: Duration) -> Probe<String> {
     let mut child = match command
         .stdin(Stdio::null())

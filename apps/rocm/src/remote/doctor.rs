@@ -365,6 +365,7 @@ mod tests {
             // that half rather than replacing it, so there is nothing for these
             // to say about one.
             model: None,
+            provenance: None,
         }
     }
 

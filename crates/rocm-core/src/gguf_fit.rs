@@ -5,8 +5,10 @@
 //! Will this GGUF model fit in GPU memory at this context size?
 //!
 //! Weights plus KV cache plus a compute buffer plus a runtime reserve, compared
-//! against the dedicated VRAM the readiness check already reads. Pure
-//! arithmetic over a [`GgufHeader`]: nothing here reads a file or the network.
+//! against the memory the engine allocates from, as the readiness check already
+//! reads it: a discrete card's dedicated VRAM, or an integrated GPU's ceiling on
+//! the pool it shares with the operating system. Pure arithmetic over a
+//! [`GgufHeader`]: nothing here reads a file or the network.
 //!
 //! The KV-cache formula is exact for a plain full-attention model (it is how
 //! llama.cpp lays the cache out), and the weights are the file's own size from
@@ -173,11 +175,22 @@ impl FromStr for KvCacheType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EstimateOutcome {
-    /// The estimated total is within the GPU's dedicated memory. The total
+    /// The estimated total is within the memory the host's engine would
+    /// allocate from: a discrete card's dedicated VRAM, or the ceiling on the
+    /// shared pool an APU draws on
+    /// ([`crate::model_readiness::AcceleratorMemory::Unified`]). Against a
+    /// shared pool this is weaker than it sounds: the ceiling is not an
+    /// allocation and nothing here measured how much of it is free. The
+    /// `Degraded` cap that goes with a shared pool is applied separately, by
+    /// `assess_model_readiness`, and only to a catalog recipe that declares a
+    /// GPU memory minimum — this estimate does not set it. The total
     /// compared is the sum of the parts as the report shows them, each in whole
     /// MiB rounded up, so it can be a few MiB above `total_bytes`.
     Fits,
-    /// The estimated total exceeds the GPU's dedicated memory.
+    /// The estimated total exceeds that memory — a discrete card's dedicated
+    /// VRAM, or an APU's shared-pool ceiling, as above. Over a shared-pool
+    /// ceiling this is as firm as over a card: freeing memory does not raise an
+    /// aperture the driver will not hand out.
     DoesNotFit,
     /// No comparison could be made. See [`ContextEstimate::cannot_estimate_reason`].
     CannotEstimate,
@@ -218,7 +231,10 @@ pub enum CannotEstimateReason {
     NoGpu,
     /// The GPU's memory could not be measured.
     AcceleratorMemoryUnknown,
-    /// An APU: the pool the engine allocates from is not readable.
+    /// An APU whose shared pool could not be read **on this host**: the figure
+    /// was absent or unparseable. The pool itself is readable in general -- see
+    /// [`crate::model_readiness::AcceleratorMemory::Unified`], which carries it
+    /// and does produce an estimate.
     UnifiedMemoryUnreadable,
 }
 
@@ -270,8 +286,23 @@ pub struct ContextEstimate {
     pub total_bytes: Option<u64>,
     /// KV cache bytes added by each token of context at `kv_cache_type`.
     pub kv_cache_bytes_per_token: Option<f64>,
-    /// Dedicated VRAM, when it was measured.
+    /// The memory `total_gib` was compared against, when it was measured.
+    ///
+    /// Dedicated VRAM on a discrete card; on an APU, the ceiling on the pool
+    /// the engine shares with the operating system. Which one it is cannot be
+    /// read off the number, so [`Self::available_is_shared_pool`] carries it.
     pub available_gib: Option<f64>,
+    /// Whether [`Self::available_gib`] is a shared pool rather than dedicated
+    /// VRAM.
+    ///
+    /// Carried on the estimate rather than re-derived by each renderer: the
+    /// note in `notes` and the evidence line in [`evidence_lines`] both have to
+    /// describe the same figure, and when they derived it separately they
+    /// disagreed in one report -- "the GPU with the most dedicated VRAM ... has
+    /// 24576 MiB" a few lines above "this host's integrated GPU has no
+    /// dedicated VRAM".
+    #[serde(default)]
+    pub available_is_shared_pool: bool,
     /// The largest context that fits at `kv_cache_type`: a multiple of 256, or
     /// the context the model was trained for when that fits and is the limit.
     /// `None` when not even one 256-token step fits, or when nothing was
@@ -340,6 +371,7 @@ impl ContextEstimate {
             total_bytes: None,
             kv_cache_bytes_per_token: None,
             available_gib: None,
+            available_is_shared_pool: false,
             max_context: None,
             training_context: None,
             conservative_ceiling: false,
@@ -730,6 +762,7 @@ pub fn estimate_fit(
         total_bytes: None,
         kv_cache_bytes_per_token: None,
         available_gib: memory.measured_gib(),
+        available_is_shared_pool: false,
         max_context: None,
         training_context: trained_context(header),
         conservative_ceiling: header.sliding_window,
@@ -820,10 +853,15 @@ pub fn estimate_fit(
             ),
             AcceleratorMemory::UnifiedMemoryUnreadable => (
                 CannotEstimateReason::UnifiedMemoryUnreadable,
-                "this host has no dedicated VRAM and the CLI cannot yet read the memory pool its \
-                 engine allocates from, so there is nothing to compare the figures against",
+                "this host has no dedicated VRAM, and the figure for the memory pool its engine \
+                 allocates from could not be read here, so there is nothing to compare the \
+                 figures against",
             ),
-            AcceleratorMemory::Unknown | AcceleratorMemory::Dedicated(_) => (
+            // `Dedicated` and `Unified` both carry a figure, so neither reaches
+            // this branch; the arm exists because the match is exhaustive.
+            AcceleratorMemory::Unknown
+            | AcceleratorMemory::Dedicated(_)
+            | AcceleratorMemory::Unified { .. } => (
                 CannotEstimateReason::AcceleratorMemoryUnknown,
                 "the GPU memory on this host could not be read, so there is nothing to compare \
                  the figures against",
@@ -833,6 +871,20 @@ pub fn estimate_fit(
         estimate.detail = Some(detail.to_owned());
         return estimate;
     };
+    // `available_gib` is a ceiling on memory shared with the operating system
+    // here, not a dedicated pool, so a `Fits` below is "the machine would allow
+    // this at best" rather than "this much is waiting for it". Said on the
+    // estimate itself, because the figure is printed beside the totals with
+    // nothing else to tell the two kinds of number apart.
+    if memory.is_shared_pool() {
+        estimate.available_is_shared_pool = true;
+        estimate.notes.push(
+            "this host's integrated GPU has no dedicated VRAM: the memory compared against is \
+             the ceiling on a pool it shares with the operating system, so how much is free \
+             depends on what else is running"
+                .to_owned(),
+        );
+    }
     // A layout whose figure can be too low gets the figures and no verdict: a
     // confident "fits" that is wrong costs a user a failed load, and a margin
     // with no measurement behind it would be a guess. The host's memory is
@@ -1113,11 +1165,20 @@ pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
     }
     if let Some(available) = estimate.available_gib {
         let offered = whole_mib_offered(available);
-        lines.push(format!(
-            "the GPU with the most dedicated VRAM that ROCm can see has {offered} MiB ({}) in \
-             total; memory other processes already hold is not subtracted",
-            format_gib(available)
-        ));
+        lines.push(if estimate.available_is_shared_pool {
+            format!(
+                "the pool this host's integrated GPU allocates from has {offered} MiB ({}) in \
+                 total; that is a ceiling it shares with the operating system, and memory other \
+                 processes already hold is not subtracted",
+                format_gib(available)
+            )
+        } else {
+            format!(
+                "the GPU with the most dedicated VRAM that ROCm can see has {offered} MiB ({}) \
+                 in total; memory other processes already hold is not subtracted",
+                format_gib(available)
+            )
+        });
         let conservative = if estimate.conservative_ceiling {
             " (conservative for this model: its sliding-window layers are sized at the full \
              context)"
@@ -1619,6 +1680,120 @@ mod tests {
             assert_eq!(result.available_gib, None);
             assert_eq!(result.max_context, None);
             assert!(result.suggestions.is_empty());
+        }
+    }
+
+    /// A shared pool is compared against, and said to be shared.
+    ///
+    /// `Unified` is the one memory state that both carries a figure and is not
+    /// a dedicated allocation, so it is the one state where a bare `FITS` would
+    /// mislead: the number compared against is a ceiling on memory the
+    /// operating system draws from too. Three things are pinned here, because
+    /// each can break on its own:
+    ///
+    /// - the comparison happens at all (`Unified` must not fall into the
+    ///   `measured_gib() == None` arm and be declined),
+    /// - it is made against the pool, not the carve-out beside it -- the
+    ///   carve-out here is far below the model's own weights, so a `Fits`
+    ///   proves the figure used was the pool,
+    /// - and the note that says the figure is shared is present for `Unified`
+    ///   and absent for a dedicated card and for an unreadable one.
+    ///
+    /// The last is why the non-`Unified` half is here: deleting the
+    /// `is_shared_pool()` block outright left every test in this file green
+    /// before this one existed, and a test that only asserted presence would
+    /// still pass against a block that pushed the note unconditionally.
+    /// The report may not call one figure both "dedicated VRAM" and "no
+    /// dedicated VRAM".
+    ///
+    /// `evidence_lines` and the shared-pool note describe the same number from
+    /// two places, and `model_readiness` prints both in one report -- evidence
+    /// bullets first, then the estimate's notes. While they derived the
+    /// shared-pool fact separately, an APU got "the GPU with the most dedicated
+    /// VRAM ... has 24576 MiB" a few lines above "this host's integrated GPU
+    /// has no dedicated VRAM". Asserted as a relation between the two renderers
+    /// rather than as two literal strings, so rewording either cannot quietly
+    /// restore the contradiction.
+    #[test]
+    fn the_evidence_line_and_the_note_cannot_disagree_about_what_the_figure_is() {
+        let (header, size) = llama(GIB_U as usize / 1024);
+        for (memory, shared) in [
+            (
+                AcceleratorMemory::Unified {
+                    gtt_total_gib: 24.0,
+                },
+                true,
+            ),
+            (AcceleratorMemory::Dedicated(24.0), false),
+        ] {
+            let estimate = estimate(&header, size, 4096, KvCacheType::F16, memory);
+            assert!(
+                estimate.available_gib.is_some(),
+                "premise: both hosts must measure something, or neither renderer speaks"
+            );
+            let evidence = evidence_lines(&estimate).join("\n");
+            let says_dedicated = evidence.contains("dedicated VRAM");
+            let notes = estimate.notes.join("\n");
+            let denies_dedicated = notes.contains("no dedicated VRAM");
+            assert!(
+                !(says_dedicated && denies_dedicated),
+                "shared={shared}: one report called the same figure dedicated VRAM and not \
+                 dedicated VRAM.\nevidence:\n{evidence}\nnotes:\n{notes}"
+            );
+            assert_eq!(
+                says_dedicated, !shared,
+                "shared={shared}: the evidence line names the wrong kind of memory:\n{evidence}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_pool_is_compared_against_its_ceiling_and_said_to_be_shared() {
+        const SHARED: &str = "shares with the operating system";
+        let (header, size) = llama(GIB_U as usize / 1024);
+
+        let shared = estimate(
+            &header,
+            size,
+            4096,
+            KvCacheType::F16,
+            AcceleratorMemory::Unified {
+                gtt_total_gib: 24.0,
+                // Far below the model's own weights: were THIS the figure
+                // compared against, the outcome below could not be `Fits`.
+            },
+        );
+        assert_eq!(
+            shared.outcome,
+            EstimateOutcome::Fits,
+            "a readable pool is a measurement, so the estimate must be made, not declined: {:?}",
+            shared.detail
+        );
+        assert_eq!(
+            shared.available_gib,
+            Some(24.0),
+            "the estimate was compared against the carve-out, not the pool the engine allocates \
+             from"
+        );
+        assert!(
+            shared.notes.iter().any(|note| note.contains(SHARED)),
+            "a bare FITS against a shared ceiling reads as memory set aside for the model: {:?}",
+            shared.notes
+        );
+
+        // The other two states that reach this code with the same model: one
+        // with a real dedicated pool, one with no figure at all. Neither may
+        // carry the note.
+        for memory in [
+            AcceleratorMemory::Dedicated(24.0),
+            AcceleratorMemory::Unknown,
+        ] {
+            let result = estimate(&header, size, 4096, KvCacheType::F16, memory);
+            assert!(
+                !result.notes.iter().any(|note| note.contains(SHARED)),
+                "{memory:?} was told its memory is shared with the operating system: {:?}",
+                result.notes
+            );
         }
     }
 

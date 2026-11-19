@@ -22,6 +22,11 @@
 #                  both (default "release nightly")
 #   E2E_LANE_WORK  where the build and runtimes go (default /var/tmp/e2e-lane)
 #   LANE_OUT       where reported files go (default /out)
+#   E2E_EXPECT_GPU whether the lane has a GPU (default 1: every queue lane is
+#                  given one); the suite fails rather than passing with every
+#                  GPU scenario skipped. Set but empty, it leaves the lane
+#                  undeclared, which switches that check off. See
+#                  tests/e2e-cucumber/README.md.
 
 set -euo pipefail
 
@@ -39,6 +44,7 @@ if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
 fi
 
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
+export E2E_EXPECT_GPU="${E2E_EXPECT_GPU-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
 # The channels are checked before anything is built, so a typo costs nothing.
@@ -77,6 +83,32 @@ save_results() {
       echo "warning: could not copy the E2E results to ${out}/${channel}" >&2
   fi
 }
+
+# A lane that exits non-zero after this point leaves a note of how it ended in
+# `${out}/lane-status.txt`, so a failure that stops the script before the channel
+# loop, or a channel that fails, still leaves something to read. The argument and channel checks above
+# run first and write nothing. `lane.log` is the harness's, not written here.
+# The lane's status stays the one it was ending with (the trap does not exit); a
+# failed write only warns. A signal sent to the script itself writes no note:
+# bash reports no status to the trap then.
+channels_failed=""
+# shellcheck disable=SC2329 # run by the EXIT trap, which shellcheck cannot follow
+lane_end() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${rc}" -ne 0 ]]; then
+    {
+      mkdir -p "${out}" &&
+        {
+          echo "status=${rc}"
+          echo "channels_failed=${channels_failed# }"
+        } >"${out}/lane-status.txt" &&
+        sync
+    } 2>/dev/null ||
+      echo "warning: could not write ${out}/lane-status.txt" >&2
+  fi
+}
+trap lane_end EXIT
 
 # One tree on one filesystem: uv only hardlinks out of its cache into a runtime
 # on the same mount, and copies every file otherwise (see e2e-selfhosted.yml).
@@ -223,6 +255,7 @@ for channel in ${channels}; do
   run_channel "${channel}" || rc=$?
   save_results "${channel}"
   if [[ "${rc}" -ne 0 ]]; then
+    channels_failed+=" ${channel}"
     echo "channel ${channel} failed (status ${rc})" >&2
     [[ "${status}" -ne 0 ]] || status="${rc}"
   fi
