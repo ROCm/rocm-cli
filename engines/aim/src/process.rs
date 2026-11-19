@@ -185,7 +185,7 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         &request.host,
         request.port,
         device_policy,
-        &launched.gpu_indices,
+        launched.gpu_indices.as_deref(),
         engine_recipe.as_ref(),
     )?;
 
@@ -261,9 +261,15 @@ struct Launched {
     /// The GPU ordinals the container was narrowed to through
     /// `HIP_VISIBLE_DEVICES`, for [`crate::state::write_running_state`] to
     /// record so the `device:` row can name one (ROCMAI-550). Empty when no
-    /// GPU was attached, and when the container was already running — that
-    /// launch chose the ordinals and this call cannot know which.
-    gpu_indices: Vec<u32>,
+    /// GPU was attached.
+    ///
+    /// `None` when the container was already running: that launch chose the
+    /// ordinals and this call cannot know which. Distinct from `Some(vec![])`
+    /// on purpose. `write_running_state` replaces the state file whole, so an
+    /// empty list written there does not read as "unknown" — it erases the
+    /// ordinals and the GPU name the original launch recorded, and the
+    /// `device:` row stops naming a device for a server that still has one.
+    gpu_indices: Option<Vec<u32>>,
 }
 
 /// Starts the named service's container unless it is already running.
@@ -293,7 +299,9 @@ fn run_container(
                 label_name: crate::registry::local_image_metadata(&image_ref)
                     .and_then(|metadata| metadata.canonical_name),
                 keyed,
-                gpu_indices: Vec::new(),
+                // Not `Vec::new()`: see the field's doc. This call did not
+                // choose the GPUs and must not claim there were none.
+                gpu_indices: None,
             });
         }
         ContainerState::Exited(_) => crate::docker::remove(&name)?,
@@ -385,7 +393,7 @@ fn run_container(
     Ok(Launched {
         label_name: metadata.canonical_name,
         keyed,
-        gpu_indices,
+        gpu_indices: Some(gpu_indices),
     })
 }
 
@@ -443,7 +451,7 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.host,
         request.port,
         request.device_policy,
-        &launched.gpu_indices,
+        launched.gpu_indices.as_deref(),
         request.engine_recipe.as_ref(),
     )?;
 
