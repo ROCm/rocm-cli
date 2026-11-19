@@ -640,9 +640,10 @@ mod tests {
         };
 
         let install_root = root.join("install");
-        let stale_bin = install_root.join("bin");
-        fs::create_dir_all(&stale_bin).unwrap();
-        write_fake_python_reporting(&stale_bin, "python", "cp312", "Python 3.12.10").unwrap();
+        // A working cp312 venv for this very folder: it runs, has `pyvenv.cfg`
+        // and reports `install_root` as its `sys.prefix`, so the wheel tag is
+        // the one reuse check it fails.
+        plant_working_venv_python(&install_root, &install_root);
         // A venv a previous `install sdk` made: rebuilding is only allowed on
         // one ROCm CLI can show it created.
         plant_rocm_owned_venv_markers(&install_root);
