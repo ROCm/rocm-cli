@@ -1066,7 +1066,16 @@ Feature: Model serving
   # command that follows the engine's log, then it exits 0 once the endpoint
   # lists the model. The named command is run, not just read: a hint that
   # points at a command that does not work would still pass a string check.
-  @id:serve-interactive-startup-progress @requires-gpu
+  # Linux-only, like every other scenario that drives `rocm` under a PTY
+  # (dash.feature's header): portable-pty's Windows (ConPTY) path is not a
+  # validated contract of this harness. On the native-Windows GPU lane the
+  # emulated screen stayed blank for the whole 300s wait while the same serve
+  # run piped (serve-07) came up. On native Windows, whether the wait is
+  # announced (`a_wait_that_can_fail_without_a_summary_is_announced` in
+  # service_launch/start.rs) and how it decides (the `wait_for_serve_startup`
+  # tests in serve_progress.rs) run on the Windows build-and-test job; the
+  # printed wait line itself is not exercised there.
+  @id:serve-interactive-startup-progress @requires-gpu @requires-os:linux
   Scenario: serve-64 - Interactive serve shows how to follow startup and exits when the model is served
     Given a managed runtime is active
     When the user serves a model on GPU under a real terminal

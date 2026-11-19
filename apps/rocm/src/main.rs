@@ -949,8 +949,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             force_dev_binaries,
             force,
         }) => {
-            uninstall::reject_force(force.is_some())?;
-            uninstall(UninstallOptions {
+            let options = UninstallOptions {
                 yes,
                 dry_run,
                 keep_binaries,
@@ -958,7 +957,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 keep_data,
                 keep_cache,
                 force_dev_binaries,
-            })
+            };
+            uninstall::reject_force(force.is_some(), &options)?;
+            uninstall(options)
         }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();
@@ -1530,7 +1531,10 @@ pub(crate) mod tests {
 
     use super::*;
 
-    use crate::cli::PermissionsModeArg;
+    // From `cli_args`, its definition, rather than through `cli`'s re-export:
+    // the subcommand that names it now lives in `cli/subcommands.rs`, so `cli`
+    // itself no longer reaches the type.
+    use crate::cli_args::PermissionsModeArg;
     use clap::ValueEnum;
     use rocm_core::{ManagedServiceRecord, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS};
 

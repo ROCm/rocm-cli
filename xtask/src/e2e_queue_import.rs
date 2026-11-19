@@ -148,9 +148,11 @@ struct QueueLog {
 #[derive(Debug, PartialEq, Eq)]
 struct MatrixRow {
     lane: String,
-    /// The lane's phase (`Done`, `Failed`, ...), when the row had the usual shape.
+    /// The lane's phase (`Done`, `Failed`, ...), when the matrix header names a
+    /// `PHASE` column and the row has one token per header column.
     phase: Option<String>,
-    /// The lane command's exit status, or `-` when it never ran.
+    /// The lane command's exit status, or `-` when it never ran; read under the
+    /// same condition as `phase`, from the `EXIT` column.
     exit: Option<String>,
     /// Whether the queue lets this lane fail the run. Anything but `advisory` is
     /// read as blocking.
@@ -182,6 +184,30 @@ fn is_lane_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Where the columns a row is read from sit in the lane matrix, taken from the
+/// matrix's own header line: the positions of `PHASE` and `EXIT`, and how many
+/// columns the header names. The header itself and each row's lane and gate are
+/// still anchored on the first and last token (`LANE`, `GATE`).
+#[derive(Default)]
+struct Columns {
+    /// How many columns the header names; a row with another token count is not
+    /// read by position.
+    width: usize,
+    phase: Option<usize>,
+    exit: Option<usize>,
+}
+
+impl Columns {
+    fn from_header(header: &[&str]) -> Self {
+        let find = |name: &str| header.iter().position(|column| *column == name);
+        Self {
+            width: header.len(),
+            phase: find("PHASE"),
+            exit: find("EXIT"),
+        }
+    }
+}
+
 /// Read the lane matrix and the tested commit out of the run's job log.
 ///
 /// The publisher prints its report with a `| ` prefix on every line, which the
@@ -196,6 +222,7 @@ fn parse_log(log: Option<&str>) -> QueueLog {
     let Some(log) = log else { return out };
     let tested = &*TESTED;
     let mut in_matrix = false;
+    let mut columns = Columns::default();
     let mut unnamed = 0;
     for line in log.lines() {
         let line = line.trim_start_matches('\u{feff}');
@@ -215,6 +242,7 @@ fn parse_log(log: Option<&str>) -> QueueLog {
         let tokens: Vec<&str> = body.split_whitespace().collect();
         if tokens.first() == Some(&"LANE") && tokens.last() == Some(&"GATE") {
             in_matrix = true;
+            columns = Columns::from_header(&tokens);
             continue;
         }
         if !in_matrix {
@@ -242,14 +270,20 @@ fn parse_log(log: Option<&str>) -> QueueLog {
             });
             continue;
         }
-        // LANE WORKLOAD PHASE EXIT EXPORT WAITED GATE
-        let shaped = tokens.len() == 7;
-        let phase = shaped
-            .then(|| tokens[2])
+        // Only a row with one token per header column is read by position: a
+        // phase such as `Cancelled(no capacity)` holds a space, which shifts
+        // every later column, so such a row stays unknown.
+        let shaped = tokens.len() == columns.width;
+        let phase = columns
+            .phase
+            .filter(|_| shaped)
+            .map(|i| tokens[i])
             .filter(|p| p.bytes().all(|b| b.is_ascii_alphabetic()))
             .map(str::to_owned);
-        let exit = shaped
-            .then(|| tokens[3])
+        let exit = columns
+            .exit
+            .filter(|_| shaped)
+            .map(|i| tokens[i])
             .filter(|e| *e == "-" || (e.len() <= 4 && e.bytes().all(|b| b.is_ascii_digit())))
             .map(str::to_owned);
         out.lanes.push(MatrixRow {
@@ -554,6 +588,29 @@ mod tests {
 2026-11-13T03:45:26.1365895Z | mi999x       not a row after the matrix                      Failed 1 Exported 0m block
 ";
 
+    /// An abridged lane matrix of the 2026-11-19 run, whose job log gained a
+    /// `RETRIES` column ahead of `GATE`, with stand-in workload names and commit.
+    /// The `Cancelled(no capacity)` rows hold a space in their phase.
+    const LOG_WITH_RETRIES: &str = "2026-11-19T07:23:50.0900188Z | rocm-cli main at 3829cd14d86e0000000000000000000000000000
+2026-11-19T07:23:50.0900419Z |
+2026-11-19T07:23:50.0901120Z | LANE         WORKLOAD                             PHASE                  EXIT  EXPORT    WAITED  RETRIES GATE
+2026-11-19T07:23:50.0901421Z | mi300x       rocm-cli-gh-44444197890-1-mi300x     Done                   0     Exported  0m      0       block
+2026-11-19T07:23:50.0901811Z | mi325x       rocm-cli-gh-44444197890-1-mi325x     Failed                 1     Exported  0m      1       advisory
+2026-11-19T07:23:50.0902769Z | mi355x       rocm-cli-gh-44444197890-1-mi355x     Cancelled(no capacity) -     -         -       1       advisory
+2026-11-19T07:23:50.0903103Z | r9700s       rocm-cli-gh-44444197890-1-r9700s     Cancelled(no capacity) -     -         0m      1       block
+2026-11-19T07:23:50.0926119Z |
+2026-11-19T07:23:50.0930777Z | SUMMARY: 4 lane(s), 1 passed, 1 failed, 1 incomplete, 0 missing, 2 advisory
+";
+
+    fn unknown_row(lane: &str, blocking: bool) -> MatrixRow {
+        MatrixRow {
+            lane: lane.to_owned(),
+            phase: None,
+            exit: None,
+            blocking,
+        }
+    }
+
     fn row(lane: &str, phase: &str, exit: &str, blocking: bool) -> MatrixRow {
         MatrixRow {
             lane: lane.to_owned(),
@@ -580,6 +637,76 @@ mod tests {
                 row("w7900-dual", "Done", "0", false),
             ],
             "a line after the matrix is not a lane"
+        );
+    }
+
+    #[test]
+    fn a_matrix_with_a_retries_column_is_read_by_the_header() {
+        let log = parse_log(Some(LOG_WITH_RETRIES));
+        assert_eq!(
+            log.lanes,
+            vec![
+                row("mi300x", "Done", "0", true),
+                row("mi325x", "Failed", "1", false),
+                // A phase with a space shifts the columns: unknown, not misread.
+                unknown_row("mi355x", false),
+                unknown_row("r9700s", true),
+            ]
+        );
+        assert!(log.lanes[0].is_clean(), "an 8-token Done/0 row is clean");
+        assert!(!log.lanes[1].is_clean());
+        assert!(!log.lanes[2].is_clean());
+    }
+
+    #[test]
+    fn phase_and_exit_follow_the_header_wherever_it_puts_them() {
+        // A column inserted ahead of PHASE moves both columns along.
+        let inserted = "2026-11-19T07:23:50Z | LANE POOL WORKLOAD PHASE EXIT WAITED GATE\n\
+                        2026-11-19T07:23:50Z | mi300x gpu wl-mi300x Done 0 0m block\n";
+        assert_eq!(
+            parse_log(Some(inserted)).lanes,
+            vec![row("mi300x", "Done", "0", true)]
+        );
+        // So does a reordering of the two.
+        let swapped = "2026-11-19T07:23:50Z | LANE WORKLOAD EXIT PHASE GATE\n\
+                       2026-11-19T07:23:50Z | mi300x wl-mi300x 1 Failed advisory\n";
+        assert_eq!(
+            parse_log(Some(swapped)).lanes,
+            vec![row("mi300x", "Failed", "1", false)]
+        );
+    }
+
+    #[test]
+    fn a_header_without_a_phase_or_exit_column_leaves_the_lane_unknown() {
+        // No column is guessed at the place the old layout kept it.
+        for header in [
+            "LANE WORKLOAD EXIT EXPORT GATE",
+            "LANE WORKLOAD PHASE EXPORT GATE",
+        ] {
+            let log = format!(
+                "2026-11-19T07:23:50Z | {header}\n\
+                 2026-11-19T07:23:50Z | mi300x wl-mi300x Done 0 block\n"
+            );
+            let lanes = parse_log(Some(&log)).lanes;
+            assert_eq!(lanes.len(), 1, "{header}");
+            assert!(!lanes[0].is_clean(), "{header}");
+            assert!(
+                lanes[0].phase.is_none() || lanes[0].exit.is_none(),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_with_another_width_than_the_header_is_not_read_by_position() {
+        // Eight tokens under a seven-column header: indices 2 and 3 would read
+        // `Done` and `0`, which belong to a different layout than the one the
+        // header announced.
+        let wide = "2026-11-19T07:23:50Z | LANE WORKLOAD PHASE EXIT EXPORT WAITED GATE\n\
+                    2026-11-19T07:23:50Z | mi300x wl-mi300x Done 0 Exported 0m 1 block\n";
+        assert_eq!(
+            parse_log(Some(wide)).lanes,
+            vec![unknown_row("mi300x", true)]
         );
     }
 
