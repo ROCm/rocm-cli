@@ -12,7 +12,7 @@ chat.
 
 It ships as a single prebuilt binary for Linux and Windows (x86_64), needs no
 Python, Rust, or existing ROCm install, and includes inference engine
-adapters for Lemonade and vLLM.
+adapters for Lemonade, vLLM, and AIM.
 
 .. important::
 
