@@ -932,7 +932,8 @@ mod tests {
 /// under the scratch dir, and, where readiness is reached, a minimal in-process
 /// OpenAI-compatible server on loopback. `docker image inspect` is answered by
 /// the fake, so nothing here touches the network or the real data dir.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod subprocess_tests {
     use super::*;
     use crate::docker::subprocess_tests::{in_subprocess, run_with_fake_docker};

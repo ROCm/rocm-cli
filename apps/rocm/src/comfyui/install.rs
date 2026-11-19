@@ -2290,7 +2290,8 @@ mod tests {
 /// Property tests for the ComfyUI source unpack, judged on the filesystem by
 /// `crate::archive_props`. The archive is pre-placed where the installer
 /// caches it, so `download_and_extract_source` reads it instead of fetching.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod archive_properties {
     use std::fs;
     use std::path::Path;

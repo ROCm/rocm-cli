@@ -370,7 +370,10 @@ pub fn prepare_report(
     // Default-deny, and this is the branch that enforces it. A machine with no
     // readable AMD architecture has nothing confirming its hardware is on the
     // compatibility matrix, and "we could not tell" is not permission.
-    if amd.is_empty() || amd.iter().any(|gfx| gfx.is_empty()) {
+    let Some(&first_architecture) = amd.first() else {
+        return Err(Refusal::ArchitectureUnreadable);
+    };
+    if amd.iter().any(|gfx| gfx.is_empty()) {
         return Err(Refusal::ArchitectureUnreadable);
     }
     if !amd.iter().all(|gfx| is_rocm_supported(gfx)) {
@@ -381,12 +384,9 @@ pub fn prepare_report(
     // caller rather than from the machine. `entry` is checked against the
     // catalog so that a forged or mistaken id cannot carry caller-supplied
     // text onto a public tracker; `cli_version` is checked below.
-    let entry_recognised = entry.is_some_and(crate::fix::is_catalog_id);
-    let entry = if entry_recognised {
-        entry.expect("checked Some above").to_owned()
-    } else {
-        UNRECOGNISED.to_owned()
-    };
+    let recognised_entry = entry.filter(|id| crate::fix::is_catalog_id(id));
+    let entry_recognised = recognised_entry.is_some();
+    let entry = recognised_entry.unwrap_or(UNRECOGNISED).to_owned();
     // A fix cannot be offered for a cause the catalog did not establish: that
     // is a self-contradictory fact once it reaches a public tracker. Derived
     // here rather than trusted from the caller, because `prepare_report` is
@@ -403,7 +403,7 @@ pub fn prepare_report(
         // choosing what to hide; a machine holding two approved architectures
         // is rare enough that a second field would buy grouping accuracy
         // nobody needs.
-        architecture: (*amd.first().expect("checked non-empty above")).to_owned(),
+        architecture: first_architecture.to_owned(),
         architecture_matrix: APPROVED_ARCHITECTURES_SOURCE.to_owned(),
         entry,
         os_family: examination.os_family.clone(),

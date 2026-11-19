@@ -79,7 +79,9 @@ is unreadable and incompatible with everything.
   `unknown_method`, and input that is not a request envelope (including JSON
   that is not an object) gets `invalid_request`. Each of these is an answer on
   stdout. Input that is not valid UTF-8 is not read as a request: the adapter
-  exits with an error and prints no answer.
+  exits with an error and prints no answer. An answer whose payload cannot be
+  serialized is replaced by an error envelope with code
+  `response_serialization_failed`.
 - The client checks a response's version before anything else in it, `ok`
   and the shape of the rest included, whenever stdout is a single JSON object.
   An answer in a protocol it cannot use is an error that names both versions,

@@ -28,7 +28,8 @@ mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod deletion_properties;
 mod diagnose_cmd;
 mod driver_install;
