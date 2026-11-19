@@ -37,23 +37,24 @@ const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
 /// release has its own digest, so bumping the pin means recording the new pair
 /// here as well.
 const EMBEDDABLE_WINDOWS_SHA256: &str =
-    "7ff6c5d6ab612c33690411a7e53d6d0dd62eb515a073375c35015b0778a5a344";
+    "1bfa0673cc5e3a4c7ae69c0294331318eac2f200c2f525a478949000fc3070c7";
 const EMBEDDABLE_LINUX_SHA256: &str =
-    "16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90";
+    "ce6e044b8fa81040a9b0a7fdd8b41054629bdba905cb8a864fe04b0c9aa289a1";
 
 /// What the `lemond` in the pinned Linux archive needs from the host, read with
 /// `objdump -T lemond` (the newest `GLIBC_*` and `OPENSSL_*` versions listed).
 /// A host older than either is refused before download and before `lemond`
 /// starts; see [`crate::host_libraries`]. Like the digests, these belong to one
 /// release: re-read them on every bump and record that archive's digest here,
-/// which a unit test holds equal to [`EMBEDDABLE_LINUX_SHA256`]. Lemonade
-/// 2026.45.3's `lemond`, for one, needs glibc 2.43 and OpenSSL 3.2.0, which
-/// Ubuntu 24.04 does not have; that is why the pin stays at 2026.44.1
-/// (<https://github.com/lemonade-sdk/lemonade/issues/4123>).
+/// which a unit test holds equal to [`EMBEDDABLE_LINUX_SHA256`]. A release can
+/// raise them: the `lemond` of Lemonade 2026.45.3 and 2026.46.2 needs glibc 2.43
+/// and OpenSSL 3.2.0, which Ubuntu 24.04 does not have
+/// (<https://github.com/lemonade-sdk/lemonade/issues/4123>), so neither was
+/// pinned. 2026.47.1 is built on Ubuntu 24.04 again and needs what 2026.44.1 did.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const LINUX_LEMOND_NEEDS: crate::host_libraries::LemondHostNeeds =
     crate::host_libraries::LemondHostNeeds {
-        archive_sha256: "16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90",
+        archive_sha256: "ce6e044b8fa81040a9b0a7fdd8b41054629bdba905cb8a864fe04b0c9aa289a1",
         glibc: "2.38",
         openssl: "3.0.0",
     };

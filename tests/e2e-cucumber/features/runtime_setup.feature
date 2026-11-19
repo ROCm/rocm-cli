@@ -339,8 +339,12 @@ Feature: Runtime configuration
   # coverage.
   #
   # Which route a lane takes depends on its SDK. An SDK older than Lemonade's
-  # packaged pin (ROCm 7.14 against 2026.44.1's 10.1.0) is aligned, and the CLI
-  # says so; an SDK that already is the packaged pin (ROCm 10.1) needs no
+  # packaged pin (ROCm 7.14 against 2026.47.1's 10.1.0) is meant to be aligned,
+  # with the CLI saying so, but on Windows, the only OS this scenario runs on,
+  # that route fails: Lemonade's TheRock 7.14.1 download answered HTTP 404 on the
+  # 2026-11-18 nightly and the install reverted to the packaged pin. No xfail
+  # row covers it, so a Windows lane on a 7.14.x SDK fails this scenario. An
+  # SDK that already is the packaged pin (ROCm 10.1) needs no
   # alignment and gets none; a nightly SDK is never aligned and keeps the
   # packaged pin. The Then accepts each route and fails a revert, or an
   # alignment the install does not report:
@@ -348,9 +352,14 @@ Feature: Runtime configuration
   # active runtime's version. `--reinstall` re-extracts the packaged embeddable,
   # resetting `backend_versions.json` to its pinned defaults, so this does not
   # depend on what an earlier scenario left in a shared runtime tree.
-  # `expectations.toml` carries a Windows xfail row for this scenario
+  # `expectations.toml` carried a Windows xfail row for this scenario
   # (ROCMAI-899), written for Lemonade 11.5.1, which could not fetch a 7.14.x
-  # TheRock tarball; a deterministic XPASS on that lane marks the row stale.
+  # TheRock tarball. It was deleted after the 2026-11-18 Windows nightly, with
+  # Lemonade 2026.44.1 pinned, reported it as a stale XPASS: that lane's SDKs, a
+  # 10.1.0 release matching the packaged pin and a nightly, take the routes
+  # above that align nothing. Aligning to
+  # a 7.14.x SDK still fails on Windows; see the comment above the serve-06
+  # row in `expectations.toml`.
   #
   # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
   # environment and has no llama.cpp backend to align; `@nightly` for the same

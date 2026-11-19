@@ -2482,33 +2482,32 @@ flaky = true
         ));
     }
 
-    /// The two rows for the Windows Lemonade backend problems (written while 11.5.1
-    /// was pinned, kept until a nightly shows them stale) apply to native
-    /// Windows with lemonade and to nothing else: not to Linux hosts (including one whose
-    /// default engine is vLLM, where the engine named is what decides), and they are not
-    /// `flaky` (an XPASS means the cause is gone and the row is stale). Only serve-06's
-    /// row sets `serve_timeout_secs`, so the known-bad Windows serve stops waiting out the
-    /// scenario's 2400s tag.
+    /// The row for the Windows large-model Lemonade serve (written while 11.5.1 was
+    /// pinned, kept until a nightly shows it stale) applies to native Windows with
+    /// lemonade and to nothing else: not to Linux hosts (including one whose default
+    /// engine is vLLM, where the engine named is what decides), and it is not `flaky`
+    /// (an XPASS means the cause is gone and the row is stale). It sets
+    /// `serve_timeout_secs`, so the known-bad Windows serve stops waiting out the
+    /// scenario's 2400s tag. Its sibling row for runtime-16 was deleted after the
+    /// 2026-11-18 Windows nightly reported it as a stale XPASS, so runtime-16 is
+    /// expected to pass there again.
     #[test]
-    fn lemonade_alignment_rows_apply_only_to_native_windows_with_lemonade() {
+    fn lemonade_windows_serve_row_applies_only_to_native_windows_with_lemonade() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        for id in [
-            "runtime-lemonade-backend-alignment-reported",
-            "serve-large-model-inference",
-        ] {
-            assert!(m.is_xfail(id, &cap("strix-windows"), "lemonade"), "{id}");
-            for linux in ["strix-ubuntu", "mi300x", "wsl2"] {
-                assert!(!m.is_xfail(id, &cap(linux), "lemonade"), "{id} on {linux}");
-            }
-            // Same Windows host, other engine: the row is about lemonade.
-            assert!(!m.is_xfail(id, &cap("strix-windows"), "vllm"), "{id} vllm");
-            let entries = m.entries_for(id);
-            assert_eq!(entries.len(), 1, "{id}");
-            assert!(!entries[0].flaky, "{id} is deterministic");
+        let id = "serve-large-model-inference";
+        assert!(m.is_xfail(id, &cap("strix-windows"), "lemonade"), "{id}");
+        for linux in ["strix-ubuntu", "mi300x", "wsl2"] {
+            assert!(!m.is_xfail(id, &cap(linux), "lemonade"), "{id} on {linux}");
         }
-        assert_eq!(
-            m.entries_for("runtime-lemonade-backend-alignment-reported")[0].serve_timeout_secs,
-            None
+        // Same Windows host, other engine: the row is about lemonade.
+        assert!(!m.is_xfail(id, &cap("strix-windows"), "vllm"), "{id} vllm");
+        let entries = m.entries_for(id);
+        assert_eq!(entries.len(), 1, "{id}");
+        assert!(!entries[0].flaky, "{id} is deterministic");
+        assert!(
+            m.entries_for("runtime-lemonade-backend-alignment-reported")
+                .is_empty(),
+            "runtime-16 passed on the Windows nightly; an xfail row for it is stale"
         );
         // serve-06's row shortens the wait on the failing host and nowhere else: the
         // harness hands the row's window on native Windows, and still the 2400s the

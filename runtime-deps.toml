@@ -18,4 +18,4 @@
 # Lemonade embeddable release, published as
 # `lemonade-embeddable-<version>-<os-arch>.{tar.gz|zip}` under the
 # `v<version>` tag of the lemonade-sdk/lemonade GitHub releases.
-version = "2026.44.1"
+version = "2026.47.1"

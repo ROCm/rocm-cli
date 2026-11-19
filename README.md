@@ -47,9 +47,10 @@ serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
 `GLIBCXX_3.4.32`, and OpenSSL 3.0.0 or newer (`libssl.so.3`): that is what the
-Lemonade engine is linked against. Every stable Lemonade release from 11.5.1
-through 2026.44.1, the one rocm-cli pins, needs those versions; the newest,
-2026.45.3, needs glibc 2.43 and OpenSSL 3.2.0, which is why it is not pinned.
+Lemonade engine is linked against. Lemonade 2026.47.1, the release rocm-cli
+pins, needs those versions, as every stable release from 11.5.1 through
+2026.44.1 did; 2026.45.3 and 2026.46.2 needed glibc 2.43 and OpenSSL 3.2.0,
+which is why neither was pinned.
 Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides glibc
 2.39, `GLIBCXX_3.4.33` and OpenSSL 3.0.13. On an older host,
 `rocm engines install lemonade` stops before downloading anything and says what

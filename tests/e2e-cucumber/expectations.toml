@@ -244,53 +244,44 @@ reason = "Lemonade managed serve never exposes the model: observed backend argum
 serve_timeout_secs = 90
 flaky = true
 
-# --- Lemonade 11.5.1 could not align its llama.cpp backend to a ROCm 7.14.x SDK ---
+# --- Windows large-model Lemonade serve (serve-06) ---
 # `rocm engines install lemonade` tries to align Lemonade's `llamacpp:rocm`
-# backend with the active ROCm SDK. Lemonade 11.5.1, which `runtime-deps.toml`
-# pinned when these rows were written, downloads the TheRock tarball it pairs with the backend
-# only from https://repo.amd.com/rocm/tarball/, a path the 7.14.x tarballs are not
-# published to (AMD's 7.14 install guide uses /rocm/tarball-multi-arch/), so the
-# download answers HTTP 403 for `therock-dist-<os>-<family>-7.14.1.tar.gz`. The
-# pinned llama.cpp build has no ROCm 7.14 asset either (HTTP 404), so every tier
-# of the alignment fails and the CLI reverts to Lemonade's pinned ROCm 7.13
-# backend. Reproduced on a Strix Halo Linux box with an isolated root, not only on
-# the CI runners, so the failed alignment is not specific to Windows; the scenarios
-# below only fail there (runtime-16 is `@requires-os:windows`, and serve-06 passed on
-# the W7900 and MI300X lanes of the 2026-11-05 run).
+# backend with the active ROCm SDK. Lemonade 11.5.1, pinned when this row was
+# written, downloaded the TheRock tarball it pairs with the backend only from
+# https://repo.amd.com/rocm/tarball/, where the 7.14.x tarballs are not published
+# (HTTP 403), and its llama.cpp build had no ROCm 7.14 asset (HTTP 404), so every
+# tier of the alignment failed and the CLI reverted to the pinned ROCm 7.13
+# backend. That broke two Windows scenarios (runtime-16 is `@requires-os:windows`,
+# and serve-06 passed on the W7900 and MI300X lanes of the 2026-11-05 run). serve-06
+# serves a 35B model and the engine fails on its own after the launch reports
+# success: `rocm serve` exits 0, `/v1/models` never lists the model within the wait
+# (the failing step is the serve step, not the chat request), and the lane's
+# service log shows an access violation in the SDK's Tensile library. Both
+# scenarios failed on each Windows lane run examined (2026-10-28, 2026-11-05 and
+# 2026-11-06), so the row is not `flaky`: an XPASS means the cause is gone and the
+# row should be deleted. It sets `serve_timeout_secs`: a row's wait wins over the
+# scenario's own `@serve-timeout:2400` tag, and the failing serve never became
+# ready within that window on the Windows lane (2026-10-27 and 2026-11-10 runs),
+# holding the lane for about 41 minutes per channel. 600s is the step default, so
+# the scenario still gets a normal load; if the cause is fixed, delete the row and
+# the tag's 2400s applies again.
 #
-# runtime-16 asserts the alignment succeeded, which it cannot while the 7.14.x
-# tarball is unreachable. serve-06 serves a 35B model through the Windows lane's
-# 7.13 backend against the SDK's 7.14.1 libraries and the engine fails on its own
-# after the launch reports success: `rocm serve` exits 0, `/v1/models` never lists
-# the model within the wait (the failing step is the serve step, not the chat
-# request), and the lane's service log shows an access violation in the SDK's
-# Tensile library. The mismatch between the backend and the SDK is the suspected
-# cause; it has NOT been reproduced off Windows, so the row names both facts.
-# Both rows are deterministic (both scenarios failed on each Windows lane run
-# examined: 2026-10-28, 2026-11-05 and 2026-11-06), so neither is `flaky`: an
-# XPASS means the cause is gone and the row should be deleted. Only serve-06's row
-# sets `serve_timeout_secs`: a row's wait wins over the scenario's own
-# `@serve-timeout:2400` tag, and the failing serve never became ready within that
-# window on the Windows lane (2026-10-27 and 2026-11-10 runs), holding the lane for
-# about 41 minutes per channel. 600s is the step default, so the scenario still gets
-# a normal load; if the cause is fixed, delete the row and the tag's 2400s applies
-# again.
-#
-# The pin is now Lemonade 2026.44.1, which fetches TheRock from AMD's whl-next
-# wheel index or its core tarball location, and whose pinned llama.cpp build
-# (b11580) ships a ROCm 7.14 archive. So both rows may now XPASS. That has not
-# been observed yet: both scenarios are `@nightly`, which pull-request lanes do
-# not run. A stale XPASS on the first Windows nightly run after the 2026.44.1 pin
-# lands means the cause is gone, and the row is deleted then, in a follow-up by
-# the author of the 2026.44.1 pin. ROCMAI-899 is already closed; the row stays
-# until that nightly shows the XPASS.
-[["runtime-lemonade-backend-alignment-reported"]]
-when = { effective_engine = "lemonade", os = "windows" }
-bug = "ROCMAI-899"
-reason = "Observed with Lemonade 11.5.1, which fetched TheRock only from repo.amd.com/rocm/tarball/, where 7.14.x is not published (HTTP 403), so its backend could not be aligned to a 7.14.x SDK and the install reverted to the pinned 7.13 backend. Not yet re-checked with the 2026.44.1 pin, which fetches TheRock elsewhere; delete this row if the Windows nightly lane reports it as a stale XPASS."
-
+# On the 2026-11-18 Windows nightly, the first with Lemonade 2026.44.1 pinned,
+# both Windows E2E jobs failed on a stale XPASS of runtime-16's row (ROCMAI-899),
+# which is deleted. runtime-16 passes only where the active SDK already is
+# Lemonade's packaged TheRock pin (10.1.0) or is a nightly, since neither route
+# aligns anything (`assert_lemonade_backend_paired_with_active_sdk`), and the
+# two jobs' serve scenarios ran on a 10.1.0 release SDK and a 10.1.0 nightly
+# SDK. Aligning to a 7.14.x SDK
+# still fails on Windows: in the release job the 7.14.1 TheRock tarball answered
+# HTTP 404 from stable.repo.amd.com/rocm/core/tarball/ and the install reverted
+# to the packaged pin. The current pin, 2026.47.1, keeps TheRock 10.1.0, so
+# runtime-16 takes the same route. serve-06 still failed in both jobs, with the
+# model never served and Tensile frames in the service log, on those 10.1.0 SDKs
+# with Lemonade's packaged backend (TheRock 10.1.0, `rocm-stable` b11580), so a
+# mismatch between the backend and the SDK does not explain that failure.
 [["serve-large-model-inference"]]
 when = { effective_engine = "lemonade", os = "windows" }
 bug = "ROCMAI-900"
-reason = "The Windows large-model serve never exposed the model while Lemonade 11.5.1 was pinned (the launch exited 0, then the engine failed on its own; the service log showed a crash in the SDK's Tensile library): its ROCm 7.13 backend ran against the 7.14.1 SDK because 11.5.1 could not align it (suspected cause, not reproduced off Windows). Not yet re-checked with the 2026.44.1 pin; delete this row if the Windows nightly lane reports it as a stale XPASS."
+reason = "The Windows large-model serve never exposes the model: the launch exits 0, then the engine fails on its own and the service log shows a crash in the SDK's Tensile library. First seen with Lemonade 11.5.1, whose ROCm 7.13 backend ran against a 7.14.1 SDK; with Lemonade 2026.44.1 on the 2026-11-18 Windows nightly it failed the same way on a 10.1.0 SDK with the packaged backend, so a backend/SDK mismatch does not explain it. Not reproduced off Windows; delete this row if the Windows nightly lane reports it as a stale XPASS."
 serve_timeout_secs = 600
