@@ -1659,6 +1659,80 @@ mod tests {
         Ok(())
     }
 
+    /// The lock-ordering argument in `publish_anthropic_endpoint`'s doc comment,
+    /// raced rather than asserted sequentially.
+    ///
+    /// Both existing tests drive publish-then-rewrite on one thread, so they
+    /// only cover the interleaving where the note is already taken when
+    /// `carry_published_anthropic_endpoint` reads it. The dangerous one is the
+    /// other: a publisher that notes *after* the carry has already run. This
+    /// parks a whole-file writer at `before_publish` -- past the carry, still
+    /// holding the file lock -- and only then lets the publisher go, so the
+    /// note lands in exactly that window every run rather than by timing luck.
+    ///
+    /// The endpoint must reach the file either way: carried by the rewrite if
+    /// it was noted first, or merged by the publisher afterwards if it was
+    /// not. What must never happen is the rewrite winning and the endpoint
+    /// being gone, which is the `anthropic endpoint:` row never coming back.
+    ///
+    /// Also pins that the two locks are not taken in both orders: the
+    /// publisher takes the in-memory note and releases it before asking for
+    /// the file lock, so parking a writer that holds the file lock cannot
+    /// deadlock it. A regression to "note held across the file lock" hangs
+    /// this test rather than failing it, which the harness reports as a
+    /// timeout.
+    #[test]
+    fn a_publication_landing_after_the_carry_still_reaches_the_file() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-anthropic-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let state_path = dir.join("state.json");
+        write_json_state_file(&state_path, &serde_json::json!({ "status": "starting" }))?;
+
+        // Released once the writer is parked past its carry, with the lock held.
+        let carried = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = std::sync::Arc::clone(&carried);
+        let writer_path = state_path.clone();
+        let writer = std::thread::spawn(move || {
+            write_json_state_file_with(
+                &writer_path,
+                &serde_json::json!({ "status": "running", "server_pid": 7 }),
+                || {
+                    writer_barrier.wait();
+                },
+            )
+        });
+
+        carried.wait();
+        // The writer has read the (empty) note and is holding the file lock.
+        // This publication therefore cannot be carried; it has to land on its
+        // own once the lock is free.
+        crate::publish_anthropic_endpoint(
+            &state_path,
+            "http://127.0.0.1:41999",
+            crate::AnthropicEndpointMode::Proxy,
+        )?;
+        writer.join().expect("writer thread panicked")?;
+
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(
+            state[crate::ANTHROPIC_ENDPOINT_URL_STATE_KEY],
+            "http://127.0.0.1:41999",
+            "a publication racing a whole-file rewrite must survive it, whichever \
+             order they land in: {state}"
+        );
+        assert_eq!(state[crate::ANTHROPIC_ENDPOINT_MODE_STATE_KEY], "proxy");
+        // And the rewrite's own document is still there, so the endpoint did
+        // not survive by the rewrite having been lost instead.
+        assert_eq!(state["status"], "running", "{state}");
+        assert_eq!(state["server_pid"], 7, "{state}");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// The regression for the lost `server_pid`: writers in this process and
     /// in two child processes (this test binary run again) each merge their
     /// own keys into one state file while a reader that takes no lock reads it
