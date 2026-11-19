@@ -12784,6 +12784,54 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn a_failing_lane_leaves_a_note_of_how_it_ended_beside_its_results() {
+        // The suite fails on both channels: each keeps its results, and the
+        // note names the status and both channels.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            suite_rc: 3,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 3, "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+        assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note"),
+            "status=3\nchannels_failed=release nightly\n",
+            "{log}"
+        );
+
+        // A lane that stops before any channel runs still leaves the note.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(1),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        let note = std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note");
+        assert!(note.starts_with(&format!("status={rc}\n")), "{note}");
+
+        // A lane that passes writes none.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase::default());
+        assert_eq!(rc, 0, "{log}");
+        assert!(!out.join("lane-status.txt").exists(), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_lane_runs_only_the_channels_it_is_asked_for_and_refuses_others() {
         let LaneRun {
             rc,
@@ -12955,7 +13003,7 @@ esac
             !log.contains("cargo"),
             "nothing is built after apt-get gave up:\n{log}"
         );
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// `apt-get install` fails on a dropped connection or a pool that moved
@@ -12992,7 +13040,7 @@ esac
             !log.contains("cargo"),
             "nothing is built after apt-get gave up:\n{log}"
         );
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// The rustup-init download is retried, and only the download: a file that
@@ -13083,7 +13131,7 @@ esac
                 "{log}"
             );
             assert!(!log.contains("cargo build"), "{log}");
-            assert!(!out.exists());
+            assert!(!out.join("release").exists());
         }
     }
 
@@ -13108,7 +13156,7 @@ esac
         );
         assert!(!log.contains("cargo fetch"), "{log}");
         assert!(!log.contains("cargo build"), "{log}");
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// The fetch covers only the host's crates, so a build target set from
@@ -13129,7 +13177,7 @@ esac
         assert_eq!(rc, 1, "{log}");
         assert!(log.contains("CARGO_BUILD_TARGET is set"), "{log}");
         assert!(!log.contains("cargo fetch"), "{log}");
-        assert!(!out.exists());
+        assert!(!out.exists(), "{log}");
 
         let LaneRun { rc, log, .. } = run_lane(&LaneCase {
             machine: "aarch64",
