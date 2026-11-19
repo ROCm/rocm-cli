@@ -108,7 +108,7 @@ The Markdown-links hook (`lychee`) runs on every commit, over the whole reposito
 cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
 ```
 
-The PowerShell hook (`powershell-script-analyzer`) lints `.ps1` files with PSScriptAnalyzer through `cargo xtask powershell-lint`. It skips with a message on a non-Windows host, and on Windows when no PowerShell is found or the one it picks (`pwsh`, else `powershell`) lacks the PSScriptAnalyzer module. The `powershell-lint` CI job is the gate. To lint locally on Windows, install the module with `Install-Module PSScriptAnalyzer -Scope CurrentUser`; `cargo xtask powershell-lint --shell pwsh` forces a run on another host, where PowerShell Core can report edition-specific differences that do not match CI.
+The PowerShell hook (`powershell-script-analyzer`) lints `.ps1` files with PSScriptAnalyzer through `cargo xtask powershell-lint`. It skips on a non-Windows host, and on Windows when no PowerShell is found or the one it picks (`pwsh`, else `powershell`) lacks the PSScriptAnalyzer module. The hook is not `verbose`, so under `prek` the skip is silent; `cargo xtask powershell-lint` run directly prints why it skipped. The `powershell-lint` CI job is the gate. To lint locally on Windows, install the module with `Install-Module PSScriptAnalyzer -Scope CurrentUser`; `cargo xtask powershell-lint --shell pwsh` forces a run on another host, where PowerShell Core can report edition-specific differences that do not match CI.
 
 ### Workspace layout
 
