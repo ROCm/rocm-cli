@@ -233,6 +233,16 @@ fn settle_exited_service(
         }
         return deliberate;
     }
+    // A whole-record write, not the `merge_json_state_file` the branch above
+    // uses, and deliberately so: reaching here means `refresh_from_engine_state`
+    // adopted fields from the engine state file (`engine_pid`,
+    // `engine_start_ticks`, `served_model_id`) alongside the status verdict, and
+    // merging only `status` would drop them. The clobber window the other branch
+    // guards against is the *opposite* case — nothing new learned, so writing the
+    // stale snapshot back could only overwrite a concurrent writer. This is the
+    // codebase's established convention for `ManagedServiceRecord`
+    // (`stop_internal_managed_service_confirmed_with` does the same), so the
+    // window here is the pre-existing one rather than a new hazard.
     let _ = latest.write();
     deliberate
 }

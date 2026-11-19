@@ -490,8 +490,9 @@ fn restart_launch_lock_timeout() -> Duration {
 }
 
 /// Replaces the child `spawn()` of a restart (non-Windows only; Windows spawns
-/// through `rocm_core::spawn_detached_no_inherit`). Test-only seam, so a test
-/// can observe the leased port at the exact instant production would spawn.
+/// through `rocm_core::spawn_detached_with_log`, which is what puts the
+/// restarted child's stdout/stderr into the service log). Test-only seam, so a
+/// test can observe the leased port at the exact instant production would spawn.
 type RestartSpawnOverride<'a> =
     dyn Fn(&mut std::process::Command) -> io::Result<std::process::Child> + 'a;
 
