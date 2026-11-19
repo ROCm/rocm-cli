@@ -87,7 +87,7 @@ pub fn next_speed(current: f64) -> f64 {
             return s;
         }
     }
-    *SPEED_STEPS.last().unwrap()
+    SPEED_STEPS.last().copied().unwrap_or(current)
 }
 
 pub fn prev_speed(current: f64) -> f64 {
@@ -155,11 +155,11 @@ async fn run(
         daemon_version: format!("replay/v{PROTOCOL_VERSION}"),
     });
 
-    if entries.is_empty() {
+    let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
         return Ok(());
-    }
-    let first_ts_us = entries.first().unwrap().ts_us;
-    let last_ts_us = entries.last().unwrap().ts_us;
+    };
+    let first_ts_us = first.ts_us;
+    let last_ts_us = last.ts_us;
     let total_s = last_ts_us.saturating_sub(first_ts_us) / 1_000_000;
 
     let mut paused = false;
@@ -167,7 +167,7 @@ async fn run(
     let mut last_emit = tokio::time::Instant::now();
 
     // Emit the first event immediately so the UI lights up.
-    emit_at(tx, &entries[0], first_ts_us, total_s);
+    emit_at(tx, first, first_ts_us, total_s);
     let mut cursor: usize = 1;
 
     while cursor < entries.len() {
@@ -303,7 +303,7 @@ fn do_jump(
     // Anchor: where are we now in recording time?
     let now_idx = (*cursor).min(entries.len().saturating_sub(1));
     let now_ts = entries[now_idx].ts_us;
-    let last_ts = entries.last().unwrap().ts_us;
+    let last_ts = entries.last().map_or(now_ts, |e| e.ts_us);
 
     let target_ts_us = if delta_s >= 0 {
         now_ts.saturating_add((delta_s as u64).saturating_mul(1_000_000))

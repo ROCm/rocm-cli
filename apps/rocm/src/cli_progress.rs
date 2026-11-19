@@ -27,7 +27,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -321,12 +321,12 @@ impl AnimatedSpinner {
             spinner.enabled = enabled;
         }
         let inner = Arc::new(Mutex::new(spinner));
-        inner.lock().unwrap().tick();
+        lock_spinner(&inner).tick();
         let stop = Arc::new(AtomicBool::new(false));
         // A ticker thread only exists to keep repainting an already-visible
         // spinner; when stderr isn't a TTY every repaint it would trigger is
         // a no-op, so skip holding an OS thread open for the whole download.
-        let ticker = if inner.lock().unwrap().enabled {
+        let ticker = if lock_spinner(&inner).enabled {
             let inner = Arc::clone(&inner);
             let stop = Arc::clone(&stop);
             Some(thread::spawn(move || {
@@ -335,7 +335,7 @@ impl AnimatedSpinner {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    inner.lock().unwrap().tick();
+                    lock_spinner(&inner).tick();
                 }
             }))
         } else {
@@ -350,11 +350,15 @@ impl AnimatedSpinner {
 
     /// Repaint with a byte-progress label. See [`Spinner::set_progress`].
     pub(crate) fn set_progress(&self, prefix: &str, bytes: u64, total: Option<u64>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .set_progress(prefix, bytes, total);
+        lock_spinner(&self.inner).set_progress(prefix, bytes, total);
     }
+}
+
+/// The shared spinner, recovered if a thread panicked while holding it: the
+/// spinner only paints progress, so a poisoned lock must not turn into a
+/// second panic in the download it is decorating, or in `Drop`.
+fn lock_spinner(inner: &Mutex<Spinner>) -> MutexGuard<'_, Spinner> {
+    inner.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Drop for AnimatedSpinner {
@@ -363,7 +367,7 @@ impl Drop for AnimatedSpinner {
         if let Some(ticker) = self.ticker.take() {
             let _ = ticker.join();
         }
-        self.inner.lock().unwrap().clear();
+        lock_spinner(&self.inner).clear();
     }
 }
 
@@ -652,5 +656,26 @@ mod tests {
             spinner.ticker.is_none(),
             "no ticker thread should be spawned when stderr isn't a TTY"
         );
+    }
+
+    #[test]
+    fn animated_spinner_keeps_working_after_its_lock_is_poisoned() {
+        let spinner = AnimatedSpinner::start_with_interval_enabled(
+            "Downloading…",
+            Duration::from_millis(5),
+            false,
+        );
+        let inner = Arc::clone(&spinner.inner);
+        let poisoner = thread::spawn(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("poison the spinner lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(spinner.inner.is_poisoned());
+
+        spinner.set_progress("Downloading", 7, Some(7));
+        assert_eq!(lock_spinner(&spinner.inner).max_progress_bytes, 7);
+        // Drop clears the line through the same lock; it must not panic.
+        drop(spinner);
     }
 }

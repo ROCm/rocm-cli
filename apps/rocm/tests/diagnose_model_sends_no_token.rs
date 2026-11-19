@@ -8,6 +8,12 @@
 //! command's environment, the listing, the `HEAD` and the range requests that
 //! reach a stand-in hub carry no `Authorization` and no `Cookie` header.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};

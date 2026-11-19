@@ -32,6 +32,12 @@
 //!
 //! A Rust binary rather than a shell script so the scenarios run on Windows too.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only stand-in for `gh` in the e2e scenarios, never shipped: a stub setup failure should abort the scenario loudly"
+)]
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 

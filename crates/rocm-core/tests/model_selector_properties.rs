@@ -13,6 +13,12 @@
 //! never panic and must not report a *different* model as the one the user
 //! asked for.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 #[path = "common/loopback.rs"]
 mod loopback;
 #[path = "common/proptest_cases.rs"]

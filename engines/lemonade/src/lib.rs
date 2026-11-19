@@ -562,7 +562,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     let serve_request = launch_serve_request(&request, &state_path, &log_path);
     let current_exe =
         std::env::current_exe().context("failed to discover current Lemonade engine binary")?;
-    let args = crate::process::serve_http_command_args(&serve_request);
+    let args = crate::process::serve_http_command_args(&serve_request)?;
     crate::state::write_running_state(
         &serve_request,
         &runtime,
@@ -1046,7 +1046,7 @@ mod tests {
             );
             assert_eq!(serve.model_ref, resolved.canonical_model_id, "{requested}");
             // The wrapper process is started with that same identity.
-            let args = crate::process::serve_http_command_args(&serve);
+            let args = crate::process::serve_http_command_args(&serve).unwrap();
             assert_eq!(args[2], reported, "{args:?}");
         }
     }
