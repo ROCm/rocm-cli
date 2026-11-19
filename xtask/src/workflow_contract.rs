@@ -6052,6 +6052,77 @@ fi
         );
     }
 
+    /// The queue-results fetch is bounded by its step's `timeout-minutes`, and
+    /// the cap has to outlast the retries the step allows itself: one job's log
+    /// read is up to `attempts x --max-time` plus a `sleep` after each failed
+    /// attempt. A 5-minute cap sat below that (about 6.3 minutes), so a slow
+    /// storage hop cut the step off mid-retry, the queue lanes were missing from
+    /// the consolidated report and the wiki, and the retries never got to finish.
+    /// The budget is read from the script, so changing a retry count, a
+    /// `--max-time` or a `sleep` re-checks the cap.
+    #[test]
+    fn nightly_queue_fetch_timeout_outlasts_one_jobs_retry_budget() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "e2e-report-nightly");
+        let steps = job_steps(job).expect("the report job has steps");
+        let (_, step) = steps
+            .iter()
+            .find(|(name, _)| name.starts_with("Fetch the latest queue results"))
+            .expect("e2e-report-nightly has a `Fetch the latest queue results` step");
+        // Code only: a comment that names `--max-time` or `sleep` is not the budget.
+        let script = normalized_whitespace(
+            &step
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // The number that follows `marker`, which must be present.
+        let number_after = |marker: &str| -> u64 {
+            let (_, rest) = script
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("the fetch step must contain `{marker}`:\n{script}"));
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("a number must follow `{marker}`:\n{script}"))
+        };
+        let attempts = script
+            .split_once("for attempt in ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(list, _)| list.split_whitespace().count() as u64)
+            .expect("the job-log read loops over its attempts");
+        let max_time = number_after("--max-time ");
+        let pause = number_after("sleep ");
+        // The pause follows every failed attempt, the last one included.
+        let one_job_worst_case = attempts * (max_time + pause);
+
+        let cap = step_key(step, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the fetch step has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap >= one_job_worst_case * 5 / 4,
+            "the queue fetch step is capped at {cap}s, but reading one job's log can take \
+             {one_job_worst_case}s ({attempts} attempts x ({max_time}s + {pause}s)); the cap \
+             must cover that with a quarter to spare or a slow fetch is cut off mid-retry and \
+             the queue lanes go missing from the report"
+        );
+        // ...and leaves the job's own cap room for the steps after it: a fetch that
+        // used all of its time must not push the report and the wiki publish past
+        // the job's timeout, which would lose them for the sake of the queue lanes.
+        let job_cap = job_scalar(job, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the report job has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap + 5 * 60 <= job_cap,
+            "the queue fetch step ({cap}s) must leave the report job ({job_cap}s) at least five \
+             minutes for the steps after it"
+        );
+    }
+
     #[test]
     fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
         let nightly = read_workflow("nightly.yml");
