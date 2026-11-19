@@ -332,7 +332,14 @@ async fn ensure_serve_port_free() -> String {
     // Vulkan (EAI-7052) and starves the vLLM serve under test; no scenario needs it.
     kill_listeners_on_port(SERVE_PORT);
     kill_listeners_on_port(ASSISTANT_PORT);
-    let deadline = Instant::now() + Duration::from_mins(1);
+    // Longer than Linux's 60 s TIME_WAIT: a server that closed a connection
+    // first and was then killed leaves a TIME_WAIT socket on the port with no
+    // process behind it. It refuses connects (so the old connect-only check
+    // called the port free), fails every `bind` until it expires, and is
+    // invisible to `fuser`/`lsof`. Observed with both Lemonade 2026.44.1 and
+    // 2026.45.3's `lemond` (bind after SIGKILL failed with EADDRINUSE even with
+    // SO_REUSEADDR). `ss -tan` shows it, which the timeout note below prints.
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut port_note = String::new();
     loop {
         // A refused connect only proves nothing listens; a socket that is
@@ -348,7 +355,7 @@ async fn ensure_serve_port_free() -> String {
         }
         if Instant::now() >= deadline {
             port_note = format!(
-                "port {SERVE_PORT} still unavailable after 60 s (connect refused: {refused}, bind: {bindable:?})\n{}",
+                "port {SERVE_PORT} still unavailable after 90 s (connect refused: {refused}, bind: {bindable:?})\n{}",
                 e2e_cucumber::serve_log::port_holders(SERVE_PORT)
             );
             eprintln!("{port_note}");
