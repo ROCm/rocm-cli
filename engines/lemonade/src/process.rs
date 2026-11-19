@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::device_policy::device_policy_name;
 use crate::install::LemonadeInstallManifest;
+use crate::recipe::ModelRecipe;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
 use crate::state::{MAX_TAIL_READ, parse_http_endpoint, resolve_lemonade_model_ref};
 use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
@@ -520,10 +521,33 @@ pub(crate) fn run_lemonade_backend_install(
     process_env: &LemonadeProcessEnvironment,
     parent: &ParentRuntimeEnvironment,
 ) -> Result<()> {
+    run_lemonade_recipe_backend_install(
+        manifest,
+        host,
+        port,
+        LLAMACPP_RECIPE,
+        backend,
+        process_env,
+        parent,
+    )
+}
+
+/// Install `recipe:backend` through the `lemonade` CLI: a llama.cpp build, or a
+/// container backend's image (Gufo).
+pub(crate) fn run_lemonade_recipe_backend_install(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    recipe: &str,
+    backend: &str,
+    process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<()> {
     let mut command = backend_install_command(
         manifest,
         host,
         port,
+        recipe,
         backend,
         process_env,
         parent,
@@ -550,6 +574,7 @@ fn backend_install_command(
     manifest: &LemonadeInstallManifest,
     host: &str,
     port: u16,
+    recipe: &str,
     backend: &str,
     process_env: &LemonadeProcessEnvironment,
     parent: &ParentRuntimeEnvironment,
@@ -564,7 +589,7 @@ fn backend_install_command(
         .arg(port.to_string())
         .arg("backends")
         .arg("install")
-        .arg(format!("{LLAMACPP_RECIPE}:{backend}"))
+        .arg(format!("{recipe}:{backend}"))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -638,6 +663,7 @@ pub(crate) fn run_lemonade_model_load_with_parent(
     host: &str,
     port: u16,
     model_ref: &str,
+    recipe: ModelRecipe,
     backend: &str,
     engine_recipe: Option<&EngineRecipeHint>,
     log_path: Option<&Path>,
@@ -650,6 +676,7 @@ pub(crate) fn run_lemonade_model_load_with_parent(
             host,
             port,
             model_ref,
+            recipe,
             backend,
             engine_recipe,
         ))
@@ -685,6 +712,7 @@ pub(crate) fn run_lemonade_model_load_with_parent(
 pub(crate) fn models_payload_has_ready_model(
     value: &Value,
     model_ref: &str,
+    recipe: ModelRecipe,
     backend: &str,
 ) -> bool {
     value
@@ -697,15 +725,19 @@ pub(crate) fn models_payload_has_ready_model(
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(Value::as_str))
                     .any(|loaded| model_names_match(loaded, model_ref));
-                name_matches && model_reports_ready_backend(model, backend)
+                name_matches && model_reports_ready_backend(model, recipe, backend)
             })
         })
 }
 
 /// A `/v1/models` entry is servable on GPU when it carries no `recipe_options` (a stock
 /// `llama-server` direct-serve entry — GPU-only by construction) or its reported
-/// `llamacpp_backend` matches the expected backend.
-fn model_reports_ready_backend(model: &Value, backend: &str) -> bool {
+/// `llamacpp_backend` matches the expected backend. A Gufo serve has no direct-serve
+/// entry, so it must match [`gufo_entry_loaded_on_gpu`].
+fn model_reports_ready_backend(model: &Value, recipe: ModelRecipe, backend: &str) -> bool {
+    if recipe == ModelRecipe::Gufo {
+        return gufo_entry_loaded_on_gpu(model);
+    }
     match model.get("recipe_options") {
         None => true,
         Some(options) => options
@@ -715,10 +747,37 @@ fn model_reports_ready_backend(model: &Value, backend: &str) -> bool {
     }
 }
 
+/// Whether a loaded-model entry is a Gufo load on the GPU.
+///
+/// Gufo's one backend runs only on the GPU, so the entry carries no backend name
+/// to check; the recipe has to say `gufo`, and a `device`, when Lemonade reports
+/// one, has to say `gpu`. A registered model never loaded carries no
+/// `recipe_options`, or an empty object, and is not loaded; on `/v1/models` one
+/// loaded once may still carry its saved options, so only `/health` says it is
+/// loaded now. `rocm serve`'s readiness gate in `apps/rocm`
+/// calls this too, through the crate root, so the two cannot disagree.
+pub fn gufo_entry_loaded_on_gpu(model: &Value) -> bool {
+    let recipe_is_gufo =
+        model.get("recipe").and_then(Value::as_str) == Some(crate::recipe::GUFO_RECIPE);
+    let on_gpu = model
+        .get("device")
+        .and_then(Value::as_str)
+        .is_none_or(|device| device.eq_ignore_ascii_case("gpu"));
+    let loaded = model
+        .get("recipe_options")
+        .and_then(Value::as_object)
+        .is_some_and(|options| !options.is_empty());
+    recipe_is_gufo && on_gpu && loaded
+}
+
+/// The `lemonade load` arguments. A llama.cpp load names its backend and passes
+/// the catalog's llama-server flags; a Gufo load names neither, because the Gufo
+/// recipe has one backend and the catalog's flags are llama-server flags.
 fn lemonade_model_load_args(
     host: &str,
     port: u16,
     model_ref: &str,
+    recipe: ModelRecipe,
     backend: &str,
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Vec<String> {
@@ -729,10 +788,16 @@ fn lemonade_model_load_args(
         port.to_string(),
         "load".to_owned(),
         model_ref.to_owned(),
+    ];
+    if recipe == ModelRecipe::Gufo {
+        args.push("--save-options".to_owned());
+        return args;
+    }
+    args.extend([
         "--llamacpp".to_owned(),
         backend.to_owned(),
         "--save-options".to_owned(),
-    ];
+    ]);
     if let Some(engine_recipe) = engine_recipe.filter(|recipe| !recipe.required_flags.is_empty()) {
         args.extend([
             "--llamacpp-args".to_owned(),
@@ -758,6 +823,7 @@ fn query_health_json(host: &str, port: u16) -> Result<Value> {
 pub(crate) fn query_loaded_model_endpoint(
     endpoint_url: &str,
     model_ref: &str,
+    recipe: ModelRecipe,
     backend: &str,
 ) -> Result<bool> {
     let (host, port) = parse_http_endpoint(endpoint_url)
@@ -767,7 +833,7 @@ pub(crate) fn query_loaded_model_endpoint(
     // advertises the model in `/v1/models`; fall back to that (name + backend) so both
     // serving modes are recognized as ready.
     if let Ok(health) = query_health_json(&host, port)
-        && health_has_loaded_model(&health, model_ref, backend)
+        && health_has_loaded_model(&health, model_ref, recipe, backend)
     {
         return Ok(true);
     }
@@ -782,7 +848,9 @@ pub(crate) fn query_loaded_model_endpoint(
     .with_context(|| format!("failed to query Lemonade models at {endpoint}/v1/models"))?;
     let models =
         serde_json::from_str::<Value>(&body).context("failed to parse Lemonade /v1/models JSON")?;
-    Ok(models_payload_has_ready_model(&models, model_ref, backend))
+    Ok(models_payload_has_ready_model(
+        &models, model_ref, recipe, backend,
+    ))
 }
 
 /// Post-load smoke test: the freshly loaded model must actually complete a chat
@@ -799,7 +867,12 @@ pub(crate) fn query_chat_smoke_endpoint(host: &str, port: u16, model_ref: &str) 
     Ok(status == 200)
 }
 
-fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bool {
+fn health_has_loaded_model(
+    health: &Value,
+    model_ref: &str,
+    recipe: ModelRecipe,
+    backend: &str,
+) -> bool {
     let model_ref = model_ref.trim();
     if model_ref.is_empty() {
         return false;
@@ -814,11 +887,14 @@ fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bo
                 .into_iter()
                 .filter_map(|field| model.get(field).and_then(Value::as_str))
                 .any(|loaded| model_names_match(loaded, model_ref));
-            let backend_matches = model
-                .get("recipe_options")
-                .and_then(|options| options.get("llamacpp_backend"))
-                .and_then(Value::as_str)
-                .is_some_and(|loaded| lemonade_backend_matches(loaded, backend));
+            let backend_matches = match recipe {
+                ModelRecipe::Gufo => gufo_entry_loaded_on_gpu(model),
+                ModelRecipe::LlamaCpp => model
+                    .get("recipe_options")
+                    .and_then(|options| options.get("llamacpp_backend"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|loaded| lemonade_backend_matches(loaded, backend)),
+            };
             name_matches && backend_matches
         })
 }
@@ -1079,6 +1155,7 @@ mod tests {
             &test_manifest(),
             "127.0.0.1",
             8123,
+            LLAMACPP_RECIPE,
             "rocm",
             &LemonadeProcessEnvironment::default(),
             &parent,
@@ -1154,6 +1231,7 @@ mod tests {
             "127.0.0.1",
             11435,
             "Qwen3-0.6B-GGUF",
+            ModelRecipe::LlamaCpp,
             "vulkan",
             None,
             Some(&log),
@@ -1313,6 +1391,7 @@ helper line
         assert!(models_payload_has_ready_model(
             &direct,
             "LiquidAI/LFM2.5-230M-GGUF:Q4_0",
+            ModelRecipe::LlamaCpp,
             "vulkan"
         ));
         // Router entry loaded on the matching backend → ready.
@@ -1323,6 +1402,7 @@ helper line
         assert!(models_payload_has_ready_model(
             &loaded,
             "Qwen3-0.6B-GGUF",
+            ModelRecipe::LlamaCpp,
             "vulkan"
         ));
         // Registered but not loaded (empty `recipe_options`) → not ready.
@@ -1333,6 +1413,7 @@ helper line
         assert!(!models_payload_has_ready_model(
             &registered,
             "Qwen3-0.6B-GGUF",
+            ModelRecipe::LlamaCpp,
             "vulkan"
         ));
     }
@@ -1363,7 +1444,14 @@ helper line
 
     #[test]
     fn lemonade_model_load_uses_selected_backend() {
-        let args = lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", None);
+        let args = lemonade_model_load_args(
+            "127.0.0.1",
+            11435,
+            DEFAULT_MODEL,
+            ModelRecipe::LlamaCpp,
+            "vulkan",
+            None,
+        );
         assert_eq!(
             args,
             vec![
@@ -1393,8 +1481,14 @@ helper line
             ],
             ..EngineRecipeHint::default()
         };
-        let args =
-            lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", Some(&recipe));
+        let args = lemonade_model_load_args(
+            "127.0.0.1",
+            11435,
+            DEFAULT_MODEL,
+            ModelRecipe::LlamaCpp,
+            "vulkan",
+            Some(&recipe),
+        );
         assert_eq!(
             args[args.len() - 2..],
             [
@@ -1405,13 +1499,138 @@ helper line
     }
 
     #[test]
+    fn a_gufo_load_names_no_llamacpp_backend_and_passes_no_llama_server_flags() {
+        let recipe = EngineRecipeHint {
+            required_flags: vec!["--temperature".to_owned(), "0.5".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let args = lemonade_model_load_args(
+            "127.0.0.1",
+            11435,
+            "Qwen3.8-27B-Gufo",
+            ModelRecipe::Gufo,
+            "rocm",
+            Some(&recipe),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "11435",
+                "load",
+                "Qwen3.8-27B-Gufo",
+                "--save-options",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gufo_install_names_the_gufo_recipe() {
+        let parent = ParentRuntimeEnvironment::rooted_at(Path::new("/nonexistent"));
+        let command = backend_install_command(
+            &test_manifest(),
+            "127.0.0.1",
+            8123,
+            crate::recipe::GUFO_RECIPE,
+            "rocm",
+            &LemonadeProcessEnvironment::default(),
+            &parent,
+            OutputConsoles {
+                stdout: true,
+                stderr: true,
+            },
+            |_| {},
+        )
+        .expect("the command builds");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[args.len() - 3..], ["backends", "install", "gufo:rocm"]);
+    }
+
+    /// The `/health` entry Lemonade 2026.48 reports for a loaded Gufo model,
+    /// field for field (`lemonade status --json` on a Strix Halo).
+    fn loaded_gufo_health() -> Value {
+        json!({"all_models_loaded": [{
+            "backend_url": "http://127.0.0.1:8001/v1",
+            "checkpoint": "unsloth/Qwen3.8-27B-GGUF:Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            "device": "gpu",
+            "model_name": "Qwen3.8-27B-Gufo",
+            "recipe": "gufo",
+            "recipe_options": {"ctx_size": 262_144, "gufo_args": ""},
+            "status": "ready",
+            "type": "llm"
+        }]})
+    }
+
+    #[test]
+    fn a_gufo_model_reads_as_loaded_only_as_a_gufo_gpu_load() {
+        let health = loaded_gufo_health();
+        assert!(health_has_loaded_model(
+            &health,
+            "Qwen3.8-27B-Gufo",
+            ModelRecipe::Gufo,
+            "rocm"
+        ));
+        // The same entry is not a llama.cpp load: it names no llama.cpp backend.
+        assert!(!health_has_loaded_model(
+            &health,
+            "Qwen3.8-27B-Gufo",
+            ModelRecipe::LlamaCpp,
+            "rocm"
+        ));
+        // Each field the check reads, broken in turn, makes it not loaded.
+        for (field, value) in [
+            ("recipe", json!("llamacpp")),
+            ("device", json!("cpu")),
+            ("recipe_options", json!({})),
+            ("model_name", json!("Qwen3-0.6B-GGUF")),
+        ] {
+            let mut broken = loaded_gufo_health();
+            broken["all_models_loaded"][0][field] = value;
+            assert!(
+                !health_has_loaded_model(&broken, "Qwen3.8-27B-Gufo", ModelRecipe::Gufo, "rocm"),
+                "{field}"
+            );
+        }
+        // A `/v1/models` entry follows the same rule; a registered Gufo model
+        // with no options is not loaded, where a stock llama-server entry would be.
+        let registered = json!({"data": [{"id": "Qwen3.8-27B-Gufo", "recipe": "gufo"}]});
+        assert!(!models_payload_has_ready_model(
+            &registered,
+            "Qwen3.8-27B-Gufo",
+            ModelRecipe::Gufo,
+            "rocm"
+        ));
+        let loaded = json!({"data": [{
+            "id": "Qwen3.8-27B-Gufo",
+            "recipe": "gufo",
+            "recipe_options": {"ctx_size": 4096}
+        }]});
+        assert!(models_payload_has_ready_model(
+            &loaded,
+            "Qwen3.8-27B-Gufo",
+            ModelRecipe::Gufo,
+            "rocm"
+        ));
+    }
+
+    #[test]
     fn health_parser_requires_loaded_requested_model() {
         let unloaded = json!({
             "status": "ok",
             "model_loaded": null,
             "all_models_loaded": []
         });
-        assert!(!health_has_loaded_model(&unloaded, DEFAULT_MODEL, "vulkan"));
+        assert!(!health_has_loaded_model(
+            &unloaded,
+            DEFAULT_MODEL,
+            ModelRecipe::LlamaCpp,
+            "vulkan"
+        ));
 
         let loaded = json!({
             "status": "ok",
@@ -1424,8 +1643,18 @@ helper line
                 }
             }]
         });
-        assert!(health_has_loaded_model(&loaded, "lemonade-qwen", "vulkan"));
-        assert!(!health_has_loaded_model(&loaded, "lemonade-qwen", "rocm"));
+        assert!(health_has_loaded_model(
+            &loaded,
+            "lemonade-qwen",
+            ModelRecipe::LlamaCpp,
+            "vulkan"
+        ));
+        assert!(!health_has_loaded_model(
+            &loaded,
+            "lemonade-qwen",
+            ModelRecipe::LlamaCpp,
+            "rocm"
+        ));
     }
 
     #[test]

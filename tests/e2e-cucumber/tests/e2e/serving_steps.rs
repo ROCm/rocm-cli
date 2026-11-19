@@ -224,7 +224,7 @@ async fn serve_failure_evidence(
 /// `run_rocm_ok`, since the engine log explains those launches too.
 ///
 /// Returns the serve command's stdout, for a scenario that checks what it printed.
-async fn serve_and_wait(
+pub(crate) async fn serve_and_wait(
     world: &mut E2eWorld,
     args: &[&str],
     model: &str,

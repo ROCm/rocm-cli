@@ -565,8 +565,18 @@ fn model_list_ready_for_model(
 /// (direct-serve) entry has no `recipe_options` and is accepted (that path only runs
 /// GPU backends); a Lemonade-router entry carries `recipe_options`, so it must report a
 /// GPU backend (ROCm or Vulkan) — which keeps a registered-but-unloaded model (empty `recipe_options`)
-/// from reading as ready.
+/// from reading as ready. That holds only for a model never loaded: the engine loads with
+/// `--save-options` (`lemonade_model_load_args` in the lemonade engine's `process.rs`),
+/// so a model loaded once and since unloaded may still carry options here and read
+/// ready, for llama.cpp and Gufo alike. A Gufo entry is never a direct-serve one, so it is judged by
+/// the lemonade engine's `gufo_entry_loaded_on_gpu` whether or not it carries
+/// `recipe_options`.
 fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
+    if model.get("recipe").and_then(serde_json::Value::as_str)
+        == Some(rocm_engine_lemonade::GUFO_RECIPE)
+    {
+        return rocm_engine_lemonade::gufo_entry_loaded_on_gpu(model);
+    }
     match model.get("recipe_options") {
         None => true,
         Some(_) => service_model_reports_gpu_backend(model),
@@ -574,6 +584,11 @@ fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
 }
 
 fn service_model_reports_gpu_backend(model: &serde_json::Value) -> bool {
+    if model.get("recipe").and_then(serde_json::Value::as_str)
+        == Some(rocm_engine_lemonade::GUFO_RECIPE)
+    {
+        return rocm_engine_lemonade::gufo_entry_loaded_on_gpu(model);
+    }
     model
         .get("recipe_options")
         .and_then(|options| options.get("llamacpp_backend"))
@@ -670,6 +685,62 @@ mod tests {
             &loaded_cpu,
             "Qwen3-0.6B-GGUF"
         ));
+    }
+
+    #[test]
+    fn service_http_readiness_accepts_a_gufo_model_only_when_loaded_on_the_gpu() {
+        // The entry Lemonade 2026.48 reports for a loaded Gufo model.
+        let loaded = json!({
+            "model_name": "Qwen3.8-27B-Gufo",
+            "recipe": "gufo",
+            "device": "gpu",
+            "recipe_options": { "ctx_size": 262_144, "gufo_args": "" }
+        });
+        let ready = |entry: &serde_json::Value| {
+            service_http_readiness_response_ready(
+                "lemonade",
+                "/v1/health",
+                200,
+                &json!({ "all_models_loaded": [entry] }).to_string(),
+                "Qwen3.8-27B-Gufo",
+            )
+        };
+        assert!(ready(&loaded));
+        for (field, value) in [
+            ("device", json!("cpu")),
+            ("recipe_options", json!({})),
+            ("recipe", json!("llamacpp")),
+        ] {
+            let mut broken = loaded.clone();
+            broken[field] = value;
+            assert!(!ready(&broken), "{field}");
+        }
+    }
+
+    /// The `/v1/models` shape: a Gufo entry is never a direct-serve one, so one
+    /// with no `recipe_options` is registered, not loaded, where a stock
+    /// llama-server entry without them is ready.
+    #[test]
+    fn service_http_readiness_reads_a_registered_gufo_model_list_entry_as_not_loaded() {
+        let ready = |entry: serde_json::Value| {
+            service_http_readiness_response_ready(
+                "lemonade",
+                "/v1/models",
+                200,
+                &json!({ "data": [entry] }).to_string(),
+                "Qwen3.8-27B-Gufo",
+            )
+        };
+        assert!(!ready(
+            json!({ "id": "Qwen3.8-27B-Gufo", "recipe": "gufo" })
+        ));
+        assert!(ready(json!({
+            "id": "Qwen3.8-27B-Gufo",
+            "recipe": "gufo",
+            "recipe_options": { "ctx_size": 4096 }
+        })));
+        // The direct-serve rule the Gufo case must not fall into still holds.
+        assert!(ready(json!({ "id": "Qwen3.8-27B-Gufo" })));
     }
 
     #[test]

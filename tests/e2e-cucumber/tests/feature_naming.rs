@@ -43,6 +43,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
+    ("lemonade_gufo.feature", "lemonade-gufo"),
     // Not `lemonade`: the file is about the copies Lemonade leaves on disk,
     // not about serving with it, which `model_serving.feature` covers.
     ("lemonade_installs.feature", "lemonade-installs"),

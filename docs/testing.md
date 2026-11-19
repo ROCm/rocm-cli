@@ -893,6 +893,22 @@ Lemonade Linux lane (`@requires-gpu`, `@requires-os:linux`,
 regression fails the lane. Of the other direct-route serves, `serve-07` keeps its
 flaky Linux row; `serve-08` has none, so it fails the lane too.
 
+[`lemonade_gufo.feature`](../tests/e2e-cucumber/features/lemonade_gufo.feature)
+covers Lemonade's Gufo models. `lemonade-gufo-01` to `-03` and `-05` run on the mock lane:
+they plant a Lemonade install whose registry lists Gufo models and stand in for
+what Lemonade reports about its Gufo backend through `ROCM_E2E_LEMONADE_SYSTEM_INFO`
+(a `rocm/e2e-test-hooks` build, which also waives `rocm serve`'s no-usable-GPU
+refusal), so the refusal on an unsupported GPU, the refusal with Lemonade's setup
+steps, the engine list's Gufo line and the refusal of sampling flags are checked
+on every PR without a Strix Halo. `lemonade-gufo-04` serves a real Gufo model; it
+is `@nightly`, `@requires-bare-metal` and `@requires-gfx:gfx1151`, so it runs only
+on the Strix Halo Ubuntu lane with nightly scenarios included (not the Strix Halo
+WSL one), and needs Podman or Docker set up for Lemonade there. Unit tests for the recipe decision, every Lemonade backend
+state, the load arguments and the loaded-model check are in
+[`gufo.rs`](../engines/lemonade/src/gufo.rs), [`recipe.rs`](../engines/lemonade/src/recipe.rs)
+and [`process.rs`](../engines/lemonade/src/process.rs):
+`cargo test -p rocm-engine-lemonade --lib -- gufo recipe`.
+
 The daemon's Lemonade contracts in
 [telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
 hold observation time during singleton-to-multiple-model transitions. The first

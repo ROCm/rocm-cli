@@ -29,12 +29,14 @@ mod backend_alignment;
 mod device_policy;
 mod direct_llama;
 mod footprint;
+mod gufo;
 // Linux only: Windows `lemond` has no glibc or OpenSSL floor to check.
 #[cfg(any(target_os = "linux", test))]
 mod host_libraries;
 mod install;
 mod llamacpp_backend;
 mod process;
+mod recipe;
 mod router_serve;
 mod runtime_dir;
 mod state;
@@ -48,6 +50,8 @@ mod test_support;
 // the crate root before the split, and `apps/rocm` depends on this crate's
 // lib target.
 pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
+pub use gufo::{GUFO_DETECT_NOTE_PREFIX, GUFO_RECIPE};
+pub use process::gufo_entry_loaded_on_gpu;
 // The read-only view of Lemonade's install trees and record that `apps/rocm`
 // needs for `rocm storage` and `rocm runtimes uninstall`; see `footprint`.
 pub use footprint::{
@@ -353,6 +357,11 @@ fn detect_response() -> DetectResponse {
             "Lemonade llama.cpp backend selected for this GPU: {}:{}",
             runtime.manifest.backend_recipe, runtime.manifest.backend_name
         ));
+        let runtime_dir = &runtime.manifest.runtime_dir;
+        notes.extend(crate::gufo::detect_note(
+            crate::gufo::recorded_status(runtime_dir).as_ref(),
+            &crate::recipe::registered_models_for(runtime_dir, crate::recipe::ModelRecipe::Gufo),
+        ));
     } else {
         notes.push(
             "Lemonade embeddable is not installed yet; run `rocm engines install lemonade`"
@@ -516,6 +525,21 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
     let device_policy = crate::device_policy::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
+    // A Gufo model is checked here, on the same round trip, so a GPU or container
+    // setup Gufo cannot run on is refused on the user's terminal before the model
+    // or the Gufo image is downloaded and before any serve starts (`rocm serve`
+    // has installed Lemonade itself by then, in `ensure_self_managed_engine_ready`).
+    if let Ok(runtime) = crate::install::resolve_runtime()
+        && crate::recipe::ModelRecipe::for_model(&runtime.manifest, &request.model_ref)
+            == crate::recipe::ModelRecipe::Gufo
+    {
+        return crate::gufo::resolve_gufo_model(
+            &runtime.manifest,
+            canonical_model_id,
+            device_policy,
+            engine_recipe,
+        );
+    }
     Ok(ResolveModelResponse {
         canonical_model_id,
         served_model_id: None,
@@ -707,15 +731,17 @@ fn serve_with_context(request: &ServeHttpRequest, context: ServeContext) -> Resu
         }
         crate::direct_llama::ServeRoute::Router { model_ref } => model_ref,
     };
+    let recipe = crate::recipe::ModelRecipe::for_model(&runtime.manifest, &router_model_ref);
     let mut steps = crate::router_serve::LemondRouterSteps {
         runtime,
         request,
+        recipe,
         process_env: &process_env,
         log_path,
         parent,
         child: None,
     };
-    let result = crate::router_serve::serve_router(request, &mut steps, &router_model_ref);
+    let result = crate::router_serve::serve_router(request, &mut steps, &router_model_ref, recipe);
     with_direct_fallback(
         result,
         &paths,
@@ -786,12 +812,13 @@ fn healthcheck_service_at(state_path: &Path) -> Result<HealthcheckResponse> {
         .as_ref()
         .and_then(|value| crate::state::value_string(value, "backend_requested"))
         .unwrap_or_else(|| ROCM_BACKEND_NAME.to_owned());
+    let recipe = crate::recipe::ModelRecipe::from_state(state.as_ref());
     let listed = state_status == "ready"
         && !model_ref.is_empty()
         && endpoint_url
             .as_deref()
             .map(|endpoint| {
-                crate::process::query_loaded_model_endpoint(endpoint, &model_ref, &backend)
+                crate::process::query_loaded_model_endpoint(endpoint, &model_ref, recipe, &backend)
             })
             .transpose()
             .unwrap_or(None)
@@ -1002,6 +1029,112 @@ mod tests {
             assert_eq!(state["canonical_model_id"], served_name);
             assert!(state.get(rocm_core::INFERENCE_VERIFIED_STATE_KEY).is_some());
         }
+    }
+
+    /// A ready Gufo service reads as ready only as a Gufo load on the GPU: the
+    /// healthcheck takes the recipe from the state, a Gufo `/health` entry names
+    /// no llama.cpp backend, and one that reports another device is not ready.
+    #[test]
+    fn a_gufo_service_reads_as_ready_only_when_loaded_on_the_gpu() {
+        assert!(gufo_service_reads_as_ready("gpu"));
+        assert!(!gufo_service_reads_as_ready("cpu"));
+    }
+
+    /// Healthcheck a ready-recorded Gufo service whose `/health` entry reports
+    /// `device`, and say whether it read as ready.
+    fn gufo_service_reads_as_ready(device: &'static str) -> bool {
+        use crate::test_http::{Reply, spawn_fixture};
+        let (port, server) = spawn_fixture(Duration::from_secs(5), move |recorded| {
+            let chat = recorded.method == "POST";
+            Reply {
+                status: 200,
+                body: if chat {
+                    json!({"choices": [{"message": {"content": "ok"}}]})
+                } else {
+                    json!({"all_models_loaded": [{
+                        "model_name": "Qwen3.8-27B-Gufo",
+                        "recipe": "gufo",
+                        "device": device,
+                        "recipe_options": {"ctx_size": 4096, "gufo_args": ""}
+                    }]})
+                }
+                .to_string(),
+                last: chat,
+            }
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let request = ServeHttpRequest {
+            service_id: "gufo".to_owned(),
+            model_ref: "Qwen3.8-27B-Gufo".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: vec![0],
+            runtime_id: None,
+            env_id: None,
+            state_path: dir.join("state.json"),
+            log_path: None,
+            engine_recipe: None,
+        };
+        let runtime = crate::install::LemonadeRuntime {
+            manifest: crate::install::LemonadeInstallManifest {
+                env_id: "test".to_owned(),
+                version: "test".to_owned(),
+                runtime_dir: dir.join("runtime"),
+                lemond: dir.join("lemond"),
+                lemonade: dir.join("lemonade"),
+                backend_recipe: LLAMACPP_RECIPE.to_owned(),
+                backend_name: "rocm".to_owned(),
+                installed_at_unix_ms: 0,
+            },
+        };
+        crate::state::write_running_state_for_model(
+            &request,
+            &runtime,
+            std::process::id(),
+            None,
+            "ready",
+            "Qwen3.8-27B-Gufo",
+        )
+        .unwrap();
+        crate::state::merge_json_state(
+            &request.state_path,
+            &json!({"backend_requested": "rocm", "recipe": "gufo"}),
+        )
+        .unwrap();
+        let response = healthcheck_service_at(&request.state_path).unwrap();
+        let _ = server.join();
+        response.status == "ready" && response.model_loaded
+    }
+
+    /// A model Lemonade's registry assigns to Gufo is served through the Gufo
+    /// backend: the router asks Lemonade about `gufo:rocm`, not for a llama.cpp
+    /// backend. Nothing answers on the port here, so the serve fails at exactly
+    /// that question, and the failure names which backend was being selected.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_registered_gufo_model_is_served_through_the_gufo_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let manifest = crate::test_http::fake_runtime::manifest(dir, 0, None);
+        let registry = manifest.runtime_dir.join(crate::recipe::SERVER_MODELS_JSON);
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &registry,
+            json!({"Qwen3.8-27B-Gufo": {"recipe": "gufo"}}).to_string(),
+        )
+        .unwrap();
+        let mut request = fake_request(dir, "Qwen3.8-27B-Gufo");
+        request.port = crate::state::free_local_port().unwrap();
+        let context = fake_context(dir, manifest);
+        let error = serve_http_resolving(request, |_| Ok(context)).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("failed to select a supported Lemonade Gufo backend"),
+            "{error}"
+        );
+        assert!(error.contains("about its Gufo backend"), "{error}");
     }
 
     fn launch_request(model_ref: &str) -> LaunchRequest {

@@ -1687,6 +1687,10 @@ mod tests {
             &manifest,
             serde_json::json!({
                 "RecipeModel": {"recipe": "oga", "checkpoint": "not/a/gguf"},
+                // A Gufo model is served by Gufo, never by a llama-server started
+                // directly, even with a plain GGUF checkpoint (the router-failure
+                // fallback reads the same answer).
+                "Gufo-GGUF": {"recipe": "gufo", "checkpoint": "owner/repo:Q4_K_M"},
                 "NoCheckpoint": {"recipe": "llamacpp"},
                 "MalformedCheckpoint": {"recipe": "llamacpp", "checkpoint": 123},
                 "Exact-GGUF": {"recipe": "llamacpp", "checkpoint": "owner/repo:Q8_0"}
@@ -1694,6 +1698,7 @@ mod tests {
         );
         for name in [
             "RecipeModel",
+            "Gufo-GGUF",
             "Unknown-GGUF",
             "exact-gguf",
             "Exact",
@@ -3128,6 +3133,7 @@ mod tests {
                 "id": "Qwen3-0.6B-GGUF", "recipe_options": {"llamacpp_backend": "vulkan"}
             }]}),
             "qwen-smoke",
+            crate::recipe::ModelRecipe::LlamaCpp,
             "vulkan"
         ));
     }

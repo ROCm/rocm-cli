@@ -500,7 +500,16 @@ fn append_engine_detect_summary(output: &mut String, engine: &str, paths: Option
     if detect.runtime_executable.is_some() {
         let _ = writeln!(output, "    runtime executable: available");
     }
-    if let Some(note) = friendly_engine_detect_notes(engine, &detect.notes) {
+    let (gufo_notes, notes): (Vec<String>, Vec<String>) = detect
+        .notes
+        .into_iter()
+        .partition(|note| note.starts_with(rocm_engine_lemonade::GUFO_DETECT_NOTE_PREFIX));
+    if let Some(note) = friendly_engine_detect_notes(engine, &notes) {
+        let _ = writeln!(output, "    note: {note}");
+    }
+    // Whether Gufo can run here is its own answer: the one-line summary above
+    // says only whether Lemonade is ready, so it would hide it.
+    for note in gufo_notes {
         let _ = writeln!(output, "    note: {note}");
     }
 }

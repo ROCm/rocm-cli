@@ -580,6 +580,25 @@ Expected result:
   runtime and removed with it, and a following `rocm storage report` shows the
   remaining copy as `not recorded as installed`.
 
+To check serving a Lemonade Gufo model (Gufo runs only on Strix Halo, gfx1151,
+under Linux, from a container): on a Strix Halo with Podman and `crun`
+installed and your account in `render`, run
+`rocm serve Qwen3.8-27B-Gufo --engine lemonade`. It downloads about 20 GB and
+the Gufo container image on the first run. Expected result:
+
+- The serve becomes ready, `rocm logs` shows `Lemonade is serving
+  Qwen3.8-27B-Gufo with Gufo (gufo:rocm)`, and a chat request to the endpoint
+  is answered. `podman ps --filter label=ai.lemonade` lists the Gufo container.
+- `rocm engines` shows a `Lemonade Gufo backend (gufo:rocm, Strix Halo
+  container): installed` line that names the Gufo models.
+- Run it again with `--temperature 0.5`: it is refused, naming the flags Gufo
+  would not apply, and nothing is started.
+- On a machine whose AMD GPU is not a Strix Halo, the same serve is refused before the model
+  is downloaded, saying Gufo runs only on a Strix Halo GPU. On a Strix Halo
+  where Podman uses `runc`, or your account is not in `render`, it is refused
+  with the problems and the setup commands Lemonade reports, and `rocm
+  engines` says Gufo needs container setup.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a

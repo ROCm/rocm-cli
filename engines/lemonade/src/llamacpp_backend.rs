@@ -44,7 +44,16 @@ pub(crate) fn install_best_llamacpp_backend(
             log_path,
             &process_env,
         )?;
-        ensure_best_llamacpp_backend(manifest, DEFAULT_HOST, port, &process_env, force_reinstall)
+        let backend = ensure_best_llamacpp_backend(
+            manifest,
+            DEFAULT_HOST,
+            port,
+            &process_env,
+            force_reinstall,
+        )?;
+        // The server is up anyway: keep what it says about Gufo for `rocm engines`.
+        crate::gufo::record_status_from(&manifest.runtime_dir, DEFAULT_HOST, port);
+        Ok(backend)
     })();
     let _ = terminate_pid(child.id(), true);
     let _ = child.wait();
