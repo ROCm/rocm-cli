@@ -18,7 +18,7 @@ use e2e_cucumber::device_memory::{
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
+    ServeAttempt, archive_service_log, engine_from_serve_args, reported_endpoint, reported_engine,
     serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
@@ -139,14 +139,30 @@ static SERVE_BASE_URL: LazyLock<String> =
 static MODELS_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1/models"));
 
+/// The OpenAI-compatible base URL a serve printed on its `endpoint:` row (see
+/// [`reported_endpoint`]), or [`SERVE_BASE_URL`] when nothing usable was
+/// printed, as for a failed launch.
+fn served_base_url(output: &str) -> String {
+    reported_endpoint(output).map_or_else(|| SERVE_BASE_URL.to_string(), str::to_owned)
+}
+
+/// The model listing under [`served_base_url`].
+fn served_models_url(stdout: &str) -> String {
+    format!("{}/models", served_base_url(stdout))
+}
+
 /// The one-line verdict on a `--managed` serve that launched cleanly and then
 /// never produced a usable endpoint.
 ///
 /// Says "exited 0" out loud because that is the whole difficulty of this failure:
 /// nothing in the exit status, and nothing the CLI printed, distinguishes it from
 /// a healthy serve — the evidence sections below it are the only account there is.
-fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> String {
-    let models_url = MODELS_URL.as_str();
+fn stall_headline(
+    invocation: &str,
+    models_url: &str,
+    ready_substr: &str,
+    timeout_secs: u64,
+) -> String {
     format!(
         "{invocation} exited 0, but {models_url} never served `{ready_substr}` within \
          {timeout_secs}s — the launch reported success and the engine then failed on its own"
@@ -268,16 +284,17 @@ async fn serve_and_wait_with_key(
         &envs,
         e2e_cucumber::serve_log::serve_cli_budget(timeout_secs),
     );
+    let models_url = served_models_url(&stdout);
     if rc == 0
-        && model_is_ready_with_key(&MODELS_URL, Some(ready_substr), timeout_secs, api_key).await
+        && model_is_ready_with_key(&models_url, Some(ready_substr), timeout_secs, api_key).await
     {
-        world.endpoint = Some(SERVE_BASE_URL.to_string());
+        world.endpoint = Some(served_base_url(&stdout));
         world.model_name = Some(model.to_string());
         return stdout;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
     let headline = if rc == 0 {
-        stall_headline(&invocation, ready_substr, timeout_secs)
+        stall_headline(&invocation, &models_url, ready_substr, timeout_secs)
     } else {
         format!("{invocation} failed (rc={rc})")
     };
@@ -725,18 +742,20 @@ async fn named_log_command_runs(world: &mut E2eWorld) {
 async fn serve_exits_and_endpoint_lists_model(world: &mut E2eWorld) {
     let timeout = Duration::from_secs(serve_timeout_for(world));
     let (_, _, ready_substr) = host_serve_target();
-    world
-        .tui
-        .as_mut()
-        .expect("no pty session for `rocm serve`")
-        .assert_exits_cleanly("the interactive serve", timeout)
+    let tui = world.tui.as_mut().expect("no pty session for `rocm serve`");
+    tui.assert_exits_cleanly("the interactive serve", timeout)
         .await;
+    // The port may have moved off SERVE_PORT (#1130): read it from the
+    // `endpoint:` row the serve left on screen, falling back to the default.
+    let screen = tui.screen_text();
+    let base_url = served_base_url(&screen);
+    let models_url = format!("{base_url}/models");
     assert!(
-        model_is_ready(&MODELS_URL, Some(ready_substr), 30).await,
-        "serve exited 0 but {} does not list {ready_substr}",
-        MODELS_URL.as_str()
+        model_is_ready(&models_url, Some(ready_substr), 30).await,
+        "serve exited 0 but {models_url} does not list {ready_substr}\n\
+         --- serve screen ---\n{screen}\n--- end screen ---"
     );
-    world.endpoint = Some(SERVE_BASE_URL.to_string());
+    world.endpoint = Some(base_url);
 }
 
 #[given("a managed engine will exit while it starts")]
@@ -912,7 +931,9 @@ async fn call_routes_outside_the_openai_api(world: &mut E2eWorld, api_key: Optio
         .timeout(Duration::from_mins(2))
         .build()
         .expect("http client");
-    let base = format!("http://127.0.0.1:{SERVE_PORT}");
+    // The root of the endpoint the serve reported, which may not be SERVE_PORT (#1130).
+    let endpoint = world.endpoint.clone().expect("no endpoint configured");
+    let base = endpoint.strip_suffix("/v1").unwrap_or(&endpoint).to_owned();
     world.route_statuses.clear();
     for (method, path, body) in routes_outside_the_openai_api(&model) {
         let mut request = client.request(method.clone(), format!("{base}{path}"));
@@ -1052,6 +1073,7 @@ async fn serve_gpu_model_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
     // which an assert would have skipped.
     let attempts = if world.expect_xfail { 1 } else { 2 };
     let mut made = 0;
+    let mut models_url = MODELS_URL.to_string();
     for attempt in 1..=attempts {
         made = attempt;
         let device_state = ensure_serve_port_free().await;
@@ -1070,10 +1092,11 @@ async fn serve_gpu_model_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
             &envs,
             e2e_cucumber::serve_log::serve_cli_budget(timeout_secs),
         );
+        models_url = served_models_url(&stdout);
         if rc == 0
-            && model_is_ready_with_key(&MODELS_URL, Some(ready_substr), timeout_secs, api_key).await
+            && model_is_ready_with_key(&models_url, Some(ready_substr), timeout_secs, api_key).await
         {
-            world.endpoint = Some(SERVE_BASE_URL.to_string());
+            world.endpoint = Some(served_base_url(&stdout));
             world.model_name = Some(model.to_string());
             return;
         }
@@ -1116,7 +1139,6 @@ async fn serve_gpu_model_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
             break;
         }
     }
-    let models_url = MODELS_URL.as_str();
     panic!(
         "endpoint {models_url} did not serve model {ready_substr} after {made} attempt(s) of {timeout_secs}s each:\n{}",
         diagnostics.join("\n\n")
@@ -1740,7 +1762,8 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // resolved model on the shared port; fall back to the requested id.
     let served = resolved_model(&stdout).unwrap_or(model).to_string();
     let ready_substr = ready_substr_for(&served).to_string();
-    world.endpoint = Some(SERVE_BASE_URL.to_string());
+    let models_url = served_models_url(&stdout);
+    world.endpoint = Some(served_base_url(&stdout));
     world.model_name = Some(served);
     // Both streams and the rc are carried on the World so whichever Then step
     // fires can explain itself: the scenarios behind this step assert on the
@@ -1761,9 +1784,10 @@ async fn user_serves_default_engine(world: &mut E2eWorld) {
     // 11435 may still answer from a prior scenario's leaked serve, and a
     // model-agnostic wait would then proceed against the wrong server.
     let timeout_secs = serve_timeout_for(world);
-    if rc == 0 && !model_is_ready(&MODELS_URL, Some(&ready_substr), timeout_secs).await {
+    if rc == 0 && !model_is_ready(&models_url, Some(&ready_substr), timeout_secs).await {
         let headline = stall_headline(
             &format!("`rocm serve {model} --managed`"),
+            &models_url,
             &ready_substr,
             timeout_secs,
         );
