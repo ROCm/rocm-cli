@@ -67,6 +67,7 @@ use crate::gpu_policy::{
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
 use crate::serve_port;
+use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
     ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
     engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
@@ -864,8 +865,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
-    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
-    // not have.
+    // E2E-only launch fault injection (either mode) and the startup-exit
+    // stand-in engine likewise stand in for the GPU they do not have.
     //
     // The scripted free-space override opens the same waiver: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
@@ -880,6 +881,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !cpu_only
         && !scripted_backend_failure
         && !e2e_simulate_oom_launch()
+        && !crate::service_launch::e2e_simulate_startup_exit()
         && !reuse_existing
         && host_has_no_usable_gpu
     {
@@ -1124,7 +1126,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let managed_runtime_id = resolved_selection.runtime_id.clone();
     let managed_env_id = resolved_selection.env_id.clone();
 
-    // Persist the endpoint key (public bind only) in a 0600 file so the engine
+    // Persist the endpoint key (public bind only) in an owner-only file so the engine
     // child, the restart/recovery path, and inspection commands can retrieve it by
     // service id. Loopback binds resolve to `None` and store nothing.
     if let Some(key) = endpoint_auth.as_deref() {
@@ -1132,10 +1134,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
-            "Starting {model} on {selected_engine}…"
-        )));
+        let starting = serve_progress::starting_label(&model, &selected_engine);
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(starting.clone()));
         spinner.borrow_mut().tick();
+        let mut shown = starting;
+        // Interactive summary (stdout and stderr both terminals) follows
+        // download / load / health until ready or a bounded failure. Piped
+        // output, or a redirected stderr, keeps the historical 45-second
+        // status budget so a serve that never answers does not block CI.
+        // `--wait` keeps waiting past either, until the server answers or dies.
+        let policy = serve_progress::ServeStartupPolicy::for_background_serve(
+            summary_mode,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        );
         // The key is shown when the wait begins, since Ctrl-C or a failed wait
         // would otherwise leave a running authenticated server whose key was never
         // printed. It is then not repeated in the summary below.
@@ -1158,6 +1169,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             require_api_key,
             gpu_refusal_waived_for_reuse,
             wait,
+            &policy,
             // Named with the id the launch resolved to: an already-starting
             // server keeps its own, not the one generated above. The spinner
             // has no id on it, and a non-TTY stderr gets no spinner at all.
@@ -1165,7 +1177,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 spinner.borrow_mut().clear();
                 eprintln!(
                     "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
-                     Follow: rocm logs --service {waiting_on} --follow"
+                     Follow: {} --follow",
+                    crate::service_hints::service_logs_hint(waiting_on)
                 );
                 if let Some(config) = wait_begin_client_config(
                     waiting_on,
@@ -1181,32 +1194,48 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                     print!("{config}");
                 }
             },
-            &mut |_elapsed| spinner.borrow_mut().tick(),
+            &mut |view: &ServeStartupView| {
+                let mut spinner = spinner.borrow_mut();
+                if view.label == shown {
+                    spinner.tick();
+                } else {
+                    shown.clone_from(&view.label);
+                    spinner.set_label(view.label.clone());
+                }
+            },
         );
         // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
         let report = match launched {
             Ok(report) => report,
             Err(error) => {
                 spinner.borrow_mut().clear();
+                if let Some(warning) = supervise_after_launch_error(&error, || {
+                    ensure_background_helper_running_quiet(summary_mode)
+                }) {
+                    eprintln!("{warning}");
+                }
                 return Err(error);
             }
         };
         let mut spinner = spinner.into_inner();
         // Not when the launch was fabricated. `simulate_oom_managed_launch`
-        // writes a `starting` record for a process that never existed, so the
-        // helper would be left watching a pid that will never appear, with
-        // nothing in the scenario's teardown to stop it: observed as `rocm
-        // daemon` processes outliving their e2e checkout by days, still
-        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // writes a record (`starting`, or `ready` in its `ready` mode) for a
+        // process that never existed, so the helper would be left watching a pid
+        // that will never appear, with nothing in the scenario's teardown to stop
+        // it: observed as `rocm daemon` processes outliving their e2e checkout by
+        // days, still carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
         // supervising a real spawned server, and there is none here.
         //
         // That — not ordering — is the whole justification. This suppression
         // runs *before* the OOM note is computed in the `summary_mode` block
         // below, so the previous claim here, that the note "is computed before
         // it would have run", was backwards and could not have excused it.
-        // serve-40's `no background automation daemon was left behind` is what
-        // holds the branch: deleting it left the scenario green with a `rocm
-        // daemon` still running.
+        // The `no background automation daemon was left behind` step of the
+        // `@id:serve-oom-launch-memory-guidance` and
+        // `@id:serve-smoke-failure-summary` scenarios records that none was
+        // started but does not discriminate this branch: the helper starts only
+        // when a watcher is enabled, and the isolated config those scenarios use
+        // enables none, so removing the branch leaves them green.
         //
         // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
         // the test-only feature, so this branch folds away in shipped builds.
@@ -1236,16 +1265,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Best-effort inference smoke test, on by default (opt out with
             // `--no-smoke-test`). Only meaningful for a freshly-ready server we
             // just launched; skipped when metrics could not be shown anyway.
-            let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
-                spinner.set_label("Running smoke test…");
-                // The local provider resolves the endpoint key from the per-service
-                // 0600 key file by service id, so the smoke test authenticates
-                // against a protected public endpoint without threading the secret
-                // through here.
-                serve_summary::run_smoke_test(&paths, resolve.served_model_name())
-            } else {
-                serve_summary::SmokeMetrics::default()
-            };
+            let (metrics, smoke_failure) =
+                if !no_smoke_test && !report.already_running && report.status == "ready" {
+                    spinner.set_label("Running smoke test…");
+                    // The local provider resolves the endpoint key from the per-service
+                    // owner-only key file by service id, so the smoke test authenticates
+                    // against a protected public endpoint without threading the secret
+                    // through here.
+                    serve_summary::run_smoke_test(&paths, resolve.served_model_name()).into_parts()
+                } else {
+                    (serve_summary::SmokeMetrics::default(), None)
+                };
             spinner.clear();
 
             let mut notes = collect_serve_notes(
@@ -1314,6 +1344,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 status: report.status.clone(),
                 already_running: report.already_running,
                 metrics,
+                smoke_failure,
                 api_key: launched_key,
                 notes,
             };
@@ -1402,6 +1433,35 @@ fn collect_serve_notes(
         }
     }
     notes
+}
+
+/// Start supervision after `start_managed_service` failed, when that failure
+/// left a launched server behind. Returns the warning to print when the
+/// helper itself would not start.
+///
+/// Only a startup stop that left the server running
+/// ([`serve_progress::ServeStartupFailed`] with `server_running`) leaves a
+/// process to supervise. A stop on an engine that failed or a process that
+/// exited has already been settled and reported as failed, so the CLI does not
+/// start the helper for it. Other errors either come before the child
+/// exists (the claiming record is written first, as `starting`, and `rocmd`
+/// treats it as any stale start), or from a child that already exited or an
+/// I/O error writing its record, which did not start the helper before this
+/// wait existed either. The startup failure stays the error the user reads; a
+/// helper failure is a warning beside it.
+fn supervise_after_launch_error(
+    error: &anyhow::Error,
+    start_helper: impl FnOnce() -> Result<()>,
+) -> Option<String> {
+    error
+        .downcast_ref::<serve_progress::ServeStartupFailed>()
+        .filter(|stop| stop.server_running)
+        .and_then(|_| start_helper().err())
+        .map(|helper| {
+            format!(
+                "warning: the background helper did not start, so nothing restarts this server if it fails: {helper:#}"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1660,6 +1720,94 @@ mod tests {
         assert_eq!(
             serve_model_ref_for_engine("qwen", Some(&recipe), "lemonade"),
             "Qwen3-4B-Instruct-2507-GGUF"
+        );
+    }
+
+    #[test]
+    fn serve_small_assistant_resolves_the_gguf_build_on_lemonade() {
+        // The small assistant recipe is published as safetensors under its
+        // canonical id and as GGUF under a companion repo. Lemonade can only
+        // serve the latter, and only with a quantization variant pinned, so
+        // every way of naming the recipe has to arrive at that ref.
+        for model in [
+            "qwen2.5",
+            "qwen2.5-1.5b",
+            "qwen2.5-1.5b-instruct",
+            "qwen-small",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        ] {
+            let recipe = resolve_builtin_model_recipe(model)
+                .unwrap_or_else(|| panic!("{model} resolves to a recipe"));
+            // With no engine named and no GPU family preferring one, automatic
+            // selection follows the recipe. A host whose family prefers vLLM
+            // takes the earlier branch in `select_serve_engine` and is not
+            // covered here; the ref each engine resolves to is, below.
+            assert_eq!(
+                select_serve_engine(None, None, Some(&recipe), None),
+                ServeEngineSelection {
+                    engine: "lemonade".to_owned(),
+                    source: "recipe preferred engine; pass --engine <engine> to override; no automatic fallback",
+                },
+                "{model}"
+            );
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "lemonade"),
+                "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M",
+                "{model}"
+            );
+            // vLLM keeps the safetensors repo the canonical id names.
+            assert_eq!(
+                serve_model_ref_for_engine(model, Some(&recipe), "vllm"),
+                "Qwen/Qwen2.5-1.5B-Instruct",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_lemonade_catalog_recipe_resolves_to_a_servable_ref() {
+        // Lemonade passes a Hugging Face `owner/repo` through untouched, and the
+        // engine then refuses it without a `:variant` -- on Windows from inside
+        // the detached engine process, where the user never sees the reason. The
+        // catalog is what has to supply the variant, so no recipe that lists
+        // Lemonade may resolve to a bare `owner/repo`. A bare registry name (no
+        // `/`) is a Lemonade model id, not a Hugging Face repo, and is fine.
+        //
+        // Scope: recipes that list Lemonade, and only those. Lemonade can still
+        // be reached for a recipe that does not -- an explicit `--engine
+        // lemonade`, a configured `default_engine`, or the platform default when
+        // nothing else fits -- and that recipe is handed its canonical id, which
+        // is what a recipe with no Lemonade build should get. Refusing a bare
+        // ref before the engine starts is the other half of that, and is not
+        // this test's job.
+        let offenders = rocm_core::builtin_model_recipes()
+            .into_iter()
+            .filter(|recipe| model_recipe_supports_engine(recipe, "lemonade"))
+            .map(|recipe| {
+                let resolved = serve_model_ref_for_engine(
+                    &recipe.canonical_model_id,
+                    Some(&recipe),
+                    "lemonade",
+                );
+                (recipe.canonical_model_id, resolved)
+            })
+            .filter(|(_, resolved)| {
+                // A trailing `:` is as unservable as no colon at all, so the
+                // variant has to be there, not merely the separator.
+                resolved.contains('/')
+                    && resolved
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.split_once(':'))
+                        .is_none_or(|(_, variant)| variant.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "these recipes hand Lemonade a Hugging Face repo with no `:variant`, which the \
+             engine refuses after it has already been launched; give each one a lemonade \
+             engine_recipes entry whose model_id_override names the GGUF repo and variant: \
+             {offenders:?}"
         );
     }
 
@@ -2173,5 +2321,63 @@ mod tests {
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
         );
+    }
+
+    #[test]
+    fn a_startup_stop_starts_supervision_and_keeps_its_own_error() {
+        use std::cell::Cell;
+        let stop = || -> anyhow::Error {
+            serve_progress::ServeStartupFailed {
+                message: "qwen on vllm stopped making download progress".to_owned(),
+                server_running: true,
+            }
+            .into()
+        };
+        // Row: startup stop, helper starts. Helper called, nothing to warn.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&stop(), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+        assert_eq!(warning, None);
+
+        // Row: startup stop, helper fails. The warning names the helper
+        // error; the startup failure is still what the caller returns.
+        let warning = super::supervise_after_launch_error(&stop(), || anyhow::bail!("no daemon"))
+            .expect("a helper that failed is reported");
+        assert!(
+            warning.starts_with("warning: the background helper did not start"),
+            "{warning}"
+        );
+        assert!(warning.contains("no daemon"), "{warning}");
+
+        // Row: the server ended (engine failed, process exited). It was
+        // settled and reported as failed, so no helper is started to restart
+        // it behind that error.
+        let called = Cell::new(false);
+        let ended: anyhow::Error = serve_progress::ServeStartupFailed {
+            message: "qwen on vllm failed: the server process exited".to_owned(),
+            server_running: false,
+        }
+        .into();
+        let warning = super::supervise_after_launch_error(&ended, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get(), "an ended launch starts no helper");
+        assert_eq!(warning, None);
+
+        // Row: any other launch error. No helper.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&anyhow::anyhow!("spawn failed"), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(
+            !called.get(),
+            "a launch that never ran a server starts no helper"
+        );
+        assert_eq!(warning, None);
     }
 }

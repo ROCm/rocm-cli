@@ -64,7 +64,7 @@ runs the suite. Extra arguments after `--` are forwarded to the cucumber CLI.
 # All features:
 cargo xtask e2e
 
-# Filter by scenario name:
+# Filter by scenario name (bypasses capability gating; see below):
 cargo xtask e2e -- -n "model name"
 
 # Stop on first failure:
@@ -101,6 +101,57 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 | `ROCM_CLI_CONFIG_DIR` | (temp dir) | Isolated config directory per scenario |
 | `ROCM_CLI_DATA_DIR` | (temp dir) | Isolated data directory per scenario |
 | `ROCM_CLI_CACHE_DIR` | (temp dir) | Isolated cache directory per scenario |
+| `E2E_PROBE_TIMEOUT_SECS` | 120 | How long each capability-probe command (`rocm examine`, `rocm engines list`) may run before it is killed and the run is refused: whole seconds ≥ 1; anything else uses 120. The post-run version probe (`collect_versions`) uses the same deadline but fails quietly, only blanking the version columns, and does not refuse the run |
+| `E2E_EXPECT_GPU` | unset (undeclared) | Whether the lane has a GPU: `1` = GPU expected, `0` = deliberately none, unset or empty = no claim; any other value fails the run. Set on every self-hosted CI lane; see "Lane verdict" below |
+
+### Lane verdict
+
+Scenarios that resolve to skip never reach `report.json`, so scenario results
+alone cannot tell a lane that tested its GPU from one on which every GPU
+scenario was skipped. The harness checks the run itself, before and after the
+scenarios:
+
+- **Before any scenario runs**, it fails when the capability probe could not
+  read the binary under test, naming the command and saying why:
+  `rocm examine` or `rocm engines list` could not be started (with the error),
+  or could not be waited on, exited non-zero (with the exit
+  status and the tail of its stderr), printed nothing, was still running after
+  `E2E_PROBE_TIMEOUT_SECS` (default 120; it is killed, and the message gives
+  the deadline and the stderr tail so far), or exited but left its output
+  open, held by a process it started (with the stderr tail so far). On a lane
+  that sets `E2E_EXPECT_GPU=1` it also fails when the probe found no usable AMD
+  GPU, naming the detected gfx target, WSL flag, driver status and visibility
+  mask it decided from. A run refused here writes no `platform.json`; its
+  `report.json` is already there, empty, because `run_suite` in
+  [`tests/e2e.rs`](tests/e2e.rs) creates it before calling
+  `lane_verdict::preflight`, and on every self-hosted lane that ran its suite
+  the results upload step is gated on `always()` (`e2e-gpu`'s also skips a
+  run that found itself stale, which never reaches the suite), so the
+  consolidated report shows the lane as EMPTY.
+- **After the run**, it fails when no scenario executed (for example a `-n`
+  filter that matches nothing), and on an `E2E_EXPECT_GPU=1` lane when no
+  `@requires-gpu` (or `@requires-multi-gpu`) scenario executed. GPU scenarios
+  the run's own configuration leaves out (`@nightly`, `@merge-queue`, or
+  anything outside an `E2E_ONLY_LIFECYCLE` selection) still count as resolved
+  but never as executed, so `E2E_EXPECT_GPU=1` with `E2E_ONLY_LIFECYCLE=1` and
+  no GPU scenario selected fails by design. The reason is also recorded as
+  `lane_failure` in `platform.json`, so the consolidated report shows the lane
+  as FAIL, even when every scenario it resolved was a skip, and gives the reason
+  under "Needs attention: platforms" (in both the step summary and the HTML
+  report) and in the lane's section of the HTML report.
+
+`E2E_EXPECT_GPU=0` is for a lane that deliberately has no usable GPU, such as
+the WSL lanes: the harness prints a note that `@requires-gpu` scenarios are not
+applicable, and a note that the declaration is stale if the probe finds a GPU
+anyway; neither fails the run. Both checks are in
+[`src/lane_verdict.rs`](src/lane_verdict.rs).
+
+A cucumber `-n`/`--name` or `--tags` filter on the command line replaces the
+harness's own scenario filter, so the scenarios it selects run without the
+capability gating, the opt-in sets and the expectation matrix described below,
+and the after-run GPU check does not apply. Use it to run a known scenario on a
+host that can satisfy it; use `E2E_ONLY_LIFECYCLE` with `E2E_ALSO_RUN_IDS` to
+select scenarios with the gating kept.
 
 ## Tags and per-scenario expectations
 
@@ -137,7 +188,7 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. On a lane that sets `E2E_EXPECT_GPU=1` a host with none fails the run instead; see "Lane verdict" above. |
 | `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
@@ -145,10 +196,10 @@ Scenarios carry stable-id and capability tags:
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
-| `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch that runs out of GPU memory so the OOM guidance can be verified without a GPU. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
+| `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch so `rocm serve`'s summary can be verified without a GPU: one that runs out of GPU memory (the OOM guidance), or, in its `ready` mode, one that becomes ready and then fails its smoke test. On Linux the same feature also carries a stand-in engine (`ROCM_E2E_SIMULATE_STARTUP_EXIT=1`) that logs a line and exits during startup, so the interactive startup wait's failure path runs for real. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
-| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios and the native-Windows vLLM refusal scenarios serve-33/34/35. |
+| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios, the native-Windows vLLM refusal scenarios serve-33/34/35, and the side-by-side runtime scenarios runtime-lifecycle-19/20/21. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
@@ -179,7 +230,11 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
-| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | Radeon PRO W7900 (self-hosted) | no |
+
+`e2e-gpu-strix-ubuntu` skips `pull_request` (one Linux GPU
+node and one Windows GPU pool per PR); it also skips `merge_group` and still runs on `push`
+and dispatch. The merge queue therefore has no native Linux GPU lane
+(MI300X skips it too); it runs only Windows Strix and WSL2.
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
@@ -190,18 +245,16 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow covers a strict superset of the hardware in the table
-above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
-`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-w7900`, `e2e-gpu-nightly-strix`,
+The nightly workflow runs the MI300X and the Strix Halo hardware from the
+table above as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
-counterpart — both were demoted from per-PR to nightly-only per ROCMAI-125 —
-so nightly is where their regression coverage now lives. The shared
-large-model scenario follows each lane's serve engine: it serves
-`Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P), and the
-`unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint (hardware-verified on
-Strix Halo) through Lemonade on every other lane (Strix Halo, R9700, W7900).
+grid. R9700, MI350P and W7900 no longer have a self-hosted nightly lane in
+`nightly.yml`: they run on the queue ([nightly-on-the-queue.md](../../docs/nightly-on-the-queue.md)),
+and the nightly report adds the queue's lanes to that grid. The shared large-model scenario follows each lane's serve engine: it
+serves `Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P),
+and the `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint (hardware-verified
+on Strix Halo) through Lemonade on every other lane (Strix Halo, R9700, W7900).
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on

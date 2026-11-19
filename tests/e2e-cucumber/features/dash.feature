@@ -75,7 +75,13 @@ Feature: Interactive dashboard
     When the user opens the dashboard
     And the user opens the Observe view
     Then the managed model is displayed
-    When the user quits the dashboard
+    When the user opens the managed services overlay
+    Then the Services overlay lists the managed model with its port
+    When the user asks to stop the listed service
+    Then a stop approval prompt names the managed model and its port
+    When the user declines the approval prompt
+    And the user closes the managed services overlay
+    And the user quits the dashboard
     Then the dashboard exits successfully
 
 
@@ -910,3 +916,203 @@ Feature: Interactive dashboard
     Then the CPU graph and the per-core strip sit side by side
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  Scenario: dash-52 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
+    Given a managed runtime is active
+    And the dashboard watches only managed services
+    And a GGUF model is being served on lemonade
+    Then the model responds to inference requests
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the real managed Lemonade model is displayed
+    When the user opens instance detail
+    Then the managed model's instance detail shows it ready on the port it was served on
+    When the user closes instance detail
+    And the user selects engine status in the Serving view
+    Then Lemonade is shown as a managed runtime installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the model responds to inference requests
+
+  @id:dash-lemonade-external-protocol-discovery @requires-os:linux
+  Scenario: dash-53 - External Lemonade protocol discovery displays every loaded model without adopting the service
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the user opens the managed services overlay
+    Then the Services overlay has no managed servers
+    When the user attempts to stop and restart the external models
+    Then the Services overlay closes without an approval prompt or job
+    And both loaded models are still displayed
+    And the external server received no lifecycle request and no managed record exists
+    When the user selects engine status in the Serving view
+    Then Lemonade is shown as externally running without a managed installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the external server received no lifecycle request and no managed record exists
+
+  @id:dash-lemonade-external-protocol-transitions @requires-os:linux
+  Scenario: dash-54 - External Lemonade protocol models disappear on unload, return on reload, and disappear again when the server stops responding
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the external Lemonade server unloads its second model
+    Then only the first model is displayed, with its throughput
+    When the external Lemonade server unloads every model
+    Then no loaded model is displayed and none are reported as discovered
+    When the external Lemonade server loads both models again
+    Then both loaded models are displayed with throughput shown as unknown
+    And the external server received no lifecycle request and no managed record exists
+    When the external Lemonade server stops responding
+    Then no loaded model is displayed and none are reported as discovered
+    When the user selects engine status in the Serving view
+    Then Lemonade returns to the managed installation status without external availability
+
+  # ROCMAI-1042: on a short terminal the Esc menu drew its bordered modal and
+  # nothing inside it — the wordmark plus all three rows did not fit, and the
+  # only guard was all-or-nothing. The selection stayed live behind the empty
+  # box, so ↑/↓ and Enter still worked on rows nobody could see.
+  #
+  # dash-34 already opens this menu, but only at the default geometry, where
+  # the logo layout fits and the bug is invisible. The unit sweep beside
+  # `ui/menu.rs` covers every height against the layout functions; this is the
+  # one place the real event loop, the real SIGWINCH resize and the real
+  # terminal are in the picture, which is where the empty box was actually
+  # seen.
+  #
+  # The box at this size holds two of the three rows, so what is asserted is
+  # the SELECTED row — drawn with its cursor and its whole label, before and
+  # after a move. That covers both halves of the fix: the fallback draws
+  # instead of returning, and its width floor keeps what it draws legible.
+  @id:dash-esc-menu-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-55 - The Esc menu still shows its selected action on a terminal too short for the logo
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user shrinks the terminal below the Esc menu's logo layout
+    And the user presses Escape
+    Then the dashboard menu shows Options as the selected action
+    When the user moves the dashboard menu selection down
+    Then the dashboard menu shows Help as the selected action
+    When the user presses Escape
+    Then the dashboard menu is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # Every live dashboard of a user shares one telemetry socket, and the daemon
+  # behind it runs inside whichever dashboard got there first. Closing that
+  # dashboard used to strand every other open one on "disconnected" until it
+  # was restarted; now a dashboard that is still open takes the daemon over
+  # and reconnects. Runs on the same simulated GPU-less host as dash-37, so
+  # the outcome does not depend on the runner's hardware. Unix only: there is
+  # no daemon socket on Windows.
+  @id:dash-second-session-survives-first-closing @requires-os:linux
+  Scenario: dash-56 - Closing one dashboard leaves another open dashboard connected
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the user opens a second dashboard
+    Then the second dashboard is connected to its telemetry daemon
+    When the user quits the first dashboard
+    Then the first dashboard exits successfully
+    And the second dashboard is connected to its telemetry daemon again
+
+  # A dashboard whose telemetry daemon cannot start says so once it closes,
+  # on the terminal it gives back, rather than inside the dashboard where the
+  # message would be drawn over. Something that is not a socket at the socket
+  # path is one such case: the daemon refuses to replace it, and the dashboard
+  # must say which path and why, and leave it alone. Same simulated GPU-less
+  # host as dash-37; Unix only, as there is no daemon socket on Windows.
+  @id:dash-reports-unusable-telemetry-socket-on-exit @requires-os:linux
+  Scenario: dash-57 - A dashboard whose telemetry daemon could not start says why after it closes
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # A daemon that takes over from one that stopped reads the benchmark results
+  # file from the start and sends a dashboard that connects to it every row
+  # again, so a dashboard that stays open through the hand-off must not add
+  # those rows to the ones it already lists. Same simulated GPU-less host as
+  # dash-37; Unix only, as there is no daemon socket on Windows.
+  @id:dash-handoff-lists-each-benchmark-result-once @requires-os:linux
+  Scenario: dash-58 - A dashboard that stays open through a hand-off lists each benchmark result once
+    Given a machine with no GPU
+    And two benchmark results have been recorded
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the user opens a second dashboard
+    And the user opens the Observe view of the second dashboard
+    Then the second dashboard lists each recorded benchmark result once
+    When the user quits the first dashboard
+    Then the first dashboard exits successfully
+    And the second dashboard is connected to its telemetry daemon again
+    And the second dashboard still lists each recorded benchmark result once
+
+  # A daemon that served and then stopped for good is reported as having
+  # stopped serving, not as unable to start. Its socket's directory becoming
+  # unreadable is one way: the daemon can no longer check that the path is its
+  # own and gives it up, and no client can reach it any more. A directory
+  # permission does not bind root, so `@requires-dir-permissions` skips this
+  # where the suite runs as root. Same simulated GPU-less host as dash-37.
+  @id:dash-reports-telemetry-daemon-that-stopped-serving @requires-os:linux @requires-dir-permissions
+  Scenario: dash-59 - A dashboard whose telemetry daemon stopped serving says so after it closes
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the folder holding the dashboard's telemetry socket stops being readable
+    And the dashboard stays open until its telemetry daemon stops serving
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the dashboard reports that its telemetry daemon stopped serving
+
+  # The same report when the dashboard is ended with Ctrl-C instead of quit.
+  # A typed Ctrl-C, like a SIGINT or SIGTERM, ends the process inside the
+  # dashboard, so nothing after it in `rocm dash` runs; the report is printed
+  # from that exit path instead, once the terminal is restored. Same setup as
+  # dash-57; the dashboard is drawn (and so in raw mode, where Ctrl-C is a key)
+  # before the keystroke is sent.
+  @id:dash-reports-unusable-telemetry-socket-on-ctrl-c @requires-os:linux
+  Scenario: dash-60 - A dashboard ended with Ctrl-C still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The same report when the dashboard is ended by a SIGTERM (a supervisor
+  # stopping it): the signal watcher ends the process inside the dashboard and
+  # prints the report from there, as for dash-60. Same setup as dash-57.
+  @id:dash-reports-unusable-telemetry-socket-on-sigterm @requires-os:linux
+  Scenario: dash-61 - A dashboard ended by a SIGTERM still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the dashboard receives a SIGTERM
+    Then the dashboard exits from the signal with code 143
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The same for an externally delivered SIGINT (`kill -INT`), which takes the
+  # signal watcher's path, not the typed Ctrl-C of dash-60. Same setup as
+  # dash-57.
+  @id:dash-reports-unusable-telemetry-socket-on-sigint @requires-os:linux
+  Scenario: dash-62 - A dashboard ended by a SIGINT still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the dashboard receives a SIGINT
+    Then the dashboard exits from the signal with code 130
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place

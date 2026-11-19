@@ -8,8 +8,9 @@
 //! telemetry daemon's [`RunnerOptions`] — wiring `services_dir =
 //! AppPaths::services_dir()` so the managed services that `rocm serve --managed`
 //! writes there surface live in the dashboard (the D7 registry→scrape→`gen_tps`
-//! seam) — auto-starts an embedded daemon when none is already listening, and
-//! runs the ratatui dashboard TUI.
+//! seam) — keeps the embedded telemetry daemon available through
+//! [`crate::dash_daemon`] (served by whichever open dashboard owns the socket),
+//! and runs the ratatui dashboard TUI.
 //!
 //! The rest of `rocm` is synchronous; the async daemon/TUI run on a tokio
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
@@ -58,10 +59,11 @@ pub fn runner_options(
         instance_tick: Duration::from_secs_f64(d.instance_tick_secs),
         disable_vllm_metrics: false,
         vllm_metrics_host: "127.0.0.1".into(),
-        // Lemonade discovery stays opt-in (mirrors a no-flag embedded daemon).
-        enable_lemonade: false,
-        lemonade_host: "127.0.0.1".into(),
-        lemonade_port: 13305,
+        // Read-only discovery of local external Lemonade; managed registry
+        // discovery remains independent of this switch.
+        enable_lemonade: d.enable_lemonade,
+        lemonade_host: d.lemonade_host.clone(),
+        lemonade_port: d.lemonade_port,
         persist_dir: Some(paths.telemetry_state_dir()),
         // D7 seam consumer: managed services from `rocm serve --managed`.
         services_dir: Some(paths.services_dir()),
@@ -129,12 +131,12 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
 /// been deleted — leaves the directive frozen at its last value, pinning the
 /// logical clock rather than restoring wall time. The warning goes to `tracing`, not
 /// stdout/stderr. It is reached through [`runner_options`], which runtime code
-/// calls only from [`maybe_spawn_embedded_daemon`]; `run_async` calls that only
+/// calls only from [`crate::dash_daemon::spawn_keeper`]; `run_async` calls that only
 /// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for an
 /// interactive `rocm chat` (including the launcher's routes into them; a
 /// non-interactive `rocm chat` renders text and never enters `run_async`), not
 /// for a focused overlay or `rocm dash --replay`/`--demo`. All of this is
-/// unix-only: on Windows [`maybe_spawn_embedded_daemon`] never calls
+/// unix-only: on Windows [`crate::dash_daemon::spawn_keeper`] never calls
 /// [`runner_options`], so no entry point reaches the warning. On the paths that
 /// do reach it, the process is about to hand the terminal to the TUI, and the
 /// client log is file-only (see `logging.rs`), so a stray stdout/stderr write
@@ -211,9 +213,11 @@ fn runtime_summaries(paths: &AppPaths, config: &RocmCliConfig) -> Vec<RuntimeSum
     let active_key = config.active_runtime_key.as_deref();
     let prev_key = config.previous_runtime_key.as_deref();
     let default_id = config.default_runtime_id.as_deref();
-    // Mirror `render_runtimes_text`: a runtime is active by an explicit
-    // active_runtime_key, or — absent one — by being the single manifest whose
-    // runtime_id matches the configured default_runtime_id.
+    // The dash matches exactly: a runtime is active when its key equals
+    // active_runtime_key, or, with no active_runtime_key, when it is the single
+    // runtime whose id equals default_runtime_id; it is the rollback target
+    // when its key equals previous_runtime_key. docs/json-output.md compares
+    // these rules with what `rocm runtimes list` marks.
     let default_matches: Vec<&str> = manifests
         .iter()
         .filter(|m| Some(m.runtime_id.as_str()) == default_id)
@@ -256,6 +260,29 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
             mode: config.effective_watcher_mode(w).as_str().to_string(),
         })
         .collect()
+}
+
+/// Read-only managed-engine inventory, independent of GPU telemetry and
+/// endpoint liveness. An unavailable detect response means unknown, not absent.
+fn lemonade_managed_installed(paths: &AppPaths) -> Option<bool> {
+    let detect = crate::engine_ipc::engine_request::<_, rocm_engine_protocol::DetectResponse>(
+        Some(paths),
+        "lemonade",
+        rocm_engine_protocol::EngineMethod::Detect,
+        &rocm_engine_protocol::DetectRequest::default(),
+    )
+    .ok();
+    managed_installed_from_detect(detect.as_ref())
+}
+
+/// Pure verdict over a Detect result: `None` when Detect failed (unknown, not
+/// absent); otherwise installed only counts when the runtime is managed. A
+/// legacy response without `managed_env` is not proof of a managed install.
+fn managed_installed_from_detect(
+    detect: Option<&rocm_engine_protocol::DetectResponse>,
+) -> Option<bool> {
+    let detect = detect?;
+    Some(detect.installed && detect.managed_env == Some(true))
 }
 
 /// Resolve the TUI args from the unified config + environment.
@@ -328,6 +355,7 @@ pub fn resolved_args(
         // `resolved_args` itself has no opinion, so this always starts `false`
         // here.
         launcher_hosted: false,
+        lemonade_managed_installed: lemonade_managed_installed(paths),
     }
 }
 
@@ -344,9 +372,10 @@ pub fn resolved_args(
 /// is open, and the only source of truth at all on Windows, where
 /// `rocm_dash_tui::client`'s `#[cfg(windows)]` arm does connect and stream
 /// live GPU/CPU/memory every tick but — by design, there being no
-/// `rocmdashd` unix socket to source one from (`maybe_spawn_embedded_daemon`
-/// is unix-only) — never sends an instance snapshot, so
-/// `AppState::instances` never gets a first one there.
+/// `rocmdashd` unix socket to source one from (`dash_daemon::spawn_keeper`
+/// is unix-only) — never sends an instance snapshot, so this probe is also
+/// where `AppState::instances` comes from there: the dashboard polls it
+/// (`ManagedRegistrySnapshot::instances`) once a second off the UI thread.
 ///
 /// **Known divergence, same shape as [`services_past_attempts`]'s:** this
 /// reads the record's raw on-disk `status`, not process liveness. A service
@@ -366,9 +395,29 @@ impl ManagedRegistryProbe for LiveManagedRegistryProbe {
         let discovery = discover_managed_services(&records);
         ManagedRegistrySnapshot {
             has_live_service: discovery.svcs.iter().any(|svc| svc.status.is_serving()),
+            instances: managed_instances(&discovery),
             managed_ids: discovery.seen,
         }
     }
+}
+
+/// The live managed services as dashboard instances with no telemetry yet —
+/// the same mapping the daemon applies to a newly discovered service.
+fn managed_instances(
+    discovery: &rocm_dash_daemon::registry::ManagedDiscovery,
+) -> Vec<rocm_dash_core::metrics::Instance> {
+    discovery
+        .svcs
+        .iter()
+        .map(|svc| {
+            rocm_dash_core::traits::merge_instance(
+                svc,
+                &rocm_dash_core::traits::InstanceSample::default(),
+                0,
+                0,
+            )
+        })
+        .collect()
 }
 
 /// Managed-service records that are no longer running, read from the same
@@ -706,18 +755,7 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
 fn launcher_serving_instances(paths: &AppPaths) -> Vec<rocm_dash_core::metrics::Instance> {
     use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
     let records = load_service_records(&paths.services_dir());
-    discover_managed_services(&records)
-        .svcs
-        .into_iter()
-        .map(|svc| rocm_dash_core::metrics::Instance {
-            container_id: svc.container_id,
-            container_name: svc.container_name,
-            model_name: svc.model_name,
-            status: svc.status,
-            port: svc.port,
-            ..Default::default()
-        })
-        .collect()
+    managed_instances(&discover_managed_services(&records))
 }
 
 /// Entry point for a focused launcher flow (Set up / Serve / Diagnose).
@@ -995,27 +1033,43 @@ async fn run_async(
     // A live daemon is only needed for a connected full dashboard; replay/demo
     // feeds events straight into the TUI, and a focused host draws no telemetry
     // and streams its own job via the job-bridge — both skip the embedded daemon.
-    let embedded = if should_spawn_daemon(&args) {
-        maybe_spawn_embedded_daemon(&args.connect, &config, &paths).await
+    let keeper = if should_spawn_daemon(&args) {
+        crate::dash_daemon::spawn_keeper(&args.connect, &config, &paths).await
     } else {
         None
     };
 
+    // A signal or a typed Ctrl-C ends the process inside the TUI, so the
+    // report after `run` below never runs on those exits; this prints it from
+    // there instead. Dropped as soon as `run` returns, so after that only the
+    // report below is printed -- except for a signal that resolved in the
+    // instant before `run` cancelled its watcher (see `set_pre_exit_hook` in
+    // rocm-dash-tui's `app/terminal.rs`), which can print it once more.
+    let report_on_forced_exit = keeper
+        .as_ref()
+        .map(|keeper| crate::dash_daemon::report_on_forced_exit(keeper, paths.client_log_dir()));
     let result = rocm_dash_tui::app::run(args)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()));
+    drop(report_on_forced_exit);
 
-    // Tidy up the embedded daemon on exit (best-effort).
-    if let Some((handle, socket)) = embedded {
-        handle.abort();
-        if let Some(path) = socket {
-            let _ = std::fs::remove_file(path);
-        }
+    // Stop this dashboard's keeper before the runtime goes. If it owned the
+    // daemon, that removes the daemon's socket so another open dashboard can
+    // take over; if it did not, the owner's socket is left alone.
+    if let Some(keeper) = keeper
+        && let Some(failure) = crate::dash_daemon::stop_keeper(keeper).await
+    {
+        // The TUI has left the alternate screen by now, so this lands on the
+        // terminal instead of inside the dashboard.
+        eprintln!(
+            "{}",
+            crate::dash_daemon::failure_report(&failure, &paths.client_log_dir())
+        );
     }
     result
 }
 
-/// Whether `run_async` should auto-start the embedded telemetry daemon: only for
+/// Whether `run_async` should run the embedded telemetry daemon's keeper: only for
 /// a live, non-replay FULL dashboard. A focused host (`args.focus.is_some()`)
 /// draws no telemetry and streams its own job via the job-bridge, so it needs no
 /// daemon — and must not re-surface the socket-crash class for a flow that never
@@ -1025,60 +1079,66 @@ const fn should_spawn_daemon(args: &ResolvedArgs) -> bool {
     args.replay.is_none() && args.focus.is_none()
 }
 
-/// Auto-start an embedded telemetry daemon when no local one is already
-/// listening, so `rocm dash` works without a separate `rocm daemon` terminal.
-/// Returns the task handle + socket to clean up on exit, or `None` when an
-/// existing daemon was found (we connect to it instead).
-// One function with `#[cfg]` blocks inside, not a cfg-split pair: the unix
-// body awaits, the Windows body does not. Callers `.await` this either way,
-// so dropping `async` off unix would not compile.
-#[allow(clippy::unused_async)]
-async fn maybe_spawn_embedded_daemon(
-    connect: &str,
-    config: &RocmCliConfig,
-    paths: &AppPaths,
-) -> Option<(tokio::task::JoinHandle<()>, Option<PathBuf>)> {
-    #[cfg(unix)]
-    {
-        // Only auto-manage a LOCAL unix-socket daemon.
-        let target = connect.strip_prefix("unix:")?;
-        if tokio::net::UnixStream::connect(target).await.is_ok() {
-            return None; // a daemon already answers here
-        }
-
-        let opts = runner_options(config, paths, false);
-        let listen = connect.to_string();
-        let socket = Some(PathBuf::from(target));
-
-        let handle = tokio::spawn(async move {
-            if let Err(e) = rocm_dash_daemon::server::run(&listen, opts).await {
-                eprintln!("rocm: embedded telemetry daemon exited: {e:#}");
-            }
-        });
-        // Poll until the daemon has bound and is accepting connections.
-        // A fixed sleep is race-prone on slow or loaded systems.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if tokio::net::UnixStream::connect(target).await.is_ok() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break; // Proceed anyway; the TUI client will retry with backoff.
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        Some((handle, socket))
-    }
-    #[cfg(windows)]
-    {
-        let _ = (connect, config, paths);
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detect(installed: bool, managed_env: Option<bool>) -> rocm_engine_protocol::DetectResponse {
+        let mut v = serde_json::json!({
+            "installed": installed, "env_id": null, "python_version": null,
+            "torch_version": null, "transformers_version": null,
+            "available_devices": [], "notes": [],
+            "capabilities": {"cpu": false, "rocm_gpu": false, "openai_compatible": true,
+                "tool_calling": false, "quantized_models": "", "reasoning_parser": false}
+        });
+        if let Some(m) = managed_env {
+            v["managed_env"] = m.into();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn managed_installed_verdict_follows_detect_result() {
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(true)))),
+            Some(true)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(false)))),
+            Some(false)
+        );
+        // Legacy response without the ownership field proves nothing managed.
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, None))),
+            Some(false)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(false, Some(true)))),
+            Some(false)
+        );
+        // A failed Detect is unknown, never "not installed".
+        assert_eq!(managed_installed_from_detect(None), None);
+    }
+
+    #[test]
+    fn lemonade_discovery_defaults_and_overrides_reach_daemon() {
+        let default = runner_options(&RocmCliConfig::default(), &paths(), false);
+        assert!(default.enable_lemonade);
+        assert_eq!(default.lemonade_host, "127.0.0.1");
+        assert_eq!(default.lemonade_port, 13305);
+        let config: RocmCliConfig = serde_json::from_str(
+            r#"{
+            "dashboard": {"daemon": {"enable_lemonade": false,
+                "lemonade_host": "localhost", "lemonade_port": 14567}}
+        }"#,
+        )
+        .unwrap();
+        let overridden = runner_options(&config, &paths(), false);
+        assert!(!overridden.enable_lemonade);
+        assert_eq!(overridden.lemonade_host, "localhost");
+        assert_eq!(overridden.lemonade_port, 14567);
+        assert_eq!(overridden.services_dir, Some(paths().services_dir()));
+    }
 
     fn cfg() -> RocmCliConfig {
         RocmCliConfig::default()
@@ -1157,8 +1217,10 @@ mod tests {
     /// `running`, and there is no process or listener behind it. That status
     /// string is the whole of what decides the count — this path never consults
     /// a pid and never probes the port, and the on-disk view it deserializes
-    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
-    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) does carry pid fields
+    /// now, for the daemon's process attribution. Discovery on this path derives
+    /// ancestry roots from them too, but the count asserted here comes from the
+    /// record's status string alone and never reads a pid. Asserting 0 is asserting that no refresh happens on this path —
     /// if someone later adds one, this test fails and they are pointed at the
     /// doc comment explaining the trade-off rather than silently flipping a
     /// launch-time read into network I/O.
@@ -1295,6 +1357,61 @@ mod tests {
             !probe_snapshot(&args).has_live_service,
             "the probe must reflect the current registry state, not a one-shot snapshot"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows has no daemon, so the dashboard's instance list comes from the
+    /// probe's `instances` (see `AppState::push_host_gpu_snapshot`). A ready
+    /// Lemonade record must come through with its model and port; a stopped
+    /// record and one with no bound port must not.
+    #[test]
+    fn live_registry_probe_carries_the_live_managed_instances() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "probe-instances-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"lemonade-qwen","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M","port":11436,"status":"ready","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("stopped.json"),
+            br#"{"service_id":"lemonade-old","engine":"lemonade","model_ref":"Qwen/Qwen2.5-1.5B-Instruct","port":11435,"status":"stopped","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"lemonade-unbound","engine":"lemonade","port":0,"status":"ready","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        let instances = probe_snapshot(&args).instances;
+        assert_eq!(
+            instances.len(),
+            1,
+            "only the live, bound record: {instances:?}"
+        );
+        let inst = &instances[0];
+        assert_eq!(inst.container_id, "lemonade-qwen");
+        assert_eq!(inst.model_name, "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M");
+        assert_eq!(inst.port, Some(11436));
+        assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1627,7 +1744,7 @@ mod tests {
         assert!(!opts.enable_docker);
     }
 
-    /// EAI-7359 regression: the embedded daemon (`maybe_spawn_embedded_daemon`)
+    /// EAI-7359 regression: the embedded daemon (`dash_daemon::spawn_keeper`)
     /// always calls `runner_options(.., enable_docker=false)`, so the vLLM
     /// Prometheus scraper must NOT be gated on `enable_docker` — otherwise it
     /// is permanently dead in the common no-Docker / managed-vLLM case even
@@ -1913,6 +2030,9 @@ mod tests {
         assert_eq!(inst.model_name, "meta-llama/Llama-3.1-8B");
         assert_eq!(inst.port, Some(11435));
         assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
+        // Registry records are owned by this CLI; the flag must survive the map
+        // so lifecycle surfaces treat the launcher row as managed.
+        assert!(inst.managed, "registry-owned record must stay managed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

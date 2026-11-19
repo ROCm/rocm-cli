@@ -24,6 +24,7 @@ mod cli_report;
 mod comfyui;
 mod config_cmd;
 mod dash;
+mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
@@ -61,6 +62,7 @@ mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
 mod serve_port;
+mod serve_progress;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;
@@ -72,6 +74,7 @@ mod services_text;
 mod setup_cmd;
 mod shell_quote;
 mod storage;
+mod symptom_input;
 mod system_packages;
 #[cfg(test)]
 mod test_support;
@@ -659,6 +662,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose {
             symptom,
+            symptom_file,
+            engine,
             top,
             json,
             distro,
@@ -668,8 +673,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             report,
             send,
         }) => {
+            let symptom = symptom_input::resolve(symptom, symptom_file.as_deref())
+                .map_err(|error| clap_exit_code(symptom_input::usage_error(&error)))?;
             let model = model.map(|model_ref| {
                 diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            let symptom = symptom.map(|text| diagnose_cmd::SymptomQuery {
+                text,
+                engine: engine.map(Into::into),
             });
             diagnose(symptom, top, json, distro, model, report, send)
         }
@@ -753,6 +764,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let arguments = serde_json::from_str(arguments_json.trim_start_matches('\u{feff}'))
                 .with_context(|| format!("failed to parse arguments JSON for `{name}`"))?;
+            let arguments = chat::mcp_call_cli_arguments(&name, arguments)?;
             let value = chat::run_internal_mcp_call(&paths, &name, arguments, allow_mutation)?;
             println!("{}", serde_json::to_string(&value)?);
             Ok(())
@@ -1270,6 +1282,134 @@ pub(crate) mod tests {
         );
     }
 
+    /// The catalog manifest tells a caller that exit 2 is shared between an
+    /// unknown fix-id and a malformed command line. That claim is about clap,
+    /// which only this crate links, so it is proved here: a bad `rocm fix`
+    /// command line really exits with the code published for `unknown_id`,
+    /// through the same `clap_exit_code -> exit_code_for` chain `main` uses,
+    /// and the refusal has a line starting with the `error:` the description
+    /// tells a caller to look for (not `Usage:`, which a missing value does not
+    /// print). The
+    /// description's own wording is pinned in
+    /// `rocm-core` (`the_unknown_id_description_names_the_usage_error_it_shares_a_code_with`).
+    #[test]
+    fn a_usage_error_exits_with_the_code_published_for_an_unknown_fix_id() {
+        let manifest = rocm_core::catalog_manifest();
+        let published = manifest.exit_codes["unknown_id"];
+        for argv in [
+            &["rocm", "fix", "--no-such-option"][..],
+            &["rocm", "fix", "fix-9-igpu-dgpu", "--device-index"][..],
+            &[
+                "rocm",
+                "fix",
+                "fix-9-igpu-dgpu",
+                "--device-index",
+                "not-a-number",
+            ][..],
+        ] {
+            let err = super::cli_command()
+                .try_get_matches_from(argv)
+                .expect_err("a malformed command line must be a parse error");
+            let rendered = err.render().to_string();
+            assert!(
+                rendered.lines().any(|line| line.starts_with("error:"))
+                    && !rendered.contains(rocm_core::fix_exit::UNKNOWN_ID_PREFIX),
+                "{argv:?}: the description promises `error:` and no unknown-id message:\n{rendered}"
+            );
+            let result: Result<()> = Err(super::clap_exit_code(err));
+            assert_eq!(
+                super::exit_code_for(result),
+                ExitCode::from(published as u8),
+                "{argv:?}: a usage error must exit with the code the manifest names for it"
+            );
+        }
+        assert!(
+            manifest.exit_code_descriptions["unknown_id"].contains("malformed command line"),
+            "the published description must warn that a usage error exits {published} too"
+        );
+    }
+
+    /// A negative device index exits with one of two published codes, and the
+    /// catalog says which by how it is written: `--device-index=-1` reaches the
+    /// fix, which refuses it as `not_applicable`; `--device-index -1` never gets
+    /// past the parser, which reads `-1` as an unknown option, a usage error that
+    /// exits with the `unknown_id` code. Both go through the real parser and
+    /// the same exit path `main` uses, the first through `dispatch` as well.
+    /// Under `--dry-run`, so a lost guard in the runner would only preview.
+    ///
+    /// "Reaches the fix" holds on Windows and Linux, where fix-9 applies. On
+    /// WSL it does not apply, so `apply` returns 3 from the platform gate before
+    /// the runner, and the `=-1` half cannot notice a lost runner guard there;
+    /// `a_negative_device_index_is_not_applicable_and_nothing_runs` in
+    /// `rocm-core`'s `fix/runners.rs` holds the guard on every host.
+    #[test]
+    fn a_negative_device_index_reaches_the_fix_only_when_written_with_equals() {
+        let manifest = rocm_core::catalog_manifest();
+        let not_applicable = manifest.exit_codes["not_applicable"];
+        let unknown_id = manifest.exit_codes["unknown_id"];
+
+        let cli = super::Cli::try_parse_from([
+            "rocm",
+            "fix",
+            "fix-9-igpu-dgpu",
+            "--device-index=-1",
+            "--dry-run",
+        ])
+        .expect("`--device-index=-1` must parse: the fix, not the parser, refuses it");
+        assert!(
+            matches!(
+                cli.command,
+                Some(super::Command::Fix {
+                    device_index: Some(-1),
+                    ..
+                })
+            ),
+            "the parsed value must be -1"
+        );
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        let result = super::dispatch(cli);
+        drop(env);
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(not_applicable as u8),
+            "`--device-index=-1` must exit with the code published as not_applicable"
+        );
+
+        let err = super::cli_command()
+            .try_get_matches_from([
+                "rocm",
+                "fix",
+                "fix-9-igpu-dgpu",
+                "--device-index",
+                "-1",
+                "--dry-run",
+            ])
+            .expect_err("`--device-index -1` must be a usage error");
+        let rendered = err.render().to_string();
+        assert!(
+            rendered.lines().any(|line| line.starts_with("error:"))
+                && !rendered.contains(rocm_core::fix_exit::UNKNOWN_ID_PREFIX),
+            "`--device-index -1` must be refused as a usage error:\n{rendered}"
+        );
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(unknown_id as u8),
+            "`--device-index -1` must exit with the code published as unknown_id"
+        );
+
+        for (name, spelling) in [
+            ("not_applicable", "`--device-index=-1`"),
+            ("unknown_id", "`--device-index -1`"),
+        ] {
+            assert!(
+                manifest.exit_code_descriptions[name].contains(spelling),
+                "the {name} description must name {spelling}"
+            );
+        }
+    }
+
     /// Any other error must still fail with exit 1, matching what
     /// `Result<(), anyhow::Error>`'s `Termination` impl already does today for
     /// every subcommand other than `fix`.
@@ -1761,7 +1901,7 @@ pub(crate) mod tests {
         Ok(record)
     }
 
-    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// Everything [`plant_service_record`] writes *except* the owner-only endpoint
     /// key: the manifest, the log, and the engine state file.
     ///
     /// Split out for the launch-lock test below, which writes the key itself —

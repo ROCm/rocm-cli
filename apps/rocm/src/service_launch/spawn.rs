@@ -392,6 +392,23 @@ fn test_spawn_hook() -> Option<std::rc::Rc<SpawnOverride<'static>>> {
     TEST_SPAWN_HOOK.with(|hook| hook.borrow().clone())
 }
 
+/// The stand-in engine behind [`super::readiness::e2e_simulate_startup_exit`]:
+/// a shell that appends to the launch's own log and exits during startup.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+fn simulated_startup_exit_spawner(log_path: &Path) -> Box<SpawnOverride<'static>> {
+    let log_path = log_path.to_path_buf();
+    Box::new(move |_command| {
+        let log = fs::OpenOptions::new().append(true).open(&log_path)?;
+        let stderr = log.try_clone()?;
+        ProcessCommand::new("sh")
+            .args(["-c", super::readiness::SIMULATED_STARTUP_EXIT_SCRIPT])
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(stderr)
+            .spawn()
+    })
+}
+
 #[cfg(not(windows))]
 type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> + 'a;
 
@@ -519,6 +536,11 @@ fn launch_managed_engine_child_locked(
         let hook = test_spawn_hook();
         #[cfg(all(test, not(windows)))]
         let spawn_override = spawn_override.or(hook.as_deref());
+        #[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+        let stand_in = super::readiness::e2e_simulate_startup_exit()
+            .then(|| simulated_startup_exit_spawner(&record.log_path));
+        #[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+        let spawn_override = spawn_override.or(stand_in.as_deref());
         let mut child = match spawn_override {
             Some(spawn) => spawn(&mut command),
             None => command.spawn(),

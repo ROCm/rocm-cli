@@ -264,7 +264,9 @@ pub(super) const KEYWORDS_PAGE_FAULT: KeywordTable = &[
 // vLLM's OOM apart from an arbitrary training script hitting the same
 // allocator error. `check_16_vllm_oom` therefore scores *only* the lines
 // carrying `VLLM_ANCHOR_PATTERN` (see `vllm_anchored_lines`), never the whole
-// pasted log: an OOM on an unanchored line contributes nothing at all.
+// pasted log: an OOM on an unanchored line contributes nothing at all. The one
+// exception is a symptom the user says came from vLLM (`rocm diagnose --engine
+// vllm`), where every non-blank line is vLLM's by their account and scores.
 //
 // Weighting splits the *allocator message* from the *exception class name*:
 //   - The HIP allocator's own messages (`HIP out of memory`, the
@@ -465,6 +467,9 @@ pub(super) fn finalize(
         score: score.min(100),
         evidence,
         fix: Some(fix),
+        // Not a checker's call: `diagnose` sets it by comparing against a run
+        // with no symptom.
+        symptom_matched: false,
     }
 }
 

@@ -47,6 +47,21 @@ pub(crate) fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'st
     }
 }
 
+/// The torch and torchvision series (`major.minor` prefixes, e.g. `("2.13",
+/// "0.28")`) the discover table pairs for `rocm_sdk_version`'s ROCm `major.minor`
+/// line. `None` for a line with no row.
+///
+/// Read by `rocm install sdk` so the SDK resolves the same pair the vLLM install
+/// realigns onto. Left to `uv`, torch resolves to the newest build on the index
+/// while torchvision's metadata names no exact torch, so the two can land on a
+/// pair whose torchvision cannot register its operators.
+pub(crate) fn verified_torch_stack_series(
+    rocm_sdk_version: &str,
+) -> Option<(&'static str, &'static str)> {
+    let build = vllm_rocm_discover_build(rocm_sdk_version)?;
+    Some((build.torch_version_prefix, build.torchvision_version_prefix))
+}
+
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
 /// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
 /// a ROCm SDK major version, ignoring minor, patch, and any dev/pre-release
@@ -317,7 +332,7 @@ mod tests {
         // with no row still fails closed instead of taking the 7.2.3 default
         // pin; other lines (and unparsable text) resolve that default.
         assert_eq!(
-            discover_readers(Some("10.2.0")),
+            discover_readers(Some("10.3.0")),
             DiscoverReaders {
                 row: None,
                 route: VllmInstallRoute::Static,
@@ -525,15 +540,39 @@ mod tests {
             Some("2.11.0.2")
         );
         assert_eq!(verified_torchaudio_release("10.0.0"), None);
+        // The 10.2 row's torchaudio is a series match, hardware-unverified.
         assert_eq!(verified_torchaudio_release("10.2.0"), None);
         assert_eq!(verified_torchaudio_release("7.2.3"), None);
+    }
+    /// The SDK resolves the pair this table verified, not whatever `uv` finds
+    /// newest, and a line with no row is left to `uv`.
+    #[test]
+    fn verified_torch_stack_series_is_the_row_pairing() {
+        assert_eq!(
+            verified_torch_stack_series("10.1.0"),
+            Some(("2.13", "0.28"))
+        );
+        assert_eq!(
+            verified_torch_stack_series("10.1.0a20260928"),
+            Some(("2.13", "0.28"))
+        );
+        assert_eq!(
+            verified_torch_stack_series("10.0.0"),
+            Some(("2.12", "0.27"))
+        );
+        assert_eq!(
+            verified_torch_stack_series("10.2.0"),
+            Some(("2.14", "0.29"))
+        );
+        assert_eq!(verified_torch_stack_series("10.3.0"), None);
+        assert_eq!(verified_torch_stack_series("7.2.3"), None);
     }
     /// An unknown 10.x line fails closed rather than silently resolving the
     /// static table's 7.2.3 pin, which is the whole point of keeping
     /// [`rocm_sdk_major_matches`] alongside the narrower row lookup.
     #[test]
     fn unknown_rocm10_line_still_fails_closed() {
-        let err = install_target(None, Some("10.2.0")).expect_err("10.2.0 has no vLLM build");
+        let err = install_target(None, Some("10.3.0")).expect_err("10.3.0 has no vLLM build");
         let rendered = format!("{err:#}");
         assert!(
             !rendered.contains("7.2.3"),

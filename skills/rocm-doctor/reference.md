@@ -101,11 +101,11 @@ id is refused, and the refusal exits 1 (see the table). Exit codes:
 
 | code | meaning |
 | --- | --- |
-| 0 | applied / dry-run / print-only plan / list |
+| 0 | applied / dry-run (except the Windows read failure under 4) / print-only plan / list |
 | 1 | internal error; also the refusal of `--json` together with a fix id |
 | 2 | usage error (incl. unknown fix-id) |
 | 3 | not applicable on this host (OS mismatch, negative `--device-index`) — nothing changed |
-| 4 | attempted but the command failed |
+| 4 | attempted but the command failed or timed out; after a timeout the change may be partial — the message names how to check it and what to re-run (an older CLI instead prints `exited 124` or `exited -1` with `NOT changed`; see step 3 in [SKILL.md](SKILL.md)). Also, on Windows only, `fix-2-unset-override`, `fix-6-path` or `fix-9-igpu-dgpu --device-index N` when it could not read the current value of the variable it changes, `--dry-run` included — nothing changed and no plan shown; the catalog entry printed first is the fix's generic description, not a preview of the change on this machine |
 | 5 | user declined at the prompt |
 
 Three ids are ever auto-applicable — never four, and `fix-9-igpu-dgpu` is not
@@ -134,8 +134,10 @@ a promise that the runner mutates anything, and — per the per-host list above 
 not the same claim on Windows or WSL2 for the one entry whose behaviour
 depends on more than the host alone.
 
-The ones that do mutate print the exact command, honor `--dry-run`, refuse on a
-non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
+The ones that do mutate print the exact command, honor `--dry-run` (on
+Windows a dry run whose read fails exits 4 with no plan; see 4 in the exit-code
+table), refuse on a non-interactive shell without `--yes`, and confirm first.
+**Two exceptions:**
 
 - **`fix-2-unset-override` mutates on Windows only.** Its Linux runner reports
   where the override is set and which rc files carry it, then stops — it will
@@ -166,7 +168,7 @@ reporting confident nonsense.
 | `fix-5-amdgpu-load` | linux | `amdgpu` module not loaded (or blacklisted) | "ROCk module is NOT loaded", blacklist entry, Secure Boot | print-only |
 | `fix-6-path` | linux/windows/wsl | ROCm/HIP binaries not on PATH after install | `rocminfo: command not found`, `hipInfo` missing from PATH | auto |
 | `fix-7-stale-repos` | linux | Stale/conflicting APT/DNF/zypper repos from prior installer runs | apt 404 `repo.radeon.com`, unmet deps, ≥2 ROCm repo files | print-only |
-| `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm major than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | print-only |
+| `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm X.Y release than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | print-only |
 | `fix-9-igpu-dgpu` | linux/windows | iGPU enumerated alongside dGPU, destabilising the runtime | APU + discrete AMD present, `HIP_VISIBLE_DEVICES` unset, crash/segfault | needs-arg |
 | `fix-10-container` | linux | Container can't see `/dev/kfd` or `/dev/dri/renderD*` | running in docker/podman, kfd/render devices missing | print-only |
 | `fix-11-iommu` | linux | Multi-GPU hang with IOMMU enabled | ≥2 AMD GPUs, `iommu=` not `pt`, hang/deadlock/timeout | print-only |

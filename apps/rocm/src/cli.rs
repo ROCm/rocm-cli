@@ -13,8 +13,8 @@
 //! keeps reaching them as `crate::Command`, `crate::Provider` and so on.
 
 pub(crate) use crate::cli_args::{
-    DevicePolicyArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider, SandboxToolArg,
-    TelemetryModeArg, WatcherModeArg,
+    DevicePolicyArg, DiagnoseEngineArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider,
+    SandboxToolArg, TelemetryModeArg, WatcherModeArg,
 };
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::{bootstrap, chat, comfyui, remote, storage};
@@ -23,8 +23,13 @@ use rocm_core::DEFAULT_LOCAL_HOST;
 use std::path::PathBuf;
 
 /// User-selectable serving engines, in the order shown in `--help` and shell
-/// completions. Used as the clap `value_parser` for every user-facing `--engine`
-/// argument so the possible values stay in sync across the CLI surface.
+/// completions. Used as the clap `value_parser` for every user-facing argument
+/// that names an engine to serve, install, open a shell in or set as a
+/// preference (`serve --engine`, `engines install`/`shell`, and the
+/// engine-setting `config` commands), so the possible values stay in sync
+/// across those commands.
+/// `diagnose --engine` is narrower on purpose: it takes `DiagnoseEngineArg`,
+/// only the engines the diagnosis catalog tells apart.
 pub(crate) const SUPPORTED_ENGINES: [&str; 3] = ["lemonade", "vllm", "aim"];
 
 #[derive(Parser, Debug)]
@@ -96,8 +101,65 @@ pub(crate) enum Command {
     /// takes the id, not the position.
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring.
-        #[arg(long)]
+        ///
+        /// A shell reads this text before `rocm` does, so quotes, `$(...)`
+        /// and a leading `-` in a pasted error can be changed, run, or taken
+        /// as a flag. Use `--symptom-file` to hand over a paste untouched.
+        ///
+        /// Each match then says whether this text contributed to it
+        /// (`symptom_matched` in --json).
+        //
+        // `symptom_source` groups the two symptom flags for `--engine`, which
+        // needs a symptom from either. A plain `requires = "symptom"` also let
+        // `--symptom-file` through, but only because clap waives a requirement
+        // on an argument that conflicts with one present; the group says what
+        // is meant. It does not change how the two flags refuse each other:
+        // `--symptom-file`'s own `conflicts_with` still does that.
+        #[arg(long, value_name = "TEXT", group = "symptom_source")]
         symptom: Option<String>,
+        /// Read the error text from a file instead, or from standard input
+        /// when PATH is `-`, so no shell quoting is needed. A file named `-`
+        /// is passed as `./-`.
+        ///
+        /// The text that arrives is matched as `--symptom` would match it,
+        /// with one trailing line break removed (shells and editors add one).
+        /// A UTF-8 byte-order mark is dropped, and a file with a UTF-16
+        /// byte-order mark, as Windows PowerShell's `>` writes, is decoded;
+        /// anything else must be UTF-8. An unreadable file, input that is not
+        /// text, or input larger than 16 MiB is a usage error (exit code 2).
+        /// For example: `rocm diagnose --symptom-file error.txt`. In
+        /// PowerShell, save the clipboard first
+        /// (`Get-Clipboard -Raw > error.txt`): Windows PowerShell 5.1 pipes
+        /// text to a program as ASCII, turning any other character into `?`.
+        /// With nothing piped in, paste the text at the terminal and end it
+        /// with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "symptom",
+            group = "symptom_source"
+        )]
+        symptom_file: Option<PathBuf>,
+        /// The engine the symptom came from (`--symptom` or `--symptom-file`),
+        /// so it can be matched as that engine's error without editing it.
+        ///
+        /// Some failure modes belong to one engine, and the error it prints
+        /// (a PyTorch out-of-memory error, for one) is the same text any other
+        /// program could print. Without this, such an entry matches only a
+        /// line that names the engine itself. With it, every non-blank line of
+        /// the symptom is taken as that engine's, the symptom is used exactly
+        /// as given (from a file, as read: one trailing line break removed),
+        /// and the JSON diagnosis records both under `provenance` (exactly,
+        /// once the JSON is decoded: on the wire `--json` is ASCII, with any
+        /// non-ASCII character written as a `\uXXXX` escape). The text
+        /// report opens with a line naming the engine, and says the flag
+        /// changed nothing where no entry on this OS reads that engine (native
+        /// Windows has no vLLM entry).
+        /// A `--report` never carries either: it names only the cause the
+        /// diagnosis established. Only engines the catalog tells apart are
+        /// accepted; writing `vllm` in the symptom text still works as before.
+        #[arg(long, value_enum, value_name = "ENGINE", requires = "symptom_source")]
+        engine: Option<DiagnoseEngineArg>,
         /// Show at most this many matches (default 5).
         #[arg(long, default_value_t = 5)]
         top: usize,
@@ -211,7 +273,18 @@ pub(crate) enum Command {
     /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
     /// marked that way today: a GPU ROCm has no runtime build for is a fact
     /// about the hardware, not something to put right).
-    /// Use `--dry-run` to see any fix's plan without changing anything.
+    /// Use `--dry-run` to see a fix's plan without changing anything.
+    ///
+    /// A fix whose command fails exits 4 and says why on stderr. A command that
+    /// does not finish within its time limit is stopped and also exits 4; the
+    /// change may then be partial, so the message names how to check it and the
+    /// `rocm fix` command to re-run. On Windows, `fix-2-unset-override`,
+    /// `fix-6-path` and `fix-9-igpu-dgpu --device-index N` read the current
+    /// value of the variable they change before planning; when that read
+    /// fails they stop before changing anything, with exit 4. Under
+    /// `--dry-run` they stop the same way and show no plan; the catalog entry
+    /// printed first is the fix's generic description, not a preview of the
+    /// change on this machine.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
@@ -222,13 +295,22 @@ pub(crate) enum Command {
         /// Fixes that only print steps never ask.
         #[arg(long)]
         yes: bool,
-        /// Show the plan without changing anything.
+        /// Show the plan without changing anything. On Windows, a dry run of a
+        /// fix that reads the current value of the variable it would change
+        /// stops with exit 4 and shows no plan when that read fails; the
+        /// catalog entry printed first is the fix's generic description, not a
+        /// preview of the change on this machine.
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
         #[arg(long)]
         device_index: Option<i64>,
         /// Emit the catalog as JSON for tooling. Only valid without a fix id.
+        ///
+        /// It also names each exit code and says what it means. Exit 2 is
+        /// both an unknown fix id (a stderr line starting `Unknown fix-id:`)
+        /// and a malformed command line (a stderr line starting `error:`);
+        /// read the message to tell them apart.
         #[arg(long)]
         json: bool,
     },
@@ -313,7 +395,10 @@ pub(crate) enum Command {
     /// apply). With --prompt, or a prompt piped on standard input, sends that one
     /// prompt and prints the reply. Use `rocm config enable-provider` and
     /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server.
+    /// `local` provider talks to a running server. On Linux/WSL the interactive
+    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
+    /// and, like it, prints why that daemon was failing after it closes,
+    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -430,8 +515,13 @@ rocm model --verbose"
     /// Picks an engine and ROCm runtime automatically unless overridden. An
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
-    /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
+    /// server runs as a managed background service. For a fresh launch in a terminal it
+    /// first prints the service id and how to follow its log; while it starts, the status line
+    /// follows what the engine is doing (download, load, or the latest log line) until
+    /// the server is ready or that wait fails. A ready server then prints a deployment
+    /// summary (status, endpoint, model, and smoke-test metrics). A wait that fails
+    /// while the server is still running names `rocm logs` and `rocm services stop`
+    /// instead of a finished "not ready" summary. Use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
@@ -520,8 +610,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep waiting until the server answers requests or its engine gives up
         /// (vLLM and AIM after 5 minutes by default, raised with
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
-        /// instead of returning `starting` after 45 seconds.
-        /// Also waits on a matching server that is already starting. Fails with a
+        /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
+        /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. Fails with a
         /// pointer to the logs if the server exits first. Cannot be
         /// combined with --foreground or --verbose, which already stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
@@ -530,6 +621,9 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
         /// Skip the post-startup inference smoke test (time-to-first-token, tokens/sec).
+        ///
+        /// When the smoke test runs and cannot complete, the summary says so
+        /// and does not report the service as ready; ROCm CLI does not stop the server.
         #[arg(long)]
         no_smoke_test: bool,
         /// Allow binding to a non-local address.
@@ -671,6 +765,20 @@ rocm logs --search error timeout")]
         status: bool,
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    ///
+    /// On Linux/WSL, discovers loaded models from local Lemonade at 127.0.0.1:13305
+    /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
+    /// lemonade_port in config.json. External models have no Services stop/restart
+    /// controls; discovery is read-only and quitting leaves external servers running.
+    ///
+    /// On Linux/WSL, open dashboards share one telemetry daemon; when the dashboard
+    /// running it closes, one still open takes it over. If the daemon was
+    /// failing when the dashboard closed, the reason is printed after it closes,
+    /// whether it was quit or ended with Ctrl-C, SIGINT or SIGTERM, unless
+    /// another dashboard's daemon is serving by then. A crash of the dashboard's
+    /// own supervision of its telemetry daemon is reported even then when the
+    /// dashboard is quit; on Ctrl-C or a signal it is only written to the log
+    /// files under the data directory's logs folder, as it happens.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -784,7 +892,7 @@ pub(crate) enum InstallTarget {
     /// Install TheRock ROCm wheels into a Python folder managed by ROCm CLI.
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
-rocm install sdk --channel nightly --build-date 2026-08-20\n  \
+rocm install sdk --channel nightly --build-date 2026-08-19\n  \
 rocm install sdk --family gfx1100 --dry-run\n  \
 rocm install sdk --version 7.14.1 --family gfx110X-all\n  \
 rocm install sdk --devel\n  \
@@ -946,7 +1054,17 @@ rocm engines install vllm --reinstall")]
 #[derive(Subcommand, Debug)]
 pub(crate) enum RuntimesCommand {
     /// Show ROCm runtimes known to ROCm CLI.
-    List,
+    ///
+    /// Each runtime is listed with its version (and build date), GPU family,
+    /// mode and toolchain, then its channel, package source, source layout
+    /// generation and exact GPU target as its manifest recorded them. A fact
+    /// recorded nowhere, or recorded blank, is shown as `unrecorded`; nothing
+    /// is guessed from other facts.
+    List {
+        /// Print the runtime list as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
@@ -1098,7 +1216,9 @@ pub(crate) enum ComfyuiCommand {
         /// what its release shipped instead replaces whatever has the names the new release
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
         /// running or still starting, checked before the download and again just before the code
-        /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// is replaced, unless rocm-cli's saved record of it cannot be parsed, which it then says;
+        /// a record that cannot be read at all (a directory at its path, permission denied) is an
+        /// error naming the file.
         /// Over an existing install, a download that is not a ComfyUI release (no main.py) is
         /// discarded and the install is left as it was.
         #[arg(long)]
@@ -1126,6 +1246,13 @@ pub(crate) enum ComfyuiCommand {
         yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
+    ///
+    /// If rocm-cli's saved record of the ComfyUI it started cannot be parsed, it
+    /// stops no process, since the record names none, and checks only the
+    /// default address: if nothing answers there it moves the record aside to
+    /// `running.json.unreadable`; if something does, it keeps the record and
+    /// exits non-zero. A record that cannot be read at all (a directory at its
+    /// path, permission denied) is an error naming the file.
     Stop {
         /// Accepted for consistency with other mutating commands; stopping never prompts.
         #[arg(long)]
@@ -1197,9 +1324,9 @@ pub(crate) enum ServicesCommand {
     ///
     /// Only works on a record that is not running: stop the server first (on
     /// Windows a process `rocm` cannot query counts as running). The record's
-    /// details file, log, engine state file, and endpoint key file are all
-    /// deleted, so its log can no longer be read and it can no longer be
-    /// restarted.
+    /// details file, log, engine state file, and endpoint key file (with any
+    /// copy of the key an interrupted save left beside it) are all deleted, so
+    /// its log can no longer be read and it can no longer be restarted.
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -1210,9 +1337,9 @@ pub(crate) enum ServicesCommand {
         ///
         /// Only when a stop was requested, no recorded process is confirmed
         /// running, and at least one could not be queried (on Windows, a live
-        /// process the account may not open). Deletes the record, log, engine
-        /// state and endpoint key, and says which process; if it is still
-        /// running it keeps running. Refused for a process confirmed running.
+        /// process the account may not open). Deletes the same files as a
+        /// plain `remove`, and says which process; if it is still running it
+        /// keeps running. Refused for a process confirmed running.
         #[arg(long)]
         force: bool,
     },
@@ -1469,6 +1596,30 @@ mod tests {
         assert_eq!(
             FrameworkProbe::from(FrameworkArg::Skip),
             FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn dash_help_scopes_lemonade_discovery_to_linux_and_wsl() {
+        // The embedded daemon that does the discovery is Unix-only, so the help
+        // must not promise it on every platform. README.md says the same.
+        let help = Cli::command()
+            .find_subcommand_mut("dash")
+            .expect("dash subcommand")
+            .render_long_help()
+            .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("On Linux/WSL, discovers loaded models from local Lemonade"),
+            "{help}"
+        );
+        // This pins the wording only. Scenario
+        // `@id:dash-lemonade-external-protocol-discovery` proves the claim: the
+        // external server receives no request beyond reads after the dashboard
+        // quits.
+        assert!(
+            flat.contains("quitting leaves external servers running"),
+            "{help}"
         );
     }
 
@@ -1902,6 +2053,94 @@ mod tests {
         Cli::try_parse_from(argv)
     }
 
+    // `--symptom-file` exists because a pasted error does not survive the shell
+    // as an argument: one starting with `-` is not even accepted as
+    // `--symptom`'s value. The file form takes `-` (stdin) and any path, and
+    // the two sources cannot both be given.
+    #[test]
+    fn diagnose_takes_the_symptom_from_a_file_or_stdin_but_not_with_symptom() {
+        assert!(
+            parse_diagnose(&["--symptom", "-x HIP error"]).is_err(),
+            "a leading minus is read as a flag, which is what --symptom-file avoids"
+        );
+        for path in ["-", "error.txt"] {
+            match parse_diagnose(&["--symptom-file", path]) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Diagnose {
+                            symptom,
+                            symptom_file,
+                            ..
+                        }),
+                    ..
+                }) => {
+                    assert_eq!(symptom, None);
+                    assert_eq!(symptom_file, Some(PathBuf::from(path)));
+                }
+                other => panic!("expected diagnose for {path:?}, got {other:?}"),
+            }
+        }
+        let error = parse_diagnose(&["--symptom", "oom", "--symptom-file", "-"])
+            .expect_err("--symptom and --symptom-file are exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // `--engine` names where a symptom came from (ROCMAI-955). It takes only
+    // the engines the catalog tells apart, so an engine `serve` knows but the
+    // catalog does not is a usage error rather than a value silently ignored,
+    // and without a symptom it would describe nothing. The symptom may come
+    // from either `--symptom` or `--symptom-file`.
+    #[test]
+    fn diagnose_engine_takes_the_engines_the_catalog_tells_apart() {
+        let cli = parse_diagnose(&["--symptom", "torch.OutOfMemoryError", "--engine", "vllm"])
+            .expect("vllm parses");
+        match cli.command {
+            Some(Command::Diagnose {
+                engine, symptom, ..
+            }) => {
+                assert_eq!(
+                    engine.map(rocm_core::SymptomEngine::from),
+                    Some(rocm_core::SymptomEngine::Vllm)
+                );
+                assert_eq!(symptom.as_deref(), Some("torch.OutOfMemoryError"));
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        for unknown in ["lemonade", "aim", "llama.cpp", "VLLM-ish"] {
+            let error = parse_diagnose(&["--symptom", "x", "--engine", unknown])
+                .expect_err("an engine the catalog does not tell apart must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{unknown}"
+            );
+            assert!(error.to_string().contains("vllm"), "{error}");
+        }
+        for path in ["-", "error.txt"] {
+            match parse_diagnose(&["--symptom-file", path, "--engine", "vllm"]) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Diagnose {
+                            engine,
+                            symptom_file,
+                            ..
+                        }),
+                    ..
+                }) => {
+                    assert_eq!(engine, Some(DiagnoseEngineArg::Vllm));
+                    assert_eq!(symptom_file, Some(PathBuf::from(path)));
+                }
+                other => panic!("--symptom-file {path} --engine vllm must parse, got {other:?}"),
+            }
+        }
+        let error = parse_diagnose(&["--engine", "vllm"])
+            .expect_err("an engine with no symptom describes nothing");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
     // The context options describe the model being asked about, so without
     // `--model` they would be accepted and silently do nothing.
     #[test]
@@ -2031,6 +2270,24 @@ mod tests {
             }) => assert_eq!(runtime, "release-pip-x"),
             other => panic!("expected runtimes activate, got {other:?}"),
         }
+    }
+
+    /// `--json` belongs to `list` alone: bare `rocm runtimes` stays the text
+    /// listing, so a script has to name the subcommand to get JSON.
+    #[test]
+    fn runtimes_json_is_a_list_flag() {
+        for (args, json) in [(&["list", "--json"][..], true), (&["list"][..], false)] {
+            match parse_runtimes(args).expect("runtimes list parses").command {
+                Some(Command::Runtimes {
+                    command: Some(RuntimesCommand::List { json: parsed }),
+                }) => assert_eq!(parsed, json, "{args:?}"),
+                other => panic!("expected runtimes list, got {other:?}"),
+            }
+        }
+        assert!(
+            parse_runtimes(&["--json"]).is_err(),
+            "`rocm runtimes --json` must be rejected, not read as `list --json`"
+        );
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
