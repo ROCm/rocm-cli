@@ -132,13 +132,14 @@ runs:
             # (`repo_root().join("...")`, `include_str!`) is missing from this
             # category, so it covers every entry such a read reaches. It does
             # not see a path held in a const or built at run time, nor a file
-            # only a command reads: not `.github/scripts/**`, which a test
-            # reads through the `SHARED_PREFLIGHT` const, nor `lychee.toml`,
-            # which the `cargo xtask lychee` command reads through
-            # `LYCHEE_CONFIG` rather than a test. For `.github/scripts/**` and
-            # `lychee.toml` only `every_path_category_glob_is_pinned_by_a_sample`
-            # fails, and it checks that the glob is here, not that anything
-            # reads the file.
+            # only a command reads: not `.github/scripts/gpu-preflight.sh`,
+            # which a test reads through the `SHARED_PREFLIGHT` const, nor
+            # `lychee.toml`, which the `cargo xtask lychee` command reads
+            # through `LYCHEE_CONFIG` rather than a test. For those two files
+            # `every_path_category_glob_is_pinned_by_a_sample` is what fails
+            # when the glob goes (the `.github/scripts/**` glob is also held by
+            # the literal reads of `settle-e2e-lanes.sh`), and it checks that
+            # the glob is here, not that anything reads the file.
             - 'scripts/**'
             - 'install*'
             - '.github/scripts/**'
@@ -165,6 +166,11 @@ runs:
             - 'scripts/**'
             - 'xtask/**'
             - 'engines/**'
+            # Crate and app data compiled into the binary (the `include_str!`
+            # of crates/rocm-core/src/model_catalog.json) is neither a .rs nor
+            # a Cargo.toml file, and the E2E suite drives that binary.
+            - 'apps/**'
+            - 'crates/**'
             - '**/*.py'
             - '**/*.sh'
             - '**/*.ps1'

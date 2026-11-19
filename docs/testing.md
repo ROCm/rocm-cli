@@ -1202,8 +1202,9 @@ the reader is not skipped), and fails on a path Windows resolves differently (a 
 in `.` or a space), so a new cross-crate read cannot be added without a decision. A second test
 holds every table entry to that `rust` category.
 The scan has limits. A path held in a const (`.github/scripts/gpu-preflight.sh`, read through
-`SHARED_PREFLIGHT`) is not seen at all; its `rust` glob is pinned only by a per-glob sample test,
-which checks the glob is there, not that a test reads the file. And a read whose path is
+`SHARED_PREFLIGHT`) is not seen at all; the per-glob sample test pins that file's glob and checks
+the glob is there, not that a test reads the file (the `.github/scripts/**` glob is also held
+by the literal reads of `settle-e2e-lanes.sh`). And a read whose path is
 written out (an `include_str!` literal, a `CARGO_MANIFEST_DIR` chain ending in literal
 `.join("...")` segments, or `repo_root().join("...")` with a literal path) is checked file by
 file, but a test that derives the repo root in one place and joins the rest elsewhere (the result

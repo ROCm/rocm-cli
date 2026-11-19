@@ -7480,6 +7480,8 @@ fi
                 "scripts/README.txt",
                 "xtask/assets/data.json",
                 "engines/vllm/worker/settings.toml",
+                "apps/rocm/assets/data.json",
+                "crates/rocm-core/src/model_catalog.json",
                 "tool.py",
                 ".github/scripts/gpu-preflight.sh",
                 ".github/scripts/Invoke-WslBash.ps1",
