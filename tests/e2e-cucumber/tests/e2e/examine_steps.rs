@@ -1943,27 +1943,18 @@ fn plant_pci_bus(world: &mut E2eWorld, rows: &[(&str, &str, bool, &str)], nodes:
         )
         .expect("failed to write planted KFD node properties");
     }
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
     let listing = rows
         .iter()
         .map(|(_, _, _, line)| *line)
         .collect::<Vec<_>>()
         .join("\n");
-    rocm_core::fake_executable::write_fake_executable(
-        &bin.join("lspci"),
-        format!("#!/bin/sh\ncat <<'LSPCI'\n{listing}\nLSPCI\n"),
-    )
-    .expect("failed to write the fake lspci");
+    let lspci = format!("#!/bin/sh\ncat <<'LSPCI'\n{listing}\nLSPCI\n");
     // A `rocminfo` that answers and lists no agents, ahead of any real one, so
-    // a GPU runner's own agents are not paired onto these rows.
-    rocm_core::fake_executable::write_fake_executable(&bin.join("rocminfo"), "#!/bin/sh\nexit 0\n")
-        .expect("failed to write the fake rocminfo");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    // a GPU runner's own agents are not matched onto these rows.
+    put_fake_executables_on_path(
+        world,
+        &[("lspci", &lspci), ("rocminfo", "#!/bin/sh\nexit 0\n")],
+    );
     world
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));

@@ -359,19 +359,8 @@ fn lspci_line() -> impl Strategy<Value = (String, (&'static str, &'static str, &
         })
 }
 
-/// A marketing name drawn from the real corpus with any mutation applied,
-/// paired with the ground truth for the part it names.
-fn marketing_name() -> impl Strategy<
-    Value = (
-        String,
-        (&'static str, &'static str, bool, Option<&'static str>),
-    ),
-> {
-    (proptest::sample::select(AMD_MARKETING_NAMES), mutation())
-        .prop_map(|(entry, m)| (apply_mutation(entry.0, m), entry))
-}
-
-/// The same, restricted to spellings that still name the same device.
+/// A marketing name drawn from the real corpus, respelled in a way that still
+/// names the same device, with the ground truth for that device.
 fn marketing_name_spelled_differently() -> impl Strategy<
     Value = (
         String,
@@ -610,7 +599,9 @@ proptest! {
 
     /// `extract_lspci_name` recovers exactly the vendor-plus-device text of an
     /// unmutated `lspci -nn` line: everything between the class `]:` and the
-    /// trailing `[vendor:device]`.
+    /// trailing `[vendor:device]`. And the scan enumerates the line exactly
+    /// when its class is one the probe lists: a PCI bridge carrying an AMD
+    /// GPU's name is not a GPU.
     #[test]
     fn lspci_name_extraction_round_trips(
         addr in pci_address(),
@@ -626,6 +617,9 @@ proptest! {
         let expected = format!("Advanced Micro Devices, Inc. [AMD/ATI] {}", device.0);
         prop_assert_eq!(extract_lspci_name(&line), expected);
         prop_assert_eq!(extract_lspci_device_id(&line), Some(device.1.to_owned()));
+        let mut e = Examination::default();
+        apply_lspci_gpus(&mut e, &line);
+        prop_assert_eq!(e.gpus.len(), usize::from(class.1), "{:?}: {:?}", line, e.gpus);
     }
 
     /// A name that names an APU must not be reported as "not an APU".
@@ -700,15 +694,15 @@ proptest! {
     }
 
     /// The APU family list and the target rule agree with ground truth for
-    /// every target a real host reports, whatever its case or its feature
-    /// suffix: `gfx_is_apu_family` says yes or no, and
+    /// every target a real host reports, whatever its case or its feature or
+    /// generic-target suffix: `gfx_is_apu_family` says yes or no, and
     /// `apu_verdict_from_target` makes an APU integrated and leaves any other
     /// verdict as it was.
     #[test]
     fn apu_answers_match_ground_truth(
         gfx in proptest::sample::select(GFX_TARGETS),
         suffix in proptest::sample::select(
-            &["", ":xnack-", ":sramecc+:xnack-", ":sramecc-"][..]
+            &["", ":xnack-", ":sramecc+:xnack-", ":sramecc-", "-generic", "-generic:xnack-"][..]
         ),
         upper in any::<bool>(),
         current in proptest::sample::select(&[None, Some(false), Some(true)][..]),
@@ -1258,18 +1252,35 @@ fn generator_reach_is_measured_and_sufficient() {
         }
     }
 
-    let mut marketing_resolved = 0u64;
-    let mut marketing_apu_truth = 0u64;
+    // The marketing-name strategies the properties draw from, measured as
+    // drawn: `apu_marketing_name` for `examine_never_calls_a_known_apu_discrete`
+    // and `marketing_name_spelled_differently` for the spelling property.
+    let mut apu_name_resolved = 0u64;
+    let mut apu_name_spelled = 0u64;
     for _ in 0..DRAWS {
-        let (name, truth) = marketing_name()
+        let (name, truth) = apu_marketing_name()
             .new_tree(&mut runner)
-            .expect("marketing strategy")
+            .expect("APU marketing strategy")
             .current();
         if !classify_amd_marketing_name(&name).0.is_empty() {
-            marketing_resolved += 1;
+            apu_name_resolved += 1;
+        }
+        if name != truth.0 {
+            apu_name_spelled += 1;
+        }
+    }
+    let mut spelled_resolved = 0u64;
+    let mut spelled_apu_truth = 0u64;
+    for _ in 0..DRAWS {
+        let (name, truth) = marketing_name_spelled_differently()
+            .new_tree(&mut runner)
+            .expect("spelling strategy")
+            .current();
+        if !classify_amd_marketing_name(&name).0.is_empty() {
+            spelled_resolved += 1;
         }
         if truth.2 {
-            marketing_apu_truth += 1;
+            spelled_apu_truth += 1;
         }
     }
 
@@ -1297,29 +1308,35 @@ fn generator_reach_is_measured_and_sufficient() {
         "generator reach over {DRAWS} draws each:\n\
          lspci lines     : name parsed {:.1}%, GPU-class {:.1}%, APU silicon {:.1}%, \
          scanned as APU {:.1}%, gfx resolved {:.1}%\n\
-         marketing names : resolved {:.1}%, APU silicon {:.1}%\n\
+         APU names       : resolved {:.1}%, respelled {:.1}%\n\
+         respelled names : resolved {:.1}%, APU silicon {:.1}%\n\
          rocminfo agents : another target {:.1}%, Memory Properties without APU {:.1}%",
         pct(lspci_parsed),
         pct(lspci_gpu_class),
         pct(lspci_apu_device),
         pct(lspci_classified_apu),
         pct(lspci_gfx_resolved),
-        pct(marketing_resolved),
-        pct(marketing_apu_truth),
+        pct(apu_name_resolved),
+        pct(apu_name_spelled),
+        pct(spelled_resolved),
+        pct(spelled_apu_truth),
         pct(agent_other_target),
         pct(agent_discrete_reading),
     );
     let floors = [
         ("lspci: name parsed", lspci_parsed, draws / 2),
         // A third, not a half: one class in five is the PCI bridge the probe
-        // must not enumerate, and the case and tab mutations break the
-        // case-sensitive class match on purpose so that branch is sampled too.
+        // must not enumerate (`lspci_name_extraction_round_trips` asserts that
+        // it is not), and the case and tab mutations break the case-sensitive
+        // class match.
         ("lspci: enumerated GPU class", lspci_gpu_class, draws / 3),
         ("lspci: APU silicon", lspci_apu_device, draws / 4),
         ("lspci: scanned as an APU", lspci_classified_apu, draws / 6),
         ("lspci: gfx target resolved", lspci_gfx_resolved, draws / 4),
-        ("marketing: name resolved", marketing_resolved, draws / 2),
-        ("marketing: APU silicon", marketing_apu_truth, draws / 3),
+        ("APU names: resolved", apu_name_resolved, draws / 2),
+        ("APU names: respelled", apu_name_spelled, draws / 4),
+        ("respelled names: resolved", spelled_resolved, draws / 2),
+        ("respelled names: APU silicon", spelled_apu_truth, draws / 4),
         (
             "rocminfo: another agent target",
             agent_other_target,
