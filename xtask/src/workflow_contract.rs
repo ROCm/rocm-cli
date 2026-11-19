@@ -16,7 +16,7 @@
 //! `concurrency.group`, then assert on those extracted values.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -1116,9 +1116,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// adopted by an edit to this repository, which CI then exercises.
     #[test]
     fn no_workflow_runs_on_the_moving_ubuntu_latest_label() {
-        let workflows = all_workflows();
+        let workflows = all_workflows_and_actions();
         assert!(
-            workflows.iter().any(|(name, _)| name == "ci.yml"),
+            workflows
+                .iter()
+                .any(|(name, _)| name == ".github/workflows/ci.yml"),
             "expected ci.yml among the workflows (directory scan sanity check)"
         );
         for (name, text) in workflows {
@@ -2499,12 +2501,19 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
                 "{workflow} `{report_job}`: LANE_REPORTS must map every self-hosted lane, \
                  in workflow order, to the artifact its upload step names"
             );
-            for (job, _) in &lanes {
-                assert!(
-                    block.lines().any(|line| line.trim() == format!("- {job}")),
-                    "{workflow} `{report_job}` must list `{job}` under needs, or the \
-                     missing-report check cannot see whether it ran"
-                );
+            // The nightly report job reads its lanes through `e2e-lanes-settled`
+            // (see `nightly_report_reads_lanes_through_the_queue_deadline_job`),
+            // not through `needs`: a lane in `needs` would hold the report for
+            // as long as the lane sits queued.
+            let reads_lanes_through_needs = workflow != "nightly.yml";
+            if reads_lanes_through_needs {
+                for (job, _) in &lanes {
+                    assert!(
+                        block.lines().any(|line| line.trim() == format!("- {job}")),
+                        "{workflow} `{report_job}` must list `{job}` under needs, or the \
+                         missing-report check cannot see whether it ran"
+                    );
+                }
             }
             assert!(
                 block.lines().any(|line| line.trim() == "actions: read"),
@@ -2513,10 +2522,15 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             // `!cancelled()` rather than the implicit `success()`: the check has
             // to run precisely when an earlier step or a lane has failed.
             let step_lines: Vec<&str> = step.lines().map(str::trim).collect();
+            let needs_env = if reads_lanes_through_needs {
+                "NEEDS: ${{ toJSON(needs) }}"
+            } else {
+                "NEEDS: ${{ needs.e2e-lanes-settled.outputs.lane_results }}"
+            };
             for required in [
                 "if: ${{ !cancelled() }}",
                 "GH_TOKEN: ${{ github.token }}",
-                "NEEDS: ${{ toJSON(needs) }}",
+                needs_env,
             ] {
                 assert!(
                     step_lines.contains(&required),
@@ -2885,6 +2899,824 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             log.contains("could not list this run's artifacts"),
             "an API failure must say so rather than fail silently:\n{log}"
         );
+    }
+
+    /// A job's `needs:` entries, in any of the three YAML spellings the workflows
+    /// use: a block list (`needs:` then `- item` lines), a flow list
+    /// (`needs: [a, b]`) and a scalar (`needs: a`). A spelling this misses reads
+    /// as "needs nothing", which would let a guard over `needs` pass for the job
+    /// it was meant to check.
+    fn job_needs(block: &str) -> Vec<String> {
+        let mut lines = block.lines();
+        while let Some(line) = lines.next() {
+            let Some(rest) = line.strip_prefix("    needs:") else {
+                continue;
+            };
+            let rest = strip_comment(rest).trim();
+            if !rest.is_empty() {
+                return flattened_list_items(rest);
+            }
+            return lines
+                .take_while(|line| line.starts_with("      - "))
+                .map(|line| {
+                    strip_comment(line)
+                        .trim_start_matches([' ', '-'])
+                        .trim()
+                        .to_owned()
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    #[test]
+    fn job_needs_reads_every_spelling_of_needs() {
+        let block = |needs: &str| format!("    name: x\n    runs-on: y\n{needs}    if: z\n");
+        assert_eq!(job_needs(&block("    needs: a\n")), ["a"]);
+        assert_eq!(job_needs(&block("    needs: a # why\n")), ["a"]);
+        assert_eq!(job_needs(&block("    needs: [a, b]\n")), ["a", "b"]);
+        assert_eq!(
+            job_needs(&block("    needs:\n      - a\n      - b # why\n")),
+            ["a", "b"]
+        );
+        assert!(job_needs(&block("")).is_empty());
+        // The scalar spelling is real: three nightly jobs use it, and the
+        // lane-wait guard reads them through this helper.
+        let nightly = read_workflow("nightly.yml");
+        assert_eq!(
+            job_needs(job_block(&nightly, "windows-nightly")),
+            ["nightly"],
+            "a scalar `needs:` must be read, or the guard over lane dependencies skips the job"
+        );
+        assert_eq!(
+            job_needs(job_block(&nightly, "publish-nightly")),
+            ["nightly", "windows-nightly"]
+        );
+    }
+
+    /// A step env value, e.g. `QUEUE_DEADLINE_MINUTES: "120"`, as the bare value.
+    fn env_value(block: &str, key: &str) -> String {
+        let prefix = format!("{key}:");
+        block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("block sets `{key}`"))
+            .trim()
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    #[test]
+    fn nightly_report_reads_lanes_through_the_queue_deadline_job() {
+        // GitHub cannot time a job out while it waits for a runner, so a lane in
+        // the `needs` of any job that publishes a report holds that report back
+        // until the 24h limit when its runner pool is offline. The lanes are
+        // reached through `e2e-lanes-settled`, which gives up on a lane that
+        // never started; the run is then ended by `cancel-abandoned-e2e-lanes`.
+        let nightly = read_workflow("nightly.yml");
+        let lanes = self_hosted_e2e_jobs(&nightly);
+        assert!(!lanes.is_empty(), "nightly.yml has self-hosted lanes");
+
+        // No job may wait on a lane directly.
+        for job in job_ids(&nightly) {
+            let needs = job_needs(job_block(&nightly, &job));
+            for (lane, _) in &lanes {
+                assert!(
+                    !needs.contains(lane),
+                    "nightly.yml job `{job}` lists lane `{lane}` under needs, so a lane that is \
+                     queued on an offline pool would hold `{job}` for 24 hours; read the lane \
+                     through `e2e-lanes-settled`"
+                );
+            }
+        }
+        assert!(
+            job_needs(job_block(&nightly, "e2e-report-nightly"))
+                .contains(&"e2e-lanes-settled".to_owned()),
+            "the nightly report job must wait on `e2e-lanes-settled`"
+        );
+
+        // The settle job knows every lane, by the display name the API reports.
+        let settle = job_block(&nightly, "e2e-lanes-settled");
+        let expected: Vec<String> = lanes
+            .iter()
+            .map(|(job, _)| {
+                let name = job_scalar(job_block(&nightly, job), "name");
+                format!("{job}={name}")
+            })
+            .collect();
+        assert_eq!(
+            block_scalar_lines(settle, "LANES"),
+            expected,
+            "`e2e-lanes-settled` LANES must list every self-hosted nightly lane, in workflow \
+             order, as `job id=display name`; a lane missing here is never waited for and a \
+             misspelt name reads as `absent`"
+        );
+
+        // The deadlines are ordered, and the job's own cap lets the script stop
+        // itself rather than being killed mid-wait.
+        // The value is `${{ inputs.queue_deadline_minutes || '60' }}`: the
+        // default after `||` is what a scheduled run uses.
+        let queue_expr = env_value(settle, "QUEUE_DEADLINE_MINUTES");
+        let queue: u32 = queue_expr
+            .rsplit('\'')
+            .nth(1)
+            .and_then(|default| default.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("QUEUE_DEADLINE_MINUTES has a numeric default: {queue_expr}")
+            });
+        let hard: u32 = env_value(settle, "HARD_DEADLINE_MINUTES").parse().unwrap();
+        let cap: u32 = job_scalar(settle, "timeout-minutes").parse().unwrap();
+        let longest_lane = lanes
+            .iter()
+            .map(|(job, _)| {
+                job_scalar(job_block(&nightly, job), "timeout-minutes")
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| panic!("lane `{job}` has a numeric timeout-minutes"))
+            })
+            .max()
+            .unwrap();
+        let lane_run: u32 = env_value(settle, "LANE_RUN_MINUTES").parse().unwrap();
+        assert!(
+            lane_run >= longest_lane,
+            "LANE_RUN_MINUTES ({lane_run}) must cover the longest lane's timeout-minutes \
+             ({longest_lane}), or the script's bound on the queue deadline is too loose"
+        );
+        assert!(
+            queue + longest_lane <= hard,
+            "a lane that starts just before the queue deadline ({queue}m) must finish \
+             ({longest_lane}m) before the hard deadline ({hard}m)"
+        );
+        assert!(
+            hard < cap,
+            "the script's hard deadline ({hard}m) must come before the job's timeout ({cap}m)"
+        );
+
+        // The canceller runs last, after every other job, or it would cancel a
+        // job that is still producing a report.
+        let cancel = job_block(&nightly, "cancel-abandoned-e2e-lanes");
+        let mut others: Vec<String> = job_ids(&nightly)
+            .into_iter()
+            .filter(|job| job != "cancel-abandoned-e2e-lanes")
+            .filter(|job| !lanes.iter().any(|(lane, _)| lane == job))
+            .collect();
+        let mut needs = job_needs(cancel);
+        others.sort();
+        needs.sort();
+        assert_eq!(
+            needs, others,
+            "`cancel-abandoned-e2e-lanes` must need every job except the lanes it cancels"
+        );
+        assert!(
+            cancel.lines().any(|line| line.trim() == "actions: write"),
+            "cancelling a run needs `actions: write`"
+        );
+        assert!(
+            cancel.contains("gh run cancel \"$GITHUB_RUN_ID\""),
+            "the canceller must cancel this run"
+        );
+        let condition = job_scalar(cancel, "if");
+        assert!(
+            condition.starts_with("${{ always()")
+                && condition.contains("abandoned_count")
+                && condition.contains("needs.e2e-lanes-settled.result == 'failure'")
+                && condition.contains("needs.e2e-lanes-settled.result == 'cancelled'"),
+            "the canceller must run even after a failed job, and only when a lane was given up \
+             on or the settle job itself failed or was cancelled (a job killed by its own \
+             timeout-minutes reports `cancelled`, and nothing else bounds the wait then): \
+             {condition}"
+        );
+    }
+
+    #[test]
+    fn a_skip_build_dispatch_never_builds_or_publishes_a_release() {
+        // `skip_build` exists so a change to the lane, report and readiness jobs
+        // can be dispatched from a branch. Anything that builds or publishes a
+        // release under that input would put a branch's binaries on the public
+        // `nightly` release, so the guard is pinned on every such job.
+        let nightly = read_workflow("nightly.yml");
+        assert!(
+            top_level_block(&nightly, "on").contains("skip_build:"),
+            "workflow_dispatch must offer a `skip_build` input"
+        );
+
+        let build = job_block(&nightly, "nightly");
+        let steps = job_steps(build).expect("the nightly job has steps");
+        let check_at = steps
+            .iter()
+            .position(|(name, _)| name == "Check for changes since last nightly")
+            .expect("the nightly job decides whether to skip in a named step");
+        let check = &steps[check_at].1;
+        assert!(
+            check.contains("SKIP_BUILD: ${{ inputs.skip_build }}")
+                && check.contains("echo \"skip=true\" >> \"$GITHUB_OUTPUT\""),
+            "the check step must set skip=true when skip_build is set:\n{check}"
+        );
+        // The check's own early exit comes first; every later step must honour it.
+        for (name, step) in &steps[check_at + 1..] {
+            assert!(
+                step.contains("steps.check.outputs.skip != 'true'"),
+                "nightly step `{name}` runs after the skip decision and must be gated on it, or \
+                 a skip_build dispatch builds and stages a release:\n{step}"
+            );
+        }
+
+        // Every other job that can write a release waits on that decision too.
+        // The wiki publishers also hold `contents: write` (a wiki push, not a
+        // release) and are limited to `main` by their own condition instead.
+        for job in job_ids(&nightly) {
+            let block = job_block(&nightly, &job);
+            let writes_contents = block.lines().any(|line| line.trim() == "contents: write");
+            if job == "nightly" || !writes_contents {
+                continue;
+            }
+            let condition = job_scalar(block, "if");
+            if condition.contains("github.ref == 'refs/heads/main'") {
+                continue;
+            }
+            assert!(
+                condition.contains("needs.nightly.outputs.skip != 'true'"),
+                "job `{job}` has `contents: write` and must be gated on \
+                 `needs.nightly.outputs.skip != 'true'`, or a skip_build dispatch publishes"
+            );
+        }
+    }
+
+    /// Run `.github/scripts/settle-e2e-lanes.sh` against canned job listings.
+    ///
+    /// `listings[n]` is what the `n`th `gh api` call returns (the last one
+    /// repeats; `FAIL` makes the call fail like an API outage). `minutes_since_created`
+    /// is "now" relative to every job's `created_at`. Returns the exit code,
+    /// the log, the `GITHUB_OUTPUT` file, the step summary and the call count.
+    #[cfg(unix)]
+    fn run_settle(
+        listings: &[&str],
+        minutes_since_created: u64,
+    ) -> (i32, String, String, String, u32) {
+        run_settle_with(
+            listings,
+            minutes_since_created,
+            "lane-a=Lane A (gpu)\nlane-b=Lane B (gpu)\n",
+            "120",
+        )
+    }
+
+    /// [`run_settle`] with the lane list and the queue deadline (minutes) chosen.
+    #[cfg(unix)]
+    fn run_settle_with(
+        listings: &[&str],
+        minutes_since_created: u64,
+        lanes: &str,
+        queue_minutes: &str,
+    ) -> (i32, String, String, String, u32) {
+        const CREATED: u64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stub = dir.path().join("gh");
+        rocm_core::fake_executable::write_fake_executable(
+            &stub,
+            "#!/bin/sh\n\
+             n=$(cat \"$STUB_DIR/count\" 2>/dev/null || echo 0)\n\
+             n=$((n+1))\n\
+             echo $n > \"$STUB_DIR/count\"\n\
+             f=\"$STUB_DIR/call.$n\"\n\
+             [ -f \"$f\" ] || f=\"$STUB_DIR/call.last\"\n\
+             if grep -qx FAIL \"$f\"; then echo 'HTTP 502' >&2; exit 1; fi\n\
+             cat \"$f\"\n",
+        )
+        .expect("plant gh stub");
+        for (n, listing) in listings.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("call.{}", n + 1)), listing)
+                .expect("write listing");
+        }
+        std::fs::write(
+            dir.path().join("call.last"),
+            listings.last().expect("at least one listing"),
+        )
+        .expect("write last listing");
+        let (output, summary) = (dir.path().join("output"), dir.path().join("summary"));
+        std::fs::write(&output, "").expect("write output");
+        std::fs::write(&summary, "").expect("write summary");
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        // `timeout`: a script that never settles must fail this test, not hang it.
+        let out = std::process::Command::new("timeout")
+            .arg("60")
+            .arg("bash")
+            .arg(script)
+            .env("PATH", path)
+            .env("STUB_DIR", dir.path())
+            .env("LANES", lanes)
+            .env("QUEUE_DEADLINE_MINUTES", queue_minutes)
+            .env("HARD_DEADLINE_MINUTES", "300")
+            .env("LANE_RUN_MINUTES", "120")
+            .env("POLL_SECS", "0")
+            .env(
+                "SETTLE_NOW_EPOCH",
+                (CREATED + minutes_since_created * 60).to_string(),
+            )
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .env("GITHUB_OUTPUT", &output)
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .expect("running the settle script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status.code().expect("settle exited with a status code"),
+            log,
+            std::fs::read_to_string(&output).expect("read output"),
+            std::fs::read_to_string(&summary).expect("read summary"),
+            std::fs::read_to_string(dir.path().join("count"))
+                .expect("gh was called")
+                .trim()
+                .parse()
+                .expect("call count"),
+        )
+    }
+
+    /// One line of a jobs listing, as `gh api --jq '.jobs[]'` prints it.
+    #[cfg(unix)]
+    fn listed_job(name: &str, status: &str, conclusion: Option<&str>) -> String {
+        serde_json::json!({
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "created_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string()
+            + "\n"
+    }
+
+    /// Both legs of a lane in one state, plus an unrelated job the script must ignore.
+    #[cfg(unix)]
+    fn lane_legs(lane: &str, status: &str, conclusion: Option<&str>) -> String {
+        listed_job(&format!("{lane} (release)"), status, conclusion)
+            + &listed_job(&format!("{lane} (nightly)"), status, conclusion)
+    }
+
+    #[cfg(unix)]
+    fn settle_results(output: &str) -> serde_json::Value {
+        let line = output
+            .lines()
+            .find_map(|line| line.strip_prefix("lane_results="))
+            .unwrap_or_else(|| panic!("no lane_results in {output:?}"));
+        serde_json::from_str(line).expect("lane_results is JSON")
+    }
+
+    #[cfg(unix)]
+    fn settle_has_jq() -> bool {
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !has_jq {
+            // As in the missing-report check's test: a skip reads as a pass, so
+            // on CI a missing `jq` must fail loudly.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`jq` is not on PATH, so the settle script's logic cannot be exercised; \
+                 install it on this runner"
+            );
+            eprintln!("skipping: no `jq` on PATH");
+        }
+        has_jq
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_reports_finished_lanes_and_gives_up_only_on_lanes_that_never_started() {
+        if !settle_has_jq() {
+            return;
+        }
+        let other = listed_job("Build Linux nightly assets", "queued", None);
+
+        // Everything finished: the results carry through in the `needs` shape.
+        let done = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("failure"))
+            + &other;
+        let (code, log, output, summary, _) = run_settle(&[&done], 10);
+        assert_eq!(code, 0, "{log}");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-a"]["result"], "success", "{results}");
+        assert_eq!(results["lane-b"]["result"], "failure", "{results}");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+        assert!(summary.is_empty(), "nothing given up on: {summary}");
+
+        // A lane still queued past the deadline is given up on, by name, while
+        // the lane that finished keeps its own result. This is the stuck-nightly
+        // case: it must settle instead of waiting for a runner that never comes.
+        let stuck = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "queued", None)
+            + &other;
+        let (code, log, output, summary, calls) = run_settle(&[&stuck], 121);
+        assert_eq!(
+            code, 0,
+            "a queued lane past the deadline must not hang:\n{log}"
+        );
+        assert_eq!(calls, 1, "nothing left to wait for");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-a"]["result"], "success", "{results}");
+        assert_eq!(results["lane-b"]["result"], "abandoned", "{results}");
+        assert!(output.contains("abandoned_count=2"), "both legs: {output}");
+        assert!(
+            summary.contains("Lane B (gpu) (release)")
+                && summary.contains("Lane B (gpu) (nightly)"),
+            "the summary must name each leg given up on: {summary}"
+        );
+        assert!(
+            !summary.contains("Lane A"),
+            "a finished lane is not given up on: {summary}"
+        );
+
+        // Within the deadline a queued lane is waited for, and its result is
+        // used once it runs.
+        let queued = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "queued", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (code, log, output, _, calls) = run_settle(&[&queued, &queued, &finished], 119);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 3, "must keep polling while a lane can still start");
+        assert_eq!(settle_results(&output)["lane-b"]["result"], "success");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_waits_for_a_lane_that_started_but_not_past_the_hard_deadline() {
+        if !settle_has_jq() {
+            return;
+        }
+        let running = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "in_progress", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+
+        // Started before the queue deadline and still running past it: a slow
+        // lane is waited for, since cutting it off would drop a partial report
+        // that is about to exist.
+        let (code, log, output, _, calls) = run_settle(&[&running, &finished], 200);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "a started lane must be waited for");
+        assert_eq!(settle_results(&output)["lane-b"]["result"], "success");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+
+        // But not forever: a runner that hangs is given up on at the hard deadline.
+        let (code, log, output, _, calls) = run_settle(&[&running], 301);
+        assert_eq!(code, 0, "a hung lane must not hang the wait:\n{log}");
+        assert_eq!(calls, 1, "{log}");
+        assert_eq!(settle_results(&output)["lane-b"]["result"], "abandoned");
+        assert!(output.contains("abandoned_count=2"), "{output}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_does_not_abandon_a_leg_queued_behind_its_started_sibling() {
+        if !settle_has_jq() {
+            return;
+        }
+        // A single-runner pool: the `release` leg runs while the `nightly` leg
+        // waits for the same runner. Past the queue deadline the queued leg is
+        // waiting its turn, not unserved, so it is not abandoned.
+        let serial = listed_job("Lane A (gpu) (release)", "in_progress", None)
+            + &listed_job("Lane A (gpu) (nightly)", "queued", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"));
+        let (code, log, output, _, calls) =
+            run_settle_with(&[&serial, &finished], 130, "lane-a=Lane A (gpu)\n", "120");
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "the queued leg must be waited for: {log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+
+        // A sibling that already finished counts as started too.
+        let after_first = listed_job("Lane A (gpu) (release)", "completed", Some("success"))
+            + &listed_job("Lane A (gpu) (nightly)", "queued", None);
+        let (code, log, _, _, calls) = run_settle_with(
+            &[&after_first, &finished],
+            130,
+            "lane-a=Lane A (gpu)\n",
+            "120",
+        );
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "{log}");
+
+        // The hard deadline still ends the wait on a queued leg whose sibling hung.
+        let (code, log, output, _, calls) =
+            run_settle_with(&[&serial], 301, "lane-a=Lane A (gpu)\n", "120");
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 1, "{log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "abandoned");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_reports_skipped_cancelled_and_unknown_lanes_distinctly() {
+        if !settle_has_jq() {
+            return;
+        }
+        // `skipped` is the one result the missing-report check waves through, so
+        // it must mean every leg was skipped; `absent` is what a renamed lane
+        // reads as, and the check flags it.
+        let listing = lane_legs("Lane A (gpu)", "completed", Some("skipped"));
+        let (code, log, output, _, _) = run_settle(&[&listing], 5);
+        assert_eq!(code, 0, "{log}");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-a"]["result"], "skipped", "{results}");
+        assert_eq!(results["lane-b"]["result"], "absent", "{results}");
+
+        let mixed = listed_job("Lane A (gpu) (release)", "completed", Some("skipped"))
+            + &listed_job("Lane A (gpu) (nightly)", "completed", Some("cancelled"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (_, _, output, _, _) = run_settle(&[&mixed], 5);
+        assert_eq!(
+            settle_results(&output)["lane-a"]["result"],
+            "cancelled",
+            "one skipped leg does not make the lane skipped"
+        );
+
+        // A lane whose name merely starts with another lane's is not its leg.
+        let prefix = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane A (gpu, extra)", "queued", None)
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (code, log, output, _, calls) = run_settle(&[&prefix], 5);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 1, "the look-alike lane is not Lane A's leg");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_reads_a_leading_zero_deadline_as_decimal() {
+        if !settle_has_jq() {
+            return;
+        }
+        // Bash arithmetic reads `060` as octal 48, so a 60-minute deadline
+        // silently became 48, and `008` is an error. A leg queued for 50
+        // minutes is still inside a 60-minute deadline.
+        let queued = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "queued", None);
+        let finished = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let lanes = "lane-a=Lane A (gpu)\nlane-b=Lane B (gpu)\n";
+        let (code, log, output, _, calls) =
+            run_settle_with(&[&queued, &finished], 50, lanes, "060");
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(
+            calls, 2,
+            "`060` is 60 minutes, so a leg queued for 50 is still waited for"
+        );
+        assert!(output.contains("abandoned_count=0"), "{output}");
+
+        // And `008` is 8 minutes, not an arithmetic error.
+        let (code, log, output, _, _) = run_settle_with(&[&finished], 5, lanes, "008");
+        assert_eq!(code, 0, "`008` must not crash the script:\n{log}");
+        assert!(output.contains("abandoned_count=0"), "{output}");
+        let (code, _, output, _, _) = run_settle_with(&[&queued], 9, lanes, "008");
+        assert_eq!(code, 0);
+        assert!(
+            output.contains("abandoned_count=2"),
+            "a leg queued for 9 minutes is past an 8-minute deadline: {output}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_refuses_a_queue_deadline_that_leaves_no_room_to_run() {
+        // The dispatch input is free text. A queue deadline above the hard
+        // deadline minus the longest lane would abandon, and then cancel the run
+        // under, a lane that started in time and is still inside its own timeout.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        // An accepted deadline goes on to poll the API; a `gh` that always fails
+        // keeps that off the network, and `timeout` ends the poll loop.
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_gh_stub(&dir.path().join("gh"), false);
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |queue: &str| {
+            let out = std::process::Command::new("timeout")
+                .arg("5")
+                .arg("bash")
+                .arg(&script)
+                .env("PATH", &path)
+                .env("POLL_SECS", "1")
+                .env("LANES", "lane-a=Lane A\n")
+                .env("QUEUE_DEADLINE_MINUTES", queue)
+                .env("HARD_DEADLINE_MINUTES", "240")
+                .env("LANE_RUN_MINUTES", "120")
+                .env("GITHUB_REPOSITORY", "owner/repo")
+                .env("GITHUB_RUN_ID", "1")
+                .output()
+                .expect("running the settle script");
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned()
+                    + &String::from_utf8_lossy(&out.stderr),
+            )
+        };
+        let (code, log) = run("121");
+        assert_eq!(
+            code,
+            Some(1),
+            "121 + 120 passes 240 and must be refused:\n{log}"
+        );
+        assert!(log.contains("hard deadline"), "say why:\n{log}");
+        // 120 + 120 fits exactly. This case never gets as far as the API (no gh
+        // on this PATH would be needed to refuse), so only check that the
+        // refusal is not what stops it: it must not mention the hard deadline.
+        let (_, log) = run("120");
+        assert!(
+            !log.contains("hard deadline"),
+            "120 + 120 fits in 240 and must be accepted:\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_gives_each_job_to_the_lane_with_the_longest_matching_name() {
+        if !settle_has_jq() {
+            return;
+        }
+        // `Build` is a prefix of `Build (extra)`'s legs, so a plain prefix match
+        // hands the second lane's jobs to the first. Each job belongs to the
+        // lane with the longest name it matches.
+        let lanes = "lane-1=Build\nlane-2=Build (extra)\n";
+        let listing = lane_legs("Build", "completed", Some("success"))
+            + &lane_legs("Build (extra)", "completed", Some("failure"));
+        let (code, log, output, _, _) = run_settle_with(&[&listing], 5, lanes, "120");
+        assert_eq!(code, 0, "{log}");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-1"]["result"], "success", "{results}");
+        assert_eq!(results["lane-2"]["result"], "failure", "{results}");
+
+        // The longer lane's absence must not be papered over by the shorter
+        // lane's matching jobs: `Build (extra)` has no jobs here.
+        let only_first = lane_legs("Build", "completed", Some("success"));
+        let (_, _, output, _, _) = run_settle_with(&[&only_first], 5, lanes, "120");
+        let results = settle_results(&output);
+        assert_eq!(results["lane-1"]["result"], "success", "{results}");
+        assert_eq!(results["lane-2"]["result"], "absent", "{results}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_does_not_let_a_cancelled_leg_hide_a_failed_one() {
+        if !settle_has_jq() {
+            return;
+        }
+        // `cancel-abandoned-e2e-lanes` can cancel a run after one leg has
+        // already failed; the lane must still read as failed.
+        let listing = listed_job("Lane A (gpu) (release)", "completed", Some("failure"))
+            + &listed_job("Lane A (gpu) (nightly)", "completed", Some("cancelled"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        let (code, log, output, _, _) = run_settle(&[&listing], 5);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "failure");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_fails_itself_when_the_job_list_stays_unreadable() {
+        // Unreadable listings used to be retried for ever, leaving the job's own
+        // timeout-minutes (reported as `cancelled`, which the canceller did not
+        // match) as the only way out: the 24h hang this job exists to prevent.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_gh_stub(&dir.path().join("gh"), false);
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // A one-minute hard deadline with no poll delay is one 60s attempt, so
+        // the script gives up after the first failed listing.
+        let out = std::process::Command::new("timeout")
+            .arg("20")
+            .arg("bash")
+            .arg(&script)
+            .env("PATH", path)
+            .env("POLL_SECS", "0")
+            .env("LANES", "lane-a=Lane A\n")
+            .env("QUEUE_DEADLINE_MINUTES", "0")
+            .env("HARD_DEADLINE_MINUTES", "1")
+            .env("LANE_RUN_MINUTES", "0")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .output()
+            .expect("running the settle script");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a sustained failure to list jobs must fail the job (124 means it hung):\n{log}"
+        );
+        assert!(
+            log.contains("giving up so the run can be ended"),
+            "say why the job failed:\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_does_not_wait_on_a_hung_job_list_request() {
+        // A request that never returns would defeat the bound on failed
+        // listings, because no failure is ever counted. Each request is given a
+        // timeout, so a hung one counts as a failure like any other.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        let dir = tempfile::tempdir().expect("temp dir");
+        rocm_core::fake_executable::write_fake_executable(
+            &dir.path().join("gh"),
+            "#!/bin/sh\nexec sleep 30\n",
+        )
+        .expect("plant gh stub");
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // A zero-minute hard deadline allows no failed listing, so the first
+        // request that times out ends the script.
+        let out = std::process::Command::new("timeout")
+            .arg("15")
+            .arg("bash")
+            .arg(&script)
+            .env("PATH", path)
+            .env("POLL_SECS", "0")
+            .env("SETTLE_CALL_TIMEOUT_SECS", "1")
+            .env("LANES", "lane-a=Lane A\n")
+            .env("QUEUE_DEADLINE_MINUTES", "0")
+            .env("HARD_DEADLINE_MINUTES", "0")
+            .env("LANE_RUN_MINUTES", "0")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .output()
+            .expect("running the settle script");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a request that hangs must time out and fail the job (124 means it hung):\n{log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_refuses_a_deadline_that_is_not_a_whole_number() {
+        // The queue deadline is a dispatch input, and bash arithmetic reads a
+        // non-number as 0: unchecked, `abc` would give up on every lane at once.
+        let script = repo_root().join(".github/scripts/settle-e2e-lanes.sh");
+        for bad in ["abc", "1.5", "-5", "60 "] {
+            // `timeout`: with the check gone the script would poll the API for
+            // ever, and a broken check must fail this test, not hang it.
+            let out = std::process::Command::new("timeout")
+                .arg("20")
+                .arg("bash")
+                .arg(&script)
+                .env("LANES", "lane-a=Lane A\n")
+                .env("QUEUE_DEADLINE_MINUTES", bad)
+                .env("HARD_DEADLINE_MINUTES", "240")
+                .env("LANE_RUN_MINUTES", "120")
+                .env("GITHUB_REPOSITORY", "owner/repo")
+                .env("GITHUB_RUN_ID", "1")
+                .output()
+                .expect("running the settle script");
+            let log = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "deadline {bad:?} must be refused:\n{log}"
+            );
+            assert!(
+                log.contains("must be whole numbers"),
+                "the refusal must say why for {bad:?}:\n{log}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn settle_survives_a_failed_api_call() {
+        if !settle_has_jq() {
+            return;
+        }
+        let done = lane_legs("Lane A (gpu)", "completed", Some("success"))
+            + &lane_legs("Lane B (gpu)", "completed", Some("success"));
+        // A failed listing must neither settle (the lanes would read as absent)
+        // nor abort the job.
+        let (code, log, output, _, calls) = run_settle(&["FAIL\n", &done], 5);
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls, 2, "{log}");
+        assert!(log.contains("could not list this run's jobs"), "{log}");
+        assert_eq!(settle_results(&output)["lane-a"]["result"], "success");
     }
 
     /// The `name:` of `step`, a block as `step_block` returns it (its first
@@ -5134,13 +5966,19 @@ fi
             "gh run download \"$candidate\"",
             "--name queue-run-results",
             // A run that started a day ago is not tonight's, whenever it ended.
-            "[ \"$started_at\" -ge \"$(date -u -d '24 hours ago' +%s)\" ]",
+            "[ \"$started_at\" -lt \"$(date -u -d '24 hours ago' +%s)\" ]",
             // Only a finished run: a run still going has a partial log.
-            "[ \"${run_info%%$'\\t'*}\" = \"completed\" ]",
+            "[ \"${run_info%%$'\\t'*}\" != \"completed\" ]",
             // The log says which branch the run tested and which lanes block;
             // the run may have several jobs, so every one is scanned.
             "actions/runs/${candidate}/jobs?per_page=100",
+            // curl, not `gh api`: gh refuses a log holding terminal escape
+            // sequences, which is what rejected run 44002836099.
+            "curl -fsSL --connect-timeout 15 --max-time 120 -H \"Authorization: Bearer ${GH_TOKEN}\"",
             "/logs\" > queue-results/job.log.part",
+            // A rejected run says why, on a line of its own: run 44002836099 was
+            // rejected and the log could not say which filter did it.
+            "::notice::queue run ${candidate} not imported: $1",
         ] {
             assert!(
                 fetch.contains(needed),
@@ -5151,6 +5989,15 @@ fi
             !fetch.contains("conclusion"),
             "a red queue run is still a run: its artifact is uploaded whatever it concluded"
         );
+        assert!(
+            !fetch.contains("gh api \"repos/${GITHUB_REPOSITORY}/actions/jobs/"),
+            "`gh api` refuses a job log with terminal escape sequences: read it with curl"
+        );
+        assert!(
+            !fetch.contains("logs\" > queue-results/job.log.part 2>"),
+            "the job-log read must not discard its error: that is what hid the reason"
+        );
+
         // No credential beyond the job's own read-only token.
         let fetch_step = &steps[position("Fetch the latest queue results")].1;
         let env = step_env(fetch_step);
@@ -5207,6 +6054,77 @@ fi
         );
     }
 
+    /// The queue-results fetch is bounded by its step's `timeout-minutes`, and
+    /// the cap has to outlast the retries the step allows itself: one job's log
+    /// read is up to `attempts x --max-time` plus a `sleep` after each failed
+    /// attempt. A 5-minute cap sat below that (about 6.3 minutes), so a slow
+    /// storage hop cut the step off mid-retry, the queue lanes were missing from
+    /// the consolidated report and the wiki, and the retries never got to finish.
+    /// The budget is read from the script, so changing a retry count, a
+    /// `--max-time` or a `sleep` re-checks the cap.
+    #[test]
+    fn nightly_queue_fetch_timeout_outlasts_one_jobs_retry_budget() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "e2e-report-nightly");
+        let steps = job_steps(job).expect("the report job has steps");
+        let (_, step) = steps
+            .iter()
+            .find(|(name, _)| name.starts_with("Fetch the latest queue results"))
+            .expect("e2e-report-nightly has a `Fetch the latest queue results` step");
+        // Code only: a comment that names `--max-time` or `sleep` is not the budget.
+        let script = normalized_whitespace(
+            &step
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // The number that follows `marker`, which must be present.
+        let number_after = |marker: &str| -> u64 {
+            let (_, rest) = script
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("the fetch step must contain `{marker}`:\n{script}"));
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("a number must follow `{marker}`:\n{script}"))
+        };
+        let attempts = script
+            .split_once("for attempt in ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(list, _)| list.split_whitespace().count() as u64)
+            .expect("the job-log read loops over its attempts");
+        let max_time = number_after("--max-time ");
+        let pause = number_after("sleep ");
+        // The pause follows every failed attempt, the last one included.
+        let one_job_worst_case = attempts * (max_time + pause);
+
+        let cap = step_key(step, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the fetch step has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap >= one_job_worst_case * 5 / 4,
+            "the queue fetch step is capped at {cap}s, but reading one job's log can take \
+             {one_job_worst_case}s ({attempts} attempts x ({max_time}s + {pause}s)); the cap \
+             must cover that with a quarter to spare or a slow fetch is cut off mid-retry and \
+             the queue lanes go missing from the report"
+        );
+        // ...and leaves the job's own cap room for the steps after it: a fetch that
+        // used all of its time must not push the report and the wiki publish past
+        // the job's timeout, which would lose them for the sake of the queue lanes.
+        let job_cap = job_scalar(job, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the report job has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap + 5 * 60 <= job_cap,
+            "the queue fetch step ({cap}s) must leave the report job ({job_cap}s) at least five \
+             minutes for the steps after it"
+        );
+    }
+
     #[test]
     fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
         let nightly = read_workflow("nightly.yml");
@@ -5230,6 +6148,10 @@ fi
         for required in [
             "!cancelled()",
             "needs.e2e-report-nightly.result == 'success'",
+            // A failed report job is a broken nightly (a lane ran and uploaded
+            // nothing), when the grid is most worth reading; the page guard
+            // below keeps a report without one off the wiki.
+            "needs.e2e-report-nightly.result == 'failure'",
             "github.repository == 'ROCm/rocm-cli'",
             "github.ref == 'refs/heads/main'",
         ] {
@@ -5238,6 +6160,10 @@ fi
                 "the wiki job's `if:` must require `{required}`: {condition}"
             );
         }
+        assert!(
+            !condition.contains("!= 'skipped'") && !condition.contains("== 'skipped'"),
+            "a skipped report job has nothing to publish and must not reach the wiki: {condition}"
+        );
         assert!(
             !condition.contains("always()"),
             "always() would publish from a cancelled run: {condition}"
@@ -6070,48 +6996,1174 @@ fi
         }
     }
 
-    /// Extract the literal glob entries from ci.yml's pull-request `rust:`
-    /// paths-filter bucket, stopping at the next sibling filter key. Scoped to
-    /// an exact `rust:` line (not a prefix match) so this doesn't also pick up
-    /// the unrelated `rust: ${{ … }}` job output a few lines above it.
-    fn rust_paths_filter_entries(ci: &str) -> Vec<String> {
-        let lines: Vec<&str> = ci.lines().collect();
-        let start = lines
-            .iter()
-            .position(|line| line.trim() == "rust:")
-            .unwrap_or_else(|| panic!("ci.yml declares a `rust:` paths-filter bucket"));
-        let key_indent = indent_of(lines[start]);
-        let end = lines[start + 1..]
-            .iter()
-            .position(|line| !line.trim().is_empty() && indent_of(line) <= key_indent)
-            .map_or(lines.len(), |offset| start + 1 + offset);
-        lines[start + 1..end]
-            .iter()
-            .filter_map(|line| strip_comment(line).trim().strip_prefix("- "))
-            .map(|item| strip_quotes(item.trim()))
+    /// The shared action both workflows' `changes` jobs classify paths with.
+    const CLASSIFY_ACTION: &str = ".github/actions/classify-changes/action.yml";
+
+    pub(crate) fn read_classify_action() -> String {
+        let p = repo_root().join(CLASSIFY_ACTION);
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    }
+
+    /// Every local composite action as `(path, text)`, read from the directory
+    /// so an action added later is covered by the scans that use this.
+    fn all_local_actions() -> Vec<(String, String)> {
+        let dir = repo_root().join(".github/actions");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("action dir entry").path())
+            .flat_map(|action| [action.join("action.yml"), action.join("action.yaml")])
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+                    .replace("\r\n", "\n");
+                let rel = path
+                    .strip_prefix(repo_root())
+                    .expect("action under the repo root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, text)
+            })
             .collect()
     }
 
-    /// `forces_full_workspace` (xtask/src/affected.rs) names the doc paths
-    /// that fall back to a full-workspace run because an xtask test reads
-    /// them directly ([`crate::affected::XTASK_READ_DOCS`]). If one of them
-    /// isn't ALSO in ci.yml's `rust` paths-filter bucket,
-    /// `needs.changes.outputs.rust` stays false for a PR that touches only
-    /// that doc, and the `test` job's every step — including `cargo nextest
-    /// run`, which is what would have caught the drift — never runs at all.
+    /// The workflows and the local actions, every file a `uses:` or a runner
+    /// label can sit in.
+    fn all_workflows_and_actions() -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = all_workflows()
+            .into_iter()
+            .map(|(name, text)| (format!(".github/workflows/{name}"), text))
+            .collect();
+        files.extend(all_local_actions());
+        files
+    }
+
+    /// The path filters declared in the action's paths-filter `filters: |`
+    /// block, as `(name, globs)` in file order. Comments are dropped.
+    pub(crate) fn paths_filters(action: &str) -> Vec<(String, Vec<String>)> {
+        let lines: Vec<&str> = action.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| strip_comment(line).trim() == "filters: |")
+            .expect("the action passes paths-filter a `filters: |` block");
+        let block_indent = indent_of(lines[at]);
+        let body: Vec<&str> = lines[at + 1..]
+            .iter()
+            .take_while(|line| line.trim().is_empty() || indent_of(line) > block_indent)
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .copied()
+            .collect();
+        let key_indent = body.iter().map(|line| indent_of(line)).min().unwrap_or(0);
+        let mut filters: Vec<(String, Vec<String>)> = Vec::new();
+        for line in body {
+            let code = strip_comment(line).trim();
+            if indent_of(line) == key_indent {
+                let name = code
+                    .strip_suffix(':')
+                    .unwrap_or_else(|| panic!("filter key `{code}` ends with `:`"));
+                filters.push((name.to_owned(), Vec::new()));
+            } else if let Some(item) = code.strip_prefix("- ") {
+                filters
+                    .last_mut()
+                    .expect("a glob comes after its filter key")
+                    .1
+                    .push(strip_quotes(item.trim()));
+            }
+        }
+        filters
+    }
+
+    pub(crate) fn paths_filter<'a>(
+        filters: &'a [(String, Vec<String>)],
+        name: &str,
+    ) -> &'a [String] {
+        filters
+            .iter()
+            .find_map(|(key, globs)| (key == name).then_some(globs.as_slice()))
+            .unwrap_or_else(|| panic!("the action declares a `{name}` path filter"))
+    }
+
+    /// Whether `path` matches the paths-filter glob `pattern`, as picomatch
+    /// with `dot: true` (what paths-filter v4 passes) reads the globs used
+    /// here: `**` is any number of whole segments, `*` any run of characters
+    /// inside one segment, dotfiles included.
+    fn glob_matches(pattern: &str, path: &str) -> bool {
+        fn segment(pattern: &[u8], name: &[u8]) -> bool {
+            match (pattern.split_first(), name.split_first()) {
+                (None, None) => true,
+                (Some((b'*', rest)), _) => {
+                    segment(rest, name) || (!name.is_empty() && segment(pattern, &name[1..]))
+                }
+                (Some((p, rest)), Some((n, tail))) if p == n => segment(rest, tail),
+                _ => false,
+            }
+        }
+        fn segments(pattern: &[&str], path: &[&str]) -> bool {
+            match pattern.split_first() {
+                None => path.is_empty(),
+                Some((&"**", rest)) => (0..=path.len()).any(|skip| segments(rest, &path[skip..])),
+                Some((head, rest)) => path.split_first().is_some_and(|(first, tail)| {
+                    segment(head.as_bytes(), first.as_bytes()) && segments(rest, tail)
+                }),
+            }
+        }
+        let pattern: Vec<&str> = pattern.split('/').collect();
+        let path: Vec<&str> = path.split('/').collect();
+        segments(&pattern, &path)
+    }
+
+    pub(crate) fn filter_matches(globs: &[String], path: &str) -> bool {
+        globs.iter().any(|glob| glob_matches(glob, path))
+    }
+
     #[test]
-    fn forces_full_workspace_docs_are_in_the_rust_filter() {
-        let ci = read_workflow("ci.yml");
-        let rust_filter = rust_paths_filter_entries(&ci);
-        for doc in crate::affected::XTASK_READ_DOCS {
+    fn glob_matches_reads_globs_the_way_paths_filter_does() {
+        for (pattern, path) in [
+            ("**", ".cargo/config.toml"),
+            ("**", "README.md"),
+            ("**/*.rs", "build.rs"),
+            ("**/*.rs", "apps/rocm/src/main.rs"),
+            ("apps/**", "apps/rocm/src/data.json"),
+            (".cargo/**", ".cargo/config.toml"),
+            ("rust-toolchain*", "rust-toolchain.toml"),
+            (
+                "**/proptest-regressions/**",
+                "apps/rocm/proptest-regressions/x.txt",
+            ),
+            ("README.md", "README.md"),
+        ] {
             assert!(
-                rust_filter.iter().any(|entry| entry == doc),
-                "`{doc}` is in `forces_full_workspace` (xtask/src/affected.rs) but \
-                 missing from ci.yml's `rust` paths-filter bucket, so an edit to it \
-                 alone skips the rust-gated jobs entirely instead of running the \
-                 test that reads it"
+                glob_matches(pattern, path),
+                "`{pattern}` must match `{path}`"
             );
         }
+        for (pattern, path) in [
+            ("**/*.rs", "apps/rocm/src/main.rsx"),
+            ("apps/**", "crates/apps/x"),
+            ("*.md", "docs/testing.md"),
+            ("README.md", "docs/README.md"),
+            ("docs/**", "docsx/a.md"),
+        ] {
+            assert!(
+                !glob_matches(pattern, path),
+                "`{pattern}` must not match `{path}`"
+            );
+        }
+    }
+
+    /// The `Force a full run` step of the action: its dedented script and its
+    /// `env:` entries as `(variable, expression)`.
+    fn force_full_run_step(action: &str) -> (String, Vec<(String, String)>) {
+        let step = job_steps(action)
+            .expect("the action has a `steps:` list")
+            .into_iter()
+            .find_map(|(name, step)| (name == "Force a full run").then_some(step))
+            .expect("the action has a \"Force a full run\" step");
+        let script = dedent(&run_block(&step).expect("the step has a block-scalar `run:`"))
+            .expect("the step's script is not empty");
+        let lines: Vec<&str> = step.lines().collect();
+        let env_at = lines
+            .iter()
+            .position(|line| strip_comment(line).trim() == "env:")
+            .expect("the step passes its inputs through `env:`");
+        let env_indent = indent_of(lines[env_at]);
+        let env = lines[env_at + 1..]
+            .iter()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .take_while(|line| indent_of(line) > env_indent)
+            .map(|line| {
+                let (key, value) = line
+                    .trim()
+                    .split_once(": ")
+                    .unwrap_or_else(|| panic!("env entry `{line}` is `KEY: value`"));
+                (key.to_owned(), value.trim().to_owned())
+            })
+            .collect();
+        (script, env)
+    }
+
+    /// The filter whose `_files` list an `env:` expression reads, if it reads one.
+    fn files_output_filter(expression: &str) -> Option<&str> {
+        expression
+            .strip_prefix("${{ steps.filter.outputs.")?
+            .strip_suffix("_files }}")
+    }
+
+    #[cfg(unix)]
+    struct Classification {
+        forced: String,
+        stdout: String,
+    }
+
+    /// Run the action's `Force a full run` step under bash, as the runner
+    /// does on `event`, with every `_files` list it reads computed by matching
+    /// `changed` against `filters` the way paths-filter does. Off
+    /// pull_request the filter step is skipped, so every list is empty.
+    ///
+    /// An `env:` expression the test cannot compute fails the test rather
+    /// than expanding to nothing, so the step cannot start reading an input
+    /// this test silently feeds as empty.
+    #[cfg(unix)]
+    fn classify(
+        event: &str,
+        changed: &[&str],
+        filters: &[(String, Vec<String>)],
+    ) -> Classification {
+        let action = read_classify_action();
+        let (script, env) = force_full_run_step(&action);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output = dir.path().join("github_output");
+        std::fs::write(&output, "").expect("write GITHUB_OUTPUT");
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("GITHUB_OUTPUT", &output);
+        for (key, expression) in &env {
+            let value = if expression == "${{ github.event_name }}" {
+                event.to_owned()
+            } else if let Some(filter) = files_output_filter(expression) {
+                if event == "pull_request" {
+                    let globs = paths_filter(filters, filter);
+                    let files: Vec<&str> = changed
+                        .iter()
+                        .copied()
+                        .filter(|path| filter_matches(globs, path))
+                        .collect();
+                    serde_json::to_string(&files).expect("serialize a file list")
+                } else {
+                    String::new()
+                }
+            } else {
+                panic!("the step reads `{expression}` into {key}, which this test does not feed")
+            };
+            command.env(key, value);
+        }
+        let out = command
+            .output()
+            .expect("running the classifier script (needs bash and jq)");
+        assert!(
+            out.status.success(),
+            "the classifier script failed (it needs jq on PATH): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = std::fs::read_to_string(&output).expect("read GITHUB_OUTPUT");
+        let forced: Vec<&str> = written
+            .lines()
+            .filter_map(|line| line.strip_prefix("forced="))
+            .collect();
+        assert_eq!(
+            forced.len(),
+            1,
+            "the classifier writes `forced=` exactly once; wrote {written:?}"
+        );
+        Classification {
+            forced: forced[0].to_owned(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        }
+    }
+
+    /// A pull request whose only change is a file no category names runs
+    /// everything, and says which file did it. Before the catch-all, a
+    /// `.cargo/config.toml`-only change matched no category, so every gated
+    /// job skipped and the required checks went green on an untested change.
+    /// Here every category is emptied so the file is unclassified whatever
+    /// the real globs say; the real globs are exercised below.
+    #[cfg(unix)]
+    #[test]
+    fn a_pull_request_changing_an_unclassified_file_forces_a_full_run() {
+        if !jq_available_or_skip("a_pull_request_changing_an_unclassified_file_forces_a_full_run") {
+            return;
+        }
+        let action = read_classify_action();
+        let empty: Vec<(String, Vec<String>)> = paths_filters(&action)
+            .into_iter()
+            .map(|(name, globs)| {
+                let globs = if name == "all" { globs } else { Vec::new() };
+                (name, globs)
+            })
+            .collect();
+        let outcome = classify("pull_request", &[".cargo/config.toml"], &empty);
+        assert_eq!(outcome.forced, "true");
+        let notice: Vec<&str> = outcome
+            .stdout
+            .lines()
+            .filter(|line| line.starts_with("::notice"))
+            .collect();
+        assert_eq!(notice.len(), 1, "one notice: {}", outcome.stdout);
+        assert!(
+            notice[0].contains(r#"[".cargo/config.toml"]"#),
+            "the notice names the unclassified file: {}",
+            notice[0]
+        );
+
+        // The same with the real globs: a new kind of top-level file.
+        let real = paths_filters(&action);
+        let outcome = classify(
+            "pull_request",
+            &["apps/rocm/src/main.rs", "a-new-tool.cfg"],
+            &real,
+        );
+        assert_eq!(outcome.forced, "true");
+        assert!(
+            outcome
+                .stdout
+                .contains("::notice title=Unclassified files force a full run::")
+                && outcome.stdout.contains(r#"["a-new-tool.cfg"]"#),
+            "the notice names only the unclassified file: {}",
+            outcome.stdout
+        );
+    }
+
+    /// A pull request whose every file is in some category, or inert, is not
+    /// forced: each job still skips unless its own category matched.
+    #[cfg(unix)]
+    #[test]
+    fn a_pull_request_whose_files_are_all_classified_is_not_forced() {
+        if !jq_available_or_skip("a_pull_request_whose_files_are_all_classified_is_not_forced") {
+            return;
+        }
+        let filters = paths_filters(&read_classify_action());
+        for changed in [
+            &[][..],
+            &[
+                "apps/rocm/src/main.rs",
+                "crates/rocm-core/src/model_catalog.json",
+                ".cargo/config.toml",
+                "docs/testing.md",
+                "README.md",
+                "skills/rocm-doctor/SKILL.md",
+                "about.toml",
+                "ruff.toml",
+                ".readthedocs.yaml",
+                "install.sh",
+                "LICENSE.TXT",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ][..],
+            &["CODE_OF_CONDUCT.md", ".github/ISSUE_TEMPLATE/bug_report.md"][..],
+        ] {
+            let outcome = classify("pull_request", changed, &filters);
+            assert_eq!(outcome.forced, "false", "{changed:?}");
+            assert!(
+                !outcome.stdout.contains("::notice"),
+                "no notice when nothing is unclassified ({changed:?}): {}",
+                outcome.stdout
+            );
+        }
+    }
+
+    /// Off pull_request nothing is narrowed: the filter step is skipped, and
+    /// every category is forced on, so the merge queue and `main` run the
+    /// full suite.
+    #[cfg(unix)]
+    #[test]
+    fn every_event_but_pull_request_forces_a_full_run() {
+        let filters = paths_filters(&read_classify_action());
+        for event in ["push", "merge_group", "workflow_dispatch", "schedule"] {
+            assert_eq!(
+                classify(event, &["README.md"], &filters).forced,
+                "true",
+                "{event}"
+            );
+        }
+    }
+
+    /// The catch-all subtracts every category's `_files` list from the
+    /// changed files. A category whose list it does not read counts all of
+    /// its files as unclassified, so a filter added without wiring it here
+    /// would force a full run on every pull request touching it. The lists
+    /// hold names an author chose, so they reach the script through `env:`
+    /// only, never as a `${{ }}` inside `run:`.
+    #[test]
+    fn changes_classifier_reads_every_filter() {
+        let action = read_classify_action();
+        assert!(
+            action
+                .lines()
+                .any(|line| strip_comment(line).trim() == "list-files: json"),
+            "paths-filter must publish its file lists as JSON (`list-files: json`)"
+        );
+        let filters = paths_filters(&action);
+        assert_eq!(
+            paths_filter(&filters, "all"),
+            ["**"],
+            "the `all` filter lists every changed file"
+        );
+        let (script, env) = force_full_run_step(&action);
+        assert!(
+            !script.contains("${{"),
+            "the catch-all script must read its inputs from `env:`, not `${{{{ }}}}`:\n{script}"
+        );
+        let read: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|(key, expression)| Some((files_output_filter(expression)?, key.as_str())))
+            .collect();
+        assert_eq!(read.get("all"), Some(&"ALL_FILES"), "env: {env:?}");
+        for (name, _) in &filters {
+            if name == "all" {
+                continue;
+            }
+            let key = read.get(name.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "the `{name}` filter's `_files` list is not in the catch-all's env:, so \
+                     every file only it matches would count as unclassified"
+                )
+            });
+            assert!(
+                key.starts_with("CLASSIFIED_"),
+                "`{name}_files` must be read as a CLASSIFIED_* variable, which the script \
+                 subtracts; it is read as {key}"
+            );
+        }
+        for filter in read.keys() {
+            assert!(
+                filters.iter().any(|(name, _)| name == filter),
+                "the catch-all reads `{filter}_files`, but no `{filter}` filter is declared"
+            );
+        }
+    }
+
+    /// For every path category, paths it must match: one per glob, each
+    /// matched by that glob and by no other glob of the category, so
+    /// dropping any glob fails `every_path_category_glob_is_pinned_by_a_sample`.
+    const CATEGORY_SAMPLES: &[(&str, &[&str])] = &[
+        (
+            "rust",
+            &[
+                "examples/tool.rs",
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                ".cargo/config.toml",
+                "apps/rocm/assets/data.json",
+                "crates/rocm-core/src/model_catalog.json",
+                "engines/vllm/worker/settings.toml",
+                "xtask/assets/data.json",
+                "tests/install-sh/run.sh",
+                "fixtures/proptest-regressions/seed.txt",
+                "README.md",
+                "docs/testing.md",
+                "skills/rocm-cli-assistant/SKILL.md",
+                "MANIFEST.md",
+                "CONTRIBUTING.md",
+                "coverage-floors.toml",
+                "runtime-deps.toml",
+                "doctor-catalog.json",
+                "lychee.toml",
+                "scripts/run-e2e-lane.sh",
+                "install.sh",
+                ".github/scripts/gpu-preflight.sh",
+                ".github/dependabot.yml",
+                ".pre-commit-config.yaml",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "heavy",
+            &[
+                "build.rs",
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                ".cargo/config.toml",
+                "runtime-deps.toml",
+                "scripts/README.txt",
+                "xtask/assets/data.json",
+                "engines/vllm/worker/settings.toml",
+                "tool.py",
+                ".github/scripts/gpu-preflight.sh",
+                ".github/scripts/Invoke-WslBash.ps1",
+                "smoke.feature",
+                "tests/e2e-cucumber/fixtures/data.json",
+                "tests/remote-ssh/Dockerfile",
+                "skills/rocm-doctor/reference.md",
+                "install.cmd",
+                "LICENSE.TXT",
+                "docs/keys/rocm-cli-release-current-public.pem",
+                ".github/prompts/issue-triage.txt",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "tpn",
+            &[
+                "Cargo.lock",
+                "apps/rocm/Cargo.toml",
+                "about.toml",
+                "about.hbs",
+                "THIRD_PARTY_NOTICES.txt",
+                "xtask/src/tpn.rs",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "lint",
+            &[
+                "scripts/README.txt",
+                "engines/vllm/worker/settings.toml",
+                "tool.py",
+                "tool.sh",
+                "tool.ps1",
+                "ruff.toml",
+                "PSScriptAnalyzerSettings.psd1",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "docs",
+            &[
+                "docs/rocm-docs/index.md",
+                "README.md",
+                "CONTRIBUTING.md",
+                "docs/vllm.md",
+                "docs/wsl.md",
+                ".readthedocs.yaml",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "skills",
+            &[
+                "skills/rocm-doctor/SKILL.md",
+                ".github/workflows/ci.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "serve",
+            &[
+                "engines/vllm/Cargo.toml",
+                "crates/rocm-core/src/lib.rs",
+                "crates/rocm-engine-protocol/src/lib.rs",
+                "apps/rocm/src/main.rs",
+                "apps/rocmd/src/main.rs",
+                "tests/e2e-cucumber/README.md",
+                "crates/e2e-report/src/lib.rs",
+                "xtask/src/main.rs",
+                "smoke.feature",
+                "scripts/run-e2e-lane.sh",
+                ".github/scripts/gpu-preflight.sh",
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                ".cargo/config.toml",
+                ".github/workflows/e2e-selfhosted.yml",
+                ".github/actions/classify-changes/action.yml",
+            ],
+        ),
+        (
+            "inert",
+            &[
+                "AGENTS.md",
+                "CODE_OF_CONDUCT.md",
+                "SECURITY.md",
+                ".github/CODEOWNERS",
+                ".github/ISSUE_TEMPLATE/bug_report.md",
+                ".github/pull_request_template.md",
+                ".github/prompts/release-readiness-narrative.txt",
+                ".github/triage-maintainers.txt",
+                ".github/scan_tools_configs/zizmor.yml",
+            ],
+        ),
+    ];
+
+    /// Every glob of every path category is held in place by a sample path
+    /// that only it matches: removing a glob fails here, and so does
+    /// narrowing one until it no longer matches its sample, but a narrowing
+    /// that keeps the sample (`tests/remote-ssh/**` cut down to the sample
+    /// `tests/remote-ssh/Dockerfile`) passes. A new glob or category needs its
+    /// sample added above. The serve matrix deliberately leaves out the dash
+    /// crates.
+    #[test]
+    fn every_path_category_glob_is_pinned_by_a_sample() {
+        let filters = paths_filters(&read_classify_action());
+        for (category, globs) in &filters {
+            if category == "all" {
+                continue;
+            }
+            let samples = CATEGORY_SAMPLES
+                .iter()
+                .find_map(|(name, samples)| (name == category).then_some(*samples))
+                .unwrap_or_else(|| {
+                    panic!("the `{category}` category has no entry in CATEGORY_SAMPLES")
+                });
+            for sample in samples {
+                assert!(
+                    filter_matches(globs, sample),
+                    "`{sample}` must be in the `{category}` category"
+                );
+            }
+            for glob in globs {
+                assert!(
+                    samples.iter().any(|sample| {
+                        glob_matches(glob, sample)
+                            && globs
+                                .iter()
+                                .filter(|other| *other != glob)
+                                .all(|other| !glob_matches(other, sample))
+                    }),
+                    "no sample in CATEGORY_SAMPLES for `{category}` is matched by `{glob}` \
+                     alone, so removing the glob would go unnoticed"
+                );
+            }
+        }
+        for (category, _) in CATEGORY_SAMPLES {
+            assert!(
+                filters.iter().any(|(name, _)| name == category),
+                "CATEGORY_SAMPLES names `{category}`, which the action does not declare"
+            );
+        }
+        let serve = paths_filter(&filters, "serve");
+        for path in [
+            "crates/rocm-dash-tui/src/lib.rs",
+            "crates/rocm-dash-tui/Cargo.toml",
+        ] {
+            assert!(
+                !filter_matches(serve, path),
+                "`{path}` cannot change serve behaviour and must stay out of `serve`"
+            );
+        }
+    }
+
+    /// Cargo's configuration is in every category that compiles, and the files
+    /// the builds and tests read (crate data, fixtures, docs) are in `rust`. A
+    /// file in none of them used to skip every gated job.
+    /// [`every_path_category_glob_is_pinned_by_a_sample`] pins each glob.
+    #[test]
+    fn cargo_config_crate_data_and_docs_are_classified() {
+        let filters = paths_filters(&read_classify_action());
+        for category in ["rust", "heavy", "serve"] {
+            assert!(
+                filter_matches(paths_filter(&filters, category), ".cargo/config.toml"),
+                "`.cargo/config.toml` must be in the `{category}` category"
+            );
+        }
+        let rust = paths_filter(&filters, "rust");
+        for path in [
+            "crates/rocm-core/src/model_catalog.json",
+            "apps/rocm/assets/x.json",
+            "engines/vllm/worker/x.toml",
+            "tests/e2e-cucumber/fixtures/x.ps1",
+            "tests/remote-ssh/examination.json",
+            "README.md",
+            "docs/nightly-on-the-queue.md",
+            "docs/architecture.md",
+            "skills/rocm-cli-assistant/SKILL.md",
+            "doctor-catalog.json",
+            "Cargo.lock",
+            "Cargo.toml",
+            "apps/rocm/Cargo.toml",
+            "rust-toolchain.toml",
+            "xtask/assets/data.json",
+            "fixtures/proptest-regressions/seed.txt",
+            "runtime-deps.toml",
+        ] {
+            assert!(
+                filter_matches(rust, path),
+                "`{path}` must be in the `rust` category"
+            );
+        }
+        // CI's own definition, workflow or action, re-runs whatever it gates.
+        for (name, globs) in &filters {
+            assert_eq!(
+                filter_matches(globs, ".github/workflows/ci.yml"),
+                filter_matches(globs, ".github/actions/classify-changes/action.yml"),
+                "the `{name}` category must hold `.github/actions/**` exactly when it holds \
+                 `.github/workflows/**`"
+            );
+        }
+    }
+
+    /// The repository files a job's own lines name: a local action it `uses:`
+    /// (`./x` stands for `x/action.yml`) and every path under `.github/`,
+    /// `scripts/`, `tests/` or an `install*` file at the root that a `run:`,
+    /// `with:` or `env:` line spells out and that exists in the tree, written
+    /// from the root or from the workspace variable. A path built at run time
+    /// or written relative to another directory is not seen.
+    fn job_file_refs(block: &str) -> std::collections::BTreeSet<String> {
+        const ROOTS: [&str; 4] = [".github/", "scripts/", "tests/", "install"];
+        let root = repo_root();
+        let mut refs = std::collections::BTreeSet::new();
+        for line in block.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let code = strip_comment(line);
+            let trimmed = code.trim().trim_start_matches("- ").trim();
+            if let Some(action) = trimmed.strip_prefix("uses:") {
+                if let Some(dir) = strip_quotes(action.trim()).strip_prefix("./") {
+                    refs.insert(format!("{}/action.yml", dir.trim_end_matches('/')));
+                }
+                continue;
+            }
+            let is_path_char =
+                |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\');
+            for token in code.split(|c: char| !is_path_char(c)) {
+                let token = token.replace('\\', "/");
+                // `$env:GITHUB_WORKSPACE\x` and `${{ github.workspace }}/x`
+                // name `x` from the root.
+                let token = token.strip_prefix("GITHUB_WORKSPACE").unwrap_or(&token);
+                let token = token
+                    .trim_start_matches("./")
+                    .trim_start_matches('/')
+                    .trim_end_matches(['.', '/']);
+                if ROOTS.iter().any(|r| token.starts_with(r)) && root.join(token).is_file() {
+                    refs.insert(token.to_owned());
+                }
+            }
+        }
+        refs
+    }
+
+    #[test]
+    fn job_file_refs_finds_run_paths_and_local_actions() {
+        let block = "    steps:\n\
+                     \x20     - uses: ./.github/actions/classify-changes\n\
+                     \x20     - run: bash .github/scripts/gpu-preflight.sh\n\
+                     \x20     - run: python .\\scripts\\release_readiness.py --self-test\n\
+                     \x20       & \"$env:GITHUB_WORKSPACE\\.github\\scripts\\Invoke-WslBash.ps1\" -Script\n\
+                     \x20       bash ${{ github.workspace }}/scripts/run-e2e-lane.sh\n\
+                     \x20     # bash scripts/reclaim-gpu.sh\n\
+                     \x20     - run: echo tests/no/such/file.sh\n";
+        let refs: Vec<String> = job_file_refs(block).into_iter().collect();
+        assert_eq!(
+            refs,
+            [
+                ".github/actions/classify-changes/action.yml",
+                ".github/scripts/Invoke-WslBash.ps1",
+                ".github/scripts/gpu-preflight.sh",
+                "scripts/release_readiness.py",
+                "scripts/run-e2e-lane.sh",
+            ]
+        );
+    }
+
+    /// A job gated on a path category runs only when that category matches, so
+    /// every file the job runs or reads must be in it: otherwise a pull request
+    /// that changes only that file skips the job that uses it. A changed file
+    /// that matches some category is not forced to a full run, so being in
+    /// another category does not help. Checked for every job of both
+    /// workflows that read `changes` outputs, against every path category the
+    /// job reads (a step-level gate counts as the job's). "Every file" means
+    /// every file [`job_file_refs`] finds: a local action, or a path under
+    /// `.github/`, `scripts/`, `tests/` or `install*` spelled out in the job.
+    /// Each workflow must yield at least one gated job and one such file, so a
+    /// workflow whose gates or paths stop being recognised fails instead of
+    /// passing with nothing checked.
+    #[test]
+    fn every_file_a_gated_job_uses_is_in_its_gating_category() {
+        let filters = paths_filters(&read_classify_action());
+        let mut problems = Vec::new();
+        for workflow in ["ci.yml", "e2e-selfhosted.yml"] {
+            let text = read_workflow(workflow);
+            let mut gated_jobs = 0usize;
+            let mut checked = 0usize;
+            for (job, block) in ci_jobs(&text) {
+                let gates: Vec<&(String, Vec<String>)> = changes_output_reads(&block)
+                    .into_iter()
+                    .filter_map(|name| filters.iter().find(|(f, _)| *f == name))
+                    .collect();
+                if gates.is_empty() {
+                    continue;
+                }
+                gated_jobs += 1;
+                for file in job_file_refs(&block) {
+                    checked += 1;
+                    for (category, globs) in &gates {
+                        if !filter_matches(globs, &file) {
+                            problems.push(format!(
+                                "{workflow} job `{job}` uses {file}, which its gate \
+                                 `{category}` does not match"
+                            ));
+                        }
+                    }
+                }
+            }
+            assert!(
+                gated_jobs > 0,
+                "found no job in {workflow} gated on a path category"
+            );
+            assert!(checked > 0, "found no file a gated job in {workflow} uses");
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// A file a test reads from outside its crate selects the reader in
+    /// `cargo xtask affected` ([`crate::cross_crate_reads::CROSS_CRATE_READS`],
+    /// [`crate::affected::XTASK_READ_DOCS`]). If the `rust` category did not
+    /// also match it, `needs.changes.outputs.rust` would stay false for a pull
+    /// request that touches only that file, and the `test` job's every step —
+    /// including the `cargo nextest run` that would run the reader — would
+    /// skip. None of them may be `inert` either.
+    #[test]
+    fn every_cross_crate_read_is_in_the_rust_filter() {
+        let filters = paths_filters(&read_classify_action());
+        let rust = paths_filter(&filters, "rust");
+        let inert = paths_filter(&filters, "inert");
+        // A path each table pattern matches: `*.rs` is a file-name suffix, a
+        // trailing `/` a directory prefix, anything else an exact path.
+        let samples = |pattern: &str| -> Vec<String> {
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                vec![format!("x{suffix}"), format!("some/dir/x{suffix}")]
+            } else if pattern.ends_with('/') {
+                vec![format!("{pattern}x.md"), format!("{pattern}sub/x.json")]
+            } else {
+                vec![pattern.to_owned()]
+            }
+        };
+        let paths: Vec<String> = crate::cross_crate_reads::CROSS_CRATE_READS
+            .iter()
+            .flat_map(|(pattern, _)| samples(pattern))
+            .chain(
+                crate::affected::XTASK_READ_DOCS
+                    .iter()
+                    .map(ToString::to_string),
+            )
+            .collect();
+        for path in paths {
+            assert!(
+                filter_matches(rust, &path),
+                "`{path}` is read by a test from outside its crate, but the `rust` category \
+                 in {CLASSIFY_ACTION} does not match it, so an edit to it alone skips the \
+                 rust-gated jobs instead of running the test that reads it"
+            );
+            assert!(
+                !filter_matches(inert, &path),
+                "`{path}` is read by a test, so it cannot be `inert`"
+            );
+        }
+    }
+
+    /// Both workflows classify paths through the one action: neither keeps a
+    /// private copy of the filters to drift from the other (the self-hosted
+    /// copy of `heavy` had already lost `runtime-deps.toml`). The local action
+    /// is read from the workspace, so the job checks out first.
+    #[test]
+    fn both_change_jobs_classify_through_the_shared_action() {
+        for workflow in ["ci.yml", "e2e-selfhosted.yml"] {
+            let text = read_workflow(workflow);
+            let block = job_block(&text, "changes");
+            let steps = job_steps(block).expect("the `changes` job has steps");
+            let uses = |step: &str| {
+                step.lines()
+                    .filter_map(|line| {
+                        strip_comment(line)
+                            .trim()
+                            .trim_start_matches("- ")
+                            .strip_prefix("uses: ")
+                    })
+                    .map(str::trim)
+                    .next()
+                    .map(str::to_owned)
+            };
+            let classify_at = steps
+                .iter()
+                .position(|(_, step)| {
+                    uses(step).as_deref() == Some("./.github/actions/classify-changes")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{workflow}'s `changes` job must use ./.github/actions/classify-changes")
+                });
+            assert!(
+                steps[..classify_at]
+                    .iter()
+                    .any(|(_, step)| uses(step).is_some_and(|u| u.starts_with("actions/checkout@"))),
+                "{workflow}'s `changes` job must check out before using the local action"
+            );
+            assert_eq!(
+                steps[classify_at]
+                    .1
+                    .lines()
+                    .find_map(|line| strip_comment(line).trim().strip_prefix("id: ")),
+                Some("classify"),
+                "{workflow}: the classify step's id is `classify`, which the outputs read"
+            );
+            // paths-filter reads a pull request's files from the API.
+            // Exactly these: `contents: read` to check out, `pull-requests:
+            // read` for paths-filter, and no write scope.
+            let permissions = job_mapping(block, "permissions");
+            let want: BTreeMap<String, String> = [("contents", "read"), ("pull-requests", "read")]
+                .into_iter()
+                .map(|(scope, level)| (scope.to_owned(), level.to_owned()))
+                .collect();
+            assert_eq!(permissions, want, "{workflow}'s `changes` job permissions");
+        }
+        // The filter step runs on pull requests only: anywhere else there is
+        // no pull request to list, and the catch-all forces every category.
+        let action = read_classify_action();
+        let filter_step = job_steps(&action)
+            .expect("the action has steps")
+            .into_iter()
+            .find_map(|(_, step)| step.contains("dorny/paths-filter@").then_some(step))
+            .expect("the action runs paths-filter");
+        let lines: Vec<&str> = filter_step.lines().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| strip_comment(line).trim() == "id: filter"),
+            "the paths-filter step's id is `filter`, which the outputs read"
+        );
+        assert!(
+            lines.iter().any(
+                |line| strip_comment(line).trim() == "if: github.event_name == 'pull_request'"
+            ),
+            "the paths-filter step must be gated on `github.event_name == 'pull_request'`"
+        );
+        for (path, text) in all_workflows_and_actions() {
+            if path == CLASSIFY_ACTION {
+                continue;
+            }
+            assert!(
+                !text.contains("dorny/paths-filter"),
+                "{path} runs paths-filter itself; classify through {CLASSIFY_ACTION} instead"
+            );
+        }
+    }
+
+    /// The `value:` of every output the action declares.
+    fn action_outputs(action: &str) -> BTreeMap<String, String> {
+        let block = top_level_block(action, "outputs");
+        let mut outputs = BTreeMap::new();
+        let mut current: Option<String> = None;
+        for line in block.lines() {
+            let code = strip_comment(line);
+            if code.trim().is_empty() {
+                continue;
+            }
+            if indent_of(code) == 2 {
+                current = code.trim().strip_suffix(':').map(str::to_owned);
+            } else if let (Some(name), Some(value)) =
+                (&current, code.trim().strip_prefix("value: "))
+            {
+                outputs.insert(name.clone(), value.trim().to_owned());
+            }
+        }
+        outputs
+    }
+
+    /// The `changes` outputs a workflow reads: every whole
+    /// `needs.changes.outputs.<name>` reference outside a YAML comment. The
+    /// name runs to the end of the identifier, so `rust_x` is not a read of
+    /// `rust`, and a reference preceded by an identifier character is not one.
+    fn changes_output_reads(text: &str) -> std::collections::BTreeSet<String> {
+        const PREFIX: &str = "needs.changes.outputs.";
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        let mut reads = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let code = if line.trim_start().starts_with('#') {
+                ""
+            } else {
+                strip_comment(line)
+            };
+            for (at, _) in code.match_indices(PREFIX) {
+                if code[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_ident(c) || c == '.')
+                {
+                    continue;
+                }
+                let name: String = code[at + PREFIX.len()..]
+                    .chars()
+                    .take_while(|c| is_ident(*c))
+                    .collect();
+                reads.insert(name);
+            }
+        }
+        reads
+    }
+
+    #[test]
+    fn changes_output_reads_skips_comments_and_longer_names() {
+        let text = "\
+    if: needs.changes.outputs.rust == 'true'
+    # needs.changes.outputs.lint == 'true'
+# needs.changes.outputs.e2e == 'true'
+    if: x # needs.changes.outputs.docs
+    if: needs.changes.outputs.heavy_x == 'true'
+    if: xneeds.changes.outputs.tpn == 'true'
+";
+        let reads: Vec<String> = changes_output_reads(text).into_iter().collect();
+        assert_eq!(reads, ["heavy_x", "rust"]);
+    }
+
+    /// Every output is a comparison with the string 'true'. paths-filter sets
+    /// a filter's output to the string 'false' when it does not match, and
+    /// 'false' is truthy in an expression, so the old
+    /// `steps.filter.outputs.X || steps.all.outputs.forced` never let a forced
+    /// run win on a pull request.
+    #[test]
+    fn change_outputs_compare_with_the_string_true() {
+        let action = read_classify_action();
+        let outputs = action_outputs(&action);
+        let filters = paths_filters(&action);
+        for (name, _) in &filters {
+            if name == "all" || name == "inert" {
+                continue;
+            }
+            assert_eq!(
+                outputs.get(name).map(String::as_str),
+                Some(
+                    format!(
+                        "${{{{ steps.filter.outputs.{name} == 'true' || \
+                         steps.all.outputs.forced == 'true' }}}}"
+                    )
+                    .as_str()
+                ),
+                "the action's `{name}` output"
+            );
+        }
+        for name in outputs.keys() {
+            assert!(
+                filters.iter().any(|(filter, _)| filter == name),
+                "the action's `{name}` output is not a path category"
+            );
+        }
+        let mut read_outputs = std::collections::BTreeSet::new();
+        // Outputs that are not a path category, each read by its workflow.
+        let not_categories = [
+            ("ci.yml", "windows"),
+            ("e2e-selfhosted.yml", "sdk_version_matrix"),
+            ("e2e-selfhosted.yml", "sdk_pins"),
+        ];
+        for workflow in ["ci.yml", "e2e-selfhosted.yml"] {
+            let text = read_workflow(workflow);
+            let job = job_mapping(job_block(&text, "changes"), "outputs");
+            let reads = changes_output_reads(&text);
+            for (key, value) in &job {
+                assert!(
+                    reads.contains(key),
+                    "{workflow}'s `changes` job exports `{key}`, which no job reads"
+                );
+                if not_categories.contains(&(workflow, key.as_str())) {
+                    continue;
+                }
+                assert_eq!(
+                    value,
+                    &format!("${{{{ steps.classify.outputs.{key} == 'true' }}}}"),
+                    "{workflow}'s `changes` output `{key}`"
+                );
+                assert!(
+                    outputs.contains_key(key),
+                    "the action has no `{key}` output"
+                );
+                read_outputs.insert(key.clone());
+            }
+            // Every category a job reads is exported.
+            for name in &reads {
+                assert!(
+                    job.contains_key(name),
+                    "{workflow} reads `needs.changes.outputs.{name}`, which `changes` does not export"
+                );
+            }
+        }
+        for name in outputs.keys() {
+            assert!(
+                read_outputs.contains(name),
+                "the action's `{name}` output is exported by no `changes` job"
+            );
+        }
+    }
+
+    /// Dependabot's github-actions updater reads `.github/workflows` from `/`
+    /// but does not follow a local `uses: ./...` into a composite action, so
+    /// each local action's directory is listed by name, or its pins (the
+    /// paths-filter one in classify-changes) are never bumped. The list is
+    /// compared both ways, so an entry left behind by a removed action fails
+    /// too.
+    #[test]
+    fn dependabot_bumps_the_pins_in_every_local_action() {
+        let config = std::fs::read_to_string(repo_root().join(".github/dependabot.yml"))
+            .expect("reading .github/dependabot.yml")
+            .replace("\r\n", "\n");
+        let start = config
+            .find("  - package-ecosystem: github-actions\n")
+            .expect("dependabot.yml has a github-actions entry");
+        let rest = &config[start + 1..];
+        let entry = &rest[..rest.find("\n  - package-ecosystem:").unwrap_or(rest.len())];
+        assert!(
+            !entry
+                .lines()
+                .any(|line| line.trim().starts_with("directory:")),
+            "the github-actions entry lists `directories:`; Dependabot rejects `directory:` \
+             alongside it"
+        );
+        let lines: Vec<&str> = entry.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == "directories:")
+            .expect("the github-actions entry has a `directories:` list");
+        let indent = indent_of(lines[at]);
+        let directories: Vec<String> = lines[at + 1..]
+            .iter()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .take_while(|line| indent_of(line) > indent)
+            .filter_map(|line| strip_comment(line).trim().strip_prefix("- "))
+            .map(|item| strip_quotes(item.trim()))
+            .collect();
+        let mut wanted = vec!["/".to_owned()];
+        for (path, _) in all_local_actions() {
+            let dir = path
+                .rsplit_once('/')
+                .expect("an action file sits in a directory")
+                .0;
+            wanted.push(format!("/{dir}"));
+        }
+        let mut listed = directories;
+        listed.sort();
+        wanted.sort();
+        assert_eq!(
+            listed, wanted,
+            "dependabot.yml's github-actions `directories:` must list `/` and every local \
+             action's directory, and nothing else (a stale entry names a removed action)"
+        );
+    }
+
+    /// Every third-party action, in a workflow or a local action, is pinned to
+    /// a full commit SHA with the version in a trailing comment: a moving tag
+    /// lets a retagged or compromised action into CI silently.
+    #[test]
+    fn every_action_reference_is_pinned_to_a_full_commit_sha() {
+        let mut checked = 0;
+        for (path, text) in all_workflows_and_actions() {
+            for line in text.lines() {
+                let Some(reference) = line.trim().trim_start_matches("- ").strip_prefix("uses: ")
+                else {
+                    continue;
+                };
+                if reference.starts_with("./") {
+                    continue;
+                }
+                checked += 1;
+                let (target, comment) = reference.split_once(" # ").unwrap_or_else(|| {
+                    panic!("{path}: `{reference}` has no `# <version>` comment")
+                });
+                let sha = target
+                    .rsplit_once('@')
+                    .unwrap_or_else(|| panic!("{path}: `{reference}` has no `@<sha>`"))
+                    .1;
+                assert!(
+                    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{path}: `{reference}` is not pinned to a full commit SHA"
+                );
+                assert!(!comment.trim().is_empty(), "{path}: `{reference}`");
+            }
+        }
+        assert!(checked > 0, "found no `uses:` to check");
     }
 
     #[test]
@@ -6548,6 +8600,43 @@ fi
             step_keys(&step),
             ["name", "if", "run"],
             "the fish profile step must not grow keys such as continue-on-error \
+             that turn it into an advisory check:\n{step}"
+        );
+    }
+
+    /// The `pr-<number>` channel of `install.sh` is exercised by a hermetic
+    /// shell script with a stub `gh`. The Linux build job must run it as a
+    /// gate, for the same reasons as the fish checks above: the step is
+    /// checked, not the job's text, so a commented-out step, `if: false` or
+    /// `continue-on-error: true` cannot leave the script mentioned while
+    /// nothing runs it.
+    #[test]
+    fn ci_linux_build_and_test_runs_the_install_sh_pr_channel_checks() {
+        let ci = read_workflow("ci.yml");
+        let linux = job_block(&ci, "build-and-test");
+        let lines: Vec<&str> = linux.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start() == "- name: Installer PR channel checks")
+            .expect(
+                "build-and-test must have an `Installer PR channel checks` step so a \
+                 pr-<number> install that trusts the wrong run or key fails in required CI",
+            );
+        let step = step_block(&lines, at);
+        assert_eq!(
+            step_key(&step, "run"),
+            "sh tests/install-sh/pr_channel.sh",
+            "the PR channel step must run tests/install-sh/pr_channel.sh:\n{step}"
+        );
+        assert_eq!(
+            step_key(&step, "if"),
+            "needs.changes.outputs.heavy == 'true'",
+            "the PR channel step must run whenever the job's other heavy checks do:\n{step}"
+        );
+        assert_eq!(
+            step_keys(&step),
+            ["name", "if", "run"],
+            "the PR channel step must not grow keys such as continue-on-error \
              that turn it into an advisory check:\n{step}"
         );
     }
@@ -7891,15 +9980,9 @@ fi
              like the other xtask checks in the clippy job"
         );
 
-        let start = ci
-            .find("            rust:\n")
-            .expect("ci.yml defines the `rust` path filter");
-        let end = start
-            + ci[start..]
-                .find("            heavy:\n")
-                .expect("ci.yml defines the `heavy` path filter after `rust`");
+        let filters = paths_filters(&read_classify_action());
         assert!(
-            ci[start..end].contains("- 'docs/architecture.md'"),
+            filter_matches(paths_filter(&filters, "rust"), "docs/architecture.md"),
             "the `rust` path filter must include docs/architecture.md, so a doc-only edit \
              re-runs `{command}`"
         );
@@ -11894,6 +13977,54 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn a_failing_lane_leaves_a_note_of_how_it_ended_beside_its_results() {
+        // The suite fails on both channels: each keeps its results, and the
+        // note names the status and both channels.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            suite_rc: 3,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 3, "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+        assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note"),
+            "status=3\nchannels_failed=release nightly\n",
+            "{log}"
+        );
+
+        // A lane that stops before any channel runs still leaves the note.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(1),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        let note = std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note");
+        assert!(note.starts_with(&format!("status={rc}\n")), "{note}");
+
+        // A lane that passes writes none.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase::default());
+        assert_eq!(rc, 0, "{log}");
+        assert!(!out.join("lane-status.txt").exists(), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_lane_runs_only_the_channels_it_is_asked_for_and_refuses_others() {
         let LaneRun {
             rc,
@@ -12065,7 +14196,7 @@ esac
             !log.contains("cargo"),
             "nothing is built after apt-get gave up:\n{log}"
         );
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// `apt-get install` fails on a dropped connection or a pool that moved
@@ -12102,7 +14233,7 @@ esac
             !log.contains("cargo"),
             "nothing is built after apt-get gave up:\n{log}"
         );
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// The rustup-init download is retried, and only the download: a file that
@@ -12193,7 +14324,7 @@ esac
                 "{log}"
             );
             assert!(!log.contains("cargo build"), "{log}");
-            assert!(!out.exists());
+            assert!(!out.join("release").exists());
         }
     }
 
@@ -12218,7 +14349,7 @@ esac
         );
         assert!(!log.contains("cargo fetch"), "{log}");
         assert!(!log.contains("cargo build"), "{log}");
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// The fetch covers only the host's crates, so a build target set from
@@ -12239,7 +14370,7 @@ esac
         assert_eq!(rc, 1, "{log}");
         assert!(log.contains("CARGO_BUILD_TARGET is set"), "{log}");
         assert!(!log.contains("cargo fetch"), "{log}");
-        assert!(!out.exists());
+        assert!(!out.exists(), "{log}");
 
         let LaneRun { rc, log, .. } = run_lane(&LaneCase {
             machine: "aarch64",

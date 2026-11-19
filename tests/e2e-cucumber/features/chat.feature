@@ -221,3 +221,19 @@ Feature: Chat and endpoint detection
     When a tool-using client asks the CLI to check a path with a second set of arguments nested inside the first
     Then the CLI refuses the request for its nested arguments
     And no tool result is printed
+
+  # PR #1041 pointed the chat `model` tool at the curated `rocm model` listing
+  # instead of the 58k-token `--verbose` dump, which was right: the dump was
+  # more than a locally served model's whole context. The deterministic "ROCm
+  # CLI summary" block was gated on a string only the dump printed, so it
+  # silently stopped appearing for model questions — and the curated listing is
+  # grouped by hardware target and names only large models, so on a small GPU
+  # the answer named nothing that fits. The block names the ~4 GiB local
+  # assistant by name, and this drives the real `rocm chat` turn end to end:
+  # the CLI's own fallback runs the model tool, so a regression in either the
+  # tool's renderer or the summary's gate shows up here.
+  @id:chat-model-question-shows-the-rocm-cli-summary
+  Scenario: chat-20 - Asking what models this machine can run shows the deterministic ROCm CLI summary
+    Given a local chat assistant that answers a model question in words
+    When the user asks in one-shot chat which models this machine can run
+    Then the chat shows a ROCm CLI summary naming the low-VRAM local assistant

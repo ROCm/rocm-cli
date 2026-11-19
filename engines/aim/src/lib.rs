@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 mod docker;
+mod endpoint_auth;
 mod install;
 mod process;
 mod registry;

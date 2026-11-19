@@ -16,9 +16,10 @@ workspace = true
 e2e-test-hooks = []
 # Compiles test helpers so a dependent crate's tests can use them: the
 # `foreign_temp_probe` probe, `atomic_write::stage_owner_only_file_unpublished`
-# (the leftover a killed owner-only store leaves) and, on Windows,
-# `owner_only_file::owner_only_dacl_mismatch` (reads a file's DACL back).
-# Enabled only from a `[dev-dependencies]` entry; never in a shipped build.
+# (the leftover a killed owner-only store leaves), the examine scenarios'
+# planted `lspci` lines (`rocm_core::examine::TEST_FIXTURE_LSPCI_LINE_*`) and,
+# on Windows, `owner_only_file::owner_only_dacl_mismatch` (reads a file's DACL
+# back). Enabled only from a `[dev-dependencies]` entry; never in a shipped build.
 test-support = []
 
 [build-dependencies]
@@ -72,4 +73,12 @@ tempfile = "3"
 chrono.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_System_LibraryLoader` is for `host_gpu/unified_memory.rs`, which loads
+# `dxgi.dll` by absolute System32 path to read the WDDM shared-memory budget.
+# There is no `Win32_Graphics_Dxgi` feature to use instead: windows-sys carries
+# no COM interfaces at all, so the three vtable slots that read are declared in
+# that module. `Win32_Security_Authorization` is for `owner_only_file`.
+# windows-sys features are additive and each one here is the only source of
+# some binding this crate calls, so dropping one does not trim the build, it
+# breaks it on Windows.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

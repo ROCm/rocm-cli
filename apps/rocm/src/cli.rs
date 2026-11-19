@@ -183,7 +183,10 @@ pub(crate) enum Command {
         /// range request; no token is sent, so a gated or private repository
         /// cannot be read): weights plus KV cache at `--context-size` plus a
         /// compute buffer and a runtime reserve, against the dedicated VRAM of
-        /// the GPU with the most of it, labelled ESTIMATED rather than READY or
+        /// the GPU with the most of it - or, on an integrated GPU, against the
+        /// shared memory pool its engine allocates from, which is a ceiling the
+        /// operating system draws on too and is reported as such - labelled
+        /// ESTIMATED rather than READY or
         /// BLOCKED. A device-visibility mask on a host whose GPUs differ in
         /// memory is flagged in the report, since which card it selects is not
         /// verified there. Any other model the
@@ -207,7 +210,10 @@ pub(crate) enum Command {
         /// GPU memory could be read; without a reading, the memory the model
         /// needs is shown and nothing is compared, so no largest context is
         /// given. The comparison is against the total dedicated VRAM of the GPU
-        /// with the most of it that ROCm can see, as for a curated model, not
+        /// with the most of it that ROCm can see - or, on an integrated GPU,
+        /// against the shared memory pool its engine allocates from rather than
+        /// the BIOS carve-out beside it - as for a curated model, and in
+        /// neither case against
         /// what other processes have left free. Applies to a GGUF outside the
         /// catalog (a curated model's memory minimum is fixed, and says so);
         /// `rocm serve` has no context-size option yet, so this answers the
@@ -395,7 +401,10 @@ pub(crate) enum Command {
     /// apply). With --prompt, or a prompt piped on standard input, sends that one
     /// prompt and prints the reply. Use `rocm config enable-provider` and
     /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server.
+    /// `local` provider talks to a running server. On Linux/WSL the interactive
+    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
+    /// and, like it, prints why that daemon was failing after it closes,
+    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -512,8 +521,13 @@ rocm model --verbose"
     /// Picks an engine and ROCm runtime automatically unless overridden. An
     /// Anthropic `/v1/messages` endpoint is published beside the OpenAI
     /// one (see `rocm services list`). By default the
-    /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
+    /// server runs as a managed background service. For a fresh launch in a terminal it
+    /// first prints the service id and how to follow its log; while it starts, the status line
+    /// follows what the engine is doing (download, load, or the latest log line) until
+    /// the server is ready or that wait fails. A ready server then prints a deployment
+    /// summary (status, endpoint, model, and smoke-test metrics). A wait that fails
+    /// while the server is still running names `rocm logs` and `rocm services stop`
+    /// instead of a finished "not ready" summary. Use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
@@ -602,8 +616,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep waiting until the server answers requests or its engine gives up
         /// (vLLM and AIM after 5 minutes by default, raised with
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
-        /// instead of returning `starting` after 45 seconds.
-        /// Also waits on a matching server that is already starting. Fails with a
+        /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
+        /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. Fails with a
         /// pointer to the logs if the server exits first. Cannot be
         /// combined with --foreground or --verbose, which already stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
@@ -761,6 +776,15 @@ rocm logs --search error timeout")]
     /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
     /// lemonade_port in config.json. External models have no Services stop/restart
     /// controls; discovery is read-only and quitting leaves external servers running.
+    ///
+    /// On Linux/WSL, open dashboards share one telemetry daemon; when the dashboard
+    /// running it closes, one still open takes it over. If the daemon was
+    /// failing when the dashboard closed, the reason is printed after it closes,
+    /// whether it was quit or ended with Ctrl-C, SIGINT or SIGTERM, unless
+    /// another dashboard's daemon is serving by then. A crash of the dashboard's
+    /// own supervision of its telemetry daemon is reported even then when the
+    /// dashboard is quit; on Ctrl-C or a signal it is only written to the log
+    /// files under the data directory's logs folder, as it happens.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -795,7 +819,10 @@ rocm uninstall --keep-data --yes")]
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
         /// when there is something to remove, it prints the plan and refuses
-        /// with exit 1, removing nothing.
+        /// with exit 1, removing nothing, and ends with a `Try:` line that is
+        /// the same command with --yes added. Run it in the same environment:
+        /// it repeats the flags, not variables such as HOME set before the
+        /// command.
         #[arg(long)]
         yes: bool,
         /// Show what would be removed without deleting anything.
@@ -1198,7 +1225,9 @@ pub(crate) enum ComfyuiCommand {
         /// what its release shipped instead replaces whatever has the names the new release
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
         /// running or still starting, checked before the download and again just before the code
-        /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// is replaced, unless rocm-cli's saved record of it cannot be parsed, which it then says;
+        /// a record that cannot be read at all (a directory at its path, permission denied) is an
+        /// error naming the file.
         /// Over an existing install, a download that is not a ComfyUI release (no main.py) is
         /// discarded and the install is left as it was.
         #[arg(long)]
@@ -1226,6 +1255,13 @@ pub(crate) enum ComfyuiCommand {
         yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
+    ///
+    /// If rocm-cli's saved record of the ComfyUI it started cannot be parsed, it
+    /// stops no process, since the record names none, and checks only the
+    /// default address: if nothing answers there it moves the record aside to
+    /// `running.json.unreadable`; if something does, it keeps the record and
+    /// exits non-zero. A record that cannot be read at all (a directory at its
+    /// path, permission denied) is an error naming the file.
     Stop {
         /// Accepted for consistency with other mutating commands; stopping never prompts.
         #[arg(long)]
@@ -1461,6 +1497,7 @@ pub(crate) enum SetupCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uninstall_plan::UninstallOptions;
     use crate::{cli_command, device_policy_name, engine_inventory, uninstall::reject_force};
     use clap::{CommandFactory, Parser};
     use rocm_engine_protocol::DevicePolicy;
@@ -1688,7 +1725,9 @@ mod tests {
     fn yes_help_says_what_happens_without_it_outside_a_terminal() {
         // Wording pin: the sentences are only worth having while they are true,
         // and the behavior itself is proven elsewhere —
-        //   uninstall              uninstall-04
+        //   uninstall              uninstall-04; uninstall-16 runs its `Try:` line;
+        //                          `uninstall_refusal_advice_parses_and_clears_the_refusal`
+        //                          (the line is the argv with --yes, no environment)
         //   runtimes uninstall     runtime-lifecycle-04
         //   storage remove-*       storage-01, `removal_requires_yes_when_there_is_no_terminal_to_prompt`
         //   fix                    diagnose-08, `consent_without_prompt` unit tests
@@ -1704,7 +1743,15 @@ mod tests {
         const NEVER_ASKS: &[&str] = &["never asks for confirmation"];
         const NEVER_PROMPTS: &[&str] = &["never prompts"];
         let cases: &[(&[&str], &[&str])] = &[
-            (&["uninstall"], REFUSES),
+            (
+                &["uninstall"],
+                &[
+                    "(default: no)",
+                    "refuses with exit 1,",
+                    "ends with a `Try:` line",
+                    "Run it in the same environment",
+                ],
+            ),
             (&["runtimes", "uninstall"], REFUSES),
             (&["storage", "remove-old-installs"], REFUSES),
             (&["storage", "remove-downloads"], REFUSES),
@@ -2594,18 +2641,27 @@ mod tests {
             panic!("not an uninstall command");
         };
         assert!(force.is_some() && !force_dev_binaries);
-        let refusal = reject_force(force.is_some()).unwrap_err().to_string();
+        let refusal = reject_force(force.is_some(), &UninstallOptions::default())
+            .unwrap_err()
+            .to_string();
         assert!(refusal.contains("`--force` is not an option"), "{refusal}");
         assert!(refusal.contains("--yes"), "{refusal}");
         assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
-        assert!(reject_force(false).is_ok());
+        // Its last line is the command meant, which
+        // `uninstall_force_advice_parses_and_clears_the_refusal` runs.
+        assert_eq!(
+            rocm_core::recovery_hint::try_command(&refusal),
+            Some("rocm uninstall --yes"),
+            "{refusal}"
+        );
+        assert!(reject_force(false, &UninstallOptions::default()).is_ok());
         // `--force=x` is the same mistake, and gets the same answer rather than
         // a usage line that lists every flag.
         let cli = Cli::try_parse_from(["rocm", "uninstall", "--force=x"]).unwrap();
         let Some(Command::Uninstall { force, .. }) = cli.command else {
             panic!("not an uninstall command");
         };
-        assert!(reject_force(force.is_some()).is_err());
+        assert!(reject_force(force.is_some(), &UninstallOptions::default()).is_err());
 
         // Near misses and the forms clap suggests from elsewhere in the command
         // line never offer the destructive flag.

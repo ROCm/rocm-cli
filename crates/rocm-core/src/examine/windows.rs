@@ -5,7 +5,7 @@
 //! The native Windows probes: the GPU query, the HIP SDK, the Adrenalin driver and
 //! the MSVC redistributable.
 
-use super::linux_gpus::{classify_amd_marketing_name, gfx_apu_verdict, gfx_is_apu_family};
+use super::linux_gpus::{apu_verdict_from_target, classify_amd_marketing_name, gfx_is_apu_family};
 use super::{Examination, Gpu};
 use crate::probe_exec::{MEDIUM, run};
 use std::path::Path;
@@ -192,16 +192,13 @@ pub(super) fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdo
         else {
             continue;
         };
-        // Same rule as `apply_rocminfo_gpu_agents`: a target whose packaging is
-        // known outranks the display probe's verdict, an unknown one leaves it.
-        // Today the two branches cannot disagree here: a row reaches this loop
-        // only with an empty target, and the Windows probe gives every such row
-        // the "not an APU" default, so an unknown target leaves exactly what an
-        // overwrite with `gfx_is_apu_family`'s `false` would. The rule is kept
-        // so the hipInfo fold cannot quietly drift from the rocminfo one.
-        if let Some(is_apu) = gfx_apu_verdict(&gfx) {
-            gpu.is_apu = Some(is_apu);
-        }
+        // A row reaches here only with an empty target, so this is the
+        // "fills an empty row target" case of the rule table at
+        // `apu_verdict_from_target`, the same one the KFD membership pass
+        // applies: an APU-family target makes the row integrated, and any
+        // other leaves the display probe's verdict, since a target outside the
+        // families is no evidence of a discrete card.
+        gpu.is_apu = apu_verdict_from_target(gpu.is_apu, &gfx);
         gpu.gfx_target = gfx;
     }
 }
