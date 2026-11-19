@@ -2509,10 +2509,17 @@ Expected result:
 
 ## 20. Curated Models Narrowed To This Machine
 
-Needs two hosts to be meaningful: one with a large discrete GPU (an MI300X) and
-one with a small or integrated GPU (a Ryzen APU is the case this exists for).
-The mock lane covers the logic with a forced memory figure; what it cannot do is
-read a real machine.
+Needs two hosts to be meaningful, **both with discrete GPUs**: one large (an
+MI300X) and one small (a 16 GiB Radeon or similar). The mock lane covers the
+logic with a forced memory figure; what it cannot do is read a real machine.
+
+An integrated GPU is deliberately *not* one of them yet. `rocm` classifies an
+APU's shared pool as unreadable rather than as a memory figure, so an APU takes
+the unmeasured branch below and its listing is **unchanged** by this check. That
+is the honest current behaviour, not an oversight: reading the pool is
+`rocmai-912` / #1054's `Unified { gtt_total_gib }`, and narrowing an APU on a
+figure nothing measured would be the invented claim this whole area exists to
+remove. Re-point this section at an APU once that lands.
 
 ```bash
 rocm model
@@ -2527,14 +2534,14 @@ Expected result, on the large host:
 
 Expected result, on the small host:
 
-- The models listed are ones this machine's GPU memory can hold. On an APU with
-  roughly 8 GiB of shared pool that means the Lemonade GGUF recipes, and none of
-  the 17 GiB-and-larger ones.
+- The models listed are ones this machine's GPU memory can hold. On a 16 GiB
+  discrete card that means the smaller recipes, and none of the 17 GiB-and-larger
+  ones.
 - No row says `needs a larger GPU`: a recommendation and a refusal cannot both
   be true of the same row.
 
 Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
-or a GPU the CLI cannot measure):
+a GPU the CLI cannot measure, **or any APU** — see above):
 
 - The list is *not* narrowed, and ends with `This machine's GPU memory could not
   be read, so these are not filtered to what it can run.` An unmeasured machine

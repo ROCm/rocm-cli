@@ -315,9 +315,19 @@ async fn assert_the_assistant_matches_the_user(world: &mut E2eWorld) {
     );
 }
 
+/// The listing this captures becomes the substring target that
+/// `assert_the_assistant_matches_the_user` compares the assistant's answer
+/// against, so its success is asserted here rather than left implied. An empty
+/// stdout from a crash would make that comparison `contains("")` -- trivially
+/// true -- and `model-catalog-09` would pass having compared nothing.
 #[when("the user asks which models are recommended")]
 async fn user_asks_for_recommendations(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["model"]);
+    assert_eq!(rc, 0, "`rocm model` failed:\n{stderr}");
+    assert!(
+        !stdout.trim().is_empty(),
+        "`rocm model` printed nothing, so there is no answer to compare against:\n{stderr}"
+    );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);

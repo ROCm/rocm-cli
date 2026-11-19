@@ -201,6 +201,13 @@ fn host_accelerator_memory(
 /// the same rule, including its "largest mask-visible card, never the sum"
 /// decision and its refusal to read an APU's carve-out as the pool.
 ///
+/// The *rule* is shared; the inputs are not identical. This passes `None` for
+/// `AppPaths` where `assess_model_with_host_paths` threads a discovered one
+/// through, which is inert only because `detect_host_gpu_summary` ignores that
+/// argument on every platform branch today. If a branch ever reads it, these
+/// two stop agreeing silently -- so the equivalence above is a property of the
+/// classifier, not of the two call sites.
+///
 /// An APU therefore reports `None` and the listing stays unfiltered, which is
 /// honest on this branch: the pool an integrated part allocates from is not
 /// readable here yet.
