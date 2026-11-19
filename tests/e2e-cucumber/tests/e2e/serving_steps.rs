@@ -316,7 +316,8 @@ const ASSISTANT_PORT: u16 = 8001;
 /// Polls until nothing answers on the port (bounded), killing any listener.
 ///
 /// Returns a one-line description of the device state the next serve starts on
-/// (see [`wait_for_free_vram`]). Callers that only need the reset can ignore it;
+/// (see [`wait_for_free_vram`]), followed by a note naming the port's holder when
+/// the port never became usable. Callers that only need the reset can ignore it;
 /// a serve that then fails to become ready reports it, because "the previous
 /// engine had not released the GPU yet" is otherwise invisible in the log.
 async fn ensure_serve_port_free() -> String {
@@ -332,38 +333,36 @@ async fn ensure_serve_port_free() -> String {
     // Vulkan (EAI-7052) and starves the vLLM serve under test; no scenario needs it.
     kill_listeners_on_port(SERVE_PORT);
     kill_listeners_on_port(ASSISTANT_PORT);
-    // Longer than Linux's 60 s TIME_WAIT: a server that closed a connection
-    // first and was then killed leaves a TIME_WAIT socket on the port with no
-    // process behind it. It refuses connects (so the old connect-only check
-    // called the port free), fails every `bind` until it expires, and is
-    // invisible to `fuser`/`lsof`. Observed with both Lemonade 2026.44.1 and
-    // 2026.45.3's `lemond` (bind after SIGKILL failed with EADDRINUSE even with
-    // SO_REUSEADDR). `ss -tan` shows it, which the timeout note below prints.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut port_note = String::new();
-    loop {
-        // A refused connect only proves nothing listens; a socket that is
-        // bound but not listening (or still tearing down) refuses connects
-        // yet fails the next `bind`, which serve-08's port drift and
-        // serve-49's listener hit. Require both.
-        let refused = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
-            .await
-            .is_err();
-        let bindable = e2e_cucumber::serve_log::port_is_bindable(SERVE_PORT);
-        if refused && bindable.is_ok() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            port_note = format!(
-                "port {SERVE_PORT} still unavailable after 90 s (connect refused: {refused}, bind: {bindable:?})\n{}",
-                e2e_cucumber::serve_log::port_holders(SERVE_PORT)
-            );
-            eprintln!("{port_note}");
-            break;
-        }
-        kill_listeners_on_port(SERVE_PORT);
-        kill_listeners_on_port(ASSISTANT_PORT);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait longer than Linux's 60 s TIME_WAIT. Observed locally with `lemond`
+    // 2026.44.1 and 2026.45.3: after a request it closed first and a SIGKILL,
+    // `ss -tan` showed a TIME-WAIT socket on the port with no process behind
+    // it, connects were refused (so a connect-only check called the port
+    // free), `bind` failed with EADDRINUSE even with SO_REUSEADDR, and
+    // `fuser`/`lsof` listed nothing. The likely mechanism, not checked in
+    // `lemond` itself, is that the TIME_WAIT bucket inherits the dead
+    // listener's lack of SO_REUSEADDR. A refused connect alone proves only that
+    // nothing listens, so require a successful bind as well.
+    let port_note = e2e_cucumber::serve_log::wait_for_port_usable(
+        SERVE_PORT,
+        Duration::from_secs(90),
+        Duration::from_secs(2),
+        || async {
+            let refused = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
+                .await
+                .is_err();
+            (
+                refused,
+                e2e_cucumber::serve_log::port_is_bindable(SERVE_PORT),
+            )
+        },
+        || {
+            kill_listeners_on_port(SERVE_PORT);
+            kill_listeners_on_port(ASSISTANT_PORT);
+        },
+    )
+    .await;
+    if let Some(note) = &port_note {
+        eprintln!("{note}");
     }
     // The port closing does NOT mean the prior serve's VRAM is back: a killed
     // vLLM releases ~tens of GiB of device memory only as the process fully
@@ -375,10 +374,9 @@ async fn ensure_serve_port_free() -> String {
     // memory utilization" (engine core init failed). Wait for the device to
     // actually drain before returning.
     let device_state = wait_for_free_vram().await;
-    if port_note.is_empty() {
-        device_state
-    } else {
-        format!("{device_state}\n{port_note}")
+    match port_note {
+        None => device_state,
+        Some(note) => format!("{device_state}\n{note}"),
     }
 }
 
