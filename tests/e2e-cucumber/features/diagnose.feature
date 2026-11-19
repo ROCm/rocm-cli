@@ -1184,3 +1184,129 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI reports the vLLM compiled-extension load failure as an established cause
     And the CLI can act on the fix named for the vLLM compiled-extension load failure
+
+  # ROCMAI-912. An APU has no private VRAM: every adapter query reports the
+  # fixed BIOS carve-out as the device's memory (512 MiB on a Ryzen 7 4700U,
+  # ~4 GiB on a Strix Halo) while the engine allocates out of system memory the
+  # GPU is given an aperture onto. Comparing a recipe's minimum against the
+  # carve-out refuses nearly every curated model on machines that serve them,
+  # which is why `--model` used to answer "could not determine" on every APU.
+  #
+  # The aperture IS readable -- `mem_info_gtt_total` beside the carve-out on
+  # Linux, `DXGI_ADAPTER_DESC1::SharedSystemMemory` on Windows -- so the figure
+  # the verdict is reached against is that one. The host is simulated, as in
+  # diagnose-40: a kernel topology naming a gfx1151 part and a DRM card
+  # carrying both counters, so the scenario describes the same machine on every
+  # lane rather than whatever GPU the runner has. Linux-gated because the
+  # simulation seam re-roots Linux paths only; the Windows source is covered by
+  # the unit tests in `host_gpu/unified_memory.rs`, which are the only coverage
+  # it can have: no CI lane runs a Windows APU.
+  @id:diagnose-model-an-apu-is-measured-on-its-shared-pool @requires-os:linux
+  Scenario: diagnose-81 - An integrated GPU is judged on the pool it allocates from, not its carve-out
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the shared pool, not the carve-out
+    And the model is reported as degraded, because the pool is shared rather than set aside
+
+  # The other half: the pool is readable in general, not on every host. An
+  # older kernel exposes no `mem_info_gtt_total`, and a container may pass no
+  # DRM device through. That host must be told the figure could not be read --
+  # not handed installed system RAM, which over-estimates in the one direction
+  # that produces a confident wrong "it fits", and not the generic
+  # "could not measure the GPU" either, whose remedy is to run `amd-smi` again:
+  # `amd-smi` already answered here, with the wrong pool, and would answer
+  # identically forever.
+  @id:diagnose-model-an-unreadable-shared-pool-is-said-not-guessed @requires-os:linux
+  Scenario: diagnose-82 - An integrated GPU whose pool cannot be read is told so, not given a number
+    Given a machine whose only GPU shares system memory, with the pool it may use unreadable
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is that the shared pool could not be read, and no memory figure is claimed
+
+  # The hazard the aperture read introduces. `mem_info_gtt_total` exists on a
+  # discrete card too, so the figure reaches the classification on every host.
+  # A discrete card must be judged on its own VRAM and nothing else: added to
+  # it, an 8 GiB card would answer as 68 GiB and every model would "fit";
+  # replacing it would judge the card on a pool it never allocates from. The
+  # planted machine carries a large aperture beside a small VRAM figure, so a
+  # verdict reached on either wrong number is visible in the report.
+  @id:diagnose-model-a-discrete-card-is-never-credited-with-the-aperture @requires-os:linux
+  Scenario: diagnose-83 - A discrete GPU is judged on its own VRAM, never on the system-memory aperture
+    Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the card's own VRAM alone
+
+  # The other half of the aperture's attribution problem, and the one a user can
+  # see. `mem_info_gtt_total` is per device; the verdict answers for one device.
+  # On a host showing two AMD DRM cards there is no way to tell from the file
+  # which figure belongs to the part the engine would allocate from, so neither
+  # is reported -- the user gets "could not determine" instead of a confident
+  # number that might describe the other card. `two_amd_cards_leave_the_gtt_aperture_unattributable`
+  # proves the reader does that; this proves the CLI does.
+  #
+  # The machine is an APU beside a second AMD card that ROCm does not enumerate
+  # as a compute device, which is the shape where this rule is the one that
+  # decides. On a two-card host with no `amd-smi` at all, the sysfs VRAM
+  # fallback's own older ordinal-ambiguity guard (`read_drm_vram_usage`)
+  # withholds every row first, and the answer is "GPU memory unmeasured" before
+  # the aperture is ever consulted -- so the scenario plants a stub `amd-smi`
+  # reporting the one compute device, alongside the two cards in sysfs. The
+  # premise it rests on is diagnose-81: the same APU with the same readable
+  # 60 GiB aperture, alone, does get a figure.
+  @id:diagnose-model-two-amd-cards-leave-the-pool-unattributable @requires-os:linux
+  Scenario: diagnose-84 - An integrated GPU beside a second AMD card is credited with neither pool
+    Given a machine whose integrated GPU shares system memory beside a second AMD card
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And neither card's aperture is offered as the pool the model would use
+
+  # Who the shared-pool softening is allowed to speak about. It is the last
+  # thing the assessment does, and it used to fire on the host alone: every
+  # `Ready` verdict on an APU was downgraded, told "this host's integrated GPU
+  # has no dedicated VRAM" and handed a plan about closing programs and
+  # serving. For a `cpu_only` recipe that is advice about a device the model
+  # never touches -- the engine allocates from system memory, so what the
+  # accelerator's pool is shared with cannot make it worse, and the report
+  # volunteers GPU evidence no earlier branch put there.
+  #
+  # No shipped recipe is `cpu_only` today (all 49 are `gpu_required` or
+  # `gpu_preferred`), so the catalog is planted: a signed recipe index -- the
+  # only way the CLI loads one, as `model-catalog-03` does -- carrying the
+  # smallest curated recipe twice, once as shipped and once with its device
+  # policy and GPU minimum removed. Both halves are asked on the SAME host in
+  # the same scenario, because the first assertion alone would pass just as
+  # happily against a shared-pool check someone had deleted outright; the
+  # second is the premise that makes the first mean something.
+  @id:diagnose-model-a-cpu-only-recipe-is-not-softened-by-a-pool-it-never-uses @requires-os:linux
+  Scenario: diagnose-85 - A CPU-only recipe is not softened by a shared pool it never allocates from
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a recipe catalog offering the smallest curated model CPU-only beside a copy that needs the GPU
+    When the user asks the CLI whether the CPU-only recipe would run, in machine-readable form
+    Then the model is reported ready, with no GPU evidence and nothing to remediate
+    When the user asks the CLI whether the copy that needs the GPU would run, in machine-readable form
+    Then the model is reported as degraded, because the pool is shared rather than set aside
+
+  # The same distinction one layer down, for a model the catalog has no recipe
+  # for. A GGUF outside the catalog is answered with an estimate (diagnose-49),
+  # and that estimate prints the host's memory beside the model's parts with
+  # nothing to tell the two kinds of number apart. On an APU the figure is the
+  # ceiling on a pool the operating system draws on too, so a bare "fits"
+  # against it means "this machine would allow it at best", not "this much is
+  # waiting for it" -- and nothing in the estimate measured how much of the
+  # pool is free. The note is the only place a reader is told which kind of
+  # number they are looking at, and it reaches `--json` on the estimate itself.
+  #
+  # Same planted APU as diagnose-81, same tiny GGUF as diagnose-49. The
+  # aperture is asserted as the figure compared against, not merely that some
+  # note exists: a host that fell back to `cannot_estimate` would carry no
+  # figure at all and this scenario would be describing nothing.
+  @id:diagnose-model-a-gguf-estimate-says-its-pool-is-shared @requires-os:linux
+  Scenario: diagnose-86 - A GGUF estimate on an integrated GPU is told the figure is a shared ceiling, not free memory
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
+    Then the estimate is compared against the shared pool's ceiling, and says the pool is shared
