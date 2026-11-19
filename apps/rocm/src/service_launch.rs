@@ -69,8 +69,9 @@ pub(crate) use helper_autostart::{
 };
 pub(crate) use launch_transaction::{managed_service_reuse_refusal, no_usable_gpu_refusal};
 pub(crate) use readiness::{
-    StopWatch, e2e_simulate_oom_launch, managed_engine_exit_failure_detail,
-    managed_service_stop_marker_present, managed_service_stop_was_requested,
+    StopWatch, e2e_simulate_oom_launch, e2e_simulate_startup_exit,
+    managed_engine_exit_failure_detail, managed_service_stop_marker_present,
+    managed_service_stop_was_requested,
 };
 #[cfg(not(windows))]
 pub(crate) use spawn::{

@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT
 
 //! Waiting on a launched or already-live managed service: the readiness budget,
-//! liveness of the tracked process, how a wait ends, and the end-to-end OOM
-//! fault-injection seam that fabricates a launch: one that never became ready
-//! (it ran out of GPU memory), or, in the `ready` mode, one that became ready.
+//! liveness of the tracked process, how a wait ends, and the end-to-end
+//! fault-injection seam that fabricates a launch on a host with no GPU — see
+//! `e2e_simulate_oom_launch` for the modes it offers and what each one leaves
+//! for the surface under test to compute.
 
 // There is deliberately no `use std::fs`, `use std::thread` or
 // `use rocm_core::process_is_running` here: this file names them by full path.
@@ -19,6 +20,7 @@ use super::spawn::ManagedLaunchReport;
 use crate::device_policy_name;
 use crate::endpoint_keys;
 use crate::engine_runtime_select::wait_for_service_http_ready_with_progress;
+use crate::serve_progress;
 use crate::services_text::read_optional_tail_lines;
 use crate::status_for_readiness;
 #[cfg(feature = "e2e-oom-fault-injection")]
@@ -33,8 +35,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-/// How long one readiness wait polls before `rocm serve` reports `starting`.
-const READINESS_WAIT: Duration = Duration::from_secs(45);
+/// How long one `--wait` readiness pass polls: the same budget after which a
+/// piped `rocm serve` reports `starting`.
+const READINESS_WAIT: Duration = crate::serve_progress::PIPED_SERVE_STATUS_BUDGET;
 
 /// `rocm serve --wait`: keep waiting past [`READINESS_WAIT`] (a first start
 /// downloads the model, which can take far longer) until the server answers or
@@ -97,9 +100,40 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
     record_still_live(&latest, pid_alive)
 }
 
+/// What an exit nobody asked for is recorded as.
+///
+/// `failed` is overloaded: to a reader of `rocm services list` it means "this
+/// died on its own", and to `rocmd` it is the restart trigger
+/// (`manifest_service_recovery_reason` in
+/// apps/rocmd/src/watchers/server_recover.rs recovers `failed`, and
+/// `find_recoverable_service` only skips a record carrying a stop marker).
+/// Exit points differ in which of the two they can afford, so each names its
+/// own policy rather than inheriting one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnexplainedDeath {
+    /// ROCMAI-541's exit points: the launch, the attached session and `--wait`
+    /// reported the death only through the record, so a crash recorded as
+    /// `stopped` was indistinguishable from an operator's own stop. Recording
+    /// it as the crash it was is the whole fix, and `rocmd` restarting a
+    /// crashed server afterwards is supervision working.
+    IsACrash,
+    /// The interactive startup wait, which hands the user a loud synchronous
+    /// `ServeStartupFailed` instead, so the record is not the only thing
+    /// saying the launch failed. Stamping `failed` here would additionally
+    /// make `rocmd` restart the server behind the error just printed, so this
+    /// path keeps the clean `stopped` it chose deliberately.
+    IsRecordedAsStopped,
+}
+
 /// Record how a server that died mid-start died, leaving a manifest that a
 /// `services stop` already settled untouched. A `failed` state the engine
 /// reported is persisted rather than overwritten, so the reason survives.
+///
+/// The manifest is re-read here, after the caller decided the server ended.
+/// If it now describes a live process again, `rocmd` restarted the service in
+/// between (`restart_managed_service` in apps/rocmd/src/supervise.rs records
+/// the new pid through `record_spawned_supervisor`), and that restart is left alone rather than written back to
+/// `stopped`.
 ///
 /// Returns whether the death was **asked for**, so the caller can say so. The
 /// `--wait` message used to read "the server exited before it became ready"
@@ -114,7 +148,12 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
 /// second could already show the record live, and the two together stamped
 /// `failed` on a death that had in fact just been asked for. One read cannot
 /// disagree with itself.
-fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
+fn settle_exited_service(
+    paths: &AppPaths,
+    service_id: &str,
+    pid_alive: &dyn Fn(u32) -> bool,
+    unexplained: UnexplainedDeath,
+) -> bool {
     let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
         // No snapshot to judge from and nothing to stamp. The standalone read
         // is sound *here* precisely because this branch writes nothing, so
@@ -125,6 +164,17 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
     let on_disk = latest.status.clone();
     let _ = latest.refresh_from_engine_state();
     if crate::managed_service_status::managed_service_is_live(&latest) {
+        // A recorded pid is alive again: `rocmd` restarted the service between
+        // the caller observing the death and this read, so there is no death
+        // here to characterise and the restart is left exactly as it is.
+        // Checked before the verdict below, which would otherwise stamp a
+        // live, freshly restarted record as `failed`.
+        if crate::managed_service_status::recorded_service_pids(&latest)
+            .into_iter()
+            .any(pid_alive)
+        {
+            return deliberate;
+        }
         // The record still reads live even after the death was observed, so
         // nothing has recorded *why* it died: the engine's own in-process
         // backstop (`record_engine_serve_http_failure`) never got to run. A
@@ -137,7 +187,7 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
         // An engine that *did* stamp `failed` itself is not reached: that record
         // no longer reads live, so it takes the branch below and keeps its own
         // reason.
-        if deliberate {
+        if deliberate || unexplained == UnexplainedDeath::IsRecordedAsStopped {
             latest.status = "stopped".to_owned();
         } else {
             latest.status = "failed".to_owned();
@@ -178,7 +228,7 @@ fn settle_exited_service(paths: &AppPaths, service_id: &str) -> bool {
         // `failed` is left alone — the engine's own reason is on it, and
         // rewriting it would be the invisible no-op write the guard above
         // forbids.
-        if !deliberate && latest.status != "failed" {
+        if unexplained == UnexplainedDeath::IsACrash && !deliberate && latest.status != "failed" {
             mark_service_failed(&latest.manifest_path, &latest.engine_state_path);
         }
         return deliberate;
@@ -199,11 +249,11 @@ pub(super) fn died_during_wait(
 ) -> Option<anyhow::Error> {
     if !wait_until_ready
         || readiness == EndpointReadiness::Serving
-        || service_still_live(paths, service_id, pid_alive)
+        || service_still_live(paths, service_id, &pid_alive)
     {
         return None;
     }
-    if settle_exited_service(paths, service_id) {
+    if settle_exited_service(paths, service_id, &pid_alive, UnexplainedDeath::IsACrash) {
         // A `rocm services stop` from another shell ends the wait too, and it is
         // not a launch that failed. The wait still ends non-zero, because the
         // thing the caller asked to wait for did not happen — but it says which
@@ -213,13 +263,65 @@ pub(super) fn died_during_wait(
             "the server for service `{service_id}` was stopped before it became ready"
         ));
     }
-    let mut message = format!(
-        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `rocm logs --service {service_id}` for its output"
+    let message = format!(
+        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `{}` for its output",
+        crate::service_hints::service_logs_hint(service_id)
     );
-    // A plain `serve` adds the memory guidance for a vLLM launch that ran out of
-    // VRAM; the wait's failure is the same launch, so it gets the same note.
-    // "starting" is the status the note keys on for "never became ready", which is
-    // what a `--wait` death is, whatever the settled record now says.
+    // The record is already settled above — the verdict it returned is what
+    // chose the message — so only the audit line and the memory guidance are
+    // left. Settling a second time would re-stamp a record that a concurrent
+    // writer may have moved on since.
+    Some(anyhow!(report_ended_launch(
+        paths,
+        service_id,
+        "exited during --wait",
+        message
+    )))
+}
+
+/// Settle a launch whose server ended before it became ready, record it in
+/// the audit log (`why` says how it ended), and return `message` with the
+/// memory guidance a plain `serve` would print for it.
+///
+/// Shared by a `--wait` that saw the server exit and the interactive wait's
+/// engine-failed or process-exited stop: the record is settled by
+/// [`settle_exited_service`] (`stopped`, or the engine's own `failed`, never
+/// over a stop already recorded), and a vLLM launch that ran out of VRAM gets
+/// the same note either way. "starting" is the status the note keys on for
+/// "never became ready", whatever the settled record now says.
+pub(super) fn settle_ended_launch(
+    paths: &AppPaths,
+    service_id: &str,
+    why: &str,
+    message: String,
+    pid_alive: &dyn Fn(u32) -> bool,
+) -> String {
+    settle_exited_service(
+        paths,
+        service_id,
+        pid_alive,
+        UnexplainedDeath::IsRecordedAsStopped,
+    );
+    report_ended_launch(paths, service_id, why, message)
+}
+
+/// The reporting half of [`settle_ended_launch`], for a caller that settled the
+/// record itself because it needed [`settle_exited_service`]'s verdict —
+/// whether the death was asked for — to choose `message` in the first place.
+fn report_ended_launch(
+    paths: &AppPaths,
+    service_id: &str,
+    why: &str,
+    mut message: String,
+) -> String {
+    crate::record_cli_audit_event(
+        paths,
+        "service",
+        "managed_service_launch",
+        "error",
+        format!("managed service ended before it became ready: {why}"),
+        Some(service_id),
+    );
     if let Ok(record) = ManagedServiceRecord::read_manifest(paths, service_id) {
         for note in crate::serve_summary::append_oom_serve_note(
             Vec::new(),
@@ -231,7 +333,7 @@ pub(super) fn died_during_wait(
             let _ = write!(message, "\n  note: {note}");
         }
     }
-    Some(anyhow!(message))
+    message
 }
 
 /// Record the outcome of a finished wait on the manifest as it is now, changing
@@ -266,15 +368,23 @@ pub(super) fn record_wait_outcome(
 /// positive OOM-guidance summary path can be verified on a GPU-less CI host,
 /// where a real launch cannot run. See [`simulate_oom_managed_launch`].
 ///
-/// The value `ready` selects the one other mode: the fabricated launch is a
-/// managed vLLM launch that *did* become ready (nothing to blame on memory), so a
-/// scenario can point its port at a mock engine and watch what the summary does
-/// when the post-launch smoke test then fails. Both values open the same seams
-/// (the GPU pre-flight waiver and the background-helper suppression).
+/// The other two values select the other two modes. Every value opens the same
+/// seams (the GPU pre-flight waiver and the background-helper suppression).
+///
+/// - `ready`: the fabricated launch is a managed vLLM launch that *did* become
+///   ready (nothing to blame on memory), so a scenario can point its port at a
+///   mock engine and watch what the summary does when the post-launch smoke test
+///   then fails.
+/// - `extension-load`: the launch died the way a vLLM compiled extension that
+///   failed to load kills it, and the fabrication stops at the log. What the
+///   user then sees is built by the engine's own
+///   `startup_log_context`/`extension_load_failure_hint`, reached through
+///   [`rocm_engine_vllm::e2e_exited_before_ready_message`] — see
+///   [`simulate_extension_load_launch_failure`].
 #[cfg(feature = "e2e-oom-fault-injection")]
 pub(crate) fn e2e_simulate_oom_launch() -> bool {
     std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH")
-        .is_some_and(|value| value == "1" || value == "ready")
+        .is_some_and(|value| value == "1" || value == "ready" || value == "extension-load")
 }
 
 /// Whether the armed hook is in its `ready` mode (see [`e2e_simulate_oom_launch`]).
@@ -283,12 +393,110 @@ fn e2e_simulate_ready_launch() -> bool {
     std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "ready")
 }
 
+/// Whether the armed hook is in its `extension-load` mode (see
+/// [`e2e_simulate_oom_launch`]).
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn e2e_simulate_extension_load_failure() -> bool {
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "extension-load")
+}
+
+/// Test-only (see [`e2e_simulate_oom_launch`]): the startup log a vLLM launch
+/// leaves behind when one of its compiled extensions failed to load, as the
+/// engine wrote it on the host in ROCMAI-1058 (runtime path shortened).
+///
+/// Deliberately *raw*: the import warning, the engine core's `AttributeError`,
+/// and then enough API-server traceback to push both of them out of the echoed
+/// tail — the shape that makes the hint read a wider window than it echoes.
+/// None of rocm-cli's own wording is planted here, so every sentence the
+/// scenario asserts has to have been derived from these lines by the engine.
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn extension_load_startup_log() -> String {
+    let mut lines = vec![
+        "(APIServer pid=629241) INFO 11-16 11:48:20 [utils.py:253] non-default args".to_owned(),
+        "WARNING 11-16 11:48:27 [rocm.py:53] Failed to import from vllm._C_stable_libtorch with \
+         ImportError(\"/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required \
+         by /opt/rt/site-packages/vllm/_C_stable_libtorch.abi3.so)\")"
+            .to_owned(),
+        "(EngineCore pid=629513) INFO 11-16 11:48:40 [core.py:98] Initializing engine".to_owned(),
+        "(EngineCore pid=629513) ERROR 11-16 11:48:44 [core.py:1374] AttributeError: \
+         '_OpNamespace' '_C' object has no attribute 'get_cuda_view_from_cpu_tensor'"
+            .to_owned(),
+    ];
+    for frame in 0..(2 * rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES) {
+        lines.push(format!(
+            "(APIServer pid=629241)   File \"/opt/rt/site-packages/vllm/frame_{frame}.py\", line \
+             {frame}, in run"
+        ));
+    }
+    lines.push(
+        "(APIServer pid=629241) RuntimeError: Engine core initialization failed. See root cause \
+         above. Failed core proc(s): {}"
+            .to_owned(),
+    );
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+/// Test-only (see [`e2e_simulate_oom_launch`]): plant that log under the
+/// service record and fail the launch with the engine's own message for it.
+///
+/// The two fabricated facts are the ones a GPU-less lane cannot produce: that
+/// the vLLM process died, and what it had written when it did. Everything the
+/// user then reads — the echoed tail, which line is named as the detected
+/// failure, and the `rocm diagnose --symptom '…'` command — is computed by the
+/// engine's production code from that log, which is what makes the scenario
+/// able to fail when that code is wrong.
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn simulate_extension_load_launch_failure(record: &mut ManagedServiceRecord) -> anyhow::Error {
+    record.status = "starting".to_owned();
+    if let Err(error) = record.write() {
+        return error;
+    }
+    if let Err(error) = std::fs::write(&record.log_path, extension_load_startup_log()) {
+        return anyhow!("failed to write {}: {error}", record.log_path.display());
+    }
+    anyhow!(
+        "{}",
+        rocm_engine_vllm::e2e_exited_before_ready_message("exit status: 1", &record.log_path)
+    )
+}
+
 /// Release builds carry no fault-injection switch: the seam compiles out
 /// entirely, so `rocm serve` behaves identically to a build without the feature.
 #[cfg(not(feature = "e2e-oom-fault-injection"))]
 pub(crate) const fn e2e_simulate_oom_launch() -> bool {
     false
 }
+
+/// Test-only switch for the mock lane, compiled in only with
+/// `e2e-oom-fault-injection` and read only on Linux: a managed launch spawns a
+/// stand-in engine that writes one log line and exits during startup, in place
+/// of the real `rocm` serve child, so the interactive startup wait's
+/// process-exited path runs end to end on a host with no GPU. Everything else
+/// about the launch (record, log, wait, settling) is the production path.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+pub(crate) fn e2e_simulate_startup_exit() -> bool {
+    std::env::var_os(SIMULATE_STARTUP_EXIT_ENV).is_some_and(|value| value == "1")
+}
+
+/// Release builds, and hosts other than Linux, carry no such switch.
+#[cfg(not(all(feature = "e2e-oom-fault-injection", target_os = "linux")))]
+pub(crate) const fn e2e_simulate_startup_exit() -> bool {
+    false
+}
+
+/// The variable [`e2e_simulate_startup_exit`] reads; the e2e step spells the
+/// same name, since the shipped crate must not depend on the harness.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+const SIMULATE_STARTUP_EXIT_ENV: &str = "ROCM_E2E_SIMULATE_STARTUP_EXIT";
+
+/// What the stand-in engine runs: one meaningful log line, then an exit after
+/// the spawn's immediate-exit check, so the launch is published and the
+/// startup wait (not the spawn) is what sees the process end.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+pub(super) const SIMULATED_STARTUP_EXIT_SCRIPT: &str = "echo 'e2e stand-in engine: loading model weights'; sleep 2; \
+     echo 'e2e stand-in engine: exiting during startup'; exit 1";
 
 /// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
 /// managed vLLM launch, then return the launch report the summary path would see
@@ -303,6 +511,10 @@ pub(crate) const fn e2e_simulate_oom_launch() -> bool {
 /// - `ready` mode: the launch became ready — `status: "ready"`, the record marked
 ///   inference-verified, and `log_path: None` (nothing failed to start), so the
 ///   caller's smoke test runs against whatever answers on `host:port`.
+/// - `extension-load` mode: the launch died on a vLLM compiled extension that
+///   failed to load, and this returns an `Err` rather than a report, because
+///   that is what the real readiness wait does. See
+///   [`simulate_extension_load_launch_failure`].
 #[cfg(feature = "e2e-oom-fault-injection")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn simulate_oom_managed_launch(
@@ -354,6 +566,13 @@ pub(super) fn simulate_oom_managed_launch(
             manifest_path: Some(record.manifest_path),
         });
     }
+    if e2e_simulate_extension_load_failure() {
+        // The `extension-load` mode: a launch that died the way a compiled
+        // extension that failed to load kills it. Unlike the other two modes
+        // this answers with an error, because the surface under test *is* the
+        // engine's startup-failure message.
+        return Err(simulate_extension_load_launch_failure(&mut record));
+    }
     record.status = "starting".to_owned();
     record.write()?;
     // A real allocator OOM signature in the log this invocation owns, so the
@@ -397,12 +616,11 @@ pub(super) fn simulate_oom_managed_launch(
     })
 }
 
-/// Probe `record`'s endpoint until it answers: once within the readiness
-/// budget, or (with `wait_until_ready`) for as long as the server stays alive.
+/// Probe `record`'s endpoint until it answers (`--wait`), for as long as the
+/// server stays alive. Each pass is one [`READINESS_WAIT`]-long readiness wait.
 pub(super) fn wait_for_record_ready(
     paths: &AppPaths,
     record: &ManagedServiceRecord,
-    wait_until_ready: bool,
     endpoint_api_key: Option<&str>,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> EndpointReadiness {
@@ -421,14 +639,57 @@ pub(super) fn wait_for_record_ready(
             on_tick,
         )
     };
-    if wait_until_ready {
-        wait_past_readiness_budget(
-            || probe(&mut *on_wait_tick),
-            || service_still_live(paths, &record.service_id, service_pid_is_alive),
-        )
-    } else {
-        probe(on_wait_tick)
-    }
+    wait_past_readiness_budget(
+        || probe(&mut *on_wait_tick),
+        || service_still_live(paths, &record.service_id, service_pid_is_alive),
+    )
+}
+
+/// One sample of a freshly launched service for the startup wait: the model
+/// name its endpoint answers to and the engine/process signals.
+///
+/// Read from the manifest on disk, like [`service_still_live`], so a
+/// `rocm services stop` from another terminal is seen. Liveness is
+/// [`service_pid_is_alive`]: the supervisor is an unreaped child of this
+/// process, so a dead one still passes `process_is_running`.
+fn observe_launch(
+    paths: &AppPaths,
+    held: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    pid_alive: impl Fn(u32) -> bool,
+) -> (String, serve_progress::ServeStartupSignals) {
+    let mut latest = ManagedServiceRecord::read_manifest(paths, &held.service_id)
+        .unwrap_or_else(|_| held.clone());
+    let _ = latest.refresh_from_engine_state();
+    let pids = crate::managed_service_status::recorded_service_pids(&latest);
+    let signals = serve_progress::ServeStartupSignals {
+        engine_failed: latest.status == "failed",
+        process_alive: pids.is_empty() || pids.into_iter().any(pid_alive),
+        log_line: serve_progress::latest_meaningful_log_line(&latest.log_path, endpoint_api_key),
+    };
+    (latest.served_model_name().to_owned(), signals)
+}
+
+/// Follow a fresh launch (without `--wait`) until it serves, the policy's
+/// budget runs out, or the wait stops. See [`serve_progress`].
+pub(super) fn wait_for_launch_startup(
+    paths: &AppPaths,
+    record: &ManagedServiceRecord,
+    requested_model: &str,
+    endpoint_api_key: Option<&str>,
+    policy: &serve_progress::ServeStartupPolicy,
+    on_view: &mut dyn FnMut(&serve_progress::ServeStartupView),
+) -> Result<EndpointReadiness, serve_progress::ServeStartupStop> {
+    serve_progress::wait_for_serve_startup(
+        &record.engine,
+        requested_model,
+        &record.host,
+        record.port,
+        endpoint_api_key,
+        policy,
+        &mut || observe_launch(paths, record, endpoint_api_key, service_pid_is_alive),
+        on_view,
+    )
 }
 
 /// An equivalent service is already live. Without `--wait`, or once it is
@@ -452,8 +713,7 @@ pub(super) fn wait_on_existing_service(
     // The key the caller generated belongs to a launch that did not happen; the
     // existing service answers to its own.
     let stored_key = endpoint_keys::endpoint_api_key(paths, &report.service_id);
-    let readiness =
-        wait_for_record_ready(paths, &record, true, stored_key.as_deref(), on_wait_tick);
+    let readiness = wait_for_record_ready(paths, &record, stored_key.as_deref(), on_wait_tick);
     if let Some(error) = died_during_wait(
         paths,
         &report.service_id,
@@ -1314,6 +1574,42 @@ mod tests {
         Ok(())
     }
 
+    /// The startup wait's sample comes from the manifest on disk: the
+    /// engine's own `failed`, liveness by pid (supervisor or engine), and the
+    /// name the endpoint answers to.
+    #[test]
+    fn observe_launch_reads_failure_and_liveness_from_the_manifest() -> anyhow::Result<()> {
+        let (root, paths) = test_paths("observe-launch");
+        paths.ensure()?;
+        let mut held = reusable_record(&paths);
+        held.supervisor_pid = 41;
+        held.engine_pid = Some(42);
+        held.write()?;
+        let sample = |pid_alive: fn(u32) -> bool| observe_launch(&paths, &held, None, pid_alive);
+
+        let (model, signals) = sample(|pid| pid == 42);
+        assert_eq!(model, held.served_model_name());
+        assert!(!signals.engine_failed);
+        assert!(signals.process_alive, "a live engine pid is alive");
+        assert!(
+            sample(|pid| pid == 41).1.process_alive,
+            "a live supervisor is alive"
+        );
+        assert!(
+            !sample(|_| false).1.process_alive,
+            "every recorded pid dead"
+        );
+
+        // Another writer's `failed` on disk is what the wait sees, not the
+        // copy it holds.
+        let mut on_disk = ManagedServiceRecord::read_manifest(&paths, &held.service_id)?;
+        on_disk.status = "failed".to_owned();
+        on_disk.write()?;
+        assert!(sample(|_| true).1.engine_failed);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn wait_past_readiness_budget_keeps_probing_a_live_starting_server() {
         let mut readings = vec![
@@ -1495,28 +1791,51 @@ mod tests {
     fn a_wait_death_is_a_crash_unless_a_stop_asked_for_it() {
         let (root, paths) = test_paths("wait-settle");
         paths.ensure().expect("paths");
-        // The stop arm runs first, while nothing has stamped `failed` anywhere:
-        // the marker is the sound evidence, so a stop that landed during the
-        // wait settles as a clean stop.
-        let mut record = record_tracking_pid(&paths, 0, "starting");
-        record.stop_requested_unix_ms = Some(1);
+        let mut record = record_tracking_pid(&paths, 4_242, "starting");
         record.write().expect("write");
-        settle_exited_service(&paths, &record.service_id);
+        // A manifest whose recorded process is alive again was restarted by
+        // `rocmd` after the caller decided the server ended: left alone, and
+        // checked before the crash/stop verdict so a restart is never stamped.
+        settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| true,
+            UnexplainedDeath::IsACrash,
+        );
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "starting");
+
+        // The stop arm, while nothing has stamped `failed` anywhere: the marker
+        // is the sound evidence, so a stop that landed during the wait settles
+        // as a clean stop.
+        record.stop_requested_unix_ms = Some(1);
+        record.status = "starting".to_owned();
+        record.write().expect("write");
+        assert!(
+            settle_exited_service(
+                &paths,
+                &record.service_id,
+                &|_| false,
+                UnexplainedDeath::IsACrash,
+            ),
+            "it must report the death as deliberate, so `--wait` can say so"
+        );
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(
             after.status, "stopped",
             "a stop that asked for this death must not be reported as a crash"
-        );
-        assert!(
-            settle_exited_service(&paths, &record.service_id),
-            "and it must report the death as deliberate, so `--wait` can say so"
         );
 
         // Same service, same death, with nothing having asked for it.
         record.stop_requested_unix_ms = None;
         record.status = "starting".to_owned();
         record.write().expect("write");
-        settle_exited_service(&paths, &record.service_id);
+        settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(
             after.status, "failed",
@@ -1554,7 +1873,12 @@ mod tests {
         )
         .expect("plant a concurrent writer's field");
 
-        settle_exited_service(&paths, &record.service_id);
+        settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
 
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
@@ -1615,7 +1939,12 @@ mod tests {
         )
         .expect("plant a concurrent writer's field");
 
-        let deliberate = settle_exited_service(&paths, &record.service_id);
+        let deliberate = settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
 
         assert!(
             !deliberate,
@@ -1679,7 +2008,12 @@ mod tests {
         )
         .expect("plant a concurrent writer's field");
 
-        assert!(!settle_exited_service(&paths, &record.service_id));
+        assert!(!settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        ));
 
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
@@ -1735,7 +2069,12 @@ mod tests {
             }
             record.write().expect("write");
 
-            let deliberate = settle_exited_service(&paths, &record.service_id);
+            let deliberate = settle_exited_service(
+                &paths,
+                &record.service_id,
+                &|_| false,
+                UnexplainedDeath::IsACrash,
+            );
             let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
 
             assert!(
@@ -1813,6 +2152,18 @@ mod tests {
                 .status
         };
 
+        let launch_errors = || {
+            rocm_core::load_recent_audit_events(&paths, 20)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|event| {
+                    event.action == "managed_service_launch"
+                        && event.level == "error"
+                        && event.service_id.as_deref() == Some(id.as_str())
+                })
+                .collect::<Vec<_>>()
+        };
+
         // Not waiting, already serving, or still alive: no failure, no change.
         let pending = EndpointReadiness::Unreachable;
         assert!(died_during_wait(&paths, &id, false, pending, |_| false).is_none());
@@ -1821,6 +2172,7 @@ mod tests {
         );
         assert!(died_during_wait(&paths, &id, true, pending, |_| true).is_none());
         assert_eq!(status(), "starting");
+        assert!(launch_errors().is_empty(), "{:?}", launch_errors());
 
         // Dead server: the error names the logs command and the record is settled.
         let error = died_during_wait(&paths, &id, true, pending, |_| false).expect("died");
@@ -1838,6 +2190,15 @@ mod tests {
         // the ROCMAI-541 defect surviving at the `--wait` exit point — see
         // `a_wait_death_is_a_crash_unless_a_stop_asked_for_it`.
         assert_eq!(status(), "failed");
+
+        // The `--wait` death is audited like the interactive wait's.
+        let errors = launch_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|event| event.message.contains("exited during --wait")),
+            "{errors:?}"
+        );
 
         // And a stop issued from another shell during the wait gets its own
         // sentence, rather than being reported as the launch failing to come

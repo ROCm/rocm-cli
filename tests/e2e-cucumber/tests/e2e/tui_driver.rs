@@ -62,6 +62,9 @@ const OVERFLOW_COLS: u16 = 90;
 /// dock switches its GPU panel into the wide layout at.
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
+/// Tall enough that the Observe tab's Bench section, the last of its four
+/// stacked sections, has room for its rows table under the rollup.
+const TALL_ROWS: u16 = 100;
 /// Short enough that the Esc menu's modal can no longer fit the big ROCm
 /// wordmark plus all three rows, so `ui::menu` has to take its compact
 /// fallback. The modal is `centered_rect(50, 70, 60, 17, area)`, i.e. 70% of
@@ -185,8 +188,9 @@ pub struct TuiSession {
     is_chat: bool,
     scenario: Option<String>,
     argv: Vec<String>,
-    /// Exit code observed by [`deliver_signal_and_wait`], read back by the
-    /// signal scenarios' `Then` steps once the child has been reaped.
+    /// Exit code observed by [`deliver_signal_and_wait`],
+    /// [`press_ctrl_c_and_wait`] or [`quit_and_wait`], read back by a
+    /// scenario's `Then` steps once the child has been reaped.
     observed_exit_code: Option<i32>,
 }
 
@@ -299,10 +303,17 @@ impl TuiSession {
         // Inherit the parent environment first, then overlay the isolation and
         // deterministic-terminal vars — mirroring how the piped `run_rocm` path
         // (`std::process::Command`, which inherits by default) resolves PATH and
-        // shared libraries, so the two spawn paths behave identically.
+        // shared libraries. One deliberate difference: this path drops the
+        // caller's `RUST_LOG`, which piped runs still inherit.
         for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
         }
+        // Steps read the client log and count the info-level lines `rocm`
+        // writes under its default filter, which a `RUST_LOG` in the shell
+        // running the suite would replace (e.g. `warn` drops every such line).
+        // Removed before the overlays below, so a scenario that sets its own
+        // filter still can.
+        cmd.env_remove("RUST_LOG");
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
             cmd.env(key, value);
         }
@@ -685,6 +696,12 @@ impl TuiSession {
         self.resize_to(WIDE_ROWS, WIDE_COLS)
     }
 
+    /// Enlarge to [`TALL_ROWS`]x[`WIDE_COLS`], so the Observe tab shows the
+    /// Bench section's rows table.
+    pub fn use_tall_size(&mut self) -> Result<(), String> {
+        self.resize_to(TALL_ROWS, WIDE_COLS)
+    }
+
     /// Shrink to [`OVERFLOW_ROWS`]x[`OVERFLOW_COLS`] — small enough that the
     /// instance-detail popup's `launch_args`/`env_vars` panes can't fit the
     /// demo fixtures' entries, forcing a scrollable body.
@@ -1063,6 +1080,7 @@ impl TuiSession {
                 let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                 self.finished = true;
                 self.record_once(code);
+                self.observed_exit_code = Some(code);
                 return Some(code);
             }
             if Instant::now() >= deadline {
@@ -1262,9 +1280,10 @@ impl TuiSession {
     }
 
     /// The exit code recorded by the most recent
-    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) or
-    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait), read back by the
-    /// scenario's `Then` step to assert the expected `128 + signo` value.
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait),
+    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait) or
+    /// [`quit_and_wait`](Self::quit_and_wait), read back by the scenario's
+    /// `Then` step (the expected `128 + signo` value, or 0 after a quit).
     #[must_use]
     pub const fn observed_exit_code(&self) -> Option<i32> {
         self.observed_exit_code
