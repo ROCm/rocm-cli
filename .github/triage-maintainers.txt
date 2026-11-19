@@ -7,11 +7,8 @@ fredespi
 r0x0r
 juhovainio
 rominf
-amitkumar-amd
 tomastola
 siloteemu
 volen-silo
 jussielo-amd
-michaelroy-amd
 johnl-amd
-amd-mkarvir
