@@ -41,12 +41,15 @@ installation consistent across Linux distributions.
 - **Better diagnosis.** `rocm diagnose` takes `--symptom-file`, estimates the
   memory that a GGUF model needs, and flags an outdated Visual C++ runtime. vLLM
   startup failures now name the failing line.
-- **Runtime visibility.** `rocm runtimes list` and `rocm examine` show where each
-  runtime came from, and `rocm runtimes list --json` prints JSON.
+- **Runtime visibility.** `rocm runtimes list` and `rocm examine` show where
+  each runtime came from, and `rocm runtimes list --json` prints JSON.
 - **Lemonade on Linux.** Lemonade is pinned to 2026.44.1 so that a ROCm 10.1 SDK
   gets a ROCm backend, and installs check glibc and OpenSSL up front.
 - **Security.** Endpoint API key files are accessible only to their owner on
-  every platform, and vLLM requires the endpoint key on every server route.
+  every platform. A key-protected vLLM endpoint (a public bind, one served with
+  `--require-api-key`, or one started by `rocm remote serve`) requires the key
+  on every route except `/health` and CORS preflights. A loopback `rocm serve`
+  endpoint still has no key by default.
 
 ## Breaking changes
 
@@ -60,6 +63,10 @@ installation consistent across Linux distributions.
   to pin a specific amdgpu release. `rocm install driver` refuses to plan while
   either old variable is still set, so an old pin is never silently turned into
   `latest`.
+- `rocm install sdk` without `--version` now installs the newest stable ROCm
+  release, ROCm 10 or newer, instead of ROCm 7.14. The default Python moves
+  with it, from 3.12 to 3.14. To keep the earlier release, pin it with
+  `--version 7.14.1`. See also the ROCm SDK 10.2.0 entry under Known issues.
 
 ## Added
 
@@ -86,8 +93,8 @@ installation consistent across Linux distributions.
   `rocm runtimes list --json` prints the list as JSON.
 - `rocm install sdk` reads the current stable and nightly TheRock hosts by
   default (`stable.repo.amd.com` and `nightly.repo.amd.com`) and keeps earlier
-  version pins on the old hosts. Without `--version`, it now installs the newest
-  stable release.
+  version pins on the old hosts. Its new default release is listed under
+  Breaking changes.
 - `rocm install sdk --python-version X.Y` chooses the Python version for a
   ROCm 10 SDK install. An install that doesn't need vLLM can use Python 3.10 to
   3.14. The default stays 3.14.
@@ -158,9 +165,6 @@ installation consistent across Linux distributions.
   settings, validated the same way as the CLI before approval.
 - The dashboard assistant no longer advertises the `list_skills` and
   `skill_plan` tools, whose install recipes could not run.
-- `rocm install sdk` without `--version` now installs the newest stable ROCm
-  release instead of ROCm 7.14. To keep the earlier release, pin it with
-  `--version 7.14.1`.
 
 ## Resolved issues
 
@@ -241,6 +245,19 @@ installation consistent across Linux distributions.
   fails.
 - Fixed log tails being reported as empty when the log had content.
 - Fixed the service ID being dropped from inline `key=value` service rows.
+- Fixed a key-protected vLLM endpoint answering clients without the key on
+  routes outside the OpenAI `/v1` API, such as `/invocations`, `/tokenize`, and
+  `/metrics`. An endpoint is key-protected when it binds a public interface
+  (`--allow-public-bind`), is served with `--require-api-key`, or is started by
+  `rocm remote serve`. Every route now requires the key except `GET` and `HEAD`
+  requests to `/health` and CORS preflights. A loopback `rocm serve` endpoint
+  without `--require-api-key` still has no key. Because `/metrics` now needs the
+  key, `rocm dash` can't show engine metrics for a key-protected vLLM server,
+  and `rocm bench load` can't benchmark one.
+- Fixed an endpoint API key file being readable by other accounts. On Windows
+  it inherited the permissions of the data directory, and on Linux storing a key
+  again kept a loosened file mode. Key files are now accessible only to their
+  owner on every platform, and storing a key again repairs the permissions.
 
 ### Detection and diagnosis
 
@@ -262,8 +279,8 @@ installation consistent across Linux distributions.
 - Fixed `rocm diagnose --report --send` and the dashboard send action never
   opening a mail client on Windows, because the link was cut off at the `&`
   character.
-- Fixed `rocm examine` not reporting `amdkfd_loaded` and `amdgpu_loaded` when the
-  drivers are built into the kernel.
+- Fixed `rocm examine` not reporting `amdkfd_loaded` and `amdgpu_loaded` when
+  the drivers are built into the kernel.
 - Fixed a timed-out `rocm fix` step not being reported as a timeout.
 - Fixed wording in several places in the Doctor skill and `rocm fix`.
 
@@ -327,11 +344,17 @@ installation consistent across Linux distributions.
 
 - Instinct serving on RHEL 9.6 can still need manual vLLM, OpenMPI, and
   `amdsmi` workarounds.
+- The AIM engine runs the same vLLM server inside its container but doesn't
+  install the every-route key check. A key-protected AIM endpoint has only
+  vLLM's own `VLLM_API_KEY` check, so routes such as `/invocations`,
+  `/tokenize`, and `/metrics` answer without the key.
 - On ROCm SDK 10.2.0 with Lemonade 2026.44.1 (observed on Strix Halo in WSL2),
   copies between ordinary host memory and the GPU run at roughly 20 MiB/s, more
   than 100 times slower than on 10.1.0, so loading a large model takes many
-  minutes. `rocm serve` with Lemonade stops the server at its 2-minute readiness
-  timeout and marks the service as failed. As a workaround, install ROCm SDK
-  10.1.0 with `rocm install sdk --version 10.1.0`, or run
-  `rocm runtimes rollback` if a 10.1 runtime was the previous one. Then start
-  serving again with `rocm serve <model>`.
+  minutes. While ROCm SDK 10.2.0 is the newest stable release,
+  `rocm install sdk` without `--version` installs it. `rocm serve` with Lemonade
+  stops the server at its 2-minute readiness timeout and marks the service as
+  failed. As a workaround, install ROCm SDK 10.1.0 with
+  `rocm install sdk --version 10.1.0`, or run `rocm runtimes rollback` if a 10.1
+  runtime was the previous one. Then start serving again with
+  `rocm serve <model>`.
