@@ -77,9 +77,12 @@ the result from `--json`:
   `compute_buffer_gib`, `runtime_reserve_gib`, `total_gib`, the same in bytes as
   `weights_bytes`, `kv_cache_bytes`, `compute_buffer_bytes`,
   `runtime_reserve_bytes` and `total_bytes`, and `kv_cache_bytes_per_token`, the
-  cache's cost of one token); the comparison (`available_gib` is the total
-  dedicated VRAM of the GPU with the most of it that ROCm can see, not what is
-  free; `max_context` is the largest context that fits, capped at
+  cache's cost of one token); the comparison (`available_gib` is the memory the
+  estimate was compared against, not what is free: the total dedicated VRAM of
+  the GPU with the most of it that ROCm can see, or -- on an integrated GPU --
+  the ceiling on the pool it shares with the operating system.
+  `available_is_shared_pool` says which of the two it is, and is the only way
+  to tell them apart from the number alone; `max_context` is the largest context that fits, capped at
   `training_context`, and is null when GPU memory was not measured, when no
   verdict is given (`unmeasured_layout`, or `missing_metadata` with figures),
   and when not even one 256-token step fits); and what the figures leave out
