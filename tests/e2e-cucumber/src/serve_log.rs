@@ -450,10 +450,13 @@ mod tests {
 
     use super::{
         MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
-        engine_from_serve_args, parse_log_path, port_holders, port_is_bindable, read_clamped,
-        read_clamped_file, reported_engine, serve_attempt_report, serve_cli_budget,
-        service_log_tail, slugify, tail_lines, wait_for_port_usable,
+        engine_from_serve_args, parse_log_path, port_is_bindable, read_clamped, read_clamped_file,
+        reported_engine, serve_attempt_report, serve_cli_budget, service_log_tail, slugify,
+        tail_lines, wait_for_port_usable,
     };
+    // Only the Linux-gated test below calls it; the listing is Linux-only.
+    #[cfg(target_os = "linux")]
+    use super::port_holders;
 
     #[test]
     fn cli_budget_outlasts_the_readiness_timeout_by_a_bounded_margin() {
