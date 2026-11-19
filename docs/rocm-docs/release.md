@@ -16,5 +16,5 @@ SPDX-License-Identifier: MIT
 
 | Version | Release date |
 | ------- | ------------ |
-| [0.3.0](https://rocm.docs.amd.com/projects/rocm-cli/en/docs-0.3.0/index.html) | To be announced |
+| [0.3.0](https://rocm.docs.amd.com/projects/rocm-cli/en/docs-0.3.0/index.html) | November 18, 2026 |
 | [0.2.1](https://rocm.docs.amd.com/projects/rocm-cli/en/docs-0.2.1/index.html) | October 29, 2026 |
