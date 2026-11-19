@@ -1097,6 +1097,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn write_registry(manifest: &install::LemonadeInstallManifest) {
+        write_registry_with_labels(manifest, &["reasoning"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_registry_with_labels(manifest: &install::LemonadeInstallManifest, labels: &[&str]) {
         let resources = manifest.runtime_dir.join("resources");
         std::fs::create_dir_all(&resources).unwrap();
         std::fs::write(
@@ -1107,7 +1112,7 @@ mod tests {
                     "checkpoint": "owner/serve-test-repo:Q4_0",
                     "suggested": true,
                     "size": 0.38,
-                    "labels": ["reasoning"]
+                    "labels": labels
                 }
             })
             .to_string(),
@@ -1266,6 +1271,50 @@ mod tests {
         assert_eq!(state["model_ref"], "qwen-smoke");
         assert_eq!(state["canonical_model_id"], "qwen-smoke");
         assert_eq!(state["status"], "stopped");
+    }
+
+    /// The pinned 2026.44.1 catalog labels its small chat models `chat`. A serve
+    /// of such a name must take the direct route, not start the router; the
+    /// recorded load method says which one served.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_registered_name_labelled_chat_is_served_directly_through_serve_http() {
+        use crate::test_http::{Reply, fake_runtime, spawn_fixture};
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let manifest = fake_runtime::manifest(dir, 0, None);
+        write_registry_with_labels(&manifest, &["chat", "reasoning"]);
+        install_fake_llama_server(&manifest, "#!/bin/sh\nexit 0\n");
+        let gguf = dir.join(
+            "cache/huggingface/hub/models--owner--serve-test-repo/snapshots/rev/model-Q4_0.gguf",
+        );
+        std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
+        std::fs::write(&gguf, b"gguf").unwrap();
+        let (port, server) = spawn_fixture(Duration::from_secs(10), |recorded| {
+            let chat = recorded.method == "POST";
+            Reply {
+                status: 200,
+                body: if chat {
+                    json!({"choices": [{"message": {"content": "ok"}}]})
+                } else {
+                    json!({"data": [{"id": "Qwen3-0.6B-GGUF"}]})
+                }
+                .to_string(),
+                last: chat,
+            }
+        });
+        let mut request = fake_request(dir, "Qwen3-0.6B-GGUF");
+        request.port = port;
+        let context = fake_context(dir, manifest);
+        serve_http_resolving(request.clone(), |_| Ok(context)).unwrap();
+        server.join().unwrap();
+
+        let state = crate::state::read_service_state(&request.state_path).unwrap();
+        assert_eq!(
+            state["load_response"]["method"], "lemonade-packaged-llama-server",
+            "{state}"
+        );
+        assert_eq!(state["backend_mode"], "lemonade-packaged-llama-server");
     }
 
     #[cfg(target_os = "linux")]

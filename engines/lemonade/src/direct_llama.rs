@@ -823,7 +823,8 @@ pub(crate) fn resolve_direct_llama_checkpoint(
     // Only the single-checkpoint shape is supported directly. Extra files,
     // multimodal inputs, options and unknown fields belong to Lemonade's router.
     // In the 11.5.1 source, size/suggested describe catalog entries and these
-    // labels classify chat models. Other labels can change launch flags (MTP).
+    // labels classify chat models; 2026.44.1 also tags those models `chat`.
+    // Other labels can change launch flags (MTP).
     if checkpoint.variant.is_none()
         || fields.iter().any(|(key, value)| match key.as_str() {
             "recipe" | "checkpoint" => false,
@@ -831,7 +832,10 @@ pub(crate) fn resolve_direct_llama_checkpoint(
             "suggested" => !value.is_boolean(),
             "labels" => !value.as_array().is_some_and(|labels| {
                 labels.iter().all(|label| {
-                    matches!(label.as_str(), Some("reasoning" | "tool-calling" | "tools"))
+                    matches!(
+                        label.as_str(),
+                        Some("chat" | "reasoning" | "tool-calling" | "tools")
+                    )
                 })
             }),
             _ => true,
@@ -1386,7 +1390,7 @@ mod tests {
     fn simple_registered_models_with_chat_labels_serve_directly() {
         let dir = scratch_dir("registered-labels");
         let manifest = test_manifest(dir.join("runtime"));
-        for label in ["reasoning", "tool-calling", "tools"] {
+        for label in ["chat", "reasoning", "tool-calling", "tools"] {
             write_registry(
                 &manifest,
                 serde_json::json!({"Labelled-GGUF": {
@@ -2408,6 +2412,45 @@ mod tests {
                 "size": 63.0
             }
         })
+    }
+
+    /// The entry for the default small model as the pinned 2026.44.1 release
+    /// ships it: the same checkpoint as in 11.5.1, now also labelled `chat`.
+    #[test]
+    fn the_pinned_release_catalog_entry_for_the_small_model_routes_direct() {
+        let dir = scratch_dir("pinned-release-catalog");
+        let mut manifest = test_manifest(dir.join("runtime"));
+        manifest.backend_name = "vulkan".to_owned();
+        write_registry(
+            &manifest,
+            serde_json::json!({
+                "Qwen3-0.6B-GGUF": {
+                    "checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+                    "recipe": "llamacpp",
+                    "suggested": true,
+                    "labels": ["chat", "reasoning"],
+                    "size": 0.38
+                }
+            }),
+        );
+        let binary = manifest
+            .runtime_dir
+            .join("bin/llamacpp/vulkan")
+            .join(platform_binary_name("llama-server"));
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"x").unwrap();
+        let route = serving_route(&manifest, &serve_request("Qwen3-0.6B-GGUF"), true).unwrap();
+        let ServeRoute::Direct { model, server } = route else {
+            panic!(
+                "a `chat`-labelled registered GGUF should serve directly, not through the router"
+            );
+        };
+        assert_eq!(server, binary);
+        assert!(
+            matches!(&model, DirectLlamaModel::Checkpoint(found) if found.model_ref() == "unsloth/Qwen3-0.6B-GGUF:Q4_0"),
+            "{model:?}"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
