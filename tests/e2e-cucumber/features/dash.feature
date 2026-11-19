@@ -1137,3 +1137,29 @@ Feature: Interactive dashboard
     And the user quits the dashboard
     Then the dashboard exits successfully
     And the managed model is still listed as running
+
+  # ROCMAI-1050's other half, and the one dash-63 cannot reach. Growing the
+  # popup only fixes the bodies that now fit; a body that still does not fit
+  # must SAY so and name the keys that move it, or a silent cut is
+  # indistinguishable from the original bug — the dashboard naming a remedy it
+  # does not show. Two served models at twelve rows is past what even the grown
+  # popup holds, so this is the overflow case on real geometry rather than a
+  # fabricated one. The unit test
+  # `a_body_that_still_overflows_a_short_screen_says_so_and_keeps_the_buttons`
+  # pins the same rule against a synthetic body; this proves a user can actually
+  # reach it.
+  @id:dash-quit-confirm-overflow-names-its-keys @requires-os:linux
+  Scenario: dash-64 - A quit prompt too tall for the window says so and names the keys that scroll it
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When another managed model is served
+    Then the other managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt says there is more to read and names the keys that scroll it
+    When the user declines the quit prompt
+    And the user quits the dashboard
+    Then the dashboard exits successfully

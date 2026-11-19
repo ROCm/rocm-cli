@@ -2290,6 +2290,30 @@ async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// ROCMAI-1050's overflow half: growing the popup cannot save every body, so a
+/// body that still does not fit has to advertise itself instead of being cut
+/// silently — which is the original defect, not a lesser version of it.
+///
+/// The notice and the key names are asserted together on purpose. A notice
+/// that named no keys would leave the user exactly as stuck as the silent cut,
+/// and the keys alone would not say there was anything below. Matched on the
+/// whitespace-collapsed screen because the row is laid out to the popup's
+/// width and may wrap at this geometry.
+#[then("the quit prompt says there is more to read and names the keys that scroll it")]
+async fn quit_confirm_announces_more_to_read(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the quit prompt says \"More to read\" and names PgUp/PgDn",
+            |screen| {
+                let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+                flat.contains("More to read") && flat.contains("PgUp/PgDn")
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// Issue #145's actual stop action, not just the warning: `s` on the
 /// dashboard's quit-confirm prompt is meant to close it and open the Services
 /// overlay instead of resolving an Approve/Deny/Cancel verdict
