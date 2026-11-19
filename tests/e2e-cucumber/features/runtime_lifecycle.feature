@@ -468,3 +468,31 @@ Feature: Runtime lifecycle state machine
     Then the activation fails naming that runtime without its escape sequences
     And the error report carries no terminal control character
     And no runtime is active
+
+  # ROCm SDK 10.2.0 on WSL2 copied pageable host memory to the GPU at about
+  # 20 MiB/s (issue #1143), so a model load that takes seconds on 10.1.0 can take
+  # many minutes. The CLI cannot fix the runtime; it says so when the runtime is
+  # activated, and the way out it names has to work: activating a registered
+  # 10.1.0 runtime ends the warning. The host is simulated (`/dev/dxg` under a
+  # test host root), so the scenario holds on a machine that is not WSL2 and on
+  # one that is. The same warning is printed by `rocm install sdk` and by
+  # `rocm serve`; neither can run on the mock lane (no download, no GPU), so their
+  # text and when it appears are covered by unit tests in
+  # apps/rocm/src/runtime_advisory.rs and apps/rocm/src/runtime_install_finalize.rs.
+  @id:runtime-lifecycle-activate-warns-about-slow-sdk-on-wsl @requires-os:linux
+  Scenario: runtime-lifecycle-33 - Activating ROCm SDK 10.2.0 on WSL2 warns that loading a model can be slow, and activating 10.1.0 ends the warning
+    Given a WSL2 host
+    And a registered ROCm SDK 10.2.0 runtime and a registered ROCm SDK 10.1.0 runtime
+    When the user activates the ROCm SDK 10.2.0 runtime
+    Then the activation succeeds and warns that model loading can be slow on WSL2 and names ROCm SDK 10.1.0
+    When the user activates the ROCm SDK 10.1.0 runtime
+    Then the activation succeeds without that warning
+
+  # The measurement was made on WSL2 only, so the same runtime elsewhere must not
+  # be called slow.
+  @id:runtime-lifecycle-slow-sdk-warning-is-wsl-only @requires-os:linux
+  Scenario: runtime-lifecycle-34 - Activating ROCm SDK 10.2.0 on a host that is not WSL2 prints no slow-loading warning
+    Given a host that is not WSL2
+    And a registered ROCm SDK 10.2.0 runtime and a registered ROCm SDK 10.1.0 runtime
+    When the user activates the ROCm SDK 10.2.0 runtime
+    Then the activation succeeds without that warning

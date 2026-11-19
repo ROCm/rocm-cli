@@ -16,7 +16,7 @@ use crate::llamacpp_backend::{backend_server_dirs, find_llama_server_binary_for_
 use crate::process::{
     LemonadeProcessEnvironment, LogMode, apply_environment_vars, hide_child_console_window,
     lemonade_process_environment_vars, query_chat_smoke_endpoint, run_lemonade_pull_with_parent,
-    spawn_lemond_with_parent, wait_for_lemonade_cli_status_with_parent,
+    spawn_lemond_with_parent, summarize_startup_log_tail, wait_for_lemonade_cli_status_with_parent,
 };
 use crate::runtime_dir::ParentRuntimeEnvironment;
 use crate::state::{
@@ -350,13 +350,49 @@ pub(crate) fn serve_direct_llama_server(
         log_path,
         reason,
         parent,
-        DIRECT_SERVER_READY_TIMEOUT,
+        DIRECT_SERVER_READY_POLICY,
     )
 }
 
 /// How long a direct llama-server may take to answer `/v1/models` and a chat smoke
 /// test before the serve is treated as failed.
-const DIRECT_SERVER_READY_TIMEOUT: Duration = Duration::from_mins(2);
+///
+/// A fixed budget cannot tell a server that is slow from one that is stuck: loading a
+/// large GGUF is bounded by disk and host-to-GPU copy speed, which differ by orders of
+/// magnitude between hosts. So the wait is bounded by how long the server's log stays
+/// silent, with the whole-startup deadline only as a ceiling.
+#[derive(Clone, Copy, Debug)]
+struct DirectReadyPolicy {
+    /// Ceiling on the whole wait, however much the server keeps writing.
+    deadline: Duration,
+    /// How long the server's log may stay unchanged before it counts as stuck.
+    silent_limit: Duration,
+    /// Pause between readiness probes.
+    poll_interval: Duration,
+}
+
+/// The production policy. `deadline` is [`rocm_core::SERVE_STARTUP_DEADLINE`], the
+/// bound `rocm serve` follows a start for and the age past which `rocmd`'s
+/// server-recover watcher (`live_startup_still_in_progress`) stops sparing a live
+/// startup, so the engine does not kill a server the rest of the CLI still waits for.
+/// `silent_limit` matches `SILENT_LOAD` in `apps/rocm/src/serve_progress.rs`, the
+/// quiet period the interactive wait allows a load.
+const DIRECT_SERVER_READY_POLICY: DirectReadyPolicy = DirectReadyPolicy {
+    deadline: rocm_core::SERVE_STARTUP_DEADLINE,
+    silent_limit: Duration::from_mins(5),
+    poll_interval: Duration::from_millis(500),
+};
+
+/// Log lines quoted in a readiness failure.
+const READY_FAILURE_LOG_TAIL_LINES: usize = 20;
+
+/// What the readiness wait can see of the server process it is waiting on.
+#[derive(Debug, PartialEq, Eq)]
+enum ServerProcess {
+    Running,
+    /// The process ended; holds its exit status as text.
+    Exited(String),
+}
 
 #[allow(clippy::too_many_arguments)]
 fn serve_direct_llama_server_within(
@@ -368,7 +404,7 @@ fn serve_direct_llama_server_within(
     log_path: Option<&Path>,
     reason: &str,
     parent: &ParentRuntimeEnvironment,
-    ready_timeout: Duration,
+    ready_policy: DirectReadyPolicy,
 ) -> Result<()> {
     if !model_path.is_file() {
         bail!(
@@ -439,7 +475,7 @@ fn serve_direct_llama_server_within(
         backend: &backend,
         model_path,
         log_path,
-        ready_timeout,
+        ready_policy,
     };
     supervise_direct_server(&mut child, &request.state_path, &mut steps)
 }
@@ -448,7 +484,9 @@ fn serve_direct_llama_server_within(
 /// handling in [`supervise_direct_server`] is exercised without a live server.
 trait DirectServerSteps {
     fn record_running(&mut self, server_pid: u32) -> Result<()>;
-    fn wait_ready(&mut self) -> Result<()>;
+    /// Wait until the server answers. `server` reports whether its process is still
+    /// running, so a server that exited is reported at once rather than waited on.
+    fn wait_ready(&mut self, server: &mut dyn FnMut() -> ServerProcess) -> Result<()>;
     fn record_ready(&mut self, server_pid: u32) -> Result<()>;
     /// Announce what is now true. Called only once the server answered, passed its
     /// chat smoke test and the `ready` state is written: an earlier announcement
@@ -465,7 +503,7 @@ struct RealDirectServerSteps<'a> {
     backend: &'a str,
     model_path: &'a Path,
     log_path: Option<&'a Path>,
-    ready_timeout: Duration,
+    ready_policy: DirectReadyPolicy,
 }
 
 impl DirectServerSteps for RealDirectServerSteps<'_> {
@@ -479,13 +517,15 @@ impl DirectServerSteps for RealDirectServerSteps<'_> {
         )
     }
 
-    fn wait_ready(&mut self) -> Result<()> {
+    fn wait_ready(&mut self, server: &mut dyn FnMut() -> ServerProcess) -> Result<()> {
         let request = self.request;
         wait_for_openai_models_ready(
             &request.host,
             request.port,
             &request.model_ref,
-            self.ready_timeout,
+            self.ready_policy,
+            self.log_path,
+            server,
         )?;
         if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
             bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
@@ -534,13 +574,23 @@ fn supervise_direct_server<S: DirectServerSteps>(
 ) -> Result<()> {
     let server_pid = child.id();
     let stop_and_fail = |child: &mut Child| {
-        let _ = terminate_pid(server_pid, true);
-        let _ = child.wait();
+        // A child the readiness wait already reaped has no process left to signal, and
+        // its pid may have been handed to another one. `try_wait` keeps the status it
+        // reaped, so this holds however long ago that was.
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = terminate_pid(server_pid, true);
+            let _ = child.wait();
+        }
         let _ = mark_json_status(state_path, "failed");
     };
     let started = (|| -> Result<()> {
         steps.record_running(server_pid)?;
-        steps.wait_ready()?;
+        steps.wait_ready(&mut || match child.try_wait() {
+            Ok(Some(status)) => ServerProcess::Exited(status.to_string()),
+            // A failed look is not an exit: keep waiting, and let the readiness
+            // probe and the deadline decide.
+            Ok(None) | Err(_) => ServerProcess::Running,
+        })?;
         steps.record_ready(server_pid)?;
         steps.announce_serving();
         Ok(())
@@ -596,18 +646,28 @@ pub(crate) fn direct_llama_server_command(
     command
 }
 
+/// Poll `/v1/models` until it lists `model_ref`, or give up.
+///
+/// A loading llama-server answers `503` until it is done, so a failing probe alone
+/// says nothing about whether it is stuck. The wait gives up when the process exits
+/// (at once), when its log has been silent for `policy.silent_limit`, or at
+/// `policy.deadline`; each failure names which of these it was, whether the process
+/// was still running, the last probe result and the log's tail.
 fn wait_for_openai_models_ready(
     host: &str,
     port: u16,
     model_ref: &str,
-    timeout: Duration,
+    policy: DirectReadyPolicy,
+    log_path: Option<&Path>,
+    server: &mut dyn FnMut() -> ServerProcess,
 ) -> Result<()> {
     let endpoint = format_http_base_url(host, port);
     let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
     let start = std::time::Instant::now();
-    let mut last_error = None;
-    while start.elapsed() < timeout {
-        match http_get_text_with_auth(
+    let mut log_size = log_path.and_then(file_len);
+    let mut last_output = start;
+    loop {
+        let last_check = match http_get_text_with_auth(
             &endpoint,
             "/v1/models",
             endpoint_api_key.as_deref(),
@@ -616,15 +676,63 @@ fn wait_for_openai_models_ready(
         .and_then(|body| parse_models_ready(&body, model_ref))
         {
             Ok(true) => return Ok(()),
-            Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
-            Err(error) => last_error = Some(error.to_string()),
+            Ok(false) => "model was not reported by /v1/models".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        if let ServerProcess::Exited(status) = server() {
+            bail!(
+                "Lemonade packaged llama-server did not become ready: the server exited \
+                 ({status}) before it listed the model (last readiness check: {last_check})\n{}",
+                summarize_startup_log_tail(log_path, READY_FAILURE_LOG_TAIL_LINES)
+            );
         }
-        std::thread::sleep(Duration::from_millis(500));
+        let now = std::time::Instant::now();
+        let current_size = log_path.and_then(file_len);
+        if current_size != log_size {
+            log_size = current_size;
+            last_output = now;
+        }
+        let cause = if now.duration_since(start) >= policy.deadline {
+            Some(format!(
+                "it did not list the model within {}",
+                describe_duration(policy.deadline)
+            ))
+        } else if now.duration_since(last_output) >= policy.silent_limit {
+            Some(format!(
+                "its log had no new output for {}",
+                describe_duration(policy.silent_limit)
+            ))
+        } else {
+            None
+        };
+        if let Some(cause) = cause {
+            bail!(
+                "Lemonade packaged llama-server did not become ready: {cause}. The server \
+                 process was still running and is being stopped (last readiness check: \
+                 {last_check}). A very slow model load, from a slow disk or slow host-to-GPU \
+                 copies, looks the same.\n{}",
+                summarize_startup_log_tail(log_path, READY_FAILURE_LOG_TAIL_LINES)
+            );
+        }
+        std::thread::sleep(policy.poll_interval);
     }
-    bail!(
-        "Lemonade packaged llama-server did not become ready: {}",
-        last_error.unwrap_or_else(|| "not checked".to_owned())
-    )
+}
+
+/// Size of the file at `path`: the only progress signal a server writing to a log
+/// gives without reading it, and one that works whatever the server prints.
+fn file_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+/// `300s` as "5 minutes", `90s` as "90 seconds".
+fn describe_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        60 => "1 minute".to_owned(),
+        s if s > 60 && s % 60 == 0 => format!("{} minutes", s / 60),
+        1 => "1 second".to_owned(),
+        s => format!("{s} seconds"),
+    }
 }
 
 fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
@@ -2784,7 +2892,7 @@ mod tests {
             }
             Ok(())
         }
-        fn wait_ready(&mut self) -> Result<()> {
+        fn wait_ready(&mut self, _server: &mut dyn FnMut() -> ServerProcess) -> Result<()> {
             if matches!(self.0, DirectFail::NotReady) {
                 bail!("injected readiness failure");
             }
@@ -2808,6 +2916,209 @@ mod tests {
         fn wait_exit(&mut self, _child: &mut Child) -> std::io::Result<ExitStatus> {
             Err(std::io::Error::other("injected wait failure"))
         }
+    }
+
+    /// A policy in milliseconds so the wait's decisions run in a test's time.
+    fn test_ready_policy(deadline_ms: u64, silent_ms: u64) -> DirectReadyPolicy {
+        DirectReadyPolicy {
+            deadline: Duration::from_millis(deadline_ms),
+            silent_limit: Duration::from_millis(silent_ms),
+            poll_interval: Duration::from_millis(20),
+        }
+    }
+
+    /// Wait on a port nothing listens on, so the model is never listed and only the
+    /// wait's own decisions end it.
+    fn wait_on_unlistened_port(
+        policy: DirectReadyPolicy,
+        log_path: Option<&Path>,
+        server: &mut dyn FnMut() -> ServerProcess,
+    ) -> String {
+        let port = crate::state::free_local_port().unwrap();
+        wait_for_openai_models_ready(
+            "127.0.0.1",
+            port,
+            "owner/repo:Q4_0",
+            policy,
+            log_path,
+            server,
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    /// The production wait outlasts the 2 minutes the first version allowed, and its
+    /// ceiling is the one the rest of the CLI follows a start for.
+    #[test]
+    fn the_production_ready_policy_is_the_cli_startup_deadline_with_a_silence_limit_inside_it() {
+        assert_eq!(
+            DIRECT_SERVER_READY_POLICY.deadline,
+            rocm_core::SERVE_STARTUP_DEADLINE
+        );
+        assert!(DIRECT_SERVER_READY_POLICY.silent_limit > Duration::from_mins(2));
+        assert!(DIRECT_SERVER_READY_POLICY.silent_limit < DIRECT_SERVER_READY_POLICY.deadline);
+    }
+
+    /// A server that exits is reported at once, with its status and its log, instead
+    /// of being waited on until a deadline.
+    #[test]
+    fn a_direct_server_that_exits_before_ready_fails_at_once_with_its_status_and_log() {
+        let dir = scratch_dir("direct-exited-early");
+        let log_path = dir.join("serve.log");
+        fs::write(
+            &log_path,
+            "load_tensors: loading model\nerror: out of memory\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = wait_on_unlistened_port(
+            test_ready_policy(60_000, 60_000),
+            Some(&log_path),
+            &mut || ServerProcess::Exited("exit status: 137".to_owned()),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited on a dead server"
+        );
+        assert!(error.contains("did not become ready"), "{error}");
+        assert!(error.contains("exited (exit status: 137)"), "{error}");
+        assert!(!error.contains("still running"), "{error}");
+        assert!(error.contains("error: out of memory"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live server whose log has gone quiet is given up on after the silence limit,
+    /// well before the ceiling, and the message says it was still running.
+    #[test]
+    fn a_direct_server_with_a_silent_log_is_given_up_on_at_the_silence_limit() {
+        let dir = scratch_dir("direct-silent");
+        let log_path = dir.join("serve.log");
+        fs::write(&log_path, "load_tensors: offloading 32 layers to GPU\n").unwrap();
+        let started = std::time::Instant::now();
+        let error =
+            wait_on_unlistened_port(test_ready_policy(60_000, 300), Some(&log_path), &mut || {
+                ServerProcess::Running
+            });
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "ran to the ceiling"
+        );
+        assert!(error.contains("its log had no new output"), "{error}");
+        assert!(
+            error.contains("still running and is being stopped"),
+            "{error}"
+        );
+        assert!(error.contains("last readiness check:"), "{error}");
+        assert!(error.contains("offloading 32 layers"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A server that keeps writing is a slow load, not a stuck one: it is not given up
+    /// on at the silence limit, only at the ceiling.
+    #[test]
+    fn a_direct_server_that_keeps_writing_outlasts_the_silence_limit_until_the_ceiling() {
+        use std::io::Write as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch_dir("direct-progress");
+        let log_path = dir.join("serve.log");
+        fs::write(&log_path, "start\n").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, log_path) = (Arc::clone(&stop), log_path.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut log = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+                    writeln!(log, ".").unwrap();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let error =
+            wait_on_unlistened_port(test_ready_policy(2_000, 400), Some(&log_path), &mut || {
+                ServerProcess::Running
+            });
+        let waited = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            error.contains("did not list the model within 2 seconds"),
+            "{error}"
+        );
+        assert!(
+            waited >= Duration::from_millis(1_900),
+            "gave up after {waited:?}, before the ceiling, on a server that kept writing"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With no log to watch there is no progress to see, so a live server is
+    /// judged on silence from the start.
+    #[test]
+    fn a_direct_server_with_no_log_is_given_up_on_at_the_silence_limit() {
+        let error = wait_on_unlistened_port(test_ready_policy(60_000, 200), None, &mut || {
+            ServerProcess::Running
+        });
+        assert!(error.contains("its log had no new output"), "{error}");
+        assert!(
+            error.contains("no Lemonade startup log path was configured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn durations_in_a_readiness_failure_read_as_minutes_or_seconds() {
+        assert_eq!(describe_duration(Duration::from_mins(30)), "30 minutes");
+        assert_eq!(describe_duration(Duration::from_mins(1)), "1 minute");
+        assert_eq!(describe_duration(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(describe_duration(Duration::from_secs(1)), "1 second");
+    }
+
+    /// `supervise_direct_server` hands the wait a probe of the real child: a server
+    /// that exits while the wait runs is seen as exited, the serve fails, the state
+    /// says `failed`, and the already-reaped child is not signalled again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_gives_the_readiness_wait_a_probe_that_sees_the_child_exit() {
+        struct WaitsForExit;
+        impl DirectServerSteps for WaitsForExit {
+            fn record_running(&mut self, _server_pid: u32) -> Result<()> {
+                Ok(())
+            }
+            fn wait_ready(&mut self, server: &mut dyn FnMut() -> ServerProcess) -> Result<()> {
+                for _ in 0..500 {
+                    if let ServerProcess::Exited(status) = server() {
+                        bail!("server exited: {status}");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                bail!("the probe never saw the child exit")
+            }
+            fn record_ready(&mut self, _server_pid: u32) -> Result<()> {
+                Ok(())
+            }
+            fn announce_serving(&mut self) {
+                panic!("announced serving for a server that exited");
+            }
+        }
+        let dir = scratch_dir("direct-probe");
+        let state_path = dir.join("state.json");
+        fs::write(&state_path, r#"{"status":"running"}"#).unwrap();
+        let mut guard = KillOnDrop(
+            ProcessCommand::new("sh")
+                .args(["-c", "exit 3"])
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let error = supervise_direct_server(&mut guard.0, &state_path, &mut WaitsForExit)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("server exited: exit status: 3"), "{error}");
+        let state = fs::read_to_string(&state_path).unwrap();
+        assert!(state.contains("failed"), "{state}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// `wait_ready` gates `ready` on a chat completion as well as on
@@ -2855,9 +3166,12 @@ mod tests {
             backend: "vulkan",
             model_path: &model_path,
             log_path: None,
-            ready_timeout: Duration::from_secs(5),
+            ready_policy: test_ready_policy(5_000, 5_000),
         };
-        let error = steps.wait_ready().unwrap_err().to_string();
+        let error = steps
+            .wait_ready(&mut || ServerProcess::Running)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("chat-completion smoke test"), "{error}");
         let paths: Vec<String> = server
             .join()
@@ -2885,7 +3199,7 @@ mod tests {
             fn record_running(&mut self, _server_pid: u32) -> Result<()> {
                 Ok(())
             }
-            fn wait_ready(&mut self) -> Result<()> {
+            fn wait_ready(&mut self, _server: &mut dyn FnMut() -> ServerProcess) -> Result<()> {
                 Ok(())
             }
             fn record_ready(&mut self, _server_pid: u32) -> Result<()> {
@@ -2993,11 +3307,18 @@ mod tests {
             Some(&log_path),
             "test",
             &ParentRuntimeEnvironment::rooted_at(&dir),
-            Duration::from_secs(1),
+            test_ready_policy(1_000, 1_000),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("did not become ready"), "{error}");
+        // The server was alive and loading, not dead: the failure says so, and quotes
+        // the log the user would otherwise have to go and find.
+        assert!(error.contains("still running"), "{error}");
+        assert!(
+            error.contains("Launching Lemonade packaged vulkan"),
+            "the log tail is quoted: {error}"
+        );
         let still_running = recorded_server_pid(&server)
             .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
         if still_running && let Some(pid) = recorded_server_pid(&server) {

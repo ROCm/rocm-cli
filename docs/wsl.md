@@ -183,6 +183,47 @@ For `rocm-cli`, the command itself should resolve the managed runtime manifest
 and apply that environment before launching HIP apps such as Lemonade's bundled
 `llama.cpp` backend. Users should not have to hand-export these values.
 
+## Known Issue: ROCm SDK 10.2.0 Loads Models Slowly
+
+On one WSL2 host (a gfx1151 GPU), ROCm SDK 10.2.0 copied pageable host memory to
+the GPU at about 20 MiB/s, where 10.1.0 on the same host managed at least several
+hundred MiB/s.
+Loading a large model, which is mostly such copies, can then take far longer than
+usual, and `rocm serve` stays not-ready while its server is still loading. The
+slowdown is in the runtime rather than in `rocm-cli`; it is tracked in
+[issue 1143](https://github.com/ROCm/rocm-cli/issues/1143). Other GPUs and newer
+10.2.x builds have not been measured.
+
+On that host, with the environment `rocm serve` gives the server, loading
+`gemma-4-26B-A4B` (`Q4_K_M`, 16.9 GB) took about 14 minutes on 10.2.0 and 16 seconds on
+10.1.0. Both 10.2.0 attempts then stopped with a GPU memory fault
+(`illegal memory access`) while the server warmed up, before it ever answered, so
+waiting out the load did not produce a working server. Setting
+`GPU_STAGING_BUFFER_SIZE=256`, which removes the slowdown in a pageable-copy test,
+did not shorten the model load (about 14 minutes with it too). These are two runs
+of one model on one host.
+
+`rocm runtimes activate`, `rocm install sdk` and `rocm serve` print a `warning:`
+when the runtime they act on is SDK 10.2.0 on a WSL2 host. To move to 10.1.0, run
+`rocm install sdk --version 10.1.0`, or `rocm runtimes activate <runtime_key>` for
+a 10.1.0 runtime that `rocm runtimes list` already shows.
+
+`rocm serve` with a Lemonade `llama-server` no longer gives up on a server after a
+fixed two minutes. It waits while the server's log keeps growing, up to the same
+30 minutes the rest of the CLI follows a start for, and stops a server whose log
+has been silent for five minutes, or that has exited. The failure says which of
+those happened, whether the server was still running, and quotes the end of its
+log.
+
+`llama-server` writes nothing to its log while it copies the model to the GPU, so
+a load that is slow enough to take more than five minutes (several GiB at 20 MiB/s)
+is still stopped by that silence limit, here (`DIRECT_SERVER_READY_POLICY` in
+[direct_llama.rs](../engines/lemonade/src/direct_llama.rs)) and in the interactive
+wait that `rocm serve` runs (`SILENT_LOAD` in
+[serve_progress.rs](../apps/rocm/src/serve_progress.rs)). The limit is not raised,
+because the measurement above ended in a fault after the load. Moving to 10.1.0 is
+the way past it.
+
 ## Diagnosing A WSL Host
 
 `rocm diagnose` has a separate set of

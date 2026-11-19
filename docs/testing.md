@@ -2279,6 +2279,27 @@ cargo xtask e2e -- -n 'runtime-lifecycle-31 '
 cargo test -p rocm --bin rocm runtimes_list
 ```
 
+ROCm SDK 10.2.0 on WSL2 copied pageable host memory to the GPU far more slowly than
+10.1.0 on the host it was measured on (issue 1143), so
+activating it, installing it, or serving with it prints a `warning:` naming the
+way back to 10.1.0 ([wsl.md](wsl.md#known-issue-rocm-sdk-1020-loads-models-slowly)).
+`@id:runtime-lifecycle-activate-warns-about-slow-sdk-on-wsl`
+(`runtime-lifecycle-33`) activates a planted 10.2.0 runtime on a simulated WSL2
+host (`/dev/dxg` under `ROCM_CLI_TEST_HOST_ROOT`), expects the warning, then
+follows the command the warning names (`rocm runtimes activate` for a registered
+10.1.0 runtime) and expects the warning gone;
+`@id:runtime-lifecycle-slow-sdk-warning-is-wsl-only` (`runtime-lifecycle-34`) is the
+same activation on a host that is not WSL2 and expects none. `rocm install sdk`
+and `rocm serve` cannot run on the mock lane, so the advisory's text and the
+versions and hosts it applies to are pinned by `runtime_advisory.rs`'s unit tests,
+and the install report by
+`render_sdk_install_success_warns_for_the_slow_sdk_on_wsl_only`:
+
+```bash
+cargo xtask e2e -- -n 'runtime-lifecycle-3[23] '
+cargo test -p rocm --bin rocm -- runtime_advisory render_sdk_install_success
+```
+
 Activate one validated runtime:
 
 ```bash
