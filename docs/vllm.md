@@ -62,8 +62,8 @@ during serving.
 The opt-out covers the packages the SDK installs together with torch
 (torchvision, torchaudio and triton) as well. vLLM pins an exact build of each.
 The install check spares them when it settled on a torch divergence, and the
-engine's built-in repair spares them whenever the opt-out is set; in both cases
-they are reported as expected divergences rather than violations, and vLLM is
+engine's built-in repair spares them whenever the opt-out is set. In both cases
+they are reported as expected divergences instead of violations, and vLLM is
 not reinstalled over them, because that reinstall would put the engine's own
 torch back. The trade-off: under the opt-out a genuinely broken torchvision,
 torchaudio or triton (including one that is not installed at all) is neither
@@ -75,8 +75,10 @@ and `torchaudio` along with `rocm`, which replaces the stack the engine or you
 installed (and `triton` with it). With the variable set it asks for the ROCm
 packages alone and leaves the torch stack where it is: the plan prints a
 `torch_kept:` line naming the torch it found, and `rocm install sdk --dry-run`
-shows the same reduced `command:`. A runtime with no torch yet, or an
-environment recreated for another Python, still gets the full stack, since
+shows the same reduced `command:`.
+
+A runtime with no torch yet, or an
+environment recreated for another Python, still gets the full stack, because
 there is nothing to keep. The runtime's recorded composition (and so its
 runtime key and `rocm update` comparison) is unchanged.
 
@@ -103,8 +105,9 @@ interpreter for a 10.x install automatically. By default, a Python already on
 `PATH`, or already installed as ROCm CLI's managed Python, is rejected if it is
 not `cp314`, with a message naming the required tag; with `--python-version`
 (below) the tag it names is the one you chose.
-That 3.14 is the default for a ROCm 10.x SDK install, not a limit of the SDK: the
-SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
+
+Python 3.14 is the default for a ROCm 10.x SDK install, not a limit of the SDK:
+the SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
 --python-version` picks one of them for an install that does not need vLLM. The
 vLLM install then refuses that runtime; re-running the install with
 `--python-version 3.14` moves it back.
@@ -112,30 +115,37 @@ vLLM install then refuses that runtime; re-running the install with
 This route is selected by `major.minor`, so `10.0.0`, `10.1.0` and `10.2.0`
 discover through *different* rows, each pinning its own vLLM minor. `10.0.0` reads
 vLLM from the production index; `10.1.0` and `10.2.0` read it from a separate
-staging host, where AMD stages their vLLM builds. The `10.0.0` and `10.1.0` rows
-take their torch stack from the stable `whl-next` index, which is also where
-`rocm install sdk` resolves those SDKs' own `+rocmX.Y` torch from. For those two
-rows vLLM's discovery is independent of the SDK install: it resolves its own
-torch, torchvision, and torchaudio pins fresh from the row's own static version
-prefixes, instead of reusing what the SDK install resolved. The SDK install might
-have resolved a different torch version than the row pins.
+staging host, where AMD stages their vLLM builds.
 
-The `10.2.0` row does not discover its torch stack: it keeps the torch,
+The `10.0.0` and `10.1.0` rows take their torch stack from the stable `whl-next`
+index, which is also where `rocm install sdk` resolves those SDKs' own
+`+rocmX.Y` torch from. For those two rows vLLM's discovery is independent of the
+SDK install: it resolves its own torch, torchvision, and torchaudio pins fresh
+from the row's own static version prefixes, instead of reusing what the SDK
+install resolved. The SDK install might have resolved a different torch version
+than the row pins.
+
+The `10.2.0` row does not discover its torch stack. It keeps the torch,
 torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,
-torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`), checks them
-against the row's series and the SDK's ROCm line, and realigns to those exact
-builds from the index the SDK was installed from (the one its runtime manifest
-records, so a nightly SDK uses the nightly index and a release SDK the release
-one; the row's nightly index when no manifest for the SDK's interpreter recorded
-one or the registry could not be read, and the install output says which). A series match
-would not work there: the nightly index serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
-`+rocm10.3` build. The staging host's `+rocm10.2.0rcN` torch is not used: it
-requires `rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that
-staging does not serve. The row has been installed and imported (`import
-vllm._C`) against a 10.2 SDK. A GPU serve has been run on WSL2 only with the
-runtime linked to its own `librocdxg.so`, never against a release SDK, and the 10.2 vLLM
-wheel is published for `linux_x86_64` only. The nightly channel resolves to
-ROCm 10.3, which has no vLLM build and no row.
+torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`) and checks
+them against the row's series and the SDK's ROCm line. It then realigns to those
+exact builds from the index the SDK was installed from, which is the one its
+runtime manifest records: a nightly SDK uses the nightly index and a release SDK
+the release one. When no manifest for the SDK's interpreter recorded one, or the
+registry could not be read, it uses the row's nightly index. The install output
+says which index it used.
+
+A series match would not work there: the nightly index serves 10.2 and 10.3
+builds side by side, and the newest `torch 2.14.*` is a `+rocm10.3` build. The
+staging host's `+rocm10.2.0rcN` torch is not used either: it requires
+`rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that staging does
+not serve.
+
+The row has been installed and imported (`import vllm._C`) against a 10.2 SDK.
+A GPU serve has been run on WSL2 only, with the runtime linked to its own
+`librocdxg.so`, and never against a release SDK. The 10.2 vLLM wheel is
+published for `linux_x86_64` only. The nightly channel resolves to ROCm 10.3,
+which has no vLLM build and no row.
 
 One value flows the other way. A row's exact torchaudio pin, where it has one
 instead of a series, is also the hardware-verified build `rocm install sdk` pins
@@ -164,24 +174,29 @@ One package is checked after the install instead. vLLM's wheel pins
 published for Python 3.14 only. The install, and every later
 `rocm engines install vllm` on a managed runtime, imports
 `tensorizer.serialization` with the runtime's Python, under the environment the
-server is launched with (including `PYTHONPATH`) and with colour switched off.
-When that import fails inside tensorizer itself, it upgrades tensorizer to
-2.12.1 with `--no-deps` and imports it again. A torch or shared-library failure
-is not tensorizer's and is left to the device check.
+server is launched with (including `PYTHONPATH`) and with color switched off.
+A tensorizer that imports keeps vLLM's pin. When that import fails inside
+tensorizer itself, the install upgrades tensorizer to 2.12.1 with `--no-deps`
+and imports it again. A torch or shared-library failure is not tensorizer's and
+is left to the device check.
 
-When this run installed vLLM (a first install, `--reinstall` or a repair), a
-failed upgrade, a check that cannot run, or a tensorizer that still cannot be
-imported after the upgrade fails the install with the exception, instead of
-ending in a startup crash at `rocm serve`. On a runtime this run did not
-install vLLM into, the same three cases are warnings, so an install that used to
-be a no-op (for example offline) stays one. A tensorizer that imports keeps
-vLLM's pin. A later `rocm engines install vllm` on a runtime whose upgrade
-failed only warns, and `rocm serve` on it keeps failing until an install
-succeeds: retrying after a failed install is deliberately not fatal.
+When this run installed vLLM (a first install, `--reinstall`, or a repair), any
+of these cases fails the install with the exception, instead of ending in a
+startup crash at `rocm serve`:
+
+- A failed upgrade
+- A check that cannot run
+- A tensorizer that still cannot be imported after the upgrade
+
+On a runtime this run did not install vLLM into, the same three cases are
+warnings, so an install that used to be a no-op (for example offline) stays one.
+A later `rocm engines install vllm` on a runtime whose upgrade failed only warns,
+and `rocm serve` on it keeps failing until an install succeeds: retrying after a
+failed install is deliberately not fatal.
 
 The check runs inside the engine install, before the CLI realigns the runtime's
 torch. If torch cannot load against the SDK at that moment, the probe sees a
-torch failure rather than tensorizer's, reads it as not tensorizer's and leaves
+torch failure instead of tensorizer's, reads it as not tensorizer's and leaves
 tensorizer alone; the next `rocm engines install vllm` checks again.
 
 Because the upgraded release no longer matches vLLM's exact pin,
@@ -191,15 +206,19 @@ the runtime holds. A reinstall is not needed to keep it: the install re-checks
 tensorizer and upgrades it again, provided torch can load when the check runs
 (see above).
 
-Two side effects are new. The check imports torch and tensorizer under the
-environment the server is launched with, which can write the launch's
-compatibility shims, so a `rocm engines install vllm` on an existing managed
-runtime is no longer free of side effects. The probe and the upgrade each have a
-five-minute timeout. And on the `rocm install sdk` auto-install path, a refused
-tensorizer upgrade can still print `dependency_check: satisfied` beside the
-refusal error, because a refused upgrade keeps vLLM's own pin and `uv pip check`
-only compares declared metadata; the refusal text carries the truth, and that
-output is deliberately not changed here.
+The check has two side effects:
+
+- It imports torch and tensorizer under the environment the server is launched
+  with, which can write the launch's compatibility shims. A
+  `rocm engines install vllm` on an existing managed runtime is therefore not
+  free of side effects.
+- On the `rocm install sdk` auto-install path, a refused tensorizer upgrade can
+  still print `dependency_check: satisfied` beside the refusal error, because a
+  refused upgrade keeps vLLM's own pin and `uv pip check` only compares declared
+  metadata. The refusal text carries the truth; that output is deliberately
+  left as it is.
+
+The probe and the upgrade each have a five-minute timeout.
 
 `flash-attn` and `amd-aiter` are the exception to the per-package series match
 above. The vLLM wheel declares the exact builds of both that it was built
