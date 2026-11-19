@@ -119,8 +119,12 @@ const NEXT_LAYOUT_HINT_MAX_LISTED: usize = 5;
 ///
 /// The suggested `--version` is one the next layout publishes and is never the
 /// release that just failed. `published` is that layout's version listing
-/// (`None` when the listing could not be read), narrowed to one GPU family when
-/// `family_scope` names it. `attempted` is the release the failure recorded,
+/// (`None` when it could not be read), narrowed to one GPU family when
+/// `family_scope` names it. A wheel caller narrows it further, to releases
+/// that publish torch, torchvision and torchaudio for this Python and platform
+/// (`wheel.rs`'s `rocm_versions_with_full_stack`), and the hint says so: a
+/// release without them would fail the same way. Whether `uv` then finds an
+/// installable set is known only when the suggestion runs. `attempted` is the release the failure recorded,
 /// and the hint leaves it out. It also leaves out any release
 /// [`layout_serving`] would not route back to this layout on the request's
 /// channel, so a re-run searches the same layout. Callers reach it only for
@@ -174,9 +178,18 @@ pub(in crate::therock) fn next_layout_unsatisfied_hint(
     alternatives.sort_by(|left, right| compare_version_strings(right, left));
     alternatives.dedup();
     let other = if attempted.is_some() { " other" } else { "" };
+    // A wheel caller passes only releases with every framework package built
+    // for this Python and platform, so the hint says what was checked: whether
+    // `uv` can resolve that set is known only when it runs.
+    let stack = match recovery.format {
+        RecoveryFormat::Wheel => {
+            " with torch, torchvision and torchaudio for this Python and platform"
+        }
+        RecoveryFormat::Tarball => "",
+    };
     let Some(newest) = alternatives.first() else {
         return format!(
-            "{lead} It publishes no{other} stable release{scope}, so no `--version` pin can install from it yet."
+            "{lead} It publishes no{other} stable release{scope}{stack}, so no `--version` pin can install from it yet."
         );
     };
     let mut listed = alternatives
@@ -197,7 +210,7 @@ pub(in crate::therock) fn next_layout_unsatisfied_hint(
     } else {
         "Stable releases it publishes"
     };
-    format!("{lead} {label}{scope}: {listed}. {command}")
+    format!("{lead} {label}{scope}{stack}: {listed}. {command}")
 }
 
 /// The sentence naming what to run. `pinned` is whether the failed request
@@ -353,7 +366,7 @@ mod tests {
             None,
         );
         assert!(
-            hint.contains("Other stable releases it publishes: 10.1.0, 10.0.0."),
+            hint.contains("Other stable releases it publishes with torch, torchvision and torchaudio for this Python and platform: 10.1.0, 10.0.0."),
             "{hint}"
         );
         // A pinned request re-runs its own command with a different
@@ -381,7 +394,7 @@ mod tests {
             None,
         );
         assert!(
-            hint.contains("Other stable releases it publishes: 10.1.2, 10.0.0."),
+            hint.contains("Other stable releases it publishes with torch, torchvision and torchaudio for this Python and platform: 10.1.2, 10.0.0."),
             "{hint}"
         );
 
@@ -424,7 +437,7 @@ mod tests {
             None,
         );
         assert!(
-            hint.contains("Stable releases it publishes: 10.0.0. "),
+            hint.contains("Stable releases it publishes with torch, torchvision and torchaudio for this Python and platform: 10.0.0. "),
             "{hint}"
         );
 
@@ -436,7 +449,10 @@ mod tests {
             WHEEL_AT_GFX1200,
             None,
         );
-        assert!(hint.contains("It publishes no stable release"), "{hint}");
+        assert!(
+            hint.contains("It publishes no stable release with torch, torchvision and torchaudio"),
+            "{hint}"
+        );
         assert!(!hint.contains("10.1.0a20260822"), "{hint}");
         assert!(!hint.contains("--version 10"), "{hint}");
 
@@ -464,7 +480,7 @@ mod tests {
             None,
         );
         assert!(
-            hint.contains("Stable releases it publishes: 10.0.0. "),
+            hint.contains("Stable releases it publishes with torch, torchvision and torchaudio for this Python and platform: 10.0.0. "),
             "{hint}"
         );
         assert!(!hint.contains("10.0.1.12345"), "{hint}");

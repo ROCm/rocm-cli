@@ -854,17 +854,64 @@ fn resolve_pip_runtime_plan(
         &uv,
     )
     .map_err(|error| {
+        let unsatisfied = VersionUnsatisfied::find(&error);
+        // Only a failure the hint will answer pays for the framework listings.
+        let candidates =
+            (layout == SourceLayout::Next && unsatisfied.is_some() && recovery.suggests_releases())
+                .then(|| {
+                    releases_with_full_stack(
+                        paths,
+                        &source.index_url,
+                        &rocm_versions,
+                        wheel_compatibility,
+                        download_timeout_secs,
+                    )
+                })
+                .flatten();
         let context = wheel_resolution_failure_context(
             channel,
             layout,
             &source.index_url,
             version_selector,
-            Some(&rocm_versions),
-            VersionUnsatisfied::find(&error),
+            candidates.as_deref(),
+            unsatisfied,
             recovery,
         );
         error.context(context)
     })
+}
+
+/// The `rocm` releases a next-layout failure may suggest: those for which
+/// torch, torchvision and torchaudio are all published for this Python and
+/// platform. A release missing one fails the same way the request just did.
+/// `None` when a listing could not be read, so the hint says it cannot suggest
+/// a release rather than guessing from the `rocm` listing alone.
+fn releases_with_full_stack(
+    paths: &AppPaths,
+    index_url: &str,
+    rocm_versions: &[String],
+    wheel_compatibility: &WheelCompatibility,
+    download_timeout_secs: Option<u64>,
+) -> Option<Vec<String>> {
+    let listing = |package| {
+        load_simple_index_versions(
+            paths,
+            index_url,
+            package,
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )
+        .ok()
+    };
+    let (torch, torchvision, torchaudio) = (
+        listing("torch")?,
+        listing("torchvision")?,
+        listing("torchaudio")?,
+    );
+    Some(rocm_versions_with_full_stack(
+        rocm_versions,
+        [&torch, &torchvision, &torchaudio],
+    ))
 }
 
 /// `include_devel` reaches this far because version resolution, not only install
@@ -1022,19 +1069,7 @@ fn resolve_pip_runtime_from_index(
                 &rocm_version,
                 rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
                 index_url,
-            )
-            .map_err(|error| {
-                // With no pin, the build was taken from those with a full stack,
-                // so a build without torchaudio means none has one (the full list
-                // is the fallback). Another `--version` fails the same way, so
-                // the failure must not carry the marker that triggers a
-                // suggestion.
-                if version_selector.is_none() && with_full_stack.is_empty() {
-                    anyhow::anyhow!("{error:#}")
-                } else {
-                    error
-                }
-            })?;
+            )?;
             let requirements = published_pip_requirements(
                 &rocm_version,
                 &pin.version,

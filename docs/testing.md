@@ -1372,7 +1372,8 @@ canonical index. A `major.minor.patch` pin stays exact. When a ROCm 10 pin
 cannot be satisfied because no release matches, the release has no torchaudio
 for this Python and platform, or `uv` finds no installable package set for it,
 the error lists the other stable ROCm 10 releases that layout publishes, if
-any, and suggests one of them, never the release that just failed and never
+any (for a wheel, only those that publish torch, torchvision and torchaudio for
+this Python and platform), and suggests the newest of them, never the release that just failed and never
 `--channel nightly`. An install is told which `--version`/`--family` to re-run
 with. `rocm update`, which has neither flag, is given a whole
 `rocm install sdk` command with the runtime's `--format` and `--devel`. Any
@@ -1399,11 +1400,12 @@ cover this:
 - `therock-next-29`: an exact pin ignores later patches.
 - `therock-next-30`: a canonical `7.14` line pin.
 - `therock-next-31`: an unpinned install where no build has an installable
-  torchaudio fails with no version suggested, because another version would
-  fail the same way.
+  torchaudio fails, says no other release publishes torch, torchvision and
+  torchaudio for this host, and names no version.
 - `therock-next-32`: an update whose newest release has no installable package
   set (a real `uv pip compile` reports no solution) suggests an install that
-  keeps the runtime's format and toolchain. The scenario runs that command.
+  keeps the runtime's format and toolchain, and leaves out a newer release
+  that publishes no framework packages. The scenario runs that command.
 
 They run in the default e2e lane. `therock-next-26` and `therock-next-27` are
 Linux-only, because Windows refuses tarball installs.

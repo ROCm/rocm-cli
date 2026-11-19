@@ -462,9 +462,9 @@ Feature: TheRock "next" ROCm 10 install layout
     Then the preview resolves the canonical release pip index for ROCm 7.14.1
     And the preview never mentions the ROCm 10 pip index
 
-  # With no pin the install takes the newest build that has a full stack, so a
-  # failure on torchaudio means no build has one. Another `--version` would
-  # fail the same way, so the failure must not suggest one.
+  # A failure on torchaudio is one another release could clear, so the hint
+  # lists the other releases that publish torch, torchvision and torchaudio
+  # for this host. Here none does, so it says so and names no `--version`.
   @id:therock-next-31-unpinned-install-with-no-installable-torchaudio-suggests-no-version
   Scenario: therock-next-31 - An unpinned ROCm 10 install where no build has an installable torchaudio suggests no other version
     Given a ROCm 10 pip index fixture where no build has a torchaudio this host can install
@@ -475,7 +475,8 @@ Feature: TheRock "next" ROCm 10 install layout
   # An update has no `--version` to change. When the newest release has every
   # package listed but no installable set (`uv pip compile` finds no
   # solution), the failure names a whole `rocm install sdk` command for the
-  # other release, keeping the runtime's format and toolchain extras. Running
+  # other release, keeping the runtime's format and toolchain extras, and leaves
+  # out a release with no torch, torchvision or torchaudio. Running
   # that command proves it exists, accepts those flags, and resolves.
   @id:therock-next-32-failed-update-suggests-an-install-that-keeps-its-extras
   Scenario: therock-next-32 - A ROCm 10 update with no installable package set suggests an install command that keeps the runtime's format and toolchain

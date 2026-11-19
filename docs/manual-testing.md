@@ -303,7 +303,9 @@ Version pins, checked with `--dry-run`:
 - `--version 7.14 --dry-run` previews the newest stable 7.14.x from the
   canonical index.
 - A ROCm 10 pin the source cannot satisfy fails with a list of the other
-  stable ROCm 10 releases it publishes, if any, and a `--version` to try. Running that suggestion
+  stable ROCm 10 releases it publishes, if any, and a `--version` to try. For
+  a wheel, the list leaves out releases that publish no torch, torchvision or
+  torchaudio for this host. Running that suggestion
   must succeed, and the error must not suggest `--channel nightly`.
 - A `rocm update --apply` of a ROCm 10 runtime that fails the same way
   suggests a whole `rocm install sdk` command with the runtime's `--format`

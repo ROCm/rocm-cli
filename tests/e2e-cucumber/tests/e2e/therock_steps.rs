@@ -596,7 +596,21 @@ async fn pip_index_fixture_with_unsolvable_newest_build(world: &mut E2eWorld) {
         &torchaudio,
         UNPUBLISHED_NEXT_ROCM_VERSION,
     );
+    // A third `rocm` build, newer than the installable one, with no torch,
+    // torchvision or torchaudio at all. Suggesting it would fail the same way,
+    // so the failure must leave it out.
+    let rocm = [
+        NEXT_ROCM_VERSION,
+        NEXT_ROCM_WITHOUT_FRAMEWORKS_VERSION,
+        NEWER_NEXT_ROCM_VERSION,
+    ]
+    .map(|rocm| (rocm, ANY_WHEEL_TAG, Vec::new()));
+    let served = root(world).join("therock-pip-fixtures").join("next");
+    write_wheel_index_builds(&served.join("rocm"), "rocm", &rocm);
 }
+
+/// A `rocm` build published with no framework packages beside it.
+const NEXT_ROCM_WITHOUT_FRAMEWORKS_VERSION: &str = "10.0.5";
 
 #[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
 async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
@@ -964,16 +978,7 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
         ]),
     );
     world.artifact_server = Some(LoopbackServer::start(&served));
-    allow_base_overrides(world);
-    let base = server_base(world);
-    let next = next_tarball_base(world);
-    world.command_env.push((
-        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
-        format!("{base}/tarball/current/").into(),
-    ));
-    world
-        .command_env
-        .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
+    point_at_tarball_fixtures(world);
 }
 
 /// The newer 10.1 patch, uploaded first.
@@ -2721,8 +2726,17 @@ async fn failure_names_missing_torchaudio_without_version_advice(world: &mut E2e
         )),
         "the refusal did not say why {NEWER_NEXT_ROCM_VERSION} failed:\n{reported}"
     );
+    // No other release publishes the whole framework set for this host, so the
+    // hint says so instead of naming a release that would fail the same way.
+    assert!(
+        reported.contains(
+            "It publishes no other stable release with torch, torchvision and torchaudio for this Python and platform, so no `--version` pin can install from it yet."
+        ),
+        "the refusal did not say no other release can install:\n{reported}"
+    );
     for absent in [
-        "--version",
+        "--version 10",
+        "--family",
         "Install one of them",
         "Re-run with one of them",
         "nightly",
@@ -2760,12 +2774,17 @@ async fn failure_suggests_install_that_keeps_extras(world: &mut E2eWorld) {
             "the refusal did not carry `{expected}` from uv's failure:\n{reported}"
         );
     }
-    // 10.1.0 is the release that failed, so it is not offered again.
+    // 10.1.0 is the release that failed, and 10.0.5 has no framework
+    // packages, so only 10.0.0 is offered.
     assert!(
         reported.contains(&format!(
-            "Other stable releases it publishes: {NEXT_ROCM_VERSION}."
+            "Other stable releases it publishes with torch, torchvision and torchaudio for this Python and platform: {NEXT_ROCM_VERSION}."
         )),
-        "the refusal did not list only the release that was not tried:\n{reported}"
+        "the refusal did not list only the release that can install:\n{reported}"
+    );
+    assert!(
+        !reported.contains(NEXT_ROCM_WITHOUT_FRAMEWORKS_VERSION),
+        "the refusal offered a release with no framework packages:\n{reported}"
     );
     assert!(
         reported.contains(&format!(
