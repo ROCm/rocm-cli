@@ -1455,18 +1455,36 @@ mod tests {
     /// anyone whose GPU was not detected, and narrowing on a recipe that names
     /// no families would hide most of the catalog outright; asserting only the
     /// first arm would pass a gate that did both.
+    ///
+    /// Lemonade, not vLLM or AIM: those two are ruled out by the *platform*
+    /// gate inside [`recipe_engine_allowed`] whenever it runs on native
+    /// Windows, which would make the first arm below pass there for a reason
+    /// that has nothing to do with the GPU family, and make the other three
+    /// impossible. Lemonade is `PlatformRuleOut::Allowed` everywhere, so what
+    /// this asserts is the same on every runner — the same hazard
+    /// `unsupported_here_for` takes its `ruled_out` as a parameter to avoid.
     #[test]
     fn a_recipe_its_engine_cannot_run_on_this_gpu_is_not_offered() {
         let mut recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
-        recipe.preferred_engines = vec!["vllm".to_owned()];
+        recipe.preferred_engines = vec!["lemonade".to_owned()];
         let with_families = |families: &[&str]| rocm_core::ModelRecipeEngineRecord {
-            engine: "vllm".to_owned(),
+            engine: "lemonade".to_owned(),
             supported_gfx_families: families.iter().map(|f| (*f).to_owned()).collect(),
             ..Default::default()
         };
         let allowed = |recipe: &ModelRecipeRecord, family: Option<&str>| {
             recipe_engine_allowed(recipe, &|| true, family)
         };
+        // The premise, asserted rather than trusted: `runtime_is_windows` is a
+        // `const fn`, so the platform gate cannot be simulated and this test is
+        // only as portable as its engine. If this engine ever becomes
+        // platform-gated, say so here instead of failing below as a baffling
+        // "offered a recipe it should not have".
+        assert!(
+            engine_ruled_out_by_platform_with("lemonade", || true) == PlatformRuleOut::Allowed,
+            "this test's engine must not be platform-gated on any runner, or the arms below \
+             stop being about the GPU family at all"
+        );
 
         recipe.engine_recipes = vec![with_families(&["gfx94X-dcgpu"])];
         assert!(
