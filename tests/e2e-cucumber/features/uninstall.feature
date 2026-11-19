@@ -6,9 +6,12 @@ Feature: Uninstall
   # cover what the plan does with the folders it is pointed at, so they run on
   # the mock lane every PR.
   #
-  # Every scenario passes --keep-binaries (the binary under test must survive)
-  # and points HOME, the uv cache and the Hugging Face cache at the scenario's
-  # own folder, so an uninstall can never reach the runner's shared caches.
+  # Every scenario passes --keep-binaries (the binary under test must survive),
+  # except the assistant's preview (uninstall-12), which removes nothing, and
+  # uninstall-16, which runs a copy of the binary under test placed in the
+  # scenario's own folder. All of them point HOME, the uv cache and the Hugging
+  # Face cache at the scenario's own folder, so an uninstall can never reach the
+  # runner's shared caches.
   #
   # The link scenarios are Linux-only, and the behaviour they pin is only
   # claimed for Linux: on Windows a directory symlink or junction needs
@@ -123,9 +126,10 @@ Feature: Uninstall
     And the config folder still holds the user's files
 
   # `--force` is a natural guess for skipping the confirmation, and the nearest
-  # real flag by name is `--force-dev-binaries`, which removes the binaries of a
-  # development build. `--force` is refused with the flag to use instead, a near
-  # miss of it never suggests the destructive flag, and nothing is removed.
+  # real flag by name is `--force-dev-binaries`, the older spelling of
+  # `--allow-dev-binaries`, which removes the binaries of a development build.
+  # `--force` is refused with the flag to use instead, a near miss of it never
+  # suggests either spelling of the destructive flag, and nothing is removed.
   @id:uninstall-mistyped-force-is-not-answered-with-a-destructive-flag
   Scenario: uninstall-10 - A mistyped --force is refused without pointing at the flag that removes development binaries
     Given the config folder holds the user's files
@@ -187,3 +191,31 @@ Feature: Uninstall
     Then the uninstall is reported as cancelled
     And the user is not told the answer was misunderstood
     And the config folder still holds the user's files
+
+  # A `rocm` run from a cargo build folder (`target/debug` or `target/release`)
+  # keeps the ROCm CLI binaries in that folder, so uninstalling from a checkout
+  # does not delete the developer's build, and says which flag removes them.
+  # `--allow-dev-binaries` removes them and overrides nothing else: it still
+  # needs confirming. `--force-dev-binaries`, its older spelling, still works.
+  #
+  # The development build here is a copy of the binary under test, placed in a
+  # build folder inside the scenario's own folder beside a stand-in daemon, and
+  # every run keeps the config, data and cache, so the copy and the stand-in are
+  # all a run can remove. Linux-only: Windows cannot delete the running
+  # `rocm.exe`, so it is removed only after the command exits, and whether it is
+  # gone when the next step looks would be a race.
+  @id:uninstall-development-build-keeps-its-binaries-unless-allowed @requires-os:linux
+  Scenario: uninstall-16 - A development build keeps its binaries unless the user allows removing them, which still needs confirming
+    Given ROCm CLI is run from a development build folder
+    When the user dry-runs an uninstall from the development build
+    Then the uninstall succeeds
+    And the dry run keeps the development build's binaries and names the flag that removes them
+    When the user dry-runs an uninstall from the development build, allowing its binaries with the older spelling of the flag
+    Then the uninstall succeeds
+    And the dry run lists the development build's binaries
+    When the user allows removing the development build's binaries without confirming
+    Then the uninstall is refused until it is confirmed, after listing the development build's binaries
+    And the development build's binaries are still there
+    When the user allows removing the development build's binaries and confirms
+    Then the uninstall succeeds
+    And the development build's binaries are gone

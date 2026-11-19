@@ -1998,9 +1998,19 @@ Expected result:
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
   is not an option and points to `--yes`; a near miss such as `--forc` is an
   unknown-argument error (exit 2). Neither
-  suggests `--force-dev-binaries` (scenario `uninstall-10`).
+  suggests `--allow-dev-binaries` or its older spelling `--force-dev-binaries`
+  (scenario `uninstall-10`).
   `rocm uninstall --help` ends with examples that start with a dry run
   (scenario `uninstall-11`).
+- Run from a cargo build, `HOME=$(mktemp -d) ./target/debug/rocm uninstall
+  --keep-config --keep-data --keep-cache --dry-run` lists nothing to remove and,
+  under `Left alone:`, says the binaries are kept and to pass
+  `--allow-dev-binaries`. Adding `--allow-dev-binaries` (or its older spelling
+  `--force-dev-binaries`) lists `rocm`, `rocmd` and the other ROCm CLI programs
+  in `target/debug`, and nothing else from the build; without `--dry-run` it
+  still needs `--yes` or a `y` at the prompt (scenario `uninstall-16`). Do the
+  real run only with `rocm` copied into a scratch `target/debug` folder, not on
+  your working build.
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no

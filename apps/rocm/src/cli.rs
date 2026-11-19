@@ -834,12 +834,18 @@ rocm uninstall --keep-data --yes")]
         /// which lives under the data directory; use --keep-data for that.
         #[arg(long)]
         keep_cache: bool,
-        /// Allow removing development binaries inside the current build tree.
-        #[arg(long)]
-        force_dev_binaries: bool,
+        /// Also remove the ROCm CLI binaries in the cargo `target/debug` or
+        /// `target/release` folder `rocm` runs from, which uninstall otherwise
+        /// keeps. Overrides nothing else: `--keep-binaries`, `--dry-run` and the
+        /// confirmation still apply.
+        // `--force-dev-binaries` is the older spelling, kept working and out of
+        // the help and the completions.
+        #[arg(long, alias = "force-dev-binaries")]
+        allow_dev_binaries: bool,
         /// Not an option; accepted only to say so. Without it clap answers a
         /// mistyped `--force` (a likely guess for skipping the confirmation)
-        /// with `--force-dev-binaries`, which removes development binaries.
+        /// with `--force-dev-binaries`, the older spelling of
+        /// `--allow-dev-binaries`, which removes development binaries.
         #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "")]
         force: Option<String>,
     },
@@ -2605,7 +2611,9 @@ mod tests {
 
     /// `--force` is a likely guess for "skip the confirmation", and without a
     /// declared `--force` clap answers it, and every near miss of it, with
-    /// `--force-dev-binaries`, which removes the binaries of a development build.
+    /// `--force-dev-binaries`, the older spelling of `--allow-dev-binaries`, which
+    /// removes the binaries of a development build. Neither spelling may be
+    /// offered for a `--force` near miss.
     /// The scenario `uninstall-mistyped-force-is-not-answered-with-a-destructive-flag`
     /// proves the real binary's output; this pins the parse behind it.
     #[test]
@@ -2614,17 +2622,17 @@ mod tests {
         let cli = Cli::try_parse_from(["rocm", "uninstall", "--force"]).unwrap();
         let Some(Command::Uninstall {
             force,
-            force_dev_binaries,
+            allow_dev_binaries,
             ..
         }) = cli.command
         else {
             panic!("not an uninstall command");
         };
-        assert!(force.is_some() && !force_dev_binaries);
+        assert!(force.is_some() && !allow_dev_binaries);
         let refusal = reject_force(force.is_some()).unwrap_err().to_string();
         assert!(refusal.contains("`--force` is not an option"), "{refusal}");
         assert!(refusal.contains("--yes"), "{refusal}");
-        assert!(!refusal.contains("force-dev-binaries"), "{refusal}");
+        assert!(!refusal.contains("dev-binaries"), "{refusal}");
         assert!(reject_force(false).is_ok());
         // `--force=x` is the same mistake, and gets the same answer rather than
         // a usage line that lists every flag.
@@ -2648,7 +2656,7 @@ mod tests {
                 .unwrap_err();
             let rendered = error.render().to_string();
             assert!(
-                !rendered.contains("force-dev-binaries"),
+                !rendered.contains("dev-binaries"),
                 "{args:?} was answered with the destructive flag:\n{rendered}"
             );
             assert_eq!(error.exit_code(), 2, "{args:?}");
@@ -2671,18 +2679,25 @@ mod tests {
                 .render()
                 .to_string();
             assert!(
-                rendered.contains("--force") && !rendered.contains("force-dev-binaries"),
+                rendered.contains("--force") && !rendered.contains("dev-binaries"),
                 "{args:?} must be steered to the declared `--force`, not the destructive flag:\n{rendered}"
             );
         }
 
-        // The whole flag misspelled is still met with the flag it was meant to be.
-        let error = cli_command()
-            .try_get_matches_from(["rocm", "uninstall", "--force-dev-binary"])
-            .unwrap_err()
-            .render()
-            .to_string();
-        assert!(error.contains("--force-dev-binaries"), "{error}");
+        // The whole flag misspelled is still met with the flag it was meant to
+        // be. The older spelling is a hidden alias, which clap still offers as
+        // a suggestion, so a misspelling of it is answered with it.
+        for (typed, meant) in [
+            ("--allow-dev-binary", "--allow-dev-binaries"),
+            ("--force-dev-binary", "--force-dev-binaries"),
+        ] {
+            let error = cli_command()
+                .try_get_matches_from(["rocm", "uninstall", typed])
+                .unwrap_err()
+                .render()
+                .to_string();
+            assert!(error.contains(meant), "{typed}: {error}");
+        }
 
         // It stays out of the help.
         let mut command = cli_command();
@@ -2692,6 +2707,57 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(!help.contains("Not an option"), "{help}");
+    }
+
+    /// `--allow-dev-binaries` and its older spelling `--force-dev-binaries` set
+    /// the same option, and only the new name is advertised. This pins the parse
+    /// and the help text; what the option does, and that it overrides nothing
+    /// else, is proven by `a_development_build_keeps_its_binaries_unless_allowed`
+    /// in `uninstall_plan.rs` and by the scenario
+    /// `uninstall-development-build-keeps-its-binaries-unless-allowed`.
+    #[test]
+    fn both_spellings_allow_dev_binaries_and_only_the_new_one_is_advertised() {
+        for flag in ["--allow-dev-binaries", "--force-dev-binaries"] {
+            let cli = Cli::try_parse_from(["rocm", "uninstall", flag]).unwrap();
+            let Some(Command::Uninstall {
+                allow_dev_binaries,
+                force,
+                ..
+            }) = cli.command
+            else {
+                panic!("not an uninstall command");
+            };
+            assert!(allow_dev_binaries && force.is_none(), "{flag}");
+        }
+        let cli = Cli::try_parse_from(["rocm", "uninstall"]).unwrap();
+        let Some(Command::Uninstall {
+            allow_dev_binaries, ..
+        }) = cli.command
+        else {
+            panic!("not an uninstall command");
+        };
+        assert!(!allow_dev_binaries, "off unless asked for");
+
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--allow-dev-binaries"), "{help}");
+        assert!(help.contains("Overrides nothing else"), "{help}");
+        assert!(!help.contains("force-dev-binaries"), "{help}");
+
+        let mut completions = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut crate::completion_command(),
+            "rocm",
+            &mut completions,
+        );
+        let completions = String::from_utf8(completions).unwrap();
+        assert!(completions.contains("--allow-dev-binaries"));
+        assert!(!completions.contains("force-dev-binaries"));
     }
 
     /// The help leads with the safe preview, then the real run, as the tip a
