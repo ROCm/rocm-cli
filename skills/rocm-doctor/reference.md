@@ -77,9 +77,12 @@ the result from `--json`:
   `compute_buffer_gib`, `runtime_reserve_gib`, `total_gib`, the same in bytes as
   `weights_bytes`, `kv_cache_bytes`, `compute_buffer_bytes`,
   `runtime_reserve_bytes` and `total_bytes`, and `kv_cache_bytes_per_token`, the
-  cache's cost of one token); the comparison (`available_gib` is the total
-  dedicated VRAM of the GPU with the most of it that ROCm can see, not what is
-  free; `max_context` is the largest context that fits, capped at
+  cache's cost of one token); the comparison (`available_gib` is the memory the
+  estimate was compared against, not what is free: the total dedicated VRAM of
+  the GPU with the most of it that ROCm can see, or -- on an integrated GPU --
+  the ceiling on the pool it shares with the operating system.
+  `available_is_shared_pool` says which of the two it is, and is the only way
+  to tell them apart from the number alone; `max_context` is the largest context that fits, capped at
   `training_context`, and is null when GPU memory was not measured, when no
   verdict is given (`unmeasured_layout`, or `missing_metadata` with figures),
   and when not even one 256-token step fits); and what the figures leave out
@@ -101,11 +104,11 @@ id is refused, and the refusal exits 1 (see the table). Exit codes:
 
 | code | meaning |
 | --- | --- |
-| 0 | applied / dry-run / print-only plan / list |
+| 0 | applied / dry-run (except the Windows read failure under 4) / print-only plan / list |
 | 1 | internal error; also the refusal of `--json` together with a fix id |
 | 2 | usage error (incl. unknown fix-id) |
 | 3 | not applicable on this host (OS mismatch, negative `--device-index`) — nothing changed |
-| 4 | attempted but the command failed |
+| 4 | attempted but the command failed or timed out; after a timeout the change may be partial — the message names how to check it and what to re-run (an older CLI instead prints `exited 124` or `exited -1` with `NOT changed`; see step 3 in [SKILL.md](SKILL.md)). Also, on Windows only, `fix-2-unset-override`, `fix-6-path` or `fix-9-igpu-dgpu --device-index N` when it could not read the current value of the variable it changes, `--dry-run` included — nothing changed and no plan shown; the catalog entry printed first is the fix's generic description, not a preview of the change on this machine |
 | 5 | user declined at the prompt |
 
 Three ids are ever auto-applicable — never four, and `fix-9-igpu-dgpu` is not
@@ -134,8 +137,10 @@ a promise that the runner mutates anything, and — per the per-host list above 
 not the same claim on Windows or WSL2 for the one entry whose behaviour
 depends on more than the host alone.
 
-The ones that do mutate print the exact command, honor `--dry-run`, refuse on a
-non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
+The ones that do mutate print the exact command, honor `--dry-run` (on
+Windows a dry run whose read fails exits 4 with no plan; see 4 in the exit-code
+table), refuse on a non-interactive shell without `--yes`, and confirm first.
+**Two exceptions:**
 
 - **`fix-2-unset-override` mutates on Windows only.** Its Linux runner reports
   where the override is set and which rc files carry it, then stops — it will
@@ -149,7 +154,7 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
   once you know N.
 
-## Closed catalog (29 failure modes)
+## Closed catalog (30 failure modes)
 
 The OS column is the platform family the CLI scopes an entry to, and WSL2 is a
 family of its own — not a flavour of `linux`. An entry reaches a WSL host only
@@ -166,7 +171,7 @@ reporting confident nonsense.
 | `fix-5-amdgpu-load` | linux | `amdgpu` module not loaded (or blacklisted) | "ROCk module is NOT loaded", blacklist entry, Secure Boot | print-only |
 | `fix-6-path` | linux/windows/wsl | ROCm/HIP binaries not on PATH after install | `rocminfo: command not found`, `hipInfo` missing from PATH | auto |
 | `fix-7-stale-repos` | linux | Stale/conflicting APT/DNF/zypper repos from prior installer runs | apt 404 `repo.radeon.com`, unmet deps, ≥2 ROCm repo files | print-only |
-| `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm major than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | print-only |
+| `fix-8-wheel-rocm` | linux/windows/wsl | Framework wheel built for a different ROCm X.Y release than the system | `libamdhip64.so.X` / `amdhip64_X.dll` load failure | print-only |
 | `fix-9-igpu-dgpu` | linux/windows | iGPU enumerated alongside dGPU, destabilising the runtime | APU + discrete AMD present, `HIP_VISIBLE_DEVICES` unset, crash/segfault | needs-arg |
 | `fix-10-container` | linux | Container can't see `/dev/kfd` or `/dev/dri/renderD*` | running in docker/podman, kfd/render devices missing | print-only |
 | `fix-11-iommu` | linux | Multi-GPU hang with IOMMU enabled | ≥2 AMD GPUs, `iommu=` not `pt`, hang/deadlock/timeout | print-only |
@@ -181,6 +186,7 @@ reporting confident nonsense.
 | `info-20-gpu-no-rocm-support` | linux/windows | Every AMD GPU on the host is a part ROCm has never shipped a runtime build for (today: gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo). Vulkan-based engines still work | every detected AMD GPU identifies as an unsupported target, and none is unidentified; scores a flat 60 | diagnose-only |
 | `fix-21-msvc-redist-outdated` | windows | MSVC runtime present but older than 14.40, so programs built with a recent toolset (such as the llama.cpp server that Lemonade installs) crash | `rocm examine --json` shows `msvc_redist_version` below 14.40; an access violation (`0xC0000005`, `-1073741819`) with `msvcp140.dll` as the faulting module | print-only |
 | `fix-22-display-driver-old` | windows | The AMD display driver is dated before the first HIP SDK for Windows (27 July 2023). Advice only: AMD publishes no minimum driver version for the HIP SDK or the Lemonade Vulkan backend, so the minimum is not established and the entry never claims the driver is broken. The date is only a floor and cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers | `rocm examine` shows `driver_age: older than the first HIP SDK for Windows`; the entry scores below the match threshold (WEAK) | print-only |
+| `fix-23-vllm-extension-load` | linux/wsl | One of vLLM's compiled extensions (`vllm/_*.abi3.so`) failed to load, for example because it was built against a newer glibc than the host has, so an op it registers is missing and the engine fails at startup | `AttributeError: '_OpNamespace' '_C' object has no attribute '...'` — enough on its own, but only when the pasted text also identifies vLLM (the word `vllm`, the `EngineCore` process prefix, or a vLLM extension name such as `_rocm_C`/`_moe_C`/`_C_cache_ops`/`_C_stable_libtorch`), since every PyTorch-ecosystem library with a `_C` extension raises the identical line; `Failed to import from vllm._...`; `GLIBC_2.NN' not found` naming a vllm `.abi3.so` | print-only |
 | `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | print-only |
 | `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | print-only |
 | `fix-wsl-3-rocdxg-missing` | wsl | ROCDXG, the ROCm-to-DXCore shim the WSL path runs on, is not installed | `librocdxg.so` not found under any ROCm install | print-only |
@@ -192,7 +198,7 @@ reporting confident nonsense.
 One thing the numbering does not tell you: the `fix-wsl-N` entries are a parallel
 series, not a continuation of the numeric one, because they answer for a
 different platform family. The numeric series itself runs `fix-1` through
-`fix-19`, then `fix-21` and `fix-22`. The ids are stable handles rather than positions, so
+`fix-19`, then `fix-21` through `fix-23`. The ids are stable handles rather than positions, so
 the number `fix-20` is simply not used here: slot 20 belongs to
 `info-20-gpu-no-rocm-support`, which is in the table above but under an `info-`
 prefix because it has no fix to offer. A gap is not an error, and a retired
@@ -201,7 +207,7 @@ entry would leave a hole rather than renumber the ones after it.
 Linux-only: fix-3, -4, -5, -7, -10, -11, -12. Windows-only: fix-13, -14, -15, -21, -22.
 Linux + Windows: info-20 (diagnose-only).
 WSL-only: fix-wsl-1 through fix-wsl-7. Linux + Windows: fix-9.
-Linux + WSL: fix-16, -17, -18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8.
+Linux + WSL: fix-16, -17, -18, -19, -23. Linux + Windows + WSL: fix-1, -2, -6, -8.
 
 ## Framework routing
 

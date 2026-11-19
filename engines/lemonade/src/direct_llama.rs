@@ -142,9 +142,10 @@ pub(crate) fn serve_direct_after_router_failure(
     // would record the service as failed for good (`refresh_from_engine_state`
     // ignores later states once a record is `failed`), so the state says
     // `starting` for the whole fallback and goes to `failed` if the fallback
-    // does not produce a running server. The router's server pid goes too:
-    // `identity_from_state` prefers it over the launcher's, so leaving the dead
-    // router's pid in place would point a `stop` during the fallback at a
+    // does not produce a running server (unless the file has become unusable,
+    // which refuses the mark and is left as it was). The router's server pid
+    // goes too: `identity_from_state` prefers it over the launcher's, so leaving
+    // the dead router's pid in place would point a `stop` during the fallback at a
     // process that is gone (or, once reused, at an unrelated one) instead of the
     // launcher that is about to start the direct server.
     crate::state::merge_json_state(
@@ -408,7 +409,7 @@ fn serve_direct_llama_server_within(
     let mut command = direct_llama_server_command(request, server, model_path);
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
-    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
+    // CLI-managed owner-only key file via `--api-key-file` (a path, not the value, so the
     // secret never lands in the process table). Reusing the managed file rather than
     // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
     // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
@@ -522,9 +523,10 @@ impl DirectServerSteps for RealDirectServerSteps<'_> {
 
 /// Own a just-spawned direct llama-server. Every step after the spawn, state
 /// writes and the final wait included, runs under one guard: any failure stops and
-/// reaps the child (`Child` does not kill on drop) and marks the state `failed`,
-/// so the server can never keep running with no state that stop and health can
-/// reach.
+/// reaps the child (`Child` does not kill on drop), so the server can never keep
+/// running with no state that stop and health can reach, and then marks the state
+/// `failed`. A state file that is empty, torn or not a JSON object refuses that
+/// mark and is left as it was.
 fn supervise_direct_server<S: DirectServerSteps>(
     child: &mut Child,
     state_path: &Path,
@@ -1970,11 +1972,11 @@ mod tests {
     #[test]
     fn direct_serve_binary_finds_build_numbered_nesting() {
         // Some Lemonade llama.cpp releases extract one level deeper than
-        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b9752/llama-server`.
+        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b11580/llama-server`.
         let dir = scratch_dir("find-server-nested");
         let runtime_dir = dir.join("runtime");
         let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let nested = llamacpp.join("rocm-stable").join("llama-b9752");
+        let nested = llamacpp.join("rocm-stable").join("llama-b11580");
         fs::create_dir_all(&nested).unwrap();
         let server = nested.join(platform_binary_name("llama-server"));
         fs::write(&server, b"x").unwrap();

@@ -11,6 +11,7 @@
 //! reducer focused.
 
 use super::{ActiveTab, AppState, Focus, Modal};
+use crate::ui::job_console::{ConsoleExit, console_esc_closes};
 
 impl AppState {
     /// Close every operational overlay. The overlays are mutually exclusive
@@ -45,9 +46,27 @@ impl AppState {
             .as_ref()
             .and_then(|m| m.active_job.as_deref())
             .or_else(|| {
-                self.serve_wizard
-                    .as_ref()
-                    .and_then(|m| m.active_job.as_deref())
+                self.serve_wizard.as_ref().and_then(|m| {
+                    // While the serve wizard's detach-confirm modal is open,
+                    // that modal owns the overlay; do not let the shared
+                    // active-job console renderer mask it.
+                    // `ui::draw_active_manager` returns early whenever this is
+                    // `Some`, so leaving the job id visible here would paint the
+                    // console over the very question the user has to answer.
+                    //
+                    // The cost of that early return is a backdrop swap, not an
+                    // overlay: the fall-through reaches `draw_serve_wizard`,
+                    // which draws the wizard's static form under the question —
+                    // so the live console is off screen for as long as the
+                    // question is up, and `Deny` brings it back whole.
+                    // Pinned by
+                    // `serve_wizard::tests::detach_confirm_modal_replaces_the_console_with_the_static_form`.
+                    if m.detach_confirm.is_some() {
+                        None
+                    } else {
+                        m.active_job.as_deref()
+                    }
+                })
             })
             .or_else(|| {
                 self.engine_manager
@@ -99,6 +118,30 @@ impl AppState {
                     .as_ref()
                     .and_then(|m| m.active_job.as_deref())
             })
+    }
+
+    /// What leaving the console of [`Self::active_job_id`] does, for the two
+    /// places that have to word it: the console's own footer hint and the
+    /// dashboard footer's Esc chip.
+    ///
+    /// [`ConsoleExit::Confirmed`] only for the serve wizard's still-running
+    /// launch — the single overlay that turns `ConsoleOutcome::Closed` into a
+    /// modal instead of leaving (`ui::serve_wizard::on_key`). The terminality
+    /// test is `console_esc_closes`, the same predicate that branch uses, so a
+    /// hint can't claim a confirmation the key handler would not raise.
+    pub(crate) fn console_exit(&self) -> ConsoleExit {
+        let serve_job = self
+            .serve_wizard
+            .as_ref()
+            .and_then(|w| w.active_job.as_deref());
+        match serve_job {
+            Some(id)
+                if self.active_job_id() == Some(id) && console_esc_closes(self.jobs.job(id)) =>
+            {
+                ConsoleExit::Confirmed
+            }
+            _ => ConsoleExit::Immediate,
+        }
     }
 
     /// Whether a job console is currently displayed (a manager is open AND on its
@@ -223,6 +266,7 @@ impl AppState {
                 && w.browser.is_none()
                 && w.picker.is_none()
                 && w.approval.is_none()
+                && w.detach_confirm.is_none()
                 && w.active_job.is_none()
         }) && self
             .install_manager
@@ -556,11 +600,16 @@ mod tests {
             browser,
             picker,
             approval,
+            detach_confirm,
             active_job,
             message: _,
         } = ServeWizardState::default();
         assert!(
-            browser.is_none() && picker.is_none() && approval.is_none() && active_job.is_none()
+            browser.is_none()
+                && picker.is_none()
+                && approval.is_none()
+                && detach_confirm.is_none()
+                && active_job.is_none()
         );
 
         let InstallManagerState {

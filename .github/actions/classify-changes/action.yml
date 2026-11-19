@@ -1,0 +1,329 @@
+name: Classify changed paths
+description: >-
+  Sort a pull request's changed files into the categories that gate CI jobs.
+  Every category is forced on when the event is not a pull request, or when a
+  changed file is in no category and not in the inert list (files no gated
+  job reads). Shared by the `changes` job of ci.yml and of
+  e2e-selfhosted.yml, so the two cannot drift apart.
+
+# Each workflow checks out the repository before `uses: ./.github/actions/...`,
+# because a local action is read from the workspace. On a pull_request event
+# paths-filter reads the changed-file list from the API, which needs
+# `pull-requests: read` on the calling job.
+#
+# Every output is the string 'true' or 'false'. A category is 'true' when the
+# pull request touches it, or when the run is forced. A run is forced off
+# pull_request (push, merge_group, workflow_dispatch), so post-merge `main` and
+# the merge queue always run the full suite and a required check is never
+# starved in the queue. It is also forced on a pull request that changes a
+# file matched by none of the categories below and not by `inert` either (the
+# list of files no gated job reads): a new kind of file runs everything until
+# someone decides which jobs it affects, instead of silently skipping the jobs
+# that read it.
+#
+# A file can be in several categories. When you add a category, also add its
+# `_files` list to the `env:` of the `Force a full run` step, or every file in
+# it counts as unclassified; `changes_classifier_reads_every_filter`
+# (xtask/src/workflow_contract.rs) fails until you do.
+
+outputs:
+  rust:
+    description: Rust checks (fmt, clippy, the affected-crate tests, coverage) must run.
+    value: ${{ steps.filter.outputs.rust == 'true' || steps.all.outputs.forced == 'true' }}
+  heavy:
+    description: The build, smoke and E2E jobs must run.
+    value: ${{ steps.filter.outputs.heavy == 'true' || steps.all.outputs.forced == 'true' }}
+  lint:
+    description: The Python, shell and PowerShell lint job must run.
+    value: ${{ steps.filter.outputs.lint == 'true' || steps.all.outputs.forced == 'true' }}
+  tpn:
+    description: The THIRD_PARTY_NOTICES.txt staleness gate must run.
+    value: ${{ steps.filter.outputs.tpn == 'true' || steps.all.outputs.forced == 'true' }}
+  docs:
+    description: The Sphinx docs-site build must run.
+    value: ${{ steps.filter.outputs.docs == 'true' || steps.all.outputs.forced == 'true' }}
+  skills:
+    description: The published-skill checks must run.
+    value: ${{ steps.filter.outputs.skills == 'true' || steps.all.outputs.forced == 'true' }}
+  serve:
+    description: The real-GPU serve matrix in e2e-selfhosted.yml must run.
+    value: ${{ steps.filter.outputs.serve == 'true' || steps.all.outputs.forced == 'true' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Filter changed paths (pull requests only)
+      id: filter
+      if: github.event_name == 'pull_request'
+      uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+      with:
+        # File lists for the `Force a full run` step. They hold file names an
+        # author chose, so that step reads them from `env:` only.
+        list-files: json
+        # paths-filter matches with picomatch's `dot: true`, so `**` and `*`
+        # also match dotfiles and dot-directories such as `.cargo/`.
+        filters: |
+          # Rust checks: fmt, clippy (with the xtask checks it runs), the
+          # affected-crate tests and coverage. Docs-only pull requests run
+          # them too, because tests read docs: `cargo xtask affected` adds the
+          # crates that read a changed file (CROSS_CRATE_READS in
+          # xtask/src/cross_crate_reads.rs, XTASK_READ_DOCS in
+          # xtask/src/affected.rs), and
+          # `every_cross_crate_read_is_in_the_rust_filter` (xtask) holds every
+          # entry of both lists to this filter.
+          rust:
+            - '**/*.rs'
+            - '**/Cargo.toml'
+            - 'Cargo.lock'
+            - 'rust-toolchain*'
+            # Cargo configuration: the `cargo xtask` alias every job uses, and
+            # any build setting cargo reads from here.
+            - '.cargo/**'
+            # Every file inside a crate or test tree: data a crate compiles in
+            # (`include_str!` of crates/rocm-core/src/model_catalog.json),
+            # fixtures its tests read (tests/e2e-cucumber/fixtures/, which
+            # rocm-core reads), the `skill_reference` test's inputs, and the
+            # examination every replayed diagnosis runs over
+            # (tests/remote-ssh/examination.json).
+            - 'apps/**'
+            - 'crates/**'
+            - 'engines/**'
+            - 'xtask/**'
+            - 'tests/**'
+            # A proptest saved-failure file is read by the seed guard in xtask
+            # (`cargo xtask affected` adds xtask when one changes), wherever it
+            # sits.
+            - '**/proptest-regressions/**'
+            # Prose and skills that tests read: `rocm`'s advised_commands test
+            # checks every `rocm ...` command in README.md, docs/ and skills/;
+            # `rocm` compiles in the assistant skill; xtask reads the pinned
+            # release key under docs/keys, docs/architecture.md
+            # (`check-architecture-doc`), docs/ci-hardware-testing.md and
+            # others; `cargo xtask eval-fixtures --check` reads
+            # skills/rocm-doctor/evals/.
+            - 'README.md'
+            - 'docs/**'
+            - 'skills/**'
+            # clippy runs `cargo xtask manifest --check` against this file;
+            # pinned_tool_versions_match_across_docs_and_workflows (xtask)
+            # also reads its cargo-about pin.
+            - 'MANIFEST.md'
+            # Carries the hawkeye and cargo-about pins that the same test
+            # reads.
+            - 'CONTRIBUTING.md'
+            # The committed per-crate coverage floors. Listed so that lowering
+            # a floor re-runs the gate that floor controls.
+            - 'coverage-floors.toml'
+            # rocm-deps compiles the pins into constants, so a pin change is a
+            # source change even though no *.rs file moved.
+            - 'runtime-deps.toml'
+            # The published fix catalog `cargo xtask catalog` checks.
+            - 'doctor-catalog.json'
+            # `cargo xtask lychee` reads its configuration.
+            - 'lychee.toml'
+            # Scripts, installers and CI configuration that xtask's contract
+            # tests read and run (the e2e lane and GPU preflight scripts, the
+            # release-readiness script, both installers, Dependabot's
+            # configuration); `rocm` and the e2e crate read the installers
+            # too. Two xtask tests keep these entries and `lychee.toml` above
+            # in place, in different ways.
+            # `every_cross_crate_read_selects_its_reader` fails when a file a
+            # test reads through a path written out at the call
+            # (`repo_root().join("...")`, `include_str!`) is missing from this
+            # category, so it covers every entry such a read reaches. It does
+            # not see a path held in a const or built at run time, nor a file
+            # only a command reads: not `.github/scripts/**`, which a test
+            # reads through the `SHARED_PREFLIGHT` const, nor `lychee.toml`,
+            # which the `cargo xtask lychee` command reads through
+            # `LYCHEE_CONFIG` rather than a test. For `.github/scripts/**` and
+            # `lychee.toml` only `every_path_category_glob_is_pinned_by_a_sample`
+            # fails, and it checks that the glob is here, not that anything
+            # reads the file.
+            - 'scripts/**'
+            - 'install*'
+            - '.github/scripts/**'
+            - '.github/dependabot.yml'
+            # license_headers_hook_has_no_file_type_filter (xtask) reads this
+            # file's license-headers hook config.
+            - '.pre-commit-config.yaml'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # build-and-test runs cargo, the smoke gate and the remaining
+          # python/shell self-tests, plus the install-lifecycle E2E (`cargo
+          # xtask package` + the real installer), so it depends on the Rust
+          # set, the packaging xtask, the lifecycle feature/steps, and the
+          # installer inputs. ci.yml's E2E jobs gate on
+          # it too; e2e-selfhosted.yml's GPU lanes gate on the narrower `serve`
+          # category below instead.
+          heavy:
+            - '**/*.rs'
+            - '**/Cargo.toml'
+            - 'Cargo.lock'
+            - 'rust-toolchain*'
+            - '.cargo/**'
+            - 'runtime-deps.toml'
+            - 'scripts/**'
+            - 'xtask/**'
+            - 'engines/**'
+            - '**/*.py'
+            - '**/*.sh'
+            - '**/*.ps1'
+            - '**/*.feature'
+            - 'tests/e2e-cucumber/**'
+            # The containerised control-channel lane; its Dockerfile matches
+            # none of the extension globs above.
+            - 'tests/remote-ssh/**'
+            # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+            # rocm_doctor_skill.feature scenarios parse its catalog table and
+            # compare it to `rocm fix`. A skill-only edit must therefore run
+            # the E2E jobs, which gate on `heavy`.
+            - 'skills/**'
+            - 'install*'
+            # `cargo xtask package` copies the licence into every bundle.
+            - 'LICENSE*'
+            # Pinned-key consistency compares docs/keys/* against the installers,
+            # so a canonical-key-only change must trigger the heavy job that runs
+            # `cargo xtask verify-pinned-keys`.
+            - 'docs/keys/**'
+            # The issue-triage self-test (scripts/triage_issue.py) checks this
+            # prompt against the labels it applies.
+            - '.github/prompts/issue-triage.txt'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
+          # dependency tree, the cargo-about config/template, the generator, or
+          # the generated file itself.
+          tpn:
+            - 'Cargo.lock'
+            - '**/Cargo.toml'
+            - 'about.toml'
+            - 'about.hbs'
+            - 'THIRD_PARTY_NOTICES.txt'
+            - 'xtask/**'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # Python / Shell / PowerShell lint job.
+          lint:
+            - 'scripts/**'
+            - 'engines/**'
+            - '**/*.py'
+            - '**/*.sh'
+            - '**/*.ps1'
+            - 'ruff.toml'
+            - 'PSScriptAnalyzerSettings.psd1'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # Sphinx docs site: the doc sources themselves, plus README.md,
+          # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
+          # single-source via MyST `{include}` directives, plus the build
+          # config/toolchain pins.
+          docs:
+            - 'docs/rocm-docs/**'
+            - 'README.md'
+            - 'CONTRIBUTING.md'
+            - 'docs/vllm.md'
+            - 'docs/wsl.md'
+            - '.readthedocs.yaml'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # Published Agent Skills, graded by skillscope. The dataset and the
+          # skill's prose are one unit — a prompt can stop matching because the
+          # description changed — so any edit under skills/ re-runs the check.
+          skills:
+            - 'skills/**'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # The real-GPU serve matrix in e2e-selfhosted.yml. Narrower than
+          # `heavy`: only paths that can change serve BEHAVIOUR or the GPU E2E
+          # harness — NOT a blanket `**/*.rs`. Compile coverage for every crate
+          # already runs on ci.yml's always-on build/test lanes, so a dash-only
+          # or unrelated-crate Rust PR need not fire the serve matrix. Err
+          # toward inclusion — Cargo.lock, the toolchain, cargo's config and
+          # CI itself are broad safety nets so a transitive-dep or CI change
+          # still runs the matrix. (Excluded on purpose: crates/rocm-dash-* —
+          # they build into `rocm` but cannot change serve behaviour.)
+          serve:
+            - 'engines/**'
+            - 'crates/rocm-core/**'
+            - 'crates/rocm-engine-protocol/**'
+            - 'apps/rocm/**'
+            - 'apps/rocmd/**'
+            - 'tests/e2e-cucumber/**'
+            - 'crates/e2e-report/**'
+            - 'xtask/**'
+            - '**/*.feature'
+            - 'scripts/**'
+            # The GPU preflight and the WSL bridge the serve lanes run;
+            # `every_file_a_gated_job_uses_is_in_its_gating_category` (xtask)
+            # fails when a gated job uses a file its gate does not match.
+            - '.github/scripts/**'
+            # Root manifest only (NOT `**/Cargo.toml` — that would re-include
+            # the excluded dash crates): `[workspace.dependencies]` edits here
+            # can change a serving crate's deps without touching Cargo.lock.
+            - 'Cargo.toml'
+            - 'Cargo.lock'
+            - 'rust-toolchain*'
+            - '.cargo/**'
+            - '.github/workflows/**'
+            - '.github/actions/**'
+          # Files no change-gated job reads: community-health files, GitHub's
+          # issue and pull request templates, code ownership, the security
+          # scanners' configuration (read only by
+          # their own workflows, which do not use this action), the release
+          # narrative prompt (read only by nightly.yml), the issue-triage
+          # maintainer list (read only by issue-triage.yml, not by the
+          # triage self-test) and agent instructions.
+          # The jobs that run on every pull request (license headers, links,
+          # prek, commit signatures) still check them. Matching one turns
+          # nothing on; it only stops the file from forcing a full run. When
+          # unsure whether a job reads a file, leave it out of here: an
+          # unclassified file costs a full run, a wrongly inert one skips a
+          # job that reads it.
+          inert:
+            - 'AGENTS.md'
+            - 'CODE_OF_CONDUCT.md'
+            - 'SECURITY.md'
+            - '.github/CODEOWNERS'
+            - '.github/ISSUE_TEMPLATE/**'
+            - '.github/pull_request_template.md'
+            - '.github/prompts/release-readiness-narrative.txt'
+            - '.github/triage-maintainers.txt'
+            - '.github/scan_tools_configs/**'
+          # Every changed file, for the catch-all below.
+          all:
+            - '**'
+
+    - name: Force a full run
+      id: all
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        ALL_FILES: ${{ steps.filter.outputs.all_files }}
+        CLASSIFIED_RUST: ${{ steps.filter.outputs.rust_files }}
+        CLASSIFIED_HEAVY: ${{ steps.filter.outputs.heavy_files }}
+        CLASSIFIED_TPN: ${{ steps.filter.outputs.tpn_files }}
+        CLASSIFIED_LINT: ${{ steps.filter.outputs.lint_files }}
+        CLASSIFIED_DOCS: ${{ steps.filter.outputs.docs_files }}
+        CLASSIFIED_SKILLS: ${{ steps.filter.outputs.skills_files }}
+        CLASSIFIED_SERVE: ${{ steps.filter.outputs.serve_files }}
+        CLASSIFIED_INERT: ${{ steps.filter.outputs.inert_files }}
+      run: |
+        set -euo pipefail
+        if [ "$EVENT_NAME" != "pull_request" ]; then
+          echo "A ${EVENT_NAME} run is not narrowed: every category runs."
+          echo "forced=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # Every changed file minus every file some category (or `inert`)
+        # matched, as compact JSON: one line, with any newline in a file name
+        # escaped, so a crafted name cannot start a workflow command.
+        unclassified=$(jq -cn '
+          [env | to_entries[] | select(.key | startswith("CLASSIFIED_"))
+            | .value | fromjson[]] as $classified
+          | (env.ALL_FILES | fromjson) - $classified')
+        if [ "$unclassified" = "[]" ]; then
+          echo "forced=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice title=Unclassified files force a full run::No path category in .github/actions/classify-changes/action.yml matches ${unclassified}, so every category runs. Add each file to the categories whose jobs read it, or to inert."
+          echo "forced=true" >> "$GITHUB_OUTPUT"
+        fi

@@ -24,6 +24,7 @@ mod cli_report;
 mod comfyui;
 mod config_cmd;
 mod dash;
+mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
@@ -61,6 +62,7 @@ mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
 mod serve_port;
+mod serve_progress;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;
@@ -661,6 +663,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Diagnose {
             symptom,
             symptom_file,
+            engine,
             top,
             json,
             distro,
@@ -674,6 +677,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 .map_err(|error| clap_exit_code(symptom_input::usage_error(&error)))?;
             let model = model.map(|model_ref| {
                 diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
+            });
+            let symptom = symptom.map(|text| diagnose_cmd::SymptomQuery {
+                text,
+                engine: engine.map(Into::into),
             });
             diagnose(symptom, top, json, distro, model, report, send)
         }
@@ -757,6 +764,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let arguments = serde_json::from_str(arguments_json.trim_start_matches('\u{feff}'))
                 .with_context(|| format!("failed to parse arguments JSON for `{name}`"))?;
+            let arguments = chat::mcp_call_cli_arguments(&name, arguments)?;
             let value = chat::run_internal_mcp_call(&paths, &name, arguments, allow_mutation)?;
             println!("{}", serde_json::to_string(&value)?);
             Ok(())
@@ -938,8 +946,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             force_dev_binaries,
             force,
         }) => {
-            uninstall::reject_force(force.is_some())?;
-            uninstall(UninstallOptions {
+            let options = UninstallOptions {
                 yes,
                 dry_run,
                 keep_binaries,
@@ -947,7 +954,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 keep_data,
                 keep_cache,
                 force_dev_binaries,
-            })
+            };
+            uninstall::reject_force(force.is_some(), &options)?;
+            uninstall(options)
         }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();
@@ -1893,7 +1902,7 @@ pub(crate) mod tests {
         Ok(record)
     }
 
-    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// Everything [`plant_service_record`] writes *except* the owner-only endpoint
     /// key: the manifest, the log, and the engine state file.
     ///
     /// Split out for the launch-lock test below, which writes the key itself —

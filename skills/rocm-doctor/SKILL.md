@@ -139,14 +139,18 @@ passes — the GPU is AMD or no vendor was named.
 1. **Diagnose.** If the user named no GPU vendor, run `rocm examine --json`
    first. Status `no-amd-gpu` means the CLI found no AMD GPU. On WSL2 the status
    is `wsl` whatever the GPU, so read `has_amd_gpu` there: false means the same.
-   Either way, say so, ask which GPU the machine has, and propose no fix until
-   that is settled. That result alone does not prove the GPU is not AMD: a
+   Either way, say so and ask which GPU the machine has, as an open question:
+   "is it AMD?" invites a yes. End the reply on the question, with no
+   `rocm diagnose` run and no fix offered in it, because a diagnosis or plan
+   shown beside the question is a fix proposed before the question is settled.
+   That result alone does not prove the GPU is not AMD: a
    container without GPU passthrough, or the very failure being diagnosed, can
    hide it. If the user confirms AMD or cannot say, continue with `rocm diagnose`
-   below, which only reads; if the answer is NVIDIA, Intel or Apple, the scope
-   gate declines. Any other result: go on. If `rocm examine` itself fails (it
-   exits 0 whenever it ran, so a non-zero exit is an error from the CLI), relay
-   the error text and stop, as the contract check does.
+   below, which only reads, in the reply after the one that asked; if the
+   answer is NVIDIA, Intel or Apple, the scope gate declines. Any other result:
+   go on in the same reply. If `rocm examine` itself fails (it exits 0 whenever it ran, so a
+   non-zero exit is an error from the CLI), relay the error text and stop, as
+   the contract check does.
 
    Pass the user's error text as the symptom:
 
@@ -231,11 +235,11 @@ passes — the GPU is AMD or no vendor was named.
 
    ```
    rocm fix <fix-id>            # prompts before changing anything
-   rocm fix <fix-id> --dry-run  # show the exact change, touch nothing
+   rocm fix <fix-id> --dry-run  # show the exact change, touch nothing (see the Windows exit 4 below)
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   Only four fixes have a runner the CLI executes itself. The other 24 are
+   Only four fixes have a runner the CLI executes itself. The other 25 are
    **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm fix
    <id>` just prints the plan for the user to run themselves — no prompt, and the
    CLI never performs those. In a diagnosis, `fix.auto_applicable` is true only
@@ -259,6 +263,53 @@ passes — the GPU is AMD or no vendor was named.
      returns 0; there is no prompt, no `--dry-run` preview, and nothing is
      pinned. Once the user knows N, re-run with
      `rocm fix fix-9-igpu-dgpu --device-index N`.
+
+   If `rocm fix` exits 4, relay its stderr line and act on how it ends:
+
+   - `Could not read the current …; nothing was changed.` — on Windows,
+     `fix-2-unset-override`, `fix-6-path` and `fix-9-igpu-dgpu --device-index N`
+     read the variable they change before planning, and that read failed
+     (`--dry-run` included). Tell the user nothing was changed and relay the
+     cause the line states; once it is cleared (for example PowerShell starts
+     and answers in time), offer to re-run the same `rocm fix` command. Do not
+     present the printed catalog entry as a preview, and do not hand the user
+     its commands (such as `setx HIP_VISIBLE_DEVICES <dGPU-index>`) instead.
+   - `… NOT changed.` — the command ran and failed, or could not start.
+     Nothing was changed, unless the line says `exited 124` or `exited -1`
+     (see below).
+   - `… may or may not have changed. Check … then re-run …` — the command
+     timed out or was killed. Relay the check (on Windows, an expression to run
+     in PowerShell) and the `rocm fix` command to re-run; claim neither that
+     the fix was applied nor that nothing changed until the check has run.
+   - `Failed to write <file>: …` — the rc-file append failed; have the user
+     look at that file.
+
+   Some CLIs that pass the Phase 0 contract check are older than these lines
+   and report two cases differently. The second looks the same as a current
+   CLI's output, so it applies to every Windows fix-2 and fix-9 run:
+
+   - A `NOT changed` line saying `exited 124` (timed out) or `exited -1`
+     (killed by a signal) does not prove nothing changed: the change may or
+     may not have landed. Say so, have the user check (`id -nG <user>` for
+     `fix-4-render-group`; on Windows, in PowerShell,
+     `[Environment]::GetEnvironmentVariable('<VAR>','User')` with `<VAR>`
+     being `HSA_OVERRIDE_GFX_VERSION`, `PATH` or `HIP_VISIBLE_DEVICES` for
+     fix-2, fix-6 or fix-9), and offer to re-run the same `rocm fix` command
+     if it did not land.
+   - On Windows such a CLI takes a failed read for an unset variable, so a
+     clean result is not proof. `fix-2-unset-override` can say
+     `No persistent HSA_OVERRIDE_GFX_VERSION found` and that the user is done,
+     and exit 0, with the override still set in either scope;
+     `fix-9-igpu-dgpu --device-index N` can run `setx` over a value the user
+     set on purpose. So have the user run that PowerShell check. For fix-2,
+     run it before calling the fix done, with `'User'` and again with
+     `'Machine'`; blank output means unset. A User value means re-running
+     `rocm fix fix-2-unset-override`; a Machine value has to be cleared from
+     an elevated PowerShell with
+     `[Environment]::SetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION', $null, 'Machine')`.
+     For fix-9, run it before applying the fix; if a value is already set, do
+     not apply it, and tell the user to change that value by hand if they
+     want a different GPU, as the CLI itself says when its read works.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 
@@ -285,7 +336,7 @@ never name one of these apps. Use the list below.
 
 ## vLLM startup failures
 
-Two vLLM engine failures are in the catalog. Both are **print-only**: `rocm fix`
+Three vLLM engine failures are in the catalog. All three are **print-only**: `rocm fix`
 prints the plan and the user runs it. Say so first, in one short sentence at the
 start of the reply, before relaying a multi-step plan.
 
@@ -305,7 +356,21 @@ start of the reply, before relaying a multi-step plan.
   and have the user check the engine's torch version first, as the printed plan
   does, before the engine reinstall it ends with. It is not a group membership
   change, so do not suggest `render` or `video` group edits for it.
-- **Native Windows** gets no match from either entry, which is correct because
+- **An op missing from `torch.ops` at engine start** (`fix-23-vllm-extension-load`,
+  Linux and WSL2): `AttributeError: '_OpNamespace' '_C' object has no attribute
+  '...'`. One of vLLM's compiled extensions did not load, often because it needs
+  a newer glibc than the host has. Pass that error line **with its log context**,
+  or the command `rocm serve` printed; the warning `Failed to import from
+  vllm._...` that names the cause also matches. The context matters: every
+  PyTorch-ecosystem library with a `_C` extension raises the identical line, so
+  the entry needs the text to identify vLLM somewhere (the word `vllm`, the
+  `(EngineCore pid=...)` prefix the real line carries, or a vLLM extension name
+  such as `_rocm_C`). If a bare `AttributeError` line gets no match, ask for the
+  surrounding log lines rather than concluding there is nothing to find. Relay
+  the plan: it finds which extension fails and why, inside
+  `rocm engines shell vllm`. Do not suggest an engine reinstall, which
+  fetches the same wheel, or group edits.
+- **Native Windows** gets no match from any of them, which is correct because
   the vLLM engine does not run there. Do not route that user to an issue tracker.
   Relay what the CLI itself says for vLLM on native Windows (`rocm serve` and
   `rocm engines install vllm`): vLLM is not supported there, so use WSL or Linux,
@@ -317,7 +382,8 @@ start of the reply, before relaying a multi-step plan.
 
 - Never invent a fix. If `rocm diagnose` returns no match, route upstream.
 - Never run a mutating fix without the user's explicit OK; prefer `--dry-run`
-  first. New failure modes are added to the CLI catalog, not improvised here.
+  first (on Windows that dry run can itself exit 4 when its read fails; see
+  step 3). New failure modes are added to the CLI catalog, not improvised here.
 
 Read [reference.md](reference.md) when `rocm fix` exits non-zero (its exit codes
 are listed there), before telling the user which platforms a fix id applies to,

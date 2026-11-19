@@ -100,7 +100,14 @@ pub(super) fn draw_footer(
         // the label can't drift from what Esc actually does, matched once
         // here instead of as two separate (and negated) lookups.
         segs.push(Seg::Key("Esc", None));
-        if closes {
+        if closes && state.console_exit() == crate::ui::job_console::ConsoleExit::Confirmed {
+            // Still running under the one owner that asks before leaving (the
+            // serve wizard's launch console): Esc opens its detach-confirm
+            // modal, so the chip must not say "close" — it would name an
+            // immediate effect the key no longer has. Matches that console's
+            // own hint ("Esc leave (asks first)").
+            segs.push(Seg::Sep(" leave…  "));
+        } else if closes {
             // Still running — Esc fully closes the overlay (the job keeps
             // running in the background), matching the console's own footer
             // hint ("Esc close (keeps running)"), not the generic sub-popup
@@ -524,19 +531,18 @@ mod tests {
         // closes the overlay there (matching the console's own "Esc close
         // (keeps running)" footer hint), so the dashboard footer chip must say
         // "close", not the generic sub-popup "cancel".
-        use crate::ui::theme::Theme;
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
+        //
+        // Uses the update manager, not the serve wizard: the serve wizard is
+        // the one `ConsoleExit::Confirmed` owner and gets its own test below.
         use rocm_dash_core::state::StateEvent;
 
-        let theme = Theme::from_name("default-dark");
         let mut state = AppState::new("t".into(), "default-dark".into());
         state.jobs.apply(StateEvent::StartJob {
             id: "job".into(),
             cmd: "echo".into(),
             args: vec!["hi".into()],
         });
-        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+        state.update_manager = Some(crate::ui::update_manager::UpdateManagerState {
             active_job: Some("job".into()),
             ..Default::default()
         });
@@ -544,16 +550,7 @@ mod tests {
         assert!(!state.active_overlay_at_root());
         assert!(state.active_job_id().is_some());
 
-        let backend = TestBackend::new(90, 1);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            let _ = draw_footer(f, f.area(), &state, &theme);
-        })
-        .unwrap();
-
-        let row: String = (0..90)
-            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
-            .collect();
+        let row = footer_row(&state);
         // The `q` chip always says "close" while any overlay is open, root or
         // not, so an unscoped substring check here would pass even if the Esc
         // chip's own label were wrong — check the Esc chip specifically.
@@ -564,6 +561,57 @@ mod tests {
         assert!(
             !row.contains("Esc  cancel"),
             "job console Esc chip should not say cancel: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_does_not_say_close_for_the_serve_wizards_running_console() {
+        // The serve wizard turns Esc on a still-running launch into its
+        // detach-confirm modal, so "close" would name an effect the key no
+        // longer has. The chip must track `AppState::console_exit`, which is
+        // the same source the console's own hint reads.
+        use rocm_dash_core::state::StateEvent;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.console_exit(),
+            crate::ui::job_console::ConsoleExit::Confirmed
+        );
+
+        let row = footer_row(&state);
+        assert!(
+            row.contains("Esc  leave…"),
+            "serve-wizard running console Esc chip should advertise the \
+             confirmation: {row:?}"
+        );
+        assert!(
+            !row.contains("Esc  close"),
+            "the chip must not promise an immediate close: {row:?}"
+        );
+
+        // Once the launch is finished the wizard closes immediately again, so
+        // the generic labels come back.
+        state.jobs.apply(StateEvent::JobDone {
+            id: "job".into(),
+            code: 0,
+        });
+        assert_eq!(
+            state.console_exit(),
+            crate::ui::job_console::ConsoleExit::Immediate
+        );
+        let done = footer_row(&state);
+        assert!(
+            done.contains("Esc  dismiss") && !done.contains("Esc  leave…"),
+            "a finished launch is dismissed, not confirmed: {done:?}"
         );
     }
 

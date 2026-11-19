@@ -25,3 +25,7 @@ rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+
+[dev-dependencies]
+# The shared engine protocol contract check (`engine_contract`).
+rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol", features = ["test-support"] }
