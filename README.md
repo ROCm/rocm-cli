@@ -193,6 +193,39 @@ irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 As on Linux, this is the binary's channel only. The ROCm SDK channel is chosen
 separately with `rocm install sdk --channel`.
 
+### Try a pull request's build
+
+CI builds a bundle for each pull request that changes code, and the installers
+can install it by pull request number. The pull request's CI run shows the
+exact command on its summary page, under "Try this PR's build". This needs the
+[GitHub CLI](https://cli.github.com) signed in (`gh auth login`, or
+`GH_TOKEN` set), because GitHub only serves workflow artifacts to signed-in
+users.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- pr-1234
+```
+
+```powershell
+$env:ROCM_CLI_CHANNEL = "pr-1234"
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+Remove-Item Env:ROCM_CLI_CHANNEL
+```
+
+The installer installs the build of the pull request's latest commit and
+prints the commit and the CI run it came from, with the run's result. Whether
+a failed run still has a build depends on the platform: the Linux build is a
+separate job, so a failing test elsewhere in the run leaves it in place, but a
+failure in the lint or formatting checks that gate it leaves none, and the
+Windows build is packaged after that job's install lifecycle checks, so a
+failure there leaves none either. Builds are unsigned and unreviewed, so only the download's checksum is
+verified, and asking for a signature (`ROCM_CLI_REQUIRE_SIGNATURE=1`, or a
+signing key) fails instead of being skipped. They are kept for 7 days, so an
+older pull request needs a new push or a re-run. `ROCM_CLI_GITHUB_REPO` points
+the lookup at a fork. `ROCM_CLI_DOWNLOAD_BASE` cannot be combined with a pull
+request channel in either installer, nor can `ROCM_CLI_ARCHIVE` or
+`ROCM_CLI_DOWNLOAD_ONLY` in `install.sh`, the only one that has them.
+
 ### Verify the installation
 
 Open a new terminal so the updated `PATH` takes effect, then run:
@@ -2081,14 +2114,19 @@ do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
 Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
 exits with code 0. Any other answer cancels the same way, after a line saying
 that the answer was not understood and is treated as no. Use `--dry-run` to only
-list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
-is a separate opt-in for development builds. At a terminal, a dry run that finds
+list, and `--yes` to skip the confirmation. There is no `--force`: passing it is refused,
+ending with a `Try:` line that repeats your command with `--yes` in its place.
+`--force-dev-binaries` is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
 (its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
 with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
 nothing to remove. Outside an interactive terminal, when there is something to
-remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
+remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`;
+the refusal ends with a `Try:` line that is the same command with `--yes` added.
+Run either `Try:` line in the same environment as the refused command: it
+repeats the flags, not variables such as `HOME` or `ROCM_CLI_CONFIG_DIR` set in
+front of the command, and without them it removes the default folders.
 Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
