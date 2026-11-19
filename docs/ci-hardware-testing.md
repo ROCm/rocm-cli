@@ -504,7 +504,10 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 are not required for merging and so are skipped in the merge queue rather
 than left queued on limited runner capacity or hung at their cap after its PR
 has merged) when the workflow's own `changes` job's
-`serve` path filter is `true`. A new push to a pull request
+`serve` path filter is `true`. That job classifies paths
+through the [classify-changes](../.github/actions/classify-changes/action.yml)
+action that `ci.yml`'s `changes` job uses too, so both workflows read one
+definition of each category. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
@@ -559,7 +562,10 @@ that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — s
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
 filter is forced `true`, so the full matrix (minus MI300X and Strix Ubuntu
-in the merge queue) always runs there. Unlike the
+in the merge queue) always runs there. It is also forced `true` on a pull
+request that changes a file that neither a category of the action nor its
+`inert` list (files no gated job reads, such as the issue templates) names, so
+a new kind of file runs the matrix until it is classified. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
