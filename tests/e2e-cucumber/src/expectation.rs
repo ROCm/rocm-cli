@@ -775,6 +775,12 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
+                // A job reaching all eight of an MI300X host's GPUs. This is
+                // not the real MI300X lane, whose job has seen one KFD GPU
+                // node (docs/ci-hardware-testing.md, "GPU visibility on the
+                // hardware pool"), so a test resolving `ExpectPass` for a
+                // `@requires-multi-gpu` scenario here does not mean that lane
+                // runs it.
                 amd_gpu_count: Some(8),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
@@ -1531,7 +1537,7 @@ serve_timeout_secs = 90
             "requires-multi-gpu",
             "requires-os:linux",
         ]);
-        // MI300X has eight devices → the premise holds → the scenario runs.
+        // A job reaching eight devices holds the premise, so the scenario runs.
         assert_eq!(
             resolve(&d, &cap("mi300x"), &m, Included::default()),
             Expectation::ExpectPass

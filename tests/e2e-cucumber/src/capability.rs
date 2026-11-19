@@ -1285,7 +1285,7 @@ fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usiz
 }
 
 /// Count AMD GPU nodes in the KFD topology: the GPUs the kernel exposes to
-/// this process, which on a shared host can be fewer than the cards on its PCI
+/// this job, which on a shared host can be fewer than the cards on its PCI
 /// bus. `Some(0)` is an authoritative "no GPU"; `None` means `/dev/kfd` exists
 /// but its topology could not be read.
 #[cfg(target_os = "linux")]
