@@ -48,20 +48,23 @@ The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
 `GLIBCXX_3.4.32`, and OpenSSL 3.0.0 or newer (`libssl.so.3`): that is what the
 Lemonade engine is linked against. Every stable Lemonade release from 11.5.1
-through 2026.44.1, the one rocm-cli pins, needs those versions; the newest,
-2026.45.3, needs glibc 2.43 and OpenSSL 3.2.0, which is why it is not pinned.
-Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides glibc
-2.39, `GLIBCXX_3.4.33` and OpenSSL 3.0.13. On an older host,
-`rocm engines install lemonade` stops before downloading anything and says what
-falls short: the glibc version Lemonade needs and the newest the host's
-`libc.so.6` provides, or that
-the host has no `libssl.so.3`, the library of OpenSSL 3. That check reads glibc
-and OpenSSL only; `GLIBCXX_3.4.32` (libstdc++) is not checked. Where Lemonade is
-already installed, the same check refuses to reinstall it or start it, and says
-the installed copy was left as it is. The check reads the `ldconfig` cache, so a
-host that provides these libraries some other way (`LD_LIBRARY_PATH`, a Nix or
-Guix profile) can set `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`: the
-shortfall is then printed as a warning and Lemonade goes ahead.
+through 2026.44.1, the one ROCm CLI pins, needs those versions. Lemonade
+2026.45.3 needs glibc 2.43 and OpenSSL 3.2.0, which is why it is not pinned.
+Ubuntu 22.04 ships glibc 2.35 and cannot run the Lemonade engine; Ubuntu 24.04
+provides glibc 2.39, `GLIBCXX_3.4.33` and OpenSSL 3.0.13.
+
+On an older host, `rocm engines install lemonade` stops before downloading
+anything and says what falls short: the glibc version Lemonade needs and the
+newest the host's `libc.so.6` provides, or that the host has no `libssl.so.3`,
+the library of OpenSSL 3. That check reads glibc and OpenSSL only;
+`GLIBCXX_3.4.32` (libstdc++) is not checked. Where Lemonade is already
+installed, the same check refuses to reinstall it or start it, and says the
+installed copy was left as it is.
+
+The check reads the `ldconfig` cache. A host that provides these libraries some
+other way (`LD_LIBRARY_PATH`, a Nix or Guix profile) can set
+`ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK=1`: the shortfall is then printed
+as a warning and Lemonade goes ahead.
 
 > [!IMPORTANT]
 > **Tech Preview:** This software is provided as-is, without warranty or
@@ -144,15 +147,17 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum and
 its detached signature against the release public key pinned in the installer,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. On Linux, when fish is installed (`fish` is on
-`PATH`, or fish's config folder already exists), the installer also adds that
-directory to `PATH` in fish's `config.fish` and installs fish completions,
-including when the login shell is bash, zsh, or ksh. Fish's config folder is
-`$XDG_CONFIG_HOME/fish` when that variable is an absolute path, else
-`~/.config/fish`. A `completions/rocm.fish` that is already there and that the
-installer did not write (your own file, or a link) is left as it is: the
-installer prints a note that completions were not installed, and
-`rocm uninstall` leaves it too.
+directory to your shell `PATH`.
+
+On Linux, when fish is installed (`fish` is on `PATH`, or fish's config folder
+already exists), the installer also adds that directory to `PATH` in fish's
+`config.fish` and installs fish completions. It does this even when the login
+shell is bash, zsh, or ksh. Fish's config folder is `$XDG_CONFIG_HOME/fish`
+when that variable is an absolute path, else `~/.config/fish`. A
+`completions/rocm.fish` that is already there and that the installer did not
+write (your own file, or a link) is left as it is: the installer prints a note
+that completions were not installed, and `rocm uninstall` leaves it too.
+
 Setting `ROCM_CLI_UPDATE_SHELL_PATH=0` skips every shell profile, fish's and
 its completions included. Rerun the installer any time to upgrade.
 `rocm uninstall` removes the binaries and the fish completions the installer
@@ -412,28 +417,41 @@ Use `rocm dash --demo` for a synthetic session that runs
 anywhere without a GPU or daemon.
 
 On Linux and WSL, the embedded daemon also discovers loaded models from a
-separately running local Lemonade server at `127.0.0.1:13305`. Configure
-`dashboard.daemon.lemonade_host` and `dashboard.daemon.lemonade_port` in
-`config.json` for another endpoint, or set `dashboard.daemon.enable_lemonade`
-to `false` to disable external discovery. The file is `~/.rocm/config.json`, or
-`config.json` in the directory named by `ROCM_CLI_CONFIG_DIR`. Editing it is the
-only way to set these fields. Native Windows has no live dashboard telemetry, so it
-has no external discovery. A healthy server with no loaded models
-does not count as a running model. Discovery does not register an external server
-as a managed service or give ROCm CLI ownership of its process. External models
-are visible in Observe, but are excluded from the Services stop/restart controls.
+separately running local Lemonade server at `127.0.0.1:13305`. Native Windows
+has no live dashboard telemetry, so it has no external discovery.
+
+To use another endpoint, set `dashboard.daemon.lemonade_host` and
+`dashboard.daemon.lemonade_port` in `config.json`. To disable external
+discovery, set `dashboard.daemon.enable_lemonade` to `false`. The file is
+`~/.rocm/config.json`, or `config.json` in the directory named by
+`ROCM_CLI_CONFIG_DIR`. Editing it is the only way to set these fields.
+
+Discovery works as follows:
+
+- A healthy server with no loaded models does not count as a running model.
+- Discovery does not register an external server as a managed service or give
+  ROCm CLI ownership of its process.
+- External models are visible in Observe, but are excluded from the Services
+  stop/restart controls.
+
 The tok/s figure for a Lemonade model is the rate of the endpoint's most recent
 completed request, not live throughput: it stays the same while the server is
-idle. The dashboard explains it with a legend (`Lemonade: last req tok/s, not live`)
-under the Instances table and the Services overlay rows, and a `last req` prefix in
-the instance detail and the quick preview. Because it is not live, the node-wide
-totals (the tok/W and tok/s heroes on Home and Observe) and the per-instance tok/W
-leave it out, and the agent snapshot marks it with `gen_tps_last_request`. A managed Lemonade server that requires an API key stays listed with its
+idle. The dashboard explains it in two places:
+
+- A legend (`Lemonade: last req tok/s, not live`) under the Instances table and
+  the Services overlay rows.
+- A `last req` prefix in the instance detail and the quick preview.
+
+Because the figure is not live, the node-wide totals (the tok/W and tok/s heroes
+on Home and Observe) and the per-instance tok/W leave it out, and the agent
+snapshot marks it with `gen_tps_last_request`.
+
+A managed Lemonade server that requires an API key stays listed with its
 registry status and throughput unavailable; the dashboard never reads the key.
 
 The engine pane distinguishes a ROCm CLI-managed Lemonade installation from an
 externally running server. When installation detection is unavailable, it shows
-an unchecked status ("unknown, run `rocm engines list`") rather than claiming
+an unchecked status ("unknown, run `rocm engines list`") instead of claiming
 Lemonade is not installed. Installation status does not depend on GPU telemetry.
 It is read once, when the dashboard starts. After you install Lemonade from the
 Engines overlay, restart the dashboard to refresh it.
@@ -461,7 +479,7 @@ environment. Running `rocm install sdk` creates a managed runtime alongside any
 legacy install.
 
 Without `--version`, `rocm install sdk` installs the newest stable release
-(ROCm 10.1 today) from `stable.repo.amd.com`, and `--channel nightly` installs the
+from `stable.repo.amd.com`, and `--channel nightly` installs the
 newest nightly build from `nightly.repo.amd.com`. Earlier releases stay
 installable by pinning them: `--version 7.14.1` installs the ROCm 7.14.1 release,
 and `--channel nightly --build-date 2026-08-19` installs a nightly from before
@@ -471,8 +489,8 @@ raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
 
 On WSL, wheel runtime installs and updates (`rocm install sdk`,
 `rocm update --apply`) also link `librocdxg.so` to the runtime's own
-`librocdxg.so.1`, so the runtime searches its own copy rather than an older host
-`librocdxg` (it also replaces a dangling `librocdxg.so`); for a runtime
+`librocdxg.so.1`, so the runtime loads its own copy instead of an older host
+`librocdxg` (it also replaces a dangling `librocdxg.so`). For a runtime
 installed earlier, `rocm examine` prints a `wsl_runtime_librocdxg` line with the
 command that does the same (see
 [WSL](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md)).
@@ -543,16 +561,21 @@ for its ROCm build and compiled GPU architectures:
 On Windows, the human-readable summary also shows the AMD display driver's
 `driver_version` and `driver_date`, and a `driver_age` line. `driver_age`
 compares the driver date with the release of the first HIP SDK for Windows
-(27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for
-the Lemonade Vulkan backend, so this is a hint to look at the driver, not a
-statement that the driver is broken. The date is only a floor: it cannot judge
-newer GPUs such as gfx120X, gfx1150, and gfx1151, which might need newer drivers.
-`rocm diagnose` lists the same finding as
-`fix-22-display-driver-old` with a WEAK score. Its advice is AMD's support
-page and a restart after the install. The entry is advice about the host, not a
-cause of any reported symptom, so when nothing else matches, `rocm diagnose`
-still says where to file it upstream. rocm-cli never installs drivers on
-Windows. The Vulkan driver version is not shown.
+(27 July 2023).
+
+AMD publishes no minimum driver version for the HIP SDK or for the Lemonade
+Vulkan backend, so this is a hint to look at the driver, not a statement that
+the driver is broken. The date is only a floor: it cannot judge newer GPUs such
+as gfx120X, gfx1150, and gfx1151, which might need newer drivers.
+
+`rocm diagnose` lists the same finding as `fix-22-display-driver-old` with a
+WEAK score. Its advice is AMD's support page and a restart after the install.
+The entry is advice about the host, not a cause of any reported symptom, so
+when nothing else matches, `rocm diagnose` still says where to file it
+upstream.
+
+ROCm CLI never installs drivers on Windows. The Vulkan driver version is not
+shown.
 
 ### Diagnose and fix
 
@@ -581,12 +604,15 @@ position.
   standard input when PATH is `-`, so no quoting is needed (a file named `-`
   is passed as `./-`). It cannot be combined with `--symptom`. The text that
   arrives is matched as `--symptom` would match it, minus one trailing line
-  break. A UTF-8 byte-order mark is dropped and a UTF-16 file with a
-  byte-order mark (what Windows PowerShell's `>` writes) is decoded; anything
-  else must be UTF-8. A file that cannot be read, input that is not text, or
-  input larger than 16 MiB is a usage error (exit code 2). With nothing piped
-  in, paste the error at the terminal and end it with Ctrl-D at the start of
-  a line (Ctrl-Z then Enter on Windows).
+  break.
+
+  A UTF-8 byte-order mark is dropped, and a UTF-16 file with a byte-order mark
+  (what Windows PowerShell's `>` writes) is decoded; anything else must be
+  UTF-8. A file that cannot be read, input that is not text, or input larger
+  than 16 MiB is a usage error (exit code 2).
+
+  With nothing piped in, paste the error at the terminal and end it with Ctrl-D
+  at the start of a line (Ctrl-Z then Enter on Windows).
 
   ```bash
   # bash (Linux, WSL): the quoted 'EOF' keeps the shell out of the paste
@@ -607,16 +633,19 @@ position.
   :: cmd.exe: save the error to a file first
   rocm diagnose --symptom-file error.txt
   ```
+
 - With either flag, a finding about the examined host can still outrank the
-  entry the text added to, so each match says whether the text contributed to
-  its score or evidence: `symptom_matched` in `--json` (always present, `false`
-  when neither `--symptom` nor `--symptom-file` was given). Any keyword hit
-  counts, however weak, so `true` means the text contributed, not that the
-  match explains the error. In the human-readable output, a `source: the
-  examined host's state alone` line marks each shown match the text did not
-  contribute to, once the text contributed to any match in the report. That
-  includes one past `--top`, so all the rows shown can carry the line when the
-  only match the text contributed to was cut off.
+  entry the text added to. Each match therefore says whether the text
+  contributed to its score or evidence: `symptom_matched` in `--json` (always
+  present, `false` when neither `--symptom` nor `--symptom-file` was given).
+  Any keyword hit counts, however weak, so `true` means the text contributed,
+  not that the match explains the error.
+
+  In the human-readable output, a `source: the examined host's state alone`
+  line marks each shown match the text did not contribute to, once the text
+  contributed to any match in the report. That includes a match past `--top`,
+  so all the rows shown can carry the line when the only match the text
+  contributed to was cut off.
 - On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
   only whether it is there. The runtime in `System32` must be 14.40 or newer
   (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
@@ -666,15 +695,16 @@ generalized first:
 - The ROCm release and the inference engine's release are each cut back to a
   release, so a build number that would narrow toward one machine never
   appears there. The CLI's own version is the exception, because it names the
-  tool that wrote the report instead of something read off the machine. That
-  value is the version `rocm version` leads with (`X.Y.Z` for a release tag
-  `vX.Y.Z`, `0.0.0-dev` for any other resolved ref), without the ref and commit
-  hash that follow it there, since a local branch name is text from the
-  machine. A release tag's suffix may only use letters, digits, `.`, `-` and
-  `+`, and the version is at most 64 characters, so a release always reports
-  its version here. A tag outside that is not treated as a release, and the
-  release workflow refuses it. Anything else that reaches the report outside
-  those rules is reported as `unknown`.
+  tool that wrote the report instead of something read off the machine.
+
+  That value is the version `rocm version` leads with (`X.Y.Z` for a release
+  tag `vX.Y.Z`, `0.0.0-dev` for any other resolved ref), without the ref and
+  commit hash that follow it there, because a local branch name is text from
+  the machine. A release tag's suffix may only use letters, digits, `.`, `-`
+  and `+`, and the version is at most 64 characters, so a release always
+  reports its version here. A tag outside those rules is not treated as a
+  release, and the release workflow refuses it. Anything else that reaches the
+  report outside those rules is reported as `unknown`.
 - The distribution is checked against a list of known names instead of being
   repeated from the machine.
 
@@ -731,26 +761,33 @@ hardware, not something an install or a setting can put right.
   (`exit_codes`, name to number) and says what each means
   (`exit_code_descriptions`, name to text).
 
-Exit code 2 has two causes. It is `unknown_id`, a fix id the catalog does not
-have, refused with a stderr line starting `Unknown fix-id:`; and it is also what
-the argument parser returns for a malformed command line (an unknown option, a
-missing value, or a value it cannot read, such as a non-number for
-`--device-index`), refused with a stderr line starting `error:` instead. A
-one-time `rocm:` notice can come before either line. A script that needs to know
-which happened reads the message, not the code. A negative device index depends
-on how it is written: `--device-index=-1` is accepted by the parser and the fix
-refuses it with exit 3, while `--device-index -1` (with a space) is read as an
-unknown option `-1`, a usage error that exits 2.
+Exit code 2 has two causes:
+
+- `unknown_id`: a fix id the catalog does not have, refused with a stderr line
+  starting `Unknown fix-id:`.
+- A malformed command line (an unknown option, a missing value, or a value the
+  argument parser cannot read, such as a non-number for `--device-index`),
+  refused by the parser with a stderr line starting `error:`.
+
+A one-time `rocm:` notice can come before either line. A script that needs to
+know which happened reads the message, not the code.
+
+A negative device index depends on how it is written: `--device-index=-1` is
+accepted by the parser and the fix refuses it with exit 3, while
+`--device-index -1` (with a space) is read as an unknown option `-1`, a usage
+error that exits 2.
 
 A fix that runs a command and fails exits 4 and says why on stderr. That
 includes a command that does not finish within its time limit (one minute):
-the CLI stops it and exits 4, but the change may have been made in part or may
+the CLI stops it and exits 4. The change might have been made in part or might
 still finish, so the message says how to check it (on Windows, an expression
 to run in PowerShell) and names the `rocm fix` command to re-run if it was not
-made. On Windows, when one of those three fixes cannot read the current value
-of the variable it changes, it stops before changing anything, also with exit 4;
-under `--dry-run` it stops the same way, before showing the change it would
-make.
+made.
+
+On Windows, when `fix-2-unset-override`, `fix-6-path` or
+`fix-9-igpu-dgpu --device-index N` cannot read the current value of the
+variable it changes, it stops before changing anything, also with exit 4. Under
+`--dry-run` it stops the same way, before showing the change it would make.
 
 ### ROCm installation
 
@@ -862,29 +899,32 @@ keeps the Python the runtime was installed with.
 
 `--python-version` applies to ROCm 10 and newer wheel installs only. A ROCm 7
 install is built for Python 3.12 and refuses any other. A Python that doesn't
-match the install is refused rather than used, so `ROCM_CLI_PYTHON` (an
+match the install is refused instead of used, so `ROCM_CLI_PYTHON` (an
 interpreter of your own) and `ROCM_CLI_MANAGED_PYTHON_VERSION` (the version
 ROCm CLI prepares itself) must name a Python the install accepts.
 
 If you see Python 3.14 without asking for it, the install resolved to ROCm 10
 or newer. That happens with `--version 10.x.y`, and also with no `--version` at
-all, since the newest build of both channels is ROCm 10 or newer. The install
+all, because the newest build of both channels is ROCm 10 or newer. The install
 prints which Python it chose, and `--dry-run` shows it without changing anything.
 
 #### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout than ROCm 7: stable
 releases from `stable.repo.amd.com` and nightlies from `nightly.repo.amd.com`.
-That is the layout an install reads unless it asks for something older. A stable
-pin of ROCm 10 or newer, a nightly pinned to a build date of 2026-08-23 or later,
-and an install with no pin at all all read it. The earlier release stream
-(`repo.amd.com`) and the earlier nightly stream (`rocm.nightlies.amd.com`), which
-stopped receiving builds on 2026-08-22, are read only when you pin something that
-exists only there: a ROCm 7 release, or a nightly from before 2026-08-23. These
-versions select their device payload by exact GPU architecture, so when ROCm CLI can't
-resolve one for this computer (it detects only a family of GPUs, or none), or you
-want to target a different GPU, also pass `--family` with the raw `gfx` code
-instead of a family label:
+That is the layout an install reads unless it asks for something older. The
+installs that read it are a stable pin of ROCm 10 or newer, a nightly pinned to
+a build date of 2026-08-23 or later, and an install with no pin at all.
+
+The earlier release stream (`repo.amd.com`) and the earlier nightly stream
+(`rocm.nightlies.amd.com`), which stopped receiving builds on 2026-08-22, are
+read only when you pin something that exists only there: a ROCm 7 release, or a
+nightly from before 2026-08-23.
+
+ROCm 10 and newer select their device payload by exact GPU architecture. When
+ROCm CLI can't resolve one for this computer (it detects only a family of GPUs,
+or none), or you want to target a different GPU, also pass `--family` with the
+raw `gfx` code instead of a family label:
 
 ```
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
@@ -916,16 +956,21 @@ A tarball catalog can be pinned only in this layout, so `--format tarball
 --version 7.14.1` is refused and points to `--format wheel`, which can.
 
 For ROCm 10, `install sdk` pins torchaudio itself, because its metadata names no
-ROCm build. When a torchaudio release has been verified on hardware for the
-requested ROCm line (the exact torchaudio the vLLM ROCm 10.x install pins for
-that line, where it pins one instead of a series), it pins that build.
-Otherwise, or when that build isn't published for the requested ROCm version on
-this Python and platform, it pins the newest build published for that ROCm
-version. The `torchaudio_selection:` line in the plan says that build isn't
-hardware-verified, as a `Note:` in a real install's log does. Newest isn't
-always right: the index has published a CPU-only torchaudio under the same
-`+rocm` label as working builds. The install stops with an error when the
-requested version publishes no torchaudio for this Python and platform.
+ROCm build. It picks the build in this order:
+
+- When a torchaudio release has been verified on hardware for the requested
+  ROCm line, it pins that build. This is the exact torchaudio the vLLM ROCm 10.x
+  install pins for that line, where it pins one instead of a series.
+- Otherwise, or when that build isn't published for the requested ROCm version
+  on this Python and platform, it pins the newest build published for that ROCm
+  version.
+- When the requested version publishes no torchaudio for this Python and
+  platform, the install stops with an error.
+
+When it pins the newest build, the `torchaudio_selection:` line in the plan says
+that build isn't hardware-verified, as a `Note:` in a real install's log does.
+Newest isn't always right: the index has published a CPU-only torchaudio under
+the same `+rocm` label as working builds.
 
 It then asks `uv` to resolve Torch and torchvision from their published
 dependency metadata alongside the pinned torchaudio. For a ROCm line the vLLM
@@ -1018,24 +1063,33 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 
 `list` shows each runtime's version (with its build date when the version
 encodes one), GPU family, mode, and whether it carries the compiler toolchain
-(`toolchain=included|excluded`). A `provenance:` line under each runtime names
-where it came from: its `channel`, the package `source` it was installed from
-(the wheel index, or the downloaded archive for a tarball install), its
-`source_layout_generation`, and the exact `device_target` its packages were
-installed for. The values are the ones the runtime's manifest recorded: the
-package index, else the artifact URL; the layout field, else the wheel
-composition's; the recorded target, else the `device-<target>` extra in the
-package specs. For the layout and target that is the same recorded field
-`rocm update` uses; the listing then trims the value and prints a blank one as
-`unrecorded`, as it does a fact recorded nowhere. Nothing is guessed from other
-facts (the target is never the family) — so a tarball or family-wide install
-shows `device_target=unrecorded`, and an adopted runtime, which installed
-nothing, shows `source=unrecorded`. An adopted runtime's channel is the one adoption
-recorded: the channel `--channel` or `--runtime-id` named, `release` when neither
-names one.
+(`toolchain=included|excluded`).
+
+A `provenance:` line under each runtime names where it came from:
+
+- `channel`: the runtime's channel. An adopted runtime's channel is
+  the one adoption recorded: the channel `--channel` or `--runtime-id` named, or
+  `release` when neither names one.
+- `source`: the package source it was installed from, which is the wheel index,
+  or the downloaded archive for a tarball install (the recorded package index,
+  else the artifact URL). An adopted runtime installed nothing, so it shows
+  `source=unrecorded`.
+- `source_layout_generation`: the recorded layout field, else the wheel
+  composition's.
+- `device_target`: the exact target its packages were installed for (the
+  recorded target, else the `device-<target>` extra in the package specs). A
+  tarball or family-wide install shows `device_target=unrecorded`.
+
+The values are the ones the runtime's manifest recorded, and nothing is guessed
+from other facts: the target is never the family. A fact recorded nowhere prints
+as `unrecorded`. For the layout and target, the value is the same recorded field
+`rocm update` uses; the listing trims it and also prints a blank one as
+`unrecorded`.
+
 `rocm examine` reports the same four facts for the active runtime as
 `active_runtime_channel`, `active_runtime_source`,
 `active_runtime_source_layout_generation` and `active_runtime_device_target`.
+
 Runtimes are told apart by the packages they were installed from, not by
 version alone, so one version can appear more than once: a `--devel` install
 and a plain one of the same version are two separate runtimes, as are two
@@ -1163,24 +1217,28 @@ followed. The two archive rows the report prints are tagged
 The report also lists `Engine installs`: each Lemonade copy on disk and its
 size. Lemonade installs into the active ROCm runtime's own folder when one is
 active and into the data folder otherwise, so a machine that installed
-Lemonade before its first SDK can hold two full copies (about 25 GiB each). The
-copy Lemonade runs from is `in use`. A copy it is not using right now is marked
-`not used right now`, which is not a promise it stays unused: Lemonade installs
-into the active ROCm runtime's folder, so a copy inside a ROCm install is reused
-as soon as that install becomes active, and is never marked reclaimable. Only
-the data folder's copy, which no ROCm install owns, is marked reclaimable, and
-nothing removes it automatically: delete its `runtime`, `downloads` and `extract`
-folders to free the space. A copy is only called unused when Lemonade's install
-record points at another copy that is really there: if the record names a folder
-with no install, or cannot be read, the report says so and marks no copy
-reclaimable. A copy inside a runtime folder
-also counts toward that runtime's size. `rocm runtimes uninstall` removes it
-with the runtime and clears Lemonade's install record, so Lemonade is no longer
-recorded as installed; it says so when the record could not be cleared, and when
-it could not be read it names `rocm engines install lemonade`, which rewrites
-the record and keeps a current install.
-For an external or imported runtime, uninstall only unregisters it, so its
-Lemonade copy stays and the report does not say otherwise.
+Lemonade before its first SDK can hold two full copies (about 25 GiB each).
+
+The copy Lemonade runs from is `in use`. A copy it is not using right now is
+marked `not used right now`, which is not a promise it stays unused. Because
+Lemonade installs into the active ROCm runtime's folder, a copy inside a ROCm
+install is reused as soon as that install becomes active, and is never marked
+reclaimable. Only the data folder's copy, which no ROCm install owns, is marked
+reclaimable. Nothing removes it automatically: delete its `runtime`,
+`downloads` and `extract` folders to free the space.
+
+A copy is only called unused when Lemonade's install record points at another
+copy that is really there. If the record names a folder with no install, or
+cannot be read, the report says so and marks no copy reclaimable.
+
+A copy inside a runtime folder also counts toward that runtime's size.
+`rocm runtimes uninstall` removes it with the runtime and clears Lemonade's
+install record, so Lemonade is no longer recorded as installed. The uninstall
+says so when the record could not be cleared. When the record could not be
+read, it names `rocm engines install lemonade`, which rewrites the record and
+keeps a current install. For an external or imported runtime, uninstall only
+unregisters it, so its Lemonade copy stays and the report does not say
+otherwise.
 
 The report also lists `local server records`: one JSON record plus the engine's
 log for each `rocm serve --managed` launch, kept after the server stops.
@@ -1211,17 +1269,22 @@ and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
-Before Lemonade writes a new install, whether from `rocm engines install
-lemonade` or the first `rocm serve` that needs it, it prints the folder it is
-installing into, the download (up to about 4.4 GiB) and disk use (up to about
-25 GiB) of its llama.cpp ROCm backend, and any Lemonade install it is not
-reusing. Those are upper bounds: Lemonade picks the backend after the install
-starts, and a smaller one needs less. So it stops before downloading only when
-the drive cannot hold Lemonade itself (about 16 MiB), and with less room than
-the ROCm backend or the finished install it warns and continues. An install that
-replaces the existing one (`--reinstall`, or a new Lemonade version) deletes it
-first, so its space counts as free and the notice says so. On Windows the
-backend download's own progress appears in the console.
+Before Lemonade writes a new install, whether from
+`rocm engines install lemonade` or the first `rocm serve` that needs it, it
+prints:
+
+- The folder it is installing into
+- The download (up to about 4.4 GiB) and disk use (up to about 25 GiB) of its
+  llama.cpp ROCm backend
+- Any Lemonade install it is not reusing
+
+The backend figures are upper bounds: Lemonade picks the backend after the
+install starts, and a smaller one needs less. So it stops before downloading
+only when the drive cannot hold Lemonade itself (about 16 MiB). With less room
+than the ROCm backend or the finished install, it warns and continues. An
+install that replaces the existing one (`--reinstall`, or a new Lemonade
+version) deletes it first, so its space counts as free and the notice says so.
+On Windows the backend download's own progress appears in the console.
 
 `--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
 libnuma), including a `sudo` password prompt. `engines install` never asks for
@@ -1261,28 +1324,35 @@ advance how it will go.
 
 #### A GGUF model outside the catalog
 
-Pass a local `.gguf` path, or `owner/repo:QUANT` for a file on Hugging Face
-(for example `owner/repo:Q4_K_M`, or an exact file name ending in `.gguf`, with
-its directory when the file is in one and another file shares its name:
-`owner/repo:dir/model-Q4_K_M.gguf`; a bare name means the file at the top of the
-repository when there is one). On Hugging Face, a multimodal projector (an `mmproj`
-file shipped beside a vision model) is never picked as the model, and naming one
-by its file name is answered as such, with the repository's model files named
-instead. A local projector file is not recognised as one; it is read like any
-other GGUF. A file that
-exists on this machine is read as that file even when its name looks like
-`owner/repo:QUANT`. A bare
-`owner/repo`, with no quantization, names a repository rather than a file and
-is answered like any other model outside the catalog: undetermined, with
-nothing read.
+Pass a local `.gguf` path, or `owner/repo:QUANT` for a file on Hugging Face.
+After the colon, give a quantization such as `owner/repo:Q4_K_M`, or an exact
+file name ending in `.gguf`. Include the file's directory when the file is in
+one and another file shares its name: `owner/repo:dir/model-Q4_K_M.gguf`. A
+bare name means the file at the top of the repository when there is one.
+
+Some references are handled specially:
+
+- On Hugging Face, a multimodal projector (an `mmproj` file shipped beside a
+  vision model) is never picked as the model. Naming one by its file name is
+  answered as such, with the repository's model files named instead. A local
+  projector file is not recognized as one; it is read like any other GGUF.
+- A file that exists on this machine is read as that file even when its name
+  looks like `owner/repo:QUANT`.
+- A bare `owner/repo`, with no quantization, names a repository instead of a
+  file and is answered like any other model outside the catalog: undetermined,
+  with nothing read.
+
 Instead of a recipe's minimum, `diagnose` reads the file's header, which holds
-the layer count, the KV head count and head width, and the tensor shapes. For
-a remote file that is one listing request for the repository (up to 16 MiB, to
+the layer count, the KV head count and head width, and the tensor shapes. For a
+remote file that is one listing request for the repository (up to 16 MiB, to
 find the file and its size), a `HEAD` request for a file the listing does not
-size, then a few megabytes fetched by HTTP range request (set
-`HF_ENDPOINT` to use a mirror); the weights are never downloaded. A remote read
-has two minutes in all, so on a slow link it can take that long to fail. No
-token is sent, so a gated or private repository cannot be read.
+size, then a few megabytes fetched by HTTP range request. The weights are never
+downloaded.
+
+Set `HF_ENDPOINT` to use a mirror. A remote read has two minutes in all, so on
+a slow link it can take that long to fail. No token is sent, so a gated or
+private repository cannot be read.
+
 It then estimates weights, plus the KV cache at `--context-size` (default 4096)
 and `--kv-cache-type` (default `f16`), plus a compute buffer and a runtime
 reserve, against this GPU's dedicated VRAM:
@@ -1291,69 +1361,88 @@ reserve, against this GPU's dedicated VRAM:
 rocm diagnose --model owner/repo:Q4_K_M --context-size 32768 --kv-cache-type q8_0
 ```
 
-The answer is labelled `ESTIMATED: fits at N tokens` or `ESTIMATED: does not
-fit at N tokens`, never `ready` or `blocked`: in `--json` the `verdict` stays
-`undetermined` and the figures are under `model.estimate`. It reports the
-largest context that fits with that KV cache type. When the file does not fit
-at the size you asked for, it lists what would make it fit: a smaller context,
-a q8_0 or q4_0 KV cache (llama.cpp needs flash attention for a quantized V
-cache, and the estimate assumes it is on), a smaller quantization, or keeping
-some layers on the CPU. Those are llama.cpp options (`--ctx-size`, `--cache-type-k`/`-v`,
+The answer is labeled `ESTIMATED: fits at N tokens` or
+`ESTIMATED: does not fit at N tokens`, never `ready` or `blocked`: in `--json`
+the `verdict` stays `undetermined` and the figures are under `model.estimate`.
+It reports the largest context that fits with that KV cache type.
+
+When the file does not fit at the size you asked for, it lists what would make
+it fit:
+
+- A smaller context
+- A q8_0 or q4_0 KV cache (llama.cpp needs flash attention for a quantized V
+  cache, and the estimate assumes it is on)
+- A smaller quantization
+- Keeping some layers on the CPU
+
+Those are llama.cpp options (`--ctx-size`, `--cache-type-k`/`-v`,
 `--n-gpu-layers`): **`rocm serve` does not take a context size, KV cache type
 or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
 
-The KV cache is exact for a plain full-attention model, and the weights are the
-file's own size from its tensor offsets, less the input embedding, which
-llama.cpp keeps in host memory -- except for a model with tied embeddings (no
-separate output layer), where llama.cpp uses the same tensor for the output
-layer on the GPU, so there it is counted. That case was not measured, and
-counting it can only overstate the figure. Only the compute buffer and the
-runtime reserve are allowances, calibrated against real loads of two dense
-full-attention models on one MI300X with llama.cpp b9752, flash attention on:
-a Llama-3.1-8B-shaped and a Qwen2.5-1.5B-shaped GGUF, each with its own output
-layer.
-No mixture-of-experts, state-space, hybrid or sliding-window model was among
-them. How close the estimate came to those
-loads, and why that describes the fit rather than a bound, is written down once,
-in the
+The estimate is built from these parts:
+
+- **KV cache:** exact for a plain full-attention model.
+- **Weights:** the file's own size from its tensor offsets, less the input
+  embedding, which llama.cpp keeps in host memory. The exception is a model
+  with tied embeddings (no separate output layer): llama.cpp uses the same
+  tensor for the output layer on the GPU, so there it is counted. That case
+  was not measured, and counting it can only overstate the figure.
+- **Compute buffer and runtime reserve:** the only allowances. They are
+  calibrated against real loads of two dense full-attention models on one
+  MI300X with llama.cpp b9752, flash attention on: a Llama-3.1-8B-shaped and a
+  Qwen2.5-1.5B-shaped GGUF, each with its own output layer. No
+  mixture-of-experts, state-space, hybrid or sliding-window model was among
+  them.
+
+How close the estimate came to those loads, and why that describes the fit
+instead of a bound, is written down once, in the
 [`gguf_fit` module documentation](https://github.com/ROCm/rocm-cli/blob/main/crates/rocm-core/src/gguf_fit.rs).
-A model with sliding-window, state-space or mixture-of-experts layers was not
-measured. A sliding-window model's KV cache is sized as if every layer attended
-over the whole context, which can only overstate it, so it still gets a verdict.
-A state-space or hybrid model's recurrent state is not counted, and a
-mixture-of-experts model's compute buffer was not measured, so for those the
-figures are shown with this GPU's memory but with no fits / does-not-fit verdict
-(`cannot_estimate`, reason `unmeasured_layout`): a "fits" that is too low would
-be worse than no answer. Many current open models are mixture-of-experts or
-hybrid, so for a large share of them this gives the memory figures and leaves
-the comparison to the reader. A header without the feed-forward or embedding width,
-which size the compute buffer, is treated the same way (reason
-`missing_metadata`, with the figures). Another
-GPU, engine build or batch size can miss by more, so leave headroom. The figures
-are compared with the total dedicated VRAM of the GPU with the most of it that
-ROCm can see, the same figure a curated model's minimum is compared with, not
-with what other processes have left free. When a device-visibility variable
-(`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) is set on
-a host whose GPUs differ in memory, the report says that the mapping between the
-mask and `amd-smi`'s numbering has not been verified on such a host, so the
-figure may be for a different card; that mapping has not been checked on a
-multi-GPU machine. Where memory cannot be read, the memory the model needs is
-shown and nothing is compared. The memory figures are whole MiB, each rounded
-up, and the verdict is decided on their sum, so what is printed always adds up.
-The largest context is also capped at the context length the model was trained
-for. `--context-size` takes 1 to 16777216 tokens. Passing `--context-size` or
-`--kv-cache-type` for a curated model changes nothing, because a recipe's memory
-minimum is fixed; the report says so. Under `--report` the model is not assessed
-at all, so nothing is fetched for it, and `--context-size` and `--kv-cache-type`
-are ignored along with `--model`; a note on stderr names the flags that were
-ignored.
+Another GPU, engine build or batch size can miss by more, so leave headroom.
+
+A sliding-window model still gets a verdict: its KV cache is sized as if every
+layer attended over the whole context, which can only overstate it. The
+following get the figures, shown with this GPU's memory, but no fits /
+does-not-fit verdict (`cannot_estimate`), because a "fits" that is too low
+would be worse than no answer:
+
+- A state-space or hybrid model, whose recurrent state is not counted, and a
+  mixture-of-experts model, whose compute buffer was not measured (reason
+  `unmeasured_layout`). Many current open models are mixture-of-experts or
+  hybrid, so for a large share of them this gives the memory figures and leaves
+  the comparison to the reader.
+- A header without the feed-forward or embedding width, which size the compute
+  buffer (reason `missing_metadata`).
+
+The figures are compared with the total dedicated VRAM of the GPU with the most
+of it that ROCm can see, the same figure a curated model's minimum is compared
+with, not with what other processes have left free. Where memory cannot be
+read, the memory the model needs is shown and nothing is compared.
+
+When a device-visibility variable (`HIP_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) is set on a host whose GPUs
+differ in memory, the figure may be for a different card. The mapping between
+the mask and `amd-smi`'s numbering has not been checked on a multi-GPU machine,
+and the report says so.
+
+The memory figures are whole MiB, each rounded up, and the verdict is decided on
+their sum, so what is printed always adds up. The largest context is also
+capped at the context length the model was trained for.
+
+How the flags apply:
+
+- `--context-size` takes 1 to 16777216 tokens.
+- Passing `--context-size` or `--kv-cache-type` for a curated model changes
+  nothing, because a recipe's memory minimum is fixed; the report says so.
+- Under `--report` the model is not assessed at all, so nothing is fetched for
+  it, and `--context-size` and `--kv-cache-type` are ignored along with
+  `--model`. A note on stderr names the flags that were ignored.
 
 On an integrated GPU (APU), where the CLI can't read the memory
 pool the engine uses, and on a host with no GPU or an unreadable one, the
 answer stays `undetermined` but still shows what the file needs. Layouts the
 formula does not describe (a file that is one shard of a split model, latent
-attention, a model with no attention layers) are reported as such rather than
-estimated.
+attention, a model with no attention layers) are reported as such instead of
+being estimated.
 
 ### Curated models
 
@@ -1392,29 +1481,41 @@ rocm serve <model> [--engine lemonade|vllm|aim]
 ```
 
 Alongside the OpenAI-compatible endpoint, a served model gets an
-Anthropic-compatible `/v1/messages` endpoint, shown as `anthropic endpoint:` in
-`rocm services list` and in the interactive `rocm serve` summary (a fresh launch
-waits briefly for it; if it is not there yet, check `rocm services list`). It is
-a text-and-tools endpoint that answers both plain and `stream: true` requests. It is a base URL: point an
-Anthropic client at it (`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key,
-if the service has one, as `x-api-key` (the translation front also accepts a
-bearer token). `rocm` runs a
-translation front on its own port, inside the serving process, so it starts and
-stops with the service; it fronts the engine even when the engine has its own
-`/v1/messages` route, because that route only accepts the served model's name. Whatever model name the client sends, the served model
-answers, and the reply names it. The translation covers text turns, system
-prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences`,
-and tool use: `tools` and `tool_choice` (including `disable_parallel_tool_use`),
-`tool_use` and `tool_result` blocks in the conversation, and `tool_use` blocks
-with the `tool_use` stop reason in the reply. Whether the model calls a tool
-depends on the engine: vLLM needs `--tool-call-parser <name>` (and auto tool choice) for any
-`tool_choice` (`any` and a named tool included), and answers a request that names a
-tool with a 400 without one. A streaming request is answered with Anthropic server-sent events built from the
-engine's streamed chunks, but streaming a request that defines `tools` is refused. Extended thinking, server tools (web search and
-the like) and image or other non-text content blocks are refused with
-an Anthropic `invalid_request_error` rather than ignored. `rocm services list`
-marks the endpoint `(not responding)` when a ready service's endpoint does not
-answer.
+Anthropic-compatible `/v1/messages` endpoint. It is shown as
+`anthropic endpoint:` in `rocm services list` and in the interactive
+`rocm serve` summary (a fresh launch waits briefly for it; if it is not there
+yet, check `rocm services list`). `rocm services list` marks the endpoint
+`(not responding)` when a ready service's endpoint does not answer.
+
+It is a text-and-tools endpoint that answers both plain and `stream: true`
+requests. It is a base URL: point an Anthropic client at it
+(`ANTHROPIC_BASE_URL=<url>`) and send your endpoint key, if the service has
+one, as `x-api-key` (the translation front also accepts a bearer token).
+
+`rocm` runs a translation front on its own port, inside the serving process, so
+it starts and stops with the service. It fronts the engine even when the engine
+has its own `/v1/messages` route, because that route only accepts the served
+model's name. Whatever model name the client sends, the served model answers,
+and the reply names it.
+
+The translation covers:
+
+- Text turns, system prompts, `max_tokens`, `temperature`, `top_p`, `top_k` and
+  `stop_sequences`
+- Tool use: `tools` and `tool_choice` (including `disable_parallel_tool_use`),
+  `tool_use` and `tool_result` blocks in the conversation, and `tool_use`
+  blocks with the `tool_use` stop reason in the reply
+
+Whether the model calls a tool depends on the engine. vLLM needs
+`--tool-call-parser <name>` (and auto tool choice) for any `tool_choice` (`any`
+and a named tool included); without one, it answers a request that names a
+tool with a 400.
+
+A streaming request is answered with Anthropic server-sent events built from
+the engine's streamed chunks, but streaming a request that defines `tools` is
+refused. Extended thinking, server tools (web search and the like), and image
+or other non-text content blocks are refused with an Anthropic
+`invalid_request_error` instead of being ignored.
 
 `--engine aim` runs the model in a Docker container instead of a host
 process; it requires a reachable Docker daemon and is Linux/WSL2 only.
@@ -1480,14 +1581,16 @@ process table.
 
 With the vLLM engine, an endpoint bound to a public interface
 (`--allow-public-bind`), or served with `--require-api-key`, answers only
-clients that present its API key as an `Authorization: Bearer` header, on every
-route the server answers, not just the OpenAI `/v1` API — including vLLM's own
-`/invocations`, `/tokenize` and `/metrics` — except `GET`/`HEAD /health` and
-CORS preflights: the `/health` liveness check stays open. The AIM engine runs
-the same vLLM server inside its container but does not install this check, so
-a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
-leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
-without the key.
+clients that present its API key as an `Authorization: Bearer` header. That
+holds on every route the server answers, not just the OpenAI `/v1` API,
+including vLLM's own `/invocations`, `/tokenize` and `/metrics`. The exceptions
+are `GET`/`HEAD /health` and CORS preflights: the `/health` liveness check
+stays open.
+
+The AIM engine runs the same vLLM server inside its container but does not
+install this check, so a key-protected AIM endpoint has only vLLM's own
+`VLLM_API_KEY` check, which leaves routes such as `/invocations`, `/tokenize`
+and `/metrics` answering without the key.
 
 Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
 key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
@@ -1525,17 +1628,18 @@ the running service, or stop it first to serve on the new port.
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). On an
-interactive terminal, if the smoke test cannot complete, the summary is headed
-`(smoke test failed)`, shows the status as `started, smoke test failed` instead
-of `ready`, and a note gives the reason and points at
+quick smoke test (time to first token and approximate tokens per second).
+Control returns to your shell with the server still running; manage it later
+with `rocm services` (below).
+
+On an interactive terminal, if the smoke test cannot complete, the summary is
+headed `(smoke test failed)`, shows the status as `started, smoke test failed`
+instead of `ready`, and a note gives the reason and points at
 `rocm logs --service <id>`. ROCm CLI does not stop the server, and the command
 still exits 0. Which failures are detected, and which still read as `ready`, is
 listed under
 [Serve Smoke Test Failure](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md#serve-smoke-test-failure)
-in the testing guide. Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+in the testing guide.
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1576,15 +1680,18 @@ engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models. Pass a GGUF repo
 with an explicit quantization variant, for example,
 `rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. Lemonade also accepts
 registered GGUF names such as `Qwen3-0.6B-GGUF`, or the `qwen-smoke` alias.
+
 On Linux, direct serving resolves simple single-GGUF entries from the installed
 Lemonade catalog. Entries needing additional files or model-specific options,
-well-formed entries of an unrecognized shape, and registered names on Windows use
-Lemonade's router instead. That includes a registered checkpoint that is not a
-plain `owner/repo:variant`, such as one whose variant is `*`. Explicit `owner/repo:variant` references require the selected GPU
-llama-server backend. Direct serving uses that backend, including Vulkan when
-supported; it does not select a stale ROCm binary merely because it is on disk.
-When Lemonade selects a GPU backend other than ROCm, such as Vulkan, serving names
-that backend instead of presenting it as ROCm. Neither route silently substitutes
+well-formed entries of an unrecognized shape, and registered names on Windows
+use Lemonade's router instead. That includes a registered checkpoint that is not
+a plain `owner/repo:variant`, such as one whose variant is `*`.
+
+Explicit `owner/repo:variant` references require the selected GPU llama-server
+backend. Direct serving uses that backend, including Vulkan when supported; it
+does not select a stale ROCm binary merely because it is on disk. When Lemonade
+selects a GPU backend other than ROCm, such as Vulkan, serving names that
+backend instead of presenting it as ROCm. Neither route silently substitutes
 the default model.
 
 On Linux, if Lemonade's router fails to load or verify a registered model, `rocm
@@ -1797,17 +1904,24 @@ rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 `stop` reports a server stopped only once every recorded process is confirmed
 gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
 stderr and exits with an error. It keeps the record, which still names the
-processes, and any endpoint key, which the server might still be enforcing. It
-names each process that, or a process under it, did not exit after it was
-signaled. On Windows it also names a process that did exit (or was already gone)
-when taking the processes under it down did not complete, or found nothing and
-no other recorded process is confirmed gone, because one of them may still be
-running. For a process it could not verify as the server's (its recorded
-start-time can no longer be read back, or, on Windows, `rocm` cannot query it at
-all), it signals nothing and names an operating-system command to check on it.
-It does not suggest running the stop again: when only a process under the
-recorded one survived, a second stop can report the server stopped while that
-process still runs.
+processes, and any endpoint key, which the server might still be enforcing.
+
+It names each process that, or a process under it, did not exit after it was
+signaled. On Windows it also names a process that did exit (or was already
+gone) when taking the processes under it down:
+
+- Did not complete
+- Found nothing, and no other recorded process is confirmed gone
+
+It names it because, in either case, one of the processes under it might
+still be running.
+
+For a process it could not verify as the server's (its recorded start-time can
+no longer be read back, or, on Windows, `rocm` cannot query it at all), it
+signals nothing and names an operating-system command to check on it. It does
+not suggest running the stop again: when only a process under the recorded one
+survived, a second stop can report the server stopped while that process still
+runs.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts
@@ -1823,16 +1937,19 @@ bound by another process, it refuses and the service stays stopped
 `rocm services restart <id> --yes` to run once that launch finishes.
 
 `remove` deletes one record that is no longer running, together with its log,
-its engine state file, its endpoint key file and any copy of that key an
-interrupted save left behind; a running server is refused,
-so stop it first. `prune` does the same in bulk, always leaves running servers
-alone, and additionally clears leftover files whose record is already gone. A
-server counts as running while any process it recorded may be running, which on
-Windows includes one `rocm` cannot query (a live process the account may not
-open): `remove` and `prune` refuse such a record until that process is gone.
-`remove <service-id> --force --yes` is the way out for exactly that case: it
+its engine state file, its endpoint key file, and any copy of that key an
+interrupted save left behind. A running server is refused, so stop it first.
+`prune` does the same in bulk, always leaves running servers alone, and
+additionally clears leftover files whose record is already gone.
+
+A server counts as running while any process it recorded might be running. On
+Windows that includes one `rocm` cannot query (a live process the account may
+not open): `remove` and `prune` refuse such a record until that process is
+gone.
+
+`remove <service-id> --force --yes` is the way out for exactly that case. It
 removes the record when a stop was requested, no recorded process is confirmed
-running, and at least one could not be queried, says which one, and never
+running, and at least one could not be queried, and it says which one. It never
 removes a record whose process `rocm` can see running. `prune` has no
 `--force`, but when it leaves such a record alone it lists it with the exact
 `remove --force --yes` command. `docs/manual-testing.md` walks through it.
@@ -2110,25 +2227,29 @@ rocm config clear-provider-key <provider>
 ```
 
 Settings live in `config.json` in the config directory and are replaced in one
-step, so an interrupted save leaves the previous file rather than a truncated
+step, so an interrupted save leaves the previous file instead of a truncated
 one. On Windows, a replace that fails part-way can instead leave the new
 settings in a `config.json.tmp-*` file beside it, which the error names: rename
-it back to `config.json` before running another command. If the file exists
-but cannot be read — a bad hand edit, for example —
-rocm-cli reports it and does not save over it, so the settings in it are never
-replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
-where runtimes are kept; when it is too damaged to read even that, commands stop
-and say how to recover (`rocm diagnose` still runs). Repairing the file
-restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
-when the file still shows it) points commands back at your runtimes' folder
-meanwhile; until the file is repaired, any command that changes settings still
-stops on it, and other commands either stop too or run on default settings.
-To start over instead, rename the file yourself: the error names the exact
-file it read (under `ROCM_CLI_CONFIG_DIR` when that is set) and a name to give
-it, `config.json.broken` beside it, and rocm-cli does not rename or move it for
-you. That resets every setting to its default, and runtimes in a custom folder
-then need `ROCM_CLI_DATA_DIR`, which the error names when the file recorded
-that folder.
+it back to `config.json` before running another command.
+
+If the file exists but cannot be read (a bad hand edit, for example), ROCm CLI
+reports it and does not save over it, so the settings in it are never replaced
+with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records where
+runtimes are kept. When it is too damaged to read even that, commands stop and
+say how to recover (`rocm diagnose` still runs).
+
+Repairing the file restores everything. Meanwhile, setting `ROCM_CLI_DATA_DIR`
+points commands back at your runtimes' folder; the error names the folder when
+the file still shows it. Until the file is repaired, any command that changes
+settings still stops on it, and other commands either stop too or run on
+default settings.
+
+To start over instead, rename the file yourself. The error names the exact file
+it read (under `ROCM_CLI_CONFIG_DIR` when that is set) and a name to give it,
+`config.json.broken` beside it; ROCm CLI does not rename or move it for you.
+That resets every setting to its default, and runtimes in a custom folder then
+need `ROCM_CLI_DATA_DIR`, which the error names when the file recorded that
+folder.
 
 ### Setup
 
@@ -2169,18 +2290,25 @@ download's progress:
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
-Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
-exits with code 0. Any other answer cancels the same way, after a line saying
-that the answer was not understood and is treated as no. Use `--dry-run` to only
-list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
-is a separate opt-in for development builds. At a terminal, a dry run that finds
-something to remove ends by saying to run the same command again without
-`--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
-(its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
-with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
-nothing to remove. Outside an interactive terminal, when there is something to
-remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
+do and asks `[y/N]` (default: no) before doing it.
+
+Only `y` or `yes` proceeds. Enter, `n` and `no` cancel: it prints
+`uninstall cancelled`, removes nothing and exits with code 0. Any other answer
+cancels the same way, after a line saying that the answer was not understood
+and is treated as no.
+
+Use `--dry-run` to only list, and `--yes` to skip the confirmation. There is no
+`--force`; `--force-dev-binaries` is a separate opt-in for development builds.
+At a terminal, a dry run that finds something to remove ends by saying to run
+the same command again without `--dry-run`. With nothing to remove, or when
+stdin or stdout is not a terminal (its output is piped or its input is
+redirected), it says nothing about a next step.
+
+It does not create the folders it reports on: with `--keep-binaries`, on a
+computer where ROCm CLI never ran, it says there is nothing to remove. Outside
+an interactive terminal, when there is something to remove, it refuses with
+exit code 1 and removes nothing unless you pass `--yes`.
+
 Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
@@ -2215,12 +2343,13 @@ still shows what was already removed.
 On Linux it also removes the fish completion script (`completions/rocm.fish`
 in fish's config folder) that the installer recorded writing, even when the
 `PATH` change stays for other programs, and keeps it with `--keep-binaries`.
+
 The installer starts that file with a line naming the folder it installed into,
 and uninstall removes the file only when that line names its own folder. A
 `rocm.fish` you wrote yourself, a link, or one another install folder wrote
 since is left in place, and the review says so under `Left alone:`. If the
 file cannot be removed, uninstall prints a warning naming it and carries on,
-since the completions are only a convenience; delete it yourself then.
+because the completions are only a convenience; delete it yourself then.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
