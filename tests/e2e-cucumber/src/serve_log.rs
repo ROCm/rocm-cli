@@ -360,12 +360,60 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
     report
 }
 
+/// Whether a loopback bind on `port` succeeds right now.
+///
+/// A refused `connect()` only proves nothing is *listening*; a socket that is
+/// bound but not listening refuses connections yet still fails every later
+/// `bind`, which is what a harness step that claims the port needs. Binding is
+/// the check that matches that use. The probe listener is dropped before
+/// returning.
+pub fn port_is_bindable(port: u16) -> std::io::Result<()> {
+    std::net::TcpListener::bind(("127.0.0.1", port)).map(drop)
+}
+
+/// Text naming whatever holds loopback TCP `port`, for a failure message.
+///
+/// Runs `ss` (every socket state, so a bound-but-not-listening or lingering
+/// socket shows too) and `fuser -v`, and reports each tool's output or why it
+/// could not run. Best-effort and Linux-only; elsewhere it says so.
+pub fn port_holders(port: u16) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let ss = run_probe("ss", &["-tanp", &format!("sport = :{port}")]);
+        let fuser = run_probe("fuser", &["-v", &format!("{port}/tcp")]);
+        format!("ss -tanp 'sport = :{port}':\n{ss}\nfuser -v {port}/tcp:\n{fuser}")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("no holder listing for port {port} on this platform")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_probe(program: &str, args: &[&str]) -> String {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => {
+            // `fuser -v` prints its table on stderr, `ss` on stdout.
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let text = text.trim_end();
+            if text.is_empty() {
+                format!("(no output, {})", out.status)
+            } else {
+                text.to_string()
+            }
+        }
+        Err(e) => format!("(could not run {program}: {e})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
-        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_engine,
-        serve_attempt_report, serve_cli_budget, service_log_tail, slugify, tail_lines,
+        engine_from_serve_args, parse_log_path, port_holders, port_is_bindable, read_clamped,
+        read_clamped_file, reported_engine, serve_attempt_report, serve_cli_budget,
+        service_log_tail, slugify, tail_lines,
     };
 
     #[test]
@@ -714,5 +762,24 @@ managed service launched
         }
         // A silent stream is a finding, so it is labelled rather than dropped.
         assert!(report.contains("stderr: (empty)"), "{report}");
+    }
+
+    #[test]
+    fn bindable_check_reports_a_held_port() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(port_is_bindable(port).is_err());
+        drop(held);
+        assert!(port_is_bindable(port).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn port_holders_names_the_tools_and_the_port() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let text = port_holders(port);
+        assert!(text.contains(&format!("sport = :{port}")), "{text}");
+        assert!(text.contains(&format!("fuser -v {port}/tcp")), "{text}");
     }
 }

@@ -333,12 +333,25 @@ async fn ensure_serve_port_free() -> String {
     kill_listeners_on_port(SERVE_PORT);
     kill_listeners_on_port(ASSISTANT_PORT);
     let deadline = Instant::now() + Duration::from_mins(1);
+    let mut port_note = String::new();
     loop {
-        // TcpStream connect succeeds only while something holds the port.
-        let free = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
+        // A refused connect only proves nothing listens; a socket that is
+        // bound but not listening (or still tearing down) refuses connects
+        // yet fails the next `bind`, which serve-08's port drift and
+        // serve-49's listener hit. Require both.
+        let refused = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
             .await
             .is_err();
-        if free || Instant::now() >= deadline {
+        let bindable = e2e_cucumber::serve_log::port_is_bindable(SERVE_PORT);
+        if refused && bindable.is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            port_note = format!(
+                "port {SERVE_PORT} still unavailable after 60 s (connect refused: {refused}, bind: {bindable:?})\n{}",
+                e2e_cucumber::serve_log::port_holders(SERVE_PORT)
+            );
+            eprintln!("{port_note}");
             break;
         }
         kill_listeners_on_port(SERVE_PORT);
@@ -354,7 +367,12 @@ async fn ensure_serve_port_free() -> String {
     // request, so the next serve dies with "Free memory ... less than desired GPU
     // memory utilization" (engine core init failed). Wait for the device to
     // actually drain before returning.
-    wait_for_free_vram().await
+    let device_state = wait_for_free_vram().await;
+    if port_note.is_empty() {
+        device_state
+    } else {
+        format!("{device_state}\n{port_note}")
+    }
 }
 
 /// How long to wait for a stopped engine to hand its device memory back.
