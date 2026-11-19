@@ -43,11 +43,12 @@ needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 
 | Engine | Linux | Windows | WSL2 |
 |---|---|---|---|
-| Lemonade | Supported | Supported | Supported (Vulkan backend) |
+| Lemonade | Supported | Supported | Supported |
 | vLLM | Supported | Not supported | Supported |
 | AIM | Supported (needs Docker) | Not supported | Not verified |
 
-- **Lemonade on WSL2** uses its Vulkan backend instead of ROCm.
+- **Lemonade** chooses its own llama.cpp backend, ROCm or Vulkan. When it
+  chooses Vulkan, ROCm CLI doesn't pair the backend with the ROCm SDK.
 - **AIM on Windows**: ROCm CLI has no GPU passthrough for AIM containers on
   native Windows.
 - **AIM on WSL2**: ROCm CLI passes the WSL2 GPU device to the container, but
