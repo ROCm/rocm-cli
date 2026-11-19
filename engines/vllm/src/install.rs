@@ -443,11 +443,14 @@ fn install_vllm_with_uv(
             let paths = AppPaths::discover()?;
             let uv =
                 ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
-            // Unwrap is safe: `vllm_install_route` only returns `RocmDiscover`
-            // when `rocm_sdk_version` looks up a build in the table.
-            let build = rocm_sdk_version.and_then(vllm_rocm_discover_build).expect(
-                "vllm_install_route returned RocmDiscover without a matching discover build",
-            );
+            // `vllm_install_route` only returns `RocmDiscover` when
+            // `rocm_sdk_version` looks up a build in the table, so this
+            // context is unreachable; it keeps that invariant from panicking.
+            let build = rocm_sdk_version
+                .and_then(vllm_rocm_discover_build)
+                .context(
+                    "vLLM install route chose the ROCm discover index without a matching build",
+                )?;
             install_vllm_rocm10_discover(&uv, &paths, python, reinstall, build)
         }
         VllmInstallRoute::Static => {

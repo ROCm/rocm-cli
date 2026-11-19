@@ -689,7 +689,8 @@ mod tests {
 /// re-spawns this test binary filtered to just itself, with a hostile `PATH`
 /// set via the safe `Command::env` on that child. The fake records every argv
 /// (and a copy of any `--env-file`) so the parent can assert on them.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 pub(crate) mod subprocess_tests {
     use super::{ContainerState, RunSpec, container_state, pull, remove, run, stop};
     use rocm_core::fake_executable::write_fake_executable;

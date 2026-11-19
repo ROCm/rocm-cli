@@ -7,15 +7,14 @@
 //!
 //! Each step used to lint or test the whole workspace whatever the push
 //! contained, so a one-file change in a leaf crate paid for every crate. The
-//! selection is the one CI already uses ([`crate::affected`]): the crates whose
-//! files changed plus every crate that transitively depends on them, with a
-//! fall back to the whole workspace for anything that cannot be attributed to
+//! selection is the one CI uses ([`affected::select_with_readers`]): the crates
+//! whose files changed plus every crate that transitively depends on them, with
+//! a fall back to the whole workspace for anything that cannot be attributed to
 //! one crate (the lockfile, the root manifest, the toolchain file, workflow
-//! files, a doc an xtask test reads, an unrecognized path). On top of that the
-//! hook widens for files that another crate's tests read from outside their own
-//! crate directory ([`CROSS_CRATE_READS`]), which the directory-based selection
-//! cannot see. CI stays the complete gate; this only makes the local early
-//! warning cheaper.
+//! files, a doc an xtask test reads, an unrecognized path), widened with the
+//! crates whose tests read a changed file from outside their own crate
+//! directory ([`crate::cross_crate_reads`]). CI stays the complete gate; this
+//! only makes the local early warning cheaper.
 //!
 //! **Fail safe.** Whenever the affected set cannot be determined (`git diff`
 //! fails because the base is not fetched, `cargo metadata` fails, the range lists
@@ -38,13 +37,12 @@
 //! neither uses nor writes one.
 //!
 //! As in [`crate::affected`], the decisions ([`push_from_env`], [`plan`],
-//! [`hook_selection`], [`resolve_selection`]) are pure and unit-tested; running
+//! [`resolve_selection`]) are pure and unit-tested; running
 //! git and cargo is confined to [`run`], and [`execute`] takes both, the stamps
 //! and the output as parameters so its own behavior (the range it diffs,
 //! `--dry-run`, a failing cargo, a skipped or recorded pass, and what it prints
 //! about each) is tested too.
 
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::Command;
 
@@ -187,95 +185,6 @@ fn package_args<'a>(packages: Option<impl Iterator<Item = &'a str>>) -> Vec<Stri
     }
 }
 
-/// Files a crate's tests (or `include_str!`) read from outside that crate's own
-/// directory, with the crates that read them. [`affected::select`] attributes a
-/// file to the crate whose directory holds it and treats Markdown and `docs/`
-/// as inert, so without these entries a push that edits such a file would never
-/// run the reader's tests: the old whole-workspace hook caught that, a narrowed
-/// one would not.
-///
-/// A pattern ending in `/` is a directory prefix, one starting with `*` is a
-/// file-name suffix, anything else is an exact path. Files that no crate owns
-/// and that are not Markdown (`install.sh`, `scripts/`, `.github/`, ...) need no
-/// entry: `select` already sends them to the whole workspace. The guard
-/// `every_cross_crate_read_is_covered_by_the_widening_rule` scans the workspace
-/// for `include_str!`/`include_bytes!` and manifest-relative reads that leave
-/// their crate and fails when one is not covered, so a new cross-crate read
-/// cannot be missed silently. The e2e harness is not listed as a reader because
-/// the `test` step never runs it.
-///
-/// - `*.rs`: xtask's contract tests scan every Rust source file in the repo
-///   (`ascii_output_contract`, `env_mutation_contract`) and the pinned-key test
-///   reads `apps/rocm/src/therock/fetch.rs`.
-/// - `README.md`, `docs/`, `skills/`: `rocm`'s `advised_commands` test checks
-///   every `rocm ...` command shown there, `rocm` compiles in the assistant
-///   skill, and xtask's tests read the pinned release key under `docs/keys` and
-///   other docs.
-/// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
-///   although it lives in the e2e crate.
-pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
-    ("*.rs", &["xtask"]),
-    ("README.md", &["rocm", "xtask"]),
-    ("docs/", &["rocm", "xtask"]),
-    ("skills/", &["rocm", "xtask"]),
-    ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
-];
-
-fn read_pattern_matches(pattern: &str, file: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        file.ends_with(suffix)
-    } else if pattern.ends_with('/') {
-        file.starts_with(pattern)
-    } else {
-        file == pattern
-    }
-}
-
-/// The hook's selection: [`affected::select`], widened with the reader crates of
-/// every changed file in [`CROSS_CRATE_READS`] and their dependents.
-pub fn hook_selection(changed_files: &[String], graph: &Graph) -> Selection {
-    hook_selection_with(changed_files, graph, CROSS_CRATE_READS)
-}
-
-fn hook_selection_with(
-    changed_files: &[String],
-    graph: &Graph,
-    reads: &[(&str, &[&str])],
-) -> Selection {
-    let base = affected::select(changed_files, graph);
-    if base == Selection::Workspace {
-        return base;
-    }
-    let readers: BTreeSet<&str> = reads
-        .iter()
-        .filter(|(pattern, _)| {
-            changed_files
-                .iter()
-                .any(|file| read_pattern_matches(pattern, file))
-        })
-        .flat_map(|(_, readers)| readers.iter().copied())
-        .collect();
-    if readers.is_empty() {
-        return base;
-    }
-    // A reader that is not a workspace member means the table is stale; run
-    // everything rather than guess.
-    let members: BTreeSet<&str> = graph
-        .crate_dirs
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
-    if readers.iter().any(|reader| !members.contains(reader)) {
-        return Selection::Workspace;
-    }
-    let mut crates = match base {
-        Selection::Packages(packages) => packages,
-        Selection::Workspace | Selection::Empty => BTreeSet::new(),
-    };
-    crates.extend(readers.into_iter().map(String::from));
-    Selection::Packages(affected::reverse_closure(&crates, &graph.rev_deps))
-}
-
 /// Resolve the selection for the pushed changes, falling back to the whole
 /// workspace (with the reason) when either input cannot be obtained.
 pub fn resolve_selection(
@@ -285,14 +194,15 @@ pub fn resolve_selection(
     let resolved = changed_files()
         .context("could not list the changed files")
         .and_then(|files| {
-            // The hook only runs when the push contains a Rust file, so a range
-            // that lists no changed files means the range is wrong, not that
-            // nothing changed.
+            // The hook only runs when the push contains a Rust file (or, for the
+            // two clippy hooks, `clippy.toml`), so a range that lists no changed
+            // files means the range is wrong, not that nothing changed.
             if files.is_empty() {
                 bail!("the pushed range lists no changed files");
             }
             let graph = load_graph().context("could not read the workspace dependency graph")?;
-            Ok(hook_selection(&files, &graph))
+            // CI's `cargo xtask affected` selects through the same function.
+            Ok(affected::select_with_readers(&files, &graph))
         });
     match resolved {
         Ok(selection) => (selection, None),
@@ -331,11 +241,15 @@ fn banner(check: Check, push: &Push, selection: &Selection, fallback: Option<&st
             check.label()
         ),
         // The claim about CI is backed by `.github/workflows/ci.yml`: the
-        // `windows-debug` job runs `cargo test --workspace --all-targets` on every
-        // change, and the `test` job selects `--workspace` for every event but
-        // `pull_request` (the merge queue and pushes to main). The test
-        // `the_banner_claim_about_ci_matches_the_workflow` fails if either stops
-        // being true, so change the text and that test together.
+        // `windows-debug` job runs `cargo test --workspace --all-targets` when
+        // the `heavy` category matches, which every Rust change does (and the
+        // hook only runs for a push that changes Rust), and the `test` job
+        // selects `--workspace` for every event but `pull_request` (the merge
+        // queue and pushes to main). The test
+        // `the_banner_claim_about_ci_matches_the_workflow` fails if any of these
+        // stops being true (the Windows test command, its `heavy` gate, `heavy`
+        // matching Rust files, the `--workspace` forcing), so change the text
+        // and that test together.
         None => format!(
             "pre-push-check {}: {} for the changes in {range}; CI's Windows job, merge queue \
              and main still check the whole workspace",
@@ -563,6 +477,7 @@ mod tests {
 
     use super::*;
     use crate::prepush_stamp::fakes::{FakeProbe, MemStore};
+    use crate::workflow_contract::tests as ci_filters;
 
     /// A fixed clock for the stamp tests.
     const NOW: u64 = 1_800_000_000;
@@ -710,9 +625,10 @@ mod tests {
         assert_eq!(selection, Selection::Empty);
     }
 
-    /// The hook fires only for a push that contains a Rust file, so an empty
-    /// list of changed files is a wrong range (a base that is not an ancestor, a
-    /// from-ref equal to the pushed commit), not a clean push. Skipping all three
+    /// The hook fires only for a push that contains a Rust file (or, for the
+    /// two clippy hooks, `clippy.toml`), so an empty list of changed files is a
+    /// wrong range (a base that is not an ancestor, a from-ref equal to the
+    /// pushed commit), not a clean push. Skipping all three
     /// steps on it would turn a bad range into a silent pass.
     #[test]
     fn an_empty_list_of_changed_files_falls_back_to_the_whole_workspace_and_says_why() {
@@ -784,6 +700,7 @@ mod tests {
             "Cargo.lock",
             "Cargo.toml",
             "rust-toolchain.toml",
+            "clippy.toml",
             ".github/workflows/ci.yml",
         ] {
             let (selection, fallback) =
@@ -839,6 +756,40 @@ mod tests {
             windows_debug.contains("cargo test --workspace --all-targets"),
             "the `windows-debug` job no longer tests the whole workspace; update the banner text"
         );
+        // That test step runs when `heavy` matches, and the hook only fires for
+        // a push that changes a Rust file, which `heavy` must therefore match.
+        let lines: Vec<&str> = windows_debug.lines().collect();
+        let run = lines
+            .iter()
+            .position(|line| line.trim() == "run: cargo test --workspace --all-targets")
+            .expect("the `windows-debug` test step");
+        let step = lines[..run]
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("- name:"))
+            .expect("the test step's name");
+        let gates: Vec<&str> = lines[step..run]
+            .iter()
+            .filter_map(|line| line.trim().strip_prefix("if:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            gates,
+            ["needs.changes.outputs.heavy == 'true'"],
+            "the `windows-debug` test step's gate changed; update the banner text"
+        );
+        let filters = ci_filters::paths_filters(&ci_filters::read_classify_action());
+        let heavy = ci_filters::paths_filter(&filters, "heavy");
+        for rust_file in [
+            "build.rs",
+            "crates/rocm-core/src/lib.rs",
+            "tests/e2e-cucumber/tests/x.rs",
+        ] {
+            assert!(
+                ci_filters::filter_matches(heavy, rust_file),
+                "`heavy` does not match {rust_file}, so a Rust push can skip the Windows tests; \
+                 update the banner text"
+            );
+        }
         assert!(
             workflow.contains("\"${GITHUB_EVENT_NAME}\" = \"pull_request\"")
                 && workflow.contains("sel=\"--workspace\""),
@@ -864,108 +815,40 @@ mod tests {
 
     // ---- files read across crate boundaries ----
 
-    fn reader_graph() -> Graph {
+    /// The directory-based selection attributes the fixture and the step file to
+    /// the e2e crate and nothing else, so the `rocm-core` tests that
+    /// `include_str!` the fixture never ran and the `test` step skipped. The
+    /// widening itself is tested in [`crate::cross_crate_reads`].
+    #[test]
+    fn a_fixture_edit_with_an_e2e_step_still_tests_the_crate_that_includes_it() {
         let mut rev_deps = BTreeMap::new();
-        rev_deps.insert(
-            "rocm-core".to_string(),
-            vec!["rocm".to_string(), "xtask".to_string()],
-        );
-        for name in ["rocm", "xtask", "e2e-cucumber"] {
+        for name in ["rocm-core", "xtask", "e2e-cucumber"] {
             rev_deps.insert(name.to_string(), vec![]);
         }
-        Graph {
+        let graph = Graph {
             crate_dirs: vec![
                 ("rocm-core".into(), "crates/rocm-core".into()),
-                ("rocm".into(), "apps/rocm".into()),
                 ("xtask".into(), "xtask".into()),
                 ("e2e-cucumber".into(), "tests/e2e-cucumber".into()),
             ],
             rev_deps,
-        }
-    }
-
-    fn selected(paths: &[&str]) -> Selection {
-        let changed: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();
-        hook_selection(&changed, &reader_graph())
-    }
-
-    fn selected_names(paths: &[&str]) -> BTreeSet<String> {
-        match selected(paths) {
-            Selection::Packages(names) => names,
-            other => panic!("expected packages for {paths:?}, got {other:?}"),
-        }
-    }
-
-    const FIXTURE: &str = "tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt";
-
-    /// The directory-based selection attributes the fixture and the step file to
-    /// the e2e crate and nothing else, so the `rocm-core` tests that
-    /// `include_str!` the fixture never ran and the `test` step skipped.
-    #[test]
-    fn a_fixture_edit_with_an_e2e_step_still_tests_the_crate_that_includes_it() {
-        let changed = [FIXTURE, "tests/e2e-cucumber/tests/e2e/diagnose_steps.rs"];
-        assert!(selected_names(&changed).contains("rocm-core"));
-        let Plan::Cargo(args) = plan(Check::Test, &selected(&changed)) else {
+        };
+        let changed = [
+            "tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt".to_string(),
+            "tests/e2e-cucumber/tests/e2e/diagnose_steps.rs".to_string(),
+        ];
+        let selection = affected::select_with_readers(&changed, &graph);
+        let Plan::Cargo(args) = plan(Check::Test, &selection) else {
             panic!("the test step must run, not skip");
         };
         assert!(args.join(" ").contains("-p rocm-core"), "{args:?}");
     }
 
-    #[test]
-    fn the_fixture_alone_selects_its_reader() {
-        assert!(selected_names(&[FIXTURE]).contains("rocm-core"));
-    }
-
-    #[test]
-    fn docs_and_skills_select_the_crates_whose_tests_read_them() {
-        for path in [
-            "README.md",
-            "docs/testing.md",
-            "skills/rocm-cli-assistant/SKILL.md",
-        ] {
-            let names = selected_names(&[path]);
-            assert!(names.contains("rocm"), "{path}: {names:?}");
-            assert!(names.contains("xtask"), "{path}: {names:?}");
-            assert!(!names.contains("rocm-core"), "{path}: {names:?}");
-        }
-    }
-
-    #[test]
-    fn any_rust_file_selects_xtask_for_its_repo_wide_source_scans() {
-        assert!(selected_names(&["apps/rocm/src/main.rs"]).contains("xtask"));
-    }
-
-    #[test]
-    fn markdown_nothing_reads_still_selects_nothing() {
-        assert_eq!(selected(&["CHANGELOG.md"]), Selection::Empty);
-    }
-
-    #[test]
-    fn the_whole_workspace_stays_the_whole_workspace() {
-        assert_eq!(
-            selected(&["Cargo.lock", "apps/rocm/src/main.rs"]),
-            Selection::Workspace
-        );
-    }
-
-    #[test]
-    fn a_reader_that_is_not_a_workspace_member_runs_everything() {
-        let changed = ["docs/testing.md".to_string()];
-        let table: &[(&str, &[&str])] = &[("docs/", &["a-crate-that-was-renamed"])];
-        assert_eq!(
-            hook_selection_with(&changed, &reader_graph(), table),
-            Selection::Workspace
-        );
-    }
-
-    #[test]
-    fn read_patterns_match_by_directory_suffix_or_exact_path() {
-        assert!(read_pattern_matches("docs/", "docs/keys/a.pem"));
-        assert!(!read_pattern_matches("docs/", "documents/a.md"));
-        assert!(read_pattern_matches("*.rs", "xtask/src/main.rs"));
-        assert!(!read_pattern_matches("*.rs", "xtask/Cargo.toml"));
-        assert!(read_pattern_matches("README.md", "README.md"));
-        assert!(!read_pattern_matches("README.md", "docs/README.md"));
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask crate has a parent directory")
+            .to_path_buf()
     }
 
     // ---- execute: the range, --dry-run and cargo's result ----
@@ -2104,479 +1987,5 @@ mod tests {
                 run.out
             );
         }
-    }
-
-    // ---- drift guard: every cross-crate read must be covered ----
-
-    use std::path::{Path, PathBuf};
-
-    /// A read that leaves the crate: a repo-relative path, or the repo root
-    /// itself when the code derives it and joins the rest elsewhere.
-    #[derive(Debug, PartialEq, Eq)]
-    enum Read {
-        Root,
-        Path(String),
-    }
-
-    /// The text of the sole string literal in `args`, if that is all it holds.
-    /// Plain (`"..."`) and raw (`r"..."`, `r#"..."#`) literals are recognised.
-    fn sole_literal(args: &str) -> Option<&str> {
-        let args = args.trim();
-        if let Some(inner) = args.strip_prefix('"') {
-            let end = inner.find('"')?;
-            return inner[end + 1..].trim().is_empty().then_some(&inner[..end]);
-        }
-        let raw = args.strip_prefix('r')?;
-        let hashes = raw.len() - raw.trim_start_matches('#').len();
-        let body = raw[hashes..].strip_prefix('"')?;
-        let closing = format!("\"{}", "#".repeat(hashes));
-        let end = body.find(&closing)?;
-        body[end + closing.len()..]
-            .trim()
-            .is_empty()
-            .then_some(&body[..end])
-    }
-
-    /// Index of the `)` that closes the `(` at `open`, skipping string literals.
-    fn matching_paren(text: &str, open: usize) -> Option<usize> {
-        let bytes = text.as_bytes();
-        let mut depth = 0usize;
-        let mut i = open;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'"' {
-                        i += if bytes[i] == b'\\' { 2 } else { 1 };
-                    }
-                }
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        None
-    }
-
-    /// Lexically resolve `..` and `.`; `None` when the path leaves the root.
-    fn normalize(path: &str) -> Option<String> {
-        let mut parts: Vec<&str> = Vec::new();
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts.pop()?;
-                }
-                other => parts.push(other),
-            }
-        }
-        Some(parts.join("/"))
-    }
-
-    /// Repo-relative targets of the `include_str!`/`include_bytes!` literals in
-    /// the file `file_rel`.
-    fn include_targets(file_rel: &str, text: &str) -> Vec<String> {
-        let dir = file_rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-        let mut targets = Vec::new();
-        for macro_name in ["include_str", "include_bytes"] {
-            let needle = format!("{macro_name}!(");
-            for (at, _) in text.match_indices(&needle) {
-                let open = at + needle.len() - 1;
-                let Some(close) = matching_paren(text, open) else {
-                    continue;
-                };
-                if let Some(literal) = sole_literal(&text[open + 1..close]) {
-                    targets.extend(normalize(&format!("{dir}/{literal}")));
-                }
-            }
-        }
-        targets
-    }
-
-    /// The reads that start at `env!("CARGO_MANIFEST_DIR")` and leave the crate
-    /// directory (through `.parent()`, `.ancestors()` or a `..` segment). Scratch
-    /// directories under `.rocm-work` and `target` are not reads of repo files.
-    fn manifest_reads(text: &str) -> Vec<Read> {
-        let needle = format!("env!(\"{}\")", "CARGO_MANIFEST_DIR");
-        let bytes = text.as_bytes();
-        let mut reads = Vec::new();
-        for (at, _) in text.match_indices(&needle) {
-            let mut i = at + needle.len();
-            let (mut escapes, mut segments) = (false, Vec::new());
-            loop {
-                while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b')') {
-                    i += 1;
-                }
-                if i >= bytes.len() || bytes[i] != b'.' {
-                    break;
-                }
-                i += 1;
-                let name_start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let name = &text[name_start..i];
-                if i >= bytes.len() || bytes[i] != b'(' {
-                    break;
-                }
-                let Some(close) = matching_paren(text, i) else {
-                    break;
-                };
-                let literal = sole_literal(&text[i + 1..close]);
-                match (name, literal) {
-                    ("parent" | "ancestors", _) => escapes = true,
-                    ("join", Some(path)) => {
-                        for part in path.split('/') {
-                            match part {
-                                ".." => escapes = true,
-                                "" | "." => {}
-                                other => segments.push(other.to_string()),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                i = close + 1;
-            }
-            if !escapes
-                || matches!(
-                    segments.first().map(String::as_str),
-                    Some(".rocm-work" | "target")
-                )
-            {
-                continue;
-            }
-            reads.push(if segments.is_empty() {
-                Read::Root
-            } else {
-                Read::Path(segments.join("/"))
-            });
-        }
-        reads
-    }
-
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask crate has a parent directory")
-            .to_path_buf()
-    }
-
-    /// Collects the files under `dir`, skipping build output, vendored trees and
-    /// every dot-directory (`.git`, `.rocm-work`, and nested checkouts such as
-    /// `.claude/worktrees/...`, whose sources belong to another branch).
-    ///
-    /// Symbolic links are neither followed nor listed: a link loop would recurse
-    /// until the OS refuses, and a link out of the tree would scan files that are
-    /// not this workspace's. A directory that cannot be read contributes nothing
-    /// instead of failing the test, since a push should not be blocked by a folder
-    /// the developer has no access to.
-    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
-        const SKIPPED: &[&str] = &["target", "node_modules", "third_party"];
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if kind.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_str().unwrap_or_default();
-                if !name.starts_with('.') && !SKIPPED.contains(&name) {
-                    walk(&path, files);
-                }
-            } else {
-                files.push(path);
-            }
-        }
-    }
-
-    fn relative(root: &Path, path: &Path) -> String {
-        path.strip_prefix(root)
-            .expect("under the repo root")
-            .to_string_lossy()
-            .replace('\\', "/")
-    }
-
-    /// A raw-string include is a cross-crate read like any other; the scanner
-    /// must not skip it.
-    #[test]
-    fn include_targets_reads_plain_and_raw_string_literals() {
-        // Built with `format!` so this file never contains a literal embed that
-        // `ascii_output_contract` would count as a data file compiled into a binary.
-        let call = |name: &str, arg: &str| format!("{name}!({arg})");
-        let target = "../../../README.md";
-        let file = "crates/reader/src/lib.rs";
-        for text in [
-            call("include_str", &format!("\"{target}\"")),
-            call("include_str", &format!("r\"{target}\"")),
-            call("include_str", &format!("r#\"{target}\"#")),
-            call("include_bytes", &format!("r##\"{target}\"##")),
-        ] {
-            assert_eq!(
-                include_targets(file, &text),
-                vec!["README.md".to_string()],
-                "{text}"
-            );
-        }
-        assert!(include_targets(file, &call("include_str", "concat!(\"a\", \"b\")")).is_empty());
-    }
-
-    /// A nested checkout (`.claude/worktrees/...`) holds another branch's
-    /// sources; scanning it reports reads that are not this tree's.
-    #[test]
-    fn walk_skips_dot_directories_and_build_output() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        for file in [
-            "crates/a/src/lib.rs",
-            ".claude/worktrees/w/crates/b/src/lib.rs",
-            ".git/hooks/x.rs",
-            "target/debug/y.rs",
-        ] {
-            let path = tmp.path().join(file);
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&path, "").expect("write");
-        }
-        let mut files = Vec::new();
-        walk(tmp.path(), &mut files);
-        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
-        assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
-    }
-
-    /// A link that points back up the tree would be followed forever, and one
-    /// that points out of it would scan files that are not this workspace's. Neither
-    /// is descended into or listed.
-    #[cfg(unix)]
-    #[test]
-    fn walk_does_not_follow_symbolic_links() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let outside = tempfile::tempdir().expect("outside dir");
-        std::fs::write(outside.path().join("elsewhere.rs"), "").expect("write");
-        let a = tmp.path().join("crates/a");
-        std::fs::create_dir_all(a.join("src")).expect("mkdir");
-        std::fs::write(a.join("src/lib.rs"), "").expect("write");
-        std::os::unix::fs::symlink(tmp.path(), a.join("loop")).expect("link up the tree");
-        std::os::unix::fs::symlink(outside.path(), a.join("out")).expect("link out of the tree");
-        std::os::unix::fs::symlink(a.join("src/lib.rs"), a.join("alias.rs")).expect("file link");
-        let mut files = Vec::new();
-        walk(tmp.path(), &mut files);
-        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
-        assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
-    }
-
-    /// A folder the developer cannot read must not fail the scan (and so block
-    /// a push); the files that can be read are still found. Running as root
-    /// reads everything, so this only asserts that nothing panics and that the
-    /// readable file is there.
-    #[cfg(unix)]
-    #[test]
-    fn walk_skips_an_unreadable_directory_instead_of_panicking() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().expect("temp dir");
-        for file in ["crates/a/src/lib.rs", "private/hidden.rs"] {
-            let path = tmp.path().join(file);
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&path, "").expect("write");
-        }
-        let private = tmp.path().join("private");
-        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))
-            .expect("remove access");
-        let mut files = Vec::new();
-        walk(tmp.path(), &mut files);
-        // Restore access first so the temp dir can be removed even if an assert fails.
-        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
-            .expect("restore access");
-        let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
-        assert!(
-            found.contains(&"crates/a/src/lib.rs".to_string()),
-            "{found:?}"
-        );
-    }
-
-    /// Fails when a crate reads a file outside its own directory that the hook's
-    /// selection would not send to that crate's tests, or when a crate derives
-    /// the repo root without being declared as a reader. Add the path to
-    /// [`CROSS_CRATE_READS`] (or declare the crate) when this fails.
-    ///
-    /// What it can see is limited. An `include_str!`/`include_bytes!` literal and
-    /// a `env!("CARGO_MANIFEST_DIR")` chain that ends in literal `.join("...")`
-    /// segments name their file, and that file is checked. A chain that only
-    /// derives the repo root and is joined somewhere else (a helper such as
-    /// `repo_root()`) is recorded as a root derivation: the guard then requires
-    /// the crate to be declared as a reader in [`CROSS_CRATE_READS`], but not
-    /// that the files it goes on to read are covered. A test that reads a new kind
-    /// of file (a `Cargo.toml` or a `.feature` of another crate) through such a
-    /// root is selected only as that file's own crate, so its entry in
-    /// [`CROSS_CRATE_READS`] has to be added by hand. Widening the rule would need
-    /// data flow through helper functions, which a text scan cannot give exactly.
-    #[test]
-    fn every_cross_crate_read_is_covered_by_the_widening_rule() {
-        let root = repo_root();
-        let mut files = Vec::new();
-        walk(&root, &mut files);
-        // The workspace members, from the same `cargo metadata` the hook selects
-        // with, so a stray `Cargo.toml` (a fixture, a nested checkout) is not
-        // taken for a workspace crate.
-        let crate_dirs = affected::load_graph()
-            .expect("read the workspace graph")
-            .crate_dirs;
-        assert!(
-            crate_dirs.iter().any(|(name, _)| name == "xtask"),
-            "found no crates under {}",
-            root.display()
-        );
-        let graph = Graph {
-            rev_deps: crate_dirs
-                .iter()
-                .map(|(name, _)| (name.clone(), Vec::new()))
-                .collect(),
-            crate_dirs,
-        };
-
-        let mut problems = Vec::new();
-        let mut root_readers = BTreeSet::new();
-        let mut checked = 0usize;
-        let mut check = |reader: &str, source: &str, target: &str| {
-            checked += 1;
-            // `test` never runs the e2e crate, so nothing selects it for its reads.
-            if reader == E2E_CRATE
-                || affected::owning_crate(target, &graph.crate_dirs) == Some(reader)
-            {
-                return;
-            }
-            let covered = match hook_selection(&[target.to_string()], &graph) {
-                Selection::Workspace => true,
-                Selection::Packages(names) => names.contains(reader),
-                Selection::Empty => false,
-            };
-            if !covered {
-                problems.push(format!("{source} ({reader}) reads {target}"));
-            }
-        };
-
-        for path in files
-            .iter()
-            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        {
-            let source = relative(&root, path);
-            let Some(reader) = affected::owning_crate(&source, &graph.crate_dirs) else {
-                continue;
-            };
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            for target in include_targets(&source, &text) {
-                check(reader, &source, &target);
-            }
-            for read in manifest_reads(&text) {
-                match read {
-                    Read::Root => {
-                        root_readers.insert(reader.to_string());
-                    }
-                    Read::Path(target) => check(reader, &source, &target),
-                }
-            }
-        }
-
-        // A scanner that finds nothing would pass vacuously. xtask's tests derive
-        // the repo root, and crates include files from outside themselves.
-        assert!(
-            root_readers.contains("xtask"),
-            "the manifest scanner found nothing"
-        );
-        assert!(checked > 0, "the include scanner found nothing");
-
-        let declared: BTreeSet<&str> = CROSS_CRATE_READS
-            .iter()
-            .flat_map(|(_, readers)| readers.iter().copied())
-            .collect();
-        for reader in root_readers {
-            if reader != E2E_CRATE && !declared.contains(reader.as_str()) {
-                problems.push(format!(
-                    "crate {reader} derives the repo root but is not a reader in CROSS_CRATE_READS"
-                ));
-            }
-        }
-        assert!(
-            problems.is_empty(),
-            "reads the narrowed hook would not run the reader's tests for:\n{}",
-            problems.join("\n")
-        );
-    }
-
-    #[test]
-    fn the_scanner_finds_includes_that_leave_the_crate() {
-        let include = |name: &str, path: &str| format!("let a = {name}!(\"{path}\");");
-        let text = format!(
-            "{}\n{}\n{}",
-            include("include_str", "../../../tests/e2e-cucumber/fixtures/a.txt"),
-            include("include_bytes", "../data.bin"),
-            include("include_str", "../../../../../escapes.txt"),
-        );
-        assert_eq!(
-            include_targets("crates/rocm-core/src/fix.rs", &text),
-            [
-                "tests/e2e-cucumber/fixtures/a.txt",
-                "crates/rocm-core/data.bin"
-            ]
-        );
-    }
-
-    #[test]
-    fn the_scanner_follows_a_manifest_relative_chain_out_of_the_crate() {
-        let manifest = format!("env!(\"{}\")", "CARGO_MANIFEST_DIR");
-        let chain = |tail: &str| format!("fn p() -> PathBuf {{ Path::new({manifest}){tail} }}");
-        assert_eq!(
-            manifest_reads(&chain(
-                ".join(\"..\").join(\"..\").join(\"skills\").join(\"d\").join(\"f.md\")"
-            )),
-            [Read::Path("skills/d/f.md".to_string())]
-        );
-        assert_eq!(
-            manifest_reads(&chain(".join(\"../..\").join(\"docs\")")),
-            [Read::Path("docs".to_string())]
-        );
-        assert_eq!(
-            manifest_reads(&chain(".parent().expect(\"root\")")),
-            [Read::Root]
-        );
-        assert_eq!(
-            manifest_reads(&chain(".ancestors().nth(2).expect(\"root\")")),
-            [Read::Root]
-        );
-    }
-
-    #[test]
-    fn the_scanner_ignores_scratch_dirs_and_reads_inside_the_crate() {
-        let manifest = format!("env!(\"{}\")", "CARGO_MANIFEST_DIR");
-        let chain = |tail: &str| format!("fn p() -> PathBuf {{ PathBuf::from({manifest}){tail} }}");
-        assert!(
-            manifest_reads(&chain(
-                ".join(\"..\").join(\"..\").join(\".rocm-work\").join(\"t\")"
-            ))
-            .is_empty()
-        );
-        assert!(manifest_reads(&chain(".join(\"target\").join(\"x\")")).is_empty());
-        assert!(manifest_reads(&chain(".join(\"features\")")).is_empty());
-    }
-
-    #[test]
-    fn the_scanner_ignores_a_join_argument_that_is_not_a_plain_literal() {
-        let manifest = format!("env!(\"{}\")", "CARGO_MANIFEST_DIR");
-        let text = format!(
-            "let p = PathBuf::from({manifest}).parent().unwrap().join(format!(\"x-{{}}\", id));"
-        );
-        assert_eq!(manifest_reads(&text), [Read::Root]);
     }
 }

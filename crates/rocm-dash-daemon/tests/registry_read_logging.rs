@@ -14,6 +14,12 @@
 //! and the capture comes up empty. In `discovery_reconcile.rs` the tests share a
 //! process, so that is what happened there. Here nothing else logs first.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

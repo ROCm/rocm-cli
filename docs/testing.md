@@ -17,6 +17,36 @@ also what the `windows-debug` job of the required `windows-build-and-test` lane
 does. See [Tests that touch the environment](#tests-that-touch-the-environment)
 before writing a test that sets an environment variable.
 
+Production code must not call `unwrap` or `expect`: the workspace
+[Cargo.toml](../Cargo.toml) enables clippy's `unwrap_used` and `expect_used`, and
+[clippy.toml](../clippy.toml) allows both in tests, where a failure should panic.
+Where production code relies on an invariant, the form depends on what the invariant
+is about:
+
+- Data compiled into the binary, such as the embedded model catalog or a literal regex
+  pattern, and a value whose type cannot fail, such as serializing a report whose fields
+  all serialize, keep their `expect` where there is no error path to return through.
+  Mark it `#[expect(clippy::expect_used, reason = "...")]`, with a reason that names the
+  test exercising the call on every run. Inside a function that already returns a
+  `Result`, such a call should take `?` instead. Use `expect` rather than `allow`, so clippy
+  flags the attribute once the call is gone, and do not hide the panic behind
+  `unwrap_or_else(|| panic!(..))`.
+- A control-flow invariant (a branch an earlier check rules out, a pipe that was
+  requested, a lock another thread may have poisoned) returns an error with `?` or takes
+  a fallback, so a later edit that breaks the invariant degrades instead of crashing.
+
+Clippy only treats an item as test code when it carries the literal `#[cfg(test)]` (or
+`#[test]`). Under a compound gate such as `#[cfg(all(test, unix))]`, a `#[test]` fn is
+still exempt, but a helper outside one is linted as production; where such a helper
+unwraps, split the gate into two attributes, `#[cfg(test)]` and then `#[cfg(unix)]`.
+Integration-test, example and build-script crates opt out with a crate-level
+`#![allow(..., reason = "...")]`. Test-support code that clippy cannot see as test code,
+such as a module compiled under `#[cfg(any(test, feature = "test-support"))]` or a file
+gated by an inner `#![cfg(all(test, unix))]`, carries the same `allow` on that module or
+item where it unwraps. It is `allow` rather than `expect` because that code is expected
+to keep unwrapping, at the cost that clippy will not report the attribute if it ever
+stops.
+
 ### Source file size
 
 No source file may exceed 1,500 production lines. Production lines leave out test-gated
@@ -251,10 +281,10 @@ Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
 for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
 every pull request that changes Rust, and the merge queue and post-merge runs
 test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
-selects `xtask` only for a change in `xtask` or in a crate it depends on, or for
-a file it reads, so a pull request that touches nothing but
-`crates/rocm-dash-tui` does not run this test on Linux. The module-import
-contract above has the same property.
+selects `xtask` for any Rust change too, because its contract tests scan every
+source file (see [CI test selection](#ci-test-selection)), so a pull request that
+touches nothing but `crates/rocm-dash-tui` runs this test on Linux as well. The
+module-import contract above has the same property.
 
 ### Tests that run a fake executable
 
@@ -578,6 +608,15 @@ not checked as written:
   `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
   in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
   checked through the functions that build it instead
+- advice assembled at run time has no literal to scan: the `Try:` line the two
+  `rocm uninstall` refusals end with is built from the flags the user gave
+  (`uninstall_command_line` in [uninstall.rs](../apps/rocm/src/uninstall.rs)), so
+  `uninstall_refusal_advice_parses_and_clears_the_refusal` and
+  `uninstall_force_advice_parses_and_clears_the_refusal` run each refusal for
+  every combination of uninstall's flags and check that the line parses, repeats
+  the command with `--yes`, and passes the gate. These tests read the line back
+  with `try_command` in
+  [recovery_hint.rs](../crates/rocm-core/src/recovery_hint.rs)
 - separate optional groups are tried one at a time, never together (they can
   be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
   command that fails only when flags from two of them are combined is not
@@ -684,13 +723,14 @@ cargo test -p xtask every_proptest_regression_file_belongs_to_a_property_test_th
 ```
 
 The pull-request affected-crates selection (see [CI test selection](#ci-test-selection))
-adds `xtask` when a changed file is under a `proptest-regressions` directory or
-when the diff of a changed Rust file adds or removes a line containing
-`proptest!`, so a property test moved inside `apps/rocm` alone still runs this
-check on the pull request, whether or not its seed moved with it. The other
-source-scan contracts do not have this rule; they still meet a change confined to
-a crate that `xtask` does not depend on in the merge queue, which runs the whole
-workspace. To prove a moved seed is read,
+adds `xtask` when a changed file is under a `proptest-regressions` directory, and
+for any changed Rust file (the `*.rs` entry of `CROSS_CRATE_READS`, see
+[Pre-push hook scope](#pre-push-hook-scope)), so a property test moved inside
+`apps/rocm` alone still runs this check on the pull request, whether or not its
+seed moved with it. The same `*.rs` entry runs the other source-scan contracts
+in `xtask` for any Rust change; a change confined to non-Rust files of a crate
+that `xtask` does not depend on meets them only in the merge queue, which runs
+the whole workspace. To prove a moved seed is read,
 append a deliberately unparsable line to it, run the test with `--nocapture`
 (`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
 `unparsable line, ignoring` warning naming that path, and remove the line.
@@ -1123,8 +1163,9 @@ cargo test -p xtask every_self_hosted_lane_declares_whether_it_has_a_gpu
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
-`cargo nextest run` over only the crates a change can reach — the changed crates
-plus their transitive dependents, derived from the workspace dependency graph by:
+`cargo nextest run` over only the crates a change can reach — the changed crates,
+the crates whose tests read a changed file from outside their own directory, plus
+their transitive dependents, derived from the workspace dependency graph by:
 
 ```bash
 cargo xtask affected --base origin/main
@@ -1133,13 +1174,28 @@ cargo xtask affected --base origin/main
 which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
 or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
-file, the workspace root manifest, CI config, or a doc an xtask test reads —
+file, the workspace root manifest, `clippy.toml`, CI config, or a doc an xtask test reads —
 `MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
-`tests/e2e-cucumber/README.md`). Two further rules add `xtask`, which holds
-the proptest seed guard and which no other crate depends on: a changed file under
-a `proptest-regressions` directory, and a changed Rust file whose diff adds or
-removes a line containing `proptest!` (found with `git diff -G`). On `main`
-and in the merge queue the full workspace always runs. The minimum quality gate in
+`tests/e2e-cucumber/README.md`). A changed file under a `proptest-regressions`
+directory adds `xtask`, which holds the proptest seed guard and which no other
+crate depends on. The selection is then widened by the files tests read from outside their crate
+(`CROSS_CRATE_READS`, described under [Pre-push hook scope](#pre-push-hook-scope)):
+any Rust file adds `xtask`, and `README.md`, `docs/` and `skills/` add `rocm` and
+`xtask`, so a pull request that edits only a doc still runs the tests that read
+it. On `main` and in the merge queue the full workspace always runs.
+
+Before any of that, the `changes` job decides which jobs run at all. It sorts
+the changed files into path categories (`rust`, `heavy`, `lint`, `tpn`, `docs`,
+`skills`, and `serve` for the GPU lanes) defined once in the
+[classify-changes](../.github/actions/classify-changes/action.yml) action, which
+both [ci.yml](../.github/workflows/ci.yml) and
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) use. A job gated on
+a category skips when the pull request touches nothing in it. A changed file that
+no category names, and that is not in the action's `inert` list (files no gated
+job reads, such as `CODE_OF_CONDUCT.md` or the issue templates), turns every
+category on and prints a notice naming the file, so a new kind of file runs the
+full suite until someone adds it to the categories whose jobs read it. Off pull
+requests every category is on. The minimum quality gate in
 [AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
 that also narrows the local pre-push hooks (next section).
 
@@ -1159,17 +1215,30 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
   `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
 
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
-so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
-file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
-test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
-selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
-[prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
-`include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
-covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
-whose path is written out (an `include_str!` literal, or a `CARGO_MANIFEST_DIR` chain ending in
-literal `.join("...")` segments) is checked file by file, but a test that derives the repo root in
-one place and joins the rest elsewhere (xtask's `repo_root()` helper) is only recorded as reading
-through the root. For that case the test checks that the crate is a declared reader, not which files
+so the selection is widened, in the hook and in CI's `test` job alike: any Rust file also selects
+`xtask` (its contract tests scan every source file), `README.md`, `docs/` and `skills/` also select
+`rocm` and `xtask` (the advised-commands test reads them and `rocm` compiles in the assistant
+skill), `skills/rocm-doctor/` also selects `e2e-cucumber` (its `skill_reference` test parses the
+skill's catalog table; CI runs that test in the `test` job's `cargo nextest` over the selection
+and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose steps run when the
+`heavy` category matches, as every `skills/` change does, while the hook's `test`
+step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
+e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+[cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
+`include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
+code (not in comments or string literals) that leave their crate and fails unless each one is
+covered both by the table and by the `rust` category of the `changes` job (so the job that runs
+the reader is not skipped), and fails on a path Windows resolves differently (a component ending
+in `.` or a space), so a new cross-crate read cannot be added without a decision. A second test
+holds every table entry to that `rust` category.
+The scan has limits. A path held in a const (`.github/scripts/gpu-preflight.sh`, read through
+`SHARED_PREFLIGHT`) is not seen at all; its `rust` glob is pinned only by a per-glob sample test,
+which checks the glob is there, not that a test reads the file. And a read whose path is
+written out (an `include_str!` literal, a `CARGO_MANIFEST_DIR` chain ending in literal
+`.join("...")` segments, or `repo_root().join("...")` with a literal path) is checked file by
+file, but a test that derives the repo root in one place and joins the rest elsewhere (the result
+of xtask's `repo_root()` helper stored and joined later, or joined with a computed path) is only
+recorded as reading through the root. For that case the test checks that the crate is a declared reader, not which files
 it reads, so a test that starts reading a new kind of file of another crate needs its
 `CROSS_CRATE_READS` entry added by hand.
 
@@ -1177,14 +1246,17 @@ A step that has nothing to check says so and exits successfully. A step whose af
 cannot be determined (the pushed range's base is not available locally, the range lists no
 changed files at all, or `cargo metadata` fails) runs over the whole workspace and prints why, so
 narrowing never replaces a check with silence. An empty list counts as undeterminable because the
-hook only fires for a push that contains a Rust file, so an empty list means the range is wrong. Pushes that change no Rust file still skip the cargo hooks through their `types: [rust]`
-filter, as before, including a lockfile-only push.
+hook only fires for a push that contains a Rust file (or, for the two clippy hooks, `clippy.toml`),
+so an empty list means the range is wrong. Pushes that change neither still skip the cargo hooks
+through their file filters, as before, including a lockfile-only push.
 
 The hook is an early warning, and CI is not narrowed everywhere. On pull requests the `clippy`
 job lints the whole workspace and the `test` job (`Test (affected crates)`) runs only the crates
-`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job on
-every change, and in the merge queue and on `main`, where the Linux `test` job is forced to
-`--workspace`.
+`cargo xtask affected` selects. The whole workspace's tests run in the `windows-debug` job when
+the `changes` job's `heavy` category matches (any Rust file does, as do `skills/`, scripts and
+workflow files, but a change only to prose docs such as `README.md` or `docs/*.md`, outside
+`docs/keys/`, does not), and in the merge queue
+and on `main`, where the Linux `test` job is forced to `--workspace`.
 
 Known limits, unchanged by the narrowing: the steps check the working tree rather than the pushed
 commit; under prek 0.4.5 a push of several refs, a tag or a deletion runs no hooks; and `-p`
@@ -2377,7 +2449,7 @@ To run just these locally: `cargo xtask e2e -- -n 'vllm-tensorizer'`. The `-n` f
 selects by scenario name and bypasses the harness's own gating, so it needs a Linux
 host for these scenarios.
 The scenarios are Linux only; the real Python 3.14 import is only exercised by
-hand ([manual-testing.md](manual-testing.md#6c-the-tensorizer-upgrade-on-python-314)).
+hand ([manual-testing.md](manual-testing.md#6d-the-tensorizer-upgrade-on-python-314)).
 
 ## Lemonade Installs On Disk
 
@@ -2467,7 +2539,11 @@ and checks the listed folder goes; a run whose stdin or stdout is not a terminal
 empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
 mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
 is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
-its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+its examples with a dry run (`uninstall-11`). Both refusals end with a `Try:`
+line naming the same uninstall with `--yes` (and without `--force`), and
+`uninstall-16` (Linux, the `--yes` refusal) and `uninstall-17` (the `--force`
+refusal) run that line as printed and check it removes the config folder and
+keeps the data folder. The assistant's uninstall preview
 ends differently, since it has no flag to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
 `uninstall-13` to `uninstall-15` drive the confirmation prompt under a
@@ -2491,9 +2567,9 @@ step with this table. The help is a wording pin; the behavior is proven here:
 
 | Command | Without `--yes`, no terminal | Proven by |
 |---|---|---|
-| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing | `uninstall-04` (Linux) |
-| `rocm runtimes uninstall` | same | `runtime-lifecycle-04` |
-| `rocm storage remove-downloads`, `remove-old-installs` | same; only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
+| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing; ends with `Try:` and the same command with `--yes` | `uninstall-04`, `uninstall-16` (Linux) |
+| `rocm runtimes uninstall` | prints the plan, refuses, exit 1, removes nothing; no `Try:` line | `runtime-lifecycle-04` |
+| `rocm storage remove-downloads`, `remove-old-installs` | as `rocm runtimes uninstall` (no `Try:` line); only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
 | `rocm fix` | prints the plan, refuses, exit 5 (stdin only decides) | `diagnose-08` (Linux, bare metal) |
 | `rocm install driver` | never asks; prints the plan, changes nothing, exit 0 | `driver-install-02` (WSL) |
 | `rocm engines install` | never asks; a missing package installs only where no password is needed | `system_package_install_action` unit tests |
@@ -2504,7 +2580,10 @@ regression would delete real settings, so the command points `HOME` at a
 scratch folder itself:
 
 ```bash
-HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+scratch=$(mktemp -d) && mkdir -p "$scratch/.rocm" && touch "$scratch/.rocm/x"   # something to remove
+# The ROCM_CLI_*_DIR variables win over HOME, so unset them for this command only.
+env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+  rocm uninstall --keep-binaries < /dev/null   # expect the refusal, ending with its Try: line; exit 1
 ```
 
 ## Removing Old Installs
@@ -2769,7 +2848,10 @@ when the engine failed but its process is still up, the message names the
 stop command. Only a stall or the
 deadline leaves the server running for the background helper to supervise.
 Scenario `serve-64` in `model_serving.feature` drives it under a PTY. It
-needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
+needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only,
+and it is `@requires-os:linux` like every other PTY scenario (the harness's
+ConPTY path is not a validated contract; see `dash.feature`'s header), so the
+native-Windows GPU lane skips it;
 it checks the wait line, that the named `rocm logs --service` command runs,
 and that the serve exits 0 with the model listed. Scenario `serve-65` is the
 failure side on the no-GPU mock lane: with `ROCM_E2E_SIMULATE_STARTUP_EXIT=1`,
@@ -4340,6 +4422,13 @@ python scripts/nightly_canary.py --self-test
 What the scheduled canary checks, who is told and how to rerun it are in
 [ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
 
+The issue-triage script has a network-free self-test too (its behavior is
+described in [issue-triage.md](issue-triage.md)):
+
+```bash
+python scripts/triage_issue.py --self-test
+```
+
 The vLLM route check (advisory) has a self-test of the same kind:
 
 ```bash
@@ -4510,6 +4599,108 @@ the heavy path (`needs.changes.outputs.heavy == 'true'`):
 ```bash
 sh tests/install-sh/run.sh
 ```
+
+The `pr-<number>` channel of `install.sh` (install the bundle CI built for a
+pull request) is covered by
+[`tests/install-sh/pr_channel.sh`](../tests/install-sh/pr_channel.sh). It puts a
+stub `gh` first on `PATH` that serves a local bundle, and checks:
+
+- the install uses the newest CI run for the head commit that still has an
+  unexpired artifact, found by run id: with the newest run's artifact expired
+  it takes the next run, and downloads neither the expired nor an older one;
+- the pinned release signing keys are not applied, so the bundle installs on
+  its checksum alone and the output says it is unsigned, while
+  `ROCM_CLI_REQUIRE_SIGNATURE=1` fails with nothing installed instead of being
+  skipped;
+- a wrong checksum, an unknown pull request, a pull request with no CI run,
+  one whose builds have all expired (the message names the 7 day retention),
+  a malformed channel (`pr-abc`, `pr-`, `pr-12x`, refused before `gh` is
+  called) and a missing `gh` each fail naming the cause, with no files
+  installed;
+- `ROCM_CLI_GITHUB_REPO` moves the lookup and the download to that repository;
+- an empty head commit is refused, and a run whose artifact list cannot be read
+  is skipped in favour of the next run instead of being taken as having a build;
+- `ROCM_CLI_ARCHIVE`, `ROCM_CLI_DOWNLOAD_BASE` and `ROCM_CLI_DOWNLOAD_ONLY`
+  with a `pr-` channel are refused, not ignored, before `gh` is called;
+- a public key the user names, through `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` or
+  `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`, is not cleared with the pinned ones: it
+  asks for verification and the install fails on the signature the bundle
+  lacks (each variable is checked on its own);
+- the stub rejects `gh pr view` without `--json headRefOid --jq .headRefOid`
+  and a run listing without `per_page=100`, and a run whose artifact list
+  cannot be read is skipped with a note saying so;
+- a required signature is refused with a message that does not point at a key
+  (CI never signs these bundles), and the expiry and workflow filters decide
+  the run: the stub hands the installer a newer run of another workflow and
+  expired artifacts, which it leaves out only where the installer's `--jq`
+  expression filters them;
+- the installer arriving on stdin, as under `curl | sh`, still installs: the
+  stub drains its stdin as a real `gh` may, so a `gh` call that is not
+  redirected from `/dev/null` swallows the rest of the script.
+
+The stub fails a call that names another repository than the one under test,
+lists runs for any commit but the pull request's head, or asks for or downloads
+another artifact than `rocm-cli-pr-linux-amd64`, so an installer that drops one
+of those fails here. It prints what the installer's `--jq` filters would, so
+the filters themselves are not exercised; they were run against the live API
+when the channel was written. It needs no network or GPU, and `INSTALL_SH` selects
+another copy of the installer. The Linux `build-and-test` job runs it under the
+same `heavy` condition as the fish checks:
+
+```bash
+sh tests/install-sh/pr_channel.sh
+```
+
+Both installers' `pr-<number>` channel is also covered end to end in the
+lifecycle set above, with the `fake-gh` stand-in
+([`fake-gh.rs`](../tests/e2e-cucumber/src/bin/fake-gh.rs)) in front of `PATH`
+and a bundle packaged unsigned, as CI packages it:
+`@id:lifecycle-linux-pr-channel-installs-ci-build` (lifecycle-38) and
+`@id:lifecycle-windows-pr-channel-installs-ci-build` (lifecycle-39) install the
+newest unexpired build, say it is unsigned and verify no signature, and run the
+installed `rocm`; the build they use belongs to a run with no conclusion yet, so
+that branch of each installer is exercised too.
+`@id:lifecycle-linux-pr-channel-refuses-required-signature` (lifecycle-40) and
+`@id:lifecycle-windows-pr-channel-refuses-required-signature` (lifecycle-41)
+keep `ROCM_CLI_REQUIRE_SIGNATURE=1` and check the install fails instead of
+skipping it, and
+`@id:lifecycle-linux-pr-channel-refuses-bundle-without-signature` (lifecycle-42)
+and `@id:lifecycle-windows-pr-channel-refuses-bundle-without-signature`
+(lifecycle-43) supply a public key and check the unsigned bundle is refused,
+each installing nothing. `@id:lifecycle-linux-pr-channel-refuses-expired-builds`
+(lifecycle-44) and `@id:lifecycle-windows-pr-channel-refuses-expired-builds`
+(lifecycle-45) refuse a pull request whose builds have all expired and install
+nothing. `@id:lifecycle-linux-pr-channel-rejects-bad-checksum` (lifecycle-46)
+and `@id:lifecycle-windows-pr-channel-rejects-bad-checksum` (lifecycle-47)
+corrupt the bundle's checksum sidecar,
+`@id:lifecycle-linux-pr-channel-unknown-pull-request` (lifecycle-48) and
+`@id:lifecycle-windows-pr-channel-unknown-pull-request` (lifecycle-49) ask for a
+pull request GitHub does not know, and
+`@id:lifecycle-linux-pr-channel-malformed-number` (lifecycle-50) and
+`@id:lifecycle-windows-pr-channel-malformed-number` (lifecycle-51) give
+`pr-abc`, which is refused before `gh` is called; each installs nothing.
+`@id:lifecycle-linux-pr-channel-no-ci-run` (lifecycle-52) and
+`@id:lifecycle-windows-pr-channel-no-ci-run` (lifecycle-53) ask for a pull
+request with a head commit but no CI run,
+`@id:lifecycle-linux-pr-channel-gh-missing` (lifecycle-54) and
+`@id:lifecycle-windows-pr-channel-gh-missing` (lifecycle-55) run with no `gh` on
+`PATH`, and `@id:lifecycle-linux-pr-channel-refuses-download-base`
+(lifecycle-56) and `@id:lifecycle-windows-pr-channel-refuses-download-base`
+(lifecycle-57) set `ROCM_CLI_DOWNLOAD_BASE`, which is refused before `gh` is
+called. The Windows ones run on the Windows lifecycle lane; `install.ps1` has no
+hermetic script of its own, so the cases only `pr_channel.sh` covers (an empty
+head commit, a run whose artifact list cannot be read, a pull request artifact
+without its `.sha256`, and `ROCM_CLI_ARCHIVE` or `ROCM_CLI_DOWNLOAD_ONLY` with
+the channel, which `install.ps1` has no variable for) have no Windows test yet.
+
+`fake-gh` is as strict as the real API: it fails a call that names the wrong
+repository, lists runs for another commit than the pull request's head, or asks
+for or downloads another artifact than the platform's pull request bundle. It
+also hands the installer what the real API would, a newer run of another
+workflow with a live artifact and expired artifacts on the newest CI run, and
+applies the expiry and workflow filters only where the installer asks for them,
+so an installer that drops one of those fails the install scenarios (38 and
+39).
 
 The same path with the packaged binary, including `rocm uninstall` putting the
 bash and fish configs back and removing the fish completions, is
@@ -5018,7 +5209,8 @@ a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
-(`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
+(`@id:serve-smoke-failure-summary` and `@id:serve-vllm-extension-load-hint` carry
+the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it selects nothing and the run fails with
 `0 scenarios executed` (see [E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
@@ -5037,7 +5229,17 @@ the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
 log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
-ready, so a mock engine can then fail its smoke test. No process is spawned, and
+ready, so a mock engine can then fail its smoke test.
+`@id:serve-vllm-extension-load-hint` (serve-66) arms it with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=extension-load`, which plants the raw startup log
+of a launch killed by a vLLM compiled extension that failed to load and fails
+the launch with the vLLM engine's own message for that log. None of rocm-cli's
+own wording is planted, so the detected line and the `rocm diagnose --symptom`
+command the scenario asserts are computed by `extension_load_failure_hint` in
+[`engines/vllm/src/startup_diagnostics.rs`](../engines/vllm/src/startup_diagnostics.rs).
+That is the half `@id:diagnose-recognises-a-vllm-extension-load-failure`
+(diagnose-80) cannot reach: it drives `rocm diagnose --symptom` directly and
+never `rocm serve`. No process is spawned, and
 the seam compiles out entirely without the feature, so a build that does not
 enable it behaves exactly as the shipped binary does.
 
@@ -5052,7 +5254,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves both of those scenarios to a reported **skip**, not a silent pass. It
+compiled out and resolves every `@requires-oom-fault-injection` scenario to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -6148,7 +6350,8 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   Hugging Face token variable set, and checks that the listing, `HEAD` and
   range requests carry no `Authorization` or `Cookie` header.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
-  host-memory states (dedicated, none, unknown, APU), what is attached to a
+  host-memory states (dedicated, none, unknown, an APU's measured shared pool,
+  an APU whose pool could not be read), what is attached to a
   curated or non-GGUF answer (nothing beyond a note on a flag that did not
   apply), the `rocm diagnose` command a GGUF plan offers (the same flags, the
   reference quoted for a shell), the plan a sized estimate keeps when it
@@ -6163,6 +6366,46 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   and the note for a mask on a host whose GPUs differ in memory. Both are unit
   tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
   lane has GPUs of different sizes.
+- The APU memory pool (ROCMAI-912). An APU has no private VRAM: every adapter
+  query reports the fixed BIOS carve-out while the engine allocates from system
+  memory, so the pool a recipe minimum is compared against is read separately by
+  `detect_host_unified_memory_gib` in
+  [unified_memory.rs](../crates/rocm-core/src/host_gpu/unified_memory.rs).
+  Scenarios `diagnose-81`, `diagnose-82`, `diagnose-83` and `diagnose-84` plant a
+  simulated host
+  (`ROCM_CLI_TEST_HOST_ROOT`) carrying a KFD node and a DRM card with both
+  counters, so they run on the ungated lane and describe the same machine
+  whatever GPU the runner has: an APU judged on its aperture and reported
+  `degraded` because the pool is shared, an APU whose aperture is absent told so
+  rather than handed a fabricated figure, a discrete card judged on its own
+  VRAM with the aperture beside it ignored, and a host showing two AMD DRM cards
+  credited with neither card's aperture. `diagnose-84` needs one thing the other
+  three do not: a stub `amd-smi` on `PATH` reporting the single compute device,
+  plus the `ROCM_E2E_KFD_DEVICE` seam so the pre-flight will launch it. Without
+  it the sysfs VRAM fallback's own, older ordinal-ambiguity guard
+  (`read_drm_vram_usage` in [gpu_policy.rs](../apps/rocm/src/gpu_policy.rs))
+  withholds every row as soon as a second AMD card appears, and the host is
+  classified "GPU memory unmeasured" before the aperture rule is ever consulted —
+  so a two-card scenario planted through the host root alone would pass while
+  exercising nothing. The host this rule actually decides for is an APU beside an
+  AMD display adapter ROCm does not enumerate, which is what the stub models.
+  The Linux reader has its own planted
+  tree in [linux.rs](../crates/rocm-core/src/host_gpu/linux.rs). **The Windows
+  source has unit coverage only**: it reads
+  `DXGI_ADAPTER_DESC1::SharedSystemMemory` through COM, the host-simulation seam
+  re-roots Linux paths only, and no Windows lane runs on an APU whose pool
+  differs from its carve-out. The adapter choice and the implausible-reading rule
+  are pure functions tested on every platform; the FFI around them is not
+  exercised by any test.
+
+  Two more scenarios cover the rules that decide when the shared-pool cap does
+  *not* apply. `diagnose-85` asks about a `cpu_only` recipe on the same planted
+  APU and requires the verdict to stay `ready` with no GPU remediation: a recipe
+  that never allocates from the accelerator cannot be made worse by what that
+  accelerator's pool is shared with. `diagnose-86` asks the GGUF estimator about
+  a file on that host and requires the estimate to say the figure it compared
+  against is a shared ceiling rather than free memory, so the weaker claim is
+  visible to a user reading the estimate rather than only to the verdict.
 
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes

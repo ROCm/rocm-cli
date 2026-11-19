@@ -14,6 +14,16 @@ use std::path::Path;
 /// "the tail" of a failed launch. A change to the protocol budget moves both.
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = DEFAULT_LOG_TAIL_LINES;
 
+/// How far back [`extension_load_failure_hint`] reads the startup log.
+///
+/// Wider than the echoed tail on purpose. When a compiled extension fails to
+/// load, the engine core dies with the `AttributeError` and the API server then
+/// prints its own traceback, which alone fills the last
+/// [`STARTUP_FAILURE_LOG_TAIL_LINES`] lines. The line that names the failure
+/// sits above it. The log is created afresh for each launch, so a wider window
+/// still reads only this launch.
+const EXTENSION_LOAD_SCAN_LINES: usize = 2000;
+
 /// Builds a human-readable summary of the tail of the startup log, if available.
 /// Returns an empty string when no log is present or it cannot be read.
 ///
@@ -51,9 +61,13 @@ pub(crate) fn startup_log_context(log_path: Option<&Path>) -> String {
         return String::new();
     }
     let hint = format!(
-        "{}{}",
+        "{}{}{}",
         oom_utilization_hint(&summary),
-        import_failure_hint(&summary)
+        import_failure_hint(&summary),
+        log_path
+            .and_then(|p| summarize_startup_log_tail(p, EXTENSION_LOAD_SCAN_LINES).ok())
+            .map(|window| extension_load_failure_hint(&window))
+            .unwrap_or_default()
     );
     let summary = summary
         .lines()
@@ -70,6 +84,21 @@ pub(crate) fn startup_log_context(log_path: Option<&Path>) -> String {
     format!(
         "\n\nStartup log, last {STARTUP_FAILURE_LOG_TAIL_LINES} lines as the terminal drew \
          them:\n{summary}{hint}"
+    )
+}
+
+/// The whole message a vLLM launch that exited before becoming ready fails
+/// with: the bail line, then [`startup_log_context`] for the log it left.
+///
+/// One copy, because two surfaces produce it. The readiness wait raises it for
+/// real, and the e2e fault-injection hook in `rocm serve` raises it for a
+/// planted log on a host with no GPU (`@id:serve-vllm-extension-load-hint`).
+/// Were the hook to spell the message itself, the scenario could keep passing
+/// against text the real failure no longer prints.
+pub(crate) fn exited_before_ready_message(status: &str, log_path: Option<&Path>) -> String {
+    format!(
+        "vLLM server process exited before becoming ready (status: {status}){}",
+        startup_log_context(log_path)
     )
 }
 
@@ -208,6 +237,84 @@ fn import_failure_line(log_tail: &str) -> Option<&str> {
                 lower.contains("file \"") && lower.contains("_optional_torch_c_dlpack")
             })
         })
+}
+
+/// Points at `rocm diagnose` when the engine died on an op missing from one of
+/// vLLM's own op namespaces (`AttributeError: '_OpNamespace' '_C' object has no
+/// attribute '...'`), which means one of its compiled extensions did not load.
+/// Prints nothing otherwise.
+///
+/// The detected line it echoes is the warning vLLM logged when the extension
+/// failed to import, when the window has one, because that line names the cause
+/// (`GLIBC_2.38' not found`, a missing library). The warning alone does not fire
+/// the hint: vLLM carries on past it, and a launch that failed for another reason
+/// must not be pointed here.
+///
+/// The quoted symptom follows the rule the other two hints use: the user's own
+/// line when the checker scores it *on its own* and it is one intact
+/// single-quoted argument, the canonical symptom otherwise. The real line quotes
+/// its namespace and op name, so in practice it is the canonical symptom.
+///
+/// "On its own" is the load-bearing half here, and it is a stricter test than
+/// the one that decides whether to print a hint at all. [`is_extension_op_missing`]
+/// may read a row as this failure on provenance — the log belongs to the vLLM
+/// launch that just failed — but the command printed below is one the *user*
+/// runs later, with nothing but the quoted text, so a row whose only vLLM
+/// identification was its provenance would print a command that reports
+/// nothing. Such a row is echoed as the detected line and the canonical symptom
+/// is quoted instead.
+fn extension_load_failure_hint(window: &str) -> String {
+    let rows: Vec<String> = window
+        .lines()
+        .flat_map(rocm_core::terminal::rendered_lines)
+        .map(|row| row.trim().to_owned())
+        .filter(|row| !row.is_empty())
+        .collect();
+    let Some(op_missing) = rows.iter().rev().find(|row| is_extension_op_missing(row)) else {
+        return String::new();
+    };
+    let detected = rows
+        .iter()
+        .rev()
+        .find(|row| {
+            row.to_ascii_lowercase()
+                .contains("failed to import from vllm.")
+        })
+        .unwrap_or(op_missing);
+    let symptom = if rocm_core::quotable_in_single_quotes(op_missing)
+        && rocm_core::vllm_extension_load_symptom_is_diagnosable(op_missing)
+    {
+        op_missing.as_str()
+    } else {
+        rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+    };
+    format!(
+        "\n\nDetected a vLLM compiled extension that failed to load ({detected}).\n\
+         For conditional remediation, run `rocm diagnose --symptom '{symptom}'`."
+    )
+}
+
+/// Whether `row` is the error an op missing from one of vLLM's op namespaces
+/// raises. The substring test is a cheap filter, so the catalog only scores the
+/// few rows that pass it; the catalog decides, so this hint and `rocm diagnose`
+/// cannot disagree about which namespaces count.
+///
+/// The row is offered to the catalog with a `vllm` token in front of it, and
+/// that is not a way of forcing a match. `_C` is the ordinary name for a
+/// compiled extension across the PyTorch ecosystem, so the catalog refuses to
+/// read the namespace shape as vLLM's unless the text identifies vLLM — a user
+/// pasting an `xformers` error into `rocm diagnose --symptom` must not get
+/// vLLM's plan. Here the text is not a paste: it is a line out of the startup
+/// log of the vLLM launch that just failed, so vLLM's identity is established by
+/// provenance rather than by the line's own wording. Supplying it keeps the hint
+/// firing on a log that writes the error without vLLM's `(EngineCore pid=…)`
+/// prefix, while *which namespaces count* stays the catalog's decision alone —
+/// the drift this call exists to prevent.
+fn is_extension_op_missing(row: &str) -> bool {
+    let lower = row.to_ascii_lowercase();
+    lower.contains("_opnamespace")
+        && lower.contains("object has no attribute")
+        && rocm_core::vllm_extension_load_symptom_is_diagnosable(&format!("vllm {row}"))
 }
 
 /// Reads the last N lines from a log file and returns them as a formatted string.
@@ -1130,6 +1237,150 @@ WARNING Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot
         assert_eq!(
             quoted_symptom_argument(&hint),
             rocm_core::VLLM_IMPORT_CANONICAL_SYMPTOM
+        );
+    }
+
+    // Lines from a real launch on a glibc 2.36 host whose managed vLLM wheel
+    // carries an extension built against glibc 2.38 (ROCMAI-1058). The runtime
+    // path is shortened; the log ends lines with `\r\n` as the engine wrote them.
+    const EXTENSION_IMPORT_WARNING: &str = "WARNING 11-16 11:48:27 [rocm.py:53] Failed to import \
+         from vllm._C_stable_libtorch with ImportError(\"/lib/x86_64-linux-gnu/libc.so.6: version \
+         `GLIBC_2.38' not found (required by /opt/rt/site-packages/vllm/_C_stable_libtorch.abi3.so)\")";
+    const EXTENSION_OP_MISSING: &str = "(EngineCore pid=629513) ERROR 11-16 11:48:44 \
+         [core.py:1374] AttributeError: '_OpNamespace' '_C' object has no attribute \
+         'get_cuda_view_from_cpu_tensor'";
+
+    /// The shape of the real log: the warning near the top, the engine core's
+    /// error, then far more than the echoed tail of API-server traceback.
+    fn extension_load_log() -> String {
+        let mut log = vec![
+            "(APIServer pid=629241) INFO 11-16 11:48:20 [utils.py:253] non-default args".to_owned(),
+            EXTENSION_IMPORT_WARNING.to_owned(),
+            "(EngineCore pid=629513) INFO 11-16 11:48:40 [core.py:98] Initializing engine"
+                .to_owned(),
+            EXTENSION_OP_MISSING.to_owned(),
+        ];
+        for frame in 0..(2 * STARTUP_FAILURE_LOG_TAIL_LINES) {
+            log.push(format!(
+                "(APIServer pid=629241)   File \"/opt/rt/site-packages/vllm/frame_{frame}.py\", line {frame}, in run"
+            ));
+        }
+        log.push(
+            "(APIServer pid=629241) RuntimeError: Engine core initialization failed. See root \
+             cause above. Failed core proc(s): {}"
+                .to_owned(),
+        );
+        let mut text = log.join("\r\n");
+        text.push_str("\r\n");
+        text
+    }
+
+    #[test]
+    fn extension_load_hint_names_the_import_warning_and_a_diagnosable_command() {
+        let hint = extension_load_failure_hint(&extension_load_log());
+        assert_eq!(
+            hint,
+            format!(
+                "\n\nDetected a vLLM compiled extension that failed to load ({EXTENSION_IMPORT_WARNING}).\n\
+                 For conditional remediation, run `rocm diagnose --symptom '{}'`.",
+                rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+            ),
+            "the warning names the cause, so it is the line echoed; the real error \
+             quotes its namespace, so the command quotes the canonical symptom"
+        );
+        assert!(
+            rocm_core::vllm_extension_load_symptom_is_diagnosable(quoted_symptom_argument(&hint)),
+            "the command the hint prints must find fix-23: {hint}"
+        );
+    }
+
+    #[test]
+    fn extension_load_hint_echoes_the_error_when_no_warning_was_logged() {
+        let hint = extension_load_failure_hint(EXTENSION_OP_MISSING);
+        assert!(
+            hint.contains(&format!("failed to load ({EXTENSION_OP_MISSING})")),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn extension_load_hint_quotes_a_quotable_line_that_scores() {
+        let line = "AttributeError: _OpNamespace _rocm_C object has no attribute paged_attention";
+        let hint = extension_load_failure_hint(line);
+        assert_eq!(quoted_symptom_argument(&hint), line, "{hint}");
+        assert!(rocm_core::vllm_extension_load_symptom_is_diagnosable(
+            quoted_symptom_argument(&hint)
+        ));
+    }
+
+    #[test]
+    fn extension_load_hint_fires_on_a_row_whose_only_vllm_identification_is_the_log_it_came_from() {
+        // The catalog will not read a bare `_C` namespace error as vLLM's: `_C`
+        // is what torchvision, xformers and the rest call their extension too,
+        // so a paste of this line into `rocm diagnose --symptom` gets nothing.
+        let bare = "AttributeError: _OpNamespace _C object has no attribute reshape_and_cache";
+        assert!(
+            !rocm_core::vllm_extension_load_symptom_is_diagnosable(bare),
+            "the catalog must not take a bare `_C` error for vLLM's"
+        );
+        // Here the same text is a line of the failed vLLM launch's own startup
+        // log, so the hint still fires...
+        let hint = extension_load_failure_hint(bare);
+        assert!(hint.contains(&format!("failed to load ({bare})")), "{hint}");
+        // ...and the command it prints quotes the canonical symptom, not the
+        // row, because the user runs that command with the provenance gone.
+        assert_eq!(
+            quoted_symptom_argument(&hint),
+            rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+            "the printed command must report a cause when run on its own: {hint}"
+        );
+        assert!(rocm_core::vllm_extension_load_symptom_is_diagnosable(
+            quoted_symptom_argument(&hint)
+        ));
+    }
+
+    #[test]
+    fn extension_load_hint_stays_quiet_without_a_missing_vllm_op() {
+        for (case, log) in [
+            ("an empty log", ""),
+            (
+                "a healthy launch",
+                "(APIServer pid=1) INFO 11-16 11:50:02 [api_server.py:1820] Starting vLLM API server on http://127.0.0.1:8000",
+            ),
+            (
+                "an unrelated failure",
+                "torch.OutOfMemoryError: HIP out of memory",
+            ),
+            // vLLM logs the warning and carries on; a launch that then fails for
+            // another reason must not be pointed at fix-23.
+            ("the import warning alone", EXTENSION_IMPORT_WARNING),
+            (
+                "an op missing from PyTorch's own namespace",
+                "AttributeError: '_OpNamespace' '_c10d_functional' object has no attribute 'all_reduce'",
+            ),
+            (
+                "an unrelated AttributeError",
+                "AttributeError: 'NoneType' object has no attribute 'get_cuda_view_from_cpu_tensor'",
+            ),
+        ] {
+            assert_eq!(extension_load_failure_hint(log), "", "{case}");
+        }
+    }
+
+    #[test]
+    fn startup_log_context_finds_an_extension_failure_above_the_echoed_tail() {
+        let context = startup_log_context_for(&extension_load_log());
+        // The echoed tail is all API-server traceback: neither line that names
+        // the failure is in it, which is why the hint reads a wider window.
+        let (echoed, hint) = context
+            .split_once("\n\nDetected a vLLM compiled extension")
+            .unwrap_or_else(|| panic!("the extension-load hint must fire: {context}"));
+        assert!(!echoed.contains("_OpNamespace"), "{echoed}");
+        assert!(!echoed.contains("GLIBC_2.38"), "{echoed}");
+        assert!(hint.contains("GLIBC_2.38' not found"), "{hint}");
+        assert!(
+            !context.contains("Detected an engine import failure"),
+            "fix-17's hint must not fire on a vllm extension: {context}"
         );
     }
 }

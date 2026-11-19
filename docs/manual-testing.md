@@ -1648,7 +1648,32 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
 
-### 6c. The tensorizer upgrade on Python 3.14
+### 6c. A vLLM compiled extension that did not load
+
+Needs a Linux host whose glibc is older than the managed vLLM wheel was built
+against (for example Debian 12, glibc 2.36, with a wheel that needs 2.38). The
+behaviour is described in
+[Compiled extension load failures](vllm.md#compiled-extension-load-failures).
+
+```bash
+rocm serve <model> --engine vllm --verbose --foreground
+```
+
+Expected result:
+
+- The serve fails, and the startup failure message ends with
+  `Detected a vLLM compiled extension that failed to load (...)`. The line in
+  the parentheses is the `Failed to import from vllm._...` warning, which names
+  the missing `GLIBC_2.NN` or library, even though the echoed 80-line tail
+  above it shows only the API server's traceback.
+- It then prints `rocm diagnose --symptom '...'`. Paste that line unchanged: it
+  must report `fix-23-vllm-extension-load` first.
+- `rocm fix fix-23-vllm-extension-load` prints the plan and exits 0 without
+  changing anything. Running its step 2 inside `rocm engines shell vllm` raises
+  the loader's own `ImportError` for the extension that failed.
+- A serve that fails for any other reason does not print the paragraph.
+
+### 6d. The tensorizer upgrade on Python 3.14
 
 Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only
 published vLLM build for that line). On a fresh runtime:
@@ -1674,7 +1699,7 @@ On some GPU families `rocm install sdk` installs vLLM itself
 the `rocm engines install vllm` that follows then shows the block without the
 warning, and nothing more needs doing.
 
-### 6d. Naming the engine instead of editing the error
+### 6e. Naming the engine instead of editing the error
 
 Take the failing line from 6a without any `vllm` in it (the
 `torch.OutOfMemoryError: HIP out of memory ...` line from
@@ -1971,19 +1996,32 @@ Expected result:
   on that folder. It adds no line about how to remove anything (scenario
   `uninstall-09`).
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
-  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  is not an option and points to `--yes`, and ends with a `Try:` line that is
+  your command with `--yes` in place of `--force` (scenario `uninstall-17`); a near miss such as `--forc` is an
   unknown-argument error (exit 2). Neither
   suggests `--force-dev-binaries` (scenario `uninstall-10`).
   `rocm uninstall --help` ends with examples that start with a dry run
   (scenario `uninstall-11`).
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
-  and exit code 1, and removes nothing. On Linux or WSL, check it with no
+  and exit code 1, and removes nothing. The refusal ends with
+  `Try: rocm uninstall --keep-binaries --yes`, the same command with `--yes`
+  added (scenario `uninstall-16`). On Linux or WSL, check it with no
   terminal attached. A regression would delete real settings, data and cache,
-  so the command points `HOME` at a scratch folder itself:
+  so the command points `HOME` at a scratch folder itself, and the `Try:` line
+  is run in that same scratch `HOME`. The folder needs something to remove: on
+  an empty one the command reports that there is nothing to remove and exits 0,
+  so it never reaches the refusal. `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`
+  and `ROCM_CLI_CACHE_DIR` take precedence over `HOME`, so each command runs
+  without them. With `RUST_BACKTRACE` set, a backtrace is printed after the
+  `Try:` line:
 
   ```bash
-  HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+  scratch=$(mktemp -d) && mkdir -p "$scratch/.rocm" && touch "$scratch/.rocm/x"   # something to remove
+  env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+    rocm uninstall --keep-binaries < /dev/null   # expect the refusal and its Try: line; exit 1
+  env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+    rocm uninstall --keep-binaries --yes         # the Try: line; removes what was listed
   ```
 
   At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
@@ -2119,8 +2157,12 @@ Expected result:
 
 ## 13. Context-Size Estimate for a GGUF Model
 
-Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
-by design) and network access to Hugging Face. The point is to check the
+Needs a host with a Radeon GPU and network access to Hugging Face. A discrete
+card is what the figures below were calibrated on; an APU is also estimated,
+but against the shared memory pool its engine allocates from, so its report
+carries a note that the figure compared with is a ceiling the operating system
+draws on too, and only an APU whose pool could not be read answers
+`undetermined`. The point is to check the
 estimate against what a real load uses: the compute buffer and runtime reserve
 were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
 so a different GPU or build can differ. How close the estimate came on them is
@@ -2137,8 +2179,8 @@ Expected result:
   and the header read finishes in seconds.
 - The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
   at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
-  and the total, with this GPU's dedicated VRAM and the largest context that
-  fits.
+  and the total, with this GPU's dedicated VRAM (on an APU, its shared pool) and
+  the largest context that fits.
 - Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
   about 53% and 28% of the `f16` one.
 - Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
