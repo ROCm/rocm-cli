@@ -174,11 +174,11 @@ pub(crate) fn write_running_state(
     let (gpu_indices, gpu_name) = match gpu_indices {
         Some(indices) => (
             json!(indices),
-            json!(
-                uses_gpu
-                    .then(|| rocm_core::pinned_gpu_name(indices))
-                    .flatten()
-            ),
+            json!(recorded_gpu_name(
+                uses_gpu,
+                indices,
+                rocm_core::pinned_gpu_name
+            )),
         ),
         None => recorded_gpu_identity(state_path),
     };
@@ -223,6 +223,26 @@ pub(crate) fn write_running_state(
             "started_at_unix_ms": current_unix_millis(),
         }),
     )
+}
+
+/// The GPU name a launch records against its ordinals, or `None` when the
+/// launch attached no GPU at all.
+///
+/// `probe` is a parameter rather than a direct call to
+/// [`rocm_core::pinned_gpu_name`] so that both branches are reachable from a
+/// test on any host. That probe declines on a machine where more than one AMD
+/// GPU could be the one that answered, and on a machine with none — which is
+/// every CI runner — so a test that let it through would see `None` whether or
+/// not the `uses_gpu` gate was honoured, and would stay green if a `cpu_only`
+/// launch started probing the host again. The same reason
+/// `model_fit::unsupported_here_for` takes its `ruled_out` instead of
+/// re-deriving it.
+fn recorded_gpu_name(
+    uses_gpu: bool,
+    gpu_indices: &[u32],
+    probe: impl Fn(&[u32]) -> Option<String>,
+) -> Option<String> {
+    uses_gpu.then(|| probe(gpu_indices)).flatten()
 }
 
 /// The `gpu_indices` and `gpu_name` already on disk for this service, for a
@@ -604,8 +624,17 @@ mod tests {
     /// `rocm (AMD Instinct MI300X)` for a container that used no GPU — the
     /// invented claim the whole ticket exists to remove.
     ///
-    /// Drops to red if `write_running_state` probes for a name regardless of
-    /// the policy, or if `reported_device` goes back to hardcoding `rocm`.
+    /// Drops to red if the policy stops gating the probe, or if
+    /// `reported_device` goes back to hardcoding `rocm`.
+    ///
+    /// The gate is asserted through [`recorded_gpu_name`] with a stub probe
+    /// that always answers, because the real one
+    /// ([`rocm_core::pinned_gpu_name`]) declines on a host with no AMD GPU or
+    /// with more than one — so on every CI runner the recorded name is `None`
+    /// either way, and reading it off the written state file alone would pass
+    /// whether or not the policy was consulted. That assertion is kept too,
+    /// since it is what the file actually ends up holding; it is just not the
+    /// one carrying the claim.
     #[test]
     fn a_cpu_only_launch_claims_neither_rocm_nor_a_gpu_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -623,11 +652,26 @@ mod tests {
         )
         .unwrap();
 
+        // The gate itself, on a probe that cannot decline: a `cpu_only` launch
+        // must not reach it even when the host would answer.
+        let always_answers = |_: &[u32]| Some("AMD Instinct MI300X".to_owned());
+        assert_eq!(
+            recorded_gpu_name(false, &[0], always_answers),
+            None,
+            "a cpu-only launch must not probe the host for a GPU name"
+        );
+        assert_eq!(
+            recorded_gpu_name(true, &[0], always_answers),
+            Some("AMD Instinct MI300X".to_owned()),
+            "premise: with a GPU attached the same probe is consulted, so the \
+             assertion above is about the policy and not about the probe"
+        );
+
         let state = read_service_state(&path).unwrap();
         assert_eq!(
             state.get("gpu_name"),
             Some(&Value::Null),
-            "a cpu-only launch must not have the host GPU probed for it: {state}"
+            "and the written state file carries no name: {state}"
         );
         assert_eq!(reported_device(&state), "cpu");
 
