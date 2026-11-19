@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The suite's chat round trip against a served endpoint: discover the model
-//! over `/models`, then POST one chat completion to it.
+//! The suite's chat round trip against a served endpoint: discover the
+//! scenario's model over `/models`, then POST one chat completion to it.
 //!
 //! The round trip runs as its own task on the runtime's worker threads, not on
 //! the thread that polls the scenarios. cucumber polls every in-flight scenario
@@ -16,9 +16,17 @@
 
 use std::time::Duration;
 
+use crate::model_id::model_ids_match;
+
 /// Discover the served model id over `{endpoint}/models` and POST one chat
 /// completion to it, returning the decoded response. `tools` is merged into the
 /// request body for the tool-definitions scenario.
+///
+/// `expected_model` is the model the scenario served. The id sent is the entry
+/// of `/models` that identifies it (see [`pick_model`]), because a router such
+/// as Lemonade's lists every model it has loaded, in no order the scenario
+/// controls, and the first entry may belong to someone else. `None` keeps the
+/// old behaviour of taking the first entry, for a scenario that names no model.
 ///
 /// Makes one attempt per entry of `attempt_budgets`, each bounded by its entry,
 /// and moves to the next only on a TRANSPORT failure of either request (the
@@ -32,16 +40,18 @@ use std::time::Duration;
 ///
 /// # Panics
 ///
-/// If every attempt fails in transport, a reply is not JSON, or `/models` names
-/// no model.
+/// If every attempt fails in transport, a reply is not JSON, `/models` names no
+/// model, or none of the models it names is `expected_model`.
 pub async fn request_chat_completion(
     endpoint: &str,
+    expected_model: Option<&str>,
     prompt: &str,
     tools: Option<serde_json::Value>,
     attempt_budgets: &[Duration],
 ) -> serde_json::Value {
     let exchange = tokio::spawn(exchange(
         endpoint.to_owned(),
+        expected_model.map(str::to_owned),
         prompt.to_owned(),
         tools,
         attempt_budgets.to_vec(),
@@ -59,6 +69,7 @@ pub async fn request_chat_completion(
 
 async fn exchange(
     endpoint: String,
+    expected_model: Option<String>,
     prompt: String,
     tools: Option<serde_json::Value>,
     attempt_budgets: Vec<Duration>,
@@ -97,10 +108,8 @@ async fn exchange(
             .json()
             .await
             .unwrap_or_else(|e| panic!("GET {models_url} returned non-JSON: {e}"));
-        let model = models["data"][0]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no model id in response: {models}"))
-            .to_string();
+        let model = pick_model(&models, expected_model.as_deref())
+            .unwrap_or_else(|reason| panic!("GET {models_url}: {reason}"));
 
         let mut body = serde_json::json!({
             "model": model,
@@ -147,6 +156,44 @@ async fn exchange(
     );
 }
 
+/// The id in a `/models` reply to send the chat to.
+///
+/// With an `expected` model, the entry that IS it: an id equal to it, else the
+/// first one [`model_ids_match`] accepts (Lemonade lists catalog names, vLLM the
+/// repo id, and the two spell one model differently). Taking `data[0]` instead
+/// sent serve-57's chat to whichever model its router listed first, and the
+/// reply then named that model rather than the scenario's. With no `expected`
+/// model, the first entry.
+///
+/// # Errors
+///
+/// The reason, with every id the server listed, when the reply names no model
+/// or none of them is `expected`.
+fn pick_model(models: &serde_json::Value, expected: Option<&str>) -> Result<String, String> {
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .map(|data| data.iter().filter_map(|m| m["id"].as_str()).collect())
+        .unwrap_or_default();
+    let Some(first) = ids.first() else {
+        return Err(format!("no model id in response: {models}"));
+    };
+    let Some(expected) = expected else {
+        return Ok((*first).to_owned());
+    };
+    ids.iter()
+        .find(|id| **id == expected)
+        .or_else(|| ids.iter().find(|id| model_ids_match(id, expected)))
+        .map(|id| (*id).to_owned())
+        .ok_or_else(|| {
+            format!(
+                "the server does not list the scenario's model '{expected}'; it lists {} \
+                 model(s): {}",
+                ids.len(),
+                ids.join(", ")
+            )
+        })
+}
+
 /// A transport failure spelled out well enough to triage from a CI log alone.
 ///
 /// `reqwest::Error`'s `Display` prints only its KIND — a client timeout and a
@@ -178,7 +225,7 @@ fn describe_request_error(error: &reqwest::Error) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::request_chat_completion;
+    use super::{pick_model, request_chat_completion};
     use crate::chat_response_is_successful;
     use crate::mock_server::MockServer;
 
@@ -199,10 +246,72 @@ mod tests {
         let budgets = [budget];
 
         let (response, ()) = tokio::join!(
-            request_chat_completion(&endpoint, "Hello", None, &budgets),
+            request_chat_completion(&endpoint, Some("TestModel/E2E-1B"), "Hello", None, &budgets),
             blocking_step,
         );
 
         assert!(chat_response_is_successful(&response), "{response}");
+    }
+
+    fn listing(ids: &[&str]) -> serde_json::Value {
+        let data: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "object": "model"}))
+            .collect();
+        serde_json::json!({"object": "list", "data": data})
+    }
+
+    /// serve-57: the router lists another model first. The chat goes to the
+    /// scenario's model, not to `data[0]`.
+    #[test]
+    fn the_scenarios_model_is_picked_even_when_the_router_lists_another_first() {
+        let models = listing(&["Qwen3-0.6B-GGUF", "Qwen3.5-0.8B-GGUF"]);
+
+        assert_eq!(
+            pick_model(&models, Some("Qwen3.5-0.8B-GGUF")).as_deref(),
+            Ok("Qwen3.5-0.8B-GGUF")
+        );
+    }
+
+    /// vLLM lists the repo id while the scenario may carry a catalog spelling:
+    /// the normalised match still finds it, and an exact id wins over it.
+    #[test]
+    fn a_differently_spelled_id_of_the_same_model_is_picked_and_an_exact_id_wins() {
+        let spelled = listing(&["other/Model-A", "unsloth/Qwen3-0.6B-Q4_0.gguf"]);
+        assert_eq!(
+            pick_model(&spelled, Some("Qwen3-0.6B-GGUF")).as_deref(),
+            Ok("unsloth/Qwen3-0.6B-Q4_0.gguf")
+        );
+
+        let both = listing(&["Qwen3-0.6B-Q4_0.gguf", "Qwen3-0.6B-GGUF"]);
+        assert_eq!(
+            pick_model(&both, Some("Qwen3-0.6B-GGUF")).as_deref(),
+            Ok("Qwen3-0.6B-GGUF")
+        );
+    }
+
+    /// A server that does not list the model fails the request with every id
+    /// it did list, rather than quietly chatting with a different model.
+    #[test]
+    fn a_missing_model_names_every_model_the_server_listed() {
+        let models = listing(&["Qwen3-0.6B-GGUF", "Llama-3.2-1B-GGUF"]);
+
+        let reason = pick_model(&models, Some("Qwen3.5-0.8B-GGUF")).expect_err("must not match");
+
+        assert!(reason.contains("Qwen3.5-0.8B-GGUF"), "{reason}");
+        assert!(reason.contains("2 model(s)"), "{reason}");
+        assert!(
+            reason.contains("Qwen3-0.6B-GGUF, Llama-3.2-1B-GGUF"),
+            "{reason}"
+        );
+    }
+
+    /// A scenario that names no model keeps taking the first entry, and an
+    /// empty listing is still an error.
+    #[test]
+    fn without_an_expected_model_the_first_entry_is_used() {
+        let models = listing(&["first", "second"]);
+        assert_eq!(pick_model(&models, None).as_deref(), Ok("first"));
+        assert!(pick_model(&listing(&[]), None).is_err());
     }
 }

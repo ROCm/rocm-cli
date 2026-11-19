@@ -374,9 +374,10 @@ On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
 wiki, overwriting it each night (the page header names the run, commit and
 date). It skips cancelled runs and runs that consolidated no platforms. It also
-skips (silently, leaving the previous page in place) when `e2e-report-nightly`
-fails, which includes any lane's `release` or `nightly` leg dying before it
-uploads its report. One-time
+runs when `e2e-report-nightly` failed, which includes any lane's `release` or
+`nightly` leg dying before it uploads its report: that is a broken nightly, and
+the grid is then most worth reading. The page guard still leaves the previous
+page in place when the consolidation has no platform table. One-time
 setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
@@ -425,11 +426,11 @@ The narrative job drafts prose from those facts via `actions/ai-inference`
 fail without blocking the table). `publish-release-readiness-wiki` then
 publishes the verdict table, plus the narrative if one was produced, to the
 `Release-Readiness` wiki page, gated on `main`/repo like `publish-e2e-wiki`
-and sharing its one-time wiki setup and skip-on-degenerate-table guard — but
-unlike `publish-e2e-wiki`, it still runs (and publishes an explicit
-"evidence unavailable" notice) when `release-readiness-nightly` fails
-outright, instead of leaving the wiki showing a stale verdict with no sign
-it's stale.
+and sharing its one-time wiki setup and skip-on-degenerate-table guard. Like
+`publish-e2e-wiki`, it still runs after its upstream job failed, and it also
+publishes an explicit "evidence unavailable" notice when
+`release-readiness-nightly` fails outright, instead of leaving the wiki showing
+a stale verdict with no sign it's stale.
 
 The lane artifacts are named canonically (`e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`,
 `e2e-gpu-report`, `e2e-gpu-selfhosted-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
@@ -593,6 +594,65 @@ Dispatch the GPU lanes with, e.g.:
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
 
+## Nightly lanes that never get a runner
+
+GitHub cannot time a job out while it waits for a runner: `timeout-minutes`
+only counts once a runner has taken the job, and a job that is still queued
+after 24 hours is cancelled. A lane whose runner pool is offline or saturated
+therefore held `nightly.yml` pending for a day, and the report and readiness
+jobs, which wait on every lane, never ran.
+
+`nightly.yml` bounds that wait itself:
+
+- `e2e-lanes-settled` stands in for the lanes in the report job's `needs`. It
+  polls the run's own job list
+  ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
+  once every lane leg has finished or can be given up on: a leg still queued
+  after `QUEUE_DEADLINE_MINUTES` (60, or the `queue_deadline_minutes` dispatch
+  input) is abandoned unless another leg of the same lane has started or
+  finished (a pool with one runner serves a lane's `release` and `nightly` legs
+  one after the other, so the queued leg is waiting its turn, not unserved).
+  A leg that started, or that is queued behind a started sibling, is waited for
+  but abandoned at `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold
+  the wait either.
+  A lane that starts just inside the queue deadline still has its full
+  `timeout-minutes`, so the script refuses a queue deadline that, plus
+  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
+  minutes, at most 120.
+- `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
+  whatever finished. An abandoned lane has no report artifact, so the report
+  job's missing-report check flags it by name, the consolidated grid shows the
+  gap and readiness reads it as a failed report rather than as success.
+- `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
+  which is what stops the abandoned legs from holding the run open until the
+  24-hour limit. It runs only when something was abandoned or the settle job
+  itself failed or was cancelled (nothing else bounds the wait then; GitHub
+  reports a job killed by its own `timeout-minutes` as `cancelled`), and only
+  after the report and readiness jobs are done, because cancelling the run also
+  skips any job that is still gated on `!cancelled()`. The settle script fails
+  itself when the run's job list stays unreadable for long enough to span the
+  hard deadline, rather than polling until the job's cap.
+
+To try a change to these jobs from a branch without publishing a nightly
+release, dispatch the workflow with `skip_build` set:
+
+```bash
+gh workflow run nightly.yml --ref <branch> -f skip_build=true
+```
+
+Add `-f queue_deadline_minutes=5` to give up on lanes that have no runner after
+five minutes, which exercises the give-up and cancel path without a long wait.
+
+That skips the Linux and Windows builds and the release publish, and runs the
+lanes, the report, readiness and the settle job. The wiki publishers run only
+from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
+
+A lane added to `nightly.yml` must be added to the `LANES` list of
+`e2e-lanes-settled`;
+`nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
+and also fails if a job waits on a lane directly. The per-PR workflow
+does not use this mechanism.
+
 ## The shared pre-warmed runtime
 
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
@@ -704,6 +764,21 @@ that runtime's own stale composition via repair, but never follows
 `update`/`repair` toward the index's latest key, and installs a fresh
 side-by-side runtime only when no match is found. See
 [`decide()`](../xtask/src/e2e_prewarm.rs)'s doc comment for the full rationale.
+
+Two failures of the pre-warm's installs are not the lane's failure:
+
+- **A server error from the index.** `rocm install sdk` and `rocm update --apply`
+  are run again, up to four attempts a minute apart, when the CLI reports
+  `HTTP 5xx while fetching <url>`. Anything else, a 404 included, fails on the
+  first attempt.
+- **vLLM refusing an unpinned nightly SDK** (`has no static build pin`). The pre-warm
+  records the reason in `e2e-engine-not-applicable.txt` in the runtimes directory,
+  and the suite reports the scenarios that serve with vLLM (serve, bench and chat scenarios, and any that pin the engine) as not applicable
+  instead of running each into the refusal. A pinned nightly, the release channel
+  and every other engine's failure stay fatal. This is temporary: remove it, the
+  marker and its reader in the harness once vLLM wheels for the 10.3 SDK exist and
+  the discover table in
+  [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) has a 10.3 row.
 
 ## Blocking vs. non-blocking
 
