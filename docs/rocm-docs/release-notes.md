@@ -14,8 +14,7 @@ SPDX-License-Identifier: MIT
 # ROCm CLI 0.3.0 release notes
 
 These release notes describe notable changes since the previous ROCm CLI
-release. For the full list, see the
-[ROCm CLI releases](https://github.com/ROCm/rocm-cli/releases) on GitHub.
+release.
 
 ## Release highlights
 
