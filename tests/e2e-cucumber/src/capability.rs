@@ -186,8 +186,16 @@ pub struct HostCapability {
     /// the harness refuses to run (see `lane_verdict::preflight_verdict`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_error: Option<String>,
+    /// Why the host's serving engine cannot be installed into the pre-warmed
+    /// shared runtime although the engine runs on this hardware, as the
+    /// pre-warm recorded it ([`ENGINE_NOT_APPLICABLE_MARKER`]). `None` when it
+    /// left no such record. The scenarios that need that engine are skipped
+    /// with this reason instead of each failing on the missing engine; see
+    /// [`engine_not_applicable_reason`].
+    pub engine_not_applicable: Option<String>,
 }
 
+use e2e_report::ENGINE_NOT_APPLICABLE_MARKER;
 /// Environment variable `xtask e2e` sets to `1` when it compiled the binary
 /// under test with the `rocm/e2e-oom-fault-injection` feature.
 ///
@@ -552,6 +560,11 @@ fn capability_from_probes(
         oom_fault_injection_from_env(std::env::var_os(OOM_FAULT_INJECTION_ENV).as_deref());
     let case_sensitive_fs = probe_case_sensitive_fs(root);
     let dir_permissions_bind = probe_dir_permissions_bind(root);
+    let engine_not_applicable = engine_not_applicable_reason(
+        std::env::var_os("E2E_SHARED_RUNTIMES_DIR")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    );
 
     HostCapability {
         os_family,
@@ -567,7 +580,19 @@ fn capability_from_probes(
         dir_permissions_bind,
         driver_status,
         probe_error,
+        engine_not_applicable,
     }
+}
+
+/// The reason `xtask e2e-prewarm` left in the shared runtimes directory for not
+/// installing the serving engine, if it left one.
+///
+/// An absent or empty file is no record: the engine is then expected to be
+/// there, and a scenario that cannot find it fails as it always did.
+pub fn engine_not_applicable_reason(runtimes_dir: Option<&std::path::Path>) -> Option<String> {
+    let text = std::fs::read_to_string(runtimes_dir?.join(ENGINE_NOT_APPLICABLE_MARKER)).ok()?;
+    let reason = text.trim();
+    (!reason.is_empty()).then(|| reason.to_owned())
 }
 
 /// Whether a directory with its write bits cleared refuses to create a file for
@@ -1532,6 +1557,7 @@ mod tests {
             dir_permissions_bind: true,
             driver_status: String::new(),
             probe_error: None,
+            engine_not_applicable: None,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -1551,6 +1577,7 @@ mod tests {
             dir_permissions_bind: true,
             driver_status: String::new(),
             probe_error: None,
+            engine_not_applicable: None,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -2466,6 +2493,7 @@ Local model engines
             dir_permissions_bind: true,
             driver_status: "wsl_rocdxg_missing".to_owned(),
             probe_error: None,
+            engine_not_applicable: None,
         };
         let base = "detected_gfx_target=gfx1151, wsl=true, driver_status=wsl_rocdxg_missing";
         assert_eq!(
@@ -2895,5 +2923,26 @@ Local model engines
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_prewarms_engine_marker_is_read_as_the_reason() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        assert_eq!(engine_not_applicable_reason(Some(tmp.path())), None);
+        assert_eq!(engine_not_applicable_reason(None), None);
+
+        let marker = tmp.path().join(ENGINE_NOT_APPLICABLE_MARKER);
+        std::fs::write(&marker, "  \n").expect("write marker");
+        assert_eq!(
+            engine_not_applicable_reason(Some(tmp.path())),
+            None,
+            "an empty file records no reason"
+        );
+
+        std::fs::write(&marker, "vllm has no build for this SDK\n").expect("write marker");
+        assert_eq!(
+            engine_not_applicable_reason(Some(tmp.path())).as_deref(),
+            Some("vllm has no build for this SDK")
+        );
     }
 }

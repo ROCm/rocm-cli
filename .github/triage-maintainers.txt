@@ -1,0 +1,17 @@
+# Maintainers eligible for round-robin assignment of new issues, one GitHub
+# login per line. Read by scripts/triage_issue.py. Mirrors the members of
+# @ROCm/rocm-cli-maintainers; it is a file rather than a team lookup because
+# listing team members needs an org-read token the workflow does not hold.
+# Order matters: the next assignee is the issue number modulo the list length.
+fredespi
+r0x0r
+juhovainio
+rominf
+amitkumar-amd
+tomastola
+siloteemu
+volen-silo
+jussielo-amd
+michaelroy-amd
+johnl-amd
+amd-mkarvir

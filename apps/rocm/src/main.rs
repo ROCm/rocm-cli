@@ -24,6 +24,7 @@ mod cli_report;
 mod comfyui;
 mod config_cmd;
 mod dash;
+mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
@@ -61,6 +62,7 @@ mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
 mod serve_port;
+mod serve_progress;
 mod serve_recipe;
 mod serve_summary;
 mod service_control;
@@ -944,8 +946,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             force_dev_binaries,
             force,
         }) => {
-            uninstall::reject_force(force.is_some())?;
-            uninstall(UninstallOptions {
+            let options = UninstallOptions {
                 yes,
                 dry_run,
                 keep_binaries,
@@ -953,7 +954,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 keep_data,
                 keep_cache,
                 force_dev_binaries,
-            })
+            };
+            uninstall::reject_force(force.is_some(), &options)?;
+            uninstall(options)
         }
         Some(Command::Completions { shell }) => {
             let mut cmd = completion_command();

@@ -818,6 +818,7 @@ mod tests {
             dir_permissions_bind: true,
             driver_status: String::new(),
             probe_error: None,
+            engine_not_applicable: None,
         };
         let pass = crate::expectation::Expectation::ExpectPass;
         let skip = crate::expectation::Expectation::Skip {
