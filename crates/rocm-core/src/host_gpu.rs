@@ -14,7 +14,9 @@
 //!
 //! The probes live in child modules: `capture` (optional-command capture),
 //! `os_facts` (kernel, distro, CPU and RAM), `linux` (sysfs, KFD and DRM),
-//! `gpu_visibility` (which GPUs this process may use), `windows_inventory` (the
+//! `gpu_visibility` (which GPUs this process may use), `unified_memory` (the
+//! pool an APU's engine allocates a model from, which is neither its VRAM
+//! carve-out nor installed RAM), `windows_inventory` (the
 //! Windows display-adapter inventory), `wsl` (WSL detection and the Windows host
 //! driver as seen from the guest), `render` (the `rocm examine` text of an
 //! `ExamineSummary`), `diagnostics` (the GPU detection diagnostics text) and
@@ -54,6 +56,7 @@ mod gpu_visibility;
 pub(crate) mod linux;
 mod os_facts;
 mod render;
+mod unified_memory;
 mod windows_inventory;
 mod wsl;
 
@@ -71,8 +74,10 @@ use linux::detect_linux_amdgpu_driver_version;
 use linux::detect_linux_primary_gpu_name;
 pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
+pub(crate) use linux::pci_bus_device_function;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
+pub use unified_memory::detect_host_unified_memory_gib;
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
 use windows_inventory::parse_windows_examine_inventory;
@@ -83,12 +88,13 @@ use windows_inventory::{
 };
 #[cfg(target_os = "linux")]
 use wsl::detect_wsl_windows_display_probe_text;
+pub use wsl::ldconfig_cache;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
 pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
-    ldconfig_cache, ldconfig_lists_librocdxg,
+    ldconfig_lists_librocdxg,
 };
 use wsl::{detect_wsl_windows_display_gfx_target_fast, wsl_driver_summary};
 

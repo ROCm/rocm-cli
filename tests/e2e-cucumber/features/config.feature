@@ -114,3 +114,19 @@ Feature: Configuration mutations
     Then the CLI confirms the telemetry mode and states the policy
     And the settings file is still a link to that file
     And the linked-to file records telemetry as off
+
+  # A command that changes a setting loads the settings file, changes one thing
+  # and saves the whole file back. Run side by side, a command that loaded
+  # before another saved used to write its stale copy over that save, so a
+  # setting the user had just changed quietly went back to what it was, while
+  # both commands reported success. Seven commands here each change their own
+  # setting over and over at the same time (setters, clear commands and each
+  # set-engine flag), and before every change check that their previous one is
+  # still in the file. No GPU, no network: mock lane.
+  @id:config-concurrent-changes-all-kept
+  Scenario: config-12 - Settings changed by commands running at the same time are all kept
+    Given a fresh CLI configuration
+    When seven commands change different settings over and over at the same time
+    Then every one of those commands succeeded
+    And no command found a change it had made undone
+    And the settings file keeps the last value each command set

@@ -78,6 +78,10 @@ pub(crate) struct TheRockRuntimeManifest {
     pub sdk_torch: Option<String>,
     #[serde(default)]
     pub installed_at_unix_ms: Option<u128>,
+    /// The wheel index the SDK install resolved its packages from (nightly or
+    /// release); absent in manifests written before it was recorded.
+    #[serde(default)]
+    pub index_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -355,6 +359,29 @@ fn sort_manifests_newest_install_first(manifests: &mut [(PathBuf, TheRockRuntime
             .then_with(|| left.runtime_key.cmp(&right.runtime_key))
             .then_with(|| left_path.cmp(right_path))
     });
+}
+/// The wheel index the SDK in the runtime whose interpreter is `python` was installed
+/// from, as its manifest in `paths`' runtime registry records it. `Ok(None)` means no
+/// manifest for that interpreter recorded one; `Err` means the registry could not be read.
+///
+/// A discover row that reuses the SDK's own torch stack has to fetch those exact builds
+/// again from the index they came from: a nightly SDK's torch is not on the release
+/// index and a release SDK's is not on the nightly one.
+pub(crate) fn recorded_sdk_index_url(paths: &AppPaths, python: &Path) -> Result<Option<String>> {
+    let registry = paths.data_dir.join("runtimes").join("registry");
+    let manifests = load_runtime_manifests_in(&registry, None)?;
+    Ok(sdk_index_url_for_python(&manifests, python))
+}
+/// The `index_url` of the manifest whose interpreter is `python`, if it recorded a
+/// non-empty one.
+fn sdk_index_url_for_python(manifests: &[TheRockRuntimeManifest], python: &Path) -> Option<String> {
+    manifests
+        .iter()
+        .find(|manifest| manifest.python_executable.as_deref() == Some(python))
+        .and_then(|manifest| manifest.index_url.as_deref())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
 }
 /// The torch build the SDK installed into this runtime, as its manifest records it.
 ///
@@ -655,7 +682,8 @@ pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
 /// belongs on the loader path.
 enum CompatDirSignal {
     /// `ensure_therock_compat_shims`'s answer is not passed in to this
-    /// derivation (the running-state payload path, which never calls it).
+    /// derivation (the running-state payload path and the read-only extension
+    /// probe, which never call it).
     /// Falls back to a read-only directory listing of whatever is already on
     /// disk: not authoritative, but the best available signal without
     /// performing a write.
@@ -717,8 +745,9 @@ fn therock_library_path_entries_inner(
         // `ensure_therock_compat_shims` says a shim is needed this launch —
         // this is what keeps a leftover stub from an earlier run (the host
         // has since gained a real `libmpi_cxx.so*`) from shadowing the loader
-        // path. On the running-state payload path (`Unchecked`), which never
-        // calls that function, fall back to a read-only directory listing of
+        // path. On the running-state payload path and the read-only extension
+        // probe (`Unchecked`), which never call that function, fall back to a
+        // read-only directory listing of
         // whatever is already there: not authoritative, but the best
         // available signal without performing a write.
         match compat_dir_signal {
@@ -738,7 +767,8 @@ fn therock_library_path_entries_inner(
 /// Whether `compat_dir` currently has any entry at all — a plain directory
 /// listing, not a check for a specific shim [`ensure_therock_compat_shims`]
 /// would recognize. This is the fallback [`therock_library_path_entries`]
-/// uses on the running-state payload path, which never calls that function
+/// uses on the running-state payload path and in the read-only extension probe,
+/// which never call that function
 /// and so has no authoritative answer to consult; see
 /// [`therock_library_path_entries_for_launch`] for the path that does.
 fn compat_dir_has_shims(compat_dir: &Path) -> bool {
@@ -747,9 +777,9 @@ fn compat_dir_has_shims(compat_dir: &Path) -> bool {
         .is_ok_and(|mut entries| entries.next().is_some())
 }
 /// Materializes the runtime-owned OpenMPI compatibility shims that
-/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call it
 /// from the launch path, before building the environment a server is spawned
-/// with — never from running-state payload assembly, which only needs the
+/// with (the serve gate's probe does too, ahead of it) — never from running-state payload assembly, which only needs the
 /// path list `therock_library_path_entries` derives, not the shims
 /// themselves. Returns the compat dir when a shim is needed for *this* launch:
 /// the `libmpi_cxx` stub `ensure_mpi_cxx_compat` wrote, or the amd-smi link
@@ -845,6 +875,38 @@ fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_sdk_index_comes_from_the_manifest_of_that_interpreter() {
+        let manifest = |python: &str, index: Option<&str>| TheRockRuntimeManifest {
+            python_executable: Some(PathBuf::from(python)),
+            index_url: index.map(str::to_owned),
+            ..Default::default()
+        };
+        let manifests = vec![
+            manifest(
+                "/rt/nightly/bin/python",
+                Some("https://nightly.example/whl"),
+            ),
+            manifest(
+                "/rt/release/bin/python",
+                Some(" https://stable.example/whl "),
+            ),
+            manifest("/rt/old/bin/python", None),
+            manifest("/rt/blank/bin/python", Some("  ")),
+        ];
+        let lookup = |python: &str| sdk_index_url_for_python(&manifests, Path::new(python));
+        assert_eq!(
+            lookup("/rt/nightly/bin/python").as_deref(),
+            Some("https://nightly.example/whl")
+        );
+        assert_eq!(
+            lookup("/rt/release/bin/python").as_deref(),
+            Some("https://stable.example/whl")
+        );
+        assert_eq!(lookup("/rt/old/bin/python"), None);
+        assert_eq!(lookup("/rt/blank/bin/python"), None);
+        assert_eq!(lookup("/rt/unknown/bin/python"), None);
+    }
     #[test]
     fn managed_env_reflects_managed_runtime_manifest_source() {
         let mut runtime = VllmRuntime {
@@ -988,11 +1050,14 @@ mod tests {
         assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
             "10.1.0a20260611"
         ))));
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.2.0"
+        ))));
     }
     #[test]
     fn runtime_has_discover_build_rejects_a_line_with_no_discover_row() {
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
-            Some("10.2.0")
+            Some("10.3.0")
         )));
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
             Some("7.2.3")

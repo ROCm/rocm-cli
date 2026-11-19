@@ -17,6 +17,7 @@
 //! by [`LifecycleState`]'s `Drop`, even when a step fails.
 
 use std::fmt::Write as _;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -60,6 +61,22 @@ pub struct LifecycleState {
     /// A shell profile the installer is pointed at through
     /// `ROCM_CLI_SHELL_PROFILE`; `None` means the default `~/.bashrc`.
     custom_profile: Option<PathBuf>,
+    /// Installer output captured straight off a pseudo-terminal, carriage
+    /// returns and all. `last_output` cannot serve here: it comes from a piped
+    /// `Command`, which the installer sees as a non-terminal and answers with
+    /// plain lines, so the progress drawing this holds never appears in it.
+    last_terminal_output: String,
+    /// The same bytes after a terminal emulator has drawn them, one row per
+    /// line. Wrapping is something the emulator does when a line overruns the
+    /// margin, never something the writer puts in the byte stream, so a torn
+    /// progress bar is only visible once the stream has been rendered. Raw
+    /// bytes answer "how wide was each frame", this answers "what did the user
+    /// end up looking at".
+    last_terminal_screen: String,
+    /// The pty width the last run used. Assertions read this rather than the
+    /// `PTY_COLS` constant, so a scenario driving a different width is checked
+    /// against the terminal it actually had instead of silently against 80.
+    last_pty_cols: u16,
     /// The login shell (`$SHELL`) the installer is run under; `None` leaves the
     /// runner's own.
     login_shell: Option<String>,
@@ -68,6 +85,12 @@ pub struct LifecycleState {
     fish_config_before_install: Option<String>,
     /// What the installer is told about `ROCM_CLI_REQUIRE_SIGNATURE`.
     signature_requirement: SignatureRequirement,
+    /// The directory `fake-gh` serves a pull request's CI builds from, and the
+    /// directory holding the planted `gh`; set by the pull request scenarios.
+    gh_stub_dir: Option<PathBuf>,
+    /// Set by the scenario where the machine has no GitHub CLI, so the
+    /// installer's `PATH` is built without one instead of with `fake-gh`.
+    gh_missing: bool,
 }
 
 /// What a scenario's installer runs are told about `ROCM_CLI_REQUIRE_SIGNATURE`.
@@ -600,9 +623,14 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_cache: None,
         profile_before_install: None,
         custom_profile: None,
+        last_terminal_output: String::new(),
+        last_terminal_screen: String::new(),
+        last_pty_cols: 0,
         login_shell: None,
         fish_config_before_install: None,
         signature_requirement: SignatureRequirement::Required,
+        gh_stub_dir: None,
+        gh_missing: false,
     });
 }
 
@@ -2141,4 +2169,1112 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         // themselves (`ROCM_CLI_*_DIR`), so uninstall removes each one whole.
         assert_missing(dir);
     }
+}
+
+/// Terminal geometry for the progress-rendering scenarios. `STALE_COLUMNS` is
+/// deliberately wider than `PTY_COLS`: it stands in for a `COLUMNS` inherited
+/// from a larger window, which is what a shell leaves behind when its terminal
+/// is resized after it starts, and is the condition under which the
+/// installer's download bar used to overrun the margin and wrap.
+///
+/// `PTY_ROWS` is tall enough to hold a whole successful install, so a clean run
+/// never scrolls and the rendered screen below shows every progress row at
+/// once. A wrapping run overflows it, which is itself part of the symptom.
+const PTY_COLS: u16 = 80;
+const PTY_ROWS: u16 = 40;
+const STALE_COLUMNS: u16 = 96;
+/// A terminal narrow enough that curl would ignore the width handed to it, so
+/// the installer declines to draw a bar at all.
+const NARROW_PTY_COLS: u16 = 20;
+/// Deliberately not 80. ncurses falls back to 80 columns when it cannot read a
+/// terminal, so a measurement that consults the wrong file descriptor lands on
+/// exactly that and is indistinguishable from a correct one at this suite's
+/// usual width. At 100 the two answers differ and the test can tell them apart.
+const WIDE_PTY_COLS: u16 = 100;
+
+/// Downloads a release install performs: the archive, its checksum sidecar and
+/// its signature sidecar. One progress bar each.
+const EXPECTED_DOWNLOADS: usize = 3;
+
+/// The shape of one pty run: how wide the terminal is, what `COLUMNS` the
+/// installer inherits, and how it is started.
+#[derive(Clone, Copy)]
+struct PtyRun<'a> {
+    /// The terminal's real width.
+    pty_cols: u16,
+    /// What the installer inherits as `COLUMNS`; `None` leaves it unset. A raw
+    /// string rather than a number so a malformed value such as a zero-padded
+    /// width can be expressed. Disagreeing with `pty_cols` is the condition
+    /// several of these scenarios exist to test.
+    columns_env: Option<&'a str>,
+    invocation: Invocation,
+}
+
+/// How the installer is started under the pty.
+#[derive(Clone, Copy)]
+enum Invocation {
+    /// `sh install.sh <channel>`, with the pty on every descriptor.
+    Direct,
+    /// `cat install.sh | sh -s <channel>`, mirroring the documented
+    /// `curl ... | sh`. The script arrives on stdin, so stdin is a pipe and
+    /// only stdout and stderr are still the terminal. This is the shape the
+    /// installer actually ships in, and the reason it measures the terminal
+    /// through fd 2 rather than whatever stdin happens to be.
+    PipedIntoShell,
+}
+
+/// Run the installer attached to a real pseudo-terminal, returning both what it
+/// wrote and what a terminal drawing those bytes would show.
+///
+/// The piped `run_installer` path cannot exercise progress drawing at all: the
+/// installer only draws a bar when its stderr is a terminal, so under a pipe it
+/// takes the quiet branch. Only a PTY puts it on the drawing path.
+///
+fn run_installer_pty(
+    world: &E2eWorld,
+    install_dir: &Path,
+    download_base: &str,
+    public_key_env: &[(&str, String)],
+    extra_env: &[(&str, String)],
+    shape: PtyRun<'_>,
+) -> (String, String) {
+    use std::io::Read as _;
+
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let PtyRun {
+        pty_cols,
+        columns_env,
+        invocation,
+    } = shape;
+
+    let root = workspace_root();
+    let st = state(world);
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: PTY_ROWS,
+            cols: pty_cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open a pty for the installer");
+
+    // The scenarios carry @requires-os:linux, so only the POSIX installer is
+    // ever driven here. This still compiles on Windows, which builds the e2e
+    // target for its own lifecycle lanes, it simply never runs.
+    // Absolute path: a scenario may hand the child a PATH that portable-pty
+    // would also use to resolve this program, and `sh` must stay findable
+    // regardless of what that PATH shadows out.
+    let shell = which_on_path("sh").unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let script = root.join("install.sh");
+    let mut cmd = CommandBuilder::new(&shell);
+    match invocation {
+        Invocation::Direct => {
+            cmd.arg(&script);
+            cmd.arg("release");
+        }
+        Invocation::PipedIntoShell => {
+            cmd.arg("-c");
+            // Single-quoted so a path with spaces survives; neither path can
+            // contain a single quote, both being repo-relative.
+            cmd.arg(format!(
+                "cat '{}' | '{}' -s release",
+                script.display(),
+                shell.display()
+            ));
+        }
+    }
+    cmd.cwd(&root);
+    for (key, value) in std::env::vars_os() {
+        cmd.env(key, value);
+    }
+    cmd.env("ROCM_CLI_DOWNLOAD_BASE", download_base);
+    cmd.env("ROCM_CLI_INSTALL_DIR", install_dir);
+    cmd.env("ROCM_CLI_REQUIRE_SIGNATURE", "1");
+    cmd.env("HOME", &st.home_dir);
+    cmd.env("TERM", "xterm-256color");
+    match columns_env {
+        Some(cols) => cmd.env("COLUMNS", cols),
+        // The harness's own COLUMNS would otherwise leak in and stand in for a
+        // value the scenario meant to leave unset.
+        None => cmd.env_remove("COLUMNS"),
+    }
+    for (key, value) in public_key_env.iter().chain(extra_env.iter()) {
+        cmd.env(key, value);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn the installer under a pty");
+    // Drop the slave before reading: while this side stays open the master
+    // never reaches EOF and the read below would block past process exit.
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to read the installer's pty");
+    let mut raw = Vec::new();
+    reader
+        .read_to_end(&mut raw)
+        .expect("failed to drain the installer's pty");
+    let status = child.wait().expect("installer process was not reaped");
+    let output = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        status.success(),
+        "the installer failed under a pty:\n{output}"
+    );
+
+    // Draw the stream the way a terminal would. Wrapping is the emulator's
+    // doing and never appears in the byte stream, so this is the only view in
+    // which an over-wide bar actually tears.
+    // vt100 0.18 takes non-zero dimensions. Both are known good here: PTY_ROWS
+    // is a fixed constant and every scenario drives a terminal at least as wide
+    // as NARROW_PTY_COLS.
+    let rows = NonZeroU16::new(PTY_ROWS).expect("PTY_ROWS is a non-zero constant");
+    let cols = NonZeroU16::new(pty_cols).expect("a pty needs a non-zero width to render into");
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(&raw);
+    // `rows()`, not `contents()`: the latter stitches a wrapped row back onto
+    // the one it came from, reporting a 96-column line on an 80-column screen
+    // and hiding the very tearing this is here to catch.
+    let screen = parser
+        .screen()
+        .rows(0, pty_cols)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (output, screen)
+}
+
+/// The frames the installer painted: the stretches between the carriage
+/// returns that separate one redraw from the next.
+///
+/// Both signals are needed, and neither is sufficient alone. A downloader
+/// redraws in place and nothing else here does, but the line it redraws on can
+/// also carry the preceding `download: <url>` notice, which is not a frame and
+/// is longer than a terminal when the URL is a real release asset. Bar
+/// characters alone are no better: the get-started block prints
+/// `rocm install sdk  # ...`, which never redraws. Requiring a carriage return
+/// and a bar character keeps each one out.
+fn progress_frames(terminal_output: &str) -> Vec<&str> {
+    terminal_output
+        .lines()
+        .filter(|line| line.contains('\r'))
+        .flat_map(|line| line.split('\r'))
+        .filter(|frame| frame.contains('#') || frame.contains('%'))
+        .collect()
+}
+
+/// Rows of a rendered screen showing a drawn progress bar.
+///
+/// The carriage returns are gone by this point, consumed by the emulator, so
+/// this matches on shape instead: a run of bar characters, which the
+/// get-started block's single `#` cannot reach and the banner art never
+/// contains.
+fn progress_rows(screen: &str) -> Vec<&str> {
+    screen
+        .lines()
+        .map(str::trim_end)
+        .filter(|row| row.contains("###"))
+        .collect()
+}
+
+/// Serve the signed dist over loopback and install from it under a pty.
+fn install_under_pty(
+    world: &mut E2eWorld,
+    pty_cols: u16,
+    columns_env: Option<&str>,
+    invocation: Invocation,
+) {
+    let st = state(world);
+    let dist_dir = st.dist_dir.clone();
+    let install_dir = st.install_dir.clone();
+    let public_key = st.public_key.clone();
+    // Loopback rather than file://, so the installer runs the HTTP download
+    // path that actually draws a bar.
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
+    let base = server.base_url();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        public_key.to_string_lossy().into_owned(),
+    )];
+    let no_path = [("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
+    let (raw, screen) = run_installer_pty(
+        world,
+        &install_dir,
+        &base,
+        &key_env,
+        &no_path,
+        PtyRun {
+            pty_cols,
+            columns_env,
+            invocation,
+        },
+    );
+    let st = state_mut(world);
+    st.last_terminal_output = raw;
+    st.last_terminal_screen = screen;
+    st.last_pty_cols = pty_cols;
+    drop(server);
+}
+
+/// Install under a pty with extra environment on top of the usual isolation.
+fn install_with_env(
+    world: &mut E2eWorld,
+    pty_cols: u16,
+    columns_env: Option<&str>,
+    extra: &[(&str, String)],
+) {
+    let st = state(world);
+    let dist_dir = st.dist_dir.clone();
+    let install_dir = st.install_dir.clone();
+    let public_key = st.public_key.clone();
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
+    let base = server.base_url();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        public_key.to_string_lossy().into_owned(),
+    )];
+    let mut env: Vec<(&str, String)> = vec![("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
+    env.extend(extra.iter().cloned());
+    let (raw, screen) = run_installer_pty(
+        world,
+        &install_dir,
+        &base,
+        &key_env,
+        &env,
+        PtyRun {
+            pty_cols,
+            columns_env,
+            invocation: Invocation::Direct,
+        },
+    );
+    let st = state_mut(world);
+    st.last_terminal_output = raw;
+    st.last_terminal_screen = screen;
+    st.last_pty_cols = pty_cols;
+    drop(server);
+}
+
+#[when("the signed bundle is installed through a pseudo-terminal narrower than COLUMNS")]
+async fn when_install_pty_stale_columns(world: &mut E2eWorld) {
+    install_under_pty(
+        world,
+        PTY_COLS,
+        Some(&STALE_COLUMNS.to_string()),
+        Invocation::Direct,
+    );
+}
+
+#[when("the signed bundle is installed through a terminal too narrow for a progress bar")]
+async fn when_install_pty_narrow(world: &mut E2eWorld) {
+    install_under_pty(world, NARROW_PTY_COLS, None, Invocation::Direct);
+}
+
+#[when("the signed bundle is installed with a zero-padded COLUMNS and no way to measure")]
+async fn when_install_pty_zero_padded_columns(world: &mut E2eWorld) {
+    // COLUMNS is the last source the width falls back to, so it is only
+    // consulted when neither stty nor tput can answer. With a real pty, stty
+    // answers first and this branch is unreachable: hide both tools.
+    //
+    // "080" passes a digits-only check but is an octal literal to POSIX
+    // arithmetic, and dash aborts the whole script on it. Only a raw string can
+    // express that, which is why columns_env is not a number.
+    let path = shadow_path(world, &["stty", "tput"], &[]);
+    install_with_env(world, PTY_COLS, Some("080"), &[("PATH", path)]);
+}
+
+#[then("every download progress frame stays within the terminal")]
+async fn then_progress_fits_terminal(world: &mut E2eWorld) {
+    let output = state(world).last_terminal_output.clone();
+    let frames = progress_frames(&output);
+    assert!(
+        !frames.is_empty(),
+        "the installer drew no progress at all under a pty:\n{output}"
+    );
+    let width = usize::from(state(world).last_pty_cols);
+    // A frame wider than the terminal certainly wraps, and one exactly as wide
+    // as it sits on the right margin, where terminals disagree about whether
+    // the next write moves down a row. Either way the carriage return ending
+    // the frame can land on a row below the bar's, so every later redraw paints
+    // one row lower. Reject both.
+    let overflowing: Vec<&&str> = frames
+        .iter()
+        .filter(|frame| frame.chars().count() >= width)
+        .collect();
+    assert!(
+        overflowing.is_empty(),
+        "{} of {} progress frames reach or exceed the {width}-column terminal, \
+         so each redraw wraps onto a new row instead of replacing the last; \
+         widest was {} columns:\n{output}",
+        overflowing.len(),
+        frames.len(),
+        overflowing
+            .iter()
+            .map(|frame| frame.chars().count())
+            .max()
+            .unwrap_or(0),
+    );
+}
+
+#[then("the finished screen shows one completed bar per download")]
+async fn then_one_bar_per_download(world: &mut E2eWorld) {
+    // Asserted against the rendered screen, not the byte stream. A bar that
+    // overruns the margin is torn in two by the terminal, which leaves the
+    // leftovers of every earlier redraw stranded on their own rows; none of
+    // that exists in the bytes, where each redraw is just one over-wide frame.
+    let screen = state(world).last_terminal_screen.clone();
+    let rows = progress_rows(&screen);
+    assert_eq!(
+        rows.len(),
+        EXPECTED_DOWNLOADS,
+        "expected {EXPECTED_DOWNLOADS} progress rows on the finished screen, \
+         one per download, but found {}. More than that means each redraw left \
+         the previous bar behind instead of replacing it:\n{screen}",
+        rows.len(),
+    );
+    // Every surviving row is a finished bar. A stack of wrapped redraws leaves
+    // partial bars with no percentage, and a torn one leaves a stranded tail.
+    let unfinished: Vec<&&str> = rows.iter().filter(|row| !row.contains("100.0%")).collect();
+    assert!(
+        unfinished.is_empty(),
+        "{} of {} progress rows do not carry a whole 100.0%, so a bar was left \
+         partially drawn or its percentage was torn across the margin: {:?}\n{screen}",
+        unfinished.len(),
+        rows.len(),
+        unfinished,
+    );
+}
+
+#[then("the installer reports that the terminal is too narrow for a progress bar")]
+async fn then_narrow_notice(world: &mut E2eWorld) {
+    // The notice is longer than this terminal is wide, so on the rendered
+    // screen it is split across physical rows and no single row contains it.
+    // Read it from the byte stream, which carries it whole, and keep the
+    // screen for the question it alone can answer: was a bar drawn.
+    let output = state(world).last_terminal_output.clone();
+    assert!(
+        output.contains("too narrow for a progress bar"),
+        "a terminal too narrow to size a bar downloads quietly, which should \
+         say so rather than look like a stall:\n{output}"
+    );
+    let screen = state(world).last_terminal_screen.clone();
+    let rows = progress_rows(&screen);
+    assert!(
+        rows.is_empty(),
+        "no progress bar should be drawn at {NARROW_PTY_COLS} columns, but the \
+         screen carries {}: {rows:?}\n{screen}",
+        rows.len(),
+    );
+}
+
+/// A single directory that shadows `PATH`: a symlink to every executable
+/// reachable on it, minus `remove`, plus a shim script for each `shims` entry.
+///
+/// Dropping whole directories cannot work here: the tools these scenarios need
+/// out of the way live in `/usr/bin` beside `sh`, `tar`, `awk` and ~980 others
+/// the installer and harness both need, so removing that directory leaves
+/// nothing able to run. Shadowing individual names keeps everything else where
+/// the installer expects it, and `command -v <name>` then genuinely misses.
+///
+/// Shims exist because some branches are only reachable when a tool answers a
+/// particular way: a terminal that never had its size set reports `0 0`, which
+/// no real pty here will do on demand.
+fn shadow_path(world: &E2eWorld, remove: &[&str], shims: &[(&str, &str)]) -> String {
+    let tag: String = remove
+        .iter()
+        .chain(shims.iter().map(|(name, _)| name))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("-");
+    let farm = root(world).join("shadow-path").join(if tag.is_empty() {
+        "none".to_owned()
+    } else {
+        tag
+    });
+    std::fs::create_dir_all(&farm).expect("failed to create the shadow PATH directory");
+    let hidden: Vec<&str> = remove
+        .iter()
+        .chain(shims.iter().map(|(name, _)| name))
+        .copied()
+        .collect();
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if hidden.iter().any(|name| file_name == *name) {
+                continue;
+            }
+            let link = farm.join(&file_name);
+            // First writer wins, so earlier PATH entries keep their precedence.
+            if !link.exists() {
+                #[cfg(unix)]
+                {
+                    let _ = std::os::unix::fs::symlink(entry.path(), &link);
+                }
+                // Only the @requires-os:linux progress scenarios build a shadow
+                // PATH, so this arm never runs. It exists because the Windows
+                // lifecycle lanes still compile this target, and a symlink is
+                // the one piece here with no portable spelling.
+                #[cfg(not(unix))]
+                {
+                    unreachable!("a shadow PATH is only built on Unix");
+                }
+            }
+        }
+    }
+    for (name, body) in shims {
+        let path = farm.join(name);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, body).expect("failed to write a PATH shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("failed to make a PATH shim executable");
+        }
+    }
+    for name in remove {
+        assert!(
+            !farm.join(name).exists(),
+            "{name} is still resolvable through the shadow PATH"
+        );
+    }
+    farm.to_string_lossy().into_owned()
+}
+
+#[when("the signed bundle is installed through a pseudo-terminal with curl unavailable")]
+async fn when_install_pty_without_curl(world: &mut E2eWorld) {
+    assert!(
+        which_on_path("wget").is_some(),
+        "this scenario covers the installer's wget branch and the host has no \
+         wget; install it or the branch goes untested"
+    );
+    let st = state(world);
+    let dist_dir = st.dist_dir.clone();
+    let install_dir = st.install_dir.clone();
+    let public_key = st.public_key.clone();
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
+    let base = server.base_url();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        public_key.to_string_lossy().into_owned(),
+    )];
+    let extra = [
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("PATH", shadow_path(world, &["curl"], &[])),
+    ];
+    let (raw, screen) = run_installer_pty(
+        world,
+        &install_dir,
+        &base,
+        &key_env,
+        &extra,
+        PtyRun {
+            pty_cols: PTY_COLS,
+            columns_env: Some(&STALE_COLUMNS.to_string()),
+            invocation: Invocation::Direct,
+        },
+    );
+    let st = state_mut(world);
+    st.last_terminal_output = raw;
+    st.last_terminal_screen = screen;
+    st.last_pty_cols = PTY_COLS;
+    drop(server);
+}
+
+/// First directory on `PATH` holding `name`, or `None`.
+///
+/// Splits on `:`, so this is Unix-shaped. Every caller sits behind a
+/// `@requires-os:linux` scenario; it compiles on Windows but would not find
+/// anything there.
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var("PATH").ok().and_then(|path| {
+        path.split(':')
+            .map(|dir| Path::new(dir).join(name))
+            .find(|candidate| candidate.exists())
+    })
+}
+
+#[then("the download prints no request logging around the bar")]
+async fn then_no_request_logging(world: &mut E2eWorld) {
+    let output = state(world).last_terminal_output.clone();
+    // wget's default verbosity narrates every step of the request, which lands
+    // interleaved with the progress bar. These lines are what -nv drops while
+    // still leaving the bar, and still reporting a failure's reason.
+    for noise in ["Connecting to", "HTTP request sent", "Length:"] {
+        assert!(
+            !output.contains(noise),
+            "{noise:?} appears around the progress bar, so the downloader is \
+             narrating the request instead of just drawing the bar:\n{output}"
+        );
+    }
+}
+
+// ── Pull request channel (`pr-<number>`) ───────────────────────────────
+//
+// The installers' `pr-<number>` channel installs the bundle CI built for a
+// pull request. The real thing needs a signed-in GitHub CLI and a live run, so
+// these scenarios plant the `fake-gh` stand-in (see `src/bin/fake-gh.rs`) in
+// front of `PATH`, and a bundle packaged unsigned, as CI packages it.
+
+/// The head commit the stand-in reports for the pull request.
+const PR_HEAD_COMMIT: &str = "53546b007a85445a2466b28447307992733829c9";
+
+/// The distribution name CI gives a pull request bundle on this platform.
+const fn pr_dist_name() -> &'static str {
+    if cfg!(windows) {
+        "rocm-cli-pr-windows-amd64"
+    } else {
+        "rocm-cli-pr-linux-amd64"
+    }
+}
+
+/// Package the pull request bundle unsigned, the way CI does, and return the
+/// directory holding the archive and its checksum sidecar: what a downloaded
+/// workflow artifact contains.
+fn package_pr_bundle(world: &E2eWorld) -> PathBuf {
+    let out_dir = root(world).join("pr-dist");
+    let mut cmd = xtask_command();
+    cmd.args(["package", pr_dist_name()])
+        .arg(&out_dir)
+        .current_dir(workspace_root())
+        .env("ROCM_BIN_DIR", release_bin_dir())
+        .env_remove("ROCM_CLI_REQUIRE_SIGNATURE")
+        .env_remove("ROCM_CLI_SIGNING_PRIVATE_KEY_PATH")
+        .env_remove("ROCM_CLI_SIGNING_PRIVATE_KEY_PEM");
+    let output = cmd.output().expect("failed to run xtask package");
+    assert!(
+        output.status.success(),
+        "packaging the pull request bundle failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifact = root(world).join("pr-artifact");
+    std::fs::create_dir_all(&artifact).expect("failed to create the artifact directory");
+    let archive = archive_name(pr_dist_name());
+    for name in [archive.clone(), format!("{archive}.sha256")] {
+        std::fs::copy(out_dir.join(&name), artifact.join(&name))
+            .unwrap_or_else(|e| panic!("packaged pull request bundle lacks {name}: {e}"));
+    }
+    artifact
+}
+
+/// A workflow run `fake-gh` reports for the pull request's head commit.
+struct CiRun {
+    id: u32,
+    /// Artifacts the run still has, and expired ones it also lists.
+    live: u32,
+    expired: u32,
+    /// The `<status> <conclusion>` it reports, `-` for no conclusion yet.
+    state: &'static str,
+    /// The workflow file the run belongs to.
+    workflow: &'static str,
+}
+
+const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+impl CiRun {
+    const fn ci(id: u32, live: u32, expired: u32, state: &'static str) -> Self {
+        Self {
+            id,
+            live,
+            expired,
+            state,
+            workflow: CI_WORKFLOW,
+        }
+    }
+}
+
+/// Plant `fake-gh` with the given runs, newest first, and the bundle
+/// `gh run download` hands out.
+fn plant_gh_stub(world: &mut E2eWorld, runs: &[CiRun], bundle: Option<&Path>) {
+    let stub = root(world).join("gh-stub");
+    let bin = stub.join("bin");
+    std::fs::create_dir_all(stub.join("bundle")).expect("failed to create the gh stub directory");
+    crate::install_fixture_binary("fake-gh", &installed_binary(&bin, "gh"));
+    std::fs::write(stub.join("head"), format!("{PR_HEAD_COMMIT}\n")).expect("write head");
+    let mut listing = String::new();
+    for run in runs {
+        let _ = writeln!(listing, "{} {} {}", run.id, run.state, run.workflow);
+    }
+    std::fs::write(stub.join("runs"), listing).expect("write runs");
+    for run in runs {
+        std::fs::write(
+            stub.join(format!("artifacts-{}", run.id)),
+            format!("{}\n", run.live),
+        )
+        .expect("write artifact count");
+        std::fs::write(
+            stub.join(format!("expired-{}", run.id)),
+            format!("{}\n", run.expired),
+        )
+        .expect("write expired count");
+    }
+    if let Some(bundle) = bundle {
+        for entry in std::fs::read_dir(bundle).expect("read the pull request artifact") {
+            let entry = entry.expect("artifact entry");
+            std::fs::copy(entry.path(), stub.join("bundle").join(entry.file_name()))
+                .expect("copy into the gh stub bundle");
+        }
+    }
+    state_mut(world).gh_stub_dir = Some(stub);
+}
+
+#[given("CI built a bundle for pull request 1048 whose newest run has expired")]
+async fn given_pr_bundle_newest_expired(world: &mut E2eWorld) {
+    let artifact = package_pr_bundle(world);
+    // Newest first. A newer run of another workflow has a live artifact, which
+    // only the workflow filter keeps out; the newest CI run's builds have
+    // expired, which only the expiry filter keeps out; the run that is used is
+    // still running (its build job is done), so it has no conclusion yet.
+    plant_gh_stub(
+        world,
+        &[
+            CiRun {
+                workflow: ".github/workflows/codeql.yml",
+                ..CiRun::ci(3500, 1, 0, "completed success")
+            },
+            CiRun::ci(3003, 0, 2, "completed failure"),
+            CiRun::ci(2002, 1, 0, "in_progress -"),
+            CiRun::ci(1001, 1, 0, "completed success"),
+        ],
+        Some(&artifact),
+    );
+}
+
+#[given("CI has only expired builds for pull request 1048")]
+async fn given_pr_builds_all_expired(world: &mut E2eWorld) {
+    plant_gh_stub(
+        world,
+        &[
+            CiRun::ci(4004, 0, 1, "completed success"),
+            CiRun::ci(3003, 0, 1, "completed failure"),
+        ],
+        None,
+    );
+}
+
+#[given("a GitHub CLI stand-in that knows no pull requests")]
+async fn given_pr_unknown(world: &mut E2eWorld) {
+    plant_gh_stub(world, &[], None);
+    let stub = state(world).gh_stub_dir.clone().expect("planted above");
+    std::fs::remove_file(stub.join("head")).expect("remove the head commit");
+}
+
+#[given("CI has not run for pull request 1048")]
+async fn given_pr_no_ci_run(world: &mut E2eWorld) {
+    // The pull request exists and has a head commit, but no run was made for it.
+    plant_gh_stub(world, &[], None);
+}
+
+#[given("the GitHub CLI is not installed")]
+async fn given_gh_missing(world: &mut E2eWorld) {
+    // Only the call log is wanted from the stub directory: no `gh` is planted,
+    // so any call the installer made would fail to run rather than be logged,
+    // and the installer's own check for the command is what must refuse.
+    let stub = root(world).join("gh-stub");
+    std::fs::create_dir_all(stub.join("bin")).expect("failed to create the gh stub directory");
+    let st = state_mut(world);
+    st.gh_stub_dir = Some(stub);
+    st.gh_missing = true;
+}
+
+/// `PATH` with no `gh` on it, for the scenario where the machine has none.
+///
+/// On Unix `gh` is hidden by name, because it can share `/usr/bin` with the
+/// tools the installer needs. On Windows the GitHub CLI installs into a
+/// directory of its own, so dropping every directory that holds one is enough.
+fn path_without_gh(world: &E2eWorld) -> String {
+    #[cfg(unix)]
+    {
+        shadow_path(world, &["gh"], &[])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = world;
+        let kept: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .filter(|dir| {
+                    !["gh.exe", "gh.cmd", "gh.bat", "gh.ps1"]
+                        .iter()
+                        .any(|name| dir.join(name).exists())
+                })
+                .collect();
+        std::env::join_paths(kept)
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+#[when("the checksum sidecar of the pull request bundle is corrupted")]
+async fn when_corrupt_pr_checksum(world: &mut E2eWorld) {
+    let stub = state(world)
+        .gh_stub_dir
+        .clone()
+        .expect("a CI stub must be planted first");
+    let sha = stub
+        .join("bundle")
+        .join(format!("{}.sha256", archive_name(pr_dist_name())));
+    std::fs::write(&sha, format!("{}\n", "0".repeat(64)))
+        .expect("failed to corrupt the checksum sidecar");
+}
+
+/// How a pull request channel install is asked to treat signatures.
+#[derive(Clone, Copy)]
+enum PrSignature {
+    /// Nothing asked: the channel must install on the checksum alone.
+    NotAsked,
+    /// `ROCM_CLI_REQUIRE_SIGNATURE=1`, with no key supplied.
+    Required,
+    /// The scenario's generated public key is supplied.
+    PublicKey,
+}
+
+#[when("the pull request channel pr-1048 is installed")]
+async fn when_install_pr_channel(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-1048", PrSignature::NotAsked);
+}
+
+#[when("the pull request channel pr-1048 is installed requiring a signature")]
+async fn when_install_pr_channel_requiring_signature(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-1048", PrSignature::Required);
+}
+
+#[when("the pull request channel pr-1048 is installed with the public key file")]
+async fn when_install_pr_channel_with_key(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-1048", PrSignature::PublicKey);
+}
+
+#[when("the pull request channel pr-1048 is installed with a download base")]
+async fn when_install_pr_channel_with_download_base(world: &mut E2eWorld) {
+    install_pr_channel_with(
+        world,
+        "pr-1048",
+        PrSignature::NotAsked,
+        "http://127.0.0.1:9/dist",
+    );
+}
+
+#[when("the channel pr-abc is installed")]
+async fn when_install_pr_channel_malformed(world: &mut E2eWorld) {
+    install_pr_channel(world, "pr-abc", PrSignature::NotAsked);
+}
+
+fn install_pr_channel(world: &mut E2eWorld, channel: &str, signature: PrSignature) {
+    // No download base: the channel takes its build from CI and refuses one.
+    install_pr_channel_with(world, channel, signature, "");
+}
+
+fn install_pr_channel_with(
+    world: &mut E2eWorld,
+    channel: &str,
+    signature: PrSignature,
+    download_base: &str,
+) {
+    let st = state(world);
+    let stub = st
+        .gh_stub_dir
+        .clone()
+        .expect("a CI stub must be planted first");
+    let install_dir = st.install_dir.clone();
+    let home = st.home_dir.clone();
+    let public_key = st.public_key.to_string_lossy().into_owned();
+    let mut cmd = installer_command(&workspace_root(), channel);
+    // The lookup goes to the default repository the stand-in serves, whatever
+    // the machine running the suite has set.
+    cmd.env_remove("ROCM_CLI_GITHUB_REPO")
+        .env_remove("FAKE_GH_REPO");
+    let path_value = if st.gh_missing {
+        path_without_gh(world)
+    } else {
+        let mut path = vec![stub.join("bin")];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(path)
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned()
+    };
+    let extra = [
+        ("PATH", path_value),
+        ("FAKE_GH_DIR", stub.to_string_lossy().into_owned()),
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("ROCM_CLI_UPDATE_USER_PATH", "0".to_string()),
+        (
+            "ROCM_CLI_CONFIG_DIR",
+            home.join(".rocm").to_string_lossy().into_owned(),
+        ),
+        // The harness asks for a signature on every install; a pull request
+        // bundle is not signed, and the channel must not need one unless the
+        // scenario asks for it.
+        (
+            "ROCM_CLI_REQUIRE_SIGNATURE",
+            match signature {
+                PrSignature::Required => "1",
+                PrSignature::NotAsked | PrSignature::PublicKey => "0",
+            }
+            .to_string(),
+        ),
+    ];
+    let key_env: &[(&str, String)] = match signature {
+        PrSignature::PublicKey => &[("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH", public_key)],
+        PrSignature::NotAsked | PrSignature::Required => &[],
+    };
+    let (out, ok) = run_installer_command(
+        world,
+        cmd,
+        &workspace_root(),
+        &install_dir,
+        download_base,
+        key_env,
+        &extra,
+    );
+    let st = state_mut(world);
+    st.last_output = out;
+    st.last_rc = i32::from(!ok);
+}
+
+/// The stand-in's call log.
+fn gh_calls(world: &E2eWorld) -> String {
+    let stub = state(world)
+        .gh_stub_dir
+        .as_ref()
+        .expect("a CI stub was planted");
+    std::fs::read_to_string(stub.join("calls")).unwrap_or_default()
+}
+
+#[then("the installer names pull request 1048 and the CI run it installed from")]
+async fn then_pr_named(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    for expected in [
+        "channel: pr-1048",
+        "pull request: #1048 at 53546b0",
+        "CI run: 2002 (in_progress/-)",
+    ] {
+        assert!(
+            out.contains(expected),
+            "installer output lacks `{expected}`:\n{out}"
+        );
+    }
+}
+
+#[when("the signed bundle is installed by piping the installer into a shell")]
+async fn when_install_pty_piped(world: &mut E2eWorld) {
+    install_under_pty(world, WIDE_PTY_COLS, None, Invocation::PipedIntoShell);
+}
+
+#[when("the signed bundle is installed where the terminal reports no size")]
+async fn when_install_pty_unsized(world: &mut E2eWorld) {
+    // A pty that never had its window size set reports `0 0`. No real pty here
+    // will do that on demand, so stand in a stty that says so.
+    //
+    // tput is deliberately left available, and the terminal is deliberately not
+    // 80 columns wide. Treating the 0 as a width suppresses the bar, but a
+    // later guard would then rescue it to the 80-column default, which at this
+    // suite's usual width is indistinguishable from success. Falling through to
+    // tput instead yields the terminal's real width, so the two outcomes differ
+    // and the assertion can tell them apart.
+    let path = shadow_path(world, &[], &[("stty", "#!/bin/sh\nprintf '0 0\\n'\n")]);
+    install_with_env(world, WIDE_PTY_COLS, None, &[("PATH", path)]);
+}
+
+#[then("each completed bar spans the measured terminal width")]
+async fn then_bar_spans_terminal(world: &mut E2eWorld) {
+    let st = state(world);
+    let screen = st.last_terminal_screen.clone();
+    let cols = usize::from(st.last_pty_cols);
+    let expected = cols - 1;
+    let rows = progress_rows(&screen);
+    assert!(
+        !rows.is_empty(),
+        "the installer drew no progress bar at all:\n{screen}"
+    );
+    // The width is the assertion. A bar drawn to some other width still fits
+    // the terminal and still redraws in place, so the width check alone cannot
+    // see it, yet it means the measurement came from somewhere other than this
+    // terminal: ncurses answers 80 when it is asked about a pipe rather than
+    // the real descriptor.
+    let wrong: Vec<(usize, &&str)> = rows
+        .iter()
+        .map(|row| (row.chars().count(), row))
+        .filter(|(len, _)| *len != expected)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "a completed bar should span {expected} of this terminal's {cols} \
+         columns, reserving only the last; got widths {:?}. A narrower bar \
+         means the width was not read from this terminal:\n{screen}",
+        wrong.iter().map(|(len, _)| *len).collect::<Vec<_>>(),
+    );
+}
+
+#[then("the installer still draws a progress bar")]
+async fn then_bar_still_drawn(world: &mut E2eWorld) {
+    // Asserted on the byte stream, not a rendered screen: a pty that never had
+    // a size cannot be drawn into meaningfully, and the question here is only
+    // whether the installer gave up on progress or not.
+    let output = state(world).last_terminal_output.clone();
+    let frames = progress_frames(&output);
+    assert!(
+        !frames.is_empty(),
+        "an unsized terminal reports 0 columns, which means unmeasured rather \
+         than unusably narrow; the installer should still draw a bar at a \
+         fallback width instead of downloading in silence:\n{output}"
+    );
+}
+
+#[then("the installer says the build is unsigned and verifies no signature")]
+async fn then_pr_unsigned(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("unsigned build"),
+        "installer did not warn the build is unsigned:\n{out}"
+    );
+    assert!(
+        !out.contains("signature verified"),
+        "a pull request bundle was verified against a signing key:\n{out}"
+    );
+}
+
+#[then("only the newest unexpired run was downloaded")]
+async fn then_pr_downloaded_newest_unexpired(world: &mut E2eWorld) {
+    let calls = gh_calls(world);
+    let downloads: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.starts_with("downloaded "))
+        .collect();
+    assert_eq!(
+        downloads,
+        ["downloaded 2002"],
+        "expected one download, from run 2002:\n{calls}"
+    );
+}
+
+#[then("the install fails reporting no downloadable build for pull request 1048")]
+async fn then_pr_no_build(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    for expected in ["no downloadable", "build for pull request #1048", "7 days"] {
+        assert!(
+            st.last_output.contains(expected),
+            "installer output lacks `{expected}`:\n{}",
+            st.last_output
+        );
+    }
+}
+
+#[then("the install fails because a signature cannot be required for a pull request build")]
+async fn then_pr_signature_cannot_be_required(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("a signature cannot be required for the pr-1048 channel"),
+        "installer output lacks the refusal:\n{}",
+        st.last_output
+    );
+    // Naming a key would send the user to a second failure: CI signs nothing.
+    assert!(
+        !st.last_output.contains("ROCM_CLI_SIGNING_PUBLIC_KEY"),
+        "the refusal points at a key, which cannot help:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting no CI run was found for pull request 1048")]
+async fn then_pr_no_ci_run(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("no CI run found for pull request #1048"),
+        "installer output lacks the missing-run refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting the GitHub CLI is missing")]
+async fn then_gh_missing(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output.contains("missing required command: gh"),
+        "installer output lacks the missing-command refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails because a download base cannot be used with a pull request build")]
+async fn then_pr_download_base_refused(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("ROCM_CLI_DOWNLOAD_BASE cannot be combined with the pr-1048 channel"),
+        "installer output lacks the download-base refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting that pull request 1048 could not be found")]
+async fn then_pr_unknown(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("could not look up pull request #1048"),
+        "installer output lacks the lookup failure:\n{}",
+        st.last_output
+    );
+}
+
+#[then("the install fails reporting that pr-abc is not a pull request channel")]
+async fn then_pr_channel_malformed(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output.contains("invalid channel: pr-abc"),
+        "installer output lacks the malformed-channel refusal:\n{}",
+        st.last_output
+    );
+}
+
+#[then("gh was never called")]
+async fn then_gh_never_called(world: &mut E2eWorld) {
+    let calls = gh_calls(world);
+    assert!(
+        calls.trim().is_empty(),
+        "the installer reached gh for a refused channel:\n{calls}"
+    );
+}
+
+#[then("the install fails because the pull request bundle has no signature")]
+async fn then_pr_bundle_unsigned(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_ne!(st.last_rc, 0, "the install succeeded:\n{}", st.last_output);
+    assert!(
+        st.last_output
+            .contains("required signature sidecar is missing"),
+        "installer output lacks the missing-signature failure:\n{}",
+        st.last_output
+    );
+}
+
+#[then("nothing was downloaded from CI")]
+async fn then_pr_nothing_downloaded(world: &mut E2eWorld) {
+    let calls = gh_calls(world);
+    assert!(
+        !calls.contains("downloaded"),
+        "a build was downloaded:\n{calls}"
+    );
 }

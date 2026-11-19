@@ -3169,6 +3169,479 @@ async fn assert_the_gpu_lspci_printed_is_listed(world: &mut E2eWorld) {
     );
 }
 
+// ── Each GPU keeps the runtime's reading of itself, not another GPU's ──
+
+/// The two GPUs `examine-55` plants: `(PCI address, KFD location_id, KFD
+/// gfx_target_version, the gfx target that version decodes to)`. The
+/// `location_id` doubles as the `BDFID` the stand-in `rocminfo` prints for the
+/// second, since both use the kernel's `(bus << 8) | devfn` encoding.
+const HIDDEN_GPU: (&str, u32, u32, &str) = ("0000:03:00.0", 768, 110_000, "gfx1100");
+const VISIBLE_GPU: (&str, u32, u32, &str) = ("0000:04:00.0", 1024, 110_001, "gfx1101");
+const VISIBLE_GPU_MODEL: &str = "AMD Radeon RX 7800 XT";
+
+/// Plant a simulated native Linux machine with one KFD GPU node per
+/// `(location_id, gfx_target_version)`, an `lspci` that prints `lspci_lines`
+/// (none is an empty bus),
+/// and a `rocminfo` that lists one GPU agent per `(gfx, marketing name,
+/// BDFID)`.
+///
+/// Native rather than WSL because the GPU probes are skipped on WSL, so a
+/// runner that is a WSL host would otherwise never reach the planted GPUs.
+/// The `rocminfo` is in the shape the real tool prints (compare the capture in
+/// `crates/rocm-core/tests/fixtures/rocminfo_gfx1151_apu.txt`): a CPU agent
+/// with BDFID 0, then the GPU agents, each closed by its `ISA Info:` block,
+/// whose ISA entries carry `Name:` lines of their own that are not the agent's
+/// name. Each GPU agent prints the given `Memory Properties:` value: `APU` as
+/// the capture prints for its integrated GPU, or empty for a discrete one,
+/// which rests on the MI300X sample output in AMD's "Using rocminfo" page
+/// (<https://rocm.docs.amd.com/projects/rocminfo/en/latest/how-to/use-rocminfo.html>),
+/// a documentation sample and not a capture taken for this repository.
+///
+/// `prelude` is shell run before the listing is printed, and the listing is
+/// expanded by the shell, so an agent's fields can depend on the environment
+/// the runtime is started in (`examine-56` uses that for
+/// `HSA_OVERRIDE_GFX_VERSION`). The listing holds no other `$`, backtick or
+/// backslash for the shell to read.
+fn plant_native_gpus_and_runtime(
+    world: &mut E2eWorld,
+    lspci_lines: &[&str],
+    kfd_gpus: &[(u32, u32)],
+    prelude: &str,
+    agents: &[(&str, &str, Option<u32>, &str)],
+) {
+    use std::fmt::Write as _;
+    plant_os_release(world, "ID=ubuntu\nVERSION_ID=\"24.04\"\n");
+    let nodes = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root/sys/class/kfd/kfd/topology/nodes");
+    let cpu = nodes.join("0");
+    std::fs::create_dir_all(&cpu).expect("failed to create the planted CPU node");
+    std::fs::write(
+        cpu.join("properties"),
+        "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+    )
+    .expect("failed to write the planted CPU node properties");
+    for (index, (location_id, version)) in kfd_gpus.iter().enumerate() {
+        let node = nodes.join((index + 1).to_string());
+        std::fs::create_dir_all(&node).expect("failed to create a planted GPU node");
+        std::fs::write(
+            node.join("properties"),
+            format!(
+                "cpu_cores_count 0\nsimd_count 96\ngfx_target_version {version}\n\
+                 location_id {location_id}\ndomain 0\n"
+            ),
+        )
+        .expect("failed to write a planted GPU node's properties");
+    }
+    // The listing goes through an unquoted heredoc and the `lspci` lines
+    // through single quotes, so nothing interpolated may carry what the shell
+    // would read: a `$` (other than the prelude's own variables, which the
+    // caller passes in agent fields on purpose), a backtick, a backslash or a
+    // single quote.
+    let shell_safe = |value: &str| !value.contains(['`', '\\', '\'']);
+    for line in lspci_lines {
+        assert!(
+            shell_safe(line) && !line.contains('$'),
+            "a planted lspci line the shell would rewrite: {line:?}"
+        );
+    }
+    for (gfx, marketing, _, memory) in agents {
+        assert!(
+            shell_safe(memory) && !memory.contains('$'),
+            "a planted rocminfo field the shell would rewrite: {memory:?}"
+        );
+        assert!(
+            shell_safe(gfx) && shell_safe(marketing) && !marketing.contains('$'),
+            "a planted rocminfo field the shell would rewrite: {gfx:?} {marketing:?}"
+        );
+    }
+    let mut lspci = String::from("#!/bin/sh\n");
+    for line in lspci_lines {
+        writeln!(lspci, "printf '%s\\n' '{line}'").expect("writing to a String cannot fail");
+    }
+    let mut rocminfo = format!("#!/bin/sh\n{prelude}\ncat <<AGENTS\n");
+    rocminfo.push_str(
+        "*******\nAgent 1\n*******\n  \
+         Name:                    AMD Ryzen 9 7950X\n  Device Type:             CPU\n  \
+         BDFID:                   0\n  ISA Info:\n",
+    );
+    for (index, (gfx, marketing, bdfid, memory)) in agents.iter().enumerate() {
+        // `None` leaves the `BDFID:` line out, as a runtime that does not say
+        // which card an agent is.
+        let bdfid_line = bdfid
+            .map(|bdfid| format!("  BDFID:                   {bdfid}\n"))
+            .unwrap_or_default();
+        write!(
+            rocminfo,
+            "*******\nAgent {}\n*******\n  \
+             Name:                    {gfx}\n  \
+             Uuid:                    GPU-XX\n  \
+             Marketing Name:          {marketing}\n  \
+             Vendor Name:             AMD\n  \
+             Device Type:             GPU\n{bdfid_line}  \
+             Memory Properties:       {memory}\n  \
+             ISA Info:\n    ISA 1\n      Name:                    amdgcn-amd-amdhsa--{gfx}\n    \
+             ISA 2\n      Name:                    amdgcn-amd-amdhsa--gfx11-generic\n",
+            index + 2
+        )
+        .expect("writing to a String cannot fail");
+    }
+    rocminfo.push_str("AGENTS\n");
+    put_fake_executables_on_path(world, &[("lspci", &lspci), ("rocminfo", &rocminfo)]);
+}
+
+#[given("a machine with two AMD GPUs of which the ROCm runtime can see only the second")]
+async fn machine_whose_runtime_sees_only_the_second_of_two_gpus(world: &mut E2eWorld) {
+    let (_, hidden_location, hidden_version, _) = HIDDEN_GPU;
+    let (_, visible_location, visible_version, visible_gfx) = VISIBLE_GPU;
+    plant_native_gpus_and_runtime(
+        world,
+        &[],
+        &[
+            (hidden_location, hidden_version),
+            (visible_location, visible_version),
+        ],
+        "",
+        // A discrete card: the real runtime's `Memory Properties:` is empty.
+        &[(visible_gfx, VISIBLE_GPU_MODEL, Some(visible_location), "")],
+    );
+}
+
+/// The `gpus[]` entry `examine --json` lists at `pci_id`.
+fn listed_gpu_at(json: &serde_json::Value, pci_id: &str) -> serde_json::Value {
+    json.pointer("/gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no `gpus` array:\n{json:#}"))
+        .iter()
+        .find(|gpu| gpu.pointer("/pci_id").and_then(serde_json::Value::as_str) == Some(pci_id))
+        .unwrap_or_else(|| panic!("no GPU is listed at {pci_id}:\n{json:#}"))
+        .clone()
+}
+
+#[then(
+    "the second GPU is reported with the model name the runtime gave it, its own architecture and as a discrete GPU"
+)]
+async fn assert_the_visible_gpu_has_the_runtimes_reading(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let (address, _, _, gfx) = VISIBLE_GPU;
+    let gpu = listed_gpu_at(&json, address);
+    assert_eq!(
+        gpu["name"],
+        serde_json::json!(VISIBLE_GPU_MODEL),
+        "{json:#}"
+    );
+    assert_eq!(gpu["gfx_target"], serde_json::json!(gfx), "{json:#}");
+    // "As a discrete GPU": the runtime's own reading, an empty
+    // `Memory Properties:` line.
+    assert_eq!(gpu["is_apu"], serde_json::json!(false), "{json:#}");
+}
+
+#[then(
+    "the first GPU is reported with its own architecture, no model name and no claim about whether it is integrated"
+)]
+async fn assert_the_hidden_gpu_keeps_its_own_reading(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let gpus = json["gpus"].as_array().map_or(0, Vec::len);
+    assert_eq!(gpus, 2, "one entry per planted GPU:\n{json:#}");
+    let (address, _, _, gfx) = HIDDEN_GPU;
+    let gpu = listed_gpu_at(&json, address);
+    assert_eq!(gpu["gfx_target"], serde_json::json!(gfx), "{json:#}");
+    // "No model name" as the report spells it: the kernel-topology
+    // placeholder, which the notes explain as an unknown marketing name.
+    assert_eq!(
+        gpu["name"],
+        serde_json::json!(rocm_core::examine::KERNEL_TOPOLOGY_GPU_NAME),
+        "{json:#}"
+    );
+    // "No claim about whether it is integrated": gfx1100 is outside the APU
+    // families, which is not proof of a discrete card, and no PCI scan named
+    // it -- so `is_apu` is null, not a verdict borrowed from the other card.
+    assert_eq!(gpu["is_apu"], serde_json::Value::Null, "{json:#}");
+    let notes: Vec<&str> = json["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("1 GPU(s)") && note.contains("marketing name is unknown")),
+        "the one unnamed GPU must be explained exactly as one:\n{notes:#?}"
+    );
+}
+
+// ── A runtime override does not change the architecture reported for a card ──
+
+/// The integrated GPU `examine-56` plants: `(PCI address, KFD location_id,
+/// KFD gfx_target_version, its own gfx target)`, a gfx1103 APU. The stand-in
+/// `rocminfo` reports it at the same address as [`OVERRIDDEN_GFX`], the ISA an
+/// `HSA_OVERRIDE_GFX_VERSION` of 11.0.0 makes the ROCm runtime report.
+const OVERRIDDEN_APU: (&str, u32, u32, &str) = ("0000:c4:00.0", 50_176, 110_003, "gfx1103");
+const OVERRIDDEN_GFX: &str = "gfx1100";
+/// The `HSA_OVERRIDE_GFX_VERSION` value that names [`OVERRIDDEN_GFX`].
+const OVERRIDE_VALUE: &str = "11.0.0";
+const OVERRIDDEN_APU_MODEL: &str = "AMD Radeon 780M Graphics";
+
+#[given(
+    "a machine whose integrated GPU the ROCm runtime is told to report as another architecture"
+)]
+async fn machine_whose_runtime_reports_an_overridden_architecture(world: &mut E2eWorld) {
+    let (_, location, version, native_gfx) = OVERRIDDEN_APU;
+    // The stand-in runtime does what ROCr does: with the override set it
+    // reports the ISA the override names, and without it the card's own. Its
+    // `Memory Properties:` says `APU` either way, because the runtime reads
+    // that from the device. When it runs with the override it also leaves a
+    // marker, so the Then can show the inspection's own `rocminfo` run saw the
+    // variable rather than only that the planted files say so.
+    let marker = override_marker(world);
+    let marker = marker
+        .to_str()
+        .expect("the scenario directory is valid UTF-8");
+    assert!(
+        !marker.contains(['$', '`', '\\', '\'', '"']),
+        "a marker path the shell would rewrite: {marker:?}"
+    );
+    let prelude = format!(
+        "if [ \"$HSA_OVERRIDE_GFX_VERSION\" = \"{OVERRIDE_VALUE}\" ]; then GFX={OVERRIDDEN_GFX}; \
+         : > \"{marker}\"; else GFX={native_gfx}; fi"
+    );
+    plant_native_gpus_and_runtime(
+        world,
+        &[],
+        &[(location, version)],
+        &prelude,
+        &[("${GFX}", OVERRIDDEN_APU_MODEL, Some(location), "APU")],
+    );
+    world
+        .command_env
+        .push(("HSA_OVERRIDE_GFX_VERSION", OVERRIDE_VALUE.into()));
+}
+
+/// Where the examine-56 stand-in `rocminfo` leaves its marker when it runs
+/// with the override set.
+fn override_marker(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("rocminfo-ran-with-the-override")
+}
+
+#[then("the integrated GPU is reported with its own architecture and as integrated")]
+async fn assert_the_overridden_apu_keeps_its_own_architecture(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    // Only the inspection ran the planted `rocminfo`, so the marker shows the
+    // runtime it read was started with the override: without it, the stand-in
+    // reports the native target and this step would hold for no reason.
+    assert!(
+        override_marker(world).exists(),
+        "the inspection's rocminfo did not run with HSA_OVERRIDE_GFX_VERSION={OVERRIDE_VALUE}, \
+         so nothing here was overridden"
+    );
+    let json = parsed_json(world);
+    let (address, _, _, native_gfx) = OVERRIDDEN_APU;
+    let gpu = listed_gpu_at(&json, address);
+    assert_eq!(
+        gpu["gfx_target"],
+        serde_json::json!(native_gfx),
+        "the runtime's overridden {OVERRIDDEN_GFX} replaced the card's own target:\n{json:#}"
+    );
+    assert_eq!(gpu["is_apu"], serde_json::json!(true), "{json:#}");
+    assert_eq!(json["has_apu"], serde_json::json!(true), "{json:#}");
+    assert_eq!(
+        json["has_discrete_amd"],
+        serde_json::json!(false),
+        "{json:#}"
+    );
+}
+
+#[then("the integrated GPU is reported with the model name the runtime gave it")]
+async fn assert_the_overridden_apu_takes_the_runtimes_name(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let (address, _, _, _) = OVERRIDDEN_APU;
+    let gpu = listed_gpu_at(&json, address);
+    assert_eq!(
+        gpu["name"],
+        serde_json::json!(OVERRIDDEN_APU_MODEL),
+        "{json:#}"
+    );
+}
+
+// ── The kernel's architecture wins over one guessed from the model name ──
+
+/// The GPU `examine-57` plants: an `lspci -nn -D` line whose model name the
+/// examination's name table reads as gfx1103, an integrated GPU, and a KFD
+/// node at the same address (`location_id`, `gfx_target_version`) saying
+/// gfx1100, a discrete one. The line is rocm-core's own constant, whose
+/// name-table reading the unit test
+/// `the_pci_lines_examine_57_and_58_plant_read_as_their_scenarios_assume`
+/// pins, so the scenario cannot pass with the two already agreeing.
+const NAME_GUESSED_GPU_ADDRESS: &str = "0000:05:00.0";
+const NAME_GUESSED_GPU_LSPCI: &str =
+    rocm_core::examine::TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103;
+const NAME_GUESSED_GPU_NODE: (u32, u32) = (1280, 110_000);
+const KERNEL_GFX: &str = "gfx1100";
+
+#[given("a machine whose PCI listing names a GPU model the kernel reports as another architecture")]
+async fn machine_whose_pci_name_and_kernel_disagree(world: &mut E2eWorld) {
+    plant_native_gpus_and_runtime(
+        world,
+        &[NAME_GUESSED_GPU_LSPCI],
+        &[NAME_GUESSED_GPU_NODE],
+        "",
+        &[],
+    );
+}
+
+#[then("the GPU is reported with the architecture the kernel gives it, as a discrete GPU")]
+async fn assert_the_kernels_architecture_is_reported(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let gpus = json["gpus"].as_array().map_or(0, Vec::len);
+    assert_eq!(gpus, 1, "one entry for the one planted GPU:\n{json:#}");
+    let gpu = listed_gpu_at(&json, NAME_GUESSED_GPU_ADDRESS);
+    assert_eq!(
+        gpu["gfx_target"],
+        serde_json::json!(KERNEL_GFX),
+        "the architecture guessed from the model name outranked the kernel's:\n{json:#}"
+    );
+    assert_eq!(gpu["is_apu"], serde_json::json!(false), "{json:#}");
+    assert_eq!(json["has_apu"], serde_json::json!(false), "{json:#}");
+    assert_eq!(
+        json["has_discrete_amd"],
+        serde_json::json!(true),
+        "{json:#}"
+    );
+}
+
+// ── The kernel's architecture fills a GPU the PCI listing cannot name ──
+
+/// The GPU `examine-58` plants: an `lspci -nn -D` line with no model name any
+/// table knows (`Device 7fff`), and a KFD node at that address
+/// (`location_id`, `gfx_target_version`) saying gfx1151, an integrated GPU.
+/// The line is rocm-core's own constant, whose empty name-table reading the
+/// same unit test pins.
+const UNNAMED_GPU_ADDRESS: &str = "0000:c3:00.0";
+const UNNAMED_GPU_LSPCI: &str =
+    rocm_core::examine::TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING;
+const UNNAMED_GPU_NODE: (u32, u32) = (49_920, 110_501);
+const UNNAMED_GPU_KERNEL_GFX: &str = "gfx1151";
+
+#[given(
+    "a machine whose PCI listing cannot name its GPU and whose kernel reports an integrated architecture for it"
+)]
+async fn machine_whose_pci_listing_cannot_name_an_integrated_gpu(world: &mut E2eWorld) {
+    plant_native_gpus_and_runtime(world, &[UNNAMED_GPU_LSPCI], &[UNNAMED_GPU_NODE], "", &[]);
+}
+
+#[then("the unnamed GPU is reported with the kernel's architecture, as an integrated GPU")]
+async fn assert_the_unnamed_gpu_takes_the_kernels_architecture(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let gpus = json["gpus"].as_array().map_or(0, Vec::len);
+    assert_eq!(gpus, 1, "one entry for the one planted GPU:\n{json:#}");
+    let gpu = listed_gpu_at(&json, UNNAMED_GPU_ADDRESS);
+    assert_eq!(
+        gpu["gfx_target"],
+        serde_json::json!(UNNAMED_GPU_KERNEL_GFX),
+        "{json:#}"
+    );
+    assert_eq!(
+        gpu["is_apu"],
+        serde_json::json!(true),
+        "the scan's default `discrete` stood over the kernel's integrated architecture:\n{json:#}"
+    );
+    assert_eq!(json["has_apu"], serde_json::json!(true), "{json:#}");
+    assert_eq!(
+        json["has_discrete_amd"],
+        serde_json::json!(false),
+        "{json:#}"
+    );
+}
+
+// ── Runtime readings that name no card are reported, not paired by position ──
+
+#[given(
+    "a machine with two AMD GPUs whose ROCm runtime lists both without saying which card is which"
+)]
+async fn machine_whose_runtime_lists_gpus_without_addresses(world: &mut E2eWorld) {
+    // The same two cards as examine-55, and a runtime that lists both, in the
+    // same order and with matching architectures, but prints no `BDFID:` for
+    // either: a position-and-count pairing would take this listing at face
+    // value, which is exactly what must not happen.
+    let (_, first_location, first_version, first_gfx) = HIDDEN_GPU;
+    let (_, second_location, second_version, second_gfx) = VISIBLE_GPU;
+    plant_native_gpus_and_runtime(
+        world,
+        &[],
+        &[
+            (first_location, first_version),
+            (second_location, second_version),
+        ],
+        "",
+        &[
+            (first_gfx, UNPLACED_FIRST_MODEL, None, ""),
+            (second_gfx, VISIBLE_GPU_MODEL, None, ""),
+        ],
+    );
+}
+
+/// The model name the examine-59 runtime gives its first agent; neither card
+/// may end up carrying it or [`VISIBLE_GPU_MODEL`].
+const UNPLACED_FIRST_MODEL: &str = "AMD Radeon RX 7900 XTX";
+
+#[then("each GPU is reported with its own architecture and no model name")]
+async fn assert_each_gpu_keeps_its_own_reading(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let gpus = json["gpus"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        gpus, 2,
+        "one entry per planted GPU, and none added:\n{json:#}"
+    );
+    for (address, _, _, gfx) in [HIDDEN_GPU, VISIBLE_GPU] {
+        let gpu = listed_gpu_at(&json, address);
+        assert_eq!(gpu["gfx_target"], serde_json::json!(gfx), "{json:#}");
+        assert_eq!(
+            gpu["name"],
+            serde_json::json!(rocm_core::examine::KERNEL_TOPOLOGY_GPU_NAME),
+            "{address} took a model name the runtime gave an agent that names no card:\n{json:#}"
+        );
+        assert_eq!(gpu["is_apu"], serde_json::Value::Null, "{json:#}");
+    }
+}
+
+#[then("the inspection says the runtime's readings could not be matched to a listed GPU")]
+async fn assert_the_unplaced_readings_are_reported(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let notes: Vec<&str> = json["notes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let note = notes
+        .iter()
+        .find(|note| note.contains("could not be matched to a listed GPU"))
+        .unwrap_or_else(|| panic!("no note about the unmatched readings:\n{notes:#?}"));
+    assert!(
+        note.starts_with("2 GPU reading(s) from rocminfo"),
+        "the note counts both readings: {note}"
+    );
+    for gfx in [HIDDEN_GPU.3, VISIBLE_GPU.3] {
+        assert!(
+            note.contains(&format!("{gfx} (no bus address)")),
+            "the note names {gfx} and why: {note}"
+        );
+    }
+}
+
 // ── `rocm serve` on a WSL host whose ROCDXG library the loader cannot find ──
 
 #[when("the user serves a model under the GPU-required default on that machine")]

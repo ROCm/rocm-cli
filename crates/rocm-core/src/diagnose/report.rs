@@ -81,11 +81,86 @@ fn is_advice_only(fix_id: &str) -> bool {
 pub const SYMPTOM_DID_NOT_CONTRIBUTE_NOTE: &str =
     "source: the examined host's state alone; the symptom text did not contribute to it";
 
+/// The `rocm diagnose --json` document: `report` as pretty JSON, ASCII on the
+/// wire.
+///
+/// `serde_json` writes non-ASCII characters raw, as UTF-8, and a Windows
+/// console on the OEM code page shows those bytes as mojibake (ROCMAI-543).
+/// The catalog's own messages are ASCII, but a report can carry text it did
+/// not write: `provenance.symptom` is the user's paste, verbatim, and some
+/// evidence lines quote paths and versions read from the examined host. That
+/// text must not be edited -- `--engine` exists so the paste is not -- so it is
+/// escaped instead: every non-ASCII character becomes `\uXXXX` (a surrogate
+/// pair beyond the Basic Multilingual Plane), and any JSON parser reads back
+/// the identical string.
+///
+/// Escaping after serialization is exact: in valid JSON a non-ASCII character
+/// can only occur inside a string, and every JSON escape sequence is ASCII, so
+/// no character this rewrites is part of one. Pinned by
+/// `every_message_the_diagnose_catalog_can_emit_is_ascii` (the wire form) and
+/// `a_non_ascii_paste_round_trips_through_the_json_exactly` (the value).
+///
+/// # Errors
+///
+/// Whatever `serde_json` returns when `report` does not serialize. A
+/// `DiagnoseReport` holds only strings, numbers, booleans and maps with string
+/// keys, so none is expected, but the caller decides what a failure means
+/// rather than this function panicking.
+pub fn render_report_json(report: &DiagnoseReport) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(report).map(|pretty| escape_non_ascii(&pretty))
+}
+
+/// `json` with every non-ASCII character replaced by its `\uXXXX` escape, in
+/// UTF-16 code units.
+fn escape_non_ascii(json: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(json.len());
+    let mut units = [0_u16; 2];
+    for c in json.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
+        }
+    }
+    out
+}
+
+/// The line the text report opens with when `--engine` named an engine.
+///
+/// Computed from `read_here`, which `diagnose_with_engine` takes from the
+/// catalog table the checks ran from, so the line cannot claim the engine was
+/// taken into account on a platform where no entry read it (native Windows has
+/// no vLLM entry today) or the reverse. A report read back from JSON does not
+/// know, and says only which engine was named. The JSON report carries no such
+/// line: `provenance` already names the engine there.
+fn named_engine_line(report: &DiagnoseReport) -> Option<String> {
+    let provenance = report.provenance.as_ref()?;
+    let engine = provenance.engine.name();
+    Some(match provenance.read_here {
+        Some(true) => format!(
+            "Engine: {engine} (named with --engine; every non-blank line of the symptom was \
+             read as {engine}'s)."
+        ),
+        Some(false) => format!(
+            "Engine: {engine} (named with --engine; no entry for {engine} exists on this OS, \
+             so the flag changed nothing)."
+        ),
+        None => format!("Engine: {engine} (named with --engine)."),
+    })
+}
+
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
 #[must_use]
 pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    if let Some(line) = named_engine_line(report) {
+        out.push_str(&line);
+        out.push_str("\n\n");
+    }
     if let Some(reason) = &report.out_of_scope {
         out.push_str("rocm diagnose: out of scope for this platform.\n\n");
         out.push_str(reason);
@@ -265,6 +340,7 @@ mod tests {
             },
             out_of_scope: None,
             model: None,
+            provenance: None,
         };
         let out = render_report_text(&report, 5);
         assert!(
@@ -496,6 +572,7 @@ mod tests {
             route_when_no_match: upstream_route("rocm-core"),
             out_of_scope: None,
             model: None,
+            provenance: None,
         };
         let out = render_report_text(&report, 1);
         assert!(

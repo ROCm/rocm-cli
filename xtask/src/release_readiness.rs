@@ -428,13 +428,13 @@ fn queue_absent_reason(markdown: &str) -> Option<String> {
 /// for every per-platform row that reports a non-`PASS` `Status` with a `Fail`
 /// cell of `0`.
 ///
-/// The second part exists because an `EMPTY` platform (no `report.json`, or
-/// one that's empty/unparseable) contributes `0` to every numeric column —
-/// including `Fail` — so the Total row's own Fail cell has no record that the
-/// platform was ever there at all. A genuine `FAIL` status always has a
-/// nonzero own `Fail` cell (already folded into the Total row), so this only
-/// adds for platforms the Total row would otherwise read as having zero
-/// failures.
+/// The second part exists because two kinds of failed row contribute `0` to
+/// the `Fail` column, so the Total row's own Fail cell has no record of them:
+/// an `EMPTY` platform (no `report.json`, or one that's empty/unparseable),
+/// and a `FAIL` platform whose only problem is the harness's post-run lane
+/// check (`lane_failure` in its `platform.json`, e.g. "0 scenarios executed"),
+/// which fails no scenario cell. A `FAIL` row with a nonzero own `Fail` cell
+/// is already folded into the Total row and is not counted again.
 ///
 /// A row for a shared-queue lane the queue does not block on (its platform
 /// cell carries [`e2e_report::ADVISORY_QUEUE_MARKER`]) counts for neither: the
@@ -793,6 +793,54 @@ mod tests {
                    | Windows | Windows | 0 | 0 | 0 | 0 | n/a | EMPTY |\n\
                    | **Total** | | 0 | 0 | 0 | 0 | 0 | |\n";
         assert_eq!(total_e2e_failures(md), Some(1));
+    }
+
+    /// A lane the harness failed after its run with no failed scenario cell
+    /// (every scenario passed or was skipped) reads `FAIL` with a `Fail` cell
+    /// of 0; the Total row cannot show it, so the row itself must count. One
+    /// that also has a failed cell is already in the Total row and is counted
+    /// once, not twice.
+    #[test]
+    fn total_e2e_failures_counts_a_lane_check_failure_with_no_failed_cells() {
+        // Real renderer output over a platform.json that records a lane
+        // failure, with the one scenario passing or failing.
+        let render = |step_status: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let report = dir.path().join("report.json");
+            std::fs::write(
+                &report,
+                format!(
+                    r#"[{{"name":"F","uri":"f.feature","elements":[{{"name":"s0","tags":[{{"name":"id:examine-a"}}],"steps":[{{"keyword":"Given ","name":"x","result":{{"status":"{step_status}"}}}}]}}]}}]"#
+                ),
+            )
+            .expect("write report");
+            std::fs::write(
+                dir.path().join("platform.json"),
+                r#"{"platform_slug":"mi300x","lane_failure":"0 scenarios executed",
+                    "expectations":[{"id":"examine-a","feature":"F","expected":"pass"}]}"#,
+            )
+            .expect("write platform.json");
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&[(
+                "e2e-gpu-report".to_string(),
+                report,
+            )]))
+        };
+
+        let md = render("passed");
+        assert!(
+            md.contains("| 1 | 1 | 0 | 0 | n/a | FAIL |")
+                && md.contains("| **Total** | | 1 | 1 | 0 |"),
+            "expected a FAIL row with a Fail cell of 0:\n{md}"
+        );
+        assert_eq!(total_e2e_failures(&md), Some(1), "{md}");
+
+        let md = render("failed");
+        assert!(
+            md.contains("| 1 | 0 | 1 | 0 | n/a | FAIL |")
+                && md.contains("| **Total** | | 1 | 0 | 1 |"),
+            "expected a FAIL row with a Fail cell of 1:\n{md}"
+        );
+        assert_eq!(total_e2e_failures(&md), Some(1), "{md}");
     }
 
     #[test]

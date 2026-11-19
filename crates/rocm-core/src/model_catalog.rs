@@ -879,6 +879,11 @@ pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
 /// (`model_catalog.json`) using the same schema as an external signed recipe
 /// index, so the offline default and hosted indexes share one format. Parsed once
 /// and cached; a malformed catalog is a test-time bug guarded by a unit test.
+#[expect(
+    clippy::expect_used,
+    reason = "the catalog is compiled in; `builtin_model_catalog_json_parses_and_validates` \
+              parses and validates it on every test run"
+)]
 fn builtin_model_catalog_document() -> &'static ModelRecipeIndexDocument {
     static CATALOG: std::sync::OnceLock<ModelRecipeIndexDocument> = std::sync::OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -984,12 +989,7 @@ mod tests {
         // Guards the embedded catalog: malformed JSON, a bad device policy, or a
         // duplicate alias/canonical id would fail the shared index schema here
         // instead of panicking at runtime.
-        let document =
-            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
-                .expect("catalog JSON parses");
-        document
-            .validate()
-            .expect("catalog satisfies the index schema");
+        let document = builtin_model_catalog_document();
         assert!(
             document.recipes.len() >= 10,
             "curated catalog is non-trivial"
