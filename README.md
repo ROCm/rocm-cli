@@ -461,7 +461,7 @@ environment. Running `rocm install sdk` creates a managed runtime alongside any
 legacy install.
 
 Without `--version`, `rocm install sdk` installs the newest stable release
-(ROCm 10.1 today) from `stable.repo.amd.com`, and `--channel nightly` installs the
+from `stable.repo.amd.com`, and `--channel nightly` installs the
 newest nightly build from `nightly.repo.amd.com`. Earlier releases stay
 installable by pinning them: `--version 7.14.1` installs the ROCm 7.14.1 release,
 and `--channel nightly --build-date 2026-08-19` installs a nightly from before
