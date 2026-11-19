@@ -6052,6 +6052,77 @@ fi
         );
     }
 
+    /// The queue-results fetch is bounded by its step's `timeout-minutes`, and
+    /// the cap has to outlast the retries the step allows itself: one job's log
+    /// read is up to `attempts x --max-time` plus a `sleep` after each failed
+    /// attempt. A 5-minute cap sat below that (about 6.3 minutes), so a slow
+    /// storage hop cut the step off mid-retry, the queue lanes were missing from
+    /// the consolidated report and the wiki, and the retries never got to finish.
+    /// The budget is read from the script, so changing a retry count, a
+    /// `--max-time` or a `sleep` re-checks the cap.
+    #[test]
+    fn nightly_queue_fetch_timeout_outlasts_one_jobs_retry_budget() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "e2e-report-nightly");
+        let steps = job_steps(job).expect("the report job has steps");
+        let (_, step) = steps
+            .iter()
+            .find(|(name, _)| name.starts_with("Fetch the latest queue results"))
+            .expect("e2e-report-nightly has a `Fetch the latest queue results` step");
+        // Code only: a comment that names `--max-time` or `sleep` is not the budget.
+        let script = normalized_whitespace(
+            &step
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // The number that follows `marker`, which must be present.
+        let number_after = |marker: &str| -> u64 {
+            let (_, rest) = script
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("the fetch step must contain `{marker}`:\n{script}"));
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits
+                .parse()
+                .unwrap_or_else(|_| panic!("a number must follow `{marker}`:\n{script}"))
+        };
+        let attempts = script
+            .split_once("for attempt in ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(list, _)| list.split_whitespace().count() as u64)
+            .expect("the job-log read loops over its attempts");
+        let max_time = number_after("--max-time ");
+        let pause = number_after("sleep ");
+        // The pause follows every failed attempt, the last one included.
+        let one_job_worst_case = attempts * (max_time + pause);
+
+        let cap = step_key(step, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the fetch step has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap >= one_job_worst_case * 5 / 4,
+            "the queue fetch step is capped at {cap}s, but reading one job's log can take \
+             {one_job_worst_case}s ({attempts} attempts x ({max_time}s + {pause}s)); the cap \
+             must cover that with a quarter to spare or a slow fetch is cut off mid-retry and \
+             the queue lanes go missing from the report"
+        );
+        // ...and leaves the job's own cap room for the steps after it: a fetch that
+        // used all of its time must not push the report and the wiki publish past
+        // the job's timeout, which would lose them for the sake of the queue lanes.
+        let job_cap = job_scalar(job, "timeout-minutes")
+            .parse::<u64>()
+            .expect("the report job has a numeric timeout-minutes")
+            * 60;
+        assert!(
+            cap + 5 * 60 <= job_cap,
+            "the queue fetch step ({cap}s) must leave the report job ({job_cap}s) at least five \
+             minutes for the steps after it"
+        );
+    }
+
     #[test]
     fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
         let nightly = read_workflow("nightly.yml");
@@ -12784,6 +12855,54 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn a_failing_lane_leaves_a_note_of_how_it_ended_beside_its_results() {
+        // The suite fails on both channels: each keeps its results, and the
+        // note names the status and both channels.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            suite_rc: 3,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 3, "{log}");
+        assert!(out.join("release/results/junit.xml").is_file(), "{log}");
+        assert!(out.join("nightly/results/junit.xml").is_file(), "{log}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note"),
+            "status=3\nchannels_failed=release nightly\n",
+            "{log}"
+        );
+
+        // A lane that stops before any channel runs still leaves the note.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            preflight_fails_on: Some(1),
+            ..LaneCase::default()
+        });
+        assert_ne!(rc, 0, "{log}");
+        let note = std::fs::read_to_string(out.join("lane-status.txt")).expect("the status note");
+        assert!(note.starts_with(&format!("status={rc}\n")), "{note}");
+
+        // A lane that passes writes none.
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase::default());
+        assert_eq!(rc, 0, "{log}");
+        assert!(!out.join("lane-status.txt").exists(), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_lane_runs_only_the_channels_it_is_asked_for_and_refuses_others() {
         let LaneRun {
             rc,
@@ -12955,7 +13074,7 @@ esac
             !log.contains("cargo"),
             "nothing is built after apt-get gave up:\n{log}"
         );
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// `apt-get install` fails on a dropped connection or a pool that moved
@@ -12992,7 +13111,7 @@ esac
             !log.contains("cargo"),
             "nothing is built after apt-get gave up:\n{log}"
         );
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// The rustup-init download is retried, and only the download: a file that
@@ -13083,7 +13202,7 @@ esac
                 "{log}"
             );
             assert!(!log.contains("cargo build"), "{log}");
-            assert!(!out.exists());
+            assert!(!out.join("release").exists());
         }
     }
 
@@ -13108,7 +13227,7 @@ esac
         );
         assert!(!log.contains("cargo fetch"), "{log}");
         assert!(!log.contains("cargo build"), "{log}");
-        assert!(!out.exists());
+        assert!(!out.join("release").exists());
     }
 
     /// The fetch covers only the host's crates, so a build target set from
@@ -13129,7 +13248,7 @@ esac
         assert_eq!(rc, 1, "{log}");
         assert!(log.contains("CARGO_BUILD_TARGET is set"), "{log}");
         assert!(!log.contains("cargo fetch"), "{log}");
-        assert!(!out.exists());
+        assert!(!out.exists(), "{log}");
 
         let LaneRun { rc, log, .. } = run_lane(&LaneCase {
             machine: "aarch64",

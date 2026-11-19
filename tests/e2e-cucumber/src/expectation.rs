@@ -2627,4 +2627,48 @@ flaky = true
             Expectation::ExpectPass
         );
     }
+
+    /// The not-applicable skip is for scenarios that serve with a real vLLM,
+    /// which is what `requires-gpu` says. The feature files also hold `serve-`,
+    /// `bench-` and `chat-` scenarios without it, which run against a mock
+    /// server; an engine the pre-warm could not install must not skip those.
+    #[test]
+    fn an_engine_the_prewarm_could_not_install_leaves_mock_scenarios_alone() {
+        let m = eai7333_matrix();
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let mut mi300x = cap("mi300x");
+        mi300x.engine_not_applicable = Some("vllm has no build for this SDK".to_owned());
+
+        // Their ids put them in the groups that start a model server, and the
+        // host defaults to vLLM: only the missing `requires-gpu` keeps them out.
+        for id in [
+            "id:serve-short-name-expansion",
+            "id:bench-load-reports-throughput",
+            "id:chat-served-model-discoverable",
+        ] {
+            let mock = decl(&[id]);
+            assert!(!mock.requires_gpu);
+            assert!(mock.starts_a_model_server(), "{id} must look like a server");
+            assert!(mock.effective_engine(&mi300x).eq_ignore_ascii_case("vllm"));
+            assert_eq!(
+                resolve(&mock, &mi300x, &m, included),
+                Expectation::ExpectPass,
+                "{id} runs against a mock and is not made not-applicable by the engine"
+            );
+            // The same scenario with `requires-gpu` is the one that is skipped.
+            let real = decl(&[id, "requires-gpu"]);
+            assert!(
+                matches!(
+                    resolve(&real, &mi300x, &m, included),
+                    Expectation::Skip { .. }
+                ),
+                "{id} with requires-gpu serves with the real engine and must be skipped"
+            );
+        }
+    }
 }

@@ -41,6 +41,34 @@ fn config_dir(world: &E2eWorld) -> PathBuf {
     root(world).join("rocm-config")
 }
 
+/// A real data folder in the isolated root, holding a file of the user's.
+fn data_dir(world: &E2eWorld) -> PathBuf {
+    root(world).join("rocm-data")
+}
+
+/// The folder settings of a run that uninstalls only the config folder: the
+/// config and data folders in the isolated root, so a run that wrongly removed
+/// the data it was told to keep would show.
+fn config_only_settings(world: &E2eWorld) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "ROCM_CLI_CONFIG_DIR",
+            config_dir(world).display().to_string(),
+        ),
+        ("ROCM_CLI_DATA_DIR", data_dir(world).display().to_string()),
+    ]
+}
+
+/// [`run_uninstall_args`] with [`config_only_settings`].
+fn run_config_only(world: &mut E2eWorld, args: &[&str]) {
+    let settings = config_only_settings(world);
+    let settings = settings
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect::<Vec<_>>();
+    run_uninstall_args(world, args, &settings);
+}
+
 /// A cache setting the kernel cannot check: its parent is a link to itself.
 fn looping_cache(world: &E2eWorld) -> PathBuf {
     root(world).join("loop").join("cache")
@@ -71,6 +99,13 @@ async fn config_holds_user_files(world: &mut E2eWorld) {
     std::fs::write(config.join(USER_FILE), "user data").expect("failed to write user file");
 }
 
+#[given("the data folder holds the user's files")]
+async fn data_holds_user_files(world: &mut E2eWorld) {
+    let data = data_dir(world);
+    std::fs::create_dir_all(&data).expect("failed to create data folder");
+    std::fs::write(data.join(USER_FILE), "user data").expect("failed to write user file");
+}
+
 #[given("the cache folder is reached through a link that points at itself")]
 async fn cache_behind_looping_link(world: &mut E2eWorld) {
     let looping = root(world).join("loop");
@@ -90,23 +125,9 @@ fn isolated_env(world: &E2eWorld) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// A confirmed uninstall that keeps the binaries and whatever `keep` names.
 fn run_uninstall(world: &mut E2eWorld, keep: &[&str], settings: &[(&str, &str)]) {
-    run_uninstall_with(world, true, keep, settings);
-}
-
-/// `confirmed: false` leaves `--yes` off, so the run reaches the confirmation
-/// gate; the harness gives the binary no terminal, which is the case the gate
-/// has to refuse.
-fn run_uninstall_with(
-    world: &mut E2eWorld,
-    confirmed: bool,
-    keep: &[&str],
-    settings: &[(&str, &str)],
-) {
-    let mut args = vec!["uninstall", "--keep-binaries"];
-    if confirmed {
-        args.push("--yes");
-    }
+    let mut args = vec!["uninstall", "--keep-binaries", "--yes"];
     args.extend_from_slice(keep);
     run_uninstall_args(world, &args, settings);
 }
@@ -161,15 +182,11 @@ async fn uninstall_config_and_cache(world: &mut E2eWorld) {
     );
 }
 
+/// Without `--yes` the run reaches the confirmation gate; the harness gives the
+/// binary no terminal, which is the case the gate has to refuse.
 #[when("the user uninstalls the config without confirming")]
 async fn uninstall_config_unconfirmed(world: &mut E2eWorld) {
-    let config = config_dir(world).display().to_string();
-    run_uninstall_with(
-        world,
-        false,
-        &["--keep-data", "--keep-cache"],
-        &[("ROCM_CLI_CONFIG_DIR", &config)],
-    );
+    run_config_only(world, &config_only_args(false));
 }
 
 /// Run `rocm uninstall` of the config folder only, without `--yes`, under a real
@@ -741,7 +758,7 @@ async fn config_gone(world: &mut E2eWorld) {
     let config = config_dir(world);
     assert!(
         std::fs::symlink_metadata(&config).is_err(),
-        "running it again as the dry run said did not remove {}:\n{}",
+        "running the command the previous run named did not remove {}:\n{}",
         config.display(),
         output(world)
     );
@@ -847,10 +864,9 @@ async fn preview_says_removal_needs_approval(world: &mut E2eWorld) {
 
 #[when("the user uninstalls the config with --force")]
 async fn uninstall_with_force(world: &mut E2eWorld) {
-    let config = config_dir(world).display().to_string();
     let mut args = config_only_args(false);
     args.push("--force");
-    run_uninstall_args(world, &args, &[("ROCM_CLI_CONFIG_DIR", &config)]);
+    run_config_only(world, &args);
 }
 
 #[when("the user uninstalls the config with a near miss of --force")]
@@ -877,6 +893,47 @@ async fn refused_and_told_to_use_yes(world: &mut E2eWorld) {
     assert!(
         !stderr.contains("force-dev-binaries"),
         "the refusal must not name the destructive flag:\n{stderr}"
+    );
+}
+
+/// The refusals in `uninstall-16` and `uninstall-17` both come from the
+/// config-only uninstall (`--force` added for the second), and end with the
+/// command the user meant: that uninstall with `--yes`, and without `--force`.
+#[then("the refusal ends by suggesting the same uninstall, confirmed")]
+async fn refusal_suggests_confirmed_uninstall(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let mut expected = vec!["rocm"];
+    expected.extend(config_only_args(false));
+    expected.push("--yes");
+    assert_eq!(
+        rocm_core::recovery_hint::try_command(stderr),
+        Some(expected.join(" ").as_str()),
+        "the refusal must end with `Try: {}`:\n{stderr}",
+        expected.join(" ")
+    );
+}
+
+#[when("the user runs the command the refusal suggests")]
+async fn run_suggested_command(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let advised = rocm_core::recovery_hint::try_command(&stderr)
+        .unwrap_or_else(|| panic!("the refusal suggests no command:\n{stderr}"))
+        .to_owned();
+    // Run as the user would copy it, in the same shell: the folder settings are
+    // the environment's, and the advice only repeats the command line.
+    let argv: Vec<&str> = advised.split_whitespace().collect();
+    assert_eq!(argv.first(), Some(&"rocm"), "{advised}");
+    run_config_only(world, &argv[1..]);
+}
+
+#[then("the data folder still holds the user's files")]
+async fn data_intact(world: &mut E2eWorld) {
+    let file = data_dir(world).join(USER_FILE);
+    assert!(
+        file.is_file(),
+        "uninstall removed {}, which it was told to keep:\n{}",
+        file.display(),
+        output(world)
     );
 }
 

@@ -2032,19 +2032,32 @@ Expected result:
   on that folder. It adds no line about how to remove anything (scenario
   `uninstall-09`).
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
-  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  is not an option and points to `--yes`, and ends with a `Try:` line that is
+  your command with `--yes` in place of `--force` (scenario `uninstall-17`); a near miss such as `--forc` is an
   unknown-argument error (exit 2). Neither
   suggests `--force-dev-binaries` (scenario `uninstall-10`).
   `rocm uninstall --help` ends with examples that start with a dry run
   (scenario `uninstall-11`).
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
-  and exit code 1, and removes nothing. On Linux or WSL, check it with no
+  and exit code 1, and removes nothing. The refusal ends with
+  `Try: rocm uninstall --keep-binaries --yes`, the same command with `--yes`
+  added (scenario `uninstall-16`). On Linux or WSL, check it with no
   terminal attached. A regression would delete real settings, data and cache,
-  so the command points `HOME` at a scratch folder itself:
+  so the command points `HOME` at a scratch folder itself, and the `Try:` line
+  is run in that same scratch `HOME`. The folder needs something to remove: on
+  an empty one the command reports that there is nothing to remove and exits 0,
+  so it never reaches the refusal. `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`
+  and `ROCM_CLI_CACHE_DIR` take precedence over `HOME`, so each command runs
+  without them. With `RUST_BACKTRACE` set, a backtrace is printed after the
+  `Try:` line:
 
   ```bash
-  HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+  scratch=$(mktemp -d) && mkdir -p "$scratch/.rocm" && touch "$scratch/.rocm/x"   # something to remove
+  env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+    rocm uninstall --keep-binaries < /dev/null   # expect the refusal and its Try: line; exit 1
+  env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+    rocm uninstall --keep-binaries --yes         # the Try: line; removes what was listed
   ```
 
   At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
