@@ -89,8 +89,12 @@ fn recipe_fits_gpu(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: f64) -> b
 
 /// The recommendation order within one hardware group: most capable first.
 ///
-/// `featured` leads, because a curator marking a recipe still means something —
-/// but it no longer *selects*, only breaks ties. After that the largest model
+/// `featured` leads, because a curator marking a recipe still means something.
+/// It is the *primary* key, not a tie-break: a featured recipe that fits
+/// outranks a larger one that also fits. What changed is that it no longer
+/// decides *eligibility* — before, only `featured` recipes were offered at all,
+/// which is how a small host was shown four models it could not run and none of
+/// the ones it could. Ordering, not selection. After that the largest model
 /// that fits comes first, since a host that can run it generally should.
 fn recommendation_rank(recipe: &ModelRecipeRecord) -> (bool, u32) {
     (
