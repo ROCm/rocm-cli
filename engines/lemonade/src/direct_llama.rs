@@ -1410,6 +1410,41 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Admitting `chat` must not let a launch-changing label or field ride along
+    /// with it: any one disallowed entry sends the model to the router.
+    #[test]
+    fn serving_regression_chat_label_with_launch_changing_entry_uses_router() {
+        let dir = scratch_dir("registered-chat-mixed");
+        let manifest = test_manifest(dir.join("runtime"));
+        for (name, labels, mmproj) in [
+            ("mtp after chat", serde_json::json!(["chat", "mtp"]), false),
+            ("mtp before chat", serde_json::json!(["mtp", "chat"]), false),
+            (
+                "unknown after chat",
+                serde_json::json!(["chat", "unknown"]),
+                false,
+            ),
+            ("chat with mmproj", serde_json::json!(["chat"]), true),
+        ] {
+            let mut metadata = serde_json::json!({
+                "recipe": "llamacpp",
+                "checkpoint": "owner/repo:Q4_0",
+                "labels": labels,
+            });
+            if mmproj {
+                metadata["mmproj"] = serde_json::json!("owner/repo:mmproj.gguf");
+            }
+            write_registry(&manifest, serde_json::json!({"Mixed-GGUF": metadata}));
+            assert!(
+                resolve_direct_llama_model(&manifest, "Mixed-GGUF")
+                    .unwrap()
+                    .is_none(),
+                "{name}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn serving_regression_safe_variantless_registered_model_uses_router() {
         let dir = scratch_dir("registered-variantless");
