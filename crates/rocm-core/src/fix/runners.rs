@@ -13,7 +13,8 @@
 
 use super::catalog::{IGPU_DGPU_ID, PATH_ID, RENDER_GROUP_ID, UNSET_OVERRIDE_ID};
 use super::consent::{
-    CheckIn, QUERY_TIMEOUT, RUN_TIMEOUT, Step, confirm, fail, read_failure, run_step,
+    CheckIn, DRY_RUN_NOTICE, QUERY_TIMEOUT, RUN_TIMEOUT, Step, confirm, fail, read_failure,
+    run_step,
 };
 use super::options::{FixOptions, exit};
 use crate::command_capture::{CommandCapture, CommandOutcome};
@@ -116,7 +117,7 @@ fn render_group_with(
     };
     println!("Will run: {program} {}", args.join(" "));
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Add user to render,video groups?", opts.yes) {
@@ -341,7 +342,7 @@ fn report_and_clear_override_windows(
             shown.join(" ")
         );
         if opts.dry_run {
-            let _ = writeln!(out, "  (dry-run; not executed)");
+            let _ = writeln!(out, "  {DRY_RUN_NOTICE}");
         } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
             let check = env_scope_query(OVERRIDE_VAR, "User");
             let rerun = format!("rocm fix {UNSET_OVERRIDE_ID}");
@@ -428,7 +429,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
@@ -541,7 +542,7 @@ fn path_export_windows(
         "  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')"
     );
     if opts.dry_run {
-        let _ = writeln!(out, "(dry-run; not executed)");
+        let _ = writeln!(out, "{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Update User PATH?", opts.yes) {
@@ -634,7 +635,7 @@ fn pin_device_in_rc_file(
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
-        println!("(dry-run; not executed)");
+        println!("{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !consent() {
@@ -712,7 +713,7 @@ fn hip_visible_devices_windows(
     );
     let _ = writeln!(out, "  setx HIP_VISIBLE_DEVICES {idx}");
     if opts.dry_run {
-        let _ = writeln!(out, "(dry-run; not executed)");
+        let _ = writeln!(out, "{DRY_RUN_NOTICE}");
         return exit::OK;
     }
     if !confirm("Set HIP_VISIBLE_DEVICES in the User scope?", opts.yes) {
