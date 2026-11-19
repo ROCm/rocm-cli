@@ -30,6 +30,7 @@ The ROCm CLI public repository is located at
 
       * :doc:`Installing ROCm CLI <install/installation>`
       * :doc:`ROCm CLI on WSL2 <install/wsl>`
+      * :doc:`Compatibility <compatibility>`
 
    .. grid-item-card:: Getting started
 
