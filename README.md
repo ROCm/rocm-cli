@@ -208,7 +208,7 @@ rocm version
 
 The output shows the ROCm CLI version with its release tag or branch and commit
 hash (a release build leads with its release version, such as
-`0.2.1 (v0.2.1, 1cde824)`; a build from `main` leads with `0.0.0-dev`), the ROCm
+`0.3.0 (v0.3.0, 07f72bb)`; a build from `main` leads with `0.0.0-dev`), the ROCm
 SDK that ROCm CLI would use on this computer, and the GPU driver version. A
 successful install prints the CLI version line. The SDK and driver lines read
 `not detected` when none is found, which is expected on a computer where you
