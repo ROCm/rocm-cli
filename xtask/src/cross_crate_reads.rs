@@ -34,11 +34,14 @@ use crate::affected::{self, Graph, Selection};
 /// and that are not Markdown (`install.sh`, `scripts/`, `.github/`, ...) need no
 /// entry: the selection already sends them to the whole workspace, as it does
 /// the docs in [`affected::XTASK_READ_DOCS`]. The guard
-/// `every_cross_crate_read_selects_its_reader` scans the workspace for
+/// `every_cross_crate_read_selects_its_reader` scans the workspace's code for
 /// `include_str!`/`include_bytes!`, manifest-relative reads and
 /// `repo_root().join("...")` calls with a path written out at the call that
 /// leave their crate, and fails when one is not covered here or by CI's `rust`
-/// path category. A path held in a const, or built at run time, is not seen,
+/// path category, or names a path Windows resolves differently (a component
+/// ending in `.` or a space). Comments and string literals are ignored, so an
+/// example call in a doc comment or a test fixture string is not a read. A
+/// path held in a const, or built at run time, is not seen,
 /// so such a read is guarded only by what pins the table entry or the CI glob
 /// by hand. Reads made by the e2e harness (the `e2e` test target, which
 /// only `cargo xtask e2e` runs) are not listed.
@@ -304,6 +307,8 @@ mod tests {
     }
 
     /// Lexically resolve `..` and `.`; `None` when the path leaves the root.
+    /// A name Windows resolves differently is kept, so that
+    /// [`target_problems`] reports it instead of the read vanishing.
     fn normalize(path: &str) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
         for part in path.split('/') {
@@ -318,14 +323,65 @@ mod tests {
         Some(parts.join("/"))
     }
 
+    /// Why Windows would not open `path` as written, if it would not: a
+    /// component ending in `.` or a space (other than `.` and `..`) has those
+    /// characters dropped, so `<root>\...` opens the repo root itself. Such a
+    /// read means something else on Windows than on Linux, so it is a problem.
+    fn windows_unsafe_name(path: &str) -> Option<String> {
+        let part = path
+            .split('/')
+            .find(|part| !matches!(*part, "." | "..") && part.ends_with(['.', ' ']))?;
+        Some(format!(
+            "names a path Windows resolves differently: {path} (component {part:?})"
+        ))
+    }
+
+    /// [`windows_unsafe_name`] for every read the three scanners find in
+    /// `text` (the file `source`): each scanner keeps such a name, so the guard,
+    /// which passes every target to [`target_problems`], reports it.
+    fn windows_unsafe_reads(source: &str, text: &str) -> Vec<String> {
+        let manifest_paths = manifest_reads(text)
+            .into_iter()
+            .filter_map(|read| match read {
+                Read::Path(path) => Some(path),
+                Read::Root => None,
+            });
+        include_targets(source, text)
+            .into_iter()
+            .chain(root_join_targets(text))
+            .chain(manifest_paths)
+            .filter_map(|target| windows_unsafe_name(&target))
+            .collect()
+    }
+
+    /// For each byte of `text`, whether it starts a character of code: one that
+    /// is not inside a comment or a string or char literal. A scanner checks
+    /// the first byte of what it matched, so a call shown in a doc comment
+    /// (`repo_root().join("...")`) or held in a test fixture string is not
+    /// taken for a read.
+    fn code_mask(text: &str) -> Vec<bool> {
+        let stripped = crate::rust_source::strip_literals_and_comments(text);
+        // The stripper writes one character for every character it reads.
+        let mut kept = stripped.chars();
+        let mut mask = vec![false; text.len()];
+        for (at, c) in text.char_indices() {
+            mask[at] = kept.next() == Some(c) && !c.is_whitespace();
+        }
+        mask
+    }
+
     /// Repo-relative targets of the `include_str!`/`include_bytes!` literals in
     /// the file `file_rel`.
     fn include_targets(file_rel: &str, text: &str) -> Vec<String> {
         let dir = file_rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let code = code_mask(text);
         let mut targets = Vec::new();
         for macro_name in ["include_str", "include_bytes"] {
             let needle = format!("{macro_name}!(");
             for (at, _) in text.match_indices(&needle) {
+                if !code[at] {
+                    continue;
+                }
                 let open = at + needle.len() - 1;
                 let Some(close) = matching_paren(text, open) else {
                     continue;
@@ -344,8 +400,12 @@ mod tests {
     fn manifest_reads(text: &str) -> Vec<Read> {
         let needle = format!("env!(\"{}\")", "CARGO_MANIFEST_DIR");
         let bytes = text.as_bytes();
+        let code = code_mask(text);
         let mut reads = Vec::new();
         for (at, _) in text.match_indices(&needle) {
+            if !code[at] {
+                continue;
+            }
             let mut i = at + needle.len();
             let (mut escapes, mut segments) = (false, Vec::new());
             loop {
@@ -405,8 +465,12 @@ mod tests {
     /// call. A path joined later, or built at run time, is not seen.
     fn root_join_targets(text: &str) -> Vec<String> {
         let needle = "repo_root()";
+        let code = code_mask(text);
         let mut targets = Vec::new();
         for (at, _) in text.match_indices(needle) {
+            if !code[at] {
+                continue;
+            }
             let rest = text[at + needle.len()..].trim_start_matches('?');
             let Some(args) = rest.trim_start().strip_prefix(".join") else {
                 continue;
@@ -439,14 +503,18 @@ mod tests {
     ///
     /// Symbolic links are neither followed nor listed: a link loop would recurse
     /// until the OS refuses, and a link out of the tree would scan files that are
-    /// not this workspace's. A directory that cannot be read contributes nothing
-    /// instead of failing the test, since a push should not be blocked by a folder
-    /// the developer has no access to.
-    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+    /// not this workspace's. A subdirectory that cannot be read contributes
+    /// nothing instead of failing the test, since a push should not be blocked by
+    /// a folder the developer has no access to. `dir` itself is different: the
+    /// caller asked for it, so failing to list it is an error, not an empty
+    /// directory.
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        walk_entries(std::fs::read_dir(dir)?, files);
+        Ok(())
+    }
+
+    fn walk_entries(entries: std::fs::ReadDir, files: &mut Vec<PathBuf>) {
         const SKIPPED: &[&str] = &["target", "node_modules", "third_party"];
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
         for entry in entries.flatten() {
             let Ok(kind) = entry.file_type() else {
                 continue;
@@ -458,8 +526,11 @@ mod tests {
             if kind.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_str().unwrap_or_default();
-                if !name.starts_with('.') && !SKIPPED.contains(&name) {
-                    walk(&path, files);
+                if !name.starts_with('.')
+                    && !SKIPPED.contains(&name)
+                    && let Ok(entries) = std::fs::read_dir(&path)
+                {
+                    walk_entries(entries, files);
                 }
             } else {
                 files.push(path);
@@ -520,6 +591,236 @@ mod tests {
         );
     }
 
+    /// The three reads the Windows job reported came from doc comments of this
+    /// file (`repo_root().join("...")` as an example), and `<root>\...` opens
+    /// the repo root on Windows. A call in a comment or a string is not a read,
+    /// and a component Windows resolves differently is not a path.
+    #[test]
+    fn a_call_in_a_comment_or_a_string_is_not_a_read() {
+        let call = |target: &str| format!("repo_root().join(\"{target}\")");
+        let text = format!(
+            "/// {}\n// {}\nlet s = \"{}\";\nlet p = {};\n",
+            call("docs/a.md"),
+            call("docs/b.md"),
+            call("docs/c.md").replace('"', "\\\""),
+            call("docs/d.md"),
+        );
+        assert_eq!(root_join_targets(&text), ["docs/d.md"]);
+        // The same text as code is a read, so the empty answers below come
+        // from the comment and not from a scanner that sees nothing.
+        let include = format!("{}!(\"../../x.md\")\n", "include_str");
+        assert_eq!(
+            include_targets("crates/a/src/lib.rs", &include),
+            ["crates/x.md"]
+        );
+        assert!(include_targets("crates/a/src/lib.rs", &format!("// {include}")).is_empty());
+        let manifest = format!(
+            "{}.parent().unwrap().join(\"README.md\")\n",
+            "env!(\"CARGO_MANIFEST_DIR\")"
+        );
+        assert!(!manifest_reads(&manifest).is_empty());
+        assert!(manifest_reads(&format!("// {manifest}")).is_empty());
+    }
+
+    #[test]
+    fn normalize_keeps_names_windows_resolves_differently_for_the_guard() {
+        assert_eq!(normalize("docs/a.md").as_deref(), Some("docs/a.md"));
+        assert_eq!(
+            normalize("./docs/../README.md").as_deref(),
+            Some("README.md")
+        );
+        assert_eq!(normalize("../x"), None);
+        assert_eq!(normalize("docs/a.").as_deref(), Some("docs/a."));
+        assert_eq!(windows_unsafe_name("docs/a.md"), None);
+        assert_eq!(windows_unsafe_name("./docs/../a.md"), None);
+        for path in ["...", "docs/.../a.md", "docs/a.", "docs/a "] {
+            assert!(windows_unsafe_name(path).is_some(), "{path}");
+        }
+        assert_eq!(
+            windows_unsafe_name("...").as_deref(),
+            Some("names a path Windows resolves differently: ... (component \"...\")")
+        );
+    }
+
+    /// The three scanners route their reads through one rule: a name Windows
+    /// resolves differently is reported whichever way it is written.
+    #[test]
+    fn every_scanner_reports_a_name_windows_resolves_differently() {
+        let include = format!("{}!(\"../../x.\");\n", "include_str");
+        let root_join = format!("let p = {}().join(\"docs/.../a.md\");\n", "repo_root");
+        let env = format!("env!(\"{}\")", "CARGO_MANIFEST_DIR");
+        let manifest =
+            format!("let q = Path::new({env}).join(\"..\").join(\"..\").join(\"skills \");\n");
+        let text = format!("{include}{root_join}{manifest}");
+        assert_eq!(
+            windows_unsafe_reads("crates/a/src/lib.rs", &text),
+            [
+                "names a path Windows resolves differently: crates/x. (component \"x.\")",
+                "names a path Windows resolves differently: docs/.../a.md (component \"...\")",
+                "names a path Windows resolves differently: skills  (component \"skills \")",
+            ]
+        );
+        assert!(windows_unsafe_reads("crates/a/src/lib.rs", "let p = 1;\n").is_empty());
+    }
+
+    #[test]
+    fn code_mask_marks_only_code_outside_comments_and_literals() {
+        let text = "a // b\n\"c\" d /* \u{e9} */ e";
+        let code: String = text
+            .char_indices()
+            .filter(|(at, _)| code_mask(text)[*at])
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(code, "ade");
+    }
+
+    /// Listing the directory the caller asked for fails loudly; only the
+    /// subdirectories under it are skipped when unreadable.
+    #[test]
+    fn walk_reports_a_directory_it_cannot_list() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut files = Vec::new();
+        assert!(walk(&tmp.path().join("missing"), &mut files).is_err());
+        let file = tmp.path().join("plain.rs");
+        std::fs::write(&file, "").expect("write");
+        assert!(walk(&file, &mut files).is_err());
+        assert!(files.is_empty());
+        walk(tmp.path(), &mut files).expect("list the temp dir");
+        assert_eq!(files.len(), 1);
+    }
+
+    /// What the guard needs to classify one read.
+    struct ReadContext<'a> {
+        root: &'a Path,
+        graph: &'a Graph,
+        rust: &'a [String],
+        inert: &'a [String],
+    }
+
+    /// The guard's problems with one read: `source`, in crate `reader`, reads
+    /// the repo-relative `target`.
+    fn target_problems(
+        context: &ReadContext<'_>,
+        reader: &str,
+        source: &str,
+        target: &str,
+    ) -> Vec<String> {
+        // A path that means something else on Windows is reported and not
+        // looked up: on Windows `<root>\...` is the repo root.
+        if let Some(problem) = windows_unsafe_name(target) {
+            return vec![format!("{source} ({reader}) {problem}")];
+        }
+        if is_e2e_harness(source)
+            || affected::owning_crate(target, &context.graph.crate_dirs) == Some(reader)
+        {
+            return Vec::new();
+        }
+        let mut problems = Vec::new();
+        // The `rust`/`inert` classification needs real files: a directory
+        // target stands for the files under it, and a literal that names
+        // nothing in the tree has no file to classify. A directory that cannot
+        // be listed is reported as such, not taken for an empty one. The table
+        // check below runs for every literal.
+        let target_path = context.root.join(target);
+        let files = if target_path.is_dir() {
+            let mut under = Vec::new();
+            match walk(&target_path, &mut under) {
+                Ok(()) => Some(under.iter().map(|p| relative(context.root, p)).collect()),
+                Err(error) => {
+                    problems.push(format!(
+                        "{source} ({reader}) reads {target}, a directory that cannot be \
+                         listed: {error}"
+                    ));
+                    None
+                }
+            }
+        } else if target_path.exists() {
+            Some(vec![target.to_string()])
+        } else {
+            None
+        };
+        if let Some(files) = files
+            && let Some(gap) = ci_gap(&files, context.rust, context.inert)
+        {
+            problems.push(format!("{source} ({reader}) reads {target}: {gap}"));
+        }
+        let selection = affected::select_with_readers(&[target.to_string()], context.graph);
+        let covered = match selection {
+            Selection::Workspace => true,
+            Selection::Packages(names) => names.contains(reader),
+            Selection::Empty => false,
+        };
+        if !covered {
+            problems.push(format!("{source} ({reader}) reads {target}"));
+        }
+        problems
+    }
+
+    fn one_crate_graph() -> Graph {
+        Graph {
+            crate_dirs: vec![("xtask".to_string(), "xtask".to_string())],
+            rev_deps: std::iter::once(("xtask".to_string(), Vec::new())).collect(),
+        }
+    }
+
+    /// A name Windows resolves differently is one problem and is not looked
+    /// up: `<root>\...` would classify the repo root on Windows.
+    #[test]
+    fn a_windows_unsafe_target_is_reported_once_and_not_classified() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let graph = one_crate_graph();
+        let context = ReadContext {
+            root: tmp.path(),
+            graph: &graph,
+            rust: &[],
+            inert: &[],
+        };
+        assert_eq!(
+            target_problems(&context, "xtask", "xtask/src/a.rs", "..."),
+            [
+                "xtask/src/a.rs (xtask) names a path Windows resolves differently: ... \
+              (component \"...\")"
+            ]
+        );
+    }
+
+    /// A target directory the guard cannot list is reported as such, not taken
+    /// for an empty one. Running as root lists anything, so there the test has
+    /// nothing to show and stops.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_directory_that_cannot_be_listed_is_a_problem() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).expect("mkdir");
+        std::fs::write(data.join("a.txt"), "").expect("write");
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000))
+            .expect("remove access");
+        let listable = std::fs::read_dir(&data).is_ok();
+        let graph = one_crate_graph();
+        let context = ReadContext {
+            root: tmp.path(),
+            graph: &graph,
+            rust: &[],
+            inert: &[],
+        };
+        let problems = target_problems(&context, "xtask", "xtask/src/a.rs", "data");
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755))
+            .expect("restore access");
+        if listable {
+            eprintln!("skipping: this user can list a directory with no permissions");
+            return;
+        }
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with(
+                "xtask/src/a.rs (xtask) reads data, a directory that cannot be listed: "
+            ),
+            "{problems:?}"
+        );
+    }
+
     fn relative(root: &Path, path: &Path) -> String {
         path.strip_prefix(root)
             .expect("under the repo root")
@@ -567,7 +868,7 @@ mod tests {
             std::fs::write(&path, "").expect("write");
         }
         let mut files = Vec::new();
-        walk(tmp.path(), &mut files);
+        walk(tmp.path(), &mut files).expect("list the temp dir");
         let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
         assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
     }
@@ -588,7 +889,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), a.join("out")).expect("link out of the tree");
         std::os::unix::fs::symlink(a.join("src/lib.rs"), a.join("alias.rs")).expect("file link");
         let mut files = Vec::new();
-        walk(tmp.path(), &mut files);
+        walk(tmp.path(), &mut files).expect("list the temp dir");
         let found: Vec<String> = files.iter().map(|p| relative(tmp.path(), p)).collect();
         assert_eq!(found, vec!["crates/a/src/lib.rs".to_string()]);
     }
@@ -611,7 +912,7 @@ mod tests {
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))
             .expect("remove access");
         let mut files = Vec::new();
-        walk(tmp.path(), &mut files);
+        walk(tmp.path(), &mut files).expect("list the temp dir");
         // Restore access first so the temp dir can be removed even if an assert fails.
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
             .expect("restore access");
@@ -650,7 +951,7 @@ mod tests {
     fn every_cross_crate_read_selects_its_reader() {
         let root = repo_root();
         let mut files = Vec::new();
-        walk(&root, &mut files);
+        walk(&root, &mut files).expect("list the repo root");
         // The workspace members, from the same `cargo metadata` the hook selects
         // with, so a stray `Cargo.toml` (a fixture, a nested checkout) is not
         // taken for a workspace crate.
@@ -681,42 +982,15 @@ mod tests {
         let mut root_readers = BTreeSet::new();
         let mut checked = 0usize;
         let mut root_joins = 0usize;
+        let context = ReadContext {
+            root: &root,
+            graph: &graph,
+            rust,
+            inert,
+        };
         let mut check = |reader: &str, source: &str, target: &str| {
             checked += 1;
-            if is_e2e_harness(source)
-                || affected::owning_crate(target, &graph.crate_dirs) == Some(reader)
-            {
-                return;
-            }
-            // The `rust`/`inert` classification needs real files: a directory
-            // target stands for the files under it, and a literal that names
-            // nothing in the tree (a scanner fixture in this file's own tests)
-            // has no file to classify. The table check below runs for every
-            // literal.
-            let target_path = root.join(target);
-            let files = if target_path.is_dir() {
-                let mut under = Vec::new();
-                walk(&target_path, &mut under);
-                Some(under.iter().map(|p| relative(&root, p)).collect())
-            } else if target_path.exists() {
-                Some(vec![target.to_string()])
-            } else {
-                None
-            };
-            if let Some(files) = files
-                && let Some(gap) = ci_gap(&files, rust, inert)
-            {
-                problems.push(format!("{source} ({reader}) reads {target}: {gap}"));
-            }
-            let selection = affected::select_with_readers(&[target.to_string()], &graph);
-            let covered = match selection {
-                Selection::Workspace => true,
-                Selection::Packages(names) => names.contains(reader),
-                Selection::Empty => false,
-            };
-            if !covered {
-                problems.push(format!("{source} ({reader}) reads {target}"));
-            }
+            problems.extend(target_problems(&context, reader, source, target));
         };
 
         for path in files

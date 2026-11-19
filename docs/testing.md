@@ -1117,10 +1117,12 @@ and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose s
 step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
 e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
 [cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
-`include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls that
-leave their crate and fails unless each one is covered both by the table and by the `rust` category
-of the `changes` job (so the job that runs the reader is not skipped), so a new cross-crate read
-cannot be added without a decision. A second test holds every table entry to that `rust` category.
+`include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
+code (not in comments or string literals) that leave their crate and fails unless each one is
+covered both by the table and by the `rust` category of the `changes` job (so the job that runs
+the reader is not skipped), and fails on a path Windows resolves differently (a component ending
+in `.` or a space), so a new cross-crate read cannot be added without a decision. A second test
+holds every table entry to that `rust` category.
 The scan has limits. A path held in a const (`.github/scripts/gpu-preflight.sh`, read through
 `SHARED_PREFLIGHT`) is not seen at all; its `rust` glob is pinned only by a per-glob sample test,
 which checks the glob is there, not that a test reads the file. And a read whose path is
