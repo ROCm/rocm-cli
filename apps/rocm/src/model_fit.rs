@@ -177,6 +177,13 @@ fn examination_reports_amd_gpu(examination: &rocm_core::Examination) -> bool {
     }
 }
 
+/// Gathers everything [`classify_accelerator_memory`] needs about this host and
+/// returns its verdict: dedicated VRAM, an APU's shared pool, or neither.
+///
+/// It exists to keep the reads and the decision apart. The classifier is a pure
+/// function of its arguments so it can be tested against hosts nobody has —
+/// an APU with an unreadable pool, a GPU-less box, a machine ROCm cannot see —
+/// and this is the one place that actually touches the machine to supply them.
 fn host_accelerator_memory(
     host_gpu_summary: &rocm_core::HostGpuSummary,
     examination: &rocm_core::Examination,

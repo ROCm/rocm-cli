@@ -5698,10 +5698,11 @@ async fn catalog_with_a_cpu_only_copy(world: &mut E2eWorld) {
 /// planted machine for the first and the runner's own for the second. That is
 /// not a failure a reader would recognise as one, it is a silent change of
 /// subject. Before this helper existed, the second half of diagnose-85
-/// answered about the dev box's real 191.9 GiB MI300X out of the built-in
+/// answered about whatever GPU the runner itself has, out of the built-in
 /// catalog, while reading as though it answered about the planted APU and the
-/// planted recipe. Restoring the environment is what keeps both halves of the
-/// scenario about one machine.
+/// planted recipe — and on a runner with a large dedicated card that is a
+/// different verdict, reported as if it were the planted host's. Restoring the
+/// environment is what keeps both halves of the scenario about one machine.
 fn ask_again_on_the_same_planted_machine(
     world: &mut E2eWorld,
     args: &[&str],
