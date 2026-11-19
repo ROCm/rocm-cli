@@ -578,6 +578,15 @@ not checked as written:
   `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
   in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
   checked through the functions that build it instead
+- advice assembled at run time has no literal to scan: the `Try:` line the two
+  `rocm uninstall` refusals end with is built from the flags the user gave
+  (`uninstall_command_line` in [uninstall.rs](../apps/rocm/src/uninstall.rs)), so
+  `uninstall_refusal_advice_parses_and_clears_the_refusal` and
+  `uninstall_force_advice_parses_and_clears_the_refusal` run each refusal for
+  every combination of uninstall's flags and check that the line parses, repeats
+  the command with `--yes`, and passes the gate. These tests read the line back
+  with `try_command` in
+  [recovery_hint.rs](../crates/rocm-core/src/recovery_hint.rs)
 - separate optional groups are tried one at a time, never together (they can
   be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
   command that fails only when flags from two of them are combined is not
@@ -2377,7 +2386,7 @@ To run just these locally: `cargo xtask e2e -- -n 'vllm-tensorizer'`. The `-n` f
 selects by scenario name and bypasses the harness's own gating, so it needs a Linux
 host for these scenarios.
 The scenarios are Linux only; the real Python 3.14 import is only exercised by
-hand ([manual-testing.md](manual-testing.md#6c-the-tensorizer-upgrade-on-python-314)).
+hand ([manual-testing.md](manual-testing.md#6d-the-tensorizer-upgrade-on-python-314)).
 
 ## Lemonade Installs On Disk
 
@@ -2467,7 +2476,11 @@ and checks the listed folder goes; a run whose stdin or stdout is not a terminal
 empty plan even at one, name no next step (`uninstall-08`, `uninstall-09`). A
 mistyped `--force` is refused with a pointer to `--yes`, and a near miss of it
 is not answered with `--force-dev-binaries` (`uninstall-10`); the help starts
-its examples with a dry run (`uninstall-11`). The assistant's uninstall preview
+its examples with a dry run (`uninstall-11`). Both refusals end with a `Try:`
+line naming the same uninstall with `--yes` (and without `--force`), and
+`uninstall-16` (Linux, the `--yes` refusal) and `uninstall-17` (the `--force`
+refusal) run that line as printed and check it removes the config folder and
+keeps the data folder. The assistant's uninstall preview
 ends differently, since it has no flag to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
 `uninstall-13` to `uninstall-15` drive the confirmation prompt under a
@@ -2491,9 +2504,9 @@ step with this table. The help is a wording pin; the behavior is proven here:
 
 | Command | Without `--yes`, no terminal | Proven by |
 |---|---|---|
-| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing | `uninstall-04` (Linux) |
-| `rocm runtimes uninstall` | same | `runtime-lifecycle-04` |
-| `rocm storage remove-downloads`, `remove-old-installs` | same; only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
+| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing; ends with `Try:` and the same command with `--yes` | `uninstall-04`, `uninstall-16` (Linux) |
+| `rocm runtimes uninstall` | prints the plan, refuses, exit 1, removes nothing; no `Try:` line | `runtime-lifecycle-04` |
+| `rocm storage remove-downloads`, `remove-old-installs` | as `rocm runtimes uninstall` (no `Try:` line); only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
 | `rocm fix` | prints the plan, refuses, exit 5 (stdin only decides) | `diagnose-08` (Linux, bare metal) |
 | `rocm install driver` | never asks; prints the plan, changes nothing, exit 0 | `driver-install-02` (WSL) |
 | `rocm engines install` | never asks; a missing package installs only where no password is needed | `system_package_install_action` unit tests |
@@ -2504,7 +2517,10 @@ regression would delete real settings, so the command points `HOME` at a
 scratch folder itself:
 
 ```bash
-HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+scratch=$(mktemp -d) && mkdir -p "$scratch/.rocm" && touch "$scratch/.rocm/x"   # something to remove
+# The ROCM_CLI_*_DIR variables win over HOME, so unset them for this command only.
+env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+  rocm uninstall --keep-binaries < /dev/null   # expect the refusal, ending with its Try: line; exit 1
 ```
 
 ## Removing Old Installs
@@ -2769,7 +2785,10 @@ when the engine failed but its process is still up, the message names the
 stop command. Only a stall or the
 deadline leaves the server running for the background helper to supervise.
 Scenario `serve-64` in `model_serving.feature` drives it under a PTY. It
-needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
+needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only,
+and it is `@requires-os:linux` like every other PTY scenario (the harness's
+ConPTY path is not a validated contract; see `dash.feature`'s header), so the
+native-Windows GPU lane skips it;
 it checks the wait line, that the named `rocm logs --service` command runs,
 and that the serve exits 0 with the model listed. Scenario `serve-65` is the
 failure side on the no-GPU mock lane: with `ROCM_E2E_SIMULATE_STARTUP_EXIT=1`,
@@ -4340,6 +4359,13 @@ python scripts/nightly_canary.py --self-test
 What the scheduled canary checks, who is told and how to rerun it are in
 [ci-hardware-testing.md](ci-hardware-testing.md#nightly-stream-canary).
 
+The issue-triage script has a network-free self-test too (its behavior is
+described in [issue-triage.md](issue-triage.md)):
+
+```bash
+python scripts/triage_issue.py --self-test
+```
+
 The vLLM route check (advisory) has a self-test of the same kind:
 
 ```bash
@@ -4510,6 +4536,108 @@ the heavy path (`needs.changes.outputs.heavy == 'true'`):
 ```bash
 sh tests/install-sh/run.sh
 ```
+
+The `pr-<number>` channel of `install.sh` (install the bundle CI built for a
+pull request) is covered by
+[`tests/install-sh/pr_channel.sh`](../tests/install-sh/pr_channel.sh). It puts a
+stub `gh` first on `PATH` that serves a local bundle, and checks:
+
+- the install uses the newest CI run for the head commit that still has an
+  unexpired artifact, found by run id: with the newest run's artifact expired
+  it takes the next run, and downloads neither the expired nor an older one;
+- the pinned release signing keys are not applied, so the bundle installs on
+  its checksum alone and the output says it is unsigned, while
+  `ROCM_CLI_REQUIRE_SIGNATURE=1` fails with nothing installed instead of being
+  skipped;
+- a wrong checksum, an unknown pull request, a pull request with no CI run,
+  one whose builds have all expired (the message names the 7 day retention),
+  a malformed channel (`pr-abc`, `pr-`, `pr-12x`, refused before `gh` is
+  called) and a missing `gh` each fail naming the cause, with no files
+  installed;
+- `ROCM_CLI_GITHUB_REPO` moves the lookup and the download to that repository;
+- an empty head commit is refused, and a run whose artifact list cannot be read
+  is skipped in favour of the next run instead of being taken as having a build;
+- `ROCM_CLI_ARCHIVE`, `ROCM_CLI_DOWNLOAD_BASE` and `ROCM_CLI_DOWNLOAD_ONLY`
+  with a `pr-` channel are refused, not ignored, before `gh` is called;
+- a public key the user names, through `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` or
+  `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`, is not cleared with the pinned ones: it
+  asks for verification and the install fails on the signature the bundle
+  lacks (each variable is checked on its own);
+- the stub rejects `gh pr view` without `--json headRefOid --jq .headRefOid`
+  and a run listing without `per_page=100`, and a run whose artifact list
+  cannot be read is skipped with a note saying so;
+- a required signature is refused with a message that does not point at a key
+  (CI never signs these bundles), and the expiry and workflow filters decide
+  the run: the stub hands the installer a newer run of another workflow and
+  expired artifacts, which it leaves out only where the installer's `--jq`
+  expression filters them;
+- the installer arriving on stdin, as under `curl | sh`, still installs: the
+  stub drains its stdin as a real `gh` may, so a `gh` call that is not
+  redirected from `/dev/null` swallows the rest of the script.
+
+The stub fails a call that names another repository than the one under test,
+lists runs for any commit but the pull request's head, or asks for or downloads
+another artifact than `rocm-cli-pr-linux-amd64`, so an installer that drops one
+of those fails here. It prints what the installer's `--jq` filters would, so
+the filters themselves are not exercised; they were run against the live API
+when the channel was written. It needs no network or GPU, and `INSTALL_SH` selects
+another copy of the installer. The Linux `build-and-test` job runs it under the
+same `heavy` condition as the fish checks:
+
+```bash
+sh tests/install-sh/pr_channel.sh
+```
+
+Both installers' `pr-<number>` channel is also covered end to end in the
+lifecycle set above, with the `fake-gh` stand-in
+([`fake-gh.rs`](../tests/e2e-cucumber/src/bin/fake-gh.rs)) in front of `PATH`
+and a bundle packaged unsigned, as CI packages it:
+`@id:lifecycle-linux-pr-channel-installs-ci-build` (lifecycle-38) and
+`@id:lifecycle-windows-pr-channel-installs-ci-build` (lifecycle-39) install the
+newest unexpired build, say it is unsigned and verify no signature, and run the
+installed `rocm`; the build they use belongs to a run with no conclusion yet, so
+that branch of each installer is exercised too.
+`@id:lifecycle-linux-pr-channel-refuses-required-signature` (lifecycle-40) and
+`@id:lifecycle-windows-pr-channel-refuses-required-signature` (lifecycle-41)
+keep `ROCM_CLI_REQUIRE_SIGNATURE=1` and check the install fails instead of
+skipping it, and
+`@id:lifecycle-linux-pr-channel-refuses-bundle-without-signature` (lifecycle-42)
+and `@id:lifecycle-windows-pr-channel-refuses-bundle-without-signature`
+(lifecycle-43) supply a public key and check the unsigned bundle is refused,
+each installing nothing. `@id:lifecycle-linux-pr-channel-refuses-expired-builds`
+(lifecycle-44) and `@id:lifecycle-windows-pr-channel-refuses-expired-builds`
+(lifecycle-45) refuse a pull request whose builds have all expired and install
+nothing. `@id:lifecycle-linux-pr-channel-rejects-bad-checksum` (lifecycle-46)
+and `@id:lifecycle-windows-pr-channel-rejects-bad-checksum` (lifecycle-47)
+corrupt the bundle's checksum sidecar,
+`@id:lifecycle-linux-pr-channel-unknown-pull-request` (lifecycle-48) and
+`@id:lifecycle-windows-pr-channel-unknown-pull-request` (lifecycle-49) ask for a
+pull request GitHub does not know, and
+`@id:lifecycle-linux-pr-channel-malformed-number` (lifecycle-50) and
+`@id:lifecycle-windows-pr-channel-malformed-number` (lifecycle-51) give
+`pr-abc`, which is refused before `gh` is called; each installs nothing.
+`@id:lifecycle-linux-pr-channel-no-ci-run` (lifecycle-52) and
+`@id:lifecycle-windows-pr-channel-no-ci-run` (lifecycle-53) ask for a pull
+request with a head commit but no CI run,
+`@id:lifecycle-linux-pr-channel-gh-missing` (lifecycle-54) and
+`@id:lifecycle-windows-pr-channel-gh-missing` (lifecycle-55) run with no `gh` on
+`PATH`, and `@id:lifecycle-linux-pr-channel-refuses-download-base`
+(lifecycle-56) and `@id:lifecycle-windows-pr-channel-refuses-download-base`
+(lifecycle-57) set `ROCM_CLI_DOWNLOAD_BASE`, which is refused before `gh` is
+called. The Windows ones run on the Windows lifecycle lane; `install.ps1` has no
+hermetic script of its own, so the cases only `pr_channel.sh` covers (an empty
+head commit, a run whose artifact list cannot be read, a pull request artifact
+without its `.sha256`, and `ROCM_CLI_ARCHIVE` or `ROCM_CLI_DOWNLOAD_ONLY` with
+the channel, which `install.ps1` has no variable for) have no Windows test yet.
+
+`fake-gh` is as strict as the real API: it fails a call that names the wrong
+repository, lists runs for another commit than the pull request's head, or asks
+for or downloads another artifact than the platform's pull request bundle. It
+also hands the installer what the real API would, a newer run of another
+workflow with a live artifact and expired artifacts on the newest CI run, and
+applies the expiry and workflow filters only where the installer asks for them,
+so an installer that drops one of those fails the install scenarios (38 and
+39).
 
 The same path with the packaged binary, including `rocm uninstall` putting the
 bash and fish configs back and removing the fish completions, is
@@ -5018,7 +5146,8 @@ a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
-(`@id:serve-smoke-failure-summary` carries the same tag). Note also that `-n` matches the scenario *name*
+(`@id:serve-smoke-failure-summary` and `@id:serve-vllm-extension-load-hint` carry
+the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it selects nothing and the run fails with
 `0 scenarios executed` (see [E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
@@ -5037,7 +5166,17 @@ the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
 log it owns, and never became ready. `@id:serve-smoke-failure-summary` arms the same hook with
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=ready`, which fabricates a launch that did become
-ready, so a mock engine can then fail its smoke test. No process is spawned, and
+ready, so a mock engine can then fail its smoke test.
+`@id:serve-vllm-extension-load-hint` (serve-66) arms it with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=extension-load`, which plants the raw startup log
+of a launch killed by a vLLM compiled extension that failed to load and fails
+the launch with the vLLM engine's own message for that log. None of rocm-cli's
+own wording is planted, so the detected line and the `rocm diagnose --symptom`
+command the scenario asserts are computed by `extension_load_failure_hint` in
+[`engines/vllm/src/startup_diagnostics.rs`](../engines/vllm/src/startup_diagnostics.rs).
+That is the half `@id:diagnose-recognises-a-vllm-extension-load-failure`
+(diagnose-80) cannot reach: it drives `rocm diagnose --symptom` directly and
+never `rocm serve`. No process is spawned, and
 the seam compiles out entirely without the feature, so a build that does not
 enable it behaves exactly as the shipped binary does.
 
@@ -5052,7 +5191,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves both of those scenarios to a reported **skip**, not a silent pass. It
+compiled out and resolves every `@requires-oom-fault-injection` scenario to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on

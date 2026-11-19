@@ -12,6 +12,13 @@
 //! `format_bytes`, the human-readable size formatter the verbose listing uses,
 //! lives here too and is also read from `storage.rs` and `automations.rs`.
 //!
+//! Two items here exist so that nothing has to read a listing back as prose:
+//! `text_is_model_catalog_listing` recognises either listing from the header
+//! each one writes, and `model_recipe_engine_availability` answers "can this
+//! host run this recipe's preferred engines" as values. `chat/summaries.rs`
+//! uses both to build the chat's deterministic model summary, which used to be
+//! parsed out of the verbose listing's `aliases=[…] min_gpu_mem=…` rows.
+//!
 //! Relocated verbatim from `examine_report_text.rs`, which keeps the
 //! `rocm examine` report and the engine-inventory listing. The two halves do not
 //! call each other: this module reaches only the engine-availability helpers in
@@ -37,6 +44,99 @@ use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
 
 use crate::engine_ipc::{builtin_engine_available, resolve_engine_binary_path_with_paths};
 use crate::{PlatformRuleOut, engine_ruled_out_by_platform_with};
+
+/// The first words of every curated `rocm model` heading, whichever recipe
+/// source produced it — see [`model_catalog_header`].
+const MODEL_CATALOG_HEADER_PREFIX: &str = "Recommended models";
+
+/// The first line of the `rocm model --verbose` listing.
+const MODEL_CATALOG_VERBOSE_HEADER: &str = "model recipes";
+
+/// Whether `text` is one of the two `rocm model` listings this module renders.
+///
+/// Both headers are matched, because the chat tool renders the curated listing
+/// and `rocm model --verbose` renders the other, and a reader that recognises
+/// only one silently stops recognising the listing when the caller switches —
+/// which is how the chat's deterministic model summary disappeared in #1041.
+/// It is deliberately only an identification: everything a caller needs *about*
+/// the models comes from `load_model_recipe_registry`, not from this text.
+pub(crate) fn text_is_model_catalog_listing(text: &str) -> bool {
+    text.lines().map(str::trim).any(|line| {
+        line.starts_with(MODEL_CATALOG_HEADER_PREFIX) || line == MODEL_CATALOG_VERBOSE_HEADER
+    })
+}
+
+/// Where this host's adapter for one engine was found, before the platform
+/// gate has a say. The variants are what
+/// [`append_model_engine_support_lines`] prints as `built_in`, `available
+/// path=…`, `unavailable reason=…` and `not_checked`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelEngineLocation {
+    /// The adapter is compiled into this binary.
+    BuiltIn,
+    /// A discovered or installed engine plugin binary.
+    Plugin(std::path::PathBuf),
+    /// No adapter could be resolved; the string is the reason to show.
+    Unavailable(String),
+    /// Nothing was looked up, because the caller had no [`AppPaths`].
+    NotChecked,
+}
+
+/// One preferred engine's standing on this host: where its adapter is, and
+/// whether the platform gate rules it out regardless.
+///
+/// Returned instead of rendered so the `rocm model --verbose` listing and the
+/// chat's deterministic model summary answer the question the same way. The
+/// summary used to re-read the listing's `engine_support:` lines, which made a
+/// rewording of those lines silently change the summary.
+#[derive(Debug, Clone)]
+pub(crate) struct ModelEngineAvailability {
+    pub(crate) engine: String,
+    pub(crate) location: ModelEngineLocation,
+    pub(crate) platform_rule_out: PlatformRuleOut,
+}
+
+/// [`model_recipe_engine_availability_with`] with the real Docker probe, for a
+/// caller asking about a recipe or two rather than the whole catalog.
+pub(crate) fn model_recipe_engine_availability(
+    recipe: &ModelRecipeRecord,
+    paths: Option<&AppPaths>,
+) -> Vec<ModelEngineAvailability> {
+    let docker_reachable = once_per_call(rocm_engine_aim::builtin_docker_daemon_reachable);
+    model_recipe_engine_availability_with(recipe, paths, &docker_reachable)
+}
+
+/// Each of `recipe`'s preferred engines, in order, with where its adapter is
+/// and what the platform gate says. `docker_reachable` is injected so a caller
+/// listing the whole catalog answers one `docker info` for all of it.
+pub(crate) fn model_recipe_engine_availability_with(
+    recipe: &ModelRecipeRecord,
+    paths: Option<&AppPaths>,
+    docker_reachable: &dyn Fn() -> bool,
+) -> Vec<ModelEngineAvailability> {
+    recipe
+        .preferred_engines
+        .iter()
+        .map(|engine| ModelEngineAvailability {
+            engine: engine.clone(),
+            location: engine_adapter_location(engine, paths),
+            platform_rule_out: engine_ruled_out_by_platform_with(engine, docker_reachable),
+        })
+        .collect()
+}
+
+fn engine_adapter_location(engine: &str, paths: Option<&AppPaths>) -> ModelEngineLocation {
+    if builtin_engine_available(engine) {
+        return ModelEngineLocation::BuiltIn;
+    }
+    let Some(paths) = paths else {
+        return ModelEngineLocation::NotChecked;
+    };
+    match resolve_engine_binary_path_with_paths(engine, paths) {
+        Ok(path) => ModelEngineLocation::Plugin(path),
+        Err(error) => ModelEngineLocation::Unavailable(model_registry_reason(error.to_string())),
+    }
+}
 
 /// The per-hardware-group heading in `rocm model`, carrying the "this is the
 /// box you are on" marker when the group matches the detected host GPU.
@@ -366,7 +466,7 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     host_ram_gib: Option<f64>,
 ) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "model recipes");
+    let _ = writeln!(output, "{MODEL_CATALOG_VERBOSE_HEADER}");
     let registry = match load_model_recipe_registry() {
         Ok(registry) => registry,
         Err(error) => {
@@ -464,11 +564,11 @@ fn append_model_recipe_staleness_lines(
 fn model_catalog_header(registry: &ModelRecipeRegistry) -> String {
     match &registry.source {
         ModelRecipeRegistrySource::BuiltIn => {
-            "Recommended models - run one with `rocm serve <model>`".to_owned()
+            format!("{MODEL_CATALOG_HEADER_PREFIX} - run one with `rocm serve <model>`")
         }
         ModelRecipeRegistrySource::SignedIndex { index_path, .. } => {
             format!(
-                "Recommended models - from recipe index {}",
+                "{MODEL_CATALOG_HEADER_PREFIX} - from recipe index {}",
                 index_path.display()
             )
         }
@@ -980,45 +1080,39 @@ fn append_model_engine_support_lines(
     }
 
     let _ = writeln!(output, "      engine_support:");
-    for engine in &recipe.preferred_engines {
-        if builtin_engine_available(engine) {
-            if let Some(note) = model_registry_adapter_availability_note(engine, docker_reachable) {
+    for support in model_recipe_engine_availability_with(recipe, paths, docker_reachable) {
+        let engine = &support.engine;
+        let note = model_registry_adapter_availability_note(support.platform_rule_out);
+        match (&support.location, note) {
+            (ModelEngineLocation::BuiltIn, Some(note)) => {
                 let _ = writeln!(
                     output,
                     "        {engine}: adapter_available path=<built-in> {note}"
                 );
-            } else {
+            }
+            (ModelEngineLocation::BuiltIn, None) => {
                 let _ = writeln!(output, "        {engine}: built_in");
             }
-        } else if let Some(paths) = paths {
-            match resolve_engine_binary_path_with_paths(engine, paths) {
-                Ok(path) => {
-                    if let Some(note) =
-                        model_registry_adapter_availability_note(engine, docker_reachable)
-                    {
-                        let _ = writeln!(
-                            output,
-                            "        {engine}: adapter_available path={} {note}",
-                            path.display()
-                        );
-                    } else {
-                        let _ = writeln!(
-                            output,
-                            "        {engine}: available path={}",
-                            path.display()
-                        );
-                    }
-                }
-                Err(error) => {
-                    let _ = writeln!(
-                        output,
-                        "        {engine}: unavailable reason={}",
-                        model_registry_reason(error.to_string())
-                    );
-                }
+            (ModelEngineLocation::Plugin(path), Some(note)) => {
+                let _ = writeln!(
+                    output,
+                    "        {engine}: adapter_available path={} {note}",
+                    path.display()
+                );
             }
-        } else {
-            let _ = writeln!(output, "        {engine}: not_checked");
+            (ModelEngineLocation::Plugin(path), None) => {
+                let _ = writeln!(
+                    output,
+                    "        {engine}: available path={}",
+                    path.display()
+                );
+            }
+            (ModelEngineLocation::Unavailable(reason), _) => {
+                let _ = writeln!(output, "        {engine}: unavailable reason={reason}");
+            }
+            (ModelEngineLocation::NotChecked, _) => {
+                let _ = writeln!(output, "        {engine}: not_checked");
+            }
         }
     }
     let _ = writeln!(
@@ -1028,11 +1122,10 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-fn model_registry_adapter_availability_note(
-    engine: &str,
-    docker_reachable: &dyn Fn() -> bool,
+const fn model_registry_adapter_availability_note(
+    ruled_out: PlatformRuleOut,
 ) -> Option<&'static str> {
-    match engine_ruled_out_by_platform_with(engine, docker_reachable) {
+    match ruled_out {
         PlatformRuleOut::Allowed => None,
         PlatformRuleOut::AimDockerUnavailable => Some(
             "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
@@ -1924,13 +2017,119 @@ mod tests {
     /// keeps the `runtime:` label half of the same check.
     #[test]
     fn vllm_adapter_availability_note_is_explicit_on_native_windows() {
+        let ruled_out = engine_ruled_out_by_platform_with("vllm", || true);
         if cfg!(windows) {
             assert!(
-                model_registry_adapter_availability_note("vllm", &|| true)
+                model_registry_adapter_availability_note(ruled_out)
                     .is_some_and(|note| note.contains("unsupported_native_windows"))
             );
         } else {
-            assert!(model_registry_adapter_availability_note("vllm", &|| true).is_none());
+            assert!(model_registry_adapter_availability_note(ruled_out).is_none());
         }
+    }
+
+    /// The values the summary and the listing now share: every preferred
+    /// engine of every recipe answered for, in the recipe's order, and the
+    /// platform gate's verdict carried alongside the adapter's location rather
+    /// than folded into it — on native Windows a resolved vLLM adapter is
+    /// still ruled out. Run over the whole catalog because a summary that
+    /// names recipes by id must not depend on which one it asks about.
+    #[test]
+    fn engine_availability_answers_for_every_preferred_engine_in_order() {
+        let (_root, paths) = test_paths("engine-availability-values");
+        // Injected rather than probed: a real `docker info` per AIM recipe
+        // would make this test the slowest in the crate.
+        let docker_reachable = || true;
+        let mut multi_engine_recipes = 0_usize;
+        for recipe in builtin_model_recipes() {
+            let engines =
+                model_recipe_engine_availability_with(&recipe, Some(&paths), &docker_reachable);
+            assert_eq!(
+                engines
+                    .iter()
+                    .map(|engine| engine.engine.as_str())
+                    .collect::<Vec<_>>(),
+                recipe
+                    .preferred_engines
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "{}",
+                recipe.canonical_model_id
+            );
+            multi_engine_recipes += usize::from(engines.len() > 1);
+            for engine in &engines {
+                assert_eq!(
+                    engine.platform_rule_out,
+                    engine_ruled_out_by_platform_with(&engine.engine, docker_reachable),
+                    "{}: {engine:?}",
+                    recipe.canonical_model_id
+                );
+                if cfg!(windows) && engine.engine == "vllm" {
+                    assert_eq!(
+                        engine.platform_rule_out,
+                        PlatformRuleOut::NativeWindowsVllm,
+                        "native Windows rules vLLM out however its adapter resolved"
+                    );
+                }
+            }
+        }
+        assert!(
+            multi_engine_recipes > 0,
+            "the catalog must still exercise a recipe with more than one preferred engine"
+        );
+    }
+
+    /// `None` paths means "nothing was looked up", not "unavailable": the
+    /// listing prints `not_checked` for it and the summary must not read it as
+    /// a missing engine. Driven with an engine name this build has no adapter
+    /// for, because every engine the catalog names is compiled in — with a
+    /// real one the lookup never leaves the `built_in` branch and this would
+    /// assert nothing.
+    #[test]
+    fn engine_availability_without_paths_is_not_checked_rather_than_unavailable() {
+        let (_root, paths) = test_paths("engine-availability-not-checked");
+        let mut recipe = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct")
+            .expect("the catalog carries the 8 GiB-class recipe");
+        recipe.preferred_engines = vec!["not-a-built-in-engine".to_owned()];
+        assert!(
+            !builtin_engine_available("not-a-built-in-engine"),
+            "the stand-in engine must have no built-in adapter, or this proves nothing"
+        );
+
+        let unchecked = model_recipe_engine_availability_with(&recipe, None, &|| true);
+        assert_eq!(unchecked.len(), 1);
+        assert_eq!(unchecked[0].location, ModelEngineLocation::NotChecked);
+
+        let looked_up = model_recipe_engine_availability_with(&recipe, Some(&paths), &|| true);
+        assert_eq!(looked_up.len(), 1);
+        assert!(
+            matches!(looked_up[0].location, ModelEngineLocation::Unavailable(_)),
+            "a looked-up engine with no adapter is unavailable, not unchecked: {:?}",
+            looked_up[0]
+        );
+    }
+
+    /// Both listings have to be recognisable as the model catalog, because the
+    /// chat tool renders the curated one and `rocm model --verbose` the other.
+    /// Recognising only one is the #1041 regression.
+    #[test]
+    fn both_model_listings_are_recognised_as_the_model_catalog() {
+        let (_root, paths) = test_paths("model-listing-recognition");
+        for listing in [
+            render_model_registry_text_with_context_and_host(Some(&paths), None, None),
+            render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None),
+        ] {
+            assert!(
+                text_is_model_catalog_listing(&listing),
+                "unrecognised model listing:\n{listing}"
+            );
+        }
+        assert!(!text_is_model_catalog_listing(
+            "examine:\n  legacy_rocm_status: not_detected\n"
+        ));
+        assert!(!text_is_model_catalog_listing(
+            "* lemonade\n  runtime: gfx120X-all\n"
+        ));
     }
 }

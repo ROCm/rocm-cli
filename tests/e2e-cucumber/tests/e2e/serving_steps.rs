@@ -3624,6 +3624,124 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
     );
 }
 
+#[given("a managed vLLM launch whose compiled extension will fail to load")]
+async fn plant_extension_load_launch(world: &mut E2eWorld) {
+    // The `extension-load` mode of the same hook `@id:serve-oom-launch-memory-guidance`
+    // arms, and the premise belongs in the premise step for the same reason.
+    //
+    // What the hook fabricates is only what a GPU-less lane cannot produce: that
+    // the vLLM process died, and the raw startup log it had written when it did
+    // (vLLM's own `Failed to import from vllm._C_stable_libtorch` warning, the
+    // engine core's `AttributeError`, and enough API-server traceback to push
+    // both out of the echoed tail). None of rocm-cli's own wording is planted.
+    // Every sentence the `Then` steps below assert is derived from that log by
+    // `startup_log_context` / `extension_load_failure_hint` in
+    // `engines/vllm/src/startup_diagnostics.rs` — the engine code this scenario
+    // exists to cover, which `@id:diagnose-recognises-a-vllm-extension-load-failure`
+    // cannot reach because it drives `rocm diagnose` and never `rocm serve`.
+    //
+    // Consumed by `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch/readiness.rs`; spelled out on both sides
+    // because the shipped binary's crate must not depend on this harness.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "extension-load".into()));
+}
+
+#[when("the user serves a model on that launch")]
+async fn user_serves_the_failing_extension_launch(world: &mut E2eWorld) {
+    // `--managed` rather than the interactive summary: the surface under test is
+    // the launch failure `rocm serve` reports, which is raised before any
+    // summary is rendered, and plain output keeps the long `rocm diagnose`
+    // command off an 80-column PTY's wrap boundaries.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-extension-load",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the startup failure names the vLLM compiled extension that did not load")]
+async fn assert_extension_load_failure_named(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert_ne!(world.cli_rc, Some(0), "the launch must fail:\n{output}");
+    assert!(
+        output.contains("Detected a vLLM compiled extension that failed to load"),
+        "the startup failure must say what it detected:\n{output}"
+    );
+    // The line it names is the one that carries the *cause*, which in the
+    // planted log is vLLM's import warning — and that line sits far above the
+    // echoed tail, so a hint that only read the tail would name the
+    // `AttributeError` instead and never mention glibc at all.
+    assert!(
+        output.contains("Failed to import from vllm._C_stable_libtorch"),
+        "the failure must name the extension whose import failed:\n{output}"
+    );
+    assert!(
+        output.contains("GLIBC_2.38' not found"),
+        "the failure must carry the loader's own reason:\n{output}"
+    );
+}
+
+#[then("the startup failure points at a diagnose command that reports a cause")]
+async fn assert_extension_load_diagnose_command(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // The real `AttributeError` quotes its namespace, so the printed command
+    // falls back to the canonical symptom. Asserting the exact argument is what
+    // discriminates: a hint that quoted the unquotable raw line, or that fell
+    // back to another entry's canonical symptom, fails here.
+    let command = format!(
+        "rocm diagnose --symptom '{}'",
+        rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+    );
+    assert!(
+        output.contains(&command),
+        "the startup failure must print `{command}`:\n{output}"
+    );
+    // ...and that command must actually report the cause, run as printed, on
+    // this machine. Without this the scenario would pass on a command that finds
+    // nothing, which is the failure mode the canonical symptom exists to avoid.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+            "--json",
+        ],
+    );
+    assert_eq!(rc, 0, "{stdout}\n{stderr}");
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("rocm diagnose --json must emit JSON");
+    // The threshold is read out of the report rather than written here, the way
+    // the diagnose scenarios read it, so this cannot drift from the CLI's own.
+    let threshold = report["min_score_for_match"].as_i64().unwrap_or(i64::MAX);
+    let score = report["matched"]
+        .as_array()
+        .and_then(|matches| {
+            matches
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some("fix-23-vllm-extension-load"))
+        })
+        .and_then(|entry| entry["score"].as_i64())
+        .unwrap_or(0);
+    assert!(
+        score >= threshold,
+        "the command the startup failure printed must report the extension-load \
+         cause, scored {score} against a threshold of {threshold}:\n{stdout}"
+    );
+}
+
 /// A managed vLLM launch that became ready, whose engine (a mock) answers
 /// `/v1/models` but fails every chat request with HTTP 500. The launch is
 /// fabricated by the `ready` mode of the same test-only hook that

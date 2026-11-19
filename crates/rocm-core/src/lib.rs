@@ -48,6 +48,7 @@ mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
+pub mod recovery_hint;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
@@ -106,10 +107,11 @@ pub use crypto::{
 };
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
-    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
+    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
     diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
-    render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
-    vllm_oom_symptom_is_diagnosable,
+    render_report_text as render_diagnose_text, vllm_extension_load_symptom_is_diagnosable,
+    vllm_import_symptom_is_diagnosable, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,

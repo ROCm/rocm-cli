@@ -1055,7 +1055,16 @@ Feature: Model serving
   # command that follows the engine's log, then it exits 0 once the endpoint
   # lists the model. The named command is run, not just read: a hint that
   # points at a command that does not work would still pass a string check.
-  @id:serve-interactive-startup-progress @requires-gpu
+  # Linux-only, like every other scenario that drives `rocm` under a PTY
+  # (dash.feature's header): portable-pty's Windows (ConPTY) path is not a
+  # validated contract of this harness. On the native-Windows GPU lane the
+  # emulated screen stayed blank for the whole 300s wait while the same serve
+  # run piped (serve-07) came up. On native Windows, whether the wait is
+  # announced (`a_wait_that_can_fail_without_a_summary_is_announced` in
+  # service_launch/start.rs) and how it decides (the `wait_for_serve_startup`
+  # tests in serve_progress.rs) run on the Windows build-and-test job; the
+  # printed wait line itself is not exercised there.
+  @id:serve-interactive-startup-progress @requires-gpu @requires-os:linux
   Scenario: serve-64 - Interactive serve shows how to follow startup and exits when the model is served
     Given a managed runtime is active
     When the user serves a model on GPU under a real terminal
@@ -1080,3 +1089,26 @@ Feature: Model serving
     And that log command shows the engine's last line
     And the failed launch is recorded as stopped
     And no background automation daemon was left behind
+
+  # ROCMAI-1058: when one of vLLM's compiled extensions fails to load (typically
+  # built against a newer glibc than the host has), vLLM logs a warning, carries
+  # on, and dies later on the first op that extension registers. `rocm serve`
+  # then prints the startup-failure message, which names what it detected and
+  # points at a `rocm diagnose --symptom` command. That message is built by
+  # `startup_log_context`/`extension_load_failure_hint` in the vLLM engine, which
+  # @id:diagnose-recognises-a-vllm-extension-load-failure cannot reach: that one
+  # drives `rocm diagnose` directly and never `rocm serve`.
+  #
+  # Same test-only hook as @id:serve-oom-launch-memory-guidance, in its
+  # `extension-load` mode, so @requires-oom-fault-injection skips this on the
+  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane.
+  # @requires-no-gpu because the fabricated launch stands in for the GPU the mock
+  # lane does not have. The hook plants only the raw startup log and the fact
+  # that the process died; every sentence asserted below is computed from that
+  # log by the engine, so breaking the hint fails this scenario.
+  @id:serve-vllm-extension-load-hint @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-66 - A launch that died on a vLLM compiled extension that did not load says so and points at diagnose
+    Given a managed vLLM launch whose compiled extension will fail to load
+    When the user serves a model on that launch
+    Then the startup failure names the vLLM compiled extension that did not load
+    And the startup failure points at a diagnose command that reports a cause
