@@ -77,10 +77,10 @@ packages alone and leaves the torch stack where it is: the plan prints a
 `torch_kept:` line naming the torch it found, and `rocm install sdk --dry-run`
 shows the same reduced `command:`.
 
-A runtime with no torch yet, or an
-environment recreated for another Python, still gets the full stack, because
-there is nothing to keep. The runtime's recorded composition (and so its
-runtime key and `rocm update` comparison) is unchanged.
+A runtime with no torch yet, or an environment recreated for another Python,
+still gets the full stack, because there is nothing to keep. The runtime's
+recorded composition (and so its runtime key and `rocm update` comparison) is
+unchanged.
 
 Use it when you are deliberately running a torch that the alignment would
 replace, such as a locally built wheel, a version under test, or a stack pinned
@@ -194,9 +194,9 @@ startup crash at `rocm serve`:
 
 On a runtime this run did not install vLLM into, the same three cases are
 warnings, so an install that used to be a no-op (for example offline) stays one.
-A later `rocm engines install vllm` on a runtime whose upgrade failed only warns,
-and `rocm serve` on it keeps failing until an install succeeds: retrying after a
-failed install is deliberately not fatal.
+A later `rocm engines install vllm` on a runtime whose upgrade failed only
+warns, and `rocm serve` on it keeps failing until an install succeeds: retrying
+after a failed install is deliberately not fatal.
 
 The check runs inside the engine install, before the CLI realigns the runtime's
 torch. If torch cannot load against the SDK at that moment, the probe sees a

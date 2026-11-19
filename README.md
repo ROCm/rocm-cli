@@ -786,9 +786,8 @@ made.
 
 On Windows, when `fix-2-unset-override`, `fix-6-path` or
 `fix-9-igpu-dgpu --device-index N` cannot read the current value of the
-variable it changes, it stops before
-changing anything, also with exit 4. Under `--dry-run` it stops the same way,
-before showing the change it would make.
+variable it changes, it stops before changing anything, also with exit 4. Under
+`--dry-run` it stops the same way, before showing the change it would make.
 
 ### ROCm installation
 
@@ -913,8 +912,8 @@ prints which Python it chose, and `--dry-run` shows it without changing anything
 
 ROCm 10 and newer ship from a different source layout than ROCm 7: stable
 releases from `stable.repo.amd.com` and nightlies from `nightly.repo.amd.com`.
-That is the layout an install reads unless it asks for something older. Three
-kinds of install read it: a stable pin of ROCm 10 or newer, a nightly pinned to
+That is the layout an install reads unless it asks for something older. The
+installs that read it are a stable pin of ROCm 10 or newer, a nightly pinned to
 a build date of 2026-08-23 or later, and an install with no pin at all.
 
 The earlier release stream (`repo.amd.com`) and the earlier nightly stream
@@ -1396,7 +1395,7 @@ The estimate is built from these parts:
   them.
 
 How close the estimate came to those loads, and why that describes the fit
-rather than a bound, is written down once, in the
+instead of a bound, is written down once, in the
 [`gguf_fit` module documentation](https://github.com/ROCm/rocm-cli/blob/main/crates/rocm-core/src/gguf_fit.rs).
 Another GPU, engine build or batch size can miss by more, so leave headroom.
 
@@ -1588,11 +1587,10 @@ including vLLM's own `/invocations`, `/tokenize` and `/metrics`. The exceptions
 are `GET`/`HEAD /health` and CORS preflights: the `/health` liveness check
 stays open.
 
-The AIM engine runs
-the same vLLM server inside its container but does not install this check, so
-a key-protected AIM endpoint has only vLLM's own `VLLM_API_KEY` check, which
-leaves routes such as `/invocations`, `/tokenize` and `/metrics` answering
-without the key.
+The AIM engine runs the same vLLM server inside its container but does not
+install this check, so a key-protected AIM endpoint has only vLLM's own
+`VLLM_API_KEY` check, which leaves routes such as `/invocations`, `/tokenize`
+and `/metrics` answering without the key.
 
 Because `/metrics` is covered, `rocm dash` cannot read engine metrics from a
 key-protected vLLM server: it leaves that server's KV-cache, queue, throughput
@@ -1910,11 +1908,13 @@ processes, and any endpoint key, which the server might still be enforcing.
 
 It names each process that, or a process under it, did not exit after it was
 signaled. On Windows it also names a process that did exit (or was already
-gone), because one of the processes under it might still be running, when
-taking those processes down:
+gone) when taking the processes under it down:
 
 - Did not complete
 - Found nothing, and no other recorded process is confirmed gone
+
+It names it because, in either case, one of the processes under it might
+still be running.
 
 For a process it could not verify as the server's (its recorded start-time can
 no longer be read back, or, on Windows, `rocm` cannot query it at all), it
