@@ -15,7 +15,10 @@
 
 mod cred_proxy;
 mod local;
+mod mise_bin;
+mod mise_snapshot;
 mod policy;
+mod provision;
 mod registry;
 
 use std::path::{Path, PathBuf};
@@ -50,6 +53,12 @@ pub(crate) enum AgentsCommand {
         /// read from the serving engine's log when the engine reports it.
         #[arg(long, value_name = "N")]
         context_tokens: Option<u64>,
+        /// Do not provision the workspace's mise toolchain. By default, when
+        /// the workspace has a mise config (mise.toml, .mise.toml or
+        /// .tool-versions), its tools are installed into a shared read-only
+        /// store before the agent starts and put on the agent's PATH.
+        #[arg(long)]
+        no_provision: bool,
         /// Arguments passed to the agent.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -162,6 +171,7 @@ pub(crate) fn run(command: AgentsCommand) -> Result<()> {
             local,
             service,
             context_tokens,
+            no_provision,
             args,
         } => {
             let local = if local || service.is_some() {
@@ -176,7 +186,15 @@ pub(crate) fn run(command: AgentsCommand) -> Result<()> {
                     .map(|tokens| (tokens, format!("the engine log of `{}`", target.service_id))),
                 (None, None) => None,
             };
-            run_agent(&root, &agent, workspace, local, context, &args)
+            run_agent(
+                &root,
+                &agent,
+                workspace,
+                local,
+                context,
+                no_provision,
+                &args,
+            )
         }
         AgentsCommand::List { json } => list(&root, json),
         AgentsCommand::Prune { yes } => prune(&root, yes),
@@ -272,6 +290,7 @@ fn run_agent(
     workspace: Option<PathBuf>,
     local: Option<local::LocalTarget>,
     context: Option<(u64, String)>,
+    no_provision: bool,
     args: &[String],
 ) -> Result<()> {
     let kind = KINDS.iter().find(|k| k.name == agent).with_context(|| {
@@ -292,12 +311,27 @@ fn run_agent(
         .canonicalize()
         .context("workspace does not exist")?;
 
+    // Taken before anything else runs, so nothing the agent does to these
+    // files can change what is provisioned for it.
+    let (decision, snapshot) = provision::snapshot_for(&workspace, no_provision)?;
+
     let id = format!("{}-{}", kind.name, &random_hex(4)?);
     let dir = root.join(&id);
     let home = dir.join("home");
     let tmp = dir.join("tmp");
     std::fs::create_dir_all(&home)?;
     std::fs::create_dir_all(&tmp)?;
+
+    let provisioned = match (decision, &snapshot) {
+        (provision::Decision::Provision, Some(snapshot)) => {
+            Some(provision::run(root, &axis, &id, &dir, snapshot)?)
+        }
+        (provision::Decision::SkippedByFlag, _) => {
+            eprintln!("rocm: --no-provision: the workspace's mise config was not provisioned");
+            None
+        }
+        _ => None,
+    };
 
     let placeholder = format!("rocm-placeholder-{}", random_hex(16)?);
     let record = Arc::new(Mutex::new(AgentRecord {
@@ -340,6 +374,10 @@ fn run_agent(
             home: &home,
             tmp: &tmp,
             tool_dirs: &tool_dirs,
+            provisioned: &provisioned
+                .as_ref()
+                .map(|p| vec![p.installs.clone(), p.mise_dir.clone()])
+                .unwrap_or_default(),
         }),
     )?;
     registry::save(&dir.join("record.json"), &record.lock().unwrap())?;
@@ -352,7 +390,10 @@ fn run_agent(
         ("HOME".into(), path_str(&home)?),
         ("TMPDIR".into(), path_str(&tmp)?),
         ("CLAUDE_CODE_TMPDIR".into(), path_str(&tmp)?),
-        ("PATH".into(), sandbox_path(&tool_dirs)?),
+        (
+            "PATH".into(),
+            sandbox_path(provisioned.as_ref(), &tool_dirs)?,
+        ),
         (
             "TERM".into(),
             std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
@@ -360,6 +401,25 @@ fn run_agent(
         (kind.base_url_env.into(), base_url),
         (kind.key_env.into(), placeholder),
     ];
+    if let Some(p) = &provisioned {
+        // The agent's own mise: finds the shared installs read-only, and
+        // writes anything it installs itself under its own home.
+        sandbox_env.extend([
+            ("MISE_SHARED_INSTALL_DIRS".into(), path_str(&p.installs)?),
+            (
+                "MISE_DATA_DIR".into(),
+                path_str(&home.join(".local/share/mise"))?,
+            ),
+            (
+                "MISE_CACHE_DIR".into(),
+                path_str(&home.join(".cache/mise"))?,
+            ),
+            (
+                "MISE_STATE_DIR".into(),
+                path_str(&home.join(".local/state/mise"))?,
+            ),
+        ]);
+    }
     sandbox_env.extend(backend.model_env);
     match (&context, kind.context_env) {
         (Some((tokens, source)), Some(var)) => {
@@ -407,6 +467,15 @@ fn run_agent(
         .status()
         .with_context(|| format!("failed to start {}", axis.display()))?;
 
+    if let Some(snapshot) = &snapshot
+        && mise_snapshot::workspace_digest(&workspace).ok().flatten() != Some(snapshot.digest())
+    {
+        eprintln!(
+            "rocm: the workspace's mise config changed while {id} ran; its toolchain came from the \
+             snapshot taken before it started, and the next `rocm agents run` here provisions \
+             from the files as they are then"
+        );
+    }
     {
         let mut rec = record.lock().unwrap();
         rec.status = AgentStatus::Exited;
@@ -420,11 +489,19 @@ fn run_agent(
     Ok(())
 }
 
-/// The sandbox's `PATH`: the user's tool directories first, as in a login
-/// shell, then the system ones.
-fn sandbox_path(tool_dirs: &[PathBuf]) -> Result<String> {
-    let mut parts = tool_dirs
-        .iter()
+/// The sandbox's `PATH`: the provisioned tools (the workspace asked for
+/// them, as `mise activate` would put them first) and mise itself, then the
+/// user's tool directories, as in a login shell, then the system ones.
+fn sandbox_path(
+    provisioned: Option<&provision::Provisioned>,
+    tool_dirs: &[PathBuf],
+) -> Result<String> {
+    let provisioned_dirs = provisioned
+        .map(|p| p.bin_dirs.iter().chain([&p.mise_dir]).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut parts = provisioned_dirs
+        .into_iter()
+        .chain(tool_dirs)
         .map(|dir| path_str(dir))
         .collect::<Result<Vec<_>>>()?;
     parts.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(str::to_owned));
