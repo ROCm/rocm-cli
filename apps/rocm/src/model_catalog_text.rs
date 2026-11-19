@@ -27,10 +27,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rocm_core::{
-    AppPaths, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
-    builtin_model_recipes, detect_host_gfx_target, load_model_recipe_registry,
-    model_artifact_cache_status, model_catalog_platforms, model_recipe_featured,
-    model_recipe_target_platform_label, normalize_therock_family, platform_matches_gfx_family,
+    AppPaths, GfxSupport, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
+    builtin_model_recipes, detect_host_gfx_target, engine_recipe_gfx_support,
+    load_model_recipe_registry, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family,
 };
 use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
 
@@ -162,10 +163,47 @@ fn platform_offer<'a>(
 /// which is the same class of wrong answer as recommending one that does not
 /// fit — the listing would just be confidently wrong about the engine instead
 /// of the memory.
-fn recipe_engine_allowed(recipe: &ModelRecipeRecord, docker_reachable: &dyn Fn() -> bool) -> bool {
+///
+/// The GPU family is the third way to be confidently wrong, and the heading
+/// above this listing claims the list is narrowed to what the machine can run.
+/// An engine recipe that names `supported_gfx_families` this host is not in
+/// cannot serve the model here at all, so offering it makes that heading false.
+fn recipe_engine_allowed(
+    recipe: &ModelRecipeRecord,
+    docker_reachable: &dyn Fn() -> bool,
+    host_gfx_family: Option<&str>,
+) -> bool {
     recipe.preferred_engines.first().is_none_or(|engine| {
         engine_ruled_out_by_platform_with(engine, docker_reachable) == PlatformRuleOut::Allowed
+            && !recipe_engine_gfx_unsupported(recipe, engine, host_gfx_family)
     })
+}
+
+/// Whether this recipe's first-choice engine names GPU families and this host's
+/// is not among them.
+///
+/// Only [`GfxSupport::Unsupported`] narrows: `Unrestricted` already covers both
+/// "the engine recipe names no families" and "no family is known for this
+/// host", so an unmeasured host filters nothing here — the same rule the
+/// memory gate follows when `fit` is `None`. The verdict is
+/// [`engine_recipe_gfx_support`] rather than a second comparison of the family
+/// strings, so this listing and `serve_cmd`'s own AIM gate cannot drift into
+/// disagreeing about which host can run a recipe.
+fn recipe_engine_gfx_unsupported(
+    recipe: &ModelRecipeRecord,
+    engine: &str,
+    host_gfx_family: Option<&str>,
+) -> bool {
+    recipe
+        .engine_recipes
+        .iter()
+        .find(|record| record.engine.eq_ignore_ascii_case(engine))
+        .is_some_and(|record| {
+            matches!(
+                engine_recipe_gfx_support(record, host_gfx_family),
+                GfxSupport::Unsupported
+            )
+        })
 }
 
 #[allow(dead_code)]
@@ -202,8 +240,9 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     // One `docker info` answers every AIM recipe in the listing, as the verbose
     // renderer already does.
     let docker_reachable = once_per_call(rocm_engine_aim::builtin_docker_daemon_reachable);
-    let engine_allowed =
-        |recipe: &ModelRecipeRecord| recipe_engine_allowed(recipe, &docker_reachable);
+    let engine_allowed = |recipe: &ModelRecipeRecord| {
+        recipe_engine_allowed(recipe, &docker_reachable, host_gfx_family.as_deref())
+    };
     let mut offered_any = false;
     let mut also_fit_total = 0usize;
     for platform in &platforms {
@@ -1398,6 +1437,52 @@ mod tests {
                 .iter()
                 .map(|recipe| &recipe.canonical_model_id)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The third way this listing could be confidently wrong, after memory and
+    /// the engine's platform. The heading says the list is narrowed to what the
+    /// machine can run, but the GPU family was never checked, so an engine
+    /// recipe naming `supported_gfx_families` without this host's was offered
+    /// anyway — a model that cannot be served here at all.
+    ///
+    /// All four arms together, because the gate must narrow in exactly one of
+    /// them. Narrowing on an unknown host would hide the whole catalog from
+    /// anyone whose GPU was not detected, and narrowing on a recipe that names
+    /// no families would hide most of the catalog outright; asserting only the
+    /// first arm would pass a gate that did both.
+    #[test]
+    fn a_recipe_its_engine_cannot_run_on_this_gpu_is_not_offered() {
+        let mut recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        recipe.preferred_engines = vec!["vllm".to_owned()];
+        let with_families = |families: &[&str]| rocm_core::ModelRecipeEngineRecord {
+            engine: "vllm".to_owned(),
+            supported_gfx_families: families.iter().map(|f| (*f).to_owned()).collect(),
+            ..Default::default()
+        };
+        let allowed = |recipe: &ModelRecipeRecord, family: Option<&str>| {
+            recipe_engine_allowed(recipe, &|| true, family)
+        };
+
+        recipe.engine_recipes = vec![with_families(&["gfx94X-dcgpu"])];
+        assert!(
+            !allowed(&recipe, Some("gfx110X-all")),
+            "a host whose family the engine recipe does not list cannot run it, so it must \
+             not be offered"
+        );
+        assert!(
+            allowed(&recipe, Some("gfx94X-dcgpu")),
+            "the same recipe on a host it does list is offered"
+        );
+        assert!(
+            allowed(&recipe, None),
+            "an unmeasured host narrows nothing here, exactly as `fit: None` does for memory"
+        );
+
+        recipe.engine_recipes = vec![with_families(&[])];
+        assert!(
+            allowed(&recipe, Some("gfx110X-all")),
+            "a recipe naming no families runs anywhere and must stay offered"
         );
     }
 
