@@ -158,15 +158,19 @@ AMD rotates those constantly.
 The install resolves each package's current wheel, including torch, from the
 row's index with `uv pip install --dry-run --reinstall`, parses the version it
 reports it would install, then reinstalls pinned to that exact version.
-`tensorizer` is not discovered or pinned this way: it has no ROCm-specific
+
+`tensorizer` is not discovered or pinned this way. It has no ROCm-specific
 build, and vLLM's own wheel metadata already declares an exact tensorizer
 dependency, so it is left to vLLM's own dependency resolution instead of
-risking a conflicting pin of its own. Every resolved pin that carries a
-`+rocmX.Y` local version is checked against the SDK's own major.minor before
-installing, so an index that happens to serve more than one ROCm line at once
-cannot silently install the wrong line's wheel onto this SDK. If AMD's index
-has no compatible build for a package, the resolver fails and the install
-fails instead of falling back to an unpinned or CPU install.
+risking a conflicting pin of its own.
+
+Every resolved pin that carries a `+rocmX.Y` local version is checked against
+the SDK's own major.minor before installing, so an index that happens to serve
+more than one ROCm line at once cannot silently install the wrong line's wheel
+onto this SDK.
+
+If AMD's index has no compatible build for a package, the resolver fails and the
+install fails instead of falling back to an unpinned or CPU install.
 
 One package is checked after the install instead. vLLM's wheel pins
 `tensorizer==2.10.1`, which cannot be imported under Python 3.14
@@ -225,12 +229,14 @@ above. The vLLM wheel declares the exact builds of both that it was built
 against, and the index keeps publishing newer ones it does not accept (for
 example `amd-aiter 0.1.24.post1` beside a vLLM that depends on a `0.1.22` dev
 build), so pinning each package's newest release can name a combination the
-vLLM wheel itself rules out. After the vLLM pin is discovered, the install
-resolves that exact vLLM with `uv pip install --dry-run` and takes the
-`flash-attn` and `amd-aiter` versions the resolver reports, but only when the
-vLLM index serves that exact version on its own (a dependency vLLM leaves
-unpinned can resolve to a PyPI build instead, and is never used as the pin).
-Otherwise the series match above decides, as before.
+vLLM wheel itself rules out.
+
+After the vLLM pin is discovered, the install resolves that exact vLLM with
+`uv pip install --dry-run` and takes the `flash-attn` and `amd-aiter` versions
+the resolver reports. It does so only when the vLLM index serves that exact
+version on its own. A dependency vLLM leaves unpinned can resolve to a PyPI
+build instead, and is never used as the pin. Otherwise the series match above
+decides, as before.
 
 The resolve probe and the confirmation only improve on the series match, so
 neither can make an install fail that would have worked without them. If the
@@ -422,18 +428,25 @@ a tiny model. ROCm CLI helps in three ways:
   other would reject.
 
   Sharing the guard is not the same as the two always printing the *same*
-  command, and for a **colorized** line they do not. The engine reads the log
-  first, refuses the raw escape-bearing line, and prints the canonical symptom.
-  Its failure message then echoes the log tail back into that same shared file as
-  the rows a terminal would have drawn, and the serve summary reads afterwards,
-  so the note quotes that rendered row instead. Both arguments are sound: the row
-  is text the terminal really printed, it carries no control bytes, and anything
-  the guard accepts is diagnosable. They are two reads of a file that changed in
-  between, not a disagreement about the rule. Lines rocm-cli wrote into that log
-  itself are skipped when picking the line, so the note quotes *your* error
-  instead of the hint printed above it: the supervisor and the engine share one
-  log file, and the engine's failure (hint included) is appended to it after the
-  error that caused it.
+  command, and for a **colorized** line they do not. The reads happen in this
+  order:
+
+  1. The engine reads the log first, refuses the raw escape-bearing line, and
+     prints the canonical symptom.
+  2. Its failure message then echoes the log tail back into that same shared
+     file as the rows a terminal would have drawn.
+  3. The serve summary reads afterwards, so the note quotes that rendered row
+     instead.
+
+  Both arguments are sound: the row is text the terminal really printed, it
+  carries no control bytes, and anything the guard accepts is diagnosable. They
+  are two reads of a file that changed in between, not a disagreement about the
+  rule.
+
+  Lines ROCm CLI wrote into that log itself are skipped when picking the line,
+  so the note quotes *your* error instead of the hint printed above it: the
+  supervisor and the engine share one log file, and the engine's failure (hint
+  included) is appended to it after the error that caused it.
 
 Explicitly, the workaround for an OOM on a shared card is:
 
@@ -451,34 +464,44 @@ A startup failure can also come from the engine failing to import, with no
 memory problem at all. The failure message then names the failing line and
 points at `rocm diagnose --symptom '<the error>'`.
 
-The hint fires only when the log tail has one of two kinds of line. The first
-is a line that contains `libtorch_cuda.so` and also contains `OSError:` or
-`ImportError:`, compared without regard to case. It does not have to start with
-that text, because the real line begins with a process prefix such as
-`(EngineCore pid=412)`. A warning that quotes the exception in its repr form,
-such as `ImportError('libtorch_cuda.so ...')`, does not count. A warning written
-with a colon, such as `... with ImportError: libtorch_cuda.so ...`, does count,
-and it can raise the hint when the real failure is something else. The
-second is a traceback frame, meaning a line that contains `file "` and
-`_optional_torch_c_dlpack`, compared without regard to case. The library line
-wins when both are present, and when several lines name the library the last
-one is quoted. A log line that only mentions the `_optional_torch_c_dlpack`
-module, such as a `UserWarning`, does not fire the hint. Any other startup
-failure prints only the log tail, except an out-of-memory failure, which prints
-the memory hint above. If a failure matches both, both paragraphs are printed,
-the memory hint first.
+The hint fires only when the log tail has one of two kinds of line:
+
+- A library line is a line that contains `libtorch_cuda.so` and also contains
+  `OSError:` or `ImportError:`, compared without regard to case. It does not
+  have to start with that text, because the real line begins with a process
+  prefix such as `(EngineCore pid=412)`. A warning that quotes the exception in
+  its repr form, such as `ImportError('libtorch_cuda.so ...')`, does not count.
+  A warning written with a colon, such as
+  `... with ImportError: libtorch_cuda.so ...`, does count, and it can raise the
+  hint when the real failure is something else.
+- A traceback frame is a line that contains `file "` and
+  `_optional_torch_c_dlpack`, compared without regard to case. A log line that
+  only mentions the `_optional_torch_c_dlpack` module, such as a `UserWarning`,
+  does not fire the hint.
+
+The library line wins when both are present, and when several lines name the
+library the last one is quoted.
+
+Any other startup failure prints only the log tail, except an out-of-memory
+failure, which prints the memory hint above. If a failure matches both, both
+paragraphs are printed, the memory hint first.
 
 The printed command quotes the failing line when it can be rendered as one
 intact single-quoted argument and `rocm diagnose` recognizes it. Otherwise it
 quotes the canonical import symptom,
-`OSError: libtorch_cuda.so: cannot open shared object file`. A line with an
-apostrophe falls back this way. So does a frame that does not score on its own,
-such as `... in <module>`, which names only the shim module and scores below the
-match threshold. A loader frame that ends in `in load_torch_c_dlpack_extension`
-also names the extension, so it scores on its own and is quoted as it is. When a
-frame alone does not score, the command quotes a canonical symptom that your
-log did not contain. The command then always reports a cause, and your own line
-stays visible in the message above it.
+`OSError: libtorch_cuda.so: cannot open shared object file`. Two cases fall back
+this way:
+
+- A line with an apostrophe.
+- A frame that does not score on its own, such as `... in <module>`, which names
+  only the shim module and scores below the match threshold.
+
+A loader frame that ends in `in load_torch_c_dlpack_extension` also names the
+extension, so it scores on its own and is quoted as it is.
+
+When a frame alone does not score, the command quotes a canonical symptom that
+your log did not contain. The command then always reports a cause, and your own
+line stays visible in the message above it.
 
 The command only reports. On Linux and WSL it matches the conditional
 engine-reinstall remediation (`fix-17-torch-dlpack`), which `rocm fix` prints

@@ -561,16 +561,21 @@ for its ROCm build and compiled GPU architectures:
 On Windows, the human-readable summary also shows the AMD display driver's
 `driver_version` and `driver_date`, and a `driver_age` line. `driver_age`
 compares the driver date with the release of the first HIP SDK for Windows
-(27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for
-the Lemonade Vulkan backend, so this is a hint to look at the driver, not a
-statement that the driver is broken. The date is only a floor: it cannot judge
-newer GPUs such as gfx120X, gfx1150, and gfx1151, which might need newer drivers.
-`rocm diagnose` lists the same finding as
-`fix-22-display-driver-old` with a WEAK score. Its advice is AMD's support
-page and a restart after the install. The entry is advice about the host, not a
-cause of any reported symptom, so when nothing else matches, `rocm diagnose`
-still says where to file it upstream. rocm-cli never installs drivers on
-Windows. The Vulkan driver version is not shown.
+(27 July 2023).
+
+AMD publishes no minimum driver version for the HIP SDK or for the Lemonade
+Vulkan backend, so this is a hint to look at the driver, not a statement that
+the driver is broken. The date is only a floor: it cannot judge newer GPUs such
+as gfx120X, gfx1150, and gfx1151, which might need newer drivers.
+
+`rocm diagnose` lists the same finding as `fix-22-display-driver-old` with a
+WEAK score. Its advice is AMD's support page and a restart after the install.
+The entry is advice about the host, not a cause of any reported symptom, so
+when nothing else matches, `rocm diagnose` still says where to file it
+upstream.
+
+ROCm CLI never installs drivers on Windows. The Vulkan driver version is not
+shown.
 
 ### Diagnose and fix
 
@@ -952,16 +957,21 @@ A tarball catalog can be pinned only in this layout, so `--format tarball
 --version 7.14.1` is refused and points to `--format wheel`, which can.
 
 For ROCm 10, `install sdk` pins torchaudio itself, because its metadata names no
-ROCm build. When a torchaudio release has been verified on hardware for the
-requested ROCm line (the exact torchaudio the vLLM ROCm 10.x install pins for
-that line, where it pins one instead of a series), it pins that build.
-Otherwise, or when that build isn't published for the requested ROCm version on
-this Python and platform, it pins the newest build published for that ROCm
-version. The `torchaudio_selection:` line in the plan says that build isn't
-hardware-verified, as a `Note:` in a real install's log does. Newest isn't
-always right: the index has published a CPU-only torchaudio under the same
-`+rocm` label as working builds. The install stops with an error when the
-requested version publishes no torchaudio for this Python and platform.
+ROCm build. It picks the build in this order:
+
+- When a torchaudio release has been verified on hardware for the requested
+  ROCm line, it pins that build. This is the exact torchaudio the vLLM ROCm 10.x
+  install pins for that line, where it pins one instead of a series.
+- Otherwise, or when that build isn't published for the requested ROCm version
+  on this Python and platform, it pins the newest build published for that ROCm
+  version.
+- When the requested version publishes no torchaudio for this Python and
+  platform, the install stops with an error.
+
+When it pins the newest build, the `torchaudio_selection:` line in the plan says
+that build isn't hardware-verified, as a `Note:` in a real install's log does.
+Newest isn't always right: the index has published a CPU-only torchaudio under
+the same `+rocm` label as working builds.
 
 It then asks `uv` to resolve Torch and torchvision from their published
 dependency metadata alongside the pinned torchaudio. For a ROCm line the vLLM
@@ -1091,7 +1101,7 @@ scripts: each runtime with its key, version, mode, status and toolchain, its
 `provenance` as an object with the same four facts, and `active` and
 `rollback_target` flags in place of the `*` and `-` markers. Unset values,
 including a provenance fact the text shows as `unrecorded`, are `null`. Fields
-might be added in later releases; existing ones are not renamed or removed.
+may be added in later releases; existing ones are not renamed or removed.
 
 `activate` and `rollback` change which runtime the next install or server
 picks up. A server that is already running is not moved: it keeps serving on
