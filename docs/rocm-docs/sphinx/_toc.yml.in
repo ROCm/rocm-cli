@@ -8,6 +8,8 @@ subtrees:
       - file: install/installation
       - file: install/wsl
         title: ROCm CLI on WSL2
+      - file: compatibility
+        title: Compatibility
       - file: getting-started
   - caption: Reference
     entries:

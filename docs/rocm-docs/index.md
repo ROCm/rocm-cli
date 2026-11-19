@@ -44,6 +44,7 @@ Check platform support and install the prebuilt binaries.
 
 * [Installing ROCm CLI](install/installation.md)
 * [ROCm CLI on WSL2](install/wsl.md)
+* [Compatibility](compatibility.md)
 ```
 
 ```{grid-item-card} Get started
