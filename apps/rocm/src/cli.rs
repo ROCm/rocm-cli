@@ -396,15 +396,17 @@ pub(crate) enum Command {
     },
     /// [preview] Chat with a configured assistant provider.
     ///
-    /// In a terminal with no --prompt, opens the interactive chat (switch
-    /// providers there with /provider; --provider, --model, and --tools don't
-    /// apply). With --prompt, or a prompt piped on standard input, sends that one
-    /// prompt and prints the reply. Use `rocm config enable-provider` and
-    /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server. On Linux/WSL the interactive
-    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
-    /// and, like it, prints why that daemon was failing after it closes,
-    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
+    /// In a terminal with no --prompt, opens the interactive chat (switch providers
+    /// there with /provider; --provider, --model, and --tools don't apply). With
+    /// --prompt, or a prompt piped on standard input, sends that one prompt and prints
+    /// the reply without terminal escape sequences. With --tools, an assistant-chosen
+    /// value a Windows shell reads as syntax (', &, %) is refused, not offered to
+    /// paste, unless it came from your own request (`install therock into <folder>`).
+    /// Use `rocm config enable-provider` and `rocm config set-provider-key` first to
+    /// configure a remote provider; the `local` provider talks to a running server. On
+    /// Linux/WSL the interactive chat shares the dashboard's telemetry daemon the way
+    /// `rocm dash` does, and, like it, prints why that daemon was failing after it
+    /// closes, including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -620,10 +622,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
         /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
         /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
-        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. If the server
-        /// exits first, a crash fails with a pointer to the logs, while a stop asked for from elsewhere reports
-        /// it was stopped before it became ready and names no logs. Cannot be combined with --foreground or
-        /// --verbose, which already stay attached.
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. If the server exits
+        /// first, a crash fails with a pointer to the logs, while a stop from elsewhere reports it was stopped before
+        /// it became ready and names no logs. Cannot be combined with --foreground or --verbose, which stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
         wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
@@ -1322,10 +1323,9 @@ pub(crate) enum ServicesCommand {
     },
     /// Restart a local model server.
     ///
-    /// Stops the server first, and starts it again only once every process it
-    /// recorded is confirmed gone. If the stop cannot confirm that, nothing is
-    /// started and the stop request stays recorded on the server. A server that dies during the restart fails
-    /// loudly rather than reporting success: its exit status and log pointer are printed, and it is marked `failed`.
+    /// Stops the server first, and starts it again only once every process it recorded is confirmed gone. If the
+    /// stop cannot confirm that, nothing is started and the stop request stays recorded. A server that dies during
+    /// the restart fails loudly: its exit status and a log pointer are printed, and the record is marked `failed`.
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,

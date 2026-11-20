@@ -1993,6 +1993,20 @@ standard input, it sends one prompt and prints the reply.
   2 minutes.
   The timeout message names the wait that applied and this variable.
 
+With `--prompt`, the reply and tool output are printed with terminal escape
+sequences and invisible characters removed, so a reply cannot hide part of a
+line, retitle the window or write the clipboard; text it tried to hide is
+shown. Every `rocm` error report is printed the same way. A change the assistant asks for with `--tools` is not made from
+`--prompt`: it is shown as an `advanced manual command:` line, quoted for a
+POSIX shell. A value the assistant chose, in that line or in a plan it asked
+for, is refused if it holds a character a Windows shell reads as syntax even
+inside those quotes, such as `'`, `&` or `%`; the message tells you to run the
+command yourself with that value. A folder the CLI takes from your own
+request, such as `install therock into <folder>`, is shown as you typed it; a
+folder that reaches the CLI through the assistant's request is held to the
+rule, even if you named it first.
+See the LLM tool-use design notes in the documentation for the exact set.
+
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
 That backend logs a warning and ignores all three sampling flags. This is an

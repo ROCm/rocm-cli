@@ -19,14 +19,21 @@
 //! * The surfaces that render such a line back inside a command the user is
 //!   invited to paste reject it rather than rewrite it
 //!   ([`quotable_in_single_quotes`]).
+//! * `rocm chat` prints a model's reply, tool output and error text, which are
+//!   untrusted too and span many lines; [`sanitize_terminal_text`] removes the
+//!   sequences from them but keeps the line structure and shows any concealed
+//!   text. Values a model chose for a command line are refused instead, for any
+//!   [`is_display_altering`] character.
 //!
-//! A second, independent scan for the second caller would have been a second
-//! grammar to get wrong, and the first one took three rounds to get right. So
-//! the grammar lives here once, in one private stepping function, and each
-//! caller interprets the classified tokens it yields. The third needs no walk
-//! at all, only the character predicates ([`is_control_or_format`] and
-//! [`is_control_or_line_separator`]) the other two end on — which is why it
-//! lives here rather than beside either of its two callers.
+//! An independent scan for each further caller would have been another grammar
+//! to get wrong, and the first one took three rounds to get right. So the
+//! grammar lives here once, in one private stepping function and the
+//! escape-skipping helpers it uses: the stripper and the line splitter
+//! interpret the classified tokens it yields, and [`sanitize_terminal_text`]
+//! skips sequences with the same helpers. The quotability check needs no walk
+//! at all, only a character predicate ([`is_display_altering`]) that takes in
+//! the characters the others end on — which is why it lives here rather than
+//! beside any one caller.
 //!
 //! # Line breaks inside a string body: merging and losing rows
 //!
@@ -46,7 +53,7 @@
 //!
 //! A terminator is not what creates the shape, as the second example shows: it
 //! contains no `BEL` and no `ST` anywhere, and the two rows still merge. The
-//! body scan runs to the next `BEL`, to `ST` (`ESC \`), to an unrelated `ESC`
+//! body scan runs to the next `BEL`, to `ST` (`ESC \` or U+009C), to an unrelated `ESC`
 //! — which it leaves in place for the next step to re-read, so the hole stays
 //! one sequence wide — or to the end of the input, and the break is swallowed
 //! in every one of those cases, terminated or not.
@@ -164,17 +171,117 @@ pub fn is_control_or_format(c: char) -> bool {
 /// `U+2028 LINE SEPARATOR` and `U+2029 PARAGRAPH SEPARATOR` are `Zl`/`Zp`, so
 /// neither `char::is_control` nor [`is_control_or_format`]'s enumerated `Cf`
 /// set covers them, yet a terminal draws the text after either on the next row.
-/// The two places that must not let that happen — this module's classifier and
-/// [`quotable_in_single_quotes`], the guard on what may be quoted into the
-/// `rocm diagnose --symptom '...'` command the OOM surfaces print — therefore
-/// share this predicate instead of each deciding for itself what breaks a line.
-/// The classifier was widened to the pair when this walk moved out of the vLLM
-/// engine (the commit that moved it says "behaviour is unchanged", which is
-/// true of everything except this); the guard was not, and a line separator
-/// went on riding into the printed command.
+/// This module's classifier ends a line on it, and [`is_display_altering`]
+/// includes it, so [`quotable_in_single_quotes`], the guard on what may be
+/// quoted into the `rocm diagnose --symptom '...'` command the OOM surfaces
+/// print, refuses a line separator too.
 #[must_use]
 pub fn is_control_or_line_separator(c: char) -> bool {
     c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Whether `c` has Unicode's `Default_Ignorable_Code_Point` property.
+///
+/// Those are the code points (`DerivedCoreProperties.txt`) a renderer shows
+/// nothing for when it has no special handling for them, which is how a
+/// terminal treats them.
+///
+/// Written out from the property rather than picked by hand, and wider than
+/// [`is_control_or_format`]'s `Cf` set: the Hangul fillers (`Lo`) render as
+/// blank space, the variation selectors (`Mn`) and the combining grapheme
+/// joiner draw nothing, and the tag block holds a run that can spell out
+/// arbitrary ASCII with no glyph at all. A value carrying any of them looks
+/// identical to one without.
+#[must_use]
+pub const fn is_default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}'                      // soft hyphen
+        | '\u{034f}'                    // combining grapheme joiner
+        | '\u{061c}'                    // Arabic letter mark
+        | '\u{115f}'..='\u{1160}'       // Hangul choseong and jungseong fillers
+        | '\u{17b4}'..='\u{17b5}'       // Khmer inherent vowels
+        | '\u{180b}'..='\u{180f}'       // Mongolian variation selectors, vowel separator
+        | '\u{200b}'..='\u{200f}'       // zero-width space and joiners, LRM, RLM
+        | '\u{202a}'..='\u{202e}'       // bidi embeddings and overrides
+        | '\u{2060}'..='\u{206f}'       // word joiner, invisible operators, bidi isolates
+        | '\u{3164}'                    // Hangul filler
+        | '\u{fe00}'..='\u{fe0f}'       // variation selectors
+        | '\u{feff}'                    // zero-width no-break space (byte-order mark)
+        | '\u{ffa0}'                    // halfwidth Hangul filler
+        | '\u{fff0}'..='\u{fff8}'       // unassigned specials
+        | '\u{1bca0}'..='\u{1bca3}'     // shorthand format controls
+        | '\u{1d173}'..='\u{1d17a}'     // musical symbol format controls
+        | '\u{e0000}'..='\u{e0fff}') // tags, variation selectors supplement, reserved
+}
+
+/// Whether `c` changes how text is displayed rather than being displayed:
+/// a control, a `Cf` format character, a line or paragraph separator, or any
+/// other default-ignorable code point.
+///
+/// The union of [`is_control_or_format`], [`is_control_or_line_separator`] and
+/// [`is_default_ignorable`]: what [`sanitize_terminal_text`] removes from prose
+/// apart from the layout characters and the glyph-shaping characters it keeps
+/// ([`is_kept_glyph_shaper`]), and what [`hides_or_moves_text`] refuses in a
+/// value on the same terms.
+#[must_use]
+pub fn is_display_altering(c: char) -> bool {
+    is_control_or_format(c) || is_control_or_line_separator(c) || is_default_ignorable(c)
+}
+
+/// The four invisible characters that may stay in printed text: the
+/// zero-width non-joiner and joiner, and the text and emoji presentation
+/// selectors (VS15, VS16). They pick how the visible character before them is
+/// drawn — joining an emoji sequence, choosing the emoji form of `❤` — and
+/// move nothing. The other variation selectors (VS1–VS14, the supplement at
+/// U+E0100, the Mongolian ones) are not kept: almost no terminal text needs
+/// them, and 256 of them can spell a payload with no glyph.
+const fn shapes_the_preceding_glyph(c: char) -> bool {
+    matches!(c, '\u{200c}' | '\u{200d}' | '\u{fe0e}' | '\u{fe0f}')
+}
+
+/// Whether `c`, coming after `before` and then `previous`, is one of the
+/// glyph-shaping characters kept in printed text: [`shapes_the_preceding_glyph`]
+/// directly after a character that is itself drawn, or a joiner directly after
+/// a presentation selector that is itself kept, as in `🏳` VS16 ZWJ `🌈`, which
+/// is how most joined emoji with an emoji-form base are spelled. Anything
+/// else — a selector after a joiner, a second joiner or a second selector in
+/// a row, one at the start of the text or after a line break — shapes nothing
+/// and is dropped, so a run of them cannot carry hidden text. One kept shaper
+/// per drawn character can still carry a little, which is why a value a model
+/// chose is refused for any of them. One rule for prose and for the values a
+/// user supplies, so such a value is refused for exactly what printing would
+/// remove.
+fn is_kept_glyph_shaper(before: Option<char>, previous: Option<char>, c: char) -> bool {
+    let is_drawn = |c: Option<char>| c.is_some_and(|c| !is_display_altering(c));
+    if !shapes_the_preceding_glyph(c) {
+        return false;
+    }
+    is_drawn(previous)
+        || (matches!(c, '\u{200c}' | '\u{200d}')
+            && matches!(previous, Some('\u{fe0e}' | '\u{fe0f}'))
+            && is_drawn(before))
+}
+
+/// Whether `value` holds anything a terminal would not show as it is.
+///
+/// That is a control (newline and tab included), an escape sequence, a format
+/// character, a line separator, or a default-ignorable character other than a
+/// glyph-shaping one after a drawn character ([`is_kept_glyph_shaper`]).
+///
+/// That is exactly the set [`sanitize_terminal_text`] would remove or change,
+/// plus `\n` and `\t`, which prose keeps but a one-line value must not carry.
+/// So a value is refused for precisely what printing it as prose would not
+/// show, and an emoji such as `❤️` (heart plus VS16) is not refused.
+#[must_use]
+pub fn hides_or_moves_text(value: &str) -> bool {
+    let (mut before, mut previous) = (None, None);
+    for c in value.chars() {
+        if is_display_altering(c) && !is_kept_glyph_shaper(before, previous, c) {
+            return true;
+        }
+        (before, previous) = (previous, Some(c));
+    }
+    false
 }
 
 /// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
@@ -212,17 +319,15 @@ pub fn is_control_or_line_separator(c: char) -> bool {
 /// `rocm serve` summary's OOM note — and a guard that protects only one of them
 /// is the bug it was written to prevent.
 ///
-/// The character test is [`is_control_or_format`] together with
-/// [`is_control_or_line_separator`], because each covers scalars the other does
-/// not and `symptom` is the *raw* log line, not the stripped one: a `Cf` bidi
-/// override reordered how the printed command renders, and a `Zl` line
-/// separator broke it across two rows.
+/// The character test is [`is_display_altering`], which takes in both
+/// [`is_control_or_format`] and [`is_control_or_line_separator`] (each covers
+/// scalars the other does not) and the rest of the default-ignorable set,
+/// because `symptom` is the *raw* log line, not the stripped one: a `Cf` bidi
+/// override reordered how the printed command renders, a `Zl` line separator
+/// broke it across two rows, and a tag character would sit in it unseen.
 #[must_use]
 pub fn quotable_in_single_quotes(symptom: &str) -> bool {
-    !symptom.contains('\'')
-        && !symptom
-            .chars()
-            .any(|c| is_control_or_format(c) || is_control_or_line_separator(c))
+    !symptom.contains('\'') && !symptom.chars().any(is_display_altering)
 }
 
 /// Consumes one glyph, control character or escape sequence and says which of
@@ -289,43 +394,72 @@ fn next_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<To
     if c != '\u{1b}' {
         return Some(classify_char(c));
     }
+    Some(match skip_escape(chars, Body::Grammar) {
+        // CSI — what a colourised logger emits. Only a well-formed SGR is
+        // ignorable; see above.
+        Escape::Csi { sgr: true } => Token::Ignorable,
+        Escape::Csi { sgr: false } => Token::LineBreak,
+        // Consuming a string body whole is also the one hole in the
+        // never-merge property, since a line break inside the body goes with
+        // it — and the body scan ends on a bare `ESC` or on end of input as
+        // readily as on a terminator, so a terminator is not what creates the
+        // hole. The module documentation is where that exception is stated,
+        // and it is stated there rather than here because a body comment in a
+        // private function reaches no reader of the public docs. Any change to
+        // what `skip_escape` consumes for a string sequence has to change that
+        // section, `rendered_lines`'s own qualifier, and the test that pins the
+        // worked examples, in one commit.
+        Escape::String | Escape::Bare => Token::Ignorable,
+        // This is where `ESC E` (NEL) and `ESC D` (IND) live.
+        Escape::Other => Token::LineBreak,
+    })
+}
+
+/// What [`skip_escape`] consumed after an `ESC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    /// A CSI (`ESC [`), and whether it was a well-formed `SGR`.
+    Csi { sgr: bool },
+    /// One of the string-argument sequences: OSC, DCS, SOS, PM, APC. Their
+    /// bodies are arbitrary text (a window title, say) and must not be emitted
+    /// as if the process had printed it, but they draw nothing at the cursor.
+    String,
+    /// `ESC` with nothing after it, or `ESC ESC`: only this `ESC` goes, and the
+    /// next one is left to be re-read as a fresh introducer. A bare `ESC` draws
+    /// nothing and moves nothing on its own.
+    Bare,
+    /// Any other escape: optional intermediates, then one final byte.
+    Other,
+}
+
+/// How far a string-argument sequence's body may run; see
+/// [`skip_string_sequence_body`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    Grammar,
+    ToLineEnd,
+}
+
+/// Consumes the rest of an escape sequence from just after its `ESC` and says
+/// which kind it was. The one place the 7-bit introducers are told apart, so
+/// [`next_token`] and [`sanitize_terminal_text`] read the same grammar.
+fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, body: Body) -> Escape {
     match chars.peek() {
-        // CSI — what a colourised logger emits.
         Some('[') => {
             chars.next();
-            Some(if skip_csi_body(chars) {
-                Token::Ignorable
-            } else {
-                Token::LineBreak
-            })
+            Escape::Csi {
+                sgr: skip_csi_body(chars),
+            }
         }
-        // The string-argument sequences: OSC, DCS, SOS, PM, APC. Their bodies
-        // are arbitrary text (a window title, say) and must not be emitted as if
-        // the process had printed it, but they draw nothing at the cursor.
-        //
-        // Consuming the body whole is also the one hole in the never-merge
-        // property, since a line break inside the body goes with it — and the
-        // scan below ends on a bare `ESC` or on end of input as readily as on a
-        // terminator, so a terminator is not what creates the hole.
-        // The module documentation is where that exception is stated, and it is
-        // stated there rather than here because a body comment in a private
-        // function reaches no reader of the public docs. Any change to what this
-        // arm consumes has to change that section, `rendered_lines`'s own
-        // qualifier, and the test that pins the worked examples, in one commit.
         Some(']' | 'P' | 'X' | '^' | '_') => {
             chars.next();
-            skip_string_sequence_body(chars);
-            Some(Token::Ignorable)
+            skip_string_sequence_body(chars, body);
+            Escape::String
         }
-        // `ESC` with nothing after it, or `ESC ESC`: drop just this one and let
-        // the loop re-read the next as a fresh introducer. A bare `ESC` draws
-        // nothing and moves nothing on its own.
-        None | Some('\u{1b}') => Some(Token::Ignorable),
-        // Any other escape: optional intermediates, then one final byte. This is
-        // where `ESC E` (NEL) and `ESC D` (IND) live.
+        None | Some('\u{1b}') => Escape::Bare,
         Some(_) => {
             skip_simple_escape_body(chars);
-            Some(Token::LineBreak)
+            Escape::Other
         }
     }
 }
@@ -374,12 +508,21 @@ fn skip_csi_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
 }
 
 /// Consumes a string-argument sequence's body and terminator (`BEL`, or `ST` =
-/// `ESC \`) from just after the introducer. A body truncated by anything else —
-/// including a bare `ESC` starting the next sequence — ends the scan with that
-/// byte left in place.
-fn skip_string_sequence_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+/// `ESC \` or its 8-bit form U+009C) from just after the introducer. A body
+/// truncated by anything else — including a bare `ESC` starting the next
+/// sequence — ends the scan with that byte left in place.
+///
+/// `Body::ToLineEnd` also ends the scan, without consuming it, at a line break
+/// (`\n`, `\r`, U+2028, U+2029). [`sanitize_terminal_text`] reads it that way,
+/// so an unterminated sequence in one line of untrusted prose cannot swallow
+/// the lines after it. [`next_token`] keeps `Body::Grammar`, whose consumption
+/// of a break the module documentation states and its tests pin.
+fn skip_string_sequence_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, body: Body) {
     while let Some(&c) = chars.peek() {
-        if c == '\u{7}' {
+        if body == Body::ToLineEnd && matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            return;
+        }
+        if c == '\u{7}' || c == '\u{9c}' {
             chars.next();
             return;
         }
@@ -427,6 +570,78 @@ pub fn strip_terminal_control_sequences(line: &str) -> String {
                 out.push(c);
             }
         }
+    }
+    out
+}
+
+/// Makes multi-line prose from an untrusted source safe to write to a terminal:
+/// what is left is exactly what the reader will see.
+///
+/// For text that cannot be refused outright — a model's reply, a tool's
+/// output, an error message quoting either. Escape sequences are removed whole,
+/// introducer and payload alike, in their 7-bit and 8-bit (C1) forms: an SGR
+/// "conceal" cannot hide the text after it, an OSC cannot retitle the window or
+/// write the clipboard (OSC 52), a DCS or APC payload is never drawn, and
+/// nothing can move the cursor. Every other [`is_display_altering`] character
+/// is dropped, except:
+///
+/// * `\n` and `\t`, which prose needs and which only move to the next line or
+///   column;
+/// * a lone `\r`, and the line and paragraph separators, which become `\n`:
+///   returning to column one would overwrite what was already printed, but the
+///   text after it is still worth reading; `\r\n` becomes a plain `\n`;
+/// * a single zero-width joiner or non-joiner, or emoji or text presentation
+///   selector, directly after a drawn character, and a joiner directly after
+///   such a selector ([`is_kept_glyph_shaper`]), which shape that glyph and
+///   move nothing.
+///
+/// Concealed text therefore becomes *visible*, rather than disappearing with
+/// its escape sequence: a reader should see what was sent, not a tidied
+/// version of it.
+///
+/// A string sequence (OSC, DCS, SOS, PM, APC) with no terminator ends at the
+/// next line break, which is kept: an unterminated one costs at most the rest
+/// of its own line, never the lines after it.
+///
+/// Unlike [`strip_terminal_control_sequences`], which serves single log lines,
+/// this keeps the line structure. A command line meant to be pasted is not
+/// prose and is not passed through here: its values are refused instead (see
+/// [`hides_or_moves_text`]), because cleaning them would make the line shown
+/// differ from the one that runs.
+#[must_use]
+pub fn sanitize_terminal_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut before, mut previous) = (None, None);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let shown = match c {
+            '\n' | '\t' => Some(c),
+            '\r' => (chars.peek() != Some(&'\n')).then_some('\n'),
+            '\u{2028}' | '\u{2029}' => Some('\n'),
+            '\u{1b}' => {
+                skip_escape(&mut chars, Body::ToLineEnd);
+                None
+            }
+            // The 8-bit CSI, and the 8-bit DCS, SOS, OSC, PM and APC.
+            '\u{9b}' => {
+                skip_csi_body(&mut chars);
+                None
+            }
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => {
+                skip_string_sequence_body(&mut chars, Body::ToLineEnd);
+                None
+            }
+            _ if is_kept_glyph_shaper(before, previous, c) => Some(c),
+            _ if is_display_altering(c) => None,
+            _ => Some(c),
+        };
+        if let Some(shown) = shown {
+            out.push(shown);
+        }
+        // What came directly before in the input, removed or not, as in
+        // `hides_or_moves_text`: a shaper separated from its base by anything
+        // invisible shapes nothing.
+        (before, previous) = (previous, Some(c));
     }
     out
 }
@@ -515,6 +730,15 @@ mod tests {
             quotable_in_single_quotes("vllm: HIP out of memory"),
             "the rejection must not be so broad that ordinary lines stop qualifying"
         );
+        // Invisible characters that are neither controls nor format characters
+        // would sit in the printed command unseen, so they make a line
+        // unquotable too.
+        for invisible in ['\u{3164}', '\u{e0041}', '\u{fe0f}'] {
+            assert!(
+                !quotable_in_single_quotes(&format!("vllm: HIP{invisible} out of memory")),
+                "{invisible:?} must make a line unquotable"
+            );
+        }
     }
 
     #[test]
@@ -771,5 +995,303 @@ mod tests {
             rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}\nx"),
             ["vllm", "x"]
         );
+    }
+
+    #[test]
+    fn concealed_text_is_shown_instead_of_hidden() {
+        // SGR 8 hides what follows on the terminal while the bytes stay in the
+        // line; the reader must see them.
+        let sent = "rocm serve qwen\u{1b}[8m --port 9\u{1b}[28m --managed";
+        assert_eq!(
+            sanitize_terminal_text(sent),
+            "rocm serve qwen --port 9 --managed"
+        );
+    }
+
+    #[test]
+    fn escape_sequences_are_removed_whole_in_both_widths() {
+        for (sent, shown) in [
+            // OSC 52 clipboard write, BEL-terminated.
+            ("a\u{1b}]52;c;aGVsbG8=\u{7}b", "ab"),
+            // OSC 0 window title, ST-terminated.
+            ("a\u{1b}]0;title\u{1b}\\b", "ab"),
+            // 8-bit OSC and 8-bit ST.
+            ("a\u{9d}0;title\u{9c}b", "ab"),
+            // 7-bit OSC ended by the 8-bit ST.
+            ("a\u{1b}]0;title\u{9c}b", "ab"),
+            // DCS and APC, 7-bit and 8-bit.
+            ("a\u{1b}Pq#0;2\u{1b}\\b", "ab"),
+            ("a\u{1b}_body\u{1b}\\b", "ab"),
+            ("a\u{90}q#0\u{9c}b", "ab"),
+            ("a\u{9f}body\u{9c}b", "ab"),
+            // Cursor up, erase line, colours.
+            ("a\u{1b}[1A\u{1b}[2K\u{1b}[1;31mb\u{1b}[0m", "ab"),
+            // 8-bit CSI: the parameters and final byte go with it.
+            ("a\u{9b}2Kb", "ab"),
+            // Two-character and nF escapes.
+            ("a\u{1b}cb\u{1b}(Bc", "abc"),
+            // An unterminated OSC swallows the rest of its line, as on a terminal.
+            ("a\u{1b}]0;never closed", "a"),
+            // A lone ESC at the end.
+            ("ab\u{1b}", "ab"),
+            // Every string introducer, 7-bit and 8-bit, takes its payload with
+            // it: SOS and PM included, which nothing above reaches.
+            ("a\u{1b}Xsos\u{1b}\\b", "ab"),
+            ("a\u{1b}^pm\u{7}b", "ab"),
+            ("a\u{98}sos\u{9c}b", "ab"),
+            ("a\u{9e}pm\u{9c}b", "ab"),
+            // A CSI's intermediate bytes (`SP`, `$`) go with it, so its final
+            // byte is not left behind as text.
+            ("a\u{1b}[2 qb", "ab"),
+            ("a\u{1b}[1$}b", "ab"),
+            ("a\u{9b}1 qb", "ab"),
+        ] {
+            assert_eq!(sanitize_terminal_text(sent), shown, "{sent:?}");
+        }
+    }
+
+    /// A string sequence left open must not take the lines after it with it:
+    /// those are often the CLI's own (a status line, the next tool result), and
+    /// an open sequence anywhere in a reply would otherwise blank the rest of
+    /// the output.
+    #[test]
+    fn an_unterminated_string_sequence_ends_at_its_line() {
+        for open in [
+            "\u{1b}]0;x", // OSC
+            "\u{1b}Pq",   // DCS
+            "\u{1b}_x",   // APC
+            "\u{1b}Xx",   // SOS
+            "\u{1b}^x",   // PM
+            "\u{9d}0;x",  // 8-bit OSC
+            "\u{90}q",    // 8-bit DCS
+            "\u{98}x",    // 8-bit SOS
+            "\u{9e}x",    // 8-bit PM
+            "\u{9f}x",    // 8-bit APC
+        ] {
+            for (newline, shown) in [
+                ("\n", "\n"),
+                ("\r\n", "\n"),
+                ("\r", "\n"),
+                ("\u{2028}", "\n"),
+                ("\u{2029}", "\n"),
+            ] {
+                let sent = format!("reply{open}{newline}CLI line one\nCLI line two");
+                assert_eq!(
+                    sanitize_terminal_text(&sent),
+                    format!("reply{shown}CLI line one\nCLI line two"),
+                    "{sent:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prose_keeps_its_layout_and_its_script() {
+        let text =
+            "line one\n\tindented 模型 é 👩\u{200d}💻 \u{2764}\u{fe0f} a\u{200c}b \u{2764}\u{fe0e}";
+        assert_eq!(sanitize_terminal_text(text), text);
+        assert_eq!(sanitize_terminal_text("a\r\nb"), "a\nb");
+        assert_eq!(
+            sanitize_terminal_text("shown\rhidden"),
+            "shown\nhidden",
+            "a carriage return must not overwrite what is already on the line"
+        );
+        assert_eq!(sanitize_terminal_text("a\u{2028}b"), "a\nb");
+        assert_eq!(sanitize_terminal_text("a\u{202e}b\u{8}c\u{7}"), "abc");
+        assert_eq!(
+            sanitize_terminal_text("run\u{e0020}\u{e0069}\u{e0064} it\u{3164}"),
+            "run it",
+            "tag characters spell text the reader cannot see; it must not pass"
+        );
+    }
+
+    /// The characters a value is refused for, beyond `Cc`: every one is
+    /// invisible or reorders the line, and none is `char::is_control`, which is
+    /// why a check written as `is_control` alone let them through.
+    #[test]
+    fn invisible_characters_are_display_altering() {
+        for c in [
+            '\u{202e}',
+            '\u{202a}',
+            '\u{2066}',
+            '\u{2069}', // bidi
+            '\u{200e}',
+            '\u{061c}', // directional marks
+            '\u{200b}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{feff}', // zero-width
+            '\u{2028}',
+            '\u{2029}', // separators
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{fe0f}', // soft hyphen, CGJ, VS16
+            '\u{115f}',
+            '\u{3164}',
+            '\u{ffa0}', // Hangul fillers
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e007f}', // tags
+        ] {
+            assert!(!c.is_control(), "U+{:04X}", c as u32);
+            assert!(is_display_altering(c), "U+{:04X}", c as u32);
+        }
+        for c in ['a', 'é', '模', '\'', '&', ' ', '👩'] {
+            assert!(!is_display_altering(c), "{c:?}");
+        }
+    }
+
+    /// Both ends of every range of the default-ignorable table, and a point
+    /// just outside each, so narrowing or widening a range is seen.
+    #[test]
+    fn the_default_ignorable_table_has_exact_edges() {
+        let ranges: [(u32, u32); 17] = [
+            (0x00ad, 0x00ad),
+            (0x034f, 0x034f),
+            (0x061c, 0x061c),
+            (0x115f, 0x1160),
+            (0x17b4, 0x17b5),
+            (0x180b, 0x180f),
+            (0x200b, 0x200f),
+            (0x202a, 0x202e),
+            (0x2060, 0x206f),
+            (0x3164, 0x3164),
+            (0xfe00, 0xfe0f),
+            (0xfeff, 0xfeff),
+            (0xffa0, 0xffa0),
+            (0xfff0, 0xfff8),
+            (0x1bca0, 0x1bca3),
+            (0x1d173, 0x1d17a),
+            (0xe0000, 0xe0fff),
+        ];
+        for (first, last) in ranges {
+            for inside in [first, last] {
+                let c = char::from_u32(inside).expect("scalar");
+                assert!(is_default_ignorable(c), "U+{inside:04X} is in the set");
+            }
+            for outside in [first - 1, last + 1] {
+                let in_another = ranges.iter().any(|&(a, b)| (a..=b).contains(&outside));
+                if let Some(c) = char::from_u32(outside)
+                    && !in_another
+                {
+                    assert!(
+                        !is_default_ignorable(c),
+                        "U+{outside:04X} is not in the set"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The glyph-shaping characters stay only one at a time, directly after a
+    /// character that is drawn; anything else, and the variation selectors
+    /// beyond the presentation pair, is removed, so they cannot carry text.
+    #[test]
+    fn glyph_shapers_stay_only_singly_after_a_drawn_character() {
+        for (sent, shown) in [
+            ("a\u{200c}b", "a\u{200c}b"),
+            ("a\u{200d}b", "a\u{200d}b"),
+            ("\u{2764}\u{fe0f}", "\u{2764}\u{fe0f}"),
+            ("\u{2764}\u{fe0e}", "\u{2764}\u{fe0e}"),
+            // A run keeps its first member only.
+            ("a\u{fe0f}\u{fe0f}\u{fe0f}b", "a\u{fe0f}b"),
+            ("a\u{200d}\u{200c}b", "a\u{200d}b"),
+            // At the start, or after a break or a tab, there is nothing to shape.
+            ("\u{200d}a", "a"),
+            ("a\n\u{fe0f}b", "a\nb"),
+            ("a\t\u{200d}b", "a\tb"),
+            // Anything invisible between the base and the shaper, an escape
+            // sequence included, leaves it shaping nothing.
+            ("a\u{1b}[0m\u{fe0f}", "a"),
+            ("a\u{200b}\u{fe0f}b", "ab"),
+            // The other variation selectors are never kept.
+            ("a\u{e0100}\u{e0101}\u{fe0f}\u{200d}b", "ab"),
+            ("a\u{fe00}b", "ab"),
+            ("\u{1820}\u{180b}\u{180c}\u{180d}\u{180f}", "\u{1820}"),
+        ] {
+            assert_eq!(sanitize_terminal_text(sent), shown, "{sent:?}");
+        }
+    }
+
+    /// A value is refused for exactly what printing would not show, plus the
+    /// newline and tab a one-line value must not carry. Each accepted row is
+    /// also printed unchanged as prose, so the rows pin `sanitize_terminal_text`
+    /// keeping those shapers as much as `hides_or_moves_text` allowing them.
+    #[test]
+    fn a_value_hides_text_exactly_where_printing_would_change_it() {
+        for value in [
+            "C:\\Users\\me\\\u{2764}\u{fe0f}\\rocm",
+            "👩\u{200d}💻",
+            // A presentation selector, then a joiner: how most joined emoji
+            // with an emoji-form base are spelled.
+            "🏳\u{fe0f}\u{200d}🌈",
+            "❤\u{fe0f}\u{200d}🔥",
+            "/mnt/my folder",
+            "模型",
+        ] {
+            assert!(!hides_or_moves_text(value), "{value:?}");
+            assert_eq!(sanitize_terminal_text(value), value);
+        }
+        for value in [
+            "a\nb",
+            "a\tb",
+            "a\rb",
+            "a\u{1b}[2Kb",
+            "a\u{9b}b",
+            "a\u{202e}b",
+            "a\u{200b}b",
+            "\u{fe0f}a",
+            "a\u{fe0f}\u{fe0f}",
+            // A joiner may follow a selector, but not the other way round,
+            // and never two joiners in a row.
+            "a\u{200d}\u{fe0f}",
+            "a\u{fe0f}\u{200d}\u{200d}",
+            "a\u{fe0f}\u{fe0f}\u{200d}",
+            "a\u{e0100}",
+            "a\u{3164}",
+            "a\u{2028}b",
+        ] {
+            assert!(hides_or_moves_text(value), "{value:?}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever goes in, what comes out is what the refusal predicate
+        /// accepts as a value, apart from the line breaks and tabs prose keeps:
+        /// nothing display-altering survives except the glyph shapers
+        /// `is_kept_glyph_shaper` keeps.
+        #[test]
+        fn nothing_display_altering_survives_sanitizing(text in proptest::prelude::any::<String>()) {
+            let cleaned = sanitize_terminal_text(&text);
+            for line in cleaned.split(['\n', '\t']) {
+                proptest::prop_assert!(!hides_or_moves_text(line), "{:?} -> {:?}", text, cleaned);
+            }
+        }
+
+        /// The same over input made of the characters that matter: every
+        /// escape introducer, 7-bit and 8-bit, their terminators, line breaks,
+        /// glyph shapers and ordinary text. The text after an introducer's
+        /// line is never lost: every `Z` sent after the last line break in the
+        /// input comes back.
+        #[test]
+        fn nothing_display_altering_survives_hostile_sequences(
+            text in "[\u{1b}\u{9b}\u{9c}\u{9d}\u{90}\u{98}\u{9e}\u{9f}\u{7}\\[\\]\\\\P_^X;0-9a-y \r\n\u{202e}\u{e0041}\u{fe0f}\u{200d}]*"
+        ) {
+            let cleaned = sanitize_terminal_text(&text);
+            for line in cleaned.split(['\n', '\t']) {
+                proptest::prop_assert!(!hides_or_moves_text(line), "{:?} -> {:?}", text, cleaned);
+            }
+            let tail = format!("{text}\nZZZ");
+            proptest::prop_assert!(
+                sanitize_terminal_text(&tail).ends_with("\nZZZ"),
+                "a line after {:?} was lost", text
+            );
+        }
+
+        /// Text with nothing to remove is returned unchanged.
+        #[test]
+        fn plain_text_is_untouched(text in "[ -~\n\té模型]*") {
+            proptest::prop_assert_eq!(sanitize_terminal_text(&text), text);
+        }
     }
 }

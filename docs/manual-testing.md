@@ -2069,6 +2069,16 @@ Expected result:
 - The plan still asks for review before mutating actions.
 - `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
+- A plan whose command carries a value a Windows shell reads as syntax inside
+  single quotes, such as `'`, `&` or `%` (the full set is in
+  [llm-tool-use.md](llm-tool-use.md)), is not shown:
+  the CLI falls back to its own plan and its note says to supply that value
+  yourself. The same holds for `rocm chat --tools --prompt …`, where the
+  assistant's request is refused with that message on stderr and no
+  `advanced manual command:` line is printed. A folder in a request the CLI
+  recognises itself (`install therock into D:\R&D\rocm`) is shown as typed;
+  in other wording the folder reaches the CLI through the assistant's request
+  and is refused like any value the assistant chose.
 
 To turn provider-assisted planning back off:
 
