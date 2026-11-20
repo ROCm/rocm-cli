@@ -76,6 +76,9 @@ runs:
             - '**/Cargo.toml'
             - 'Cargo.lock'
             - 'rust-toolchain*'
+            # Configures which lints fire in tests; an edit to it alone
+            # changes what clippy reports.
+            - 'clippy.toml'
             # Cargo configuration: the `cargo xtask` alias every job uses, and
             # any build setting cargo reads from here.
             - '.cargo/**'
@@ -161,6 +164,8 @@ runs:
             - 'Cargo.lock'
             - 'rust-toolchain*'
             - '.cargo/**'
+            # The Windows lane's clippy steps gate on this category.
+            - 'clippy.toml'
             - 'runtime-deps.toml'
             - 'scripts/**'
             - 'xtask/**'

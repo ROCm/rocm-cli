@@ -504,7 +504,9 @@ rocm update --json")]
     },
     /// Show recommended local models and what this machine can run.
     ///
-    /// The default list is the curated recommendations. The AMD Inference Microservices
+    /// The default list is the curated recommendations, narrowed to the models this
+    /// machine's GPU memory can hold and saying so; where that memory could not be read
+    /// it is not narrowed, and says that instead. The AMD Inference Microservices
     /// (AIM) catalog of pre-built Docker images is not part of it: use --verbose to see
     /// every AIM image with the GPU families it supports, how many GPUs it needs, and
     /// whether it requires a Hugging Face token. Serve one with

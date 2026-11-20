@@ -7,6 +7,11 @@
 // same way. Many steps neither `.await` nor mutate the world; allow both rather
 // than splitting the step API into sync/async and mut/non-mut variants.
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "cucumber step definitions run without `#[test]` fns; a failed step must panic its scenario"
+)]
 
 use std::path::{Path, PathBuf};
 
