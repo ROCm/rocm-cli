@@ -55,6 +55,24 @@ The Linux silicon is MI300X, checked twice:
 - `e2e-gpu`, the second, runs on the self-hosted MI300X runner and reports as
   `e2e-gpu-selfhosted-report`.
 
+Either lane satisfies the MI300X requirement of a pull request, and the queue is
+the one to count on: the self-hosted runners can sit at zero replicas. The
+`E2E consolidated report (self-hosted)` job decides it
+([`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh)): MI300X counts as passed
+only when at least one lane passed **with an exported report**; a self-hosted
+lane that was cancelled, skipped or never got a runner counts as absent, not
+failed; a lane that ran and failed still fails the check; and when neither lane
+produced a passing report the check fails. A skipped lane, or one that exported
+no report, is never a pass. The report does not wait on `e2e-gpu` directly: a job
+queued for a runner cannot be timed out, so `e2e-gpu-settled` gives up on it after
+30 minutes in the queue, and `cancel-abandoned-mi300x-lane` then ends the run with a
+force-cancel (a plain cancel leaves the queued job alive: its `if` is `always()`). On a push, a release push or a dispatch, which have no queue lane and
+no other MI300X signal, the queue deadline is 4 hours, not 30 minutes, and a lane
+that ran without a report, one that never got a runner, or an unreadable result
+(the settle job failed) fails there. A re-run of only the failed jobs does
+not refresh the report after a self-hosted failure, as `e2e-gpu-settled` has
+already succeeded: re-run all jobs for that.
+
 vLLM is the effective engine on both; MI300X is the only silicon where it is.
 The Windows pool is the Strix Halo pool (`e2e-gpu-strix-windows` and
 `e2e-wsl`). The Strix Halo
@@ -256,7 +274,8 @@ cancel, while a fork PR (an external contributor, whose hardware lanes are held
 for approval where the repository setting requires it, with a read-only token) just has `e2e-gpu`
 skip its steps and the rest of its run continue. A failed cancel is tolerated.
 The consolidated report does not count a lane that skipped itself as a missing
-report, and says so in its summary. `e2e-report` is gated on `always()`, so it
+report: the lane uploads an `mi300x-stale-run` marker, which the MI300X check reads
+as an absent lane. `e2e-report` is gated on `always()`, so it
 still runs after the cancel, but its missing-report check is gated on
 `!cancelled()` and is skipped in a cancelled run. The exemption is therefore for
 runs that are not cancelled: a fork PR (no cancel is sent), or a cancel that
@@ -709,8 +728,9 @@ from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
 A lane added to `nightly.yml` must be added to the `LANES` list of
 `e2e-lanes-settled`;
 `nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
-and also fails if a job waits on a lane directly. The per-PR workflow
-does not use this mechanism.
+and also fails if a job waits on a lane directly. The per-PR workflow uses
+the same settle script for its MI300X self-hosted lane only (`e2e-gpu-settled`);
+its other lanes stay in the report's `needs`.
 
 ## The shared pre-warmed runtime
 
@@ -850,7 +870,8 @@ regression shows red instead of always green. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
 job, naming the lane, rather than silently dropping out of the grid (a lane that
-skipped itself as stale is the exception); on a
+skipped itself as stale is the exception, and the two MI300X lanes of a pull
+request are decided together by `mi300x-gate.sh`, see above); on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
 
