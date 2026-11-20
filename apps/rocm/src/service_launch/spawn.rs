@@ -704,19 +704,16 @@ fn launch_managed_engine_child_locked(
             MANAGED_ENGINE_STARTUP_SETTLE,
         )
         .context("failed to launch managed engine process")?;
+        // Taken before the call: `adopt_watched_engine_spawn` borrows `record`
+        // mutably, so the verdict closure cannot also hold a reference into it.
+        let manifest_path = record.manifest_path.clone();
+        let engine_state_path = record.engine_state_path.clone();
         adopt_watched_engine_spawn(
             record,
             spawn.pid,
             managed_startup_exit(&spawn),
             service_id,
-            || {
-                settle_startup_death(
-                    paths,
-                    service_id,
-                    &record_manifest_path,
-                    &record_engine_state_path,
-                )
-            },
+            || settle_startup_death(paths, service_id, &manifest_path, &engine_state_path),
         )?;
         // The watch above is one-shot: it answers for the settle window only.
         // The readiness wait that follows needs a live view of the same child,
