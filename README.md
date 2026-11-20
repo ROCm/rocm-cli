@@ -1485,9 +1485,9 @@ API key. While it starts, the status line follows the engine: a download, a weig
 load, or the latest log line, until the server is ready or that wait fails
 (the engine exits, a download stops advancing, or the startup deadline
 passes). When the server is ready it prints a deployment summary: a table
-with the status, the full inference endpoint, the command that serves the
-server's API docs (see API docs below), the API-qualified model name,
-and a quick smoke test (time to first token and approximate tokens per
+with the status, the engine, the API-qualified model name, the full
+inference endpoint, the command that serves the server's API docs (see API
+docs below), and a quick smoke test (time to first token and approximate tokens per
 second). On an
 interactive terminal, if the smoke test cannot complete, the summary is headed
 `(smoke test failed)`, shows the status as `started, smoke test failed` instead

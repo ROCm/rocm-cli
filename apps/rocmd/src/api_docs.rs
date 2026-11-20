@@ -689,7 +689,14 @@ fn passed_on_answer_headers(answer: &HeaderMap, record: &ManagedServiceRecord) -
 /// `location` mapped into the forwarder when it names the model server
 /// itself; `None` when it points elsewhere.
 fn forwarded_location(location: &str, record: &ManagedServiceRecord) -> Option<String> {
-    let path = if let Some(rest) = location.strip_prefix(&record.local_base_url()) {
+    let base = record.local_base_url();
+    // The scheme compares without case (`HTTP://` is `http://`); the base is
+    // matched as a whole, so its loopback address does too.
+    let rest = location
+        .get(..base.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(&base))
+        .map(|_| &location[base.len()..]);
+    let path = if let Some(rest) = rest {
         if rest.starts_with('/') {
             rest.to_owned()
         } else if rest.is_empty() || rest.starts_with(['?', '#']) {
@@ -1094,6 +1101,11 @@ mod tests {
         assert_eq!(
             mapped("http://127.0.0.1:8000/v1/models").as_deref(),
             Some("/services/svc%20a/api/v1/models")
+        );
+        assert_eq!(
+            mapped("HTTP://127.0.0.1:8000/v1/models").as_deref(),
+            Some("/services/svc%20a/api/v1/models"),
+            "the scheme compares without case"
         );
         assert_eq!(
             mapped("/v1/modèle").as_deref(),

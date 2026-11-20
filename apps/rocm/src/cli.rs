@@ -531,8 +531,8 @@ rocm model --verbose"
     /// first prints the service id and how to follow its log; while it starts, the status line
     /// follows what the engine is doing (download, load, or the latest log line) until
     /// the server is ready or that wait fails. A ready server then prints a deployment
-    /// summary (status, endpoint, the `rocm services docs` command for its API docs,
-    /// model, and smoke-test metrics). A wait that fails
+    /// summary (status, engine, model, endpoint, the `rocm services docs` command
+    /// for its API docs, and smoke-test metrics). A wait that fails
     /// while the server is still running names `rocm logs` and `rocm services stop`
     /// instead of a finished "not ready" summary. Use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
