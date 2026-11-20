@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +19,8 @@ use e2e_cucumber::device_memory::{
 };
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
-    ServeAttempt, archive_service_log, engine_from_serve_args, reported_engine,
-    serve_attempt_report, service_log_tail,
+    EngineDeathReport, ServeAttempt, archive_service_log, engine_death_report,
+    engine_from_serve_args, reported_engine, serve_attempt_report, service_log_tail,
 };
 use e2e_cucumber::serve_plan::{ServeRun, resolved_model};
 
@@ -1804,10 +1805,10 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
 
 #[given("Lemonade preparation cannot complete")]
 async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
-    world.command_env.push((
-        "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
-        "repeated".into(),
-    ));
+    // A planted runtime whose `lemonade backends install` always exits
+    // non-zero, on a simulated host with one GPU: the CLI fails at the boundary
+    // a broken install fails at, rather than at a branch compiled into it.
+    world.plant_failing_lemonade_runtime();
 }
 
 #[when("the user serves a model with Lemonade")]
@@ -1822,6 +1823,71 @@ async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
             "--managed",
         ],
     );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// serve-18's serve, on its own step text. The plain step above is shared with
+/// lemonade-installs-02, whose serve is refused before any engine starts; that
+/// refusal carries neither engine-death message, so the interpretation below
+/// would fail it, and it applies only here.
+///
+/// `--wait` is load-bearing. The backend install fails inside the managed
+/// engine process, after `rocm serve` has spawned it, and the suite captures
+/// serve's output. With output that is not a terminal, serve does not watch the
+/// engine while it waits for readiness (`ServeStartupPolicy`'s `watch_engine`
+/// is off for that path, in `apps/rocm/src/serve_progress.rs`), so without
+/// `--wait` it notices only an engine that dies within its 200 ms post-spawn
+/// check (`launch_managed_engine_child_locked` in
+/// `apps/rocm/src/service_launch/spawn.rs`) and reports a later death as
+/// `starting` with exit 0 once the readiness probe gives up. On a loaded host
+/// this scenario would race that window. With `--wait` a later death fails the
+/// serve too (`died_during_wait` in `service_launch/readiness.rs`), once the
+/// 45 s readiness probe ends, so the slow path costs that long.
+///
+/// Both ways the failure reaches the user are followed: an engine that died
+/// inside the window fails the serve with its log tail on stderr, and one that
+/// died later fails it with a pointer to `rocm logs --service <id>`, which this
+/// step then runs, as the user would, appending its output to stdout. The
+/// Then steps read stdout and stderr together (`serve_output`), so both paths
+/// feed them the engine's own retry and recovery lines. A failed serve carrying
+/// neither message fails here, naming both, rather than as a missing retry line
+/// later.
+#[when("the user serves a model with Lemonade and waits for the engine")]
+async fn user_serves_with_lemonade_and_waits(world: &mut E2eWorld) {
+    let (mut stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+            "--wait",
+        ],
+    );
+    if rc != 0 && !stderr.contains("no usable AMD GPU detected") {
+        match engine_death_report(&stderr) {
+            EngineDeathReport::LogTailQuoted => {}
+            EngineDeathReport::LogsPointer(service_id) => {
+                let (logs, logs_stderr, logs_rc) =
+                    crate::run_rocm(world, &["logs", "--service", &service_id]);
+                assert_eq!(
+                    logs_rc, 0,
+                    "`rocm logs --service {service_id}`, which the failed serve pointed at, \
+                     failed:\n{logs}\n{logs_stderr}"
+                );
+                let _ = write!(stdout, "\n--- rocm logs --service {service_id} ---\n{logs}");
+            }
+            EngineDeathReport::Unrecognised => panic!(
+                "serve failed without either engine-death message: neither the \
+                 post-spawn check's \"managed engine exited immediately\" log tail nor \
+                 the readiness wait's \"see `rocm logs --service <id>`\" pointer. If the \
+                 CLI reworded one, update `engine_death_report`:\n{stdout}\n{stderr}"
+            ),
+        }
+    }
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -2563,8 +2629,8 @@ async fn assert_no_runtime_manifest_written(world: &mut E2eWorld) {
 
 /// Serve a Lemonade model under the GPU-required default while the unrelated
 /// live service planted above exists. No fault-injection env var: the scripted
-/// Lemonade backend failure would waive the very GPU pre-flight this scenario
-/// asserts.
+/// Lemonade free-space override would waive the very GPU pre-flight this
+/// scenario asserts.
 #[when("the user serves a different model with Lemonade under the GPU-required default")]
 async fn user_serves_other_model_with_unrelated_service_live(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(
@@ -2888,15 +2954,16 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
         Some(0),
         "serve unexpectedly succeeded:\n{output}"
     );
-    // The scripted failure seam also waives serve's no-GPU pre-flight, so this
-    // refusal can only appear when the seam is compiled out. Name that cause:
-    // otherwise a lane that pre-builds `rocm` without the feature reports a
-    // baffling "no retry announcement" instead of its real misconfiguration.
+    // The pre-flight counts the GPU planted under the simulated host root, which
+    // only an `e2e-test-hooks` build honours. Name that cause: otherwise a lane
+    // that pre-builds `rocm` without the feature reports a baffling "no retry
+    // announcement" instead of its real misconfiguration.
     assert!(
         !output.contains("no usable AMD GPU detected"),
-        "serve stopped at the no-GPU pre-flight, so the binary under test was \
-         built without the `rocm/e2e-test-hooks` feature and never reached \
-         Lemonade preparation. E2E lanes that pre-build `rocm` and export \
+        "serve stopped at the no-GPU pre-flight, so the binary under test did not \
+         see the GPU planted under ROCM_CLI_TEST_HOST_ROOT and never reached \
+         Lemonade preparation. It was probably built without the \
+         `rocm/e2e-test-hooks` feature: E2E lanes that pre-build `rocm` and export \
          ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
          what `cargo xtask e2e` builds for itself:\n{output}"
     );
@@ -2904,6 +2971,20 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
         output.matches("retrying once").count(),
         1,
         "expected exactly one retry announcement:\n{output}"
+    );
+    // Both attempts must have been refused by the planted runtime. Without its
+    // line, `serve` did not accept the planted runtime and attempted some other
+    // install -- for a mismatched `env_id`, the real multi-gigabyte one. This
+    // check runs after that install, so such a mismatch fails late, not fast.
+    assert_eq!(
+        output
+            .matches(e2e_cucumber::fixture_binary::FAKE_LEMONADE_INSTALL_REFUSAL)
+            .count(),
+        2,
+        "expected the planted runtime to refuse both backend installs. If it \
+         refused none, `serve` did not accept the planted runtime (a drifted \
+         `env_id`?) and ran some other install first, so this failure comes \
+         after that install, not instead of it:\n{output}"
     );
 }
 

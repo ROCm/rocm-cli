@@ -632,7 +632,7 @@ Pinned versions of the third-party runtimes rocm-cli manages, read from the work
 
 | File | Responsibility | Class |
 | --- | --- | --- |
-| [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names and download URLs from them. | flat |
+| [`lib.rs`](../crates/rocm-deps/src/lib.rs) | Includes the generated constants and derives Lemonade release names, download URLs and the install `env_id` from them. | flat |
 
 ### `crates/e2e-report`
 
@@ -826,9 +826,10 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`src/powershell_text_rule.rs`](../tests/e2e-cucumber/src/powershell_text_rule.rs) | The text rule for the Windows lines `rocm fix` and `rocm diagnose` print, a copy of the rule in `rocm-core` checked against a shared fixture table. | flat |
 | [`src/quit_and_wait.rs`](../tests/e2e-cucumber/src/quit_and_wait.rs) | Retry loop for quitting a TUI that may open a quit-confirm prompt first. | flat |
 | [`src/reader_failure.rs`](../tests/e2e-cucumber/src/reader_failure.rs) | Failure state shared between a background terminal reader and its waiters. | flat |
+| [`src/runtime_pins.rs`](../tests/e2e-cucumber/src/runtime_pins.rs) | Reads a pinned runtime version out of the workspace-root [`runtime-deps.toml`](../runtime-deps.toml) as plain data, so a planted runtime keyed by that pin (the Lemonade `env_id`) follows a version bump without importing `rocm-deps`. | flat |
 | [`src/runtime_root.rs`](../tests/e2e-cucumber/src/runtime_root.rs) | `check_runtime_root_not_nested`: judges the active runtime folder `rocm examine` prints and rejects a doubly nested `runtimes/wheel` path. | flat |
 | [`src/send_until.rs`](../tests/e2e-cucumber/src/send_until.rs) | Retry loop for sending an idempotent terminal input until its effect appears. | flat |
-| [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail. | flat |
+| [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail; and tells apart the two ways a failed `rocm serve --wait` reports a dead engine (`engine_death_report`). | flat |
 | [`src/serve_plan.rs`](../tests/e2e-cucumber/src/serve_plan.rs) | Explains why a `rocm serve` run printed no `resolved model:` line by keeping stderr's refusal alongside stdout. | flat |
 | [`src/shared_runtime.rs`](../tests/e2e-cucumber/src/shared_runtime.rs) | Picks which runtime a scenario activates out of the shared pre-warmed runtime tree, which may hold more than one. | flat |
 | [`src/stand_in_uname.rs`](../tests/e2e-cucumber/src/stand_in_uname.rs) | The shell script a scenario plants as a stand-in `uname`: `-v` answers a fixed string, `-r` runs a fragment the scenario chooses, and every call is logged so a scenario can count how often the kernel release was asked for. | flat |
@@ -843,6 +844,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | --- | --- | --- |
 | [`src/bin/fake-docker.rs`](../tests/e2e-cucumber/src/bin/fake-docker.rs) | A `docker` stand-in that always fails, optionally logging its arguments, for the AIM Docker-unavailable scenarios. | flat |
 | [`src/bin/fake-gh.rs`](../tests/e2e-cucumber/src/bin/fake-gh.rs) | A GitHub CLI stand-in for the installers' `pr-<number>` channel scenarios: answers `pr view`, `api` (filtered text for `install.sh`'s `--jq`, JSON for `install.ps1`) and `run download` from files in `FAKE_GH_DIR`, and logs every call. | flat |
+| [`src/bin/fake-lemonade.rs`](../tests/e2e-cucumber/src/bin/fake-lemonade.rs) | The `lemonade` CLI and `lemond` server of a planted Lemonade runtime, chosen by `argv[0]`: `lemond` stays alive for a bounded time, and `lemonade backends install` fails, for `@id:serve-lemonade-preparation-recovery`. | flat |
 | [`src/bin/fake-python.rs`](../tests/e2e-cucumber/src/bin/fake-python.rs) | A stand-in for the runtime's Python that answers the ComfyUI install's torch-stack probe and post-install GPU check. | flat |
 | [`src/bin/fake-tailscale.rs`](../tests/e2e-cucumber/src/bin/fake-tailscale.rs) | A Tailscale CLI stand-in that serves the status document named by `FAKE_TAILSCALE_STATUS`, for the `rocm remote` scenarios. | flat |
 | [`src/bin/fake-uv.rs`](../tests/e2e-cucumber/src/bin/fake-uv.rs) | A `uv` stand-in whose output, exit code, argument log and stdin handling are set by `FAKE_UV_*` variables, for the ComfyUI scenarios. | flat |

@@ -304,15 +304,16 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
    [`tests/e2e.rs`](tests/e2e.rs) plants it (it needs the `rocm-core`
    dev-dependency the library target can't reach). See
    [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
-   [`fake-tailscale`](src/bin/fake-tailscale.rs), and
-   [`fake-gh`](src/bin/fake-gh.rs) for the pattern.
+   [`fake-tailscale`](src/bin/fake-tailscale.rs), [`fake-gh`](src/bin/fake-gh.rs),
+   and [`fake-lemonade`](src/bin/fake-lemonade.rs) (one binary planted under two
+   names, taking its role from `argv[0]`) for the pattern.
 7. If a step asserts a GPU count, compare it against the GPUs the job can
    reach, not the cards on the PCI bus: see
    [GPU visibility on the hardware pool](../../docs/ci-hardware-testing.md#gpu-visibility-on-the-hardware-pool).
 
 ## Design principles
 
-- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type. (A harness *unit* test may read a planted record back through `rocm_core::ManagedServiceRecord`, to tie the writer's field names to the ones the CLI reads; steps do not.)
+- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type. (A harness *unit* test may read a planted record back through `rocm_core::ManagedServiceRecord`, to tie the writer's field names to the ones the CLI reads; steps do not.) Where a scenario plants something keyed by a pinned runtime version, such as the Lemonade runtime's `env_id`, it reads the version from the workspace pin file [`runtime-deps.toml`](../../runtime-deps.toml) as data (see [`runtime_pins`](src/runtime_pins.rs)) rather than importing `rocm-deps`.
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **A scenario about a sequence of chat completions scripts them.** `MockServer::chat_requests` records every chat completion request body even with the fixed stub reply, so a scenario can count completions and read each prompt. A script makes a double ask visible in what the user sees as well: `MockServer::start_with_chat_script` hands out one distinct reply per chat completion request (on either the `/v1/chat/completions` or the unversioned `/chat/completions` route), so the plan that gets printed or returned shows which call produced it, and a request past the end of the script gets HTTP 500 (and is still recorded), so asking more often than scripted fails loudly instead of recycling a reply. Plant the service with `ServiceRecordOptions { inference_verified: true, .. }` so the CLI's own readiness probe does not consume the first scripted reply. `planner_steps.rs` is the worked example.

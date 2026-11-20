@@ -1249,7 +1249,9 @@ skill's catalog table; CI runs that test in the `test` job's `cargo nextest` ove
 and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose steps run when the
 `heavy` category matches, as every `skills/` change does, while the hook's `test`
 step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
-e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it), and the fake Lemonade
+runtime's backends table in the e2e fixtures also selects `rocm-engine-lemonade` (its tests
+`include_str!` it). The table is `CROSS_CRATE_READS` in
 [cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
 `include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
 code (not in comments or string literals) that leave their crate and fails unless each one is
@@ -2490,7 +2492,7 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES`, compiled only into the
   `rocm/e2e-test-hooks` build `cargo xtask e2e` makes, and check against the
   disk that nothing was downloaded. That variable also waives serve's no-GPU
-  refusal, as serve-18's failure hook does.
+  refusal, so the scenario reaches the install on a host with no GPU.
 - `lemonade-installs-07` (Linux) reaches the refusal of a host whose glibc
   or OpenSSL falls short of what the pinned `lemond` needs. It reports an
   Ubuntu 20.04-like host through `ROCM_E2E_LEMONADE_HOST_GLIBC=2.31` and

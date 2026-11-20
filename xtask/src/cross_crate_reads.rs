@@ -60,8 +60,11 @@ use crate::affected::{self, Graph, Selection};
 ///   `heavy` category matches (`skills/**` is in it); the pre-push hook's `test`
 ///   step excludes `e2e-cucumber`, so there the entry only adds the clippy
 ///   steps.
-/// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
-///   although it lives in the e2e crate.
+/// - the e2e fixtures: `rocm-core`'s `fix` tests `include_str!` the PowerShell
+///   cases, and `rocm-engine-lemonade`'s backend tests the fake runtime's
+///   `lemonade backends` table, although both live in the e2e crate. The
+///   directory entry keeps `rocm-core` for any fixture; the table's own entry
+///   adds its one other reader.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
     ("README.md", &["rocm", "xtask"]),
@@ -69,6 +72,10 @@ pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("skills/", &["rocm", "xtask"]),
     ("skills/rocm-doctor/", &["e2e-cucumber"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
+    (
+        "tests/e2e-cucumber/fixtures/lemonade_backends_table.txt",
+        &["rocm-engine-lemonade"],
+    ),
 ];
 
 fn read_pattern_matches(pattern: &str, file: &str) -> bool {

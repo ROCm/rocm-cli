@@ -423,15 +423,15 @@ fn aim_board_note(
 ///
 /// Not "exactly when the bail fires", and the difference is only in test-hook
 /// builds: the bail is also waived by `gpu_bail_waived_by_test_hook` in
-/// `serve()` — the scripted Lemonade backend failure or free-space override,
-/// the simulated OOM launch, the stand-in engine that exits during startup,
-/// and the scripted engine startup death — each
-/// compiled in only with a test feature and armed by an environment variable.
-/// Under any of them the gate can open while the bail cannot fire. That is
-/// deliberate — the hook stands in for the GPU the lane does not have, so the
-/// reuse path it exercises must still behave as it would on a real GPU-less
-/// host — and it costs nothing in a shipped binary, where none of the terms can
-/// be true.
+/// `serve()` — the scripted Lemonade free-space override, the simulated OOM
+/// launch (either mode), the stand-in engine that exits during startup, and the
+/// scripted engine startup death — each compiled in only with a test feature
+/// and armed by an environment variable. Under any of them the gate can open
+/// while the bail cannot fire. That is deliberate — each stands in for the GPU
+/// its lane does not have, or lets a refusal that `rocm serve` only reaches past
+/// the bail run on a GPU-less lane, so the pre-gate must still behave as it
+/// would on a real GPU-less host — and it costs nothing in a shipped binary,
+/// where none of the terms can be true.
 ///
 /// `host_has_no_usable_gpu` is therefore the bail's own predicate, computed once
 /// by the caller and handed to both, so the two cannot drift apart. They did:
@@ -871,29 +871,21 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     //
     // Skipped for cpu_only and when reusing an already-running service (nothing is
     // launched); permissive when availability cannot be probed on this platform
-    // (probe returns `None`). The E2E-only
-    // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware, and the
-    // E2E-only launch fault injection (either mode) and the startup-exit
-    // stand-in engine likewise stand in for the GPU they do not have.
+    // (probe returns `None`). The E2E-only launch fault injection (either mode)
+    // and the startup-exit stand-in engine stand in for the GPU they do not have.
     //
-    // The scripted free-space override opens the same waiver: it exists to refuse a
+    // The scripted free-space override waives it too: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
     // reaches past this bail.
-    let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
-        && [
-            "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
-            "ROCM_E2E_LEMONADE_FREE_SPACE_BYTES",
-        ]
-        .iter()
-        .any(|variable| std::env::var_os(variable).is_some());
+    let scripted_free_space = cfg!(feature = "e2e-test-hooks")
+        && std::env::var_os("ROCM_E2E_LEMONADE_FREE_SPACE_BYTES").is_some();
     // The scripted startup-death scenario bypasses the same host precondition, for
     // the same reason: it asserts what happens *after* a spawn, so it must reach
     // one without real GPU hardware.
     //
     // Every test hook that waives this bail is named here once, so the bail and
     // `gpu_refusal_waived_for_reuse` below cannot disagree about which ones do.
-    let gpu_bail_waived_by_test_hook = scripted_backend_failure
+    let gpu_bail_waived_by_test_hook = scripted_free_space
         || e2e_simulate_oom_launch()
         || crate::service_launch::e2e_simulate_startup_exit()
         || scripted_managed_engine_startup_failure();

@@ -200,7 +200,7 @@ where
         );
     }
     Ok(LemonadeInstallManifest {
-        env_id: format!("lemonade-embeddable-{version}"),
+        env_id: rocm_deps::lemonade_env_id(&version),
         version,
         runtime_dir,
         lemond,

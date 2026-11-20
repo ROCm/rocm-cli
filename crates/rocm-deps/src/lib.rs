@@ -42,6 +42,22 @@ pub fn lemonade_download_url(version: &str, archive_name: &str) -> String {
     )
 }
 
+/// The `env_id` a Lemonade embeddable runtime of `version` is recorded under.
+///
+/// `version` is the bare release number, as in `LEMONADE_VERSION`, not a `v`
+/// tag: the id is compared by exact string, so it is not normalised here.
+///
+/// For example `lemonade-embeddable-11.5.1`. The engine writes it into the install
+/// manifest it creates, and `rocm` compares it with what the engine's `Detect`
+/// reports to decide whether its own install is already done, so the two must
+/// agree. The e2e suite repeats the shape when it plants a runtime, because it
+/// imports nothing from this workspace; its serve-18 scenario fails if the
+/// planted id stops matching.
+#[must_use]
+pub fn lemonade_env_id(version: &str) -> String {
+    format!("lemonade-embeddable-{version}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +100,15 @@ mod tests {
         assert_eq!(
             lemonade_download_url("v11.6.0", "archive.tar.gz"),
             "https://github.com/lemonade-sdk/lemonade/releases/download/v11.6.0/archive.tar.gz"
+        );
+    }
+
+    #[test]
+    fn the_lemonade_env_id_names_the_embeddable_and_its_version() {
+        assert_eq!(lemonade_env_id("11.5.1"), "lemonade-embeddable-11.5.1");
+        assert_eq!(
+            lemonade_env_id(LEMONADE_VERSION),
+            format!("lemonade-embeddable-{LEMONADE_VERSION}")
         );
     }
 }
