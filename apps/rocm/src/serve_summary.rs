@@ -291,8 +291,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} - follow `{} --follow` or check `rocm services list`",
-            crate::service_hints::service_logs_hint(&summary.service_id)
+            "  note: {explanation} - follow `{}` or check `rocm services list`",
+            crate::service_hints::service_logs_follow_hint(&summary.service_id)
         );
     }
     if let (true, Some(reason)) = (smoke_failed, summary.smoke_failure.as_deref()) {

@@ -951,6 +951,58 @@ outcome for the stopping process itself; the JSON answer of the sandbox
 `stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
 as stopped).
 
+**An engine that dies at startup.** On Windows and Linux alike, a managed
+engine that exits within its first 200 ms fails `rocm serve --managed`
+instead of reporting a server that is still starting.
+To see it without a broken engine, build the CLI with its test hooks and arm
+the scripted death, which makes the spawned engine reject its arguments:
+
+```powershell
+cargo build -p rocm --features e2e-test-hooks
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"
+./target/debug/rocm serve qwen --engine lemonade --managed
+./target/debug/rocm services list --all
+```
+
+Expected result:
+
+- The serve exits non-zero with `managed engine exited immediately with status
+  ...; inspect <log path>`, where `<log path>` is the service's own log, plus a
+  tail of that log when the engine wrote anything to it. On Windows the status
+  is the engine's exit code too.
+- `rocm services list --all` shows the attempt as `stopped`. Running the same
+  `rocm serve` again fails again with the same `managed engine exited
+  immediately ...` error, rather than reporting the earlier attempt as already
+  running, and `rocm services list --all` then shows two `stopped` records.
+- An engine that dies later than that — while loading its runtime or model —
+  is not caught by this check; the serve then waits for readiness and reports
+  the service as still starting, as before.
+
+Unset the variable afterwards; a build without `--features e2e-test-hooks`
+ignores it.
+
+To see the stop-during-start case, run `rocm serve <model> --managed` in one
+terminal and, while it is still waiting for the server, `rocm services stop
+<service-id> --yes` from another. The serve exits non-zero with an error that
+begins "a stop was requested for managed service `<service-id>` while it was
+starting". Which advice follows depends on how far the stop has got:
+
+- If the stop has finished, the record reads `stopped`, `rocm services list
+  --all` shows the service as `stopped`, and the error ends "start it again with
+  `rocm serve`".
+- If the stop is still running (it can take tens of seconds), the record still
+  reads as live (`starting`, `running` or `ready`), and a new `rocm serve` for
+  the same model would reuse the service being stopped. The error then names
+  `rocm services stop <service-id> --yes` to run first. It waits for the
+  processes; once it reports the service stopped, `rocm services list --all`
+  shows `stopped` and `rocm serve` launches anew. A stop that cannot confirm the
+  processes gone says so and leaves the service live.
+
+This is the usual result, not a certain one: the launch reads the record and
+writes its readiness verdict as two separate steps, and a stop takes no lock on
+the record, so a stop that lands between the two is overwritten by the verdict
+and the serve reports the server as it found it.
+
 #### Windows host check
 
 The Windows build-and-test job runs the workspace unit tests, which include two
@@ -1296,6 +1348,51 @@ icacls <data>\remote-sessions\<session-id>.endpoint-key
 Expected result: exactly one entry, for your own account, with `(F)` and no
 `(I)` (inherited) flag — no `Administrators`, `SYSTEM`, `Users` or
 `Authenticated Users` entry, even when `<data>` is a folder those can read.
+
+#### Remote session records
+
+`rocm remote` keeps one record per session under `<data>/remote-sessions/`.
+These checks need no second machine. On Linux, after any `rocm remote serve`
+(or with a record copied in by hand), check the directory's mode:
+
+```bash
+stat -c '%a %U' <data>/remote-sessions
+```
+
+Expected result: `700` and your user name.
+
+Then make a record unusable and list the sessions. Copy a record aside first;
+these steps edit it:
+
+```bash
+cp <data>/remote-sessions/<session-id>.json /tmp/record.json
+sed -i 's/"remote_cli": *"[^"]*"/"remote_cli": "rocm; true #"/' \
+  <data>/remote-sessions/<session-id>.json
+rocm remote status
+rocm remote stop <session-id>
+```
+
+Expected result:
+
+- `status` prints `warning: ignoring a remote session record: refusing to act
+  on <path>: remote session names an unexpected remote CLI "rocm; true #"`,
+  with the remedy to set `"remote_cli"` back to `"rocm"` or
+  `"$HOME/.local/bin/rocm"`. It does not say `No remote sessions have been
+  started`; it says `1 remote session record(s) were refused` and that the
+  machine may still be serving a model. It exits 0 (scenario `remote-17`).
+- `stop` names the same record, exits non-zero and leaves the file in place
+  (scenario `remote-18`).
+- Following the remedy (set `"remote_cli"` back, or restore the copy) makes
+  `status` list the session again.
+- With a second record for the same machine on another port, `rocm remote stop
+  <short machine name>` and `rocm remote stop <full peer name>` are refused as
+  matching the refused record too, and stop nothing (scenarios `remote-21`,
+  `remote-22`).
+- Renaming the record to another session's name, or replacing it with a FIFO
+  (`mkfifo <data>/remote-sessions/x.json`), makes `status` refuse it and
+  return at once rather than hang.
+- Run as root with `sudo -E rocm remote status`, the records are refused as
+  owned by another user, with advice to run `rocm remote` as that user.
 
 ### 4a. Dashboard Doctor Report
 
@@ -2021,6 +2118,10 @@ Expected result:
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
   on that folder. It adds no line about how to remove anything (scenario
   `uninstall-09`).
+- With a `rocm remote` session record that is refused (see *Remote session
+  records* in section 4), the dry run warns that it `could not be used and may
+  still name models running on remote machines`, names the file, and says
+  `rocm remote stop` cannot reach it (scenario `uninstall-18`).
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
   is not an option and points to `--yes`, and ends with a `Try:` line that is
   your command with `--yes` in place of `--force` (scenario `uninstall-17`); a near miss such as `--forc` is an
