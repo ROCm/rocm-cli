@@ -2297,8 +2297,10 @@ async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
 /// The notice and the key names are asserted together on purpose. A notice
 /// that named no keys would leave the user exactly as stuck as the silent cut,
 /// and the keys alone would not say there was anything below. Matched on the
-/// whitespace-collapsed screen because the row is laid out to the popup's
-/// width and may wrap at this geometry.
+/// whitespace-collapsed screen because the row is padded out to the popup's
+/// width. It cannot wrap: the footer is an unwrapped `Paragraph` in a one-row
+/// constraint, so a row too long for the popup is clipped instead. At this
+/// geometry the tail is clipped, but "PgUp/PgDn" sits inside that boundary.
 #[then("the quit prompt says there is more to read and names the keys that scroll it")]
 async fn quit_confirm_announces_more_to_read(world: &mut E2eWorld) {
     session(world)

@@ -393,6 +393,52 @@ mod tests {
         assert_eq!(state.quit_confirm_scroll, 0, "Home must return to the top");
     }
 
+    /// Scenario 5. A reopened prompt opens on its first line. `open_quit_confirm`'s
+    /// two reset lines are the only thing that clears the offset: `close_overlays`
+    /// leaves both fields alone, which this test pins on the way through so the
+    /// reset is shown to be load-bearing rather than assumed to be. Every other
+    /// test opens the prompt while the offset is already `0`, so deleting the
+    /// reset passes all of them.
+    #[test]
+    fn reopening_the_prompt_starts_it_back_at_the_first_line() {
+        use crossterm::event::KeyCode;
+        let mut state = serving_dashboard();
+        let first = painted_at(&mut state, 10);
+        assert!(
+            state.quit_confirm_max_scroll.get() > 0,
+            "premise: this geometry must overflow, or there is no offset to carry: {first}"
+        );
+        assert!(state.quit_confirm_scroll_key(KeyCode::End));
+        assert!(
+            state.quit_confirm_scroll > 0,
+            "premise: the prompt must sit off its first line before it is closed"
+        );
+
+        let still_scrolled = state.quit_confirm_scroll;
+        assert_eq!(
+            state.resolve_quit_confirm_key(KeyCode::Char('n')),
+            Some(false),
+            "premise: Deny must close the prompt and let the caller continue"
+        );
+        assert_eq!(
+            state.quit_confirm_scroll, still_scrolled,
+            "closing does not clear the offset -- if it ever does, this test stops \
+             proving anything about the reopen and must be rewritten, not deleted"
+        );
+
+        state.open_quit_confirm();
+
+        assert_eq!(
+            state.quit_confirm_scroll, 0,
+            "a reopened prompt opens on the bullet naming what is still serving"
+        );
+        assert_eq!(
+            state.quit_confirm_max_scroll.get(),
+            0,
+            "and its bound is re-measured by the next draw, not inherited"
+        );
+    }
+
     /// Scenario 4. The scroll keys must not be read as an answer. Paging is the
     /// one interaction a user performs *before* deciding, so a PgDn that quit
     /// the dashboard would be the worst possible misfire.
