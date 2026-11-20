@@ -241,17 +241,28 @@ impl WindowsExamineInventory {
         self.displays
             .iter()
             .find(|display| pci_target(display).is_some_and(|t| !gfx_target_has_no_rocm_build(t)))
+            // An adapter its device id already identified is not looked up
+            // by name: `parse_windows_display_gfx_target` never reads the name
+            // of a row whose id resolved, so a gfx90c iGPU whose name happens
+            // to match a supported part must not be named here either.
             .or_else(|| {
-                self.displays
-                    .iter()
-                    .find(|display| gfx_target_from_amd_marketing_name(&display.name).is_some())
+                self.displays.iter().find(|display| {
+                    pci_target(display).is_none()
+                        && gfx_target_from_amd_marketing_name(&display.name)
+                            .is_some_and(|t| !gfx_target_has_no_rocm_build(t))
+                })
             })
             // A recognized-but-unsupported iGPU (gfx90c) ranks below every
-            // other recognized adapter, so it cannot hide a discrete card.
+            // other recognized adapter, so it cannot hide a discrete card --
+            // but above an adapter nothing recognizes, whether the iGPU was
+            // recognized by its device id or by its name. That is the order
+            // `parse_windows_display_gfx_target` takes, so the adapter named
+            // here is the one whose target is reported.
             .or_else(|| {
-                self.displays
-                    .iter()
-                    .find(|display| pci_target(display).is_some())
+                self.displays.iter().find(|display| {
+                    pci_target(display).is_some()
+                        || gfx_target_from_amd_marketing_name(&display.name).is_some()
+                })
             })
             .or_else(|| {
                 self.displays
@@ -960,6 +971,119 @@ Class Name:                Display
             .expect("an inventory");
         assert!(!sources.calls.contains(&"system"), "{:?}", sources.calls);
         assert!(inventory.amd_display_driver_info().is_some());
+    }
+
+    /// A gfx90c iGPU recognised by its *name* must not hide a discrete card
+    /// either.
+    ///
+    /// The name table now answers gfx90c for the Vega iGPUs' codenames, which
+    /// is what `examine` needs; on the install side that answer has to rank
+    /// where the PCI-id answer for the same iGPU already does, below every
+    /// other recognised adapter, or the first adapter's name would decide the
+    /// install family for the whole host.
+    #[test]
+    fn windows_display_parser_does_not_let_a_named_vega_igpu_hide_a_discrete_card() {
+        let text = "AMD Radeon(TM) Graphics (Renoir)\t\n\
+                    AMD Radeon RX 6800M\tPCI\\VEN_1002&DEV_9999";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx1031".to_owned())
+        );
+        let text = "AMD Radeon(TM) Graphics (Renoir)\t";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx90c".to_owned()),
+            "alone, the iGPU is still reported as gfx90c"
+        );
+
+        let inventory = WindowsExamineInventory {
+            displays: vec![
+                WindowsDisplayAdapter {
+                    name: "AMD Radeon(TM) Graphics (Renoir)".to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: None,
+                },
+                WindowsDisplayAdapter {
+                    name: "AMD Radeon RX 6800M".to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: None,
+                },
+            ],
+            ..WindowsExamineInventory::default()
+        };
+        assert_eq!(
+            inventory.amd_display_name().as_deref(),
+            Some("AMD Radeon RX 6800M")
+        );
+    }
+
+    /// The other half of the same ranking: a gfx90c iGPU recognised by its
+    /// *name* still outranks an adapter nothing recognises, on both sides.
+    ///
+    /// `parse_windows_display_gfx_target` reports gfx90c for this host, so the
+    /// adapter `preferred_amd_display` names must be the iGPU the target came
+    /// from, not whichever unrecognised adapter happens to be listed first.
+    #[test]
+    fn a_named_vega_igpu_outranks_an_unrecognised_adapter_in_both_install_probes() {
+        let unrecognised = "AMD Radeon Pro Unlisted";
+        let igpu = "AMD Radeon(TM) Graphics (Renoir)";
+        assert_eq!(gfx_target_from_amd_marketing_name(unrecognised), None);
+        assert_eq!(
+            parse_windows_display_gfx_target(&format!("{unrecognised}\t\n{igpu}\t")),
+            Some("gfx90c".to_owned())
+        );
+
+        let inventory = WindowsExamineInventory {
+            displays: [unrecognised, igpu]
+                .into_iter()
+                .map(|name| WindowsDisplayAdapter {
+                    name: name.to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: None,
+                })
+                .collect(),
+            ..WindowsExamineInventory::default()
+        };
+        assert_eq!(inventory.amd_display_name().as_deref(), Some(igpu));
+    }
+
+    /// An adapter whose device id resolves is judged by that id alone, on both
+    /// install probes.
+    ///
+    /// `parse_windows_display_gfx_target` never reads the name of a row whose
+    /// PCI id resolved, so a gfx90c iGPU (by id) whose name string matches a
+    /// supported part ranks as gfx90c, below a discrete card recognised only by
+    /// its name. `preferred_amd_display` must name the adapter whose target is
+    /// reported, not the iGPU on the strength of its name.
+    #[test]
+    fn an_adapter_identified_by_its_device_id_is_not_ranked_by_its_name() {
+        let igpu = ("AMD Radeon RX 6800M", "PCI\\VEN_1002&DEV_1636");
+        let discrete = ("AMD Radeon RX 7900 XTX", "");
+        assert_eq!(gfx_target_from_amd_marketing_name(igpu.0), Some("gfx1031"));
+        assert_eq!(
+            parse_windows_display_gfx_target(&format!(
+                "{}\t{}\n{}\t{}",
+                igpu.0, igpu.1, discrete.0, discrete.1
+            )),
+            Some("gfx1100".to_owned())
+        );
+
+        let inventory = WindowsExamineInventory {
+            displays: [igpu, discrete]
+                .into_iter()
+                .map(|(name, pnp)| WindowsDisplayAdapter {
+                    name: name.to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: (!pnp.is_empty()).then(|| pnp.to_owned()),
+                })
+                .collect(),
+            ..WindowsExamineInventory::default()
+        };
+        assert_eq!(inventory.amd_display_name().as_deref(), Some(discrete.0));
     }
 
     #[test]
