@@ -172,13 +172,16 @@ pub(crate) fn ensure_best_llamacpp_backend_with_parent(
 /// release out) as `installed`, and `update_required` (an installed build
 /// Lemonade will not run until it is reinstalled, e.g. after the pin in
 /// `backend_versions.json` moved) as `installable`, so it is reinstalled rather
-/// than reused or dropped. Lemonade 2026.44.1's own `Action` for such a row is
+/// than reused or dropped. Lemonade's own `Action` for such a row is
 /// `lemonade backends install <recipe>:<backend>`, the command rocm-cli runs,
 /// and its `BackendManager::install_backend` has no early return for an
-/// installed backend while online; for `llamacpp:rocm` it also removes and
-/// fetches TheRock again (`src/cpp/server/system_info.cpp` and
-/// `src/cpp/server/backend_manager.cpp` at that tag). The other state Lemonade defines, `action_required`
-/// (used by other recipes), leaves the row out.
+/// installed native backend while online (`src/cpp/server/system_info.cpp` and
+/// `src/cpp/server/backend_manager.cpp` at 2026.44.1 and at 2026.47.1, where
+/// the early returns it gained are for container backends and for handing the
+/// install to its download manager, which runs it again). At both tags, for
+/// `llamacpp:rocm` it also removes and fetches TheRock again. The other state
+/// Lemonade defines, `action_required` (used by other recipes), leaves the row
+/// out.
 ///
 /// A row that starts in the first column and has a state in its Status column
 /// names its recipe; an indented row continues the recipe above it with another
@@ -546,6 +549,94 @@ thinksound          rocm        experimental  native     installable     Backend
             select_best_llamacpp_backend(&backends),
             Some(("rocm".to_owned(), false))
         );
+    }
+
+    /// `lemonade backends` as Lemonade 2026.47.1 printed it on a Linux host with
+    /// a Strix Halo GPU and its `llamacpp:rocm` backend installed. Unlike
+    /// 2026.44.1's, it lists container backends, two of them (`halobox`,
+    /// `nathanw`) as indented `llamacpp` rows, and ends with a line after the
+    /// closing rule.
+    const LEMONADE_2026_47_BACKENDS_TABLE: &str = "\
+Recipe              Backend     Tier          Format     Status          Message/Version                               Action
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+acestep             rocm        experimental  native     installable     Backend is supported but not installed.        lemonade backends install acestep:rocm
+                    vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install acestep:vulkan
+ds4                 rocm        guest         container  installable     Backend is supported but not installed.        lemonade backends install ds4:rocm
+flm                 npu         core          native     installable     Backend is supported but not installed.        lemonade backends install flm:npu
+gufo                rocm        guest         container  installable     Backend is supported but not installed.        lemonade backends install gufo:rocm
+halogen             rocm        guest         container  installable     Backend is supported but not installed.        lemonade backends install halogen:rocm
+kokoro              cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install kokoro:cpu
+llamacpp            cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:cpu
+                    halobox     guest         container  installable     Backend is supported but not installed.        lemonade backends install llamacpp:halobox
+                    nathanw     guest         container  installable     Backend is supported but not installed.        lemonade backends install llamacpp:nathanw
+                    rocm        core          native     installed       b12109                                         -
+                    vulkan      core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:vulkan
+llamacpp-hrx        hrx         experimental  native     installable     Backend is supported but not installed.        lemonade backends install llamacpp-hrx:hrx
+moonshine           cpu         core          python     installable     Backend is supported but not installed.        lemonade backends install moonshine:cpu
+onnxruntime         cpu         experimental  native     installable     Backend is supported but not installed.        lemonade backends install onnxruntime:cpu
+openmoss            vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install openmoss:vulkan
+rocmfpx             rocm        guest         container  installable     Backend is supported but not installed.        lemonade backends install rocmfpx:rocm
+sd-cpp              cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:cpu
+                    rocm        core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:rocm
+                    vulkan      core          native     installable     Backend is supported but not installed.        lemonade backends install sd-cpp:vulkan
+thenoise            rocm        core          python     installable     Backend is supported but not installed.        lemonade backends install thenoise:rocm
+thinksound          rocm        experimental  native     installable     Backend is supported but not installed.        lemonade backends install thinksound:rocm
+                    vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install thinksound:vulkan
+trellis             rocm        experimental  native     installable     Backend is supported but not installed.        lemonade backends install trellis:rocm
+                    vulkan      experimental  native     installable     Backend is supported but not installed.        lemonade backends install trellis:vulkan
+vllm                rocm        experimental  python     installable     Backend is supported but not installed.        lemonade backends install vllm:rocm
+whispercpp          cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install whispercpp:cpu
+                    rocm        core          native     installable     Backend is supported but not installed.        lemonade backends install whispercpp:rocm
+                    vulkan      core          native     installable     Backend is supported but not installed.        lemonade backends install whispercpp:vulkan
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Use `lemonade backends info RECIPE:BACKEND` to see a backend's description, author and license.
+";
+
+    /// The container backends 2026.47.1 lists under `llamacpp` are read as
+    /// `llamacpp` backends, and the installed ROCm build is reused as installed.
+    #[test]
+    fn parses_the_2026_47_table_and_picks_the_installed_rocm_backend() {
+        let backends = parse_llamacpp_backend_statuses(LEMONADE_2026_47_BACKENDS_TABLE);
+        assert_eq!(
+            backends,
+            vec![
+                ("cpu".to_owned(), "installable".to_owned()),
+                ("halobox".to_owned(), "installable".to_owned()),
+                ("nathanw".to_owned(), "installable".to_owned()),
+                ("rocm".to_owned(), "installed".to_owned()),
+                ("vulkan".to_owned(), "installable".to_owned()),
+            ]
+        );
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("rocm".to_owned(), true))
+        );
+    }
+
+    /// A container backend is never chosen, since the GPU priority names only
+    /// `rocm` and `vulkan`: with only the `cpu` and container rows of the
+    /// 2026.47.1 table, as it printed them, selection finds nothing rather than
+    /// picking one.
+    #[test]
+    fn a_container_backend_listed_under_llamacpp_is_never_chosen() {
+        let table = "\
+Recipe              Backend     Tier          Format     Status          Message/Version                               Action
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+llamacpp            cpu         core          native     installable     Backend is supported but not installed.        lemonade backends install llamacpp:cpu
+                    halobox     guest         container  installable     Backend is supported but not installed.        lemonade backends install llamacpp:halobox
+                    nathanw     guest         container  installable     Backend is supported but not installed.        lemonade backends install llamacpp:nathanw
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+";
+        let backends = parse_llamacpp_backend_statuses(table);
+        assert_eq!(
+            backends,
+            vec![
+                ("cpu".to_owned(), "installable".to_owned()),
+                ("halobox".to_owned(), "installable".to_owned()),
+                ("nathanw".to_owned(), "installable".to_owned()),
+            ]
+        );
+        assert_eq!(select_best_llamacpp_backend(&backends), None);
     }
 
     /// Lines that are not rows between a `llamacpp` row and its indented rows

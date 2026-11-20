@@ -259,9 +259,10 @@ cache is read, a host that provides OpenSSL 3 or glibc outside it
 refused although `lemond` could load there; setting
 `ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK` (any value) turns both refusals
 into a warning, and the refusal message names it. Lemonade
-2026.44.1, the current pin, needs glibc 2.38 and OpenSSL 3.0.0, which Ubuntu
-24.04 meets; 2026.45.3's `lemond` needs glibc 2.43 and OpenSSL 3.2.0, which it
-does not.
+2026.47.1, the current pin, needs glibc 2.38 and OpenSSL 3.0.0, which Ubuntu
+24.04 meets; the `lemond` of 2026.45.3 and 2026.46.2 needs glibc 2.43 and
+OpenSSL 3.2.0, which it does not, so the pin went from 2026.44.1 straight to
+2026.47.1.
 
 `rocm engines list` shows the exact plugin directories for the current host.
 The same output is available in the TUI with `/engine`.

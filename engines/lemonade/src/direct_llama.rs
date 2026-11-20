@@ -823,7 +823,8 @@ pub(crate) fn resolve_direct_llama_checkpoint(
     // Only the single-checkpoint shape is supported directly. Extra files,
     // multimodal inputs, options and unknown fields belong to Lemonade's router.
     // In the 11.5.1 source, size/suggested describe catalog entries and these
-    // labels classify chat models; 2026.44.1 also tags those models `chat`.
+    // labels classify chat models; 2026.44.1 and 2026.47.1 also tag those
+    // models `chat`.
     // Other labels can change launch flags (MTP).
     if checkpoint.variant.is_none()
         || fields.iter().any(|(key, value)| match key.as_str() {
@@ -2449,8 +2450,9 @@ mod tests {
         })
     }
 
-    /// The entry for the default small model as the pinned 2026.44.1 release
-    /// ships it: the same checkpoint as in 11.5.1, now also labelled `chat`.
+    /// The entry for the default small model as the pinned 2026.47.1 release
+    /// ships it (unchanged since 2026.44.1): the same checkpoint as in 11.5.1,
+    /// now also labelled `chat`.
     #[test]
     fn the_pinned_release_catalog_entry_for_the_small_model_routes_direct() {
         let dir = scratch_dir("pinned-release-catalog");

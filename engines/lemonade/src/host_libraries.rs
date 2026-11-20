@@ -136,7 +136,7 @@ const OPENSSL_SONAME: &str = "libssl.so.3";
 /// Names each library that falls short with the version needed and what the
 /// host has: the newest version node its library defines (which is what the
 /// loader compares, and not always the release: Ubuntu 24.04's OpenSSL 3.0.13
-/// defines up to `OPENSSL_3.0.3`), or that the loader cache has no library of
+/// `libssl.so.3` defines up to `OPENSSL_3.0.0`), or that the loader cache has no library of
 /// that soname. So the message alone says what to upgrade.
 pub(crate) fn host_shortfall(
     lemonade_version: &str,
@@ -158,8 +158,8 @@ pub(crate) fn host_shortfall(
             .unwrap_or_else(|| panic!("pinned {name} need {needed:?} is not a version"));
         match have {
             // `have` is the newest version node the library defines, not its
-            // release (Ubuntu 24.04's OpenSSL 3.0.13 defines up to
-            // `OPENSSL_3.0.3`), so the message names the node.
+            // release (Ubuntu 24.04's OpenSSL 3.0.13 `libssl.so.3` defines up
+            // to `OPENSSL_3.0.0`), so the message names the node.
             HostLibrary::Version(have) if have < needed => short.push(format!(
                 "{name} {needed} or newer (this host's {soname} provides up to {prefix}{have})"
             )),
@@ -402,15 +402,39 @@ mod tests {
         }
     }
 
+    /// The pinned `lemond` runs on Ubuntu 24.04, the oldest Linux release the
+    /// README supports: its `libc.so.6` (glibc 2.39) and `libssl.so.3` (OpenSSL
+    /// 3.0.13) define up to `GLIBC_2.39` and `OPENSSL_3.0.0`, which is what the
+    /// probe reads there (`readelf -V`; `OPENSSL_3.0.3` appears in that
+    /// `libssl.so.3` only as a version it needs from `libcrypto.so.3`). A bump to a release whose `lemond` needs more, as
+    /// 2026.45.3 and 2026.46.2 did (glibc 2.43, OpenSSL 3.2.0), fails here
+    /// rather than refusing every supported host at install time, provided the
+    /// bump re-reads the needs: `linux_lemond_needs_belong_to_the_pinned_linux_archive`
+    /// in `install.rs` ties only `LINUX_LEMOND_NEEDS`'s digest to the pinned
+    /// archive, not its glibc and OpenSSL values. The version passed in only
+    /// names the release in the refusal message.
+    #[test]
+    fn the_pinned_lemond_runs_on_ubuntu_24_04() {
+        let ubuntu_24_04 = host(Some("2.39"), Some("3.0.0"));
+        assert_eq!(
+            host_shortfall(
+                rocm_deps::LEMONADE_VERSION,
+                &crate::install::LINUX_LEMOND_NEEDS,
+                &ubuntu_24_04
+            ),
+            None
+        );
+    }
+
     /// The states the check can be in, one row each, as the probe can produce
-    /// them: every library new enough (Ubuntu 24.04 against the 2026.44.1
-    /// needs, and exactly at the need); glibc too old (Ubuntu 22.04); OpenSSL 3
-    /// missing with glibc too old (Ubuntu 20.04, OpenSSL 1.1 only); OpenSSL 3
+    /// them: every library new enough (Ubuntu 24.04 against glibc 2.38 and
+    /// OpenSSL 3.0.0, and exactly at the need); glibc too old (Ubuntu 22.04);
+    /// OpenSSL 3 missing with glibc too old (Ubuntu 20.04, OpenSSL 1.1 only); OpenSSL 3
     /// missing alone; and unknown versions, which never refuse.
     #[test]
     fn shortfall_names_each_library_that_falls_short_and_what_the_host_has() {
         let rows: [(HostLibraries, Option<&str>); 7] = [
-            (host(Some("2.39"), Some("3.0.3")), None),
+            (host(Some("2.39"), Some("3.0.0")), None),
             (host(Some("2.38"), Some("3.0.0")), None),
             (
                 host(Some("2.35"), Some("3.0.2")),
@@ -431,7 +455,7 @@ mod tests {
                     "it needs OpenSSL 3.0.0 or newer (this host's loader cache has no libssl.so.3)",
                 ),
             ),
-            (host(None, Some("3.0.3")), None),
+            (host(None, Some("3.0.0")), None),
             (host(None, None), None),
         ];
         for (host, expected) in rows {
@@ -453,8 +477,8 @@ mod tests {
     }
 
     /// An OpenSSL 3 older than a pin needs is reported by version: no pin needs
-    /// that today, but 2026.45.3 needed 3.2.0, and Ubuntu 24.04's OpenSSL 3.0.13 defines
-    /// only up to `OPENSSL_3.0.3`.
+    /// that today, but 2026.45.3 and 2026.46.2 needed 3.2.0, and Ubuntu 24.04's
+    /// OpenSSL 3.0.13 `libssl.so.3` defines only up to `OPENSSL_3.0.0`.
     #[test]
     fn an_openssl_3_older_than_the_need_is_named_by_version() {
         let needs = LemondHostNeeds {
@@ -462,11 +486,11 @@ mod tests {
             glibc: "2.43",
             openssl: "3.2.0",
         };
-        let message = host_shortfall("9.9.9", &needs, &host(Some("2.39"), Some("3.0.3"))).unwrap();
+        let message = host_shortfall("9.9.9", &needs, &host(Some("2.39"), Some("3.0.0"))).unwrap();
         assert!(
             message.ends_with(
                 "it needs glibc 2.43 or newer (this host's libc.so.6 provides up to GLIBC_2.39) and \
-                 OpenSSL 3.2.0 or newer (this host's libssl.so.3 provides up to OPENSSL_3.0.3)"
+                 OpenSSL 3.2.0 or newer (this host's libssl.so.3 provides up to OPENSSL_3.0.0)"
             ),
             "{message}"
         );
@@ -500,7 +524,7 @@ mod tests {
             host_check(
                 "9.9.9",
                 &NEEDS,
-                &host(Some("2.39"), Some("3.0.3")),
+                &host(Some("2.39"), Some("3.0.0")),
                 "x",
                 false
             ),
@@ -509,7 +533,7 @@ mod tests {
         refuse_if_host_too_old(
             "9.9.9",
             &NEEDS,
-            &host(Some("2.39"), Some("3.0.3")),
+            &host(Some("2.39"), Some("3.0.0")),
             "x",
             false,
         )
@@ -537,7 +561,7 @@ mod tests {
             host_check(
                 "9.9.9",
                 &NEEDS,
-                &host(Some("2.39"), Some("3.0.3")),
+                &host(Some("2.39"), Some("3.0.0")),
                 "x",
                 true
             ),
@@ -551,7 +575,7 @@ mod tests {
     const LIBSSL11_LINE: &str =
         "\tlibssl.so.1.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libssl.so.1.1\n";
 
-    /// A reader standing in for the ELF read: `GLIBC_2.31` and `OPENSSL_3.0.3`,
+    /// A reader standing in for the ELF read: `GLIBC_2.31` and `OPENSSL_3.0.0`,
     /// or `None` for a library that does not parse.
     fn planted_reader(unparseable: &'static str) -> impl Fn(&str, &str) -> Option<LibVersion> {
         move |path, _prefix| {
@@ -560,7 +584,7 @@ mod tests {
             } else if path.ends_with("libc.so.6") {
                 LibVersion::parse("2.31")
             } else {
-                LibVersion::parse("3.0.3")
+                LibVersion::parse("3.0.0")
             }
         }
     }
@@ -585,7 +609,7 @@ mod tests {
         let both = format!("{header}{LIBC_LINE}{LIBSSL_LINE}");
         assert_eq!(
             host_libraries_from_cache(Some(&both), planted_reader("-")),
-            host(Some("2.31"), Some("3.0.3"))
+            host(Some("2.31"), Some("3.0.0"))
         );
         assert_eq!(
             host_libraries_from_cache(Some(&both), planted_reader("libssl.so.3")),
