@@ -38,7 +38,8 @@ vendor-packages = [
 # wheel requires triton, the Windows one does not), so a single cross-platform
 # lock would be wrong for one of them. `platforms` maps an OS to the uv
 # `--python-platform` it is resolved for; `rocm` is the ROCm line every
-# `+rocm…` build in the lock must belong to.
+# `+rocm…` build in the lock must belong to, and a profile without it may lock
+# no `+rocm…` build.
 
 [profile.sdk-rocm10-1]
 rocm = "10.1.0"

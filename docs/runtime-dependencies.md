@@ -166,7 +166,8 @@ mise's own `pypi` backend was evaluated for these stacks and cannot lock them
   ROCm build missing from AMD's index is never replaced by a same-named
   package from PyPI;
 - every `+rocm…` build belongs to the profile's ROCm line (vLLM's own range
-  otherwise pulls a `+rocm10.0.0` torchvision into a 10.1 stack);
+  otherwise pulls a `+rocm10.0.0` torchvision into a 10.1 stack), and a
+  profile that names no `rocm` line locks no `+rocm…` build at all;
 - every wheel's platform tag fits the lock's OS (x86-64 Linux, or `win_amd64`),
   since the Windows locks are resolved on a Linux runner;
 - each package is locked once, with a version and at least one artifact;

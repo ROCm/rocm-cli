@@ -242,12 +242,16 @@ fn package_problems(
             ));
         }
     }
-    if let (Some(line), Some(built_for)) = (profile.rocm.as_deref(), rocm_line(version))
-        && built_for != line
-    {
-        out.push(format!(
+    // The only place a `+rocm` build is tied to a line: requirement matching
+    // ignores the local segment. A profile that names no line takes none.
+    match (profile.rocm.as_deref(), rocm_line(version)) {
+        (Some(line), Some(built_for)) if built_for != line => out.push(format!(
             "{name} {version}: built for ROCm {built_for}, but this profile is ROCm {line}"
-        ));
+        )),
+        (None, Some(built_for)) => out.push(format!(
+            "{name} {version}: built for ROCm {built_for}, but this profile names no ROCm line"
+        )),
+        _ => {}
     }
     out
 }
@@ -736,6 +740,33 @@ linux = "x86_64-manylinux_2_28"
             found.iter().any(|p| p.contains("built for ROCm 10.0.0")),
             "{found:?}"
         );
+    }
+
+    /// A profile without `rocm` takes no `+rocm` build, rather than skipping
+    /// the line check; a build with no ROCm tag is still fine there.
+    #[test]
+    fn a_rocm_build_in_a_profile_without_a_rocm_line_is_reported() {
+        let profiles = Profiles::parse(PROFILES).unwrap();
+        let mut profile = profiles.profile["p"].clone();
+        profile.rocm = None;
+        let problems = |torch: &str| {
+            lock_problems(
+                &profiles,
+                "p",
+                &profile,
+                "linux",
+                Some(UV),
+                &lock_text(torch, "stable.repo.amd.com"),
+            )
+        };
+        let found = problems("2.13.0+rocm10.1.0");
+        assert!(
+            found.iter().any(|p| p
+                == "torch 2.13.0+rocm10.1.0: built for ROCm 10.1.0, but this profile names no ROCm line"),
+            "{found:?}"
+        );
+        let found = problems("2.13.0");
+        assert!(!found.iter().any(|p| p.contains("ROCm line")), "{found:?}");
     }
 
     #[test]

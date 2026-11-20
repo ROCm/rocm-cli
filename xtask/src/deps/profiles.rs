@@ -50,6 +50,7 @@ pub(crate) struct Policy {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Profile {
     /// ROCm line every `+rocm…` build in this profile's locks must belong to.
+    /// Without one, `deps check` refuses any `+rocm…` build in its locks.
     pub(crate) rocm: Option<String>,
     /// Python version the profile is resolved for (`3.14`).
     pub(crate) python: String,

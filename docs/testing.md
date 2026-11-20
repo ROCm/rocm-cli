@@ -1092,7 +1092,8 @@ a profile's first lock" there):
   inputs (a digest in that header), satisfies its profile, locks each package once with a
   version and an artifact, takes every artifact from PyPI or AMD's indexes and
   AMD-only packages from AMD's indexes only, keeps every `+rocm…` build on the
-  profile's ROCm line, and carries only wheels for its OS; every binary is
+  profile's ROCm line (and refuses one in a profile that names no line), and
+  carries only wheels for its OS; every binary is
   locked for exactly Linux and Windows x64 as a release asset of the
   repository its `mise.toml` key names, from the release its version names,
   built for that OS, and the lock passes the same generator the `rocm-deps`
