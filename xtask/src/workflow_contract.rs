@@ -3039,8 +3039,32 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
              name the API reports; a misspelt name reads as `absent`"
         );
         // The deadlines are ordered and the job's cap lets the script stop itself.
-        let queue: u32 = env_value(settle, "QUEUE_DEADLINE_MINUTES").parse().unwrap();
-        let hard: u32 = env_value(settle, "HARD_DEADLINE_MINUTES").parse().unwrap();
+        // `${{ github.event_name == 'pull_request' && '<pr>' || '<other>' }}`: a short
+        // queue deadline where the queue lane is the primary check, a long one
+        // where this lane is the only MI300X signal. Both pairs must be ordered.
+        let both = |key: &str| -> [u32; 2] {
+            let expr = env_value(settle, key);
+            assert!(
+                expr.starts_with("${{ github.event_name == 'pull_request' && '"),
+                "{key} must differ by event: {expr}"
+            );
+            let nums: Vec<u32> = expr
+                .split('\'')
+                .skip(1)
+                .step_by(2)
+                .skip(1)
+                .map(|n| n.parse().unwrap())
+                .collect();
+            [nums[0], nums[1]]
+        };
+        let (queues, hards) = (
+            both("QUEUE_DEADLINE_MINUTES"),
+            both("HARD_DEADLINE_MINUTES"),
+        );
+        assert!(
+            queues[0] < queues[1],
+            "a pull request gives up sooner: {queues:?}"
+        );
         let lane_run: u32 = env_value(settle, "LANE_RUN_MINUTES").parse().unwrap();
         let cap: u32 = job_scalar(settle, "timeout-minutes").parse().unwrap();
         let lane_timeout: u32 = job_scalar(lane, "timeout-minutes").parse().unwrap();
@@ -3048,15 +3072,17 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             lane_run >= lane_timeout,
             "LANE_RUN_MINUTES ({lane_run}) must cover `e2e-gpu`'s timeout-minutes ({lane_timeout})"
         );
-        assert!(
-            queue + lane_run <= hard,
-            "a leg that starts just before the queue deadline ({queue}m) must finish \
-             ({lane_run}m) before the hard deadline ({hard}m)"
-        );
-        assert!(
-            hard < cap,
-            "the hard deadline ({hard}m) must come before the job's timeout ({cap}m)"
-        );
+        for (queue, hard) in queues.into_iter().zip(hards) {
+            assert!(
+                queue + lane_run <= hard,
+                "a leg that starts just before the queue deadline ({queue}m) must finish \
+                 ({lane_run}m) before the hard deadline ({hard}m)"
+            );
+            assert!(
+                hard < cap,
+                "the hard deadline ({hard}m) must come before the job's timeout ({cap}m)"
+            );
+        }
         assert_eq!(
             job_scalar(settle, "runs-on"),
             "ubuntu-24.04 # one LTS: only polls the GitHub API",
@@ -3134,7 +3160,15 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
                 .replace(" \\\n             ", " "),
             "MI300X_REQUIRED must hold the queue lane's whole `if`, joined by `&&`"
         );
-        assert_eq!(env_value(&step, "STALE_ARTIFACT"), "mi300x-stale-run");
+        assert_eq!(
+            env_value(&step, "STALE_ARTIFACT"),
+            "mi300x-stale-run-${{ github.run_attempt }}",
+            "the marker is per attempt: the artifact list holds every attempt's"
+        );
+        assert!(
+            lines.contains(&"SETTLE_RESULT: ${{ needs.e2e-gpu-settled.result }}"),
+            "the gate must see the settle job's own result:\n{step}"
+        );
         for required in [
             "export ARTIFACTS",
             "--paginate \\",
@@ -3149,7 +3183,8 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // The stale lane leaves its marker, which the gate reads as an absent lane.
         let stale_upload = named_step(lane, "- name: Upload the stale-run marker");
         assert!(
-            stale_upload.contains("name: mi300x-stale-run")
+            stale_upload.contains("name: mi300x-stale-run-${{ github.run_attempt }}")
+                && stale_upload.contains("path: ${{ runner.temp }}/mi300x-stale-run")
                 && stale_upload.contains("steps.stale.outputs.stale == 'true'"),
             "{stale_upload}"
         );
@@ -3160,6 +3195,8 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             "lane_results: ${{ steps.settle.outputs.lane_results }}",
             "abandoned_count: ${{ steps.settle.outputs.abandoned_count }}",
             "run: bash .github/scripts/settle-e2e-lanes.sh",
+            "id: settle",
+            "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
             "GH_TOKEN: ${{ github.token }}",
             "actions: read",
             "needs: [changes]",
@@ -3173,7 +3210,8 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // The canceller runs the cancel, with a token, after every job it must not
         // cut off.
         assert!(
-            cancel.contains("gh run cancel \"$GITHUB_RUN_ID\"")
+            cancel.contains("gh run cancel \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\"")
+                && cancel.contains("/force-cancel")
                 && cancel.contains("GH_TOKEN: ${{ github.token }}")
                 && cancel.contains("::warning::"),
             "the canceller must cancel this run with a token, tolerating a refusal:\n{cancel}"
@@ -3204,6 +3242,18 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         selfhosted: &str,
         uploaded: &[&str],
     ) -> (i32, String, String) {
+        run_mi300x_gate_settled(required, queue, selfhosted, uploaded, "success")
+    }
+
+    /// As `run_mi300x_gate`, with the settle job's own result chosen.
+    #[cfg(unix)]
+    fn run_mi300x_gate_settled(
+        required: bool,
+        queue: &str,
+        selfhosted: &str,
+        uploaded: &[&str],
+        settle: &str,
+    ) -> (i32, String, String) {
         let dir = tempfile::tempdir().expect("temp dir");
         let summary = dir.path().join("summary.md");
         std::fs::write(&summary, "").expect("write summary");
@@ -3220,6 +3270,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             .env("SELFHOSTED_RESULT", selfhosted)
             .env("SELFHOSTED_ARTIFACT", "e2e-gpu-selfhosted-report")
             .env("STALE_ARTIFACT", "mi300x-stale-run")
+            .env("SETTLE_RESULT", settle)
             .env("ARTIFACTS", uploaded.join("\n") + "\n")
             .env("GITHUB_STEP_SUMMARY", &summary)
             .output()
@@ -3399,6 +3450,42 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             summary.contains("counts as absent, not failed"),
             "{summary}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mi300x_gate_does_not_read_an_unknown_self_hosted_result_as_an_absent_lane() {
+        const Q: &str = "e2e-gpu-report";
+        const S: &str = "e2e-gpu-selfhosted-report";
+        // The settle job failed, was cancelled or never ran: `lane_results` is empty.
+        for settle in ["failure", "cancelled"] {
+            // Where either lane suffices, the queue lane's pass still counts.
+            let (code, log, _) = run_mi300x_gate_settled(true, "success", "", &[Q], settle);
+            assert_eq!(code, 0, "queue passed, settle {settle}:\n{log}");
+            let (code, log, _) = run_mi300x_gate_settled(true, "skipped", "", &[], settle);
+            assert_eq!(code, 1, "nothing passed, settle {settle}:\n{log}");
+            // Where only the self-hosted lane is judged, it fails closed.
+            let (code, log, summary) = run_mi300x_gate_settled(false, "skipped", "", &[S], settle);
+            assert_eq!(code, 1, "off a queue run, settle {settle}:\n{log}");
+            assert!(summary.contains("unknown"), "{summary}");
+        }
+        // An empty result with a healthy settle job is a lane absent from the run.
+        let (code, log, _) = run_mi300x_gate_settled(false, "skipped", "", &[], "success");
+        assert_eq!(code, 0, "{log}");
+        // A stale marker from another attempt is a different artifact name.
+        let (code, log, _) =
+            run_mi300x_gate(true, "failure", "success", &[Q, S, "mi300x-stale-run-1"]);
+        assert_eq!(code, 1, "a failed queue lane still fails:\n{log}");
+        let (code, log, _) =
+            run_mi300x_gate(true, "skipped", "success", &[S, "x-mi300x-stale-run"]);
+        assert_eq!(
+            code, 0,
+            "a near-miss marker name does not mark the lane stale:\n{log}"
+        );
+        // `::error::` is emitted when the requirement is not met.
+        let (code, log, _) = run_mi300x_gate(true, "skipped", "skipped", &[]);
+        assert_eq!(code, 1);
+        assert!(log.contains("::error::MI300X requirement not met"), "{log}");
     }
 
     #[test]

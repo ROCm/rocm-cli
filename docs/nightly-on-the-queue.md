@@ -78,9 +78,9 @@ minutes to be started and runs at most 75, and a limited number of such runs
 at once (the queue side sets the limit). The
 queue side does not take one while the nightly goes, or when it has no healthy
 MI300X worker: the gate job then fails with the reason the queue gave, which is
-capacity, not a failing test (on a pull request the consolidated report's
-MI300X check, `mi300x-gate.sh`, then needs the self-hosted lane to have passed
-with a report). The nightly window is the exception, being by design:
+capacity, not a failing test (the consolidated report's MI300X check,
+[`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh), still counts a run the
+queue refused as a lane that ran and failed). The nightly window is the exception, being by design:
 the gate ends green with a note in its summary to re-run once the window has
 passed (the queue side defines the window), and
 the consolidated report reads the lane as skipped, not missing; the MI300X check

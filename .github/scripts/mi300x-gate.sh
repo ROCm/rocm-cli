@@ -40,6 +40,9 @@
 #   QUEUE_RESULT          `e2e-gpu-queue`'s result: the `needs` vocabulary.
 #   QUEUE_SKIPPED         `true` when the queue lane skipped itself on purpose.
 #   QUEUE_ARTIFACT        the queue lane's report artifact name.
+#   SETTLE_RESULT         `e2e-gpu-settled`'s own result. Anything but `success` (or
+#                         `skipped`) leaves the self-hosted result unknown: absent
+#                         where the either-or rule applies, a failure where it does not.
 #   SELFHOSTED_RESULT     `e2e-gpu`'s result: the `needs` vocabulary plus
 #                         `abandoned` and `absent` (see settle-e2e-lanes.sh).
 #   SELFHOSTED_ARTIFACT   the self-hosted lane's report artifact name.
@@ -90,6 +93,14 @@ selfhosted_result="${SELFHOSTED_RESULT-}"
 if grep -qxF -- "${STALE_ARTIFACT:?STALE_ARTIFACT is required}" <<<"${artifacts}"; then
   selfhosted_result=skipped
 fi
+# `e2e-gpu-settled` hands over the self-hosted lane's result; when it failed, was
+# cancelled or never ran, that result is unknown and an empty one must not read as
+# an absent lane.
+settle_unknown=false
+if [[ "${SETTLE_RESULT:-success}" != success && "${SETTLE_RESULT}" != skipped ]]; then
+  settle_unknown=true
+  selfhosted_result=""
+fi
 selfhosted=$(classify "${selfhosted_result}" "" "${SELFHOSTED_ARTIFACT:?SELFHOSTED_ARTIFACT is required}")
 
 verdict=0
@@ -104,7 +115,10 @@ if [[ "${required}" = true ]]; then
     reason="no lane produced a passing report"
   fi
 else
-  if ran_without_report "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT}" ||
+  if [[ "${settle_unknown}" = true ]]; then
+    verdict=1
+    reason="the self-hosted lane's result is unknown (the settle job ${SETTLE_RESULT})"
+  elif ran_without_report "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT}" ||
     ran_without_report "${selfhosted_result}" "" "${SELFHOSTED_ARTIFACT}"; then
     verdict=1
     reason="a lane ran and exported no report"
@@ -114,6 +128,7 @@ else
 fi
 
 mark=":white_check_mark:"
+[[ "${required}" = true ]] || mark=":information_source:"
 [[ "${verdict}" = 0 ]] || mark=":x:"
 {
   echo "### MI300X: ${mark} ${reason}"
