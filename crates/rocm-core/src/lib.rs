@@ -75,7 +75,7 @@ pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
 pub use anthropic_endpoint::{
     ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
-    anthropic_endpoint_ready, wait_for_published_anthropic_endpoint,
+    anthropic_endpoint_ready, publish_anthropic_endpoint, wait_for_published_anthropic_endpoint,
 };
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
@@ -140,6 +140,10 @@ pub use fix::{
     list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
+    GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level, gpu_support_level_for_examine,
+    gpu_support_level_for_host_gpu,
+};
+pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
     normalize_therock_family,
 };
@@ -150,8 +154,8 @@ pub use host_gpu::{
     WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
     detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
     detect_host_gpu_summary, detect_host_unified_memory_gib, detect_system_ram_gib,
-    has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, preferred_serve_engine_for_host_gpu_summary,
-    usable_amd_gpu_indices, windows_amd_gpu_listing,
+    has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, pinned_gpu_name,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};

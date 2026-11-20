@@ -750,6 +750,12 @@ family is substituted for it. `rocm examine` reports the same conclusion on a
 
 These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
 
+`rocm examine` prints that `rocm_support` line on **every** host, not only this
+case, at one of three levels: ROCm/HIP-supported, Vulkan-only (the case above),
+or unknown. Unknown covers both no GPU detected and a target this build's
+catalog does not recognise — detection gaps rather than a verdict about the
+hardware, so neither is reported as "no ROCm build".
+
 #### Compiler toolchain (--devel)
 
 Pass `--devel` to also install the compiler and headers needed to build GPU
@@ -1485,9 +1491,14 @@ API key. While it starts, the status line follows the engine: a download, a weig
 load, or the latest log line, until the server is ready or that wait fails
 (the engine exits, a download stops advancing, or the startup deadline
 passes). When the server is ready it prints a deployment summary: a table
-with the status, the full inference endpoint, the API-qualified model name,
-and a quick smoke test (time to first token and approximate tokens per
-second). On an
+with the status, the engine and the backend device the engine reports (for
+example `rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)`
+where the engine pinned no GPU ordinal), the full inference endpoint, the
+API-qualified model name, and a quick smoke test (time to first token and
+approximate tokens per second). The device is read back from the running
+engine, so it is that engine's own account of the backend it was launched on
+rather than an independent measurement of the hardware. `rocm services`
+reports the same `device` for each running service. On an
 interactive terminal, if the smoke test cannot complete, the summary is headed
 `(smoke test failed)`, shows the status as `started, smoke test failed` instead
 of `ready`, and a note gives the reason and points at
@@ -1508,9 +1519,18 @@ lines shown on the status line have credentials (the endpoint key, `--api-key`
 and token values, `hf_` tokens) masked. Once the server lists the model, the wait
 checks whether it can answer with a one-token request, first right away and
 then at growing intervals up to every 15 seconds. Piped output, or a stderr that is not a terminal (`2>log`), keeps
-the 45-second wait and reports the server as it stood then. Control returns
-to your shell with the server still running; manage it later with
-`rocm services` (below).
+the 45-second wait and reports the server as it stood then.
+
+The device line is omitted when the engine cannot say yet. A server is reported
+ready as soon as it answers, which can be before it has finished loading the
+model, and until then the engine does not know which device it ended up on;
+`rocm serve` waits for it rather than holding your terminal — up to about 14
+seconds worst case (a 6-second device probe, plus Lemonade's 8-second inference
+probe) — and `rocm services` shows it once it is known. The GPU name is omitted on a machine
+with more than one AMD GPU, where naming one of them could name the wrong one.
+
+Control returns to your shell with the server still running; manage it later
+with `rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1754,6 +1774,18 @@ all), it signals nothing and names an operating-system command to check on it.
 It does not suggest running the stop again: when only a process under the
 recorded one survived, a second stop can report the server stopped while that
 process still runs.
+
+`list` asks each running server which backend and GPU it is actually on, so it
+can take a few seconds rather than returning instantly. With the built-in
+engines the query is capped in total — about 18 seconds worst case, however
+many servers are listed — and a server that does not answer in time simply has
+no `device` line rather than holding up the rest of the list. That cap is not
+universal: an external plugin engine is run as a child process and waited on
+without a deadline, so one that never exits can hold the listing indefinitely.
+Only the engines shipped here are bounded. The same applies to asking about servers in
+`rocm chat`, which prints the same list. `list --json` is unaffected: it emits
+the stored service records, which have no `device` field, asks no server
+anything, and returns as fast as it always did.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts

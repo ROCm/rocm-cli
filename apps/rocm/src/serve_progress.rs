@@ -1437,6 +1437,9 @@ mod tests {
             chat_endpoint: "http://127.0.0.1:1/v1/chat/completions".to_owned(),
             anthropic_endpoint: None,
             service_id: "svc-1".to_owned(),
+            // ROCMAI-550: a starting server has not said which backend it is
+            // on yet, which is exactly the case the row is omitted for.
+            device: None,
             status: "starting".to_owned(),
             already_running: false,
             metrics: crate::serve_summary::SmokeMetrics::default(),

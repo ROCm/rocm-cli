@@ -55,7 +55,7 @@ use rocm_engine_protocol::{
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
 use crate::engine_install_env::engine_manages_own_runtime;
-use crate::engine_ipc::engine_request;
+use crate::engine_ipc::{engine_request, fetch_service_device_briefly};
 use crate::engine_runtime_select::{
     EngineSelection, resolve_engine_selection, validate_engine_selection_runtime,
 };
@@ -66,6 +66,7 @@ use crate::gpu_policy::{
     serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::serve_device_probe::serve_device_probe_opens;
 use crate::serve_port;
 use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
@@ -1295,6 +1296,21 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 };
             spinner.clear();
 
+            // Read what the engine actually selected rather than guessing from
+            // the pre-launch GPU plan: `gpu_indices` above can be empty for a
+            // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
+            // the server is running fine on it. Only for a launch this command
+            // performed — [`serve_device_probe_opens`] says why skipping the
+            // reuse path is the point rather than tidiness. Asked more than
+            // once, briefly: `engines/lemonade` answers `"unknown"` until its
+            // own inference probe returns, a real window right after a launch
+            // reports ready. The wait is bounded
+            // (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is supported —
+            // no `device:` row, and `rocm services list` shows it once it can.
+            let device = serve_device_probe_opens(report.already_running, &report.status, || {
+                fetch_service_device_briefly(&paths, &selected_engine, &report.service_id)
+            });
+
             let mut notes = collect_serve_notes(
                 cpu_only,
                 &gpu_selection,
@@ -1359,6 +1375,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 anthropic_endpoint,
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
+                device,
                 already_running: report.already_running,
                 metrics,
                 smoke_failure,
