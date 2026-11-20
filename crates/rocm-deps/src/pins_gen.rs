@@ -88,21 +88,20 @@ pub fn render(text: &str) -> Result<String, String> {
                 return Err(format!("{tool} is not locked for {platform}"));
             }
         }
-        writeln!(
+        // Writing to a `String` cannot fail, so the `fmt::Result` carries nothing.
+        let _ = writeln!(
             out,
             "/// Version of `{tool}` locked in `runtimes/mise.lock`.\npub const {ident}_VERSION: &str = {version:?};"
-        )
-        .map_err(|err| format!("formatting the generated constants: {err}"))?;
+        );
         for (platform, (url, sha256)) in assets {
             let prefix = format!("{ident}_{}", platform.to_uppercase().replace('-', "_"));
-            writeln!(
+            let _ = writeln!(
                 out,
                 "/// Download URL of `{tool}` for `{platform}`, from `runtimes/mise.lock`.\n\
                  pub const {prefix}_URL: &str = {url:?};\n\
                  /// Hex SHA-256 of that download, from `runtimes/mise.lock`.\n\
                  pub const {prefix}_SHA256: &str = {sha256:?};"
-            )
-            .map_err(|err| format!("formatting the generated constants: {err}"))?;
+            );
         }
     }
     Ok(out)
