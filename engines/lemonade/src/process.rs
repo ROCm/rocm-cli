@@ -835,7 +835,7 @@ fn lemonade_backend_matches(value: &str, backend: &str) -> bool {
         .starts_with(&backend.to_ascii_lowercase())
 }
 
-pub(crate) fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String> {
+pub(crate) fn serve_http_command_args(request: &ServeHttpRequest) -> Result<Vec<String>> {
     let mut args = vec![
         "serve-http".to_owned(),
         request.service_id.clone(),
@@ -864,10 +864,11 @@ pub(crate) fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String>
     if let Some(engine_recipe) = request.engine_recipe.as_ref() {
         args.extend([
             "--engine-recipe-json".to_owned(),
-            serde_json::to_string(engine_recipe).expect("engine recipe serializes"),
+            serde_json::to_string(engine_recipe)
+                .context("failed to serialize the engine recipe for serve-http")?,
         ]);
     }
-    args
+    Ok(args)
 }
 
 #[cfg(windows)]
@@ -1442,7 +1443,7 @@ helper line
             log_path: Some(PathBuf::from("service.log")),
             engine_recipe: None,
         };
-        let args = serve_http_command_args(&request);
+        let args = serve_http_command_args(&request).expect("the request serializes");
         assert!(args.contains(&"--runtime-id".to_owned()));
         assert!(args.contains(&"runtime".to_owned()));
         assert!(args.contains(&"--env-id".to_owned()));

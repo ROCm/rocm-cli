@@ -593,7 +593,8 @@ async fn keep_daemon<S, F>(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;

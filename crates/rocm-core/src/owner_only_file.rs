@@ -368,8 +368,8 @@ pub(crate) mod win32 {
     pub(crate) fn create_new_with_sddl(path: &Path, sddl: &str) -> io::Result<File> {
         let descriptor = security_descriptor_from_sddl(sddl)?;
         let attributes = SECURITY_ATTRIBUTES {
-            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>())
-                .expect("SECURITY_ATTRIBUTES fits in a u32"),
+            // Cannot fail: a compile-time size of a few dozen bytes.
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).map_err(io::Error::other)?,
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };

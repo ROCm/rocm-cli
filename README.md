@@ -193,6 +193,39 @@ irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 As on Linux, this is the binary's channel only. The ROCm SDK channel is chosen
 separately with `rocm install sdk --channel`.
 
+### Try a pull request's build
+
+CI builds a bundle for each pull request that changes code, and the installers
+can install it by pull request number. The pull request's CI run shows the
+exact command on its summary page, under "Try this PR's build". This needs the
+[GitHub CLI](https://cli.github.com) signed in (`gh auth login`, or
+`GH_TOKEN` set), because GitHub only serves workflow artifacts to signed-in
+users.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- pr-1234
+```
+
+```powershell
+$env:ROCM_CLI_CHANNEL = "pr-1234"
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+Remove-Item Env:ROCM_CLI_CHANNEL
+```
+
+The installer installs the build of the pull request's latest commit and
+prints the commit and the CI run it came from, with the run's result. Whether
+a failed run still has a build depends on the platform: the Linux build is a
+separate job, so a failing test elsewhere in the run leaves it in place, but a
+failure in the lint or formatting checks that gate it leaves none, and the
+Windows build is packaged after that job's install lifecycle checks, so a
+failure there leaves none either. Builds are unsigned and unreviewed, so only the download's checksum is
+verified, and asking for a signature (`ROCM_CLI_REQUIRE_SIGNATURE=1`, or a
+signing key) fails instead of being skipped. They are kept for 7 days, so an
+older pull request needs a new push or a re-run. `ROCM_CLI_GITHUB_REPO` points
+the lookup at a fork. `ROCM_CLI_DOWNLOAD_BASE` cannot be combined with a pull
+request channel in either installer, nor can `ROCM_CLI_ARCHIVE` or
+`ROCM_CLI_DOWNLOAD_ONLY` in `install.sh`, the only one that has them.
+
 ### Verify the installation
 
 Open a new terminal so the updated `PATH` takes effect, then run:
@@ -1165,8 +1198,10 @@ models that would run here instead.
 true:
 
 - The recipe catalog could not be read.
-- This machine's GPU memory could not be measured. This includes an integrated
-  GPU (APU), where the CLI can't yet read the memory pool the engine uses.
+- This machine's GPU memory could not be measured. On an integrated GPU (APU)
+  that means the shared memory pool its engine allocates from could not be read
+  on this host, which is a narrower statement than "no reading at all" and is
+  reported as such.
 - The model is not one of the curated recipes. [`rocm model --verbose`](#curated-models)
   lists all of them, including recipes hidden from the default list.
 
@@ -1174,6 +1209,14 @@ None of these says anything about whether the model fits, so none of them is
 reported as though it did. `rocm serve` still accepts a model outside the
 catalog, but for anything other than a GGUF, `diagnose` cannot tell you in
 advance how it will go.
+
+An integrated GPU whose pool **can** be read is judged on that pool — the
+memory its engine actually allocates from, not the small VRAM carve-out the
+BIOS reserves. That pool is shared with the operating system, so it is a
+ceiling and not an allocation: a model that fits under it is answered
+`degraded` rather than `ready`, with the reason, because nothing here measures
+how much of the pool is free. A model larger than the ceiling is `blocked`, and
+the report says that freeing memory will not raise it.
 
 #### A GGUF model outside the catalog
 
@@ -1201,7 +1244,8 @@ has two minutes in all, so on a slow link it can take that long to fail. No
 token is sent, so a gated or private repository cannot be read.
 It then estimates weights, plus the KV cache at `--context-size` (default 4096)
 and `--kv-cache-type` (default `f16`), plus a compute buffer and a runtime
-reserve, against this GPU's dedicated VRAM:
+reserve, against this GPU's dedicated VRAM — or, on an integrated GPU, against
+the shared memory pool its engine allocates from:
 
 ```
 rocm diagnose --model owner/repo:Q4_K_M --context-size 32768 --kv-cache-type q8_0
@@ -1247,7 +1291,8 @@ which size the compute buffer, is treated the same way (reason
 `missing_metadata`, with the figures). Another
 GPU, engine build or batch size can miss by more, so leave headroom. The figures
 are compared with the total dedicated VRAM of the GPU with the most of it that
-ROCm can see, the same figure a curated model's minimum is compared with, not
+ROCm can see — or, on an integrated GPU, with the shared memory pool its engine
+allocates from — the same figure a curated model's minimum is compared with, not
 with what other processes have left free. When a device-visibility variable
 (`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) is set on
 a host whose GPUs differ in memory, the report says that the mapping between the
@@ -1264,12 +1309,14 @@ at all, so nothing is fetched for it, and `--context-size` and `--kv-cache-type`
 are ignored along with `--model`; a note on stderr names the flags that were
 ignored.
 
-On an integrated GPU (APU), where the CLI can't read the memory
-pool the engine uses, and on a host with no GPU or an unreadable one, the
-answer stays `undetermined` but still shows what the file needs. Layouts the
-formula does not describe (a file that is one shard of a split model, latent
-attention, a model with no attention layers) are reported as such rather than
-estimated.
+On an integrated GPU (APU) the comparison is made against the shared pool its
+engine allocates from, with a note that the figure is a ceiling on memory the
+operating system draws on too, so a `fits` there means "the machine would allow
+this at best". On a host with no GPU, an unreadable one, or an APU whose pool
+could not be read, the answer stays `undetermined` but still shows what the
+file needs. Layouts the formula does not describe (a file that is one shard of a
+split model, latent attention, a model with no attention layers) are reported as
+such rather than estimated.
 
 ### Curated models
 
@@ -1278,9 +1325,16 @@ rocm model [--verbose]
 ```
 
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
-the hardware they target. Pass `--verbose` to list every recipe, including ones
-hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+the hardware they target. The recommendations are narrowed to the models this
+machine's GPU memory can hold, at most three per hardware group, and the listing
+says how many further curated models also fit. Where none of them fit it says so
+rather than printing an empty list, and where this machine's GPU memory could not
+be read the list is not narrowed at all and says it is not host-specific — an
+unmeasured machine is never told its options are narrow.
+
+Pass `--verbose` to list every recipe, including ones hidden from the default
+list and ones too large for this machine, with details such as aliases, data
+type, minimum GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
 images are among the hidden recipes: `--verbose` shows each one's supported GPU
 families, the GPU count it needs per family, and whether it needs a Hugging Face
 token (`requires_hf_token=yes`), and
@@ -1424,10 +1478,16 @@ Likewise, an explicit `--port` that differs from the port the running service
 is already on is refused rather than silently ignored; omit `--port` to reuse
 the running service, or stop it first to serve on the new port.
 
-By default the server runs in the background under ROCm CLI's supervision and
-prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). On an
+By default the server runs in the background under ROCm CLI's supervision.
+For a fresh launch in a terminal it first prints the service id, how to follow its log
+(`rocm logs --service <service-id> --follow`) and, for a public bind, the
+API key. While it starts, the status line follows the engine: a download, a weight
+load, or the latest log line, until the server is ready or that wait fails
+(the engine exits, a download stops advancing, or the startup deadline
+passes). When the server is ready it prints a deployment summary: a table
+with the status, the full inference endpoint, the API-qualified model name,
+and a quick smoke test (time to first token and approximate tokens per
+second). On an
 interactive terminal, if the smoke test cannot complete, the summary is headed
 `(smoke test failed)`, shows the status as `started, smoke test failed` instead
 of `ready`, and a note gives the reason and points at
@@ -1435,9 +1495,22 @@ of `ready`, and a note gives the reason and points at
 still exits 0. Which failures are detected, and which still read as `ready`, is
 listed under
 [Serve Smoke Test Failure](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md#serve-smoke-test-failure)
-in the testing guide. Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+in the testing guide. A model that is still loading is not reported as a finished "not
+ready" summary. The wait fails, and `rocm serve` exits non-zero, when the
+engine reports failure or its process exits, when a download percent stops
+advancing for 3 minutes (a line at 100% counts as loading), when the endpoint has not listed the model and there is no engine log for
+5 minutes, when a load log line stops changing for 5 minutes with the endpoint
+not yet listing the model, or after 30 minutes in all. A stall leaves the server running:
+the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and the background helper does not
+restart a live server for being slow until those 30 minutes pass. Engine log
+lines shown on the status line have credentials (the endpoint key, `--api-key`
+and token values, `hf_` tokens) masked. Once the server lists the model, the wait
+checks whether it can answer with a one-token request, first right away and
+then at growing intervals up to every 15 seconds. Piped output, or a stderr that is not a terminal (`2>log`), keeps
+the 45-second wait and reports the server as it stood then. Control returns
+to your shell with the server still running; manage it later with
+`rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
@@ -1455,8 +1528,8 @@ can:
 `--managed` is the explicit form of the default background behavior.
 `--wait` keeps `rocm serve` waiting until the server answers requests or its
 engine gives up (vLLM and AIM after 5 minutes by default; raise it with
-`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), instead
-of returning `starting` after 45 seconds; if the server exits first (crashes, is killed, or is stopped with
+`ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`), with
+no CLI-side stall limit or deadline, instead of the default wait above; if the server exits first (crashes, is killed, or is stopped with
 `rocm services stop`), it fails with an error that points at the server's logs
 instead of waiting forever. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
@@ -2062,14 +2135,19 @@ do and asks `[y/N]` (default: no) before doing it. Only `y` or `yes` proceeds.
 Enter, `n` and `no` cancel: it prints `uninstall cancelled`, removes nothing and
 exits with code 0. Any other answer cancels the same way, after a line saying
 that the answer was not understood and is treated as no. Use `--dry-run` to only
-list, and `--yes` to skip the confirmation. There is no `--force`; `--force-dev-binaries`
-is a separate opt-in for development builds. At a terminal, a dry run that finds
+list, and `--yes` to skip the confirmation. There is no `--force`: passing it is refused,
+ending with a `Try:` line that repeats your command with `--yes` in its place.
+`--force-dev-binaries` is a separate opt-in for development builds. At a terminal, a dry run that finds
 something to remove ends by saying to run the same command again without
 `--dry-run`; with nothing to remove, or when stdin or stdout is not a terminal
 (its output is piped or its input is redirected), it says nothing about a next step. It does not create the folders it reports on:
 with `--keep-binaries`, on a computer where ROCm CLI never ran, it says there is
 nothing to remove. Outside an interactive terminal, when there is something to
-remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`.
+remove, it refuses with exit code 1 and removes nothing unless you pass `--yes`;
+the refusal ends with a `Try:` line that is the same command with `--yes` added.
+Run either `Try:` line in the same environment as the refused command: it
+repeats the flags, not variables such as `HOME` or `ROCM_CLI_CONFIG_DIR` set in
+front of the command, and without them it removes the default folders.
 Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.

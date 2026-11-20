@@ -13,6 +13,12 @@
 //!
 //! Usage: `rocm-demo-env --root <dir> [--model <id>]`
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "screencast demo environment for the e2e mocks, never shipped: a setup failure should stop it loudly"
+)]
+
 use std::io::Write as _;
 use std::path::PathBuf;
 

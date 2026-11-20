@@ -5,7 +5,8 @@
 //! Engine-agnostic deployment summary for `rocm serve`.
 //!
 //! By default `rocm serve <model>` no longer streams raw engine logs. Instead it
-//! shows an animated status indicator while the server starts, runs a small
+//! shows a status line that follows the engine (a download, a load, or the
+//! latest log line) while the server starts, runs a small
 //! inference smoke test, and then prints a compact summary table: deployment
 //! status, the full inference endpoint (with port), the API-qualified model name,
 //! and the measured time-to-first-token / throughput.
@@ -170,10 +171,11 @@ pub(crate) fn format_tps(tps: Option<f64>) -> String {
 /// Render the deployment summary table as plain text (returned rather than
 /// printed so it is unit-testable and identical across engines).
 pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
-    // The server answered its health check within the startup window. A launch
-    // that timed out lands here with `status == "starting"`; the heading and a
-    // note must make that visibly different from a healthy deployment so the
-    // summary is never mistaken for success.
+    // A ready server answered an inference request. Any other status on a fresh
+    // launch gets a distinct heading so it cannot be read as success.
+    // Interactive `rocm serve` does not render this heading for a startup that
+    // is still loading: that wait ends in `ServeStartupStop::user_message`
+    // (`listing_at_the_deadline_stops_without_a_not_ready_summary`).
     let ready = summary.status == "ready";
     let smoke_failed = summary.smoke_failure.is_some() && !summary.already_running;
     let heading = if summary.already_running {
@@ -231,7 +233,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ),
             (
                 "logs",
-                format!("rocm logs --service {}", summary.service_id),
+                crate::service_hints::service_logs_hint(&summary.service_id),
             ),
         ],
     ]
@@ -268,8 +270,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} - follow `rocm logs --service {} --follow` or check `rocm services list`",
-            summary.service_id
+            "  note: {explanation} - follow `{} --follow` or check `rocm services list`",
+            crate::service_hints::service_logs_hint(&summary.service_id)
         );
     }
     if let (true, Some(reason)) = (smoke_failed, summary.smoke_failure.as_deref()) {
@@ -278,8 +280,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         // empty, hedged: the reason may be rocm's own plumbing, not the engine.
         let _ = writeln!(
             out,
-            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `rocm logs --service {id}`",
-            id = summary.service_id
+            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `{logs}`",
+            logs = crate::service_hints::service_logs_hint(&summary.service_id)
         );
     }
     for note in &summary.notes {
@@ -1291,6 +1293,14 @@ mod tests {
         // The hedge: the note must not claim the server is broken, only that it
         // may be unable to serve.
         assert!(rendered.contains("; the server may not be able to serve requests"));
+        // The id goes through the shared hint, so one that needs quoting is
+        // quoted here as in the summary's other notes.
+        let mut hostile = failed_summary("connection closed mid-response");
+        hostile.service_id = "svc $(id)".to_owned();
+        let rendered = render_summary(&hostile);
+        // No `{rendered}` in the failure message: the rendered summary can
+        // carry an endpoint key, so it is not printed, like the asserts above.
+        assert!(rendered.contains("check `rocm logs --service 'svc $(id)'`"));
     }
 
     #[test]

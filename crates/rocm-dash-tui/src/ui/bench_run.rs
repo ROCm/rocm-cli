@@ -150,7 +150,9 @@ pub fn on_key(br: &mut Option<BenchRunState>, jobs: &mut State, key: KeyEvent) -
 
 /// Validate and submit the form as a `SpawnJob`.
 fn try_submit(br: &mut Option<BenchRunState>, jobs: &mut State) -> Vec<SideEffect> {
-    let state = br.as_mut().expect("called only when Some");
+    let Some(state) = br.as_mut() else {
+        return Vec::new();
+    };
 
     let endpoint = state.endpoint.trim().to_string();
     if endpoint.is_empty() {
@@ -587,6 +589,15 @@ mod tests {
         let fx = on_key(&mut br, &mut jobs, key(KeyCode::Esc));
         assert!(fx.is_empty());
         assert!(br.is_none(), "Esc must close the form");
+    }
+
+    #[test]
+    fn submitting_with_no_open_form_does_nothing() {
+        let mut br = None;
+        let mut jobs = State::default();
+        let fx = try_submit(&mut br, &mut jobs);
+        assert!(fx.is_empty(), "no form, nothing to submit");
+        assert!(br.is_none());
     }
 
     #[test]

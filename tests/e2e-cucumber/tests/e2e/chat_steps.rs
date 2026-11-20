@@ -298,3 +298,90 @@ async fn no_tool_result_printed(world: &mut E2eWorld) {
         "a tool result was printed for a refused request:\n{stdout}"
     );
 }
+
+/// The model id the CLI's built-in assistant is served under.
+///
+/// Repeated here because the harness is black-box and cannot import the
+/// product's constant (`LEMONADE_ASSISTANT_MODEL_ID` in
+/// `apps/rocm/src/providers.rs`). The planted service must carry it, or the
+/// local provider answers "no ready managed service" instead of calling the
+/// mock.
+const BUILTIN_ASSISTANT_MODEL_ID: &str = "Qwen3-4B-Instruct-2507-GGUF";
+
+/// A model question the CLI answers by running its `model` tool itself:
+/// `fallback_rocm_tool_call_for_prompt` in `apps/rocm/src/chat/intent.rs` adds
+/// a `rocm model` call for a prompt mentioning a model and asking what runs.
+/// Asked through the assistant rather than by calling the tool directly so the
+/// scenario covers the turn the user actually takes.
+const MODEL_QUESTION: &str = "which models can I run on this machine?";
+
+#[given("a local chat assistant that answers a model question in words")]
+async fn chat_assistant_that_answers_a_model_question(world: &mut E2eWorld) {
+    // Two completions, in order: the assistant's first reply (plain words, so
+    // the CLI adds its own `model` tool call) and its closing reply after the
+    // tool ran. The second is needed because a model listing's deterministic
+    // summary never stands in for the local model's own answer — it names
+    // three recipes out of the catalog — so the turn always asks again
+    // (`deterministic_summary_can_stand_alone` in
+    // `apps/rocm/src/chat/summaries.rs`).
+    let script = vec![
+        e2e_cucumber::mock_server::chat_text_reply(
+            BUILTIN_ASSISTANT_MODEL_ID,
+            "Let me check what this machine can run.",
+        ),
+        e2e_cucumber::mock_server::chat_text_reply(
+            BUILTIN_ASSISTANT_MODEL_ID,
+            "Those are the recipes this machine has.",
+        ),
+    ];
+    let mock = MockServer::start_with_chat_script(BUILTIN_ASSISTANT_MODEL_ID, script).await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(BUILTIN_ASSISTANT_MODEL_ID.to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(e2e_cucumber::mock_server::ServiceRecordOptions {
+        // Without the latch the CLI's readiness check sends its own completion
+        // probe first, which would consume the first scripted reply.
+        inference_verified: true,
+        ..e2e_cucumber::mock_server::ServiceRecordOptions::default()
+    });
+}
+
+#[when("the user asks in one-shot chat which models this machine can run")]
+async fn user_asks_which_models_run(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "chat",
+            "--provider",
+            "local",
+            "--model",
+            &model,
+            // The ROCm tool calls are opt-in on this surface, and the summary
+            // only exists for a tool result; without it the turn is a plain
+            // completion and nothing is checked about this machine.
+            "--tools",
+            "--prompt",
+            MODEL_QUESTION,
+        ],
+    );
+    assert!(rc == 0, "rocm chat failed (rc={rc}):\n{stdout}\n{stderr}");
+    world.cli_output = Some(stdout);
+}
+
+#[then("the chat shows a ROCm CLI summary naming the low-VRAM local assistant")]
+async fn chat_shows_the_rocm_cli_summary(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    assert!(
+        stdout.contains("ROCm CLI summary"),
+        "the chat printed no ROCm CLI summary block:\n{stdout}"
+    );
+    // The point of the block on a small GPU: it names a model that fits, which
+    // the curated listing grouped by hardware target does not.
+    assert!(
+        stdout.contains(&format!(
+            "Recommended local assistant: qwen ({BUILTIN_ASSISTANT_MODEL_ID})"
+        )) && stdout.contains("Fit: needs about 4 GiB GPU memory."),
+        "the summary does not name the low-VRAM assistant and its fit:\n{stdout}"
+    );
+}

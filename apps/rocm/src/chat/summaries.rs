@@ -11,97 +11,34 @@
 //! is the entry point the turn loop calls; when it returns a summary the chat
 //! shows it instead of asking the local model to restate the output.
 //!
-//! The parsers that turn tool text back into rows (`DeterministicModelRecipe`,
-//! `DeterministicServiceRow`, `DeterministicEngineRow`) and
-//! `managed_service_running_state`, the mapping from a managed service's status
-//! to `running`, `starting`, `not_running` or `unknown`, live here too. The
-//! services tool text itself is rendered by `chat/mcp_bridge.rs`
-//! (`render_services_tool_result_text`), which reads
+//! The model summary is the exception to "reads the values it needs out of
+//! it": it recognises the `rocm model` listing from the text
+//! (`model_catalog_text::text_is_model_catalog_listing`) but takes every value
+//! it prints from `load_model_recipe_registry` and
+//! `model_catalog_text::model_recipe_engine_availability`. It used to parse the
+//! `--verbose` listing's `aliases=[…] min_gpu_mem=…` rows instead, so pointing
+//! the chat tool at the curated listing in #1041 silently removed the summary.
+//!
+//! The parsers that turn tool text back into rows (`DeterministicServiceRow`,
+//! `DeterministicEngineRow`) and `managed_service_running_state`, the mapping
+//! from a managed service's status to `running`, `starting`, `not_running` or
+//! `unknown`, live here too. The services tool text itself is rendered by
+//! `chat/mcp_bridge.rs` (`render_services_tool_result_text`), which reads
 //! `managed_service_running_state` from this module.
 //!
 //! A leaf of the `chat` module: nothing here calls back into `chat.rs`. The
-//! only edges out are `providers` (the assistant model ids) and
-//! `managed_service_status::friendly_engine_label`.
+//! only edges out are `providers` (the assistant model ids),
+//! `managed_service_status::friendly_engine_label` and the two model-catalog
+//! helpers above.
 
 use crate::managed_service_status::friendly_engine_label;
+use crate::model_catalog_text::{
+    ModelEngineAvailability, model_recipe_engine_availability, text_is_model_catalog_listing,
+};
 use crate::providers;
 use rocm_core::placeholder::empty_as_unknown;
+use rocm_core::{AppPaths, ModelRecipeRecord, load_model_recipe_registry};
 use std::fmt::Write as _;
-
-#[derive(Debug, Default)]
-struct DeterministicModelRecipe {
-    pub(crate) canonical_id: String,
-    pub(crate) min_gpu_mem_gib: Option<u32>,
-    pub(crate) engines: Vec<String>,
-    pub(crate) engine_statuses: Vec<String>,
-    pub(crate) warnings: Vec<String>,
-}
-
-fn parse_deterministic_model_recipes(tool_text: &str) -> Vec<DeterministicModelRecipe> {
-    let mut recipes = Vec::new();
-    let mut current: Option<DeterministicModelRecipe> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim();
-        if let Some(recipe) = parse_model_recipe_header(trimmed) {
-            if let Some(previous) = current.replace(recipe) {
-                recipes.push(previous);
-            }
-            continue;
-        }
-        let Some(recipe) = current.as_mut() else {
-            continue;
-        };
-        if is_engine_status_line(trimmed) {
-            recipe.engine_statuses.push(trimmed.to_owned());
-        } else if let Some(warning) = trimmed.strip_prefix("warning:") {
-            recipe.warnings.push(warning.trim().to_owned());
-        }
-    }
-    if let Some(recipe) = current {
-        recipes.push(recipe);
-    }
-    recipes
-}
-
-fn parse_model_recipe_header(line: &str) -> Option<DeterministicModelRecipe> {
-    if !line.contains(" aliases=[") || !line.contains("min_gpu_mem=") {
-        return None;
-    }
-    let canonical_id = line.split_whitespace().next()?.to_owned();
-    let engines = parse_bracketed_csv(line, "engines=[", "]");
-    let min_gpu_mem_gib = line
-        .split_once("min_gpu_mem=")
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .and_then(|value| value.parse::<u32>().ok());
-    Some(DeterministicModelRecipe {
-        canonical_id,
-        min_gpu_mem_gib,
-        engines,
-        engine_statuses: Vec::new(),
-        warnings: Vec::new(),
-    })
-}
-
-fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
-    line.split_once(start)
-        .and_then(|(_, rest)| rest.split_once(end))
-        .map(|(values, _)| {
-            values
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn is_engine_status_line(line: &str) -> bool {
-    matches!(
-        line.split_once(':').map(|(engine, _)| engine),
-        Some("lemonade" | "vllm" | "aim")
-    )
-}
 
 #[derive(Debug, Default)]
 struct DeterministicServiceRow {
@@ -294,9 +231,9 @@ pub(super) fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String>
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-pub(super) fn deterministic_chat_tool_summary(tool_text: &str) -> Option<String> {
+pub(super) fn deterministic_chat_tool_summary(paths: &AppPaths, tool_text: &str) -> Option<String> {
     deterministic_rocm_tool_summary(tool_text)
-        .or_else(|| deterministic_model_tool_summary(tool_text))
+        .or_else(|| deterministic_model_tool_summary(paths, tool_text))
         .or_else(|| deterministic_combined_status_tool_summary(tool_text))
 }
 
@@ -313,47 +250,62 @@ fn deterministic_combined_status_tool_summary(tool_text: &str) -> Option<String>
     (!summaries.is_empty()).then(|| summaries.join("\n"))
 }
 
+/// Whether a deterministic summary of `tool_text` answers the turn by itself.
+///
+/// The model summary does not: it names three recipes out of a catalog of
+/// dozens, so whatever the user actually asked about the catalog still goes to
+/// the local model. Keyed on the same listing check the summary itself uses, so
+/// the two cannot disagree about what a model listing is.
 pub(super) fn deterministic_summary_can_stand_alone(tool_text: &str) -> bool {
-    !tool_text.contains("model recipes")
+    !text_is_model_catalog_listing(tool_text)
 }
 
-fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("model recipes") {
+/// The canonical id of the tiny GGUF model the catalog carries for checking
+/// that GPU serving starts at all.
+const SMOKE_TEST_MODEL_ID: &str = "Qwen3-0.6B-GGUF";
+
+/// The canonical id of the catalog's 8 GiB-class chat recipe.
+const EIGHT_GIB_CLASS_MODEL_ID: &str = "meta-llama/Llama-3.2-3B-Instruct";
+
+/// The chat's standing answer to "what can this machine run": the low-VRAM
+/// assistant, the smoke-test model and the 8 GiB-class option, by name.
+///
+/// Worth printing because the `rocm model` listing the chat tool renders is
+/// grouped by hardware target and, on a small GPU, names nothing that fits.
+/// `tool_text` only identifies the tool; every value comes from the registry,
+/// so a change to either listing's wording cannot quietly empty this out.
+fn deterministic_model_tool_summary(paths: &AppPaths, tool_text: &str) -> Option<String> {
+    if !text_is_model_catalog_listing(tool_text) {
         return None;
     }
-    let recipes = parse_deterministic_model_recipes(tool_text);
-    if recipes.is_empty() {
-        return None;
-    }
+    let registry = load_model_recipe_registry().ok()?;
+    let recipe_for = |id: &str| {
+        registry
+            .recipes
+            .iter()
+            .find(|recipe| recipe.canonical_model_id == id)
+    };
 
     let mut lines = Vec::new();
-    if let Some(recipe) = recipes
-        .iter()
-        .find(|recipe| recipe.canonical_id == providers::LEMONADE_ASSISTANT_MODEL_ID)
-    {
+    if let Some(recipe) = recipe_for(providers::LEMONADE_ASSISTANT_MODEL_ID) {
         lines.push(format!(
             "  Recommended local assistant: qwen ({})",
-            recipe.canonical_id
+            recipe.canonical_model_id
         ));
         lines.push(format!(
             "    Fit: needs about {} GPU memory.",
-            recipe
-                .min_gpu_mem_gib
-                .map_or_else(|| "unknown".to_owned(), |value| format!("{value} GiB"))
+            model_recipe_gpu_memory(recipe, "unknown")
         ));
         lines.push(format!(
             "    Engine: {}",
-            deterministic_engine_fit_summary(recipe, "lemonade")
+            engine_fit_labels(&model_recipe_engine_availability(recipe, Some(paths)))
         ));
     }
 
-    if let Some(recipe) = recipes
-        .iter()
-        .find(|recipe| recipe.canonical_id == "Qwen3-0.6B-GGUF")
-    {
+    if let Some(recipe) = recipe_for(SMOKE_TEST_MODEL_ID) {
         lines.push(format!(
             "  Tiny smoke test: qwen-smoke ({})",
-            recipe.canonical_id
+            recipe.canonical_model_id
         ));
         lines.push(
             "    Use this only to check that GPU serving starts; it is not the default assistant."
@@ -361,124 +313,69 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
         );
     }
 
-    if let Some(recipe) = recipes
-        .iter()
-        .find(|recipe| recipe.canonical_id == "meta-llama/Llama-3.2-3B-Instruct")
-    {
+    if let Some(recipe) = recipe_for(EIGHT_GIB_CLASS_MODEL_ID) {
         lines.push(format!(
             "  8 GiB-class option: llama ({})",
-            recipe.canonical_id
+            recipe.canonical_model_id
         ));
         lines.push(format!(
             "    Fit: asks for {}; this can be tight on APUs and depends on available shared GPU memory.",
-            recipe
-                .min_gpu_mem_gib.map_or_else(|| "unknown GPU memory".to_owned(), |value| format!("{value} GiB"))
+            model_recipe_gpu_memory(recipe, "unknown GPU memory")
         ));
         lines.push(format!(
             "    Engines: {}",
-            deterministic_available_engine_names(recipe).join(", ")
+            engine_fit_labels(&model_recipe_engine_availability(recipe, Some(paths)))
         ));
     }
 
-    let larger = recipes
-        .iter()
-        .filter(|recipe| recipe.min_gpu_mem_gib.is_some_and(|value| value > 8))
-        .filter(|recipe| recipe.canonical_id != providers::BUILTIN_ASSISTANT_MODEL_ID)
-        .map(|recipe| {
-            format!(
-                "{} asks for {}",
-                recipe.canonical_id,
-                recipe.min_gpu_mem_gib.map_or_else(
-                    || "more GPU memory".to_owned(),
-                    |value| format!("{value} GiB")
-                )
-            )
-        })
-        .collect::<Vec<_>>();
-    if !larger.is_empty() {
-        lines.push(format!(
-            "  Larger recipes are not low-VRAM defaults: {}.",
-            larger.join("; ")
-        ));
+    if lines.is_empty() {
+        return None;
     }
-
-    let linux_wsl_only = recipes
-        .iter()
-        .flat_map(|recipe| {
-            recipe
-                .engine_statuses
-                .iter()
-                .filter(|status| {
-                    status.contains("unsupported_native_windows")
-                        || status.to_ascii_lowercase().contains("wsl/linux")
-                        || status.to_ascii_lowercase().contains("linux/wsl")
-                })
-                .filter_map(|status| {
-                    let (engine, _) = status.split_once(':')?;
-                    Some(format!(
-                        "{} uses {} through WSL/Linux on Windows",
-                        recipe.canonical_id, engine
-                    ))
-                })
-        })
-        .collect::<Vec<_>>();
-    if !linux_wsl_only.is_empty() {
-        lines.push(format!(
-            "  Native Windows note: {}.",
-            linux_wsl_only.join("; ")
-        ));
-    }
-
-    if !lines.is_empty() {
-        lines.push(
-            "  Run `rocm examine` to refresh GPU memory details before starting anything large."
-                .to_owned(),
-        );
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
+    lines.push(
+        "  Run `rocm examine` to refresh GPU memory details before starting anything large."
+            .to_owned(),
+    );
+    Some(lines.join("\n"))
 }
 
-fn deterministic_engine_fit_summary(recipe: &DeterministicModelRecipe, engine: &str) -> String {
-    let status = recipe
-        .engine_statuses
-        .iter()
-        .find(|status| status.starts_with(&format!("{engine}:")))
-        .map(std::string::String::as_str);
-    match status {
-        Some(status) if status.contains("unsupported_native_windows") => {
-            format!("{engine}: WSL/Linux only on Windows")
-        }
-        Some(status)
-            if status.split_once(':').is_some_and(|(_, rest)| {
-                rest.trim_start().starts_with("available")
-                    || rest.trim_start().starts_with("adapter_available")
-            }) =>
-        {
-            format!("{engine}: available")
-        }
-        Some(status) => status.to_owned(),
-        None if recipe.engines.iter().any(|candidate| candidate == engine) => {
-            format!("{engine}: listed")
-        }
-        None => format!("{engine}: not listed"),
-    }
+fn model_recipe_gpu_memory(recipe: &ModelRecipeRecord, unknown: &str) -> String {
+    recipe
+        .min_gpu_mem_gb
+        .map_or_else(|| unknown.to_owned(), |value| format!("{value} GiB"))
 }
 
-fn deterministic_available_engine_names(recipe: &DeterministicModelRecipe) -> Vec<String> {
-    let engines = recipe
-        .engine_statuses
-        .iter()
-        .filter_map(|status| {
-            let (engine, rest) = status.split_once(':')?;
-            (rest.trim_start().starts_with("available")
-                || rest.trim_start().starts_with("adapter_available"))
-            .then_some(engine.to_owned())
-        })
-        .collect::<Vec<_>>();
+/// Each preferred engine with what this host can do with it, as
+/// `lemonade: built_in` or `vllm: WSL/Linux only on Windows`.
+///
+/// A recipe with no preferred engine reads `<none listed>` rather than an empty
+/// tail, so the line never ends in a dangling colon.
+fn engine_fit_labels(engines: &[ModelEngineAvailability]) -> String {
     if engines.is_empty() {
-        recipe.engines.clone()
-    } else {
-        engines
+        return "<none listed>".to_owned();
+    }
+    engines
+        .iter()
+        .map(engine_fit_label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn engine_fit_label(engine: &ModelEngineAvailability) -> String {
+    use crate::PlatformRuleOut;
+    use crate::model_catalog_text::ModelEngineLocation;
+
+    let name = &engine.engine;
+    match engine.platform_rule_out {
+        PlatformRuleOut::NativeWindowsVllm | PlatformRuleOut::NativeWindowsAim => {
+            format!("{name}: WSL/Linux only on Windows")
+        }
+        PlatformRuleOut::AimDockerUnavailable => format!("{name}: needs a reachable Docker daemon"),
+        PlatformRuleOut::Allowed => match engine.location {
+            ModelEngineLocation::BuiltIn => format!("{name}: built_in"),
+            ModelEngineLocation::Plugin(_) => format!("{name}: available"),
+            ModelEngineLocation::Unavailable(_) => format!("{name}: not installed"),
+            ModelEngineLocation::NotChecked => format!("{name}: not checked"),
+        },
     }
 }
 
@@ -662,6 +559,7 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::test_paths;
 
     /// A ComfyUI that answers but that rocm-cli did not start is running, as
     /// the chat's own status answer says (`Running: yes`), not "not running".
@@ -700,42 +598,6 @@ mod tests {
             summary.contains("  Next step: run `rocm comfyui stop`."),
             "{summary}"
         );
-    }
-
-    #[test]
-    fn parse_deterministic_model_recipes_reads_header_fields_and_notes() {
-        let recipes = parse_deterministic_model_recipes(
-            "\
-  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen, lemonade-qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-lemonade: ready
-warning: slow on this GPU
-  Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
-vllm: not_installed
-",
-        );
-        assert_eq!(recipes.len(), 2);
-        assert_eq!(recipes[0].canonical_id, "Qwen3-4B-Instruct-2507-GGUF");
-        assert_eq!(recipes[0].min_gpu_mem_gib, Some(4));
-        assert_eq!(recipes[0].engines, vec!["lemonade".to_owned()]);
-        assert_eq!(
-            recipes[0].engine_statuses,
-            vec!["lemonade: ready".to_owned()]
-        );
-        assert_eq!(recipes[0].warnings, vec!["slow on this GPU".to_owned()]);
-        assert_eq!(recipes[1].canonical_id, "Qwen/Qwen3.5-4B");
-        assert_eq!(recipes[1].min_gpu_mem_gib, Some(12));
-    }
-
-    #[test]
-    fn parse_deterministic_model_recipes_requires_aliases_bracket_in_header() {
-        let recipes = parse_deterministic_model_recipes(
-            "\
-  NotAHeader task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-  Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
-",
-        );
-        assert_eq!(recipes.len(), 1);
-        assert_eq!(recipes[0].canonical_id, "Qwen/Qwen3.5-4B");
     }
 
     #[test]
@@ -831,43 +693,88 @@ runtime_state:
         assert!(summary.contains("no global legacy ROCm install was found"));
     }
 
+    /// Both `rocm model` renderers are run for real and their output fed to the
+    /// summary, so the summary cannot keep passing against a listing format
+    /// nothing renders any more. Pointing the chat tool at the curated listing
+    /// in #1041 silently emptied this block, and the fixture test that stood
+    /// here — hand-written in the `--verbose` format — stayed green through it.
     #[test]
-    fn deterministic_model_tool_summary_identifies_low_vram_assistant() {
-        let summary = deterministic_model_tool_summary(
-            "\
-rocm_command:
-model recipes
-  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen, lemonade-qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-      warning: recommended Lemonade GGUF assistant for ROCm machines
-  Qwen3-0.6B-GGUF aliases=[qwen-smoke, lemonade-tiny] task=chat dtype=gguf device=gpu_required min_gpu_mem=2 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-      warning: tiny Lemonade GGUF smoke-test model; not the default assistant
-  Qwen/Qwen2.5-0.5B-Instruct aliases=[qwen-tiny] task=chat dtype=float16 device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-  Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
-      engine_support:
-        vllm: adapter_available path=D:\\rocm\\rocm-engine-vllm.exe runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm
-  meta-llama/Llama-3.2-3B-Instruct aliases=[llama] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=8 GiB engines=[lemonade, vllm]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-        vllm: available path=D:\\rocm\\rocm-engine-vllm.exe
-",
-        )
-        .expect("model output should summarize");
+    fn both_model_listings_summarize_the_low_vram_assistant() {
+        let (_root, paths) = test_paths("model-summary-from-renderers");
+        for listing in [
+            crate::render_model_registry_text_with_context_and_host(Some(&paths), None, None),
+            crate::render_model_registry_verbose_text_with_context_and_host(
+                Some(&paths),
+                None,
+                None,
+            ),
+        ] {
+            let summary = deterministic_model_tool_summary(&paths, &listing)
+                .unwrap_or_else(|| panic!("this `rocm model` listing must summarize:\n{listing}"));
 
-        assert!(summary.contains("Recommended local assistant: qwen"));
-        assert!(summary.contains("Qwen3-4B-Instruct-2507-GGUF"));
-        assert!(summary.contains("4 GiB"));
-        assert!(summary.contains("Tiny smoke test: qwen-smoke"));
-        assert!(summary.contains("Qwen3-0.6B-GGUF"));
-        assert!(summary.contains("8 GiB-class option: llama"));
-        assert!(summary.contains("lemonade, vllm"));
-        assert!(summary.contains("Qwen/Qwen3.5-4B asks for 12 GiB"));
-        assert!(summary.contains("Native Windows note"));
-        assert!(summary.contains("Run `rocm examine`"));
+            assert!(summary.contains(&format!(
+                "Recommended local assistant: qwen ({})",
+                providers::LEMONADE_ASSISTANT_MODEL_ID
+            )));
+            assert!(summary.contains("Fit: needs about 4 GiB GPU memory."));
+            assert!(summary.contains("Engine: lemonade:"));
+            assert!(summary.contains(&format!(
+                "Tiny smoke test: qwen-smoke ({SMOKE_TEST_MODEL_ID})"
+            )));
+            assert!(summary.contains(&format!(
+                "8 GiB-class option: llama ({EIGHT_GIB_CLASS_MODEL_ID})"
+            )));
+            assert!(summary.contains("Fit: asks for 8 GiB;"));
+            assert!(summary.contains("Engines: vllm:"));
+            assert!(summary.contains(
+                "Run `rocm examine` to refresh GPU memory details before starting anything large."
+            ));
+            // Dropped with the run-on list of every larger recipe: it was the
+            // bulk of the block and the worst value per token for a small model.
+            assert!(!summary.contains("Larger recipes"), "{summary}");
+        }
+    }
+
+    /// The listing text only says *which tool* produced it; every value in the
+    /// summary comes from the recipe registry. A header on its own therefore
+    /// summarizes exactly as a full listing does — which is what makes the
+    /// summary survive a rewording of either renderer.
+    #[test]
+    fn model_summary_values_come_from_the_registry_not_the_listing_text() {
+        let (_root, paths) = test_paths("model-summary-registry-sourced");
+        let from_header_only =
+            deterministic_model_tool_summary(&paths, "Recommended models - run one with x")
+                .expect("the curated header alone identifies the model tool");
+        let from_full_listing = deterministic_model_tool_summary(
+            &paths,
+            &crate::render_model_registry_text_with_context_and_host(Some(&paths), None, None),
+        )
+        .expect("the full listing summarizes");
+        assert_eq!(from_header_only, from_full_listing);
+        assert!(from_header_only.contains("Recommended local assistant: qwen"));
+    }
+
+    /// The second place keyed on the listing: a model summary names three
+    /// recipes, so the local model still answers what was asked. Both listings
+    /// must be recognised, and an unrelated tool's text must not be.
+    #[test]
+    fn only_a_model_listing_summary_is_barred_from_standing_alone() {
+        let (_root, paths) = test_paths("model-summary-stand-alone");
+        for listing in [
+            crate::render_model_registry_text_with_context_and_host(Some(&paths), None, None),
+            crate::render_model_registry_verbose_text_with_context_and_host(
+                Some(&paths),
+                None,
+                None,
+            ),
+        ] {
+            assert!(
+                !deterministic_summary_can_stand_alone(&listing),
+                "a model listing summary answers only part of the question:\n{listing}"
+            );
+        }
+        assert!(deterministic_summary_can_stand_alone(
+            "examine:\n  legacy_rocm_status: not_detected\n"
+        ));
     }
 }

@@ -4,6 +4,22 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      skip_build:
+        description: >-
+          Skip building and publishing the nightly release and run only the E2E
+          lanes, the consolidated report and the readiness jobs. For testing a
+          change to those jobs from a branch without publishing a release.
+        type: boolean
+        default: false
+      queue_deadline_minutes:
+        description: >-
+          How long an E2E lane may wait for a runner before the run gives up on
+          it (default 60). Lower it to try the give-up path from a branch
+          quickly. Whole minutes, at most 120: a larger value is refused, because
+          a lane that started just inside it could outlast the hard deadline.
+        type: string
+        default: "60"
 
 permissions:
   contents: read
@@ -75,7 +91,17 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          SKIP_BUILD: ${{ inputs.skip_build }}
         run: |
+          # Every job that builds or publishes a release is gated on this
+          # output, so skipping here is what keeps a branch dispatch from
+          # publishing.
+          if [ "${SKIP_BUILD}" = "true" ]; then
+            echo "commits=0" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_build was set — not building or publishing a nightly"
+            exit 0
+          fi
           LAST=$(gh release view nightly --json createdAt --jq .createdAt 2>/dev/null || echo "1970-01-01T00:00:00Z")
           COMMITS=$(git log --since="${LAST}" --oneline | wc -l)
           echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
@@ -1354,6 +1380,56 @@ jobs:
           # FAIL row with lane_failure).
           if-no-files-found: error
 
+  # GitHub has no queue timeout: `timeout-minutes` counts from the moment a
+  # runner takes the job, so a lane whose pool is offline sat queued for the full
+  # 24 hours and held the report and readiness jobs (which `needs` every lane)
+  # back with it. This job stands in for the lanes in those `needs`: it polls
+  # this run's job list and settles once every lane leg has finished or can be
+  # given up on -- a leg still queued after QUEUE_DEADLINE_MINUTES (unless a
+  # sibling leg of its lane started), or one unfinished after
+  # HARD_DEADLINE_MINUTES. Legs that started are waited for, so a slow lane
+  # still lands in the report. The report then covers whatever
+  # finished, and the lanes given up on show as gaps (see lane_results).
+  # .github/scripts/settle-e2e-lanes.sh holds the logic; the lanes are listed
+  # here by display name, and a contract test checks the list against the jobs.
+  e2e-lanes-settled:
+    name: E2E lanes settled (queue deadline)
+    runs-on: ubuntu-24.04 # one LTS: only polls the GitHub API
+    # HARD_DEADLINE_MINUTES + slack; the script stops itself at the hard
+    # deadline, before this cap.
+    timeout-minutes: 270
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      lane_results: ${{ steps.settle.outputs.lane_results }}
+      abandoned_count: ${{ steps.settle.outputs.abandoned_count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Wait for the E2E lanes to finish or time out in the queue
+        id: settle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A schedule run has no inputs, so it takes the default. A leg still
+          # queued this long after the run started is given up on.
+          QUEUE_DEADLINE_MINUTES: ${{ inputs.queue_deadline_minutes || '60' }}
+          # A leg that started is waited for, but not past this: the queue
+          # deadline plus the longest lane's timeout-minutes (140) plus slack.
+          HARD_DEADLINE_MINUTES: "240"
+          # The longest lane's timeout-minutes. The script refuses a queue
+          # deadline that, plus this, would pass the hard deadline, so a
+          # dispatch input cannot abandon a lane that is still running.
+          LANE_RUN_MINUTES: "140"
+          LANES: |
+            e2e-gpu-nightly=E2E tests (MI300X, incl. nightly-only)
+            e2e-gpu-nightly-strix=E2E tests (Strix Halo, incl. nightly-only)
+            e2e-gpu-nightly-strix-windows=E2E tests (Strix Halo, Windows, incl. nightly-only)
+            e2e-wsl-nightly=E2E tests (Strix Halo, WSL2, incl. nightly-only)
+        run: bash .github/scripts/settle-e2e-lanes.sh
+
   # The nightly lanes each uploaded a report nobody joined up, so reading a
   # nightly meant opening every artifact and comparing them by hand — on the
   # run that covers the most scenarios, since only nightly sets
@@ -1369,11 +1445,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # Not the lanes themselves: a lane whose runner pool never answers would hold
+    # this job for 24 hours. e2e-lanes-settled waits for them with a queue
+    # deadline instead, and hands over their results in `lane_results`.
     needs:
-      - e2e-gpu-nightly
-      - e2e-gpu-nightly-strix
-      - e2e-gpu-nightly-strix-windows
-      - e2e-wsl-nightly
+      - e2e-lanes-settled
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
     # filter to consult on a schedule, and the lanes are `continue-on-error`, so
     # a failed lane must still be reported. A nightly that broke is precisely
@@ -1421,6 +1497,15 @@ jobs:
       # leaving the queue's GPUs out without a word.
       - name: Fetch the latest queue results
         continue-on-error: true
+        # Bounds the whole step: each log read has its own timeout, but a run of
+        # many jobs on a stalled storage hop would still outlast the job's.
+        # One job's log read can take attempts x (--max-time + pause), so a cap
+        # below that cuts the fetch off inside the retries it exists to allow
+        # and the queue lanes go missing from the report; and the cap must leave
+        # the report job's own cap room for the steps after it. Both are held by
+        # nightly_queue_fetch_timeout_outlasts_one_jobs_retry_budget in
+        # xtask/src/workflow_contract.rs, which reads the budget from this script.
+        timeout-minutes: 8
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1447,40 +1532,87 @@ jobs:
           [ -n "$candidates" ] ||
             absent "no queue run on main finished in the last 24 hours (a run still going is not imported)"
           found=""
+          # Every rejection says why, on the run's own line: the step used to
+          # end in one warning that did not distinguish a run still going from
+          # a log that could not be read (run 44002836099 was rejected with
+          # no way to tell which).
+          skipped() { echo "::notice::queue run ${candidate} not imported: $1"; }
+          # The job log is a redirect to blob storage, and a failure of that
+          # hop is worth another try before the run is given up on. Read it with
+          # curl, not `gh api`: newer gh refuses a response holding terminal
+          # escape sequences ("pass --allow-escape-sequences"), which every
+          # job log does, so every log read failed and run 44002836099 was
+          # rejected as unreadable. curl follows the redirect and sends the token
+          # only to api.github.com.
+          fetch_job_log() {
+            local job="$1" attempt
+            for attempt in 1 2 3; do
+              curl -fsSL --connect-timeout 15 --max-time 120 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part && return 0
+              echo "::notice::queue run ${candidate}: reading the log of job ${job} failed (attempt ${attempt} of 3)"
+              sleep 5
+            done
+            return 1
+          }
           for candidate in $candidates; do
             rm -rf queue-results/results queue-results/job.log
             # A run that started a day ago is not tonight's.
-            run_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}" --jq '[.status, .run_started_at] | @tsv') || continue
+            run_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}" --jq '[.status, .run_started_at] | @tsv') || {
+              skipped "the run could not be read"
+              continue
+            }
             # A finished run only, red or green: a run still going has a
             # partial job log.
-            [ "${run_info%%$'\t'*}" = "completed" ] || continue
+            if [ "${run_info%%$'\t'*}" != "completed" ]; then
+              skipped "its status is '${run_info%%$'\t'*}', not completed"
+              continue
+            fi
             started="${run_info#*$'\t'}"
-            started_at=$(date -u -d "$started" +%s 2>/dev/null) &&
-              [ "$started_at" -ge "$(date -u -d '24 hours ago' +%s)" ] || continue
-            gh run download "$candidate" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results || continue
+            started_at=$(date -u -d "$started" +%s 2>/dev/null) || {
+              skipped "its start time '${started}' could not be read"
+              continue
+            }
+            if [ "$started_at" -lt "$(date -u -d '24 hours ago' +%s)" ]; then
+              skipped "it started at ${started}, more than 24 hours ago"
+              continue
+            fi
+            gh run download "$candidate" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results || {
+              skipped "its queue-run-results artifact could not be downloaded"
+              continue
+            }
             # The log names the branch the run tested and which lanes the queue
             # blocks on; a run that tested another branch is skipped, not the end
             # of the search. `e2e-queue-import` checks the log again.
             # The run may have several jobs: scan them all for the one that
             # prints the lane matrix.
-            jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/jobs?per_page=100" --jq '.jobs[].id') || continue
+            jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/jobs?per_page=100" --jq '.jobs[].id') || {
+              skipped "its jobs could not be listed"
+              continue
+            }
             : > queue-results/job.log
+            unreadable=0
             for job in $jobs; do
-              gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part 2>/dev/null || continue
+              if ! fetch_job_log "$job"; then
+                unreadable=$((unreadable + 1))
+                continue
+              fi
               if grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log.part; then
                 mv queue-results/job.log.part queue-results/job.log
                 break
               fi
             done
             rm -f queue-results/job.log.part
-            grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log || continue
+            if ! grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log; then
+              skipped "none of its $(wc -w <<<"$jobs") job log(s) names the tested branch ('rocm-cli main at <sha>'); ${unreadable} could not be read"
+              continue
+            fi
             found="$candidate"
             echo "$started" > queue-results/started.txt
             break
           done
           if [ -z "$found" ]; then
             rm -rf queue-results/results queue-results/job.log
-            absent "none of the newest queue runs of the last 24 hours tested main with a readable log and results"
+            absent "none of the newest queue runs of the last 24 hours tested main with a readable log and results (the notices above say why each was not imported)"
           fi
           echo "$found" > queue-results/run-id.txt
 
@@ -1556,7 +1688,9 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
-          NEEDS: ${{ toJSON(needs) }}
+          # Shaped like the `needs` context: lane job id -> {result}, with
+          # `abandoned` for a lane that never got a runner.
+          NEEDS: ${{ needs.e2e-lanes-settled.outputs.lane_results }}
           LANE_REPORTS: |
             e2e-gpu-nightly=e2e-gpu-release-report,e2e-gpu-nightly-report
             e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
@@ -1609,6 +1743,13 @@ jobs:
   # overwritten each night; the run link, commit and date in its header say
   # which run it came from. Main-branch runs only, so a dispatch from another
   # branch cannot overwrite the page, and never from an empty or cancelled run.
+  # A report job that FAILED still publishes: it fails when a lane ran and
+  # uploaded no report, which is a broken nightly, and that is when the grid is
+  # most worth reading (run 44029433287 skipped the page for exactly that). The
+  # grid guard in the step below keeps a degenerate report off the page, and the
+  # report job uploads `consolidated/` whatever its own result. A report job
+  # that failed before writing it (checkout, toolchain) leaves nothing to
+  # download, so this job fails at the download instead of publishing.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
     runs-on: ubuntu-24.04 # one LTS: publishing only
@@ -1616,7 +1757,7 @@ jobs:
     permissions:
       contents: write
     needs: e2e-report-nightly
-    if: ${{ !cancelled() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && (needs.e2e-report-nightly.result == 'success' || needs.e2e-report-nightly.result == 'failure') && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
     concurrency:
       group: publish-e2e-wiki
       cancel-in-progress: false
@@ -1825,11 +1966,11 @@ jobs:
           path: release-readiness/narrative.md
           if-no-files-found: ignore
 
-  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
-  # but unlike that job this one also runs (and publishes an explicit
-  # "evidence unavailable" notice) when release-readiness-nightly fails
-  # outright, rather than just skipping and leaving the wiki showing
-  # whatever verdict the last successful run left there.
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki.
+  # Like that job it also runs when its upstream failed, and this one then
+  # publishes an explicit "evidence unavailable" notice when
+  # release-readiness-nightly fails outright, rather than leaving the wiki
+  # showing whatever verdict the last successful run left there.
   publish-release-readiness-wiki:
     name: Publish release readiness to wiki
     runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only
@@ -1945,3 +2086,38 @@ jobs:
           git add "$page"
           git commit -m "Update release readiness from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD
+
+  # Ends the run once everything that can report has. A lane given up on above is
+  # still queued, so without this the run would stay pending until GitHub's 24h
+  # limit even though its reports are out. Cancelling is safe here only because
+  # it runs after every other job: `needs` below lists them all, so what is
+  # cancelled is the stragglers, never a job that is still producing a report.
+  # It also runs when the settle job itself failed or was cancelled: nothing else
+  # bounds the wait then, and the report and readiness jobs have already run on
+  # whatever finished. `cancelled` is how GitHub reports a job killed by its own
+  # timeout-minutes, and the settle script fails itself well before that when the
+  # job list stays unreadable, so this is the backstop for a hung call. If the
+  # whole run was cancelled instead, ending it again changes nothing.
+  cancel-abandoned-e2e-lanes:
+    name: Cancel E2E lanes that never got a runner
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    needs:
+      - nightly
+      - windows-nightly
+      - publish-nightly
+      - cleanup-staging-nightly
+      - e2e-lanes-settled
+      - e2e-report-nightly
+      - publish-e2e-wiki
+      - release-readiness-nightly
+      - release-readiness-narrative
+      - publish-release-readiness-wiki
+    if: ${{ always() && (needs.e2e-lanes-settled.result == 'failure' || needs.e2e-lanes-settled.result == 'cancelled' || (needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0')) }}
+    steps:
+      - name: Cancel the run's unfinished lanes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"

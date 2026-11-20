@@ -20,6 +20,12 @@
 //! string. Frames overwrite in place (cursor home), so the cast plays back
 //! as a smooth animation rather than a scrolling log.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "developer tool that renders documentation assets, never shipped: a failure should stop it with its message"
+)]
+
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{BufWriter, Write};
