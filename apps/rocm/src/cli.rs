@@ -534,10 +534,8 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
     /// fails, it says why on stderr, signals the server process directly and exits 0,
-    /// noting on stderr if that signal fails too. If instead the server dies on its own
-    /// while you are attached, the command exits non-zero, names the crash and quotes the
-    /// end of the service log, and leaves the service marked `failed`. Inspect or stop
-    /// servers later with `rocm services`.
+    /// noting on stderr if that signal fails too. A server that dies on its own instead exits non-zero,
+    /// quotes the end of its log and is marked `failed`. Inspect or stop servers later with `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
     /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
@@ -622,11 +620,10 @@ rocm serve qwen --verbose --device gpu_required")]
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
         /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
         /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
-        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. If the
-        /// server exits first, a crash fails with a pointer to the logs, while
-        /// a stop asked for from elsewhere reports that it was stopped before
-        /// it became ready and names no logs. Cannot be combined with
-        /// --foreground or --verbose, which already stay attached.
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. If the server
+        /// exits first, a crash fails with a pointer to the logs, while a stop asked for from elsewhere reports
+        /// it was stopped before it became ready and names no logs. Cannot be combined with --foreground or
+        /// --verbose, which already stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
         wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
@@ -1327,11 +1324,8 @@ pub(crate) enum ServicesCommand {
     ///
     /// Stops the server first, and starts it again only once every process it
     /// recorded is confirmed gone. If the stop cannot confirm that, nothing is
-    /// started and the stop request stays recorded on the server.
-    ///
-    /// A server that dies during the restart fails loudly rather than
-    /// reporting success: the exit status and a pointer to the logs are
-    /// printed, and the record is marked `failed`.
+    /// started and the stop request stays recorded on the server. A server that dies during the restart fails
+    /// loudly rather than reporting success: its exit status and log pointer are printed, and it is marked `failed`.
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
