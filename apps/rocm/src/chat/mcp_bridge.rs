@@ -553,13 +553,21 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         // whole context, so the one tool call a small model reaches for when
         // asked what it can run ended the turn with a provider error. The
         // verbose dump is still reachable, but only when it was asked for.
+        //
+        // Both measure the host the same way `Command::Model` in `main.rs`
+        // does. An assistant asked what this machine can run must get the
+        // answer a person typing `rocm model` gets, and the recommendation
+        // list is narrowed to the host's memory — so passing no host facts
+        // here would hand the assistant the unnarrowed list while the terminal
+        // showed the narrowed one.
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
         {
+            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_text_with_context_and_host(
                 Some(paths),
-                None,
-                None,
+                gpu_gib,
+                host_ram_gib,
             ))
         }
         [command, flag]
@@ -567,10 +575,11 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command.eq_ignore_ascii_case("models"))
                 && flag.eq_ignore_ascii_case("--verbose") =>
         {
+            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_verbose_text_with_context_and_host(
                 Some(paths),
-                None,
-                None,
+                gpu_gib,
+                host_ram_gib,
             ))
         }
         [command] if command.eq_ignore_ascii_case("daemon") => {
@@ -1369,8 +1378,13 @@ mod tests {
     /// context. Asking a small model "which LLMs can this machine support"
     /// makes it call exactly this, so the one question the tool exists for
     /// used to end in a provider context-overflow error.
+    ///
+    /// Scope, stated plainly because the first assertion below reads stronger
+    /// than it is: this pins *which renderer* the tool uses, not that the
+    /// listing was narrowed to the host. The narrowing is `model-catalog-09`'s,
+    /// on a lane that can plant a capacity.
     #[test]
-    fn chat_model_tool_returns_the_curated_list_rocm_model_prints() {
+    fn chat_model_tool_returns_the_curated_listing_not_the_verbose_dump() {
         let (_root, paths) = test_paths("mcp-model-curated");
 
         let result = run_internal_mcp_call(
@@ -1382,13 +1396,24 @@ mod tests {
         .expect("read-only rocm_command model should run");
         let text = mcp_tool_result_text(&result);
 
-        // The same recipes, from the same renderer `rocm model` calls.
-        let curated = render_model_registry_text_with_context_and_host(Some(&paths), None, None);
+        // A consistency check, and only that: the expected value is built from
+        // the same renderer, on the same host facts, that production just used,
+        // so the two agree whenever the tool calls that renderer at all. It
+        // cannot detect a MISSING narrowing -- on a host the test process reads
+        // no GPU for, both sides are the unnarrowed listing and this still
+        // passes. `model-catalog-09` is the guard for the narrowing itself, on
+        // a lane that can plant a capacity.
+        let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
+        let curated =
+            render_model_registry_text_with_context_and_host(Some(&paths), gpu_gib, host_ram_gib);
         assert!(
             text.contains(curated.trim()),
             "the tool must return what `rocm model` prints:\n{text}"
         );
-        // And not the per-recipe diagnostics, which are what made it huge.
+        // This is the assertion that discriminates, and the one this test is
+        // named for: the per-recipe diagnostics are what made the dump huge, so
+        // a tool that fell back to `--verbose` fails here regardless of what
+        // the host measured.
         assert!(
             !text.contains("aliases=["),
             "the verbose dump must not be the default:\n{text}"
