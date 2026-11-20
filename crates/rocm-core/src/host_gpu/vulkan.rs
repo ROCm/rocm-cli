@@ -35,14 +35,25 @@ use serde::{Deserialize, Serialize};
 
 /// The directories a Linux Vulkan loader reads ICD manifests from.
 ///
+/// These are the loader's own fixed defaults: the `vulkan/icd.d` subdirectory
+/// of `/usr/local/share` and `/usr/share` (its fallback data dirs), plus
+/// `/etc/vulkan/icd.d`. Debian and Fedora both ship Mesa's manifests to
+/// `/usr/share/vulkan/icd.d`, and AMD's proprietary packages to the same place.
+///
+/// The loader also honours `XDG_DATA_DIRS` and `XDG_DATA_HOME`, which this list
+/// does not expand. That is a deliberate limit, not an oversight: those are
+/// per-user and per-session, so a manifest found through them would not
+/// describe the machine the report is about. The cost is bounded in the safe
+/// direction — a driver installed *only* under an unscanned user directory
+/// reads as unlisted here, which can understate a driver but never invent one.
+///
 /// Read through [`host_path`] so a simulated host root can plant them, which is
 /// what lets the no-GPU CI lane cover this probe at all.
 #[cfg(target_os = "linux")]
-const LINUX_ICD_DIRS: [&str; 4] = [
+const LINUX_ICD_DIRS: [&str; 3] = [
     "/usr/share/vulkan/icd.d",
     "/usr/local/share/vulkan/icd.d",
     "/etc/vulkan/icd.d",
-    "/usr/lib/x86_64-linux-gnu/vulkan/icd.d",
 ];
 
 /// How sure the CLI is that a model can run through Vulkan here.

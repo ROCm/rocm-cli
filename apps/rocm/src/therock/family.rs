@@ -225,7 +225,7 @@ fn target_is_vulkan_only(value: &str) -> bool {
         gpu_support_level(
             Some(value),
             normalize_therock_family(value).as_deref(),
-            rocm_core::VulkanStatus::Unknown,
+            VulkanStatus::Unknown,
         ),
         GpuSupportLevel::VulkanOnly
     )

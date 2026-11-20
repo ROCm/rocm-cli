@@ -898,3 +898,30 @@ Feature: GPU detection and system inspection
     Then the inspection reports the GPU as unsupported by the official stack
     And the inspection does not say a Vulkan driver is missing
     And the inspection names the installed Vulkan driver it could not confirm
+
+  # The `rocm examine` scenarios above cover the `rocm_support:` line. This pair
+  # covers the OTHER surface the same support level drives: the one-line banner
+  # at the top of `rocm engines`, which states whether a GPU is required and
+  # which backend supplies it.
+  #
+  # It needs its own scenario rather than another Then on examine-56, because a
+  # planted fixture reaches exactly one child process -- the scenario's
+  # `command_env` is moved into the first command it runs -- so a second command
+  # in the same scenario would read the runner's real host, not the planted one.
+  #
+  # Until now that banner was only ever unit-tested against hand-picked
+  # `GpuSupportLevel` literals, so nothing proved a real probed host reaches its
+  # wording. The pair is the test: both plant a GPU the official stack rejects
+  # and differ only in whether a Vulkan driver answers, so merging the
+  # Vulkan-only arm into the shared no-backend arm fails one of the two.
+  @id:examine-engines-banner-names-vulkan @requires-os:linux
+  Scenario: examine-61 - The engine list tells a Vulkan-only machine which backend its GPU work runs on
+    Given a machine whose GPU has no official support but has a working Vulkan driver
+    When the user lists available engines on that machine
+    Then the engine list says the GPU path on this machine is Vulkan rather than ROCm
+
+  @id:examine-engines-banner-refuses-the-cpu @requires-os:linux
+  Scenario: examine-62 - The engine list still refuses the CPU on a machine with no usable GPU backend
+    Given a machine whose GPU has no official support and no Vulkan driver
+    When the user lists available engines on that machine
+    Then the engine list says a GPU is required and the CPU is not an alternative

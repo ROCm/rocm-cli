@@ -679,11 +679,16 @@ pub const VULKAN_UNCONFIRMED_CLAIM: &str =
 /// nothing is known about its display driver.
 ///
 /// `vulkaninfo` comes first and the install is conditional on what it reports,
-/// because the level is reached by hosts that already have a working driver.
-/// An unconditional "install a Vulkan driver" is advice those hosts cannot act
-/// on, and AGENTS.md §3 asks that a named command be able to clear the
-/// condition it is printed for — running `vulkaninfo` can, on every host that
-/// reaches here.
+/// because this level means the probe did not settle the question — not that a
+/// driver is missing. `vulkan_unconfirmed_next_step` in `host_gpu/render.rs`
+/// routes the hosts whose driver *was* found to
+/// [`VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER`], so what reaches this
+/// constant is the unsettled remainder, where a driver may or may not be
+/// installed. Leading with an unconditional "install a Vulkan driver" would
+/// assert an absence nothing established. AGENTS.md §3 asks that a named
+/// command be able to clear the condition it is printed for, and `vulkaninfo`
+/// can — it is what turns an unconfirmed host into a known one, whichever way
+/// the answer falls.
 ///
 /// Deliberately not "install `vulkaninfo`": on a driverless Linux host the tool
 /// is typically already installed, prints "Found no drivers!" and exits 1,
