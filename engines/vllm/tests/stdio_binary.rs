@@ -7,6 +7,12 @@
 //! that is not a request, is answered with an error envelope on stdout and a
 //! clean exit.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 

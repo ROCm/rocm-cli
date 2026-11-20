@@ -1172,7 +1172,8 @@ pub(crate) fn recipe_linux_verify(fix_id: &str) -> Option<&'static str> {
 }
 
 /// What one Windows shell did with a line typed into it.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) struct ShellRun {
     pub shell: &'static str,
     pub success: bool,
@@ -1195,7 +1196,8 @@ pub(crate) struct ShellRun {
 /// session's path, which lists the PowerShell 7 modules first. 5.1 then picks
 /// the PSReadLine built for 7, cannot load it, and writes "Cannot load PSReadline
 /// module" to stderr, which the tests below treat as a failure of the line.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) fn run_typed_in_powershell(text: &str, env: &[(&str, Option<&str>)]) -> ShellRun {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1224,7 +1226,8 @@ pub(crate) fn run_typed_in_powershell(text: &str, env: &[(&str, Option<&str>)]) 
 
 /// Runs `line` the way a user would type it into cmd (`cmd /C`, with the line
 /// passed unquoted and unescaped). `env` is as for [`run_typed_in_powershell`].
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) fn run_typed_in_cmd(line: &str, env: &[(&str, Option<&str>)]) -> ShellRun {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1250,7 +1253,8 @@ pub(crate) fn run_typed_in_cmd(line: &str, env: &[(&str, Option<&str>)]) -> Shel
 }
 
 /// Runs one printed line in cmd and in Windows PowerShell, in that order.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) fn run_typed_in_cmd_and_powershell(
     line: &str,
     env: &[(&str, Option<&str>)],
@@ -1261,7 +1265,8 @@ pub(crate) fn run_typed_in_cmd_and_powershell(
     ]
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 fn shell_run(shell: &'static str, out: std::process::Output) -> ShellRun {
     ShellRun {
         shell,

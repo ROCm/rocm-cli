@@ -1052,7 +1052,8 @@ fn hostname() -> Option<String> {
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;

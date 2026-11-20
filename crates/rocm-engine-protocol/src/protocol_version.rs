@@ -74,6 +74,10 @@ pub const INVALID_REQUEST_CODE: &str = "invalid_request";
 /// decode as that method's request.
 pub const INVALID_PAYLOAD_CODE: &str = "invalid_payload";
 
+/// The error code an engine answers with when its answer's payload cannot be
+/// serialized (see `EngineResponseEnvelope::success`).
+pub const RESPONSE_SERIALIZATION_FAILED_CODE: &str = "response_serialization_failed";
+
 /// Why two engine protocol versions cannot be used together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolMismatch {
@@ -252,6 +256,13 @@ pub fn answer_engine_request(
 /// built-in stdio verb) are held to the same list rather than to three
 /// hand-copied ones.
 #[cfg(any(test, feature = "test-support"))]
+// Compiled only for tests (directly or through `test-support`), but outside a
+// `#[cfg(test)]` item, so clippy cannot tell it is test code.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-support contract check; a broken contract must panic the engine test running it"
+)]
 pub mod engine_contract {
     use super::{
         ENGINE_PROTOCOL_VERSION, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,

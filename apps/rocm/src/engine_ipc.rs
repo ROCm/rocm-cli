@@ -235,7 +235,9 @@ fn with_scoped_builtin_engine_env<R>(
         return f();
     }
     let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().expect("builtin engine env lock poisoned");
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut vars = Vec::new();
     if let Some(paths) = paths {
         for (key, value) in paths.env_vars() {
@@ -959,6 +961,28 @@ mod tests {
         assert!(!bare.request_progress);
         assert!(bare.forward_stderr);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A test that panicked while holding the env lock must not take every
+    /// later scoped request down with it.
+    #[test]
+    fn scoped_engine_env_recovers_a_poisoned_lock() {
+        let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let (root, paths) = crate::tests::test_paths("engine-ipc-poisoned-lock");
+        let poisoner = std::thread::spawn(move || {
+            let _guard = lock.lock();
+            panic!("poison the engine env lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(lock.is_poisoned());
+
+        let seen = with_scoped_builtin_engine_env(Some(&paths), None, || {
+            std::env::var("ROCM_CLI_CONFIG_DIR").ok()
+        });
+        lock.clear_poison();
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(seen.as_deref(), paths.config_dir.to_str());
     }
 
     #[cfg(unix)]

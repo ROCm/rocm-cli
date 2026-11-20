@@ -452,6 +452,59 @@ guessed platform on Linux, which would report a Windows lane as Linux;
 `xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
 against it.
 
+## GPU visibility on the hardware pool
+
+A hardware job does not necessarily get every GPU its host has. On the
+self-hosted pool, and on the shared GPU queue's Linux pods
+([nightly-on-the-queue.md](nightly-on-the-queue.md)), the PCI bus listing
+(`lspci`, `/sys/bus/pci`, and possibly `/sys/class/drm`) describes the whole
+host. What the job can use can be narrower, and shows in what it can read
+through the kernel's compute topology (`/sys/class/kfd/kfd/topology/nodes`)
+and the render nodes (`/dev/dri/renderD*`). On the MI300X lane a job has
+seen eight AMD GPUs on the bus but one kernel GPU node and one render
+device; on the MI350P and Radeon R9700 lanes, one kernel GPU node with
+several AMD GPUs on the bus (their exact bus and render-device counts were
+not recorded). What restricts a job is set outside this repository, by the
+runner's or the queue's own isolation, which this repository cannot verify
+([nightly-on-the-queue.md](nightly-on-the-queue.md#why-it-works-this-way)).
+How many a job gets is a property of the runner, not of the change under
+test, and can differ between lanes and over time.
+
+Write a GPU-count assertion against what the job can reach, never against
+the bus:
+
+- compare against the KFD GPU nodes (nodes reporting a nonzero
+  `gfx_target_version`: read from the node's `properties` file, or from a
+  standalone `gfx_target_version` file where `properties` states none, as the
+  product does), or against the AMD entries in
+  `rocm examine --json`'s `gpus[]`, which is that set whenever KFD reports at
+  least one GPU node: `examine` matches the kernel's GPU nodes to the PCI scan
+  by address;
+- do not assert that the bus count equals the reachable count, in either
+  direction: when KFD reports at least one GPU node, AMD devices on the bus
+  that the kernel does not expose appear only in a `notes` entry, not in
+  `gpus[]`, and a partitioned Instinct shows
+  several GPU nodes for one PCI address;
+- derive the expected number from the host at run time rather than
+  hard-coding it, and gate a premise of more than one GPU with
+  `@requires-multi-gpu`, which counts those same KFD GPU nodes. It falls
+  back to the amdgpu DRM cards where KFD lists no GPU node or `/dev/kfd`
+  exists but its topology cannot be read, a hedge rather than a description
+  of known hardware; on that fallback the count can describe the whole host
+  rather than this job.
+
+examine-17 (`@id:examine-lists-every-gpu-with-its-address-and-target` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature), step
+`assert_gpus_match_kfd_nodes` in
+[examine_steps.rs](../tests/e2e-cucumber/tests/e2e/examine_steps.rs)) is the
+worked example of comparing `gpus[]` with the KFD GPU nodes, though its step
+reads `gfx_target_version` from `properties` only, without the standalone-file
+fallback the first bullet describes. The product side is
+`apply_kernel_gpu_membership` in
+[linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs). A red lane
+where the bus and the kernel disagree is the environment, not a regression:
+re-express the assertion, do not tag it out or weaken it.
+
 ## Engine is not an independently selectable axis
 
 None of the tables above vary the serve engine as a matrix dimension, because
@@ -504,7 +557,10 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 are not required for merging and so are skipped in the merge queue rather
 than left queued on limited runner capacity or hung at their cap after its PR
 has merged) when the workflow's own `changes` job's
-`serve` path filter is `true`. A new push to a pull request
+`serve` path filter is `true`. That job classifies paths
+through the [classify-changes](../.github/actions/classify-changes/action.yml)
+action that `ci.yml`'s `changes` job uses too, so both workflows read one
+definition of each category. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
@@ -559,7 +615,10 @@ that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — s
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
 filter is forced `true`, so the full matrix (minus MI300X and Strix Ubuntu
-in the merge queue) always runs there. Unlike the
+in the merge queue) always runs there. It is also forced `true` on a pull
+request that changes a file that neither a category of the action nor its
+`inert` list (files no gated job reads, such as the issue templates) names, so
+a new kind of file runs the matrix until it is classified. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and

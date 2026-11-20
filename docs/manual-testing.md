@@ -2193,8 +2193,12 @@ Expected result:
 
 ## 13. Context-Size Estimate for a GGUF Model
 
-Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
-by design) and network access to Hugging Face. The point is to check the
+Needs a host with a Radeon GPU and network access to Hugging Face. A discrete
+card is what the figures below were calibrated on; an APU is also estimated,
+but against the shared memory pool its engine allocates from, so its report
+carries a note that the figure compared with is a ceiling the operating system
+draws on too, and only an APU whose pool could not be read answers
+`undetermined`. The point is to check the
 estimate against what a real load uses: the compute buffer and runtime reserve
 were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
 so a different GPU or build can differ. How close the estimate came on them is
@@ -2211,8 +2215,8 @@ Expected result:
   and the header read finishes in seconds.
 - The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
   at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
-  and the total, with this GPU's dedicated VRAM and the largest context that
-  fits.
+  and the total, with this GPU's dedicated VRAM (on an APU, its shared pool) and
+  the largest context that fits.
 - Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
   about 53% and 28% of the `f16` one.
 - Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
@@ -2468,7 +2472,7 @@ Expected result:
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
 
-## 18. Settings Changed From Several Terminals At Once
+## 19. Settings Changed From Several Terminals At Once
 
 Commands that change settings take turns on `config.json`, so none of them
 undoes another's change. Scenario `config-12` checks this on the mock lane; this
@@ -2542,3 +2546,53 @@ Expected result:
 - Each loop prints `lost 0, failed 0`.
 - The scratch config folder lists `config.json` and `config.json.lock`; the
   lock file is expected and stays beside the settings.
+
+## 20. Curated Models Narrowed To This Machine
+
+Needs two hosts to be meaningful, **both with discrete GPUs**: one large (an
+MI300X) and one small (a 16 GiB Radeon or similar). The mock lane covers the
+logic with a forced memory figure; what it cannot do is read a real machine.
+
+An integrated GPU is deliberately *not* one of them yet. `rocm` classifies an
+APU's shared pool as unreadable rather than as a memory figure, so an APU takes
+the unmeasured branch below and its listing is **unchanged** by this check. That
+is the honest current behaviour, not an oversight: reading the pool is
+`rocmai-912` / #1054's `Unified { gtt_total_gib }`, and narrowing an APU on a
+figure nothing measured would be the invented claim this whole area exists to
+remove. Re-point this section at an APU once that lands.
+
+```bash
+rocm model
+```
+
+Expected result, on the large host:
+
+- The large models are still listed — the 54 GiB and 62 GiB recipes appear, not
+  only the small ones.
+- The listing ends with `Narrowed to what this machine can run`, possibly
+  followed by a count of further models that also fit.
+
+Expected result, on the small host:
+
+- The models listed are ones this machine's GPU memory can hold. On a 16 GiB
+  discrete card that means the smaller recipes, and none of the 17 GiB-and-larger
+  ones.
+- No row says `needs a larger GPU`: a recommendation and a refusal cannot both
+  be true of the same row.
+
+Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
+a GPU the CLI cannot measure, **or any APU** — see above):
+
+- The list is *not* narrowed, and ends with `This machine's GPU memory could not
+  be read, so these are not filtered to what it can run.` An unmeasured machine
+  must not be told its options are narrow.
+
+Then ask the assistant the same question, which must get the same answer:
+
+```bash
+echo '{"args":["model"]}' > args.json
+rocm mcp-call rocm_command --arguments-file args.json
+```
+
+- The recipes listed match what `rocm model` printed in the terminal, narrowing
+  and closing note included.

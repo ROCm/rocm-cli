@@ -11,6 +11,12 @@
 //! random generator essentially never produces an input that reaches the
 //! interesting branches of an RSA verifier.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 #[path = "common/proptest_cases.rs"]
 mod proptest_cases;
 

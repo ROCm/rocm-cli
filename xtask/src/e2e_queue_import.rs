@@ -215,6 +215,11 @@ impl Columns {
 /// pattern are kept; a line that does not is ignored, so a log that is not what
 /// was expected yields no lanes rather than text to publish.
 fn parse_log(log: Option<&str>) -> QueueLog {
+    #[expect(
+        clippy::expect_used,
+        reason = "a literal pattern; `the_import_writes_only_what_the_report_reads_under_names_that_say_lane_and_gate` \
+                  compiles it on every test run"
+    )]
     static TESTED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^rocm-cli (\S+) at ([0-9a-f]{40})$").expect("static pattern")
     });
@@ -496,6 +501,11 @@ fn render_absent(reason: &str) -> String {
 }
 
 fn is_run_url(url: &str) -> bool {
+    #[expect(
+        clippy::expect_used,
+        reason = "a literal pattern; `the_import_writes_only_what_the_report_reads_under_names_that_say_lane_and_gate` \
+                  compiles it on every test run"
+    )]
     static RUN_URL: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$")
             .expect("static pattern")
@@ -510,6 +520,11 @@ fn render_section(
     run_started: Option<&str>,
     have_matrix: bool,
 ) -> String {
+    #[expect(
+        clippy::expect_used,
+        reason = "a literal pattern; `the_import_writes_only_what_the_report_reads_under_names_that_say_lane_and_gate` \
+                  compiles it on every test run"
+    )]
     static STARTED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$").expect("static pattern")
     });

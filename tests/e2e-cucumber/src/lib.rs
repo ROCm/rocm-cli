@@ -2,6 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "e2e test-harness library: a fixture that cannot be set up must fail the scenario that uses it"
+)]
+
 pub mod binary_path;
 pub mod capability;
 pub mod chat_request;

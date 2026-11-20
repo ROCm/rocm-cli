@@ -183,7 +183,10 @@ pub(crate) enum Command {
         /// range request; no token is sent, so a gated or private repository
         /// cannot be read): weights plus KV cache at `--context-size` plus a
         /// compute buffer and a runtime reserve, against the dedicated VRAM of
-        /// the GPU with the most of it, labelled ESTIMATED rather than READY or
+        /// the GPU with the most of it - or, on an integrated GPU, against the
+        /// shared memory pool its engine allocates from, which is a ceiling the
+        /// operating system draws on too and is reported as such - labelled
+        /// ESTIMATED rather than READY or
         /// BLOCKED. A device-visibility mask on a host whose GPUs differ in
         /// memory is flagged in the report, since which card it selects is not
         /// verified there. Any other model the
@@ -207,7 +210,10 @@ pub(crate) enum Command {
         /// GPU memory could be read; without a reading, the memory the model
         /// needs is shown and nothing is compared, so no largest context is
         /// given. The comparison is against the total dedicated VRAM of the GPU
-        /// with the most of it that ROCm can see, as for a curated model, not
+        /// with the most of it that ROCm can see - or, on an integrated GPU,
+        /// against the shared memory pool its engine allocates from rather than
+        /// the BIOS carve-out beside it - as for a curated model, and in
+        /// neither case against
         /// what other processes have left free. Applies to a GGUF outside the
         /// catalog (a curated model's memory minimum is fixed, and says so);
         /// `rocm serve` has no context-size option yet, so this answers the
@@ -494,7 +500,9 @@ rocm update --json")]
     },
     /// Show recommended local models and what this machine can run.
     ///
-    /// The default list is the curated recommendations. The AMD Inference Microservices
+    /// The default list is the curated recommendations, narrowed to the models this
+    /// machine's GPU memory can hold and saying so; where that memory could not be read
+    /// it is not narrowed, and says that instead. The AMD Inference Microservices
     /// (AIM) catalog of pre-built Docker images is not part of it: use --verbose to see
     /// every AIM image with the GPU families it supports, how many GPUs it needs, and
     /// whether it requires a Hugging Face token. Serve one with
