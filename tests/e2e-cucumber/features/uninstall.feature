@@ -219,3 +219,13 @@ Feature: Uninstall
     Then the uninstall succeeds
     And the config folder is gone
     And the data folder still holds the user's files
+
+  # A session record `rocm remote` refuses to use may still describe a model
+  # running on another machine, and `rocm remote stop` cannot reach it, so the
+  # uninstall review names it rather than deleting its last trace unannounced.
+  @id:uninstall-dry-run-names-refused-remote-session-record
+  Scenario: uninstall-18 - A dry run names a refused remote session record that stop cannot reach
+    Given a session record on this machine that names a remote command this tool never writes
+    When the user dry-runs an uninstall
+    Then the uninstall succeeds
+    And the uninstall warns about the refused remote session record

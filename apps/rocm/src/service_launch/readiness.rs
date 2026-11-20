@@ -15,12 +15,16 @@
 // would be unused in some build, and a gate on it would have to be kept in step
 // with every use site. Keep the full paths. The tests module imports `fs` for
 // itself because its tests use it on every platform.
+use super::launch_transaction::{
+    RecordUpdate, live_and_no_stop_requested, update_managed_record_on_disk,
+};
 use super::spawn::ManagedLaunchReport;
 #[cfg(feature = "e2e-oom-fault-injection")]
 use crate::device_policy_name;
 use crate::endpoint_keys;
 use crate::engine_runtime_select::wait_for_service_http_ready_with_progress;
 use crate::serve_progress;
+use crate::service_hints;
 use crate::services_text::read_optional_tail_lines;
 use crate::status_for_readiness;
 #[cfg(feature = "e2e-oom-fault-injection")]
@@ -350,23 +354,98 @@ fn report_ended_launch(
 /// only what the wait learned. The copy read at spawn time can be long stale:
 /// `rocmd` may have recorded a restart or a new supervisor pid, and `rocm logs`
 /// refreshes the record, so writing it back whole would revert those.
+///
+/// The verdict is written only while the record still reads as live and no
+/// stop has been requested for it. A `rocm services stop` made during the wait
+/// keeps its marker and, once settled, its `stopped`, from the moment it writes
+/// the marker rather than only once it has settled, and the wait fails saying
+/// a stop was requested: reporting a readiness verdict (and exiting 0) for a
+/// server somebody is stopping would be false. A record settled without a
+/// stop marker means the server exited on its own (without `--wait`,
+/// `died_during_wait` does not run, so this is where that is noticed), and the
+/// failure points at its log instead. A record removed during the
+/// wait (`rocm services remove`) is not re-created from the stale copy; that
+/// fails too, since there is no service left to report.
 pub(super) fn record_wait_outcome(
     paths: &AppPaths,
     held: &mut ManagedServiceRecord,
     status: &str,
     verified: bool,
 ) -> Result<()> {
-    let mut latest = ManagedServiceRecord::read_manifest(paths, &held.service_id)
-        .unwrap_or_else(|_| held.clone());
-    status.clone_into(&mut latest.status);
-    if verified {
-        // Latch the verification the wait just performed, so the readiness checks
-        // behind `services list` and chat read it instead of re-probing.
-        latest.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    let written = update_managed_record_on_disk(
+        paths,
+        &held.service_id,
+        // Looser than the publish's and the cleanup's `launch_still_owns`, on
+        // purpose: no supervisor identity is compared. A restart during the wait
+        // (`rocmd` records a new supervisor) leaves the same service at the same
+        // endpoint, and the verdict is what that endpoint just answered, so it
+        // still holds; the write keeps the restart's fields because it changes
+        // only the status and the verification time.
+        // `record_wait_outcome_keeps_what_changed_on_disk_during_the_wait` pins it.
+        live_and_no_stop_requested,
+        |latest| {
+            status.clone_into(&mut latest.status);
+            if verified {
+                // Latch the verification the wait just performed, so the readiness
+                // checks behind `services list` and chat read it instead of
+                // re-probing.
+                latest.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+            }
+        },
+    )?;
+    // The record the guarded write refused is the one the message describes:
+    // it is not read a second time, so nothing can change between the decision
+    // and what is reported.
+    match written {
+        RecordUpdate::Written(latest) => {
+            *held = *latest;
+            Ok(())
+        }
+        RecordUpdate::NotOwned(settled) => {
+            *held = *settled;
+            // A stop leaves its marker; anything else that settled the record
+            // (the liveness refresh demoting a dead engine, or the engine's own
+            // `failed`) means the server exited on its own, and the user needs
+            // its log rather than to hear somebody stopped it.
+            if held.stop_requested_unix_ms.is_some() {
+                // While the stop is still in flight the record reads live, and a
+                // new `rocm serve` for the same model would reuse the service being
+                // stopped (reuse goes by status alone, in `find_live_managed_service`
+                // and `existing_live_managed_service_in` alike), so the advice is the
+                // stop itself, which waits for the processes and reports whether it
+                // could confirm them gone. Running it on a stop that already settled
+                // is harmless.
+                // `the_advised_stop_frees_the_model_a_stop_in_flight_still_holds`
+                // proves both halves.
+                let next_step = if crate::managed_service_status::managed_service_is_live(held) {
+                    format!(
+                        "finish the stop with `{}`, then start it again with `rocm serve`",
+                        service_hints::service_stop_hint(&held.service_id)
+                    )
+                } else {
+                    "start it again with `rocm serve`".to_owned()
+                };
+                bail!(
+                    "a stop was requested for managed service `{}` while it was starting (its \
+                     record now reads `{}`), so no readiness is reported for it; {next_step}",
+                    held.service_id,
+                    held.status
+                );
+            }
+            bail!(
+                "managed service `{}` exited while it was starting (its record now reads `{}`); \
+                 see `{}` for its output",
+                held.service_id,
+                held.status,
+                service_hints::service_logs_hint(&held.service_id)
+            );
+        }
+        RecordUpdate::Gone => bail!(
+            "managed service `{}` was removed while `rocm serve` waited for it, so there is \
+             no record of it left to report",
+            held.service_id
+        ),
     }
-    latest.write()?;
-    *held = latest;
-    Ok(())
 }
 
 /// Test-only fault-injection switch, off (`const false`) in shipped binaries:
@@ -2191,8 +2270,14 @@ mod tests {
             message.contains("exited before it became ready"),
             "{message}"
         );
+        // The hinted command parses with these flags:
+        // `advised_commands::every_advised_command_parses` reads the literal in
+        // `service_hints::service_logs_hint`.
         assert!(
-            message.contains(&format!("rocm logs --service {id}")),
+            message.contains(&format!(
+                "see `{}` for its output",
+                service_hints::service_logs_hint(&id)
+            )),
             "{message}"
         );
         // `failed`, not `stopped`: nothing asked this server to stop, so the
@@ -2307,5 +2392,204 @@ mod tests {
         let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
         assert_eq!(after.status, "starting");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_wait_outcome_does_not_recreate_a_record_removed_during_the_wait() {
+        let (root, paths) = test_paths("wait-outcome-removed");
+        paths.ensure().expect("paths");
+        let mut held = record_tracking_pid(&paths, 111, "starting");
+        held.write().expect("write");
+        // `rocm services remove` ran while `rocm serve` waited.
+        fs::remove_file(&held.manifest_path).expect("remove manifest");
+
+        let error = record_wait_outcome(&paths, &mut held, "ready", true)
+            .expect_err("a removed service has nothing left to report");
+        let recreated = held.manifest_path.exists();
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            error.to_string().contains("was removed while"),
+            "the failure must say what happened: {error:#}"
+        );
+        assert!(!recreated, "the stale copy must not re-create the record");
+    }
+
+    #[test]
+    fn an_engine_that_exited_during_the_wait_is_reported_as_exited_not_stopped() {
+        // Without `--wait`, `died_during_wait` does not run, so a record the
+        // liveness refresh demoted (or the engine marked `failed`) reaches the
+        // verdict write. No stop marker: nobody stopped it, it exited.
+        for settled_status in ["stopped", "failed"] {
+            let (root, paths) = test_paths(&format!("wait-outcome-exited-{settled_status}"));
+            paths.ensure().expect("paths");
+            let mut held = record_tracking_pid(&paths, 111, "starting");
+            held.write().expect("write");
+            let mut exited = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+            exited.status = settled_status.to_owned();
+            exited.write().expect("write");
+
+            let error = record_wait_outcome(&paths, &mut held, "starting", false)
+                .expect_err("a server that exited must not be reported as launched");
+            let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+            let _ = fs::remove_dir_all(root);
+            let message = error.to_string();
+            assert!(
+                message.contains("exited while it was starting"),
+                "{message}"
+            );
+            assert!(!message.contains("was stopped"), "{message}");
+            // The hinted command parses with these flags:
+            // `advised_commands::every_advised_command_parses` reads the literal
+            // in `service_hints::service_logs_hint`.
+            assert!(
+                message.contains(&format!(
+                    "see `{}` for its output",
+                    service_hints::service_logs_hint(&held.service_id)
+                )),
+                "{message}"
+            );
+            assert_eq!(
+                after.status, settled_status,
+                "the settled record was overwritten"
+            );
+            assert_eq!(after.stop_requested_unix_ms, None);
+        }
+    }
+
+    #[test]
+    fn a_stop_requested_during_the_wait_fails_the_serve_and_keeps_the_stop() {
+        // `rocm services stop` writes its marker first and `stopped` only once
+        // the processes are gone, so the wait can end on either state: a stop
+        // still in flight (the marker on a record that still reads live) or one
+        // that settled. Both are a stop the user asked for.
+        for settled_status in [None, Some("stopped")] {
+            let label = settled_status.unwrap_or("in-flight");
+            let (root, paths) = test_paths(&format!("wait-outcome-stop-{label}"));
+            paths.ensure().expect("paths");
+            let mut held = record_tracking_pid(&paths, 111, "starting");
+            held.write().expect("write");
+            let mut stopping =
+                ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+            stopping.stop_requested_unix_ms = Some(1_234);
+            if let Some(status) = settled_status {
+                stopping.status = status.to_owned();
+            }
+            stopping.write().expect("write");
+            let status_before = stopping.status.clone();
+
+            // An `Err` here is what `rocm serve` turns into a non-zero exit: the
+            // launch path propagates it with `?` and prints nothing else.
+            let error = record_wait_outcome(&paths, &mut held, "ready", true)
+                .expect_err("a server stopped during its wait must not be reported as launched");
+            let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id).unwrap();
+            let _ = fs::remove_dir_all(root);
+            let message = error.to_string();
+            assert!(
+                message.contains("a stop was requested for managed service"),
+                "{label}: {message}"
+            );
+            assert!(message.contains(&held.service_id), "{label}: {message}");
+            // The advice matches the state: `rocm serve` reuses a record that
+            // still reads live, so while the stop is in flight it is told to
+            // finish the stop first.
+            // Pins the wording only; that the advised stop is what frees the
+            // model is proved by
+            // `the_advised_stop_frees_the_model_a_stop_in_flight_still_holds`.
+            let advises_stop = message.contains(&format!(
+                "finish the stop with `{}`",
+                service_hints::service_stop_hint(&held.service_id)
+            ));
+            assert_eq!(advises_stop, settled_status.is_none(), "{label}: {message}");
+            assert!(
+                message.contains("start it again with `rocm serve`"),
+                "{label}: {message}"
+            );
+            // The message and the state it describes, together: the record keeps
+            // the stop's status and marker, and carries no readiness verdict.
+            assert_eq!(
+                after.status, status_before,
+                "{label}: the stop was overwritten"
+            );
+            assert_eq!(after.stop_requested_unix_ms, Some(1_234), "{label}");
+            assert_eq!(after.inference_verified_at_unix_ms, None, "{label}");
+        }
+    }
+
+    /// The behaviour behind the in-flight advice: while a stop is in flight the
+    /// record still reads live, so a new `rocm serve` for the same model would
+    /// reuse the service being stopped; the stop the failure names, run through
+    /// the real stop path, settles it and leaves nothing for reuse to find.
+    #[test]
+    fn the_advised_stop_frees_the_model_a_stop_in_flight_still_holds() -> Result<()> {
+        let (root, paths) = test_paths("wait-outcome-advised-stop");
+        paths.ensure()?;
+        // A closed port, so the Lemonade unload the stop sends fails at once.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
+        let mut held = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-advised-stop",
+            "lemonade",
+            "model-ref",
+            "canonical/advised-stop",
+            "127.0.0.1",
+            port,
+            "managed",
+            // A pid that is alive for the whole test (this test process), so
+            // the liveness refresh keeps the record live. The stop below runs
+            // the real stop path with a stub termination that reports the pid
+            // gone, so nothing is signalled; an unconfirmed stop is not covered
+            // here (it keeps the record live, and says so).
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        held.status = "starting".to_owned();
+        held.write()?;
+        let mut stopping = ManagedServiceRecord::read_manifest(&paths, &held.service_id)?;
+        stopping.stop_requested_unix_ms = Some(1_234);
+        stopping.write()?;
+        let reusable = |paths: &AppPaths| -> Result<bool> {
+            let records = crate::managed_service_status::load_managed_services(paths)?;
+            Ok(crate::managed_service_status::find_live_managed_service(
+                &records,
+                "lemonade",
+                "canonical/advised-stop",
+            )
+            .is_some())
+        };
+
+        let error = record_wait_outcome(&paths, &mut held, "ready", true)
+            .expect_err("a stop in flight must fail the serve");
+        let reused_while_stopping = reusable(&paths)?;
+        crate::service_control::stop_internal_managed_service_with(
+            &paths,
+            &held.service_id,
+            |record| {
+                rocm_core::terminate_recorded_service_pids(record, |_| {
+                    rocm_core::TerminationOutcome::Graceful
+                })
+            },
+        )?;
+        let reused_after_the_stop = reusable(&paths)?;
+        let after = ManagedServiceRecord::read_manifest(&paths, &held.service_id);
+        let _ = fs::remove_dir_all(root);
+        let message = error.to_string();
+        assert!(
+            message.contains(&service_hints::service_stop_hint(&held.service_id)),
+            "{message}"
+        );
+        assert!(
+            reused_while_stopping,
+            "the advice to finish the stop rests on reuse taking the record being stopped"
+        );
+        assert_eq!(after?.status, "stopped");
+        assert!(
+            !reused_after_the_stop,
+            "after the advised stop, `rocm serve` must launch anew rather than reuse"
+        );
+        Ok(())
     }
 }
