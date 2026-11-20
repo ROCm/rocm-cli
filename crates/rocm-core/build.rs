@@ -19,6 +19,12 @@
 //! libstdc++ dependency; `-nostdlib` yields a self-contained object with no
 //! `NEEDED` entries that loads on any Linux of the same architecture.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "build script: a panic is how a build script reports failure to cargo"
+)]
+
 use std::env;
 use std::fs;
 use std::path::Path;

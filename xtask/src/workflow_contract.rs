@@ -7443,6 +7443,7 @@ fi
                 "Cargo.toml",
                 "Cargo.lock",
                 "rust-toolchain.toml",
+                "clippy.toml",
                 ".cargo/config.toml",
                 "apps/rocm/assets/data.json",
                 "crates/rocm-core/src/model_catalog.json",
@@ -7476,6 +7477,7 @@ fi
                 "Cargo.lock",
                 "rust-toolchain.toml",
                 ".cargo/config.toml",
+                "clippy.toml",
                 "runtime-deps.toml",
                 "scripts/README.txt",
                 "xtask/assets/data.json",
@@ -8164,6 +8166,44 @@ fi
             }
         }
         assert!(checked > 0, "found no `uses:` to check");
+    }
+
+    /// `clippy.toml` sets which lints fire, so a change to it alone must still
+    /// run clippy: in CI through the classify-changes action's `rust` category
+    /// (the `clippy` job) and `heavy` category (the Windows lane's clippy
+    /// steps), and before a push through the two clippy hooks' `files:`
+    /// patterns. An unclassified file would force a full run anyway; naming it
+    /// in both categories keeps that from depending on nobody marking it inert.
+    #[test]
+    fn a_clippy_toml_only_change_still_runs_clippy() {
+        let filters = paths_filters(&read_classify_action());
+        for category in ["rust", "heavy"] {
+            assert!(
+                filter_matches(paths_filter(&filters, category), "clippy.toml"),
+                "the classify-changes action's `{category}` category must match \
+                 `clippy.toml`, or an edit to it alone skips the clippy it configures"
+            );
+        }
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        for id in ["cargo-clippy", "cargo-clippy-e2e"] {
+            let block = hook_block(&config, id);
+            let files = block
+                .lines()
+                .find_map(|line| strip_comment(line).trim().strip_prefix("files:"))
+                .map_or_else(
+                    || panic!("hook `{id}` sets a `files:` pattern:\n{block}"),
+                    |value| strip_quotes(value.trim()),
+                );
+            let pattern = regex::Regex::new(&files).expect("the `files:` pattern compiles");
+            for path in ["clippy.toml", "crates/rocm-core/src/lib.rs"] {
+                assert!(
+                    pattern.is_match(path),
+                    "hook `{id}`'s `files: {files}` must match `{path}`"
+                );
+            }
+        }
     }
 
     #[test]
