@@ -632,6 +632,322 @@ async fn then_machine_publishing(world: &mut E2eWorld) {
     );
 }
 
+/// Where this scenario's CLI keeps its session records — the same data dir
+/// `isolate_env` hands every spawned `rocm`.
+pub(crate) fn sessions_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario root")
+        .path()
+        .join("data")
+        .join("remote-sessions")
+}
+
+/// The one record this scenario's `serve` wrote.
+fn only_session_record(world: &E2eWorld) -> PathBuf {
+    let records = std::fs::read_dir(sessions_dir(world))
+        .expect("read the sessions directory")
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "expected one session record: {records:?}");
+    records.into_iter().next().expect("one record")
+}
+
+#[then("the session is recorded where only the user can reach it")]
+async fn then_sessions_private(world: &mut E2eWorld) {
+    // The record names commands run on the machine with the user's SSH
+    // identity, and its credential sits beside it, so the directory is
+    // owner-only. Unix permissions only: Windows keeps it in the per-user
+    // profile and the CLI does not set an ACL of its own.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = sessions_dir(world);
+        let mode = std::fs::metadata(&directory)
+            .expect("the sessions directory exists after a serve")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "{} is {mode:o}; another account could add or replace a record in it",
+            directory.display()
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = world;
+}
+
+/// The session id the planted records below describe. Shared with the
+/// uninstall steps, which plant the same record through the step here.
+pub(crate) const PLANTED_SESSION_ID: &str = "remote-gpu-box-11434";
+
+/// The id `serve` gives a session on the fake tailnet's GPU machine at the
+/// default port: the MagicDNS name with its dots turned to dashes.
+const GPU_BOX_SESSION_ID: &str = "remote-gpu-box-example-tailnet-ts-net-11434";
+
+/// Write a session record straight into this scenario's sessions directory, as
+/// an earlier `serve` would have — with the id, file name and `remote_cli`
+/// given.
+fn plant_session_record(
+    world: &E2eWorld,
+    session_id: &str,
+    file_stem: &str,
+    remote_cli: &str,
+) -> PathBuf {
+    let directory = sessions_dir(world);
+    std::fs::create_dir_all(&directory).expect("create the sessions directory");
+    let record = serde_json::json!({
+        "session_id": session_id,
+        "target": "gpu-box",
+        "peer_host": "gpu-box.example-tailnet.ts.net",
+        "ssh_port": null,
+        "model": "qwen",
+        "remote_service_id": "svc-1",
+        "remote_cli": remote_cli,
+        "remote_port": 11434,
+        "tailnet_port": 8000,
+        "base_url": "http://gpu-box.example-tailnet.ts.net:8000/v1",
+        "created_at_unix_ms": 1,
+    });
+    let path = directory.join(format!("{file_stem}.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&record).expect("serialize"),
+    )
+    .expect("write the session record");
+    path
+}
+
+#[given("a session record on this machine that names a remote command this tool never writes")]
+async fn given_refused_record(world: &mut E2eWorld) {
+    plant_session_record(
+        world,
+        PLANTED_SESSION_ID,
+        PLANTED_SESSION_ID,
+        "rocm; true #",
+    );
+}
+
+#[given("a session record for the GPU machine that names a remote command this tool never writes")]
+async fn given_refused_gpu_box_record(world: &mut E2eWorld) {
+    plant_session_record(
+        world,
+        GPU_BOX_SESSION_ID,
+        GPU_BOX_SESSION_ID,
+        "rocm; true #",
+    );
+}
+
+#[then("the user is told the session record cannot be used and `stop` cannot reach it")]
+async fn then_serve_names_refused(world: &mut E2eWorld) {
+    let said = said(world);
+    let record = sessions_dir(world).join(format!("{GPU_BOX_SESSION_ID}.json"));
+    assert_ne!(world.cli_rc, Some(0), "serve must refuse:\n{said}");
+    assert!(
+        said.contains("cannot be used")
+            && said.contains(&record.display().to_string())
+            && said.contains("`rocm remote stop` cannot reach a record it refuses"),
+        "the user must be told which record blocks the serve and why:\n{said}"
+    );
+    assert!(
+        !said.contains(&format!("rocm remote stop {GPU_BOX_SESSION_ID}")),
+        "`stop` cannot reach a refused record, so it must not be offered:\n{said}"
+    );
+}
+
+#[given("a session record on this machine filed under a name other than its own session")]
+async fn given_misnamed_record(world: &mut E2eWorld) {
+    plant_session_record(world, PLANTED_SESSION_ID, "remote-other-box-11434", "rocm");
+}
+
+#[when("the user asks to stop that session")]
+async fn when_stop_planted(world: &mut E2eWorld) {
+    let env = world.remote_env.clone();
+    run_remote(world, &["remote", "stop", PLANTED_SESSION_ID], &env);
+}
+
+#[then("the user is told the record was refused and how to clear it")]
+async fn then_stop_names_refused(world: &mut E2eWorld) {
+    let said = said(world);
+    let record = sessions_dir(world).join(format!("{PLANTED_SESSION_ID}.json"));
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a refused record cannot be stopped:\n{said}"
+    );
+    assert!(
+        !said.contains("no remote sessions are recorded"),
+        "the record is there; it was refused:\n{said}"
+    );
+    // The summary sentence names the record; only `refused_summary` writes it,
+    // so the per-record warning printed beside it cannot satisfy this.
+    assert!(
+        said.contains(&format!(
+            "1 remote session record(s) were refused and are not listed (see the warnings \
+             above): {}.",
+            record.display()
+        )),
+        "the user must be told which record was refused:\n{said}"
+    );
+    // How to clear it is the record's own remedy, from its warning.
+    assert!(
+        said.contains("set \"remote_cli\" in the file back to \"rocm\""),
+        "the user must be told how to clear the refusal:\n{said}"
+    );
+}
+
+/// The id `serve` gives a session on the fake tailnet's GPU machine at port
+/// 8000, planted usable beside a refused record for the same machine at the
+/// default port ([`GPU_BOX_SESSION_ID`]). Both carry the ids `serve` writes, so
+/// their file names spell the peer name as a real record's does.
+const USABLE_SESSION_ID: &str = "remote-gpu-box-example-tailnet-ts-net-8000";
+
+#[given("a usable session record and a refused one for the same GPU machine")]
+async fn given_usable_and_refused_records(world: &mut E2eWorld) {
+    plant_session_record(world, USABLE_SESSION_ID, USABLE_SESSION_ID, "rocm");
+    plant_session_record(
+        world,
+        GPU_BOX_SESSION_ID,
+        GPU_BOX_SESSION_ID,
+        "rocm; true #",
+    );
+}
+
+#[when(expr = "the user asks to stop the session on that machine by the name {string}")]
+async fn when_stop_by_machine_name(world: &mut E2eWorld, name: String) {
+    let env = world.remote_env.clone();
+    run_remote(world, &["remote", "stop", &name], &env);
+}
+
+#[then(expr = "the user is told {string} also matches the refused record")]
+async fn then_fragment_names_refused(world: &mut E2eWorld, name: String) {
+    let said = said(world);
+    let refused = sessions_dir(world).join(format!("{GPU_BOX_SESSION_ID}.json"));
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a name matching a refused record too must not be resolved:\n{said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "`{name}` matches remote session {USABLE_SESSION_ID}, but that is not the only \
+             record it matches."
+        )) && said.contains(&format!(
+            "It also matches refused session record(s), which may be the session you meant \
+             (see the warnings above): {}",
+            refused.display()
+        )),
+        "the user must be told which records the name matches:\n{said}"
+    );
+}
+
+#[then("both session records are left in place")]
+async fn then_both_records_left(world: &mut E2eWorld) {
+    for id in [USABLE_SESSION_ID, GPU_BOX_SESSION_ID] {
+        let record = sessions_dir(world).join(format!("{id}.json"));
+        assert!(
+            record.exists(),
+            "an ambiguous stop must not forget either session: {} is gone",
+            record.display()
+        );
+    }
+}
+
+#[then("the session record is left in place")]
+async fn then_record_left(world: &mut E2eWorld) {
+    // The one planted record is still there: `only_session_record` asserts
+    // exactly one.
+    let record = only_session_record(world);
+    assert!(
+        record.exists(),
+        "a refused command must not forget the session: {} is gone",
+        record.display()
+    );
+}
+
+#[then("the user is told the session record is not named after its session")]
+async fn then_record_misnamed(world: &mut E2eWorld) {
+    let said = said(world);
+    assert!(
+        said.contains("is not named after it")
+            && said.contains(&format!("{PLANTED_SESSION_ID}.json"))
+            && said.contains("1 remote session record(s) were refused"),
+        "the user must be told the record is misnamed and what to rename it to:\n{said}"
+    );
+    assert!(
+        !said.contains("No remote sessions have been started"),
+        "{said}"
+    );
+}
+
+/// A file only the extra command creates, so its presence is the proof it ran.
+const EXTRA_COMMAND_MARKER: &str = "/tmp/rocm-e2e-extra-command-ran";
+
+#[when("the session record is altered to run an extra command on that machine")]
+async fn when_record_altered(world: &mut E2eWorld) {
+    let path = only_session_record(world);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read record")).expect("parse record");
+    let cli = record["remote_cli"]
+        .as_str()
+        .expect("the record names a remote CLI")
+        .to_owned();
+    // Keeps the real CLI first so the original command would still run, and
+    // comments out the rest of the line, which is what makes the extra command
+    // invisible in normal output.
+    record["remote_cli"] =
+        serde_json::Value::String(format!("{cli}; touch {EXTRA_COMMAND_MARKER} #"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&record).expect("serialize"),
+    )
+    .expect("write altered record");
+}
+
+#[then("the user is told the session record was refused")]
+async fn then_record_refused(world: &mut E2eWorld) {
+    let said = said(world);
+    assert!(
+        said.contains("refusing to act on") && said.contains("unexpected remote CLI"),
+        "the user must be told the record was refused and why:\n{said}"
+    );
+    // Not listed as a session, but not reported as "no sessions" either: the
+    // model the record describes is still running on the machine, which the
+    // next step proves untouched.
+    assert!(
+        !said.contains("No remote sessions have been started"),
+        "a refused record is not the absence of a session:\n{said}"
+    );
+    assert!(
+        said.contains("1 remote session record(s) were refused")
+            && said.contains("may still be serving"),
+        "the user must be told a session was refused and may still be serving:\n{said}"
+    );
+}
+
+#[then("the extra command never ran on the machine")]
+async fn then_extra_command_never_ran(world: &mut E2eWorld) {
+    // Prints one of two words rather than relying on an exit status, so a
+    // broken probe cannot read as "absent".
+    let seen = machine(world).exec(&[
+        "sh",
+        "-c",
+        &format!("if [ -e {EXTRA_COMMAND_MARKER} ]; then echo ran; else echo absent; fi"),
+    ]);
+    assert_eq!(
+        seen.trim(),
+        "absent",
+        "the altered record's extra command ran on the machine"
+    );
+}
+
 #[then("the model and the endpoint are both reported healthy")]
 async fn then_both_healthy(world: &mut E2eWorld) {
     let said = said(world);
