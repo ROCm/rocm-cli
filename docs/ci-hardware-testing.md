@@ -270,7 +270,8 @@ cancel, while a fork PR (an external contributor, whose hardware lanes are held
 for approval where the repository setting requires it, with a read-only token) just has `e2e-gpu`
 skip its steps and the rest of its run continue. A failed cancel is tolerated.
 The consolidated report does not count a lane that skipped itself as a missing
-report, and says so in its summary. `e2e-report` is gated on `always()`, so it
+report: the lane uploads an `mi300x-stale-run` marker, which the MI300X check reads
+as an absent lane. `e2e-report` is gated on `always()`, so it
 still runs after the cancel, but its missing-report check is gated on
 `!cancelled()` and is skipped in a cancelled run. The exemption is therefore for
 runs that are not cancelled: a fork PR (no cancel is sent), or a cancel that
@@ -864,7 +865,8 @@ regression shows red instead of always green. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
 job, naming the lane, rather than silently dropping out of the grid (a lane that
-skipped itself as stale is the exception); on a
+skipped itself as stale is the exception, and the two MI300X lanes of a pull
+request are decided together by `mi300x-gate.sh`, see above); on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
 

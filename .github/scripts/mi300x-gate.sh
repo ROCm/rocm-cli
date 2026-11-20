@@ -19,6 +19,9 @@
 #   absent     skipped, cancelled, never got a runner (`abandoned`), not in the
 #              run, or said it skipped itself on purpose: no evidence either way
 #
+# A self-hosted lane that skipped itself as stale (its PR closed or its head moved
+# on) leaves the artifact STALE_ARTIFACT and is absent, however it ended.
+#
 # When MI300X_REQUIRED is `true` (a pull request that the queue lane takes):
 #
 #   - any lane `failed`               -> fail: a lane that ran and failed still fails
@@ -26,8 +29,11 @@
 #   - else                            -> fail: no lane produced a passing report
 #
 # Otherwise (a push, a dispatch, a pull request the queue does not take) there is
-# no either-or: only a lane that ran and left no report (`no-report`) fails, as
-# the generic missing-report check treats every other lane.
+# no either-or, and the lanes are judged as the generic missing-report check
+# judges every other lane: a lane that ran (succeeded, failed, or was cut off by
+# its timeout, which GitHub reports as cancelled) and exported no report fails
+# the check, and an absent lane does not. A lane that ran, failed and did export
+# its report is the report's to show, as before.
 #
 # Inputs (environment):
 #   MI300X_REQUIRED       `true` for the either-or rule above.
@@ -37,6 +43,7 @@
 #   SELFHOSTED_RESULT     `e2e-gpu`'s result: the `needs` vocabulary plus
 #                         `abandoned` and `absent` (see settle-e2e-lanes.sh).
 #   SELFHOSTED_ARTIFACT   the self-hosted lane's report artifact name.
+#   STALE_ARTIFACT        the marker artifact a stale-skipped self-hosted lane uploads.
 #   ARTIFACTS             the run's artifact names, one per line.
 #   GITHUB_STEP_SUMMARY   as GitHub provides it.
 set -euo pipefail
@@ -65,8 +72,25 @@ classify() {
   esac
 }
 
+# ran_without_report <result> <skipped output> <artifact>: did the lane run to an
+# end (or be cut off) and leave no report? As the generic missing-report check
+# reads a lane: only a skipped or never-started one is excused.
+ran_without_report() {
+  local result="$1" skipped="$2" artifact="$3"
+  case "${result}" in
+    skipped | abandoned | absent | "") return 1 ;;
+  esac
+  [[ "${skipped}" = true ]] && return 1
+  ! grep -qxF -- "${artifact}" <<<"${artifacts}"
+}
+
 queue=$(classify "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT:?QUEUE_ARTIFACT is required}")
-selfhosted=$(classify "${SELFHOSTED_RESULT-}" "" "${SELFHOSTED_ARTIFACT:?SELFHOSTED_ARTIFACT is required}")
+selfhosted_result="${SELFHOSTED_RESULT-}"
+# A lane that skipped itself as stale did not run for this head: absent.
+if grep -qxF -- "${STALE_ARTIFACT:?STALE_ARTIFACT is required}" <<<"${artifacts}"; then
+  selfhosted_result=skipped
+fi
+selfhosted=$(classify "${selfhosted_result}" "" "${SELFHOSTED_ARTIFACT:?SELFHOSTED_ARTIFACT is required}")
 
 verdict=0
 if [[ "${required}" = true ]]; then
@@ -80,11 +104,12 @@ if [[ "${required}" = true ]]; then
     reason="no lane produced a passing report"
   fi
 else
-  if [[ "${queue}" = no-report || "${selfhosted}" = no-report ]]; then
+  if ran_without_report "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT}" ||
+    ran_without_report "${selfhosted_result}" "" "${SELFHOSTED_ARTIFACT}"; then
     verdict=1
     reason="a lane ran and exported no report"
   else
-    reason="MI300X is not required of this run; only a lane that ran without a report fails"
+    reason="no either-or for this run; a lane that ran fails only if it exported no report"
   fi
 fi
 
@@ -93,7 +118,7 @@ mark=":white_check_mark:"
 {
   echo "### MI300X: ${mark} ${reason}"
   echo "- queue lane (\`e2e-gpu-queue\`): ${queue} (result: ${QUEUE_RESULT:-absent})"
-  echo "- self-hosted lane (\`e2e-gpu\`): ${selfhosted} (result: ${SELFHOSTED_RESULT:-absent})"
+  echo "- self-hosted lane (\`e2e-gpu\`): ${selfhosted} (result: ${selfhosted_result:-absent})"
   if [[ "${selfhosted}" = absent && "${required}" = true ]]; then
     echo "- A self-hosted lane that was cancelled, skipped or never got a runner counts as absent, not failed."
   fi

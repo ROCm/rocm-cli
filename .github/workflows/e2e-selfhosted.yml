@@ -198,8 +198,9 @@ jobs:
     # cache), and its failure is as non-blocking as it always was.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
-    # Read by `e2e-report`: a run that skipped itself as stale uploads nothing,
-    # which is not a missing report.
+    # Read by `cancel-stale-run`. `e2e-report` cannot read it (it reaches this
+    # lane through `e2e-gpu-settled`), so a stale run also uploads an
+    # `mi300x-stale-run` marker, which the MI300X check reads as an absent lane.
     outputs:
       stale: ${{ steps.stale.outputs.stale }}
     strategy:
@@ -265,9 +266,9 @@ jobs:
       # This has to be a step: a job-level `if` is evaluated before the job is
       # queued, when the PR may still be open and current, and cannot be
       # re-evaluated later. Every later step is gated on `steps.stale.outputs`
-      # so the job ends without running them, and without failing; `e2e-report`
-      # reads the `stale` job output so that is not reported as a lane that ran
-      # without uploading its report.
+      # so the job ends without running them, and without failing; it then
+      # uploads the `mi300x-stale-run` marker so that `e2e-report` does not report
+      # it as a lane that ran without uploading its report.
       #
       # Fails open: if the PR cannot be read (or `gh` is missing), the job runs
       # as before. One assumption: any API head that differs from the event's
@@ -506,6 +507,21 @@ jobs:
           name: e2e-gpu-n-2-report
           path: tests/e2e-cucumber/results/
 
+      # `e2e-report` no longer reads this job's `stale` output (it reads the lane
+      # through `e2e-gpu-settled`, which carries only a result), so a run that
+      # skipped itself as stale says so in an artifact: the MI300X check reads it
+      # as an absent lane rather than one that ran and exported nothing.
+      - name: Record that this run skipped itself as stale
+        if: always() && steps.stale.outputs.stale == 'true'
+        run: echo stale > "${RUNNER_TEMP}/mi300x-stale-run"
+
+      - name: Upload the stale-run marker
+        if: always() && steps.stale.outputs.stale == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mi300x-stale-run
+          path: ${{ runner.temp }}/mi300x-stale-run
+
   # Cancels a run `e2e-gpu` found stale. A separate job, on a GitHub-hosted
   # runner with no checkout, so the `actions: write` token never shares a job
   # with PR code (`e2e-gpu` runs it on a persistent runner). It is the internal
@@ -517,8 +533,8 @@ jobs:
   # already freed when `e2e-gpu` skipped itself. A failed cancel (e.g. a token
   # without `actions: write`) is tolerated. `e2e-report` is gated on `always()`,
   # so it still runs after the cancel, but its missing-report check is gated on
-  # `!cancelled()` and is skipped in a cancelled run. The check's `stale`
-  # exemption is therefore for runs that are not cancelled: a fork PR (no
+  # `!cancelled()` and is skipped in a cancelled run. The `mi300x-stale-run`
+  # marker's exemption is therefore for runs that are not cancelled: a fork PR (no
   # cancel is sent), or a cancel that fails or loses a race with the check.
   cancel-stale-run:
     name: Cancel a stale run
@@ -1969,7 +1985,7 @@ jobs:
             e2e-gpu-n-2=E2E tests (MI300X, n-2)
         run: bash .github/scripts/settle-e2e-lanes.sh
 
-  # Ends the run when `e2e-gpu-settled` gave up on a leg: a job queued on a
+  # Ends the run when `e2e-gpu-settled` gave up on a leg, on any event: a job queued on a
   # runner pool with no runner cannot be cancelled on its own and would keep the
   # run, and its check, pending for a day. It runs after the report and every
   # other lane, which is why it needs them all but `e2e-gpu` itself (it cannot
@@ -1990,12 +2006,16 @@ jobs:
       - e2e-gpu-strix-windows
       - e2e-wsl
       - e2e-report
-    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (needs.e2e-gpu-settled.result == 'failure' || needs.e2e-gpu-settled.result == 'cancelled' || (needs.e2e-gpu-settled.outputs.abandoned_count != '' && needs.e2e-gpu-settled.outputs.abandoned_count != '0')) }}
+    if: ${{ always() && (needs.e2e-gpu-settled.result == 'failure' || needs.e2e-gpu-settled.result == 'cancelled' || (needs.e2e-gpu-settled.outputs.abandoned_count != '' && needs.e2e-gpu-settled.outputs.abandoned_count != '0')) }}
     steps:
       - name: Cancel the run's unfinished lanes
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+        # Tolerated, as `cancel-stale-run` does: a pull request that cannot cancel
+        # (a read-only token on a dependabot or fork run) is left as it was before
+        # this job, with a warning, not turned red.
+        run: |
+          gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || echo "::warning::could not cancel run ${GITHUB_RUN_ID}; the MI300X self-hosted leg stays queued"
 
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
@@ -2150,6 +2170,7 @@ jobs:
           QUEUE_ARTIFACT: e2e-gpu-report
           SELFHOSTED_RESULT: ${{ fromJSON(needs.e2e-gpu-settled.outputs.lane_results || '{}').e2e-gpu.result }}
           SELFHOSTED_ARTIFACT: e2e-gpu-selfhosted-report
+          STALE_ARTIFACT: mi300x-stale-run
         run: |
           ARTIFACTS=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
