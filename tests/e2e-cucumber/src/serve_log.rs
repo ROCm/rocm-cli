@@ -376,9 +376,11 @@ pub enum EngineDeathReport {
 
 /// Classifies a failed `rocm serve --wait`'s stderr by its engine-death message.
 ///
-/// The wording matched here is the CLI's:
-/// `managed_engine_startup_failure_detail` (the 200 ms post-spawn check) and
-/// `died_during_wait` (the readiness wait), both in `apps/rocm/src/service_launch/`.
+/// The wording matched here is the CLI's, in `apps/rocm/src/service_launch/`:
+/// `managed_engine_startup_failure_detail` (the 200 ms post-spawn check, in
+/// `spawn.rs`) for the log tail, and for the pointer both `died_during_wait`
+/// and the "exited while it was starting" refusal in `readiness.rs`, which
+/// build it from `service_hints::service_logs_hint`.
 pub fn engine_death_report(stderr: &str) -> EngineDeathReport {
     if stderr.contains("managed engine exited immediately") {
         return EngineDeathReport::LogTailQuoted;

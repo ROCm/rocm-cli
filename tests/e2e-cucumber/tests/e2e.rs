@@ -794,7 +794,8 @@ impl E2eWorld {
         let manifest = serde_json::json!({
             // Mirrors `rocm_deps::lemonade_env_id`, which the engine and `rocm`
             // both use; the suite cannot import it. A drift sends `serve` to
-            // the real install, which serve-18's refusal count catches.
+            // the real multi-gigabyte install, and serve-18's refusal count
+            // catches it only afterwards: it fails late, not fast.
             "env_id": format!("lemonade-embeddable-{version}"),
             "version": version,
             "runtime_dir": runtime_dir,

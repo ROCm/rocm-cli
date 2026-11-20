@@ -217,13 +217,13 @@ Feature: Model serving
   # Linux paths only; hence Linux. Windows is excluded for a second reason too:
   # there `rocm serve` does not notice a managed engine dying at startup (#467),
   # so the failure would not reach the user at all. The install fails inside the
-  # spawned engine, so the serve runs with `--wait`: without it, `rocm serve`
-  # notices only an engine that dies within 200 ms of the spawn and reports a
-  # later death as `starting` with exit 0.
+  # spawned engine, so the serve runs with `--wait`: without it, a serve whose
+  # output is not a terminal (as here) notices only an engine that dies within
+  # 200 ms of the spawn and reports a later death as `starting` with exit 0.
   @id:serve-lemonade-preparation-recovery @requires-os:linux
   Scenario: serve-18 - Repeated Lemonade preparation failure gives the user a recovery path
     Given Lemonade preparation cannot complete
-    When the user serves a model with Lemonade
+    When the user serves a model with Lemonade and waits for the engine
     Then serving stops after one automatic retry
     And the user is told how to reinstall Lemonade and retry serving
 

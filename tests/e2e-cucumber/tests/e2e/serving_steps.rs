@@ -1811,23 +1811,51 @@ async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
     world.plant_failing_lemonade_runtime();
 }
 
-/// `--wait` is load-bearing. The backend install fails inside the managed
-/// engine process, after `rocm serve` has spawned it. Without `--wait`, serve
-/// only notices an engine that dies within its 200 ms post-spawn check; one
-/// that dies later is reported as `starting` with exit 0 once the readiness
-/// probe gives up, so on a loaded host this scenario would race that window.
-/// With `--wait` a later death fails the serve too, once the 45 s readiness
-/// probe ends, so the slow path costs that long.
-///
-/// Both ways the failure reaches the user are followed: an engine that died
-/// inside the window fails the serve with its log tail, and one that died
-/// later fails it with a pointer to `rocm logs --service <id>`, which this step
-/// then runs, as the user would. The retry and recovery lines are the engine's
-/// own output either way, so the assertions read the serve output together
-/// with that log. A failed serve carrying neither message fails here, naming
-/// both, rather than as a missing retry line later.
 #[when("the user serves a model with Lemonade")]
 async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// serve-18's serve, on its own step text. The plain step above is shared with
+/// lemonade-installs-02, whose serve is refused before any engine starts; that
+/// refusal carries neither engine-death message, so the interpretation below
+/// would fail it, and it applies only here.
+///
+/// `--wait` is load-bearing. The backend install fails inside the managed
+/// engine process, after `rocm serve` has spawned it, and the suite captures
+/// serve's output. With output that is not a terminal, serve does not watch the
+/// engine while it waits for readiness (`ServeStartupPolicy`'s `watch_engine`
+/// is off for that path, in `apps/rocm/src/serve_progress.rs`), so without
+/// `--wait` it notices only an engine that dies within its 200 ms post-spawn
+/// check (`launch_managed_engine_child_locked` in
+/// `apps/rocm/src/service_launch/spawn.rs`) and reports a later death as
+/// `starting` with exit 0 once the readiness probe gives up. On a loaded host
+/// this scenario would race that window. With `--wait` a later death fails the
+/// serve too (`died_during_wait` in `service_launch/readiness.rs`), once the
+/// 45 s readiness probe ends, so the slow path costs that long.
+///
+/// Both ways the failure reaches the user are followed: an engine that died
+/// inside the window fails the serve with its log tail on stderr, and one that
+/// died later fails it with a pointer to `rocm logs --service <id>`, which this
+/// step then runs, as the user would, appending its output to stdout. The
+/// Then steps read stdout and stderr together (`serve_output`), so both paths
+/// feed them the engine's own retry and recovery lines. A failed serve carrying
+/// neither message fails here, naming both, rather than as a missing retry line
+/// later.
+#[when("the user serves a model with Lemonade and waits for the engine")]
+async fn user_serves_with_lemonade_and_waits(world: &mut E2eWorld) {
     let (mut stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
         world,
         &[
@@ -2946,13 +2974,17 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
     );
     // Both attempts must have been refused by the planted runtime. Without its
     // line, `serve` did not accept the planted runtime and attempted some other
-    // install -- for a mismatched `env_id`, the real multi-gigabyte one.
+    // install -- for a mismatched `env_id`, the real multi-gigabyte one. This
+    // check runs after that install, so such a mismatch fails late, not fast.
     assert_eq!(
         output
             .matches(e2e_cucumber::fixture_binary::FAKE_LEMONADE_INSTALL_REFUSAL)
             .count(),
         2,
-        "expected the planted runtime to refuse both backend installs:\n{output}"
+        "expected the planted runtime to refuse both backend installs. If it \
+         refused none, `serve` did not accept the planted runtime (a drifted \
+         `env_id`?) and ran some other install first, so this failure comes \
+         after that install, not instead of it:\n{output}"
     );
 }
 
