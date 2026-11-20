@@ -4725,10 +4725,10 @@ an old 32-bit libstdc++ first, a cache with two x86-64 copies, a cache of
 thousands of entries, an `ldconfig` found only in sbin, an os-release path
 that is a directory (passed over for the next file, or for "unknown"), and
 hosts where a value cannot be read — and fails when its floor and the one in
-`README.md` disagree, or when a place that restates its glibc/`GLIBCXX` pair — [wsl.md](wsl.md), the WSL distro check and its fix recipe in `rocm-core`,
-or the rocm-doctor skill's [reference.md](../skills/rocm-doctor/reference.md)
-— disagrees with `README.md`. Only the pair is compared: the Ubuntu release
-name is not.
+`README.md` disagree, or when a place that restates its glibc/`GLIBCXX`
+pair — [wsl.md](wsl.md), or the WSL distro check and its fix recipe in
+`rocm-core` — disagrees with `README.md`. Only the pair is compared: the
+Ubuntu release name is not.
 In [`workflow_contract.rs`](../xtask/src/workflow_contract.rs),
 `preflight_fails_a_host_below_the_baseline_without_querying_the_gpu` holds that
 a failing baseline stops the preflight before `rocm-smi` is asked anything,

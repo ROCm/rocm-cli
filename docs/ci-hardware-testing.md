@@ -482,9 +482,8 @@ cannot run what users are told is supported, and a floor raised above it would
 hide a break on the oldest host the product supports.
 [`host_baseline_contract.rs`](../xtask/src/host_baseline_contract.rs) fails
 when the script's constants and the README sentence's glibc/`GLIBCXX` pair
-disagree, or when a place that restates the pair — [wsl.md](wsl.md), the WSL
-distro check and its fix recipe in `rocm-core`, or the rocm-doctor skill's
-[reference.md](../skills/rocm-doctor/reference.md) — disagrees with README.md, so
+disagree, or when a place that restates the pair — [wsl.md](wsl.md), or the
+WSL distro check and its fix recipe in `rocm-core` — disagrees with README.md, so
 raising the CI floor is a change to the product's support floor, made as its
 own decision rather than on the runners alone. The Ubuntu release those texts
 also name (README.md, wsl.md, `WSL_MIN_UBUNTU` in `rocm-core`) is not compared

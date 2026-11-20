@@ -16,11 +16,11 @@
 //! * that the glibc/`GLIBCXX` pair it asserts is the product's: the constants
 //!   in the script must equal the "glibc X with `GLIBCXX_Y`" sentence in
 //!   `README.md`, and each place that restates the pair (`docs/wsl.md`, the
-//!   WSL distro check and its fix recipe in `rocm-core`, the rocm-doctor
-//!   skill's reference) must agree with it, so no side can move alone. Only
-//!   the pair is tied: the Ubuntu release the same texts name (README.md,
-//!   `docs/wsl.md`, `WSL_MIN_UBUNTU` in `rocm-core`) is not compared, so
-//!   raising the floor also means checking those by hand.
+//!   WSL distro check and its fix recipe in `rocm-core`) must agree with it,
+//!   so no side can move alone. Only the pair is tied: the Ubuntu release
+//!   the same texts name (README.md, `docs/wsl.md`, `WSL_MIN_UBUNTU` in
+//!   `rocm-core`) is not compared, so raising the floor also means checking
+//!   those by hand.
 //!
 //! Where the script sits in the preflight, and that a failing baseline stops
 //! it before any GPU query, is `workflow_contract.rs`'s to drive.
@@ -86,16 +86,15 @@ mod tests {
 
     /// Files outside README.md that restate the floor as "2.38 /
     /// `GLIBCXX_3.4.32`", each exactly once: the WSL distro check's message
-    /// and the comments beside it, the fix recipe's rationale, and the
-    /// rocm-doctor skill's failure catalog. Each must select xtask when it
-    /// alone changes, or an edit to it skips the test that reads it:
-    /// `every_floor_file_selects_the_test_that_reads_it` holds that.
-    const SLASH_FLOOR_RESTATEMENTS: [&str; 5] = [
+    /// and the comments beside it, and the fix recipe's rationale. Each must
+    /// select xtask when it alone changes, or an edit to it skips the test
+    /// that reads it: `every_floor_file_selects_the_test_that_reads_it` holds
+    /// that.
+    const SLASH_FLOOR_RESTATEMENTS: [&str; 4] = [
         "crates/rocm-core/src/diagnose/wsl.rs",
         "crates/rocm-core/src/examine.rs",
         "crates/rocm-core/src/examine/wsl.rs",
         "crates/rocm-core/src/fix/catalog.rs",
-        "skills/rocm-doctor/reference.md",
     ];
 
     /// The CI floor is the glibc/`GLIBCXX` half of the product floor, on
@@ -141,7 +140,7 @@ mod tests {
     /// runs it when that file alone changes: `cargo xtask affected` (and the
     /// pre-push hook, which selects the same way) must pick xtask for it. Each
     /// gets there through its row of `CROSS_CRATE_READS` (cross_crate_reads.rs):
-    /// the Markdown files through `README.md`, `docs/` and `skills/`, the Rust
+    /// the Markdown files through `README.md` and `docs/`, the Rust
     /// files through `*.rs`. `every_cross_crate_read_is_in_the_rust_filter`
     /// also holds those rows to CI's `rust` path category.
     #[test]
