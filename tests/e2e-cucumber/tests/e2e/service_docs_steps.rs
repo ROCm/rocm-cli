@@ -21,6 +21,7 @@ use cucumber::{given, then, when};
 use serde_json::Value;
 
 use e2e_cucumber::mock_server::ServiceRecordOptions;
+use e2e_cucumber::polled_deadline::{PolledDeadline, RetryTiming};
 
 use crate::E2eWorld;
 use crate::e2e::serving_steps::LIVE_REUSE_MODEL;
@@ -34,6 +35,20 @@ const STOP_SHOWS_WITHIN: Duration = Duration::from_secs(3);
 
 /// How long `rocm services docs` gets to exit after Ctrl+C.
 const DOCS_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the waits on `rocm services docs` re-check its output or exit.
+/// They sleep between checks rather than block, so the other scenarios the
+/// harness polls on the same task keep running meanwhile.
+const DOCS_POLL: Duration = Duration::from_millis(100);
+
+/// A wait on `rocm services docs` of at most `timeout` of polled time.
+fn docs_wait(timeout: Duration) -> PolledDeadline {
+    PolledDeadline::start(RetryTiming {
+        timeout,
+        resend_interval: DOCS_POLL,
+        poll_interval: DOCS_POLL,
+    })
+}
 
 /// The port `rocm services docs` serves on when given none:
 /// `rocmd::DEFAULT_API_DOCS_PORT`, which this crate does not link.
@@ -107,7 +122,7 @@ async fn get(url: &str) -> reqwest::Response {
 /// Run `rocm <args>`, with `--port <port>` when one is given, in the
 /// background and wait for it to print `service_id`'s docs link. Keeps the
 /// command in the world and returns the link.
-fn start_docs_command(
+async fn start_docs_command(
     world: &mut E2eWorld,
     args: &[String],
     service_id: &str,
@@ -158,10 +173,10 @@ fn start_docs_command(
     drop(lines_tx);
 
     let wanted = format!("/services/{service_id}/docs/");
-    let deadline = Instant::now() + DOCS_START_TIMEOUT;
+    let mut deadline = docs_wait(DOCS_START_TIMEOUT);
     let mut printed = Vec::new();
     let link = loop {
-        match lines.recv_timeout(Duration::from_millis(200)) {
+        match lines.try_recv() {
             Ok(line) => {
                 let link = line
                     .split_whitespace()
@@ -172,8 +187,20 @@ fn start_docs_command(
                     break link;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::TryRecvError::Empty) => {
+                if let Some(expiry) = deadline.expired() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "`rocm {}` printed no {wanted} within {expiry}:\n{}",
+                        args.join(" "),
+                        printed.join("\n")
+                    );
+                }
+                let budget = deadline.budget(DOCS_POLL);
+                deadline.run(tokio::time::sleep(budget)).await;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
                 let _ = child.wait();
                 panic!(
                     "`rocm {}` ended without printing {wanted}:\n{}",
@@ -181,15 +208,6 @@ fn start_docs_command(
                     printed.join("\n")
                 )
             }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "`rocm {}` printed no {wanted} within {DOCS_START_TIMEOUT:?}:\n{}",
-                args.join(" "),
-                printed.join("\n")
-            );
         }
     };
     world.docs_command = Some(DocsCommand {
@@ -244,7 +262,7 @@ fn assert_chat_routes_listed(openapi: &Value) {
 #[given("the user is serving the API docs for the running server")]
 async fn user_serves_docs(world: &mut E2eWorld) {
     let args: Vec<String> = ["services", "docs", "e2e-mock"].map(str::to_owned).to_vec();
-    let link = start_docs_command(world, &args, "e2e-mock", Some(free_port()));
+    let link = start_docs_command(world, &args, "e2e-mock", Some(free_port())).await;
     let page = get(&link).await;
     assert!(page.status().is_success(), "premise: the docs open");
     world.docs_link = Some(link);
@@ -284,7 +302,7 @@ async fn user_runs_listed_docs_command(world: &mut E2eWorld) {
     let listing = crate::run_rocm_ok(world, &["services", "list"]);
     let args = docs_command_in(&listing)
         .unwrap_or_else(|| panic!("the services list names no API docs command:\n{listing}"));
-    let link = start_docs_command(world, &args, "e2e-mock", Some(free_port()));
+    let link = start_docs_command(world, &args, "e2e-mock", Some(free_port())).await;
     world.docs_link = Some(link);
 }
 
@@ -406,20 +424,32 @@ async fn user_serves_live_model_attached(world: &mut E2eWorld) {
 async fn user_presses_ctrl_c(world: &mut E2eWorld) {
     let docs = world.docs_command.as_mut().expect("no docs command");
     send_ctrl_c(&docs.child);
-    let deadline = Instant::now() + DOCS_STOP_TIMEOUT;
+    let mut deadline = docs_wait(DOCS_STOP_TIMEOUT);
     let status = loop {
         if let Some(status) = docs.child.try_wait().expect("wait for rocm services docs") {
             break status;
         }
-        assert!(
-            Instant::now() < deadline,
-            "rocm services docs did not exit within {DOCS_STOP_TIMEOUT:?} of Ctrl+C"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+        if let Some(expiry) = deadline.expired() {
+            panic!("rocm services docs did not exit within {expiry} of Ctrl+C");
+        }
+        let budget = deadline.budget(DOCS_POLL);
+        deadline.run(tokio::time::sleep(budget)).await;
     };
-    // The reader threads finish once both streams close.
-    while let Ok(line) = docs.lines.recv_timeout(Duration::from_secs(5)) {
-        docs.printed.push(line);
+    // The reader threads finish, and the channel disconnects, once both
+    // streams close; the process has exited, so that is moments away.
+    let mut deadline = docs_wait(DOCS_STOP_TIMEOUT);
+    loop {
+        match docs.lines.try_recv() {
+            Ok(line) => docs.printed.push(line),
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                if let Some(expiry) = deadline.expired() {
+                    panic!("rocm services docs left its output open {expiry} after exiting");
+                }
+                let budget = deadline.budget(DOCS_POLL);
+                deadline.run(tokio::time::sleep(budget)).await;
+            }
+        }
     }
     world.cli_rc = status.code();
     world.cli_output = Some(docs.printed.join("\n"));
@@ -428,7 +458,7 @@ async fn user_presses_ctrl_c(world: &mut E2eWorld) {
 #[when("the user runs the API docs command for the running server without choosing a port")]
 async fn user_runs_docs_on_default_port(world: &mut E2eWorld) {
     let args: Vec<String> = ["services", "docs", "e2e-mock"].map(str::to_owned).to_vec();
-    let link = start_docs_command(world, &args, "e2e-mock", None);
+    let link = start_docs_command(world, &args, "e2e-mock", None).await;
     world.docs_link = Some(link);
 }
 
@@ -744,7 +774,7 @@ async fn named_docs_command_opens(world: &mut E2eWorld) {
     let output = world.cli_output.clone().expect("no serve output");
     let args =
         docs_command_in(&output).unwrap_or_else(|| panic!("no API docs command in:\n{output}"));
-    let link = start_docs_command(world, &args, "e2e-mock", Some(free_port()));
+    let link = start_docs_command(world, &args, "e2e-mock", Some(free_port())).await;
     let page = get(&link).await;
     assert!(page.status().is_success(), "{link}: {}", page.status());
     assert!(
@@ -762,7 +792,7 @@ async fn serve_printed_docs_command_opens(world: &mut E2eWorld) {
         .last()
         .cloned()
         .unwrap_or_else(|| panic!("the docs command names no server: {args:?}"));
-    let link = start_docs_command(world, &args, &service_id, Some(free_port()));
+    let link = start_docs_command(world, &args, &service_id, Some(free_port())).await;
     let (origin, openapi) = openapi_behind(&link).await;
     assert_chat_routes_listed(&openapi);
     // Every route the docs document for a GET, health included, answers when

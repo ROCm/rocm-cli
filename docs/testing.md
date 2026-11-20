@@ -1151,7 +1151,9 @@ health-route table in
 [rocm-engine-protocol](../crates/rocm-engine-protocol/src/lib.rs), compared
 with what each engine reports as `supported_routes`); the forwarder (the three
 headers it passes on and the cookies it drops, the path kept percent-encoded,
-bodies above axum's 2 MiB default, a redirect passed back rather than followed,
+bodies above axum's 2 MiB default and one byte over its own 64 MiB limit
+refused, the answer headers it passes back, a redirect passed back rather than
+followed with a `Location` that leads back through it,
 a server that never accepts the connection, a server bound to `::` reached on
 `::1`, that a configured proxy does not divert it, and that its answers cannot
 run as pages of the docs' origin); stopped and unreachable servers; that the

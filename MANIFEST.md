@@ -787,11 +787,14 @@ if cargo-about is absent or not the pinned version.
 
 Assets compiled in that are not crates — today, the Swagger UI bundle behind
 `rocm services docs` — are listed in a "Bundled web assets" section maintained
-by hand at the end of `about.hbs`. `cargo-about` cannot see them, so their
-licenses bypass the `about.toml` check: when a dependency bump changes such an
-asset, update that section from the asset's own upstream notices. A test in
-`rocmd` fails when the served Swagger UI version is not the one the notices
-name.
+by hand at the end of [about.hbs](about.hbs). `cargo-about` cannot see them,
+so their licenses bypass the [about.toml](about.toml) check: when a dependency
+bump changes such an asset, update that section from the asset's own upstream
+notices. A test in [api_docs.rs](apps/rocmd/src/api_docs.rs)
+(`the_bundled_swagger_ui_is_the_version_named_in_the_notices`) fails when the
+served Swagger UI version is not the one the notices name; it does not check
+the list of the bundle's own third-party notices, which a bump must be read for
+by hand.
 
 CI verifies the committed file is current with `cargo xtask tpn --check`; a new
 dependency under a license not listed in `about.toml` fails the check until the

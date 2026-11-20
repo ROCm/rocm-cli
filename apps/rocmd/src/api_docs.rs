@@ -241,7 +241,8 @@ fn forwarding_client(connect_timeout: Duration) -> Result<reqwest::Client> {
         // prompt and the endpoint key off it, or fail the request outright.
         .no_proxy()
         // A redirect is not followed: the browser gets the model server's own
-        // status. The routes documented here never redirect.
+        // status and `Location` (see `passed_on_answer_headers`). The routes
+        // documented here never redirect.
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build the API docs forwarding client")
@@ -257,6 +258,12 @@ fn router(state: DocsState) -> Router {
         .route(
             "/services/{id}/api/{*path}",
             any(forward).layer(DefaultBodyLimit::max(FORWARD_BODY_LIMIT_BYTES)),
+        )
+        // The server's own root: `{*path}` needs a segment, so `/` has a
+        // route of its own.
+        .route(
+            "/services/{id}/api/",
+            any(forward_root).layer(DefaultBodyLimit::max(FORWARD_BODY_LIMIT_BYTES)),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -501,6 +508,9 @@ async fn docs_redirect(State(state): State<DocsState>, Path(service_id): Path<St
                     [(header::LOCATION, location)],
                 )
                     .into_response(),
+                // Unreachable: `service_path` emits only unreserved ASCII and
+                // `%XX`, all valid in a header value. Kept so a future change
+                // to it answers "not running" rather than panicking here.
                 Err(_) => not_running_page(&service_id),
             }
         }
@@ -554,7 +564,30 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let record = match find_running_service(&state, &service_id).await {
+    forward_to(&state, &service_id, method, &uri, &headers, body).await
+}
+
+/// `forward` for the server's root, `/services/<id>/api/`.
+async fn forward_root(
+    State(state): State<DocsState>,
+    Path(service_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    forward_to(&state, &service_id, method, &uri, &headers, body).await
+}
+
+async fn forward_to(
+    state: &DocsState,
+    service_id: &str,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    let record = match find_running_service(state, service_id).await {
         Ok(Some(record)) => record,
         Ok(None) => {
             return (
@@ -588,13 +621,11 @@ async fn forward(
     match request.send().await {
         Ok(answer) => {
             let status = answer.status();
-            let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
+            let passed_on = passed_on_answer_headers(answer.headers(), &record);
             let mut response = Response::new(Body::from_stream(answer.bytes_stream()));
             *response.status_mut() = status;
             let headers = response.headers_mut();
-            if let Some(content_type) = content_type {
-                headers.insert(header::CONTENT_TYPE, content_type);
-            }
+            headers.extend(passed_on);
             // The answer comes from the model server but is served from the
             // docs' origin. A page in it (llama.cpp's own UI, say) must not
             // run there: it is shown as data, never as a document of this
@@ -624,6 +655,59 @@ async fn forward(
     }
 }
 
+/// The headers of a model server's answer that the forwarder passes back:
+/// the body's type, where a redirect points, and how long to wait before
+/// retrying. Nothing else: a `Set-Cookie` or a CORS header from the model
+/// server would otherwise apply to the docs' own origin.
+///
+/// A `Location` on the model server itself (a path, or a URL under its own
+/// base) is rewritten into the forwarder, so a client that follows the
+/// redirect stays on the docs' origin and reaches the same server, its root
+/// included; any other `Location` is passed on as it is.
+fn passed_on_answer_headers(answer: &HeaderMap, record: &ManagedServiceRecord) -> HeaderMap {
+    let mut passed_on = HeaderMap::new();
+    for name in [header::CONTENT_TYPE, header::RETRY_AFTER] {
+        if let Some(value) = answer.get(&name) {
+            passed_on.insert(name, value.clone());
+        }
+    }
+    if let Some(location) = answer.get(header::LOCATION) {
+        // UTF-8 rather than `to_str`'s visible ASCII, so a path on the server
+        // with non-ASCII in it is still rewritten.
+        let rewritten = std::str::from_utf8(location.as_bytes())
+            .ok()
+            .and_then(|location| forwarded_location(location, record))
+            .and_then(|location| HeaderValue::try_from(location).ok());
+        passed_on.insert(
+            header::LOCATION,
+            rewritten.unwrap_or_else(|| location.clone()),
+        );
+    }
+    passed_on
+}
+
+/// `location` mapped into the forwarder when it names the model server
+/// itself; `None` when it points elsewhere.
+fn forwarded_location(location: &str, record: &ManagedServiceRecord) -> Option<String> {
+    let path = if let Some(rest) = location.strip_prefix(&record.local_base_url()) {
+        if rest.starts_with('/') {
+            rest.to_owned()
+        } else if rest.is_empty() || rest.starts_with(['?', '#']) {
+            // The server's root, bare or with a query or fragment.
+            format!("/{rest}")
+        } else {
+            // Another port or host that happens to share the prefix.
+            return None;
+        }
+    } else if location.starts_with('/') && !location.starts_with("//") {
+        location.to_owned()
+    } else {
+        // Another origin, or a relative reference: passed on unchanged.
+        return None;
+    };
+    Some(format!("{}/api{path}", service_path(&record.service_id)))
+}
+
 /// The part of `/services/<id>/api/<path>` after `api/`, still percent-encoded.
 fn raw_forwarded_path(request_path: &str) -> Option<&str> {
     let mut segments = request_path.splitn(5, '/');
@@ -635,6 +719,8 @@ fn raw_forwarded_path(request_path: &str) -> Option<&str> {
         segments.next(),
     ) {
         (Some(""), Some("services"), Some(_), Some("api"), Some(path)) => Some(path),
+        // Unreachable from the router, whose `/services/{id}/api/{*path}`
+        // route only matches that shape; `forward` answers 404 if it is not.
         _ => None,
     }
 }
@@ -674,11 +760,18 @@ fn routes_for(engine: &str) -> Vec<RouteDoc> {
     health.into_iter().chain(chat_routes()).collect()
 }
 
+/// The chat routes every engine answers, with the paths of
+/// `rocm_engine_protocol::OPENAI_CHAT_ROUTES`, which the engines also report.
+/// The paths are taken from it, so a route added to or dropped from it fails
+/// to compile here until it is described. Each description is matched to its
+/// path by position; `chat_server_docs_list_its_routes_with_the_served_model`
+/// checks the pairing.
 fn chat_routes() -> [RouteDoc; 3] {
+    let [models, chat_completions, completions] = rocm_engine_protocol::OPENAI_CHAT_ROUTES;
     [
         RouteDoc {
             method: HttpMethod::Get,
-            path: "/v1/models",
+            path: models,
             summary: "List the served models",
             description: "OpenAI-compatible model list. The `id` of each entry is the \
                           `model` value requests use.",
@@ -686,7 +779,7 @@ fn chat_routes() -> [RouteDoc; 3] {
         },
         RouteDoc {
             method: HttpMethod::Post,
-            path: "/v1/chat/completions",
+            path: chat_completions,
             summary: "Chat completion",
             description: "OpenAI-compatible chat completion. Set `stream` to `true` to \
                           receive server-sent events as tokens are generated.",
@@ -694,7 +787,7 @@ fn chat_routes() -> [RouteDoc; 3] {
         },
         RouteDoc {
             method: HttpMethod::Post,
-            path: "/v1/completions",
+            path: completions,
             summary: "Text completion",
             description: "OpenAI-compatible text completion of a raw prompt.",
             example_body: Some(completion_example),
@@ -929,6 +1022,26 @@ mod tests {
                 "Qwen/Qwen3.5",
                 "{engine}: try-it must start from the model the server answers to"
             );
+            // Each description sits on its own path: the model list is a GET
+            // with no body, chat a POST whose example has messages, and text
+            // completion a POST whose example has a prompt.
+            assert!(
+                openapi["paths"]["/v1/chat/completions"]["post"]["requestBody"]["content"]
+                    ["application/json"]["example"]["messages"]
+                    .is_array(),
+                "{engine}"
+            );
+            assert!(
+                openapi["paths"]["/v1/models"]["get"].is_object()
+                    && openapi["paths"]["/v1/models"]["post"].is_null(),
+                "{engine}"
+            );
+            assert!(
+                openapi["paths"]["/v1/completions"]["post"]["requestBody"]["content"]
+                    ["application/json"]["example"]["prompt"]
+                    .is_string(),
+                "{engine}"
+            );
             assert_eq!(
                 openapi["servers"][0]["url"], "/services/svc-1/api",
                 "{engine}"
@@ -964,6 +1077,87 @@ mod tests {
         );
         assert_eq!(raw_forwarded_path("/services/svc-1/api/"), Some(""));
         assert_eq!(raw_forwarded_path("/services/svc-1/docs/x"), None);
+    }
+
+    /// A `Location` on the model server is mapped into the forwarder, so
+    /// following it stays on the docs' origin; one elsewhere is left as it
+    /// is. Of the other answer headers only the type and `Retry-After` pass.
+    #[test]
+    fn answer_headers_pass_on_a_followable_location_and_nothing_else() {
+        let (root, paths) = temp_app_paths("api-docs-answer-headers");
+        let svc_a = record(&paths, "svc a", "vllm", 8000);
+        let mapped = |location: &str| forwarded_location(location, &svc_a);
+        assert_eq!(
+            mapped("/v1/models?x=1").as_deref(),
+            Some("/services/svc%20a/api/v1/models?x=1")
+        );
+        assert_eq!(
+            mapped("http://127.0.0.1:8000/v1/models").as_deref(),
+            Some("/services/svc%20a/api/v1/models")
+        );
+        assert_eq!(
+            mapped("/v1/modèle").as_deref(),
+            Some("/services/svc%20a/api/v1/modèle")
+        );
+        // The server's root, in every form, has a forwarder route of its own.
+        for (root, forwarded) in [
+            ("http://127.0.0.1:8000", "/services/svc%20a/api/"),
+            ("http://127.0.0.1:8000/", "/services/svc%20a/api/"),
+            ("http://127.0.0.1:8000/?x=1", "/services/svc%20a/api/?x=1"),
+            ("http://127.0.0.1:8000?x=1", "/services/svc%20a/api/?x=1"),
+            ("http://127.0.0.1:8000#f", "/services/svc%20a/api/#f"),
+            ("/", "/services/svc%20a/api/"),
+            ("/?x=1", "/services/svc%20a/api/?x=1"),
+            ("/#f", "/services/svc%20a/api/#f"),
+        ] {
+            assert_eq!(mapped(root).as_deref(), Some(forwarded), "{root}");
+        }
+        for elsewhere in [
+            "https://example.test/login",
+            "//example.test/login",
+            "v1/models",
+        ] {
+            assert_eq!(mapped(elsewhere), None, "{elsewhere}");
+        }
+
+        let mut answer = HeaderMap::new();
+        // A server on port 800 shares the prefix of one on 8000, and a
+        // redirect to the latter is not to itself.
+        let on_800 = record(&paths, "svc b", "vllm", 800);
+        assert_eq!(
+            forwarded_location("http://127.0.0.1:8000/v1/models", &on_800),
+            None
+        );
+        assert_eq!(
+            forwarded_location("http://127.0.0.1:800/v1/models", &on_800).as_deref(),
+            Some("/services/svc%20b/api/v1/models")
+        );
+
+        answer.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        answer.insert(header::RETRY_AFTER, HeaderValue::from_static("3"));
+        answer.insert(header::LOCATION, HeaderValue::from_static("/v1/models"));
+        answer.insert(header::SET_COOKIE, HeaderValue::from_static("session=1"));
+        answer.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        let passed_on = passed_on_answer_headers(&answer, &svc_a);
+        assert_eq!(passed_on.len(), 3, "{passed_on:?}");
+        assert_eq!(passed_on[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(passed_on[header::RETRY_AFTER], "3");
+        assert_eq!(
+            passed_on[header::LOCATION],
+            "/services/svc%20a/api/v1/models"
+        );
+        answer.insert(
+            header::LOCATION,
+            HeaderValue::from_static("https://example.test/login"),
+        );
+        assert_eq!(
+            passed_on_answer_headers(&answer, &svc_a)[header::LOCATION],
+            "https://example.test/login"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1413,12 +1607,10 @@ mod tests {
         assert_eq!(forwarded["path"], "/v1/models/Qwen%2FQwen3.5%3Fx");
         assert_eq!(forwarded["query"], Value::Null);
 
-        // Larger than axum's 2 MiB default, as an audio upload can be.
+        // Larger than axum's 2 MiB default, as a long chat history can be.
         let large = 3 * 1024 * 1024;
         let response = client
-            .post(format!(
-                "{base}/services/svc-live/api/v1/audio/transcriptions"
-            ))
+            .post(format!("{base}/services/svc-live/api/v1/chat/completions"))
             .body(vec![b'a'; large])
             .send()
             .await?;
@@ -1426,12 +1618,46 @@ mod tests {
         let forwarded: Value = response.text().await?.parse()?;
         assert_eq!(forwarded["body_len"], large);
 
-        // A redirect is passed back, not followed by the forwarder.
+        // One byte over the forwarder's own limit is refused, not passed on.
+        let too_large = client
+            .post(format!("{base}/services/svc-live/api/v1/chat/completions"))
+            .body(vec![b'a'; FORWARD_BODY_LIMIT_BYTES + 1])
+            .send()
+            .await?;
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // A redirect is passed back, not followed by the forwarder, with a
+        // `Location` the browser can follow: the stand-in's `/v1/models`, on
+        // the same server, through the forwarder.
         let redirect = client
             .get(format!("{base}/services/svc-live/api/redirect"))
             .send()
             .await?;
         assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirect.headers()[header::LOCATION],
+            "/services/svc-live/api/v1/models"
+        );
+        // And following it reaches the model server through the forwarder.
+        let followed: Value = client
+            .get(format!("{base}/services/svc-live/api/v1/models"))
+            .send()
+            .await?
+            .text()
+            .await?
+            .parse()?;
+        assert_eq!(followed["path"], "/v1/models");
+        // So does a redirect to the server's root, which `{*path}` alone
+        // would not route.
+        let at_root: Value = client
+            .get(format!("{base}/services/svc-live/api/?x=1"))
+            .send()
+            .await?
+            .text()
+            .await?
+            .parse()?;
+        assert_eq!(at_root["path"], "/");
+        assert_eq!(at_root["query"], "x=1");
 
         server.stop();
         fs::remove_dir_all(root).ok();

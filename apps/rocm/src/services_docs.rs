@@ -393,9 +393,21 @@ mod tests {
         for (engine, routes) in &reported {
             assert_eq!(&rocmd::documented_route_paths(engine), routes, "{engine}");
         }
-        // Lemonade's health route differs from the others: an engine
-        // reporting another engine's routes cannot pass for its own.
-        assert_ne!(reported[0].1, reported[1].1);
+        // Lemonade's health route differs from both others, so Lemonade
+        // reporting vLLM's or AIM's routes, or either of them reporting
+        // Lemonade's, cannot pass for its own. vLLM and AIM share `/health`,
+        // so their route lists are the same and a mix-up between the two
+        // changes nothing the docs show.
+        let routes_of = |name: &str| {
+            &reported
+                .iter()
+                .find(|(engine, _)| *engine == name)
+                .unwrap_or_else(|| panic!("{name} was not asked"))
+                .1
+        };
+        assert_ne!(routes_of("lemonade"), routes_of("vllm"));
+        assert_ne!(routes_of("lemonade"), routes_of("aim"));
+        assert_eq!(routes_of("vllm"), routes_of("aim"));
     }
 
     /// A server whose process died, though its record still says "ready",

@@ -1839,14 +1839,15 @@ docs page to the server, so it works for every engine without enabling
 cross-origin access on the server; for a server started with an endpoint key,
 enter the key under "Authorize" (it is kept only until the page is closed).
 The root page lists every running server, judged as `rocm services list` judges
-it; a server that stops or exits drops off about a second later. vLLM also documents its full API at
-its own `/docs` page: `rocm serve` and `rocm services list` print it as
-`engine docs`, and the docs page links to it.
+it; a server that stops or exits drops off about a second later. vLLM also
+documents its full API at its own `/docs` page: `rocm serve` and
+`rocm services list` print it as `engine docs`, and the docs page links to it.
 
 The docs listen on 127.0.0.1 only, answer browser requests only from their own
-pages, cannot be framed by other sites, and work offline. They use port 11430, or a free port when 11430 is
-taken; `--port <port>` picks one and fails if it is taken. Nothing keeps
-running after Ctrl+C, and the model servers are never touched.
+pages, cannot be framed by other sites, and work offline. They use port 11430,
+or a free port when 11430 is taken (saying so on stderr); `--port <port>` picks
+one and fails if it is taken. Nothing keeps running after Ctrl+C, and the model
+servers are never touched.
 
 ### Remote machines (preview)
 
