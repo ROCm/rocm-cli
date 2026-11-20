@@ -6677,10 +6677,14 @@ fi
     /// A job-level `continue-on-error: true` does more than keep the run going:
     /// a failed leg then reads `success` in `needs.<lane>.result` downstream and
     /// in the run's conclusion, although the lane's own check run still reads
-    /// `failure`. A step-level one lets the failing step pass the job. The
-    /// lanes run in separate jobs with `fail-fast: false`, so an unmasked
-    /// failure does not cancel a sibling lane. Neither consolidated report job
-    /// can be skipped by a failed lane. e2e-selfhosted's `e2e-report` runs on
+    /// `failure`. A step-level one lets the failing step pass the job.
+    /// Separate lane jobs never cancel each other; `fail-fast` governs only the
+    /// legs within one lane's matrix. Its default is `true`, which a job-level
+    /// `continue-on-error: true` used to make moot, so with no lane masked
+    /// every matrix lane must set `fail-fast: false` or one failed leg cancels
+    /// its sibling legs (see `matrix_lanes_not_fail_fast_false`). Neither
+    /// consolidated report job can be skipped by a failed lane.
+    /// e2e-selfhosted's `e2e-report` runs on
     /// `always() && (serve changed || dispatch)`, pinned by
     /// `closing_a_pr_supersedes_its_self_hosted_runs`, which reads no lane
     /// result. Nightly's `e2e-report-nightly` needs no lane, only
@@ -6702,6 +6706,97 @@ fi
              way the run's conclusion stops reflecting the failure. Remove it, or reword a script \
              that only mentions the key (this scan is deliberately fail-closed)"
         ))
+    }
+
+    /// Every self-hosted E2E lane in `text` that has a `strategy` but does not
+    /// set its `fail-fast` to exactly `false`, as `job: fail-fast: <value>`
+    /// (`<missing>` when the key is absent), lanes in file order.
+    ///
+    /// GitHub's default is `fail-fast: true`, which cancels every other leg of
+    /// a matrix as soon as one fails. Fail-closed: the value is read at the
+    /// strategy's own child indent, and anything but a plain `false` (a
+    /// trailing comment aside) is reported, including `true`, an expression, a
+    /// quoted `'false'` and a flow-mapping `strategy: {...}`, whose keys sit on
+    /// the `strategy:` line where this does not look.
+    fn matrix_lanes_not_fail_fast_false(text: &str) -> Vec<String> {
+        self_hosted_e2e_jobs(text)
+            .into_iter()
+            .filter_map(|(job, _)| {
+                let block = job_block(text, &job);
+                yaml_value_at(block, 4, "strategy")?;
+                let start = block
+                    .lines()
+                    .position(|line| {
+                        let code = strip_comment(line);
+                        indent_of(code) == 4 && code.trim_start().starts_with("strategy:")
+                    })
+                    .expect("yaml_value_at just found the strategy key");
+                let strategy: String = block
+                    .lines()
+                    .skip(start + 1)
+                    .take_while(|line| {
+                        let code = strip_comment(line);
+                        code.trim().is_empty() || indent_of(code) > 4
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let value = yaml_value_at(&strategy, 6, "fail-fast");
+                (value.as_deref() != Some("false")).then(|| {
+                    format!(
+                        "{job}: fail-fast: {}",
+                        value.as_deref().unwrap_or("<missing>")
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matrix_lane_scan_accepts_only_a_plain_false_fail_fast() {
+        let strategy = |fail_fast: &str| {
+            format!("    strategy:\n{fail_fast}      matrix:\n        channel: [a, b]\n")
+        };
+        for (case, job_lines, flagged) in [
+            ("plain false", strategy("      fail-fast: false\n"), false),
+            (
+                "false with a comment",
+                strategy("      fail-fast: false # why\n"),
+                false,
+            ),
+            (
+                "no strategy at all",
+                "    steps:\n      - run: echo\n".to_owned(),
+                false,
+            ),
+            ("missing (defaults to true)", strategy(""), true),
+            ("true", strategy("      fail-fast: true\n"), true),
+            (
+                "expression",
+                strategy("      fail-fast: ${{ false }}\n"),
+                true,
+            ),
+            ("quoted", strategy("      fail-fast: 'false'\n"), true),
+            (
+                "flow mapping",
+                "    strategy: {fail-fast: false, matrix: {channel: [a, b]}}\n".to_owned(),
+                true,
+            ),
+            (
+                "fail-fast nested under matrix, not strategy",
+                "    strategy:\n      matrix:\n        fail-fast: false\n".to_owned(),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                !matrix_lanes_not_fail_fast_false(&one_lane_workflow(&job_lines)).is_empty(),
+                flagged,
+                "{case}"
+            );
+        }
+        assert_eq!(
+            matrix_lanes_not_fail_fast_false(&one_lane_workflow(&strategy(""))),
+            ["lane: fail-fast: <missing>"]
+        );
     }
 
     #[test]
@@ -6842,6 +6937,28 @@ fi
             if let Some(failure) = mask_failure(workflow, &text) {
                 panic!("{failure}");
             }
+        }
+
+        // With no lane masked, `fail-fast` is the only thing keeping one failed
+        // leg of a lane from cancelling its sibling legs.
+        for (workflow, text) in self_hosted_workflows() {
+            let matrix_lanes = self_hosted_e2e_jobs(&text)
+                .into_iter()
+                .filter(|(job, _)| yaml_value_at(job_block(&text, job), 4, "strategy").is_some())
+                .count();
+            assert!(
+                matrix_lanes > 0,
+                "{workflow}: found no self-hosted E2E lane with a strategy, so the \
+                 fail-fast check below would check nothing"
+            );
+            let offenders = matrix_lanes_not_fail_fast_false(&text);
+            assert!(
+                offenders.is_empty(),
+                "{workflow}: these self-hosted E2E lanes do not set `fail-fast: false` \
+                 in their strategy: {offenders:?}. GitHub's default is `true`, so one failed \
+                 leg would cancel the lane's other legs; with no lane masked by \
+                 `continue-on-error`, nothing else prevents that"
+            );
         }
 
         // A failed lane does not fail `e2e-lanes-settled`, the report's only

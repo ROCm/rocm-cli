@@ -16,8 +16,10 @@ on:
         description: >-
           How long an E2E lane may wait for a runner before the run gives up on
           it (default 60). Lower it to try the give-up path from a branch
-          quickly. Whole minutes, at most 120: a larger value is refused, because
-          a lane that started just inside it could outlast the hard deadline.
+          quickly. Whole minutes, at most HARD_DEADLINE_MINUTES minus
+          LANE_RUN_MINUTES on e2e-lanes-settled (100 today): a larger value is
+          refused, because a lane that started just inside it could outlast the
+          hard deadline.
         type: string
         default: "60"
 

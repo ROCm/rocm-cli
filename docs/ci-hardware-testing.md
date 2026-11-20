@@ -679,8 +679,9 @@ jobs, which wait on every lane, never ran.
   the wait either.
   A lane that starts just inside the queue deadline still has its full
   `timeout-minutes`, so the script refuses a queue deadline that, plus
-  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
-  minutes, at most 120.
+  `LANE_RUN_MINUTES` (the longest lane's `timeout-minutes`, 140 today), would
+  pass the hard deadline: the input is whole minutes, at most
+  `HARD_DEADLINE_MINUTES` minus `LANE_RUN_MINUTES` (100 today).
 - `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
   whatever finished. An abandoned lane has no report artifact, so the report
   job's missing-report check flags it by name, the consolidated grid shows the
@@ -873,11 +874,14 @@ both in `needs.<lane>.result` and in the run's conclusion, and a step-level one
 would let the failing step pass the job. Nightly gates no merge or tag either
 way. A failed lane does not fail `e2e-lanes-settled`, which hands each lane's
 result to the report job, so on a red night the consolidated report and
-release-readiness jobs still run. `publish-e2e-wiki` updates the E2E wiki page
-when `e2e-report-nightly` succeeded or failed (it fails, for example, when a
-lane that ran uploaded no report); only a skipped or cancelled report job, or a
-run outside `main` or outside this repository, leaves the previous page in
-place.
+release-readiness jobs still run. `publish-e2e-wiki` runs when
+`e2e-report-nightly` succeeded or failed (it fails, for example, when a lane
+that ran uploaded no report), so a failed report does not by itself keep the
+E2E wiki page from being updated. The previous page stays in place when, among
+other things, the report job was skipped or cancelled, the run is outside
+`main` or outside this repository, the report job failed before writing its
+consolidated report (the wiki job then fails at the download), or the
+consolidated report has no platform table to publish.
 `e2e_lanes_do_not_mask_failures_with_continue_on_error` in
 [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) enforces this with a
 line scan of every self-hosted lane in both workflows that is fail-closed for
