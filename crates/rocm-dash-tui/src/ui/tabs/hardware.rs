@@ -585,8 +585,8 @@ fn draw_gpus_full(
             .split(inner);
         f.render_widget(Paragraph::new(stats_line), split[0]);
         f.render_widget(Paragraph::new(info_line), split[1]);
-        let spark_idx = if want_serving {
-            f.render_widget(Paragraph::new(serving.unwrap()), split[2]);
+        let spark_idx = if let Some(serving) = serving.filter(|_| want_serving) {
+            f.render_widget(Paragraph::new(serving), split[2]);
             3
         } else {
             2

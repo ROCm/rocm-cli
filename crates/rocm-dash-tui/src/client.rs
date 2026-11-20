@@ -41,10 +41,14 @@ pub enum ClientMsg {
     /// Deliberately NOT `Event(Snapshot)` — that path treats `instances` as
     /// authoritative truth and latches `has_received_snapshot` forever, but
     /// this snapshot's `instances` is always an empty stand-in (Windows has
-    /// no instance registry daemon yet), so routing it through there would
-    /// permanently blind the issue #145 quit-confirm prompt to models
-    /// actually being served. See `AppState::push_host_gpu_snapshot`.
+    /// no instance registry daemon yet). `AppState::push_host_gpu_snapshot`
+    /// leaves `instances` alone; they arrive as `ManagedInstances`.
     HostGpuSnapshot(Box<Snapshot>),
+    /// Windows only: the managed services the registry poller
+    /// (`event_loop::spawn_managed_registry_poller`) last read, off the UI
+    /// thread. Replaces `AppState::instances` — see
+    /// `AppState::set_managed_instances`.
+    ManagedInstances(Vec<rocm_dash_core::metrics::Instance>),
     /// Replay-only: the scrubber jumped backward. The TUI must wipe any
     /// state derived from past events before the burst-emitted events for
     /// the new playhead position arrive.
@@ -161,6 +165,9 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
         None => return Err(anyhow!("connection closed before Welcome")),
     };
 
+    // dash-56 and dash-58 (`dash_steps.rs`) count this line, with its
+    // `rocm_dash_tui::client` target, in the client log to tell a reconnection
+    // from the connection a dashboard already had; keep them in step.
     info!(host = %host, version = %daemon_version, "connected");
     let _ = tx.send(ClientMsg::Connected {
         host: host.clone(),
@@ -230,9 +237,9 @@ fn build_host_gpu_snapshot(
 /// instead of connecting anywhere: `HostCollector` (already cross-platform)
 /// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
 /// for GPU. Sends `Connected` like the unix arm, but then a stream of
-/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — deliberately
-/// not routed through `Event::Snapshot`, to avoid disturbing the "quit while
-/// serving" confirmation prompt (see `AppState::push_host_gpu_snapshot`).
+/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot`; instances come
+/// from the managed-service registry poller, not from here (see
+/// `ClientMsg::ManagedInstances`).
 #[cfg(windows)]
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     use rocm_dash_collectors::host::HostCollector;

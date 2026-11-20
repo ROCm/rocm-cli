@@ -37,3 +37,67 @@ Feature: Model catalog listing
     Given a recipe catalog whose AIM entry was last verified long ago
     When the user asks for the model catalog in verbose detail
     Then the catalog warns that the AIM entry may no longer be current
+
+  # The catalog is also read by tool-using clients — the dashboard's Chat tab
+  # and any MCP client — and what they were handed was the verbose listing, not
+  # the recommendation list a person sees. On a developer host that is 189 KB
+  # against under 1 KB, which is more than a locally served model's whole
+  # context, so asking the assistant what this machine can run ended with the
+  # model's provider refusing the request instead of an answer.
+  @id:model-catalog-tool-client-gets-the-recommendations
+  Scenario: model-catalog-04 - A tool-using client asking about models gets the recommendations
+    When a tool-using client asks for the model catalog
+    Then the client is given the recommended models without the per-recipe diagnostics
+    And what the client is given is small enough for a locally served model to read
+
+  # The diagnostics are not gone, they are opt-in: a client that wants them
+  # asks for them, the same way a person types `rocm model --verbose`.
+  @id:model-catalog-tool-client-can-ask-for-diagnostics
+  Scenario: model-catalog-05 - A tool-using client can still ask for the full diagnostics
+    When a tool-using client asks for the model catalog in verbose detail
+    Then the client is given the per-recipe diagnostics
+
+  # `rocm model` calls itself "Recommended models" and chose them with a flag
+  # that knew nothing about the machine: the four it carried need 17-62 GiB,
+  # while the eight recipes at or below 8 GiB carried it on none of them. A
+  # small or integrated GPU was recommended four models it cannot run and shown
+  # none of the ones it can.
+  #
+  # These run on the ungated lane: the host's GPU capacity is planted, so they
+  # describe the same machine whatever the runner has -- which is also the only
+  # way the narrowed listing is reachable at all, since the no-GPU lane measures
+  # no capacity and the GPU box measures none either.
+  @id:model-catalog-recommends-only-what-this-machine-can-run @requires-os:linux
+  Scenario: model-catalog-06 - A small machine is recommended models it can run
+    Given a machine whose GPU has room for only the smaller models
+    When the user asks which models are recommended
+    Then every model offered is one this machine can run
+    And the user is told the offer was narrowed to this machine
+
+  @id:model-catalog-says-when-nothing-fits @requires-os:linux
+  Scenario: model-catalog-07 - A machine too small for any curated model is told so
+    Given a machine whose GPU is too small for any curated model
+    When the user asks which models are recommended
+    Then the user is told none of the curated models fit
+    And no model is offered
+
+  # The behaviour most likely to regress silently, and the reason the listing
+  # does not simply filter on whatever figure it has: a machine nobody could
+  # measure must not be told its options are narrow.
+  @id:model-catalog-does-not-narrow-an-unmeasured-machine @requires-os:linux
+  Scenario: model-catalog-08 - A machine whose memory could not be read is not narrowed
+    Given a machine whose GPU memory cannot be read
+    When the user asks which models are recommended
+    Then the recommendations are not narrowed to this machine
+    And the user is told the list is not specific to it
+
+  # An assistant answering "what can this machine run" reads the same listing
+  # through its tools. Same renderer, different caller -- so the host has to be
+  # measured on both paths, and a caller that passes none hands the assistant
+  # the unnarrowed list while the terminal shows the narrowed one.
+  @id:model-catalog-assistant-is-told-what-the-user-is-told @requires-os:linux
+  Scenario: model-catalog-09 - An assistant is told what the user is told
+    Given a machine whose GPU has room for only the smaller models
+    When the user asks which models are recommended
+    And an assistant on the same machine asks the same question through its tools
+    Then the assistant is given the same recommendations the user saw

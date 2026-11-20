@@ -78,6 +78,10 @@ pub(crate) struct TheRockRuntimeManifest {
     pub sdk_torch: Option<String>,
     #[serde(default)]
     pub installed_at_unix_ms: Option<u128>,
+    /// The wheel index the SDK install resolved its packages from (nightly or
+    /// release); absent in manifests written before it was recorded.
+    #[serde(default)]
+    pub index_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -355,6 +359,29 @@ fn sort_manifests_newest_install_first(manifests: &mut [(PathBuf, TheRockRuntime
             .then_with(|| left.runtime_key.cmp(&right.runtime_key))
             .then_with(|| left_path.cmp(right_path))
     });
+}
+/// The wheel index the SDK in the runtime whose interpreter is `python` was installed
+/// from, as its manifest in `paths`' runtime registry records it. `Ok(None)` means no
+/// manifest for that interpreter recorded one; `Err` means the registry could not be read.
+///
+/// A discover row that reuses the SDK's own torch stack has to fetch those exact builds
+/// again from the index they came from: a nightly SDK's torch is not on the release
+/// index and a release SDK's is not on the nightly one.
+pub(crate) fn recorded_sdk_index_url(paths: &AppPaths, python: &Path) -> Result<Option<String>> {
+    let registry = paths.data_dir.join("runtimes").join("registry");
+    let manifests = load_runtime_manifests_in(&registry, None)?;
+    Ok(sdk_index_url_for_python(&manifests, python))
+}
+/// The `index_url` of the manifest whose interpreter is `python`, if it recorded a
+/// non-empty one.
+fn sdk_index_url_for_python(manifests: &[TheRockRuntimeManifest], python: &Path) -> Option<String> {
+    manifests
+        .iter()
+        .find(|manifest| manifest.python_executable.as_deref() == Some(python))
+        .and_then(|manifest| manifest.index_url.as_deref())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
 }
 /// The torch build the SDK installed into this runtime, as its manifest records it.
 ///
@@ -655,7 +682,8 @@ pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
 /// belongs on the loader path.
 enum CompatDirSignal {
     /// `ensure_therock_compat_shims`'s answer is not passed in to this
-    /// derivation (the running-state payload path, which never calls it).
+    /// derivation (the running-state payload path and the read-only extension
+    /// probe, which never call it).
     /// Falls back to a read-only directory listing of whatever is already on
     /// disk: not authoritative, but the best available signal without
     /// performing a write.
@@ -717,8 +745,9 @@ fn therock_library_path_entries_inner(
         // `ensure_therock_compat_shims` says a shim is needed this launch —
         // this is what keeps a leftover stub from an earlier run (the host
         // has since gained a real `libmpi_cxx.so*`) from shadowing the loader
-        // path. On the running-state payload path (`Unchecked`), which never
-        // calls that function, fall back to a read-only directory listing of
+        // path. On the running-state payload path and the read-only extension
+        // probe (`Unchecked`), which never call that function, fall back to a
+        // read-only directory listing of
         // whatever is already there: not authoritative, but the best
         // available signal without performing a write.
         match compat_dir_signal {
@@ -738,7 +767,8 @@ fn therock_library_path_entries_inner(
 /// Whether `compat_dir` currently has any entry at all — a plain directory
 /// listing, not a check for a specific shim [`ensure_therock_compat_shims`]
 /// would recognize. This is the fallback [`therock_library_path_entries`]
-/// uses on the running-state payload path, which never calls that function
+/// uses on the running-state payload path and in the read-only extension probe,
+/// which never call that function
 /// and so has no authoritative answer to consult; see
 /// [`therock_library_path_entries_for_launch`] for the path that does.
 fn compat_dir_has_shims(compat_dir: &Path) -> bool {
@@ -747,12 +777,13 @@ fn compat_dir_has_shims(compat_dir: &Path) -> bool {
         .is_ok_and(|mut entries| entries.next().is_some())
 }
 /// Materializes the runtime-owned OpenMPI compatibility shims that
-/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call it
 /// from the launch path, before building the environment a server is spawned
-/// with — never from running-state payload assembly, which only needs the
+/// with (the serve gate's probe does too, ahead of it) — never from running-state payload assembly, which only needs the
 /// path list `therock_library_path_entries` derives, not the shims
-/// themselves. Returns the `libmpi_cxx` compat dir when a shim is needed for
-/// *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to
+/// themselves. Returns the compat dir when a shim is needed for *this* launch:
+/// the `libmpi_cxx` stub `ensure_mpi_cxx_compat` wrote, or the amd-smi link
+/// [`rocm_core::ensure_amd_smi_compat`] wrote. Pass this on to
 /// [`therock_library_path_entries_for_launch`] rather than having that
 /// derivation re-check the directory itself. Returns `None` without touching
 /// the filesystem when `runtime.sdk_root` is absent, so this function stays
@@ -782,6 +813,20 @@ pub(crate) fn ensure_therock_compat_shims(
     // binding symbols torch needs; they are never called in single-node
     // serving, so this is safe.
     let mpi_cxx_shim = ensure_mpi_cxx_compat(&compat_dir);
+    // The SDK's `amdsmi` package opens `libamd_smi.so` by its bare name, which the
+    // SDK does not ship, so it loads a second amd-smi library beside torch's own
+    // and torch counts no devices (see `rocm_core::ensure_amd_smi_compat`). The
+    // link goes in the same directory, and the launch path carries the directory
+    // when either shim was written. That function also removes a leftover
+    // `libmpi_cxx.so.40` stub where the host has a real `libmpi_cxx`, and a stale
+    // `libnuma.so.1` link, since the directory can now reach the loader path for
+    // the link alone. When it answers `None` the link is not written, but the
+    // directory still reaches this launch's loader path if only the mpi stub was
+    // written, which is why the numa link is also cleared directly below.
+    let amd_smi_shim = rocm_core::ensure_amd_smi_compat(
+        &compat_dir,
+        &therock_library_path_entries_inner(runtime, CompatDirSignal::Checked(None)),
+    );
     // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with the
     // upstream `libnuma_1.2` symbol version. TheRock bundles numa only under
     // the renamed soname `librocm_sysdeps_numa.so.1` whose versions are
@@ -792,29 +837,16 @@ pub(crate) fn ensure_therock_compat_shims(
     // that stale shim here so the real numactl runtime (installed via the
     // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
     // the install/preflight.
-    remove_stale_numa_shim(&compat_dir);
-    mpi_cxx_shim
+    rocm_core::remove_stale_numa_shim(&compat_dir);
+    mpi_cxx_shim.or(amd_smi_shim)
 }
-/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
-/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
-/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
-/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
-/// path would shadow a correctly installed system libnuma. No-op when absent or
-/// when the entry is not a symlink.
-fn remove_stale_numa_shim(compat_dir: &Path) {
-    let link = compat_dir.join("libnuma.so.1");
-    if let Ok(meta) = link.symlink_metadata()
-        && meta.file_type().is_symlink()
-    {
-        let _ = fs::remove_file(&link);
-    }
-}
+
 /// A writable, runtime-owned directory for managed-runtime library compatibility
 /// shims (see [`therock_library_path_entries`]). Prefers the managed Python
 /// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
 /// when no Python launcher is recorded.
 fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
-    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
+    const COMPAT_DIR_NAME: &str = rocm_core::RUNTIME_COMPAT_DIR_NAME;
     if let Some(env_root) = runtime
         .python_executable
         .as_ref()
@@ -843,6 +875,38 @@ fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_sdk_index_comes_from_the_manifest_of_that_interpreter() {
+        let manifest = |python: &str, index: Option<&str>| TheRockRuntimeManifest {
+            python_executable: Some(PathBuf::from(python)),
+            index_url: index.map(str::to_owned),
+            ..Default::default()
+        };
+        let manifests = vec![
+            manifest(
+                "/rt/nightly/bin/python",
+                Some("https://nightly.example/whl"),
+            ),
+            manifest(
+                "/rt/release/bin/python",
+                Some(" https://stable.example/whl "),
+            ),
+            manifest("/rt/old/bin/python", None),
+            manifest("/rt/blank/bin/python", Some("  ")),
+        ];
+        let lookup = |python: &str| sdk_index_url_for_python(&manifests, Path::new(python));
+        assert_eq!(
+            lookup("/rt/nightly/bin/python").as_deref(),
+            Some("https://nightly.example/whl")
+        );
+        assert_eq!(
+            lookup("/rt/release/bin/python").as_deref(),
+            Some("https://stable.example/whl")
+        );
+        assert_eq!(lookup("/rt/old/bin/python"), None);
+        assert_eq!(lookup("/rt/blank/bin/python"), None);
+        assert_eq!(lookup("/rt/unknown/bin/python"), None);
+    }
     #[test]
     fn managed_env_reflects_managed_runtime_manifest_source() {
         let mut runtime = VllmRuntime {
@@ -986,11 +1050,14 @@ mod tests {
         assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
             "10.1.0a20260611"
         ))));
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.2.0"
+        ))));
     }
     #[test]
     fn runtime_has_discover_build_rejects_a_line_with_no_discover_row() {
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
-            Some("10.2.0")
+            Some("10.3.0")
         )));
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
             Some("7.2.3")
@@ -1155,6 +1222,132 @@ mod tests {
             assert!(
                 !env.path().join("rocm-cli-lib-compat").exists(),
                 "must not write into the venv root's compat dir when sdk_root is absent"
+            );
+        }
+    }
+
+    /// The SDK ships `libamd_smi.so.<n>` only, and the `amdsmi` package opens the
+    /// bare name, so a launch needs the link on its loader path or torch counts no
+    /// devices beside a host ROCm. The mpi shim answers `None` here, as it does on
+    /// a host with a real `libmpi_cxx`: the amd-smi link alone must reach the path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_carries_the_amd_smi_link_even_when_no_mpi_shim_is_due() {
+        let env = tempfile::tempdir().unwrap();
+        let sdk_root = env.path().join("sdk");
+        let sdk_lib = sdk_root.join("lib");
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let runtime = VllmRuntime {
+            runtime_id: "release-wheel".to_owned(),
+            env_id: "release-wheel".to_owned(),
+            python_executable: Some(env.path().join("bin").join("python")),
+            sdk_root: Some(sdk_root),
+            sdk_library_paths: vec![sdk_lib.clone()],
+            ..VllmRuntime::for_test()
+        };
+
+        let shim = ensure_therock_compat_shims(&runtime, |_| None);
+
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
+        assert_eq!(
+            fs::read_link(compat_dir.join("libamd_smi.so")).unwrap(),
+            sdk_lib.join("libamd_smi.so.26")
+        );
+        let entries = therock_library_path_entries_for_launch(&runtime, shim);
+        assert!(
+            entries.contains(&compat_dir),
+            "the link only helps when its directory is on LD_LIBRARY_PATH: {entries:?}"
+        );
+        // After the SDK's own directory, so a real bare name found there wins.
+        let position = |dir: &Path| entries.iter().position(|entry| entry == dir);
+        assert!(
+            position(&sdk_lib).unwrap() < position(&compat_dir).unwrap(),
+            "the link directory must come after the SDK's: {entries:?}"
+        );
+    }
+
+    /// The amd-smi link puts the compat directory on the loader path even when the
+    /// host has a real `libmpi_cxx`, so the launch removes a stub an earlier run
+    /// left there. With no real `libmpi_cxx` on the host the stub may be the one
+    /// torch is loading and stays.
+    ///
+    /// Which of the two holds depends on the host, so the expectation is derived
+    /// from the probe the launch uses, and only the half that matches this host
+    /// runs here. Both halves, with the host answer injected, are tested in
+    /// rocm-core (`the_shared_helpers_clear_a_leftover_mpi_cxx_stub_only_beside_a_real_library`);
+    /// this test pins that the launch goes through that helper.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_clears_a_leftover_mpi_cxx_stub_only_beside_a_real_libmpi_cxx() {
+        let env = tempfile::tempdir().unwrap();
+        let sdk_root = env.path().join("sdk");
+        let sdk_lib = sdk_root.join("lib");
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        let stub = compat_dir.join(rocm_core::openmpi::MPI_CXX_STUB_NAME);
+        fs::write(&stub, b"stub").unwrap();
+        let runtime = VllmRuntime {
+            runtime_id: "release-wheel".to_owned(),
+            env_id: "release-wheel".to_owned(),
+            python_executable: Some(env.path().join("bin").join("python")),
+            sdk_root: Some(sdk_root),
+            sdk_library_paths: vec![sdk_lib],
+            ..VllmRuntime::for_test()
+        };
+
+        // `ensure_mpi_cxx_compat` answers `None`, whatever the reason.
+        let shim = ensure_therock_compat_shims(&runtime, |_| None);
+
+        assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
+        assert!(compat_dir.join("libamd_smi.so").exists());
+        assert_eq!(
+            stub.exists(),
+            !rocm_core::openmpi::real_libmpi_cxx_present()
+        );
+    }
+
+    /// The "a bare name already exists" rule reads the SDK's directories only, not
+    /// the compat directory itself: a link there left dangling or pointing at
+    /// another SDK is repaired, not taken for the SDK's own bare name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_existing_amd_smi_link_in_the_compat_dir_is_repaired_not_trusted() {
+        let env = tempfile::tempdir().unwrap();
+        let sdk_root = env.path().join("sdk");
+        let sdk_lib = sdk_root.join("lib");
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_smi.so.26"), b"sdk").unwrap();
+        let other = env.path().join("other-sdk");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("libamd_smi.so.25"), b"other").unwrap();
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        let link = compat_dir.join("libamd_smi.so");
+        let runtime = VllmRuntime {
+            runtime_id: "release-wheel".to_owned(),
+            env_id: "release-wheel".to_owned(),
+            python_executable: Some(env.path().join("bin").join("python")),
+            sdk_root: Some(sdk_root),
+            sdk_library_paths: vec![sdk_lib.clone()],
+            ..VllmRuntime::for_test()
+        };
+
+        for stale_target in [env.path().join("gone"), other.join("libamd_smi.so.25")] {
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&stale_target, &link).unwrap();
+
+            let shim = ensure_therock_compat_shims(&runtime, |_| None);
+
+            assert_eq!(shim.as_deref(), Some(compat_dir.as_path()));
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                sdk_lib.join("libamd_smi.so.26"),
+                "a link to {} must be repointed",
+                stale_target.display()
             );
         }
     }

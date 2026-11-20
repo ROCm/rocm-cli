@@ -200,3 +200,188 @@ async fn assert_model_generated_reply(world: &mut E2eWorld) {
         .unwrap_or("");
     assert!(!content.is_empty(), "empty reply in chat response: {resp}");
 }
+
+// ── Direct tool calls through `rocm mcp-call` ──────────────────────
+
+/// A directory that exists wherever the suite runs: this crate's own.
+const EXISTING_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+fn missing_path() -> String {
+    std::path::Path::new(EXISTING_DIR)
+        .join("e2e-no-such-path")
+        .display()
+        .to_string()
+}
+
+fn run_path_exists(world: &mut E2eWorld, arguments: &serde_json::Value) {
+    let arguments = arguments.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["mcp-call", "path_exists", "--arguments-json", &arguments],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("a tool-using client hands the CLI a whole tool-call request to check a path that exists")]
+async fn mcp_call_with_a_params_envelope(world: &mut E2eWorld) {
+    // An MCP `tools/call` request's params, as a client received them: the
+    // tool's name, its arguments, and the protocol's optional `_meta`.
+    run_path_exists(
+        world,
+        &serde_json::json!({
+            "name": "path_exists",
+            "arguments": { "path": EXISTING_DIR },
+            "_meta": { "progressToken": 1 },
+        }),
+    );
+}
+
+#[when(
+    "a tool-using client asks the CLI to check a path with a second set of arguments nested inside the first"
+)]
+async fn mcp_call_with_nested_arguments(world: &mut E2eWorld) {
+    // The outer path exists and the nested one does not, so a result for
+    // either would show which set ran.
+    run_path_exists(
+        world,
+        &serde_json::json!({
+            "path": EXISTING_DIR,
+            "arguments": { "path": missing_path() },
+        }),
+    );
+}
+
+#[then("the tool reports that path as an existing directory")]
+async fn path_reported_as_existing_directory(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "rocm mcp-call failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("rocm mcp-call printed no JSON tool result ({e}):\n{stdout}"));
+    let text = value["content"][0]["text"].as_str().unwrap_or_default();
+    // The tool's own report, for the path inside the request's arguments.
+    assert!(
+        text.contains(&format!("path: {EXISTING_DIR}\n"))
+            && text.contains("exists: true")
+            && text.contains("kind: directory"),
+        "the tool did not report the requested directory:\n{text}"
+    );
+}
+
+#[then("the CLI refuses the request for its nested arguments")]
+async fn mcp_call_refused_for_nested_arguments(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the request was not refused:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("must not contain a nested `arguments` field"),
+        "the refusal does not name the nested arguments field:\n{stderr}"
+    );
+}
+
+#[then("no tool result is printed")]
+async fn no_tool_result_printed(world: &mut E2eWorld) {
+    // The tool prints its result on stdout only when it ran; neither path's
+    // report may appear.
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    assert!(
+        stdout.trim().is_empty(),
+        "a tool result was printed for a refused request:\n{stdout}"
+    );
+}
+
+/// The model id the CLI's built-in assistant is served under.
+///
+/// Repeated here because the harness is black-box and cannot import the
+/// product's constant (`LEMONADE_ASSISTANT_MODEL_ID` in
+/// `apps/rocm/src/providers.rs`). The planted service must carry it, or the
+/// local provider answers "no ready managed service" instead of calling the
+/// mock.
+const BUILTIN_ASSISTANT_MODEL_ID: &str = "Qwen3-4B-Instruct-2507-GGUF";
+
+/// A model question the CLI answers by running its `model` tool itself:
+/// `fallback_rocm_tool_call_for_prompt` in `apps/rocm/src/chat/intent.rs` adds
+/// a `rocm model` call for a prompt mentioning a model and asking what runs.
+/// Asked through the assistant rather than by calling the tool directly so the
+/// scenario covers the turn the user actually takes.
+const MODEL_QUESTION: &str = "which models can I run on this machine?";
+
+#[given("a local chat assistant that answers a model question in words")]
+async fn chat_assistant_that_answers_a_model_question(world: &mut E2eWorld) {
+    // Two completions, in order: the assistant's first reply (plain words, so
+    // the CLI adds its own `model` tool call) and its closing reply after the
+    // tool ran. The second is needed because a model listing's deterministic
+    // summary never stands in for the local model's own answer — it names
+    // three recipes out of the catalog — so the turn always asks again
+    // (`deterministic_summary_can_stand_alone` in
+    // `apps/rocm/src/chat/summaries.rs`).
+    let script = vec![
+        e2e_cucumber::mock_server::chat_text_reply(
+            BUILTIN_ASSISTANT_MODEL_ID,
+            "Let me check what this machine can run.",
+        ),
+        e2e_cucumber::mock_server::chat_text_reply(
+            BUILTIN_ASSISTANT_MODEL_ID,
+            "Those are the recipes this machine has.",
+        ),
+    ];
+    let mock = MockServer::start_with_chat_script(BUILTIN_ASSISTANT_MODEL_ID, script).await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(BUILTIN_ASSISTANT_MODEL_ID.to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(e2e_cucumber::mock_server::ServiceRecordOptions {
+        // Without the latch the CLI's readiness check sends its own completion
+        // probe first, which would consume the first scripted reply.
+        inference_verified: true,
+        ..e2e_cucumber::mock_server::ServiceRecordOptions::default()
+    });
+}
+
+#[when("the user asks in one-shot chat which models this machine can run")]
+async fn user_asks_which_models_run(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "chat",
+            "--provider",
+            "local",
+            "--model",
+            &model,
+            // The ROCm tool calls are opt-in on this surface, and the summary
+            // only exists for a tool result; without it the turn is a plain
+            // completion and nothing is checked about this machine.
+            "--tools",
+            "--prompt",
+            MODEL_QUESTION,
+        ],
+    );
+    assert!(rc == 0, "rocm chat failed (rc={rc}):\n{stdout}\n{stderr}");
+    world.cli_output = Some(stdout);
+}
+
+#[then("the chat shows a ROCm CLI summary naming the low-VRAM local assistant")]
+async fn chat_shows_the_rocm_cli_summary(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or_default();
+    assert!(
+        stdout.contains("ROCm CLI summary"),
+        "the chat printed no ROCm CLI summary block:\n{stdout}"
+    );
+    // The point of the block on a small GPU: it names a model that fits, which
+    // the curated listing grouped by hardware target does not.
+    assert!(
+        stdout.contains(&format!(
+            "Recommended local assistant: qwen ({BUILTIN_ASSISTANT_MODEL_ID})"
+        )) && stdout.contains("Fit: needs about 4 GiB GPU memory."),
+        "the summary does not name the low-VRAM assistant and its fit:\n{stdout}"
+    );
+}

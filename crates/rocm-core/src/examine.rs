@@ -42,9 +42,14 @@ pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
 use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};
-pub use linux_gpus::gfx_is_apu_family;
 use linux_gpus::{
     GpuProbeSources, probe_gpus_after_lspci, probe_gpus_lspci, summarise_gpu_categories,
+};
+pub use linux_gpus::{KERNEL_TOPOLOGY_GPU_NAME, gfx_is_apu_family};
+#[cfg(any(test, feature = "test-support"))]
+pub use linux_gpus::{
+    TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103,
+    TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING,
 };
 use rocm_install_probe::probe_rocm_install;
 pub(crate) use windows::parse_dotted_version;
@@ -54,8 +59,12 @@ use windows::{
 use wsl::probe_wsl;
 pub use wsl::{parse_wsl_distro_list, probe_wsl_distro_from_host};
 
-/// A single GPU as enumerated by `lspci`/`rocminfo` (Linux) or the display
-/// inventory (Windows).
+/// A single GPU, as the examination enumerated it.
+///
+/// On Linux from `lspci`, the kernel's KFD topology (or its sysfs fallback)
+/// and `rocminfo`; on Windows from the display inventory. `is_apu` is `None`
+/// when nothing said which package it is; see `examine::linux_gpus`'s
+/// `apu_verdict_from_target` for the Linux rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Gpu {
     pub name: String,
@@ -86,8 +95,8 @@ pub struct Device {
 /// The oldest distro release the WSL path supports.
 ///
 /// Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / `GLIBCXX_3.4.32` floor
-/// every published Lemonade embeddable is linked against, so the engine cannot
-/// start there. See `docs/wsl.md`.
+/// the pinned Lemonade embeddable is linked against (newer Lemonade releases
+/// need more), so the engine cannot start there. See `docs/wsl.md`.
 pub const WSL_MIN_UBUNTU: (u32, u32) = (24, 4);
 
 /// WSL2-specific machine state. `None` on every other platform.
@@ -124,7 +133,7 @@ pub struct WslFacts {
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
     /// Whether `librocdxg.so` is in the same `lib` directory as a
-    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` runpath. A
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` search path. A
     /// TheRock tarball is laid out this way and is never in the linker cache.
     /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
     /// can ask it from outside the distribution.

@@ -10,6 +10,12 @@
 //! exists exactly once in the tree, so there is nothing to drift and no
 //! `--check` gate to keep honest; a missing or malformed pin is a build error.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "build script: a panic is how a build script reports failure to cargo"
+)]
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

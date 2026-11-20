@@ -21,9 +21,10 @@
 //!   the package's `src/` (this includes the end-to-end harness crate under
 //!   `tests/`); a module directory of that name inside `src/` is not excluded;
 //! * a file reached only through a `mod` declaration gated on a test-only cfg
-//!   (`#[cfg(test)] mod x;`, `#[cfg(all(test, unix))] mod x;`, with or without a
-//!   `#[path]`), or whose own first line is `#![cfg(test)]`. Proptest and
-//!   property-test files are excluded this way, not by name.
+//!   (`#[cfg(test)] mod x;`, `#[cfg(all(test, unix))] mod x;`, `#[cfg(test)]`
+//!   stacked over `#[cfg(unix)]`, with or without a `#[path]`), or whose own
+//!   first line is `#![cfg(test)]`. Proptest and property-test files are
+//!   excluded this way, not by name.
 //!
 //! An external `#[cfg(test)] mod tests;` therefore never charges its lines to the
 //! parent: the child is not a source file, and the parent loses only the lines of
@@ -829,6 +830,19 @@ mod tests {
         assert_eq!(production_lines_of(&source).unwrap(), 1200);
     }
 
+    /// The spelling the workspace's `unwrap_used`/`expect_used` policy asks for
+    /// (see `clippy.toml`): clippy only exempts a literal `#[cfg(test)]`, so a
+    /// platform-gated test module stacks it over a separate `#[cfg(unix)]`.
+    #[test]
+    fn a_test_module_gated_on_stacked_test_and_unix_attributes_is_not_counted() {
+        let source = format!(
+            "{}#[cfg(test)]\n#[cfg(unix)]\nmod tests {{\n{}}}\n",
+            filler(1200),
+            filler(900)
+        );
+        assert_eq!(production_lines_of(&source).unwrap(), 1200);
+    }
+
     #[test]
     fn a_cfg_that_can_hold_outside_test_builds_is_counted() {
         for gate in [
@@ -1136,6 +1150,19 @@ trait T {
             "fn real() {}\n#[cfg(all(test, unix))]\n#[path = \"../shared/props.rs\"]\nmod props;\n",
         );
         write(dir.path(), "shared/props.rs", &filler(3000));
+        let files = counted(dir.path()).unwrap();
+        assert_eq!(files, [("src/lib.rs".to_string(), 1)]);
+    }
+
+    #[test]
+    fn an_external_module_gated_on_stacked_test_and_unix_attributes_is_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "fn real() {}\n#[cfg(test)]\n#[cfg(unix)]\nmod props;\n",
+        );
+        write(dir.path(), "src/props.rs", &filler(3000));
         let files = counted(dir.path()).unwrap();
         assert_eq!(files, [("src/lib.rs".to_string(), 1)]);
     }

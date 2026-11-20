@@ -1,3 +1,7 @@
+# Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
 param(
     [Parameter(Position = 0)]
     [string] $Channel = $env:ROCM_CLI_CHANNEL,
@@ -168,14 +172,19 @@ function Convert-FileUriToPath {
     return $null
 }
 
-# Pinned production release signing public keys (trust roots). These stay empty
-# until the repository owner publishes production keys (see docs/release-trust.md,
-# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior:
-# a signature is verified only when a key is supplied via the parameters/env vars
-# or ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
-# signatures by default with these keys as trust roots. Two slots support
-# zero-downtime key rotation: a release signed with either the current or the
-# pre-staged next key verifies, so the next key is trusted before its first use.
+# Pinned production release signing public keys (trust roots). The Current slot
+# holds the published release key, whose canonical copy is
+# docs/keys/rocm-cli-release-current-public.pem; the Next slot stays "" until a
+# rotation key is published. Resolve-SigningPublicKey falls back to these keys
+# whenever no key is passed with -SigningPublicKeyPath/-SigningPublicKeyPem (or
+# ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/ROCM_CLI_SIGNING_PUBLIC_KEY_PEM), so while a
+# release key is pinned every install on any channel except a pr-<number>
+# channel verifies the detached signature and a missing .sig sidecar fails it,
+# whether ROCM_CLI_REQUIRE_SIGNATURE is unset or 0. A pr-<number> channel
+# installs an unsigned CI bundle and empties this list. A key supplied that way replaces
+# these keys rather than adding to them. Two slots support zero-downtime key
+# rotation: a release signed with either the current or the pre-staged next key
+# verifies, so the next key is trusted before its first use.
 $PinnedReleasePublicKeyCurrent = @"
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxuyScR/BzV+kuXqWAHtE
@@ -261,6 +270,68 @@ function Save-File {
     } catch {
         Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
         Fail "${FailureMessage}: $($_.Exception.Message)"
+    }
+}
+
+# Resolve pull request $PrNumber to the CI artifact built from its current head
+# and download it into $DestDir, so the checks and the install run exactly as
+# they do for any archive. Artifacts are not public downloads, so this needs the
+# GitHub CLI signed in (or GH_TOKEN set). The newest CI run for the head commit
+# that still has its artifact wins. A run whose later jobs failed still uploads
+# one, so the run's result is printed rather than required.
+function Get-PrBundle {
+    param(
+        [string] $Repo,
+        [string] $PrNumber,
+        [string] $ArtifactName,
+        [string] $DestDir
+    )
+
+    Confirm-Command gh
+    $head = (& gh pr view $PrNumber -R $Repo --json headRefOid --jq .headRefOid | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        Fail "could not look up pull request #$PrNumber in $Repo (is gh signed in? try: gh auth login)"
+    }
+    if ([string]::IsNullOrWhiteSpace($head)) {
+        Fail "pull request #$PrNumber has no head commit"
+    }
+    $short = $head.Substring(0, [Math]::Min(7, $head.Length))
+
+    $runsJson = (& gh api "repos/$Repo/actions/runs?head_sha=$head&event=pull_request&per_page=100" | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "could not list CI runs for pull request #$PrNumber"
+    }
+    $runs = @(($runsJson | ConvertFrom-Json).workflow_runs | Where-Object { $_.path -eq ".github/workflows/ci.yml" })
+    if ($runs.Count -eq 0) {
+        Fail "no CI run found for pull request #$PrNumber at $short; CI may not have started (a first-time contributor's run waits for approval)"
+    }
+
+    $found = $null
+    foreach ($run in $runs) {
+        $artifactsJson = (& gh api "repos/$Repo/actions/runs/$($run.id)/artifacts?name=$ArtifactName" | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            Write-Detail "note: could not list the artifacts of CI run $($run.id); trying the next run"
+            continue
+        }
+        $live = @(($artifactsJson | ConvertFrom-Json).artifacts | Where-Object { -not $_.expired })
+        if ($live.Count -gt 0) {
+            $found = $run
+            break
+        }
+    }
+    if ($null -eq $found) {
+        Fail "no downloadable $ArtifactName build for pull request #$PrNumber at $short; builds are kept for 7 days and only made for changes that touch code, so push a commit or re-run CI"
+    }
+
+    $conclusion = if ($found.conclusion) { $found.conclusion } else { "-" }
+    Write-Detail "pull request: #$PrNumber at $short"
+    Write-Detail "CI run: $($found.id) ($($found.status)/$conclusion)"
+    Write-Detail "note: this is an unreviewed, unsigned build of the pull request; only its checksum is verified"
+
+    New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
+    & gh run download $found.id -R $Repo -n $ArtifactName -D $DestDir
+    if ($LASTEXITCODE -ne 0) {
+        Fail "failed to download the $ArtifactName artifact from run $($found.id)"
     }
 }
 
@@ -687,18 +758,39 @@ switch ($architecture) {
 
 $platformOs = "windows"
 
-switch ($Channel) {
-    "nightly" {
-        $assetBase = "rocm-cli-nightly-$platformOs-$platformArch.$ArchiveExtension"
-        $releasePath = "releases/download/nightly"
+# `pr-<number>` installs the bundle CI built for that pull request, which is a
+# workflow artifact rather than a release asset: see Get-PrBundle.
+$prNumber = ""
+# Case-sensitive, as in install.sh: PR-1234 is not a pull request channel.
+if ($Channel -clike "pr-*") {
+    # \z, not $: a trailing newline must not pass for a number.
+    if ($Channel -cnotmatch '^pr-[0-9]+\z') {
+        Fail "invalid channel: $Channel (a pull request channel is pr-<number>, for example pr-1234)"
     }
-    "release" {
-        $assetBase = "rocm-cli-$platformOs-$platformArch.$ArchiveExtension"
-        $releasePath = "releases/latest/download"
+    if (-not [string]::IsNullOrWhiteSpace($DownloadBase)) {
+        Fail "ROCM_CLI_DOWNLOAD_BASE cannot be combined with the $Channel channel: the build comes from CI, not from release assets"
     }
-    default {
-        $assetBase = "rocm-cli-$platformOs-$platformArch.$ArchiveExtension"
-        $releasePath = "releases/download/$Channel"
+    $prNumber = $Channel.Substring(3)
+}
+
+if ($prNumber) {
+    # CI packages the pull request bundle as a zip, whatever ArchiveExtension says.
+    $assetBase = "rocm-cli-pr-$platformOs-$platformArch.zip"
+    $releasePath = ""
+} else {
+    switch ($Channel) {
+        "nightly" {
+            $assetBase = "rocm-cli-nightly-$platformOs-$platformArch.$ArchiveExtension"
+            $releasePath = "releases/download/nightly"
+        }
+        "release" {
+            $assetBase = "rocm-cli-$platformOs-$platformArch.$ArchiveExtension"
+            $releasePath = "releases/latest/download"
+        }
+        default {
+            $assetBase = "rocm-cli-$platformOs-$platformArch.$ArchiveExtension"
+            $releasePath = "releases/download/$Channel"
+        }
     }
 }
 
@@ -724,10 +816,16 @@ $sigPath = "$archivePath.sig"
 $extractDir = Join-Path $tempRoot "extract"
 $manifestPath = Join-Path $InstallDir ".rocm-cli-manifest"
 $signatureRequired = $RequireSignature -or (Test-Truthy $env:ROCM_CLI_REQUIRE_SIGNATURE)
-# Production default: once release trust roots are pinned, release-channel installs
-# always verify. An unset or 0 ROCM_CLI_REQUIRE_SIGNATURE does not lower this
-# floor; pass -SigningPublicKeyPath/-Pem (or the env vars) to point at an
-# alternate key (e.g. a private mirror) instead.
+# This floor changes no outcome while a release key is pinned:
+# Resolve-SigningPublicKey then always returns a key, and that alone makes the
+# check below verify. If both pinned slots were emptied,
+# Test-HasPinnedReleaseKey is false and the floor does not fire either, so a
+# release install with no key supplied would skip verification, unless
+# -RequireSignature or ROCM_CLI_REQUIRE_SIGNATURE=1 is given, which makes it
+# fail for want of a key. The floor is left as it is on purpose: making a release
+# install fail when no key resolves is tracked as ROCMAI-960. Pass
+# -SigningPublicKeyPath/-Pem (or the env vars) to point at an alternate key
+# (e.g. a private mirror).
 if ($Channel -eq "release" -and (Test-HasPinnedReleaseKey)) {
     $signatureRequired = $true
 }
@@ -740,10 +838,31 @@ try {
     Write-Detail "repo: $Repo"
     Write-Detail "channel: $Channel"
     Write-Detail "install_dir: $InstallDir"
-    Write-Detail "download: $archiveUrl"
 
-    Save-File $archiveUrl $archivePath
-    Save-File $shaUrl $shaPath
+    if ($prNumber) {
+        # CI does not sign pull request bundles, so the pinned release keys do
+        # not apply to them: a key is used only when one was named explicitly
+        # or a signature was required, and then the missing .sig fails the
+        # install.
+        if ([string]::IsNullOrWhiteSpace($SigningPublicKeyPath) -and [string]::IsNullOrWhiteSpace($SigningPublicKeyPem)) {
+            $signingPublicKeys = @()
+        }
+        $prDir = Join-Path $tempRoot "pr-artifact"
+        Get-PrBundle $Repo $prNumber ([IO.Path]::GetFileNameWithoutExtension($assetBase)) $prDir
+        Write-Detail "archive: $(Join-Path $prDir $assetBase)"
+        foreach ($sidecar in @("", ".sha256", ".sig")) {
+            $source = Join-Path $prDir "$assetBase$sidecar"
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+                Copy-Item -LiteralPath $source -Destination "$archivePath$sidecar" -Force
+            } elseif ($sidecar -ne ".sig") {
+                Fail "the pull request artifact did not contain $assetBase$sidecar"
+            }
+        }
+    } else {
+        Write-Detail "download: $archiveUrl"
+        Save-File $archiveUrl $archivePath
+        Save-File $shaUrl $shaPath
+    }
 
     $expected = Get-ExpectedSha256 $shaPath
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
@@ -753,9 +872,19 @@ try {
 
     if ($signatureRequired -or ($signingPublicKeys.Count -gt 0)) {
         if ($signingPublicKeys.Count -eq 0) {
+            # Only a pull request channel gets here with a signature required
+            # and no key by design; naming a key would send the user to a
+            # second failure, since CI never signs these bundles.
+            if ($prNumber) {
+                Fail "a signature cannot be required for the $Channel channel: CI does not sign pull request builds"
+            }
             Fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH, ROCM_CLI_SIGNING_PUBLIC_KEY_PEM, -SigningPublicKeyPath, or -SigningPublicKeyPem"
         }
-        Save-File $sigUrl $sigPath "required signature sidecar is missing or unavailable"
+        if (-not $prNumber) {
+            Save-File $sigUrl $sigPath "required signature sidecar is missing or unavailable"
+        } elseif (-not (Test-Path -LiteralPath $sigPath -PathType Leaf)) {
+            Fail "required signature sidecar is missing from the pull request artifact: $assetBase.sig"
+        }
         Confirm-ArchiveSignature $archivePath $sigPath $signingPublicKeys
         Write-Ok "signature verified"
     }

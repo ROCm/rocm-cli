@@ -185,3 +185,55 @@ Feature: Chat and endpoint detection
     When the user asks the CLI to plan a vague request
     Then the planning assistant was asked exactly once
     And the CLI plans the request itself and says the planning assistant's plan "must request managed serving with --managed"
+
+  # The approval card is the user's only say over what an assistant tool call
+  # does, so the card and the command its approval runs must be the same one.
+  # A tool call carrying a second set of arguments nested inside the first is
+  # ambiguous about which it means: it is refused before any card is shown,
+  # and the model is told why, instead of showing one command and running the
+  # other.
+  @id:chat-ambiguous-tool-call-refused-before-approval @requires-os:linux
+  Scenario: chat-17 - A tool call carrying two sets of arguments is refused before any approval prompt
+    Given a running managed model answers a request to start a server with a tool call carrying two sets of arguments
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    When the user accepts the local endpoint
+    And the user asks the managed model to start a model server
+    Then the model is told the tool call was refused
+    And no tool approval prompt is displayed
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+
+  # `rocm mcp-call` is how a tool-using client runs a ROCm tool directly. A
+  # client may hand over the tool-call request it was given whole, with the
+  # tool's name beside its arguments; the CLI then runs the tool that request
+  # names, with the arguments inside it.
+  @id:chat-mcp-call-runs-a-whole-tool-call-request
+  Scenario: chat-18 - A whole tool-call request handed to the CLI runs the tool it names
+    When a tool-using client hands the CLI a whole tool-call request to check a path that exists
+    Then the tool reports that path as an existing directory
+
+  # The same refusal as chat-17, on the direct path: a request holding a
+  # second set of arguments nested beside the first is refused rather than
+  # run with either set.
+  @id:chat-mcp-call-refuses-two-sets-of-arguments
+  Scenario: chat-19 - A direct tool request carrying two sets of arguments is refused and runs nothing
+    When a tool-using client asks the CLI to check a path with a second set of arguments nested inside the first
+    Then the CLI refuses the request for its nested arguments
+    And no tool result is printed
+
+  # PR #1041 pointed the chat `model` tool at the curated `rocm model` listing
+  # instead of the 58k-token `--verbose` dump, which was right: the dump was
+  # more than a locally served model's whole context. The deterministic "ROCm
+  # CLI summary" block was gated on a string only the dump printed, so it
+  # silently stopped appearing for model questions — and the curated listing is
+  # grouped by hardware target and names only large models, so on a small GPU
+  # the answer named nothing that fits. The block names the ~4 GiB local
+  # assistant by name, and this drives the real `rocm chat` turn end to end:
+  # the CLI's own fallback runs the model tool, so a regression in either the
+  # tool's renderer or the summary's gate shows up here.
+  @id:chat-model-question-shows-the-rocm-cli-summary
+  Scenario: chat-20 - Asking what models this machine can run shows the deterministic ROCm CLI summary
+    Given a local chat assistant that answers a model question in words
+    When the user asks in one-shot chat which models this machine can run
+    Then the chat shows a ROCm CLI summary naming the low-VRAM local assistant

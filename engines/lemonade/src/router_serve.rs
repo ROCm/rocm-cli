@@ -9,10 +9,12 @@
 //! the way it fails can be tested without a real `lemond`. Production uses
 //! [`LemondRouterSteps`]. There is deliberately no direct-server step here: any
 //! failure is returned to the caller as an error and the server is stopped. The
-//! engine state is then left at `failed`, except for a model load or
+//! engine state is then marked `failed`, except for a model load or
 //! verification failure: that is tagged [`RouterLoadFailure`] and does not write
 //! `failed`, so the caller can decide, on Linux, whether the selected GPU
-//! backend can serve the model directly instead and own the final state.
+//! backend can serve the model directly instead and own the final state. A
+//! state file that is empty, torn or not a JSON object refuses the `failed`
+//! mark like any other merge and is left as it was.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::json;
@@ -72,8 +74,11 @@ pub(crate) fn serve_router<S: RouterSteps>(
 ) -> Result<()> {
     let server_pid = steps.spawn_server()?;
     // Every step after the spawn is inside this one fallible block, so a failure
-    // anywhere in it (state writes included) stops the server and marks the state
-    // `failed`; the server has no `Drop` and would otherwise keep running.
+    // anywhere in it (state writes included) stops the server, which has no `Drop`
+    // and would otherwise keep running. The state is then marked `failed`, except
+    // after a load failure, which leaves it to the fallback (below). When the
+    // state file is itself unusable (empty, torn or not a JSON object), that mark
+    // is refused like any merge and the file is left as it was.
     let outcome = (|| -> Result<()> {
         crate::state::write_running_state_for_model(
             request,
@@ -265,8 +270,10 @@ impl RouterSteps for LemondRouterSteps<'_> {
         if let Some(mut child) = self.child.take() {
             // The whole tree: a router that failed to load a model can leave a
             // backend process holding the device memory, and the fallback starts
-            // a second server on the same device and port straight after.
-            let _ = rocm_core::terminate_process_tree(child.id());
+            // a second server on the same device and port straight after. The
+            // stop escalates to SIGKILL after the grace period, so the wait below
+            // returns even for a server that ignores SIGTERM.
+            let _ = crate::state::terminate_pid(child.id(), true);
             let _ = child.wait();
         }
     }
@@ -303,11 +310,15 @@ mod tests {
         SmokeUnreachable,
         /// The state file cannot be written once the server is spawned.
         StateWrite,
-        /// The state file becomes unwritable between verification and the ready merge.
+        /// The state file is torn ([`TORN_STATE`]) between verification and the
+        /// ready merge, as a writer that rewrites it in place could leave it.
         ReadyMerge,
         WaitServer,
         FailedExit,
     }
+
+    /// A state document cut short mid-write: what [`Fail::ReadyMerge`] leaves.
+    const TORN_STATE: &[u8] = br#"{"status": "running", "server_pid": 4000000, "server_st"#;
 
     struct FakeSteps {
         runtime: LemonadeRuntime,
@@ -394,8 +405,7 @@ mod tests {
             // Asked for while the ready state is assembled, i.e. after every
             // verification step and before the merge is written.
             if self.fail == Fail::ReadyMerge {
-                std::fs::remove_file(&self.state_path).unwrap();
-                std::fs::create_dir(&self.state_path).unwrap();
+                std::fs::write(&self.state_path, TORN_STATE).unwrap();
             }
             None
         }
@@ -580,10 +590,8 @@ mod tests {
             std::fs::create_dir(&request.state_path).unwrap();
         }
         let mut steps = FakeSteps::new(temporary.path(), fail);
-        let error = format!(
-            "{:#}",
-            serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected)
-        );
+        let failure = serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected);
+        let error = format!("{failure:#}");
         assert!(error.contains(expected), "{error}");
         // The spawned server is stopped exactly once, and nothing runs after it.
         assert_eq!(
@@ -598,6 +606,24 @@ mod tests {
             "{:?}",
             steps.calls
         );
+        if fail == Fail::ReadyMerge {
+            // Refused as torn, not failed for some other reason, and true to its
+            // word: neither the ready merge nor the `failed` mark that follows
+            // replaced the file, so the torn bytes the merge found are still there.
+            let refused = failure
+                .downcast_ref::<rocm_core::JsonStateFileRefused>()
+                .unwrap_or_else(|| panic!("the merge must refuse the torn file: {error}"));
+            assert_eq!(refused.refusal, rocm_core::JsonStateRefusal::NotJson);
+            assert!(
+                request.state_path.is_file(),
+                "the state file is still a file"
+            );
+            assert_eq!(
+                std::fs::read(&request.state_path).unwrap(),
+                TORN_STATE,
+                "the torn state file must be left exactly as it was"
+            );
+        }
         if fail == Fail::WaitServer {
             // The state file is writable here, so the failure is recorded.
             let state = crate::state::read_service_state(&request.state_path).unwrap();
@@ -612,7 +638,12 @@ mod tests {
 
     #[test]
     fn ready_state_merge_failure_stops_the_server() {
-        assert_post_spawn_failure_stops_server(Fail::ReadyMerge, "failed to write");
+        // The merge reads the file first, under the state directory's lock, and
+        // refuses a torn one rather than replace it.
+        assert_post_spawn_failure_stops_server(
+            Fail::ReadyMerge,
+            "left it untouched and recorded nothing",
+        );
     }
 
     /// The ready write fails after the model loaded and verified, and the server
@@ -761,6 +792,95 @@ mod tests {
             "stop_server must terminate and reap the spawned lemond"
         );
         assert!(steps.child.is_none());
+    }
+
+    /// A `lemond` that ignores SIGTERM, with a backend child that ignores it
+    /// too, is still stopped and reaped: `stop_server` escalates to SIGKILL for
+    /// the whole tree after the stop grace instead of waiting on the server
+    /// forever. A watchdog kills both if the stop does not return in time, so a
+    /// regression fails the test instead of hanging it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_router_stop_kills_a_server_tree_that_ignores_sigterm() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let request = request(dir);
+        let env = LemonadeProcessEnvironment::default();
+        let manifest = crate::test_http::fake_runtime::manifest(dir, 0, None);
+        // The backend child writes its PID once it runs, which is after the
+        // trap is set in the parent and inherited (`SIG_IGN` survives `exec`).
+        let backend_pid_file = dir.join("backend.pid");
+        crate::test_http::fake_runtime::write_executable(
+            &manifest.lemond,
+            &format!(
+                "#!/bin/sh\ntrap '' TERM\nsh -c 'echo $$ > \"{}\"; exec sleep 300' &\nwait\n",
+                backend_pid_file.display()
+            ),
+        );
+        let mut steps = LemondRouterSteps {
+            runtime: LemonadeRuntime { manifest },
+            request: &request,
+            process_env: &env,
+            log_path: None,
+            parent: ParentRuntimeEnvironment::rooted_at(dir),
+            child: None,
+        };
+        let server_pid = steps.spawn_server().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let backend_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&backend_pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake lemond never started its backend"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let backend = rocm_core::ProcessIdentity::capture(backend_pid);
+
+        let bound = crate::STOP_GRACE * 2 + Duration::from_secs(10);
+        let (watchdog_cancel, stopped) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if stopped.recv_timeout(bound).is_ok() {
+                return false;
+            }
+            for pid in [backend_pid, server_pid] {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            true
+        });
+        steps.stop_server();
+        let _ = watchdog_cancel.send(());
+        let watchdog_fired = watchdog.join().unwrap();
+        let backend_state = rocm_core::identity_state(&backend);
+        if backend_state == rocm_core::IdentityState::Matches {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &backend_pid.to_string()])
+                .status();
+        }
+
+        assert!(
+            !watchdog_fired,
+            "stop_server did not return within {bound:?} for a server ignoring SIGTERM"
+        );
+        assert!(steps.child.is_none());
+        assert!(
+            !Path::new(&format!("/proc/{server_pid}")).exists(),
+            "the server must be killed and reaped"
+        );
+        assert!(
+            matches!(
+                backend_state,
+                rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled
+            ),
+            "the backend under the server must be killed too, got {backend_state:?}"
+        );
     }
 
     /// Backend selection runs `lemonade backends` through the serve request's

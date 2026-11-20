@@ -254,7 +254,7 @@ const UV_CHECK_VIOLATION_PREFIX: &str = "The package `";
 /// `Requires-Python`, a package with multiple installed distributions — and none of them
 /// is a `Requires-Dist` a reinstall of the requirer can resolve. Only a requirement
 /// `uv` quotes is one.
-const UV_CHECK_REQUIREMENT_INFIX: &str = " requires `";
+pub(crate) const UV_CHECK_REQUIREMENT_INFIX: &str = " requires `";
 
 /// Report the unsatisfied `Requires-Dist` entries in the environment at `venv_python`.
 ///
@@ -1427,7 +1427,8 @@ All installed packages are compatible
 /// `crate::archive_props`. Extraction here is the system `tar` resolved from
 /// `PATH`, so these exercise the host's `tar` (GNU tar on the Linux CI
 /// runners) through `extract_archive`.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod archive_properties {
     use std::path::Path;
 

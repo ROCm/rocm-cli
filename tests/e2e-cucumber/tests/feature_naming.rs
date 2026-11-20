@@ -14,6 +14,12 @@
 //! needs a real `rocm` binary), so a mis-numbered scenario is caught without a
 //! full suite run.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +67,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("therock_next_generation.feature", "therock-next"),
     ("uninstall.feature", "uninstall"),
     ("update.feature", "update"),
+    ("vllm_tensorizer.feature", "vllm-tensorizer"),
 ];
 
 fn features_dir() -> PathBuf {

@@ -1282,6 +1282,7 @@ dependencies = [
  "rand 0.10.3",
  "reqwest 0.13.4",
  "rocm-core",
+ "rocm-engine-protocol",
  "serde",
  "serde_json",
  "sha2",
@@ -3817,6 +3818,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures",
+ "libc",
  "rocm-core",
  "rocm-dash-collectors",
  "rocm-dash-core",
@@ -3888,6 +3890,7 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "object",
  "proptest",
  "rocm-core",
  "rocm-deps",
@@ -3911,6 +3914,7 @@ dependencies = [
  "rocm-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
