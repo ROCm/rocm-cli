@@ -249,9 +249,13 @@ fn zip_bundle(bundle_dir: &Path, archive_path: &Path, dist_name: &str) -> Result
     collect_files(bundle_dir, &mut entries)?;
     entries.sort();
     for absolute in entries {
-        let relative = absolute
-            .strip_prefix(bundle_dir)
-            .expect("collected path is under the bundle dir");
+        let relative = absolute.strip_prefix(bundle_dir).with_context(|| {
+            format!(
+                "collected {} outside the bundle dir {}",
+                absolute.display(),
+                bundle_dir.display()
+            )
+        })?;
         // Top-level entry is the `<dist>/...` bundle directory, with `/`
         // separators regardless of host, matching the tar layout.
         let name = format!("{dist_name}/{}", to_zip_path(relative));

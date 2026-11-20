@@ -28,7 +28,8 @@ mod dash_daemon;
 mod dash_seam;
 mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod deletion_properties;
 mod diagnose_cmd;
 mod driver_install;
@@ -804,10 +805,24 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Engines { command }) => engines(command),
         Some(Command::Model { verbose }) => {
             let paths = AppPaths::discover()?;
+            // Measure the host once and hand both renderers the same figures.
+            // These were hardcoded `None`, which left every fit verdict reading
+            // "unknown" and the recommendations unable to narrow to what this
+            // machine can run -- a 2 TB-RAM host was told its RAM telemetry was
+            // unavailable.
+            let (gpu_gib, host_ram_gib) = model_fit::host_model_listing_facts();
             let rendered = if verbose {
-                render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None)
+                render_model_registry_verbose_text_with_context_and_host(
+                    Some(&paths),
+                    gpu_gib,
+                    host_ram_gib,
+                )
             } else {
-                render_model_registry_text_with_context_and_host(Some(&paths), None, None)
+                render_model_registry_text_with_context_and_host(
+                    Some(&paths),
+                    gpu_gib,
+                    host_ram_gib,
+                )
             };
             print!("{rendered}");
             Ok(())

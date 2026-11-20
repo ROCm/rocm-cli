@@ -170,7 +170,9 @@ repos:
         name: cargo clippy
         entry: cargo xtask pre-push-check clippy
         language: system
-        types: [rust]
+        # clippy.toml sets which lints fire in tests, so a push that edits only
+        # it still has to lint.
+        files: '(\.rs|^clippy\.toml)$'
         pass_filenames: false
         verbose: true # shows which crates the push selected
         stages: [pre-push] # compiles the workspace; too slow for every commit
@@ -184,7 +186,7 @@ repos:
         # job, whenever e2e-cucumber is among the affected crates.
         entry: cargo xtask pre-push-check clippy-e2e
         language: system
-        types: [rust]
+        files: '(\.rs|^clippy\.toml)$' # see cargo-clippy
         pass_filenames: false
         verbose: true
         stages: [pre-push]
