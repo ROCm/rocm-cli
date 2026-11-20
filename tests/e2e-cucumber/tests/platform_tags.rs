@@ -28,6 +28,12 @@
 //! This runs in the ordinary `cargo test` set (unlike the `e2e` target, which
 //! needs a real `rocm` binary), so a missing tag is caught without a suite run.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -175,6 +181,7 @@ const ALLOWED_ANY_OS: &[(&str, &str)] = &[
         "remote-serve-refuses-reusing-already-serving-session",
         REMOTE_OVER_SSH,
     ),
+    ("remote-status-refuses-altered-record", REMOTE_OVER_SSH),
     // runtime_setup.feature
     (
         "runtime-install-sdk-active",

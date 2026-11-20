@@ -334,10 +334,11 @@ review question: a step that starts reading something only one OS has turns
 its entry wrong without failing anything here. Where it runs: the
 `windows-debug` job runs `cargo test --workspace --all-targets` on every pull
 request that changes Rust or a `.feature` file, both of which its `heavy` path
-filter matches, so a tag-only edit is checked there. The Linux pull-request
-lane runs it only when the change selects `e2e-cucumber` and passes that lane's
-Rust path filter, which a `.feature` file alone does not, and the pre-push hook
-does not run `e2e-cucumber`'s tests.
+filter matches, so a tag-only edit is checked there. The Linux `test` job
+(`Test (affected crates)`) runs it whenever `cargo xtask affected` selects
+`e2e-cucumber`, which any change under `tests/e2e-cucumber/` does, a `.feature`
+file included, since that path also passes the job's `rust` path filter. The
+pre-push hook does not run `e2e-cucumber`'s tests.
 
 ### Tests that run a fake executable
 

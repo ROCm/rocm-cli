@@ -296,7 +296,13 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 3. Implement step functions: Given = setup, When = action, Then = assertion.
 4. Register the module in `tests/e2e.rs` with `pub mod <name>_steps;`.
 5. Run to verify.
-6. If a step needs to fake a subprocess the CLI shells out to (`uv`, a runtime's
+6. If the scenario carries a capability tag (`@requires-gpu`,
+   `@requires-docker`, ...), also decide its OS: add `@requires-os:<os>` or
+   `@requires-wsl`, plus `@requires-bare-metal` where WSL2 lacks the interface,
+   or give its `@id` a reviewed `ALLOWED_ANY_OS` entry with a reason.
+   `cargo test -p e2e-cucumber --test platform_tags` checks it; see
+   [Capability-tagged scenarios name their OS](../../docs/testing.md#capability-tagged-scenarios-name-their-os).
+7. If a step needs to fake a subprocess the CLI shells out to (`uv`, a runtime's
    `python`, `tailscale`), add a `[[bin]]` under [`src/bin/`](src/bin/) rather
    than writing a shell/batch script: it builds on every platform cargo already
    targets. [`fixture_binary`](src/fixture_binary.rs)'s `fixture_binary()`
@@ -306,7 +312,7 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
    [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
    [`fake-tailscale`](src/bin/fake-tailscale.rs), and
    [`fake-gh`](src/bin/fake-gh.rs) for the pattern.
-7. If a step asserts a GPU count, compare it against the GPUs the job can
+8. If a step asserts a GPU count, compare it against the GPUs the job can
    reach, not the cards on the PCI bus: see
    [GPU visibility on the hardware pool](../../docs/ci-hardware-testing.md#gpu-visibility-on-the-hardware-pool).
 
