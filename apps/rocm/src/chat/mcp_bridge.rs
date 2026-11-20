@@ -27,6 +27,7 @@
 
 use super::summaries::managed_service_running_state;
 use crate::automations::{render_automations_text, render_daemon_text};
+use crate::examine_report_text::host_gpu_support_level;
 use crate::freeform_planner::{format_structured_tool_call, plan_freeform_request_with_context};
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
 use crate::rocm_argv::{chat_cli_arg_value, chat_cli_has_flag};
@@ -44,10 +45,9 @@ use crate::uninstall_plan::render_uninstall_dry_run;
 use crate::update_cmd::render_update_text;
 use crate::{
     build_codex_bridge_gpu_snapshot, build_codex_bridge_snapshot,
-    builtin_codex_bridge_engine_inventory, cli_version_string, host_gpu_support_level,
-    record_cli_audit_event, render_config_text, render_engine_inventory_text_with_paths,
-    render_examine_text, render_examine_text_with_paths,
-    render_model_registry_text_with_context_and_host,
+    builtin_codex_bridge_engine_inventory, cli_version_string, record_cli_audit_event,
+    render_config_text, render_engine_inventory_text_with_paths, render_examine_text,
+    render_examine_text_with_paths, render_model_registry_text_with_context_and_host,
     render_model_registry_verbose_text_with_context_and_host, render_setup_status_text,
     therock_install_version_selector,
 };
