@@ -12,7 +12,7 @@ use super::launch_transaction::{
     launch_still_owns, managed_service_reuse_refusal, no_usable_gpu_refusal,
     resolve_managed_port_in_transaction, update_managed_record_on_disk,
 };
-use super::readiness::{managed_service_stop_was_requested, mark_service_failed};
+use super::readiness::managed_service_stop_was_requested;
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
 use crate::engine_runtime_select::managed_service_launcher_path;
@@ -65,38 +65,37 @@ pub(crate) fn attach_background_stdio(
 #[derive(Debug, PartialEq, Eq)]
 enum StartupDeath {
     /// A `rocm services stop` landed inside the startup window and killed the
-    /// child we just spawned. Not a crash, and stamping `failed` over the
-    /// stop's own bookkeeping would report it as one.
+    /// child we just spawned. The user is told it was stopped, not that it
+    /// crashed.
     DeliberateStop,
-    /// Nothing asked for this. The manifest and the engine state file have been
-    /// marked `failed`.
+    /// Nothing asked for this: the engine died on its own way up.
     Crash,
 }
 
-/// The verdict both spawn branches owe such a child, and the writes that go with
-/// it.
+/// Which of the two a child that is gone before the readiness wait even starts
+/// is. Reads the stop markers; **writes nothing**.
 ///
-/// Shared rather than written twice because the Windows branch had **neither**
-/// half: its liveness check below simply bailed, so an engine dying in the
-/// ~200 ms post-spawn window left the `starting`/0 defaults
-/// `ManagedServiceRecord::new` wrote, and a later `rocm services`/`rocm dash`
-/// read never learned it crashed. ROCMAI-541 is a Windows ticket whose
-/// acceptance criterion is that the engine state file is marked `failed` on any
-/// error exit, so that gap was on the one platform the ticket is about.
+/// Deliberately no `failed` stamp here, which is the one place this PR does not
+/// apply ROCMAI-541's "mark the state file `failed` on any error exit". An
+/// engine that dies inside the settle window never became ready, so it is the
+/// shape most likely to die again on the next start — and `rocmd`'s recovery
+/// scan restarts a managed `failed` record that carries no stop marker, which a
+/// crash does not. `failed` here would hand recovery an engine that fails every
+/// start. #437 chose `stopped` for exactly this path and pins it in
+/// `@id:serve-managed-engine-dies-at-startup`; the cleanup's
+/// `mark_launch_abandoned` writes it.
 ///
-/// The stop is checked first for the reason `mark_service_failed`'s own contract
-/// gives: it must not overwrite a stop that is already recorded.
-fn settle_startup_death(
-    paths: &AppPaths,
-    service_id: &str,
-    manifest_path: &Path,
-    engine_state_path: &Path,
-) -> StartupDeath {
+/// The paths that *do* stamp `failed` are the ones where the engine had already
+/// come up and then died — `finalize_managed_launch_readiness`, the attached
+/// `ServerExited` arm, and the restart verdict — which is what serve-67 and
+/// serve-68 exercise. Recovery respawning one of those is the intended
+/// behaviour, not a loop.
+fn settle_startup_death(paths: &AppPaths, service_id: &str) -> StartupDeath {
     if managed_service_stop_was_requested(paths, service_id) {
-        return StartupDeath::DeliberateStop;
+        StartupDeath::DeliberateStop
+    } else {
+        StartupDeath::Crash
     }
-    mark_service_failed(manifest_path, engine_state_path);
-    StartupDeath::Crash
 }
 
 /// How long a freshly spawned managed engine is watched before it is treated as
@@ -139,9 +138,10 @@ impl std::error::Error for EngineDiedAtStartup {}
 /// state files are left saying (ROCMAI-541). A `rocm services stop` that landed
 /// inside the startup window killed this child, so stamping `failed` over the
 /// stop's own bookkeeping would report a deliberate stop as a crash; anything
-/// else is a crash and [`settle_startup_death`] marks both files `failed`. It is
-/// a closure so this stays free of `AppPaths` and keeps its unit test on every
-/// platform.
+/// else is a crash. The verdict writes nothing — see [`settle_startup_death`]
+/// for why this one path leaves the status to the cleanup — it only decides
+/// which message the user gets. It is a closure so this stays free of
+/// `AppPaths` and keeps its unit test on every platform.
 ///
 /// Both arms return [`EngineDiedAtStartup`]: the child is known dead either way,
 /// and that is what stops cleanup signalling a pid that is already free.
@@ -704,16 +704,12 @@ fn launch_managed_engine_child_locked(
             MANAGED_ENGINE_STARTUP_SETTLE,
         )
         .context("failed to launch managed engine process")?;
-        // Taken before the call: `adopt_watched_engine_spawn` borrows `record`
-        // mutably, so the verdict closure cannot also hold a reference into it.
-        let manifest_path = record.manifest_path.clone();
-        let engine_state_path = record.engine_state_path.clone();
         adopt_watched_engine_spawn(
             record,
             spawn.pid,
             managed_startup_exit(&spawn),
             service_id,
-            || settle_startup_death(paths, service_id, &manifest_path, &engine_state_path),
+            || settle_startup_death(paths, service_id),
         )?;
         // The watch above is one-shot: it answers for the settle window only.
         // The readiness wait that follows needs a live view of the same child,
@@ -762,12 +758,7 @@ fn launch_managed_engine_child_locked(
             .try_wait()
             .context("failed to check managed engine startup state")?;
         fail_if_engine_died_at_startup(startup_exit, &record.log_path, service_id, || {
-            settle_startup_death(
-                paths,
-                service_id,
-                &record.manifest_path,
-                &record.engine_state_path,
-            )
+            settle_startup_death(paths, service_id)
         })?;
         (
             child_pid,
@@ -917,22 +908,27 @@ mod tests {
         Ok(())
     }
 
-    /// ROCMAI-541's acceptance criterion is that the engine state file is marked
-    /// `failed` on any error exit, and the ticket is a **Windows** one. The
-    /// Windows spawn branch's only early exit is the startup check above, which
-    /// used to bail without writing anything — so the one platform the ticket is
-    /// about never met the criterion in the ~200 ms post-spawn window.
+    /// A child lost in the startup window is told apart from one a stop killed,
+    /// and **neither writes a status**.
     ///
-    /// This covers the verdict both branches now share rather than either call
-    /// site, because the Windows branch is `#[cfg(windows)]` and the Linux lane
-    /// could otherwise never run it. Both arms are asserted: a crash must stamp
-    /// `failed` on **both** files, and a stop that landed inside the window must
-    /// stamp neither — marking a deliberate stop `failed` is the mirror-image
-    /// defect, and a test that only checked the crash arm would pass if
-    /// `settle_startup_death` stopped consulting the stop marker at all.
+    /// This is the one path where this PR does not apply ROCMAI-541's "mark the
+    /// state file `failed` on any error exit": an engine that died inside the
+    /// settle window never became ready, and `rocmd`'s recovery restarts a
+    /// `failed` record carrying no stop marker — which a crash does not carry —
+    /// so `failed` here would hand recovery an engine that fails every start.
+    /// #437 settled this path on `stopped`, written by the cleanup's
+    /// `mark_launch_abandoned`, and pins it end to end in
+    /// `@id:serve-managed-engine-dies-at-startup`.
+    ///
+    /// What the verdict still decides is what the user is *told*: a stop that
+    /// landed in the window reports a stop, not a crash. Both arms are asserted,
+    /// because a check that only looked at the crash arm would pass if
+    /// `settle_startup_death` stopped consulting the stop marker at all. The
+    /// no-write half is asserted too, so a reinstated `failed` stamp here turns
+    /// this red rather than only the e2e lane.
     #[test]
-    fn a_child_lost_in_the_startup_window_is_marked_failed_unless_a_stop_asked_for_it() -> Result<()>
-    {
+    fn a_child_lost_in_the_startup_window_is_told_apart_from_a_stop_and_writes_nothing()
+    -> Result<()> {
         for (stop_requested, expected) in [
             (false, StartupDeath::Crash),
             (true, StartupDeath::DeliberateStop),
@@ -947,56 +943,46 @@ mod tests {
                 record.write()?;
             }
 
-            let verdict = settle_startup_death(
-                &paths,
-                service_id,
-                &record.manifest_path,
-                &record.engine_state_path,
-            );
+            let verdict = settle_startup_death(&paths, service_id);
 
             assert_eq!(verdict, expected, "stop_requested={stop_requested}");
             let manifest = fs::read_to_string(&record.manifest_path)?;
-            let marked_failed = manifest.contains("\"failed\"");
-            assert_eq!(
-                marked_failed, !stop_requested,
-                "a crash must leave the manifest `failed` and a stop must not: {manifest}"
+            assert!(
+                !manifest.contains("\"failed\""),
+                "the startup verdict must not stamp the manifest: {manifest}"
             );
-            if !stop_requested {
-                let engine_state = fs::read_to_string(&record.engine_state_path)?;
-                assert!(
-                    engine_state.contains("\"failed\""),
-                    "the engine state file is the one ROCMAI-541 names: {engine_state}"
-                );
-            }
+            let engine_state = fs::read_to_string(&record.engine_state_path).unwrap_or_default();
+            assert!(
+                !engine_state.contains("\"failed\""),
+                "nor the engine state file: {engine_state}"
+            );
             let _ = fs::remove_dir_all(&root);
         }
         Ok(())
     }
 
-    /// ROCMAI-541 review: the `failed` a startup-window crash records has to
-    /// still be there once the launch transaction's own cleanup has run.
+    /// A child that dies inside the startup window leaves a record that is
+    /// `stopped` and not live, and an engine state file that does not claim a
+    /// crash.
     ///
     /// The test above calls [`settle_startup_death`] directly, so it stops one
-    /// frame short of where the damage was. `settle_startup_death` merges
-    /// `failed` into the manifest and the engine state file and returns
-    /// `Crash`, the branch bails, and
-    /// [`spawn_managed_engine_child`]'s `Err` arm then hands
-    /// `abandon_failed_managed_launch` the in-memory `record` captured *before*
-    /// the spawn — still `starting`. Marking that copy abandoned and writing
-    /// the whole file put `stopped` back over the `failed`, while the engine
-    /// state file kept it, and `refresh_from_engine_state` will not re-read an
-    /// engine state file behind a `stopped` manifest, so the two never agree
-    /// again. Every helper-level test passed throughout.
+    /// frame short of the on-disk result. This drives a child that really is
+    /// spawned and really is gone again through the whole call and asserts the
+    /// **final** state, which is the only place the two files can be seen to
+    /// disagree.
     ///
-    /// So this drives a child that exits immediately through the whole call and
-    /// asserts the **final** on-disk state, which is the only place the clobber
-    /// was visible. Both files are asserted together: the bug was precisely
-    /// that they disagreed, so checking either alone would have missed it.
-    /// Deleting the `is_live()` guard in `abandon_launch_record` turns this
-    /// red (it reads `stopped`) and leaves the rest of the suite green.
+    /// `stopped` is #437's rule for this path and the reason is recovery:
+    /// `rocmd` restarts a managed `failed` record that carries no stop marker,
+    /// and an engine that died on the way up is the shape most likely to die
+    /// again on the next start. The verdict here therefore writes nothing, and
+    /// the cleanup's `mark_launch_abandoned` supplies `stopped`. Both files are
+    /// asserted together, because a `failed` stamp reinstated in
+    /// `settle_startup_death` would leave them disagreeing —
+    /// `refresh_from_engine_state` does not re-read an engine state file behind
+    /// a `stopped` manifest, so the pair would never reconcile.
     #[test]
     #[cfg(not(windows))]
-    fn a_startup_window_crash_stays_failed_after_the_launch_cleanup() -> Result<()> {
+    fn a_startup_window_death_leaves_a_stopped_record_both_files_agree_on() -> Result<()> {
         let (root, paths) = test_paths("startup-crash-survives-cleanup");
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
@@ -1053,22 +1039,21 @@ mod tests {
 
         let error = result.err().expect("a child that exited fails the launch");
         let manifest = ManagedServiceRecord::read_manifest(&paths, service_id)
-            .expect("the crashed launch keeps its record for `rocm services`/`rocm logs`");
+            .expect("the dead launch keeps its record for `rocm services`/`rocm logs`");
         let engine_state = fs::read_to_string(&manifest.engine_state_path).unwrap_or_default();
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(
-            manifest.status, "failed",
-            "the cleanup must not overwrite the crash it is cleaning up after: {error:#}"
+            manifest.status, "stopped",
+            "a death in the startup window must not be handed to rocmd recovery: {error:#}"
         );
         assert!(
-            engine_state.contains("\"failed\""),
-            "and the engine state file ROCMAI-541 names must still agree with it: {engine_state}"
+            !engine_state.contains("\"failed\""),
+            "and the engine state file must not disagree with it: {engine_state}"
         );
         assert!(
             !manifest.is_live(),
-            "a failed launch must stop reserving its port, which is what the \
-             `stopped` overwrite was there to guarantee"
+            "a failed launch must stop reserving its port"
         );
         Ok(())
     }
@@ -1560,35 +1545,24 @@ mod tests {
         );
         let persisted =
             persisted.expect("a post-spawn failure must leave the record on disk, not delete it");
-        // `failed`, and this assertion used to read `stopped`.
+        // `stopped`, and the engine state file must agree with it.
         //
-        // The child here *crashed*, so `settle_startup_death` has already
-        // merged `failed` into the manifest and the engine state file by the
-        // time cleanup runs. Overwriting the manifest with `stopped` and
-        // leaving the engine state file alone made the record disagree with
-        // itself permanently — `refresh_from_engine_state` will not re-read an
-        // engine state file behind a `stopped` manifest — and reported a crash
-        // to the user as a clean stop, which is the defect this whole change
-        // exists to close. The two sibling entry points already settled a crash
-        // this way (`readiness::settle_exited_service`,
-        // `service_control::settle_restart_startup_death` both leave `failed`
-        // standing); the fresh-launch path was the only one downgrading it.
+        // The startup verdict writes nothing (see `settle_startup_death`): a
+        // child that died inside the settle window never became ready, and
+        // `rocmd`'s recovery restarts a managed `failed` record carrying no
+        // stop marker, which a crash does not. #437 settled this path on
+        // `stopped` for that reason and pins it end to end in
+        // `@id:serve-managed-engine-dies-at-startup`.
         //
-        // The property the old `stopped` was really protecting — that an
-        // abandoned launch stops reserving its port — is unaffected and still
-        // asserted below: `is_live()` accepts neither status.
-        //
-        // The consequence deliberately taken on: `rocmd`'s recovery scan treats
-        // a `failed` managed record with no stop marker as a candidate
-        // (`manifest_service_recovery_reason`), so it may now respawn a launch
-        // the CLI reported as failed. That was already true of a crash on the
-        // restart and `--wait` paths, so this makes the entry points agree
-        // rather than adding a new exposure; whether recovery *should* retry a
-        // launch that never reached readiness is the open question this PR's
-        // own "Known limitations" already records, and it is not decided here.
+        // The paths that *do* leave `failed` standing are the ones where the
+        // engine had already come up — `readiness::settle_exited_service`, the
+        // attached `ServerExited` arm, `service_control::settle_restart_startup_death`
+        // — which is what ROCMAI-541's own serve-67/68 exercise. Recovery
+        // respawning one of those is intended; respawning an engine that never
+        // started is a loop.
         assert_eq!(
-            persisted.status, "failed",
-            "a crashed launch must keep the reason its own crash path recorded"
+            persisted.status, "stopped",
+            "a death inside the startup window must not be handed to rocmd recovery"
         );
         assert_eq!(
             key, None,
