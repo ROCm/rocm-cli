@@ -142,8 +142,9 @@ runs:
             # `scripts_xtask_tests_read_are_in_the_rust_filter` covers the
             # scripts: it fails when a script under `scripts/` or
             # `.github/scripts/` that an xtask source names, in a const or
-            # anywhere else, is missing from this category (the
-            # `.github/scripts/**` glob is also held by the literal reads of
+            # anywhere else, is missing from this category
+            # (`every_cross_crate_read_selects_its_reader` also holds the
+            # `.github/scripts/**` glob, through the literal reads of
             # `settle-e2e-lanes.sh`). For `lychee.toml` only
             # `every_path_category_glob_is_pinned_by_a_sample` fails, and it
             # checks that the glob is here, not that anything reads the file.
