@@ -10,6 +10,7 @@ SPDX-License-Identifier: MIT
 - [ ] Every new or changed user-facing message was read against the code path that runs after it, and its test asserts the resulting state — not only the wording — per AGENTS.md §3. Covers claims of an outcome, remediation advice naming a command, and promises that something will *not* happen.
 - [ ] Comments and doc lines this PR adds or changes that state how the code behaves were checked against that code, and each that is the reason for a decision names the file and the function, constant or test that makes it true (AGENTS.md §3).
 - [ ] If this PR changes behavior on only one platform, the description names that platform and the check that runs there and would fail without the change (AGENTS.md §3).
+- [ ] If this PR applies a fix, guard or hardening at one place, it was checked against the other sites that share its defect, and the PR text names the search and what became of each site (AGENTS.md §3).
 - [ ] Any existing scenario this PR moves off the blocking mock `e2e` job (for example by a tag) is justified as a deletion (AGENTS.md §8).
 - [ ] Commits answering review feedback were diffed whole against the reviewed head and widen no documented user-facing option's meaning or authority (AGENTS.md §11).
 - [ ] Every commit message on the branch describes what its own commit does in words still true at the branch head (AGENTS.md §5).

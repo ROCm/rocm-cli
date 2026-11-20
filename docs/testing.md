@@ -2807,6 +2807,80 @@ cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_withou
 cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
+What the chat prints from a model, and what it offers to paste, is covered by
+three more mock-lane scenarios in the same feature file (steps in
+[chat_steps.rs](../tests/e2e-cucumber/tests/e2e/chat_steps.rs)), and the
+error report every command prints by one in
+[runtime_lifecycle.feature](../tests/e2e-cucumber/features/runtime_lifecycle.feature)
+(steps in
+[runtime_lifecycle_steps.rs](../tests/e2e-cucumber/tests/e2e/runtime_lifecycle_steps.rs)):
+
+- `chat-21` (`chat-cli-reply-escapes-stripped`): a reply that conceals part of
+  a line with SGR 8, retitles the window and writes the clipboard (OSC 52, and
+  an 8-bit OSC) reaches stdout of `rocm chat --prompt` with no control
+  character and no sequence payload, and the concealed text printed where it
+  was. A title sequence the reply leaves open removes the rest of its own line
+  only: the line after it (`Still here.`) is printed.
+- `chat-22` (`chat-assistant-value-unsafe-to-paste-refused`): the assistant
+  asks `install_sdk` for a folder whose name holds `&`, which `cmd.exe` acts
+  on even inside the single quotes the line is rendered in. The CLI exits
+  non-zero, asked the assistant once, and prints nothing to stdout; stderr
+  holds the refusal, which names the character and says to run
+  `rocm install sdk` with the value, and no `advanced manual command:` or
+  `tool_call:` line. The user's own `rocm install sdk --dry-run` into that
+  folder (therock-next-15's pip index fixture and installed `uv`) is
+  accepted and names it as
+  one argument. That nothing was installed is checked by the chat-turn unit
+  tests in [providers.rs](../apps/rocm/src/providers.rs) listed below, not by
+  the scenario.
+- `chat-23` (`chat-assistant-plan-unsafe-to-paste-refused`): the assistant
+  asks `natural_language_plan` to plan an install into the same kind of
+  folder. The plan's `tool_call:` line would carry the folder, so the CLI
+  refuses the plan the same way, with the refusal naming the plan for the
+  assistant's request, and prints nothing to stdout.
+- `runtime-lifecycle-32` (`runtime-lifecycle-error-report-carries-no-escape`):
+  the error report every `rocm` command prints goes through the same cleaning.
+  `rocm runtimes activate` with a runtime name carrying a window-title and an
+  erase-line sequence fails, its report names the runtime with the sequences
+  removed and holds no control character, and no runtime is active.
+
+```bash
+cargo xtask e2e -- -n "chat-21"
+cargo xtask e2e -- -n "chat-22"
+cargo xtask e2e -- -n "chat-23"
+cargo xtask e2e -- -n "runtime-lifecycle-32"
+```
+
+The unit tests behind them: `sanitize_terminal_text`, `hides_or_moves_text`
+and `is_display_altering` in [terminal.rs](../crates/rocm-core/src/terminal.rs)
+(exact output for every introducer, an unterminated sequence ending at its
+line, the glyph-shaper rule and the default-ignorable table's edges), the
+paste-unsafe set in [shell_quote.rs](../apps/rocm/src/shell_quote.rs), the
+model-only refusals, the serve option and character rules and the plan check
+in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) (including that the same
+value passes `validate_chat_tool_call`, and that every tool that shows a
+command line is checked on it), the model-versus-user split in [turn.rs](../apps/rocm/src/chat/turn.rs)
+and [dash_seam.rs](../apps/rocm/src/dash_seam.rs), the chat turn against a
+local model in [providers.rs](../apps/rocm/src/providers.rs) (a refused
+folder, a refusal after a read-only check, a refused plan), the planner's
+check in [freeform_planner.rs](../apps/rocm/src/freeform_planner.rs), the
+status screen in [chat.rs](../apps/rocm/src/chat.rs), the error report as
+written to stderr in [main.rs](../apps/rocm/src/main.rs), and the dashboard
+agent's entry point in
+[tools.rs](../crates/rocm-dash-tui/src/agent/tools.rs):
+
+```bash
+cargo test -p rocm-core terminal::
+cargo test -p rocm --bin rocm shell_quote::
+cargo test -p rocm --bin rocm tool_policy::
+cargo test -p rocm --bin rocm chat::
+cargo test -p rocm --bin rocm dash_seam::
+cargo test -p rocm --bin rocm freeform_planner::tests::provider_planner_refuses
+cargo test -p rocm --bin rocm providers::tests::a_
+cargo test -p rocm --bin rocm tests::an_error
+cargo test -p rocm-dash-tui --lib agent::tools
+```
+
 Log browser smoke:
 
 ```bash
@@ -2884,6 +2958,77 @@ The e2e scenarios `serve-33`/`serve-34`/`serve-35` (`@requires-os:windows`) cove
 same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
+
+Managed-launch startup-death and record-write focused tests:
+
+```bash
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_child_that_exited_during_the_startup_window
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_signalled
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_handed
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_keeps_the_key
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_over_an_unreadable
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_does_not_recreate_a_removed_record
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_stop_settled_while_the_engine_spawns
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_publish_refused_by_a_
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_before_the_spawn
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::the_launch_does_not_own_a_record_a_stop
+cargo test -p rocm --bin rocm service_launch::readiness::tests::a_stop_requested_during_the_wait
+cargo test -p rocm --bin rocm service_launch::readiness::tests::the_advised_stop_frees_the_model
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_keeps_what_changed
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_does_not_recreate
+cargo test -p rocm --bin rocm service_launch::spawn::tests::the_publish_applies
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::the_launch_does_not_publish_over
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_before
+cargo test -p rocm --bin rocm service_launch::spawn::tests::an_engine_that_dies_at_startup_keeps
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_watched_spawn_seen_dead
+cargo test -p rocm --bin rocm service_launch::readiness::tests::an_engine_that_exited_during_the_wait
+cargo test -p rocm-core watched_detached_spawn   # Windows only
+cargo test -p rocm-core observe_early_exit       # Windows only
+```
+
+They pin that an engine seen dead inside the 200 ms startup window fails the
+launch naming its own log, on Windows from the exit code read through the
+process handle `CreateProcessW` returned (not by re-checking a pid Windows may
+already have reused); that cleanup never signals such an engine, since its pid is
+free; and that the launch's writes after its claim — the `running` record, the
+`stopped` mark of a failed launch, the readiness verdict — go to the record as it
+is on disk, so a `rocm services stop` made meanwhile keeps its stop marker and, once
+settled, its `stopped`, and a `rocm services remove` is not undone by re-creating the
+record. A stop counts from the moment it writes its marker, while the record still
+reads live, not only once it has settled: the publish then refuses and the failed
+launch terminates the engine the stop never saw, and a failed launch that spawned
+nothing leaves the claim to the stop instead of deleting it.
+A serve whose server is stopped during its readiness wait fails (non-zero exit) saying
+a stop was requested for it while it was starting, instead of reporting a launch, and while
+that stop is still running it names `rocm services stop <id> --yes` to run before serving
+again, since reuse would otherwise take the service being stopped
+(`the_advised_stop_frees_the_model_a_stop_in_flight_still_holds` runs that stop, confirmed,
+and checks reuse before and after); one whose
+server exited on its own during the wait (a record settled without a stop marker) fails
+saying it exited and naming `rocm logs --service <id>`. Each of those writes reads
+the record and then writes it, with no lock against a stop, so a stop landing
+between the two is still overwritten: the tests pin the narrowed race, not a
+closed one. The publish applies only the launch's own fields (engine and
+supervisor identities, `running`) over the record on disk, and a failed launch's
+cleanup leaves the endpoint key of a record a restart took over, or of one it
+cannot read, which it audits. A publish refused by a stop or a removal, and the
+cleanup terminating the engine it then names, run on the required Windows lane too
+(`a_publish_refused_by_a_*`, with a real child and a tree kill there).
+The `watched_detached_spawn_*` tests, and the one that drives the watch's failed wait
+and failed exit-code read (`observe_early_exit_*`), run on the required Windows lane.
+
+`serve-67` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
+`e2e-test-hooks` build scripts the managed engine's death (the spawned `rocm`
+gets an argument it rejects), and the scenario checks that the serve fails naming
+the engine's own log, that the record left on disk reads `stopped` and names no
+pid, and that serving the same model again reaches the engine launch again. It
+carries no host tag, so every lane built with the hooks runs it, including the
+self-hosted Windows lane; the required `windows-build-and-test` lane builds
+without the hooks and does not. Run it locally with:
+
+```bash
+cargo xtask e2e -- -n "serve-67 "
+```
 
 Serve resolver focused tests:
 
