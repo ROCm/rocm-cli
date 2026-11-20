@@ -1161,6 +1161,17 @@ and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
+On an AMD Strix Halo (gfx1151) under Linux, the lemonade engine also serves the
+models Lemonade assigns to Gufo, its Strix Halo engine, which Lemonade runs from
+a container image with Podman or Docker: for example
+`rocm serve Qwen3.8-27B-Gufo --engine lemonade`. `rocm engines` says whether
+Gufo can run here and lists those models. Before the model or the Gufo image is
+downloaded (Lemonade itself is installed first if it is not yet), the serve asks
+Lemonade whether Gufo can run on this machine, and refuses where it cannot, or
+while the container setup is incomplete, printing the setup steps Lemonade
+reports; it is never run on the CPU instead. See
+[Lemonade's Gufo models](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonades-gufo-models).
+
 Before Lemonade writes a new install, whether from `rocm engines install
 lemonade` or the first `rocm serve` that needs it, it prints the folder it is
 installing into, the download (up to about 4.4 GiB) and disk use (up to about
@@ -1463,7 +1474,8 @@ server-wide sampling defaults for the launched engine. They apply only to
 `vllm` and `lemonade`; other engines reject them. For vLLM they are folded
 into a single `--override-generation-config` JSON object (`--max-tokens` maps
 to vLLM's `max_new_tokens`); for Lemonade they pass straight through as
-llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags. Each control
+llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags, so a Lemonade
+Gufo model, which is not served by llama.cpp, refuses them. Each control
 is optional and independent, so omit any of them to keep the engine's own
 default.
 

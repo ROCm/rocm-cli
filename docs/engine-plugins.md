@@ -30,7 +30,9 @@ from the CLI is not supported while the engine set is limited to the built-ins.
 
 The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
 `llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
-unsupported. rocm-cli does not use a CPU fallback for this path.
+unsupported. rocm-cli does not use a CPU fallback for this path. A model
+Lemonade's own registry assigns to its Gufo recipe is served by Gufo instead;
+see [Lemonade's Gufo models](#lemonades-gufo-models).
 
 ## The stdio protocol contract
 
@@ -120,7 +122,7 @@ first-party adapters do not hold it everywhere yet. Known cases where a child
 process they start can write to the adapter's stdout:
 
 - `aim` runs `docker pull` with inherited stdout when it starts a container.
-- `lemonade` runs its llama.cpp backend install with inherited stdout. When
+- `lemonade` runs its llama.cpp and Gufo backend installs with inherited stdout. When
   it is given no log file, the Lemonade server it starts, the Lemonade CLI it
   runs to pull or load a model, and a packaged `llama-server` it runs directly
   on a GGUF file all inherit stdout too.
@@ -228,6 +230,59 @@ ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT=1 rocm engines install lemonade --ye
 Use it if you have hand-edited `backend_versions.json` to pin a specific
 version, matching that file's own documented use as a first-party
 customization point.
+
+## Lemonade's Gufo models
+
+Gufo is an inference engine with model-specific kernels for AMD Strix Halo
+(gfx1151). Lemonade runs it from a container image, with Podman or Docker, as
+the `gufo` recipe, whose only backend is `rocm`, and its model registry
+(`resources/server_models.json` in the Lemonade runtime) assigns a handful of
+models to that recipe, such as `Qwen3.8-27B-Gufo`. The pinned Lemonade release
+has to include Gufo; it first shipped in Lemonade 2026.46.
+
+`rocm serve <model> --engine lemonade` reads the model's recipe from that
+registry ([recipe.rs](../engines/lemonade/src/recipe.rs)). For a Gufo model,
+before the model or the Gufo image is downloaded, the adapter starts a
+short-lived `lemond` and asks it what it reports for `gufo:rocm` in
+`/api/v1/system-info` ([gufo.rs](../engines/lemonade/src/gufo.rs),
+`resolve_gufo_model`). That happens on the `ResolveModel` round trip, which
+`rocm serve` makes after it has installed Lemonade itself, so a first serve can
+still download Lemonade and its llama.cpp backend before a Gufo refusal. Then:
+
+- `installed` or `update_available`: loads the model.
+- `installable` or `update_required`: pulls the Gufo image
+  (`lemonade backends install gufo:rocm`) when the serve starts, then loads it.
+- `unsupported` (not a Strix Halo GPU, or not Linux): refuses, and says Gufo
+  runs only on Strix Halo.
+- `action_required` (the container setup is incomplete): refuses, and prints
+  the problems and the setup steps Lemonade reports. Lemonade's documentation
+  says a container started under `runc` instead of `crun` cannot open the GPU
+  and runs on the CPU, so this is never a load.
+
+Lemonade answers for the machine, not for one GPU: its `gufo:rocm` support
+entry asks for an AMD GPU of target gfx1151 (`gufo.h` in Lemonade's source), so
+on a Strix Halo with a second AMD GPU it says Gufo can run whichever GPU the
+serve selects. `rocm serve --gpu` reaches `lemond` as `HIP_VISIBLE_DEVICES`;
+Lemonade's Gufo container entry lists only the `/dev/dri` and `/dev/kfd`
+devices, and whether the selection reaches the container has not been checked. A Gufo
+serve also asks Lemonade each time, including a serve that would reuse a running
+Gufo service, because `rocm serve` makes the `ResolveModel` round trip before it
+decides on reuse.
+
+A Gufo load passes Lemonade no llama.cpp backend and no llama-server arguments,
+so a serve of a Gufo model with `--temperature`, `--top-p` or `--max-tokens` is
+refused rather than run with them dropped: on the `ResolveModel` round trip for
+`rocm serve`, and before the backend is selected for a serve started through the
+engine's own `serve-http` entry. A Gufo model is never served by a
+`llama-server` started directly, including after a failed router load. A ready
+Gufo serve writes a line naming Gufo to the serve log (`rocm logs`).
+
+`rocm engines` prints the Gufo status Lemonade last reported (recorded by
+`rocm engines install lemonade`, and refreshed by each Gufo serve, including
+after it pulls the image) and the Gufo
+models in the registry, on a `note:` line reading `Lemonade Gufo backend ...`.
+`rocm model` does not list Gufo models: the catalog it shows has no way to
+offer a model only on the GPU it runs on.
 
 ## Pinned runtime versions
 

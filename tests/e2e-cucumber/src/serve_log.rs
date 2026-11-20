@@ -62,7 +62,7 @@ const MAX_ARCHIVED_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The `log_path:` a `rocm serve --managed` plan reports for the service it
 /// launched, if the output carries one.
-fn parse_log_path(serve_stdout: &str) -> Option<&str> {
+pub fn parse_log_path(serve_stdout: &str) -> Option<&str> {
     serve_stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("log_path:"))

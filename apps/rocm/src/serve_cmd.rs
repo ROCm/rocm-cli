@@ -870,11 +870,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     //
     // The scripted free-space override opens the same waiver: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
-    // reaches past this bail.
+    // reaches past this bail. So does the scripted Lemonade system-info: it stands
+    // in for Lemonade's answer about its Gufo backend, which the engine reads on
+    // the `ResolveModel` round trip that comes after this bail.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && [
             "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
             "ROCM_E2E_LEMONADE_FREE_SPACE_BYTES",
+            "ROCM_E2E_LEMONADE_SYSTEM_INFO",
         ]
         .iter()
         .any(|variable| std::env::var_os(variable).is_some());

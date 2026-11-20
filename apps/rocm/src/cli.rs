@@ -550,7 +550,9 @@ rocm model --verbose"
     /// asked for (`qwen` for a running `qwen3-8b-instruct`) does let engine preparation run
     /// before the refusal.
     /// With an explicit --gpu the index is still validated after the exception, so a
-    /// pinned GPU that is not visible is refused even when a reusable server exists.
+    /// pinned GPU that is not visible is refused even when a reusable server exists. A Lemonade
+    /// Gufo model (Strix Halo only) is refused before download where Lemonade says it cannot
+    /// run here or its container setup is incomplete, and with --temperature/--top-p/--max-tokens.
     ///
     /// When a vLLM server THIS command launched fails to become ready and its engine log
     /// shows an out-of-memory failure, the deployment summary adds a note naming

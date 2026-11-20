@@ -28,6 +28,7 @@ const REQUIRES_DOCKER_TAG: &str = "requires-docker";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_MULTI_GPU_TAG: &str = "requires-multi-gpu";
 const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
+const REQUIRES_GFX_PREFIX: &str = "requires-gfx:";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
@@ -84,6 +85,11 @@ pub struct ScenarioDecl {
     /// not access the GPU. This permits resolver dry-runs on WSL before GPU
     /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
     pub requires_gfx_target: bool,
+    /// `@requires-gfx:<target>`: the scenario's premise is a GPU of one GFX
+    /// target (a glob such as `gfx1151` or `gfx94*`), because the engine it
+    /// drives runs only there (Gufo on Strix Halo). Skipped on a host whose
+    /// detected target does not match, or that has none.
+    pub requires_gfx: Option<String>,
     /// `@requires-no-gpu`: the scenario's premise is a host with NO usable AMD GPU
     /// (e.g. a GPU-required serve must fail fast). Skipped on any host that has a
     /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
@@ -191,6 +197,7 @@ impl ScenarioDecl {
         let mut requires_gpu = false;
         let mut requires_multi_gpu = false;
         let mut requires_gfx_target = false;
+        let mut requires_gfx = None;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
@@ -212,6 +219,8 @@ impl ScenarioDecl {
                 id = Some(rest.to_owned());
             } else if let Some(rest) = tag.strip_prefix(REQUIRES_ENGINE_PREFIX) {
                 requires_engine = Some(rest.to_owned());
+            } else if let Some(rest) = tag.strip_prefix(REQUIRES_GFX_PREFIX) {
+                requires_gfx = Some(rest.to_owned());
             } else if let Some(rest) = tag.strip_prefix(REQUIRES_OS_PREFIX) {
                 requires_os = Some(rest.to_ascii_lowercase());
             } else if let Some(rest) = tag.strip_prefix(SERVE_TIMEOUT_PREFIX) {
@@ -249,6 +258,7 @@ impl ScenarioDecl {
             requires_gpu,
             requires_multi_gpu,
             requires_gfx_target,
+            requires_gfx,
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
@@ -611,6 +621,17 @@ pub fn resolve(
         );
         return Expectation::Skip {
             reason: format!("requires more than one AMD GPU; {detected}"),
+        };
+    }
+    if let Some(wanted) = &decl.requires_gfx
+        && !cap
+            .gfx_target
+            .as_deref()
+            .is_some_and(|target| glob_match(wanted, target))
+    {
+        let detected = cap.gfx_target.as_deref().unwrap_or("none detected");
+        return Expectation::Skip {
+            reason: format!("requires an AMD GPU of GFX target {wanted}; this host has {detected}"),
         };
     }
     if decl.requires_gfx_target && cap.gfx_target.is_none() {
@@ -1073,6 +1094,39 @@ serve_timeout_secs = 90
             resolve(&scenario, &cap("mock"), &matrix, Included::default()),
             Expectation::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn gfx_requirement_runs_only_on_a_matching_target() {
+        let matrix = Expectations::default();
+        let scenario = decl(&["id:lemonade-gufo-strix", "requires-gfx:gfx1151"]);
+        assert_eq!(scenario.requires_gfx.as_deref(), Some("gfx1151"));
+        // Not read as the unrelated `@requires-gfx-target`, nor that as this.
+        assert!(!scenario.requires_gfx_target);
+        assert_eq!(decl(&["id:x", "requires-gfx-target"]).requires_gfx, None);
+        assert_eq!(
+            resolve(
+                &scenario,
+                &cap("strix-ubuntu"),
+                &matrix,
+                Included::default()
+            ),
+            Expectation::ExpectPass
+        );
+        for host in ["mi300x", "mock"] {
+            let Expectation::Skip { reason } =
+                resolve(&scenario, &cap(host), &matrix, Included::default())
+            else {
+                panic!("{host} must skip a gfx1151-only scenario");
+            };
+            assert!(reason.contains("GFX target gfx1151"), "{host}: {reason}");
+        }
+        // A family glob matches as the expectation matrix's do.
+        let family = decl(&["id:x", "requires-gfx:gfx94*"]);
+        assert_eq!(
+            resolve(&family, &cap("mi300x"), &matrix, Included::default()),
+            Expectation::ExpectPass
+        );
     }
 
     #[test]

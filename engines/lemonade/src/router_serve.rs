@@ -21,10 +21,11 @@ use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::ServeHttpRequest;
 use crate::install::LemonadeRuntime;
 use crate::process::{LemonadeProcessEnvironment, LemondChild, LemondExitStatus};
+use crate::recipe::ModelRecipe;
 use crate::runtime_dir::ParentRuntimeEnvironment;
-use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
 
 /// Marks a router model-load or load-verification failure (as opposed to a
 /// server that never became ready, a failed backend selection, or a server that
@@ -49,7 +50,8 @@ pub(crate) trait RouterSteps {
     /// Start `lemond` and return its PID.
     fn spawn_server(&mut self) -> Result<u32>;
     fn wait_ready(&mut self) -> Result<()>;
-    /// Select (and install if needed) the GPU llama.cpp backend; returns its name.
+    /// Select (and install if needed) the GPU backend of the serve's recipe;
+    /// returns its name.
     fn select_backend(&mut self) -> Result<String>;
     fn load_model(&mut self, router_model_ref: &str, backend: &str) -> Result<()>;
     /// Whether the endpoint reports the model loaded on `backend`. `Err` means the
@@ -65,13 +67,15 @@ pub(crate) trait RouterSteps {
     fn wait_server(&mut self) -> Result<LemondExitStatus>;
 }
 
-/// Serve `router_model_ref` through the router. `request.model_ref` keeps the
-/// text the user asked for; every router call uses the normalized name.
+/// Serve `router_model_ref` through the router with `recipe`. `request.model_ref`
+/// keeps the text the user asked for; every router call uses the normalized name.
 pub(crate) fn serve_router<S: RouterSteps>(
     request: &ServeHttpRequest,
     steps: &mut S,
     router_model_ref: &str,
+    recipe: ModelRecipe,
 ) -> Result<()> {
+    let recipe_name = recipe.as_str();
     let server_pid = steps.spawn_server()?;
     // Every step after the spawn is inside this one fallible block, so a failure
     // anywhere in it (state writes included) stops the server, which has no `Drop`
@@ -91,9 +95,12 @@ pub(crate) fn serve_router<S: RouterSteps>(
         steps
             .wait_ready()
             .context("Lemonade server did not become ready")?;
-        let backend = steps
-            .select_backend()
-            .context("failed to select a supported Lemonade llama.cpp backend")?;
+        let backend = steps.select_backend().with_context(|| {
+            format!(
+                "failed to select a supported Lemonade {} backend",
+                recipe.display_name()
+            )
+        })?;
         // A load failure is tagged `RouterLoadFailure`, which is what lets
         // `with_direct_fallback` serve a registered model directly on Linux. The
         // router's own error is kept and returned when no direct route is open.
@@ -101,7 +108,7 @@ pub(crate) fn serve_router<S: RouterSteps>(
             .load_model(router_model_ref, &backend)
             .map_err(|error| {
                 error.context(RouterLoadFailure(format!(
-                    "failed to load {} with Lemonade {LLAMACPP_RECIPE}:{backend}",
+                    "failed to load {} with Lemonade {recipe_name}:{backend}",
                     request.model_ref
                 )))
             })?;
@@ -117,10 +124,10 @@ pub(crate) fn serve_router<S: RouterSteps>(
                 .context("failed to run the Lemonade chat smoke test")?;
         if !verified {
             return Err(anyhow!(
-                "Lemonade load completed but the endpoint did not report a {LLAMACPP_RECIPE}:{backend}-loaded model"
+                "Lemonade load completed but the endpoint did not report a {recipe_name}:{backend}-loaded model"
             )
             .context(RouterLoadFailure(format!(
-                "failed to verify {} with Lemonade {LLAMACPP_RECIPE}:{backend}",
+                "failed to verify {} with Lemonade {recipe_name}:{backend}",
                 request.model_ref
             ))));
         }
@@ -133,19 +140,26 @@ pub(crate) fn serve_router<S: RouterSteps>(
                 "server_start_ticks": steps.server_start_ticks(server_pid),
                 "backend_state": "ready",
                 "backend_requested": backend,
-                "load_response": {
-                    "status": "loaded",
-                    "method": "lemonade-cli",
-                    "model_name": router_model_ref,
-                    "llamacpp_backend": backend
-                },
+                "recipe": recipe_name,
+                "load_response": load_response(router_model_ref, recipe, &backend),
             }),
         )?;
         // Only now is it true that Lemonade is serving on this backend: the load
         // and its verification passed and the `ready` state is written. Announcing
         // earlier would claim it for a load that fails, for a ready write that
         // fails (the server is then stopped), and again on the fallback.
-        crate::device_policy::announce_non_rocm_backend(&backend, request.log_path.as_deref());
+        match recipe {
+            ModelRecipe::Gufo => crate::device_policy::announce(
+                &crate::gufo::serving_notice(router_model_ref),
+                request.log_path.as_deref(),
+            ),
+            ModelRecipe::LlamaCpp => {
+                crate::device_policy::announce_non_rocm_backend(
+                    &backend,
+                    request.log_path.as_deref(),
+                );
+            }
+        }
         Ok(())
     })();
     if let Err(error) = outcome {
@@ -182,10 +196,33 @@ pub(crate) fn serve_router<S: RouterSteps>(
     }
 }
 
+/// What the `ready` state records about the load. A llama.cpp load keeps the
+/// `llamacpp_backend` key it always had; a Gufo load names its recipe and
+/// backend instead, so nothing reads it as a llama.cpp backend.
+fn load_response(router_model_ref: &str, recipe: ModelRecipe, backend: &str) -> serde_json::Value {
+    match recipe {
+        ModelRecipe::LlamaCpp => json!({
+            "status": "loaded",
+            "method": "lemonade-cli",
+            "model_name": router_model_ref,
+            "llamacpp_backend": backend
+        }),
+        ModelRecipe::Gufo => json!({
+            "status": "loaded",
+            "method": "lemonade-cli",
+            "model_name": router_model_ref,
+            "recipe": recipe.as_str(),
+            "backend": backend
+        }),
+    }
+}
+
 /// The real `lemond` and `lemonade` CLI behind [`RouterSteps`].
 pub(crate) struct LemondRouterSteps<'a> {
     pub(crate) runtime: LemonadeRuntime,
     pub(crate) request: &'a ServeHttpRequest,
+    /// The recipe Lemonade's registry assigns the model.
+    pub(crate) recipe: ModelRecipe,
     pub(crate) process_env: &'a LemonadeProcessEnvironment,
     pub(crate) log_path: Option<&'a Path>,
     /// The environment the child processes inherit from; tests confine it.
@@ -226,6 +263,25 @@ impl RouterSteps for LemondRouterSteps<'_> {
     }
 
     fn select_backend(&mut self) -> Result<String> {
+        if self.recipe == ModelRecipe::Gufo {
+            // `rocm serve` refuses these on its `ResolveModel` round trip, but the
+            // engine's own `serve-http` entry (`CommandKind::ServeHttp` in `lib.rs`)
+            // takes the recipe as `--engine-recipe-json` and makes no such trip, so
+            // a serve started that way must not have them dropped either. Refused
+            // here rather than at load so the Gufo image is not pulled first.
+            crate::gufo::refuse_llama_server_flags(
+                &self.request.model_ref,
+                self.request.engine_recipe.as_ref(),
+                crate::gufo::REFUSED_BEFORE_BACKEND,
+            )?;
+            return crate::gufo::ensure_backend(
+                &self.runtime.manifest,
+                &self.request.host,
+                self.request.port,
+                self.process_env,
+                &self.parent,
+            );
+        }
         crate::llamacpp_backend::ensure_best_llamacpp_backend_with_parent(
             &mut self.runtime.manifest,
             &self.request.host,
@@ -242,6 +298,7 @@ impl RouterSteps for LemondRouterSteps<'_> {
             &self.request.host,
             self.request.port,
             router_model_ref,
+            self.recipe,
             backend,
             self.request.engine_recipe.as_ref(),
             self.log_path,
@@ -254,6 +311,7 @@ impl RouterSteps for LemondRouterSteps<'_> {
         crate::process::query_loaded_model_endpoint(
             &crate::state::endpoint_url(&self.request.host, self.request.port),
             router_model_ref,
+            self.recipe,
             backend,
         )
     }
@@ -327,6 +385,9 @@ mod tests {
         state_path: PathBuf,
         /// The state file as it stood when the load step ran.
         state_at_load: Option<serde_json::Value>,
+        /// What backend selection returns: `vulkan`, a llama.cpp backend, unless a
+        /// test serves a Gufo model, whose only backend is `rocm`.
+        backend: &'static str,
     }
 
     impl FakeSteps {
@@ -339,7 +400,7 @@ mod tests {
                         runtime_dir: dir.join("runtime"),
                         lemond: dir.join("lemond"),
                         lemonade: dir.join("lemonade"),
-                        backend_recipe: LLAMACPP_RECIPE.to_owned(),
+                        backend_recipe: crate::LLAMACPP_RECIPE.to_owned(),
                         backend_name: "vulkan".to_owned(),
                         installed_at_unix_ms: 0,
                     },
@@ -348,6 +409,7 @@ mod tests {
                 calls: Vec::new(),
                 state_path: dir.join("state.json"),
                 state_at_load: None,
+                backend: "vulkan",
             }
         }
     }
@@ -372,7 +434,7 @@ mod tests {
             if self.fail == Fail::Backend {
                 anyhow::bail!("no backend");
             }
-            Ok("vulkan".to_owned())
+            Ok(self.backend.to_owned())
         }
         fn load_model(&mut self, router_model_ref: &str, backend: &str) -> Result<()> {
             self.calls
@@ -445,7 +507,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let request = request(temporary.path());
         let mut steps = FakeSteps::new(temporary.path(), Fail::None);
-        serve_router(&request, &mut steps, ROUTER_NAME).unwrap();
+        serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap();
 
         // The state written before the load: requested text kept, router name served.
         let at_load = steps.state_at_load.expect("state exists before load");
@@ -462,11 +524,74 @@ mod tests {
     }
 
     #[test]
+    fn a_gufo_serve_records_its_recipe_and_no_llamacpp_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut request = request(temporary.path());
+        let log = temporary.path().join("serve.log");
+        request.log_path = Some(log.clone());
+        let mut steps = FakeSteps::new(temporary.path(), Fail::None);
+        steps.backend = crate::gufo::GUFO_BACKEND;
+        serve_router(&request, &mut steps, "Qwen3.8-27B-Gufo", ModelRecipe::Gufo).unwrap();
+        // The user reads which engine serves the model in the serve log, the
+        // one place a managed serve's output goes.
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&crate::gufo::serving_notice("Qwen3.8-27B-Gufo")),
+        );
+        let state = crate::state::read_service_state(&request.state_path).unwrap();
+        assert_eq!(state["recipe"], "gufo");
+        assert_eq!(state["load_response"]["recipe"], "gufo");
+        assert_eq!(state["load_response"]["model_name"], "Qwen3.8-27B-Gufo");
+        assert!(
+            state["load_response"].get("llamacpp_backend").is_none(),
+            "{state}"
+        );
+        // A llama.cpp serve keeps the key it has always recorded.
+        let llamacpp = tempfile::tempdir().unwrap();
+        let request = self::request(llamacpp.path());
+        let mut steps = FakeSteps::new(llamacpp.path(), Fail::None);
+        serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap();
+        let state = crate::state::read_service_state(&request.state_path).unwrap();
+        assert_eq!(state["recipe"], "llamacpp");
+        assert_eq!(state["load_response"]["llamacpp_backend"], "vulkan");
+    }
+
+    #[test]
+    fn a_gufo_load_failure_names_the_gufo_recipe() {
+        let temporary = tempfile::tempdir().unwrap();
+        let request = request(temporary.path());
+        let mut steps = FakeSteps::new(temporary.path(), Fail::Load);
+        steps.backend = crate::gufo::GUFO_BACKEND;
+        let error =
+            serve_router(&request, &mut steps, "Qwen3.8-27B-Gufo", ModelRecipe::Gufo).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("with Lemonade gufo:rocm"),
+            "{error:#}"
+        );
+        let mut steps = FakeSteps::new(temporary.path(), Fail::Loaded);
+        steps.backend = crate::gufo::GUFO_BACKEND;
+        let error =
+            serve_router(&request, &mut steps, "Qwen3.8-27B-Gufo", ModelRecipe::Gufo).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not report a gufo:rocm-loaded model"),
+            "{error:#}"
+        );
+        let mut steps = FakeSteps::new(temporary.path(), Fail::Backend);
+        let error =
+            serve_router(&request, &mut steps, "Qwen3.8-27B-Gufo", ModelRecipe::Gufo).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to select a supported Lemonade Gufo backend"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn router_name_not_alias_reaches_load_loaded_and_smoke_checks() {
         let temporary = tempfile::tempdir().unwrap();
         let request = request(temporary.path());
         let mut steps = FakeSteps::new(temporary.path(), Fail::None);
-        serve_router(&request, &mut steps, ROUTER_NAME).unwrap();
+        serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap();
         assert_eq!(
             steps.calls,
             [
@@ -505,7 +630,7 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             let request = request(temporary.path());
             let mut steps = FakeSteps::new(temporary.path(), fail);
-            let error = serve_router(&request, &mut steps, ROUTER_NAME)
+            let error = serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp)
                 .expect_err(expected)
                 .to_string();
             assert!(error.contains(expected), "{error}");
@@ -554,7 +679,8 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             let request = request(temporary.path());
             let mut steps = FakeSteps::new(temporary.path(), fail);
-            let error = serve_router(&request, &mut steps, ROUTER_NAME).expect_err(probe);
+            let error = serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp)
+                .expect_err(probe);
             assert!(!is_router_load_failure(&error), "{error:#}");
             assert!(format!("{error:#}").contains(probe), "{error:#}");
             assert_eq!(
@@ -575,7 +701,8 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             let request = request(temporary.path());
             let mut steps = FakeSteps::new(temporary.path(), fail);
-            let error = serve_router(&request, &mut steps, ROUTER_NAME).unwrap_err();
+            let error =
+                serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap_err();
             assert!(is_router_load_failure(&error), "{error:#}");
         }
     }
@@ -590,7 +717,8 @@ mod tests {
             std::fs::create_dir(&request.state_path).unwrap();
         }
         let mut steps = FakeSteps::new(temporary.path(), fail);
-        let failure = serve_router(&request, &mut steps, ROUTER_NAME).expect_err(expected);
+        let failure = serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp)
+            .expect_err(expected);
         let error = format!("{failure:#}");
         assert!(error.contains(expected), "{error}");
         // The spawned server is stopped exactly once, and nothing runs after it.
@@ -654,7 +782,7 @@ mod tests {
         let mut request = request(temporary.path());
         request.log_path = Some(temporary.path().join("serve.log"));
         let mut steps = FakeSteps::new(temporary.path(), Fail::ReadyMerge);
-        serve_router(&request, &mut steps, ROUTER_NAME).unwrap_err();
+        serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap_err();
         assert_eq!(steps.calls.last().map(String::as_str), Some("stop"));
         let log = std::fs::read_to_string(request.log_path.as_ref().unwrap()).unwrap_or_default();
         assert!(!log.contains("not ROCm"), "{log}");
@@ -684,7 +812,8 @@ mod tests {
                 std::fs::create_dir(&request.state_path).unwrap();
             }
             let mut steps = FakeSteps::new(temporary.path(), fail);
-            let error = serve_router(&request, &mut steps, ROUTER_NAME).unwrap_err();
+            let error =
+                serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap_err();
             assert_eq!(is_router_load_failure(&error), eligible, "{error:#}");
             // The server was stopped, except when it had already exited by itself.
             assert_eq!(
@@ -702,7 +831,7 @@ mod tests {
         let mut request = request(temporary.path());
         request.log_path = Some(temporary.path().join("serve.log"));
         let mut steps = FakeSteps::new(temporary.path(), Fail::None);
-        serve_router(&request, &mut steps, ROUTER_NAME).unwrap();
+        serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap();
         let state = crate::state::read_service_state(&request.state_path).unwrap();
         let backend = state["backend_requested"].as_str().unwrap();
         assert_eq!(backend, "vulkan");
@@ -733,7 +862,7 @@ mod tests {
             let mut request = request(temporary.path());
             request.log_path = Some(temporary.path().join("serve.log"));
             let mut steps = FakeSteps::new(temporary.path(), fail);
-            serve_router(&request, &mut steps, ROUTER_NAME).unwrap_err();
+            serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap_err();
             let log =
                 std::fs::read_to_string(request.log_path.as_ref().unwrap()).unwrap_or_default();
             assert!(!log.contains("not ROCm"), "{log}");
@@ -745,7 +874,8 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let request = request(temporary.path());
         let mut steps = FakeSteps::new(temporary.path(), Fail::FailedExit);
-        let error = serve_router(&request, &mut steps, ROUTER_NAME).unwrap_err();
+        let error =
+            serve_router(&request, &mut steps, ROUTER_NAME, ModelRecipe::LlamaCpp).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -770,6 +900,7 @@ mod tests {
                 manifest: crate::test_http::fake_runtime::manifest(dir, 0, None),
             },
             request: &request,
+            recipe: ModelRecipe::LlamaCpp,
             process_env: &env,
             log_path: None,
             parent: ParentRuntimeEnvironment::rooted_at(dir),
@@ -792,6 +923,159 @@ mod tests {
             "stop_server must terminate and reap the spawned lemond"
         );
         assert!(steps.child.is_none());
+    }
+
+    /// Real router steps given llama-server flags: a Gufo serve refuses them at
+    /// backend selection, before it asks Lemonade anything or pulls the image,
+    /// on a serve that never made the `ResolveModel` round trip that refuses them
+    /// first; a llama.cpp serve takes them, and passes them to `lemonade load`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_router_steps_refuse_llama_server_flags_for_gufo_and_pass_them_for_llamacpp() {
+        let flags = rocm_engine_protocol::EngineRecipeHint {
+            required_flags: vec!["--temperature".to_owned(), "0.5".to_owned()],
+            ..rocm_engine_protocol::EngineRecipeHint::default()
+        };
+        let env = LemonadeProcessEnvironment::default();
+
+        // Gufo: refused, and the fake `lemonade` never ran. Nothing listens on
+        // the port, so reaching Lemonade at all would fail with another error.
+        let gufo = tempfile::tempdir().unwrap();
+        let mut request = request(gufo.path());
+        request.model_ref = "Qwen3.8-27B-Gufo".to_owned();
+        request.port = crate::state::free_local_port().unwrap();
+        request.engine_recipe = Some(flags.clone());
+        let mut steps = LemondRouterSteps {
+            runtime: LemonadeRuntime {
+                manifest: crate::test_http::fake_runtime::manifest(gufo.path(), 0, None),
+            },
+            request: &request,
+            recipe: ModelRecipe::Gufo,
+            process_env: &env,
+            log_path: None,
+            parent: ParentRuntimeEnvironment::rooted_at(gufo.path()),
+            child: None,
+        };
+        let error = steps.select_backend().unwrap_err().to_string();
+        assert!(error.contains("(--temperature 0.5)"), "{error}");
+        // What the message claims, checked against the calls: nothing was
+        // installed or loaded. It does not say nothing started, which would be
+        // false this late: the server is up.
+        assert!(
+            error.contains("the Gufo image was not pulled and the model was not loaded"),
+            "{error}"
+        );
+        assert!(!error.contains("nothing was started"), "{error}");
+        assert!(crate::test_http::fake_runtime::calls(gufo.path()).is_empty());
+
+        // llama.cpp: the same flags reach the load as llama-server arguments.
+        let llamacpp = tempfile::tempdir().unwrap();
+        let mut request = self::request(llamacpp.path());
+        request.engine_recipe = Some(flags);
+        let mut steps = LemondRouterSteps {
+            runtime: LemonadeRuntime {
+                manifest: crate::test_http::fake_runtime::manifest(llamacpp.path(), 0, None),
+            },
+            request: &request,
+            recipe: ModelRecipe::LlamaCpp,
+            process_env: &env,
+            log_path: None,
+            parent: ParentRuntimeEnvironment::rooted_at(llamacpp.path()),
+            child: None,
+        };
+        // Backend selection asks `lemonade backends`, which the fake answers
+        // with nothing; the point is that it is asked, not refused for flags.
+        let selection = steps.select_backend().unwrap_err().to_string();
+        assert!(!selection.contains("Gufo"), "{selection}");
+        steps.load_model(ROUTER_NAME, "vulkan").unwrap();
+        let calls = crate::test_http::fake_runtime::calls(llamacpp.path());
+        assert!(
+            calls.iter().any(|call| call.ends_with(&format!(
+                "load {ROUTER_NAME} --llamacpp vulkan --save-options --llamacpp-args --temperature 0.5"
+            ))),
+            "{calls:?}"
+        );
+    }
+
+    /// The real router steps for a Gufo model: an installed backend is used as it
+    /// is, an installable one has its image installed through `lemonade backends
+    /// install gufo:rocm`, and either way what Lemonade reports last is recorded
+    /// for `rocm engines`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_gufo_backend_selection_installs_only_when_lemonade_says_so() {
+        use crate::test_http::{Reply, spawn_fixture};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (states, installs, recorded) in [
+            (&["installed"][..], false, "installed"),
+            (&["installable", "installed"][..], true, "installed"),
+            // Lemonade's answer after the install is what is recorded, even where
+            // it is not plain `installed`.
+            (
+                &["installable", "update_available"][..],
+                true,
+                "update_available",
+            ),
+            // Lemonade stops answering after the install: what it installed is
+            // still recorded as installed, not as still to be pulled.
+            (&["installable"][..], true, "installed"),
+        ] {
+            let answered = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&answered);
+            let states: Vec<&'static str> = states.to_vec();
+            let total = states.len();
+            let (port, server) = spawn_fixture(Duration::from_secs(5), move |recorded| {
+                assert_eq!(recorded.path, "/api/v1/system-info");
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                Reply {
+                    status: 200,
+                    body: serde_json::json!({"recipes": {"gufo": {"backends": {"rocm": {
+                        "state": states[index.min(total - 1)]
+                    }}}}})
+                    .to_string(),
+                    last: index + 1 == total,
+                }
+            });
+            let temporary = tempfile::tempdir().unwrap();
+            let dir = temporary.path();
+            let mut request = request(dir);
+            request.port = port;
+            let env = LemonadeProcessEnvironment::default();
+            let mut steps = LemondRouterSteps {
+                runtime: LemonadeRuntime {
+                    manifest: crate::test_http::fake_runtime::manifest(dir, 0, None),
+                },
+                request: &request,
+                recipe: ModelRecipe::Gufo,
+                process_env: &env,
+                log_path: None,
+                parent: ParentRuntimeEnvironment::rooted_at(dir),
+                child: None,
+            };
+            // A real install has extracted its runtime here.
+            std::fs::create_dir_all(&steps.runtime.manifest.runtime_dir).unwrap();
+            assert_eq!(steps.select_backend().unwrap(), "rocm");
+            server.join().unwrap();
+            let calls = crate::test_http::fake_runtime::calls(dir);
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|call| call.ends_with("backends install gufo:rocm")),
+                installs,
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|call| call.contains("llamacpp")),
+                "{calls:?}"
+            );
+            assert_eq!(
+                crate::gufo::recorded_status(&steps.runtime.manifest.runtime_dir)
+                    .map(|status| status.state),
+                Some(recorded.to_owned()),
+                "`rocm engines` must show what Lemonade last said after the install"
+            );
+        }
     }
 
     /// A `lemond` that ignores SIGTERM, with a backend child that ignores it
@@ -820,6 +1104,7 @@ mod tests {
         let mut steps = LemondRouterSteps {
             runtime: LemonadeRuntime { manifest },
             request: &request,
+            recipe: ModelRecipe::LlamaCpp,
             process_env: &env,
             log_path: None,
             parent: ParentRuntimeEnvironment::rooted_at(dir),
@@ -908,6 +1193,7 @@ llamacpp  vulkan  installed  ok  none
         let mut steps = LemondRouterSteps {
             runtime: LemonadeRuntime { manifest },
             request: &request,
+            recipe: ModelRecipe::LlamaCpp,
             process_env: &env,
             log_path: None,
             parent: ParentRuntimeEnvironment::rooted_at(dir),
@@ -953,6 +1239,7 @@ llamacpp  vulkan  installed  ok  none
                 manifest: fake_runtime::manifest(dir, 0, None),
             },
             request: &request,
+            recipe: ModelRecipe::LlamaCpp,
             process_env: &env,
             log_path: None,
             parent: ParentRuntimeEnvironment::rooted_at(dir),

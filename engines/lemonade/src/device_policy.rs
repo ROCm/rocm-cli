@@ -161,8 +161,15 @@ pub(crate) fn non_rocm_backend_notice(backend: &str) -> Option<String> {
 /// managed serve runs with its stdout and stderr discarded and the log is the only
 /// place the user can read it. Returns the notice, or `None` for a ROCm backend.
 pub(crate) fn announce_non_rocm_backend(backend: &str, log_path: Option<&Path>) -> Option<String> {
-    use std::io::Write as _;
     let notice = non_rocm_backend_notice(backend)?;
+    announce(&notice, log_path);
+    Some(notice)
+}
+
+/// Print `notice` and append it to the serve log; see [`announce_non_rocm_backend`]
+/// for why both.
+pub(crate) fn announce(notice: &str, log_path: Option<&Path>) {
+    use std::io::Write as _;
     eprintln!("{notice}");
     if let Some(log_path) = log_path
         && let Some(mut log) = std::fs::OpenOptions::new()
@@ -173,7 +180,6 @@ pub(crate) fn announce_non_rocm_backend(backend: &str, log_path: Option<&Path>) 
     {
         let _ = writeln!(log, "{notice}");
     }
-    Some(notice)
 }
 
 /// The first pinned GPU ordinal recorded in service state, if any.
