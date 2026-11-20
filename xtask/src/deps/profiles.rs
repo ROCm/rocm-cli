@@ -238,21 +238,25 @@ pub(crate) fn normalize_name(name: &str) -> String {
 }
 
 /// The subset of PEP 508 a profile may use: `name[extras]==version`, where the
-/// version may end in `.*`.
+/// version may end in `.*` or carry an exact local tag (`==2.13.0+rocm10.1.0`),
+/// never both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Requirement {
     /// Normalised name.
     pub(crate) name: String,
+    /// The public version, without `.*` or the local tag.
     pub(crate) version: String,
     /// `true` for `==X.Y.*`.
     pub(crate) prefix: bool,
+    /// The local tag of `==X.Y.Z+tag`, lowercased as PEP 440 normalises it.
+    pub(crate) local: Option<String>,
 }
 
 impl Requirement {
     pub(crate) fn parse(text: &str) -> Result<Self> {
-        let (head, version) = text
-            .split_once("==")
-            .context("only `name==version` and `name==version.*` are supported")?;
+        let (head, version) = text.split_once("==").context(
+            "only `name==version`, `name==version.*` and `name==version+local` are supported",
+        )?;
         // `name` or `name[extra,...]`, with nothing after the closing `]`.
         let name = match head.trim().split_once('[') {
             None => head.trim(),
@@ -290,13 +294,33 @@ impl Requirement {
             "malformed package name {name:?}"
         );
         ensure!(
-            !version.is_empty() && !version.contains([';', ',', ' ', '<', '>', '!', '~', '=', '+']),
-            "malformed version {version:?}: no markers, ranges or local versions"
+            !version.is_empty() && !version.contains([';', ',', ' ', '<', '>', '!', '~', '=']),
+            "malformed version {version:?}: no markers or ranges"
         );
+        // A local tag pins one build exactly; PEP 440 allows it only with `==`
+        // and no `.*`, so `==2.13.*+rocm10.1.0` is refused below.
+        let (version, local) = match version.split_once('+') {
+            None => (version, None),
+            Some((public, local)) => {
+                ensure!(
+                    !local.is_empty()
+                        && local.split('.').all(|segment| {
+                            !segment.is_empty()
+                                && segment.chars().all(|c| c.is_ascii_alphanumeric())
+                        }),
+                    "malformed local version {local:?}: dot-separated letters and digits only"
+                );
+                (public, Some(local.to_ascii_lowercase()))
+            }
+        };
         let (version, prefix) = match version.strip_suffix(".*") {
             Some(stem) => (stem, true),
             None => (version, false),
         };
+        ensure!(
+            !(prefix && local.is_some()),
+            "a local version pins one build, so it cannot follow `.*`"
+        );
         ensure!(
             !version.contains('*'),
             "`*` is only allowed as a trailing `.*`"
@@ -317,13 +341,32 @@ impl Requirement {
             name: normalize_name(name),
             version: version.to_owned(),
             prefix,
+            local,
         })
     }
 
-    /// Whether a locked version satisfies this requirement. The local segment
-    /// (`+rocm10.1.0`) is ignored, as PEP 440 does for a specifier without one.
+    /// The specifier as a profile writes it, after the name: `==2.13.*`,
+    /// `==2.11.0.2` or `==2.13.0+rocm10.1.0`.
+    pub(crate) fn specifier(&self) -> String {
+        match (&self.local, self.prefix) {
+            (Some(local), _) => format!("=={}+{local}", self.version),
+            (None, true) => format!("=={}.*", self.version),
+            (None, false) => format!("=={}", self.version),
+        }
+    }
+
+    /// Whether a locked version satisfies this requirement. Without a local
+    /// tag in the requirement, the locked version's local segment
+    /// (`+rocm10.1.0`) is ignored, as PEP 440 does; with one, it must be that
+    /// tag exactly (compared case-insensitively, as PEP 440 normalises it).
     pub(crate) fn matches(&self, locked: &str) -> bool {
-        let public = locked.split_once('+').map_or(locked, |(public, _)| public);
+        let (public, locked_local) = locked
+            .split_once('+')
+            .map_or((locked, None), |(public, local)| (public, Some(local)));
+        if let Some(local) = &self.local {
+            return public == self.version
+                && locked_local.is_some_and(|tag| tag.eq_ignore_ascii_case(local));
+        }
         if !self.prefix {
             return public == self.version;
         }
@@ -398,21 +441,28 @@ windows = "x86_64-pc-windows-msvc"
             let open = rest.find('"').unwrap() + 1;
             rest[open..open + rest[open..].find('"').unwrap()].to_owned()
         };
-        let requirement = |package: &str| -> String {
-            profile
+        // The profile's pin, as the adapter would write it. A build pinned with
+        // a local tag stands for the adapter's series when the adapter's own
+        // specifier admits its public version, so a patch inside the series
+        // may differ; the tag's ROCm line is `deps check`'s to verify.
+        let requirement = |package: &str, adapter: &str| -> String {
+            let parsed = profile
                 .requirements
                 .iter()
-                .find_map(|r| {
-                    let parsed = Requirement::parse(r).unwrap();
-                    (parsed.name == package).then(|| {
-                        format!(
-                            "{}{}",
-                            parsed.version,
-                            if parsed.prefix { ".*" } else { "" }
-                        )
-                    })
-                })
-                .unwrap_or_else(|| panic!("vllm-rocm10-1 does not require {package}"))
+                .map(|r| Requirement::parse(r).unwrap())
+                .find(|parsed| parsed.name == package)
+                .unwrap_or_else(|| panic!("vllm-rocm10-1 does not require {package}"));
+            match &parsed.local {
+                Some(local) => {
+                    let series = Requirement::parse(&format!("{package}=={adapter}")).unwrap();
+                    if series.matches(&parsed.version) {
+                        adapter.to_owned()
+                    } else {
+                        format!("{}+{local}", parsed.version)
+                    }
+                }
+                None => parsed.specifier()["==".len()..].to_owned(),
+            }
         };
         for (package, adapter) in [
             ("vllm", format!("{}.*", field("vllm_version_prefix"))),
@@ -432,7 +482,7 @@ windows = "x86_64-pc-windows-msvc"
             ("torchaudio", field("torchaudio_version")),
         ] {
             assert_eq!(
-                requirement(package),
+                requirement(package, &adapter),
                 adapter,
                 "{package}: runtimes/profiles.toml and the vLLM adapter's {rocm} row disagree"
             );
@@ -476,7 +526,7 @@ windows = "x86_64-pc-windows-msvc"
         for bad in [
             "torch>=2.13",
             "torch==2.13; sys_platform == 'linux'",
-            "torch==2.13+rocm10.1.0",
+            "torch>=2.13+rocm10.1.0",
             "torch",
             "torch==2.*.1",
             "torch==2.13,!=2.13.1",
@@ -519,6 +569,48 @@ windows = "x86_64-pc-windows-msvc"
         for good in ["torch==2.13.*", "rocm[libraries,device-gfx1100]==10.1.0"] {
             assert!(Requirement::parse(good).is_ok(), "{good}");
         }
+    }
+
+    /// An exact pin may name a local tag; a range, a wildcard or a malformed
+    /// tag may not, since none of them pins one build.
+    #[test]
+    fn a_local_version_is_accepted_only_on_an_exact_pin() {
+        let pinned = Requirement::parse("torch[device-gfx1100]==2.13.0+ROCm10.1.0").unwrap();
+        assert_eq!(pinned.name, "torch");
+        assert_eq!(pinned.version, "2.13.0");
+        assert_eq!(pinned.local.as_deref(), Some("rocm10.1.0"));
+        assert!(!pinned.prefix);
+        assert_eq!(pinned.specifier(), "==2.13.0+rocm10.1.0");
+        for bad in [
+            "torch==2.13.*+rocm10.1.0",
+            "torch==2.13+rocm10.*",
+            "torch>=2.13+rocm10.1.0",
+            "torch~=2.13+rocm10.1.0",
+            "torch==2.13+",
+            "torch==2.13+rocm..1",
+            "torch==2.13+.rocm",
+            "torch==2.13+rocm.",
+            "torch==2.13+rocm-10",
+            "torch==2.13+rocm_10",
+            "torch==2.13+rocm10+1",
+            "torch==+rocm10.1.0",
+            "torch==2.13+rocm10.1.0\n--pre",
+        ] {
+            assert!(Requirement::parse(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    /// A pinned local tag admits that build only: the same public version
+    /// built for another ROCm line, or without a tag, does not satisfy it.
+    #[test]
+    fn an_exact_local_version_matches_only_that_build() {
+        let pinned = Requirement::parse("torchaudio==2.11.0.2+rocm10.1.0").unwrap();
+        assert!(pinned.matches("2.11.0.2+rocm10.1.0"));
+        assert!(pinned.matches("2.11.0.2+ROCM10.1.0"));
+        assert!(!pinned.matches("2.11.0.2+rocm10.2.0"));
+        assert!(!pinned.matches("2.11.0.2"));
+        assert!(!pinned.matches("2.11.0.3+rocm10.1.0"));
+        assert!(!pinned.matches("2.11.0.2+rocm10.1.0.1"));
     }
 
     #[test]

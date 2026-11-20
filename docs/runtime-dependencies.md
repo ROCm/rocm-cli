@@ -71,7 +71,11 @@ machine; `cargo xtask deps check` does not.
 To bump one binary by hand, edit its version in `mise.toml` and run `lock`
 (for Lemonade, also re-read `LINUX_LEMOND_NEEDS`, above).
 To change a Python stack, edit its requirements in `profiles.toml` and run
-`lock`. Commit everything under `runtimes/` together.
+`lock`. A requirement is `name==version`, `name==version.*`, or
+`name==version+local`, which pins one build: torch, torchvision and
+torchaudio carry `+rocm10.1.0`, because AMD's indexes serve the same version
+built for several ROCm lines and a requirement without the tag admits any of
+them. Commit everything under `runtimes/` together.
 
 ## Two locks, two tools
 
@@ -223,7 +227,7 @@ an `--exclude-newer` cutoff and records it in its header
 each lock again at the cutoff it records, so it reproduces the lock unless an
 input changed or AMD published a new build of an AMD-only package (those are
 exempt from the cutoff, below, and several are pinned as ranges such as
-`torch==2.13.*`), and a lock that does not exist yet gets a cutoff 7 days
+`vllm==0.29.*`), and a lock that does not exist yet gets a cutoff 7 days
 before now. A resolution that differs from the committed lock only in its
 cutoff keeps the committed file unchanged, so a weekly update with nothing
 new proposes nothing. The previous lock is not handed to uv as version preferences: with these
@@ -268,8 +272,9 @@ off, the update commits to `runtime-deps/update` and then fails at
 `gh pr create`; open the pull request from that branch by hand, or turn the
 setting on.
 
-The update keeps each Python requirement within its range (`torch==2.13.*`
-moves to a newer 2.13 build, not to 2.14). Widening a range — a new torch
+The update keeps each Python requirement within its range (`vllm==0.29.*`
+moves to a newer 0.29 build, not to 0.30), and a requirement pinned to one
+build (`torch==2.13.0+rocm10.1.0`) does not move. Widening a range — a new torch
 minor, a new ROCm line — is a reviewed edit to `profiles.toml`, as a major
 version bump is under Dependabot.
 

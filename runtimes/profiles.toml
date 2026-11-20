@@ -6,9 +6,13 @@
 # binaries are pinned in `mise.toml`, not here. See
 # docs/runtime-dependencies.md.
 #
-# Each requirement is `name[extras]==version` or `name[extras]==version.*`:
-# deliberately narrow, so `deps check` can decide on its own whether a lock
-# still satisfies its profile.
+# Each requirement is `name[extras]==version`, `name[extras]==version.*`, or
+# `name[extras]==version+local` to pin one build exactly: deliberately narrow,
+# so `deps check` can decide on its own whether a lock still satisfies its
+# profile. A local tag is how a profile makes uv pick the build for its ROCm
+# line: AMD's indexes serve one version built for several lines
+# (`+rocm10.1.0`, `+rocm10.2.0`), and a requirement without the tag admits
+# all of them, leaving `deps check` to reject the wrong one after the fact.
 
 [policy]
 uv-config = "runtimes/uv.toml"
@@ -50,11 +54,11 @@ requirements = [
   # gfx942, gfx950 or gfx1250 rows); an installer takes the core plus its own
   # arch's rows.
   "rocm[libraries,device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==10.1.0",
-  "torch[device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==2.13.*",
-  "torchvision==0.28.*",
+  "torch[device-gfx908,device-gfx90a,device-gfx942,device-gfx950,device-gfx1010,device-gfx1011,device-gfx1012,device-gfx1030,device-gfx1031,device-gfx1032,device-gfx1033,device-gfx1034,device-gfx1035,device-gfx1036,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201,device-gfx1250]==2.13.0+rocm10.1.0",
+  "torchvision==0.28.0+rocm10.1.0",
   # Exact: 2.11.0 is a CPU-only rebuild; 2.11.0.2 is the HIP build confirmed
   # against torch 2.13 (see engines/vllm/src/discover_builds.rs).
-  "torchaudio==2.11.0.2",
+  "torchaudio==2.11.0.2+rocm10.1.0",
 ]
 
 [profile.sdk-rocm10-1.platforms]
@@ -66,11 +70,11 @@ rocm = "10.1.0"
 python = "3.14"
 requirements = [
   "rocm[libraries]==10.1.0",
-  "torch==2.13.*",
+  "torch==2.13.0+rocm10.1.0",
   # Pinned here: left to vLLM's own range, the resolver picks a
   # `+rocm10.0.0` torchvision, which `deps check` rejects.
-  "torchvision==0.28.*",
-  "torchaudio==2.11.0.2",
+  "torchvision==0.28.0+rocm10.1.0",
+  "torchaudio==2.11.0.2+rocm10.1.0",
   "vllm==0.29.*",
   "flash-attn==2.8.*",
   "amd-aiter==0.1.*",

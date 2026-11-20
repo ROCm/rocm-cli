@@ -158,10 +158,9 @@ pub(crate) fn lock_problems(
         match versions.get(&requirement.name) {
             None => out.push(format!("{}: required but not locked", requirement.name)),
             Some(version) if !requirement.matches(version) => out.push(format!(
-                "{}: locked {version}, which does not satisfy =={}{}",
+                "{}: locked {version}, which does not satisfy {}",
                 requirement.name,
-                requirement.version,
-                if requirement.prefix { ".*" } else { "" }
+                requirement.specifier()
             )),
             Some(_) => {}
         }
@@ -776,6 +775,40 @@ linux = "x86_64-manylinux_2_28"
             found
                 .iter()
                 .any(|p| p.contains("does not satisfy ==2.13.*")),
+            "{found:?}"
+        );
+    }
+
+    /// A requirement pinned to one build is not met by the same version built
+    /// for another ROCm line, and the problem names the pin in full.
+    #[test]
+    fn a_build_other_than_the_pinned_local_version_is_reported() {
+        let profiles =
+            Profiles::parse(&PROFILES.replace("torch==2.13.*", "torch==2.13.0+rocm10.1.0"))
+                .unwrap();
+        let found = lock_problems(
+            &profiles,
+            "p",
+            &profiles.profile["p"],
+            "linux",
+            Some(UV),
+            &lock_text("2.13.0+rocm10.2.0", "stable.repo.amd.com"),
+        );
+        assert!(
+            found.iter().any(|p| p
+                == "torch: locked 2.13.0+rocm10.2.0, which does not satisfy ==2.13.0+rocm10.1.0"),
+            "{found:?}"
+        );
+        let found = lock_problems(
+            &profiles,
+            "p",
+            &profiles.profile["p"],
+            "linux",
+            Some(UV),
+            &lock_text("2.13.0+rocm10.1.0", "stable.repo.amd.com"),
+        );
+        assert!(
+            !found.iter().any(|p| p.contains("does not satisfy")),
             "{found:?}"
         );
     }
