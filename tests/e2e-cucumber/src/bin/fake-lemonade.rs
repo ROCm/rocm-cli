@@ -66,28 +66,41 @@ fn main() -> ExitCode {
     }
 }
 
-/// Stay alive for as long as the process that spawned us does.
+/// Stay alive until the engine that spawned us stops us, or is itself gone.
 ///
 /// Exiting while the engine still runs would turn the scenario's expected
-/// backend-install failure into a spurious "server exited" diagnosis. But the
-/// engine does not stop `lemond` when the backend install fails (#729): it
-/// exits and leaves the server running, and only the scenario's teardown
-/// (`stop_managed_services`, best-effort) stops it. So this fake also exits on
-/// its own once its parent is gone -- on Unix, when it has been re-parented --
-/// and in any case after [`LEMOND_MAX_LIFETIME`], so a run whose teardown did
-/// not get that far still leaves no process behind.
+/// backend-install failure into a spurious "server exited" diagnosis. The
+/// engine stops this process itself when the backend install fails:
+/// `serve_router` in `engines/lemonade/src/router_serve.rs` runs backend
+/// selection inside the block whose error calls `stop_server`. The exit rule in
+/// [`lemond_should_exit`] is the backstop for an engine that never gets there
+/// (killed, or crashed): on Unix the fake exits once it has been re-parented,
+/// and on every platform after [`LEMOND_MAX_LIFETIME`], so no process is left
+/// behind.
 fn run_lemond() -> ExitCode {
     #[cfg(unix)]
-    let spawned_by = std::os::unix::process::parent_id();
+    let spawned_by = Some(std::os::unix::process::parent_id());
+    #[cfg(not(unix))]
+    let spawned_by = None;
     let started = std::time::Instant::now();
-    while started.elapsed() < LEMOND_MAX_LIFETIME {
-        std::thread::sleep(Duration::from_millis(500));
+    loop {
         #[cfg(unix)]
-        if std::os::unix::process::parent_id() != spawned_by {
-            break;
+        let parent_now = Some(std::os::unix::process::parent_id());
+        #[cfg(not(unix))]
+        let parent_now = None;
+        if lemond_should_exit(started.elapsed(), spawned_by, parent_now) {
+            return ExitCode::SUCCESS;
         }
+        std::thread::sleep(Duration::from_millis(500));
     }
-    ExitCode::SUCCESS
+}
+
+/// Whether the fake `lemond` should exit: once [`LEMOND_MAX_LIFETIME`] has
+/// passed, or once its parent is no longer the process that spawned it (Unix
+/// re-parenting). A platform that cannot see its parent passes `None` for both
+/// and relies on the cap alone.
+fn lemond_should_exit(elapsed: Duration, spawned_by: Option<u32>, parent_now: Option<u32>) -> bool {
+    elapsed >= LEMOND_MAX_LIFETIME || spawned_by != parent_now
 }
 
 /// Backstop on the fake server's lifetime, for a parent that never exits or a
@@ -152,7 +165,8 @@ fn cli_call(args: &[String]) -> CliCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliCall, cli_call};
+    use super::{CliCall, LEMOND_MAX_LIFETIME, cli_call, lemond_should_exit};
+    use std::time::Duration;
 
     fn call(args: &[&str]) -> CliCall {
         cli_call(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
@@ -178,6 +192,17 @@ mod tests {
             ]),
             CliCall::BackendsInstall
         );
+    }
+
+    #[test]
+    fn the_fake_lemond_exits_when_reparented_or_past_its_cap() {
+        let early = Duration::from_secs(1);
+        assert!(!lemond_should_exit(early, Some(10), Some(10)));
+        assert!(lemond_should_exit(early, Some(10), Some(1)));
+        assert!(lemond_should_exit(LEMOND_MAX_LIFETIME, Some(10), Some(10)));
+        // No parent to watch: only the cap ends it.
+        assert!(!lemond_should_exit(early, None, None));
+        assert!(lemond_should_exit(LEMOND_MAX_LIFETIME, None, None));
     }
 
     #[test]
