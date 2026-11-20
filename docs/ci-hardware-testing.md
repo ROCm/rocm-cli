@@ -857,23 +857,31 @@ as stale is the exception). The nightly report job applies the same check to
 every nightly lane.
 
 No E2E lane in [`nightly.yml`](../.github/workflows/nightly.yml) sets
-`continue-on-error`, on the job or on any step, so a leg that fails turns its
-lane and the whole Nightly run red. (Outside the lanes it is still used: by
-the `release-readiness-narrative` job, by steps of
+`continue-on-error`, on the job or on any step, so a leg that fails fails its
+lane's job and that job's check run reads `failure`. (Outside the lanes it is
+still used: by the `release-readiness-narrative` job, by steps of
 `publish-release-readiness-wiki`, and by the queue-import steps of
-`e2e-report-nightly`, which must never stop the report.) Job-level
+`e2e-report-nightly`, which must never stop the report.) The Nightly run then
+concludes `failure`, unless `cancel-abandoned-e2e-lanes` cancels it because a
+leg was abandoned or `e2e-lanes-settled` failed or was cancelled (see
+[Nightly lanes that never get a runner](#nightly-lanes-that-never-get-a-runner)):
+a cancelled run concludes `cancelled`, which outranks the failure, while the
+failed lane's own check run stays red. A lane killed by its own
+`timeout-minutes` also reads `cancelled` rather than `failure`. Job-level
 `continue-on-error: true` would instead make the failed lane read `success`,
 both in `needs.<lane>.result` and in the run's conclusion, and a step-level one
 would let the failing step pass the job. Nightly gates no merge or tag either
-way. On a red
-night the consolidated report and release-readiness jobs still run, and the E2E
-wiki page is updated only when `e2e-report-nightly` succeeded and
-`publish-e2e-wiki`'s other guards hold; the report job fails, for example, when
-a lane that ran uploaded no report, and then the previous page stays in place.
+way. A failed lane does not fail `e2e-lanes-settled`, which hands each lane's
+result to the report job, so on a red night the consolidated report and
+release-readiness jobs still run. `publish-e2e-wiki` updates the E2E wiki page
+when `e2e-report-nightly` succeeded or failed (it fails, for example, when a
+lane that ran uploaded no report); only a skipped or cancelled report job, or a
+run outside `main` or outside this repository, leaves the previous page in
+place.
 `e2e_lanes_do_not_mask_failures_with_continue_on_error` in
 [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) enforces this with a
 line scan of every self-hosted lane in both workflows that is fail-closed for
-the spellings it reads: outside comments, any line mentioning
+the spellings it reads: outside indented comments, any line mentioning
 `continue-on-error` that is not exactly `continue-on-error: false` (or
 `- continue-on-error: false`) fails the test, even inside a `run:` script, and
 the failure names each such line with its lane. There is no exception list: no

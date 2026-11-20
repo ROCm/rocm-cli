@@ -432,13 +432,10 @@ jobs:
   # BUILD skip above — a regression run is worth doing even with no new commits).
   # Mirrors e2e-selfhosted.yml's e2e-gpu job (minus its PR-only stale-run
   # guard) but sets E2E_INCLUDE_NIGHTLY.
-  # Like every nightly lane, it sets no `continue-on-error`: a failing leg fails
-  # this job and the Nightly run, and `needs` downstream reads `failure`. The
-  # report and release-readiness jobs below still run on such a night. The E2E
-  # wiki page is updated only when e2e-report-nightly succeeded (it fails, for
-  # example, when a lane that ran uploaded no report) and the other guards in
-  # publish-e2e-wiki's `if:` hold; otherwise the previous page stays in place.
-  # Nightly gates no merge or tag, so a red run blocks nothing; it only reports.
+  # Like every nightly lane, it sets no `continue-on-error`, so a failing leg
+  # fails this job. What that does to the run's conclusion, and why the lanes
+  # must stay unmasked, is in docs/ci-hardware-testing.md under "Blocking vs.
+  # non-blocking".
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
@@ -1454,9 +1451,10 @@ jobs:
     needs:
       - e2e-lanes-settled
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
-    # filter to consult on a schedule, and a failed lane fails its job, which
-    # would skip a job with the default `success()` condition. A nightly that
-    # broke is precisely when the grid is worth reading.
+    # filter to consult on a schedule. A failed lane does not fail
+    # e2e-lanes-settled, but the settle job itself can fail or be cancelled
+    # (an unreadable job list, its own timeout), and the default `success()`
+    # condition would then skip the report on the night it is worth reading.
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

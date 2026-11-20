@@ -6676,15 +6676,19 @@ fi
     ///
     /// A job-level `continue-on-error: true` does more than keep the run going:
     /// a failed leg then reads `success` in `needs.<lane>.result` downstream and
-    /// in the run's conclusion, so a broken lane is indistinguishable from a
-    /// passing one everywhere but its own log. A step-level one lets the
-    /// failing step pass the job. The lanes run in separate jobs with
-    /// `fail-fast: false`, so an unmasked failure does not cancel a sibling
-    /// lane. Both consolidated report jobs are pinned to run on `always()`, so
-    /// a failed lane does not skip them: nightly's `e2e-report-nightly` by
-    /// `e2e_lanes_do_not_mask_failures_with_continue_on_error`, and
-    /// e2e-selfhosted's `e2e-report` by
-    /// `closing_a_pr_supersedes_its_self_hosted_runs`.
+    /// in the run's conclusion, although the lane's own check run still reads
+    /// `failure`. A step-level one lets the failing step pass the job. The
+    /// lanes run in separate jobs with `fail-fast: false`, so an unmasked
+    /// failure does not cancel a sibling lane. Neither consolidated report job
+    /// can be skipped by a failed lane. e2e-selfhosted's `e2e-report` runs on
+    /// `always() && (serve changed || dispatch)`, pinned by
+    /// `closing_a_pr_supersedes_its_self_hosted_runs`, which reads no lane
+    /// result. Nightly's `e2e-report-nightly` needs no lane, only
+    /// `e2e-lanes-settled` (pinned by
+    /// `nightly_report_reads_lanes_through_the_queue_deadline_job`), which
+    /// reports a failed lane in its output rather than failing, and it runs on
+    /// `always()` (pinned by
+    /// `e2e_lanes_do_not_mask_failures_with_continue_on_error`).
     fn mask_failure(workflow: &str, text: &str) -> Option<String> {
         let lines = continue_on_error_lines(text);
         if lines.is_empty() {
@@ -6695,7 +6699,7 @@ fi
              other than `false`, on the job or on a step, in these lines: {lines:?}. On the \
              job that makes a failed lane read `success` in `needs.<lane>.result` and in \
              the run's conclusion; on a step it lets the failing step pass the job. Either \
-             way the run goes green while the lane is red. Remove it, or reword a script \
+             way the run's conclusion stops reflecting the failure. Remove it, or reword a script \
              that only mentions the key (this scan is deliberately fail-closed)"
         ))
     }
@@ -6840,15 +6844,18 @@ fi
             }
         }
 
-        // With the lanes unmasked, a failed lane fails its job, and the default
-        // `success()` condition would then skip the consolidated report on the
-        // very night it is worth reading.
+        // A failed lane does not fail `e2e-lanes-settled`, the report's only
+        // need, but the settle job itself can fail or be cancelled (a job list
+        // that stays unreadable, its own timeout). The default `success()`
+        // condition would then skip the consolidated report, and with it the
+        // missing-report check that names the lanes nobody heard from. No other
+        // test pins this condition.
         let nightly = read_workflow("nightly.yml");
         let condition = job_scalar(job_block(&nightly, "e2e-report-nightly"), "if");
         assert!(
             ["always()", "${{ always() }}"].contains(&condition),
-            "e2e-report-nightly must run on `always()` so a failed lane is still \
-             reported; found `if: {condition}`"
+            "e2e-report-nightly must run on `always()` so a failed or cancelled \
+             e2e-lanes-settled still yields a report; found `if: {condition}`"
         );
     }
 
