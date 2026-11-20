@@ -1147,6 +1147,83 @@ export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3
   --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
+## API docs
+
+`rocm services docs` ([services_docs.rs](../apps/rocm/src/services_docs.rs))
+runs the API docs server of `rocmd`
+([api_docs.rs](../apps/rocmd/src/api_docs.rs)) in the foreground. Unit tests
+run a real docs server against a stand-in model server that echoes what
+reached it. They cover the routes each engine's docs list (from the
+health-route table in
+[rocm-engine-protocol](../crates/rocm-engine-protocol/src/lib.rs), compared
+with what each engine reports as `supported_routes`); the forwarder (the three
+headers it passes on and the cookies it drops, the path kept percent-encoded,
+bodies above axum's 2 MiB default and one byte over its own 64 MiB limit
+refused, the answer headers it passes back, a redirect passed back rather than
+followed with a `Location` that leads back through it,
+a server that never accepts the connection, a server bound to `::` reached on
+`::1`, that a configured proxy does not divert it, and that its answers cannot
+run as pages of the docs' origin); stopped and unreachable servers; that the
+docs list what the loader they are given reports, and with the loader
+`rocm services list` uses, not a server whose process died; unreadable service
+records (503); the redirect to a server's page; ids escaped in pages and
+percent-encoded in links; a stop that does not wait on an open try-it stream;
+the `Host` guard, the `Origin` and `Sec-Fetch-Site` guards that admit only the
+docs' own pages, and the headers that keep other sites from framing them; and a
+taken port. The CLI's tests cover which servers the command serves and when it
+refuses, the fallback from a taken default port, and the `docs`/`engine docs`
+lines `rocm serve` and `rocm services list` print:
+
+```bash
+cargo test -p rocmd api_docs
+cargo test -p rocm-engine-protocol each_engine_reports
+cargo test -p rocm --bin rocm services_docs
+cargo test -p rocm --bin rocm every_supported_engine_has_a_health_route
+cargo test -p rocm --bin rocm services_list_names_the_docs_command
+cargo test -p rocm --bin rocm serve_summary
+```
+
+[service_docs.feature](../tests/e2e-cucumber/features/service_docs.feature)
+runs the real `rocm services docs` in the scenario's isolated tree, on a free
+port of its own passed with `--port` unless the scenario is about the default
+port, and drives it over HTTP: `service-docs-01` runs the exact command
+`rocm services list` names, `02` sends a try-it request, `03` stops the server
+with `rocm services stop` (so it is Linux only, `@requires-os:linux`), `04` and
+`05` give a refused command a port another program holds, so a command that
+served before refusing would fail on the port instead, `06` sends Ctrl+C
+(SIGINT, so Linux only) and checks the docs stop while the model server still
+answers, `07` holds port 11430 and checks the command says so and serves on a
+free port (`@serial`, since every scenario shares that port), `08` opens the
+`engine docs` link `rocm services list` prints, which the stand-in server
+answers as vLLM would, and `09` asks for a stopped server's docs and follows the
+`rocm services list --all` the refusal names to the restart command it also
+names (running that restart needs an engine to start, so no scenario does):
+
+```bash
+cargo xtask e2e -- -n "service-docs-"
+```
+
+The `docs:` line `rocm serve` prints in its plain (piped) output is followed,
+and every GET route the docs list is tried through them against a real engine,
+by the last step of the GPU serve canaries `serve-05` (vLLM), `serve-07`
+(Lemonade) and the nightly `serve-26` (AIM), which only run on GPU lanes. On
+Linux Lemonade lanes `serve-07` is an expected failure for an unrelated known
+issue, so there a broken docs line would not turn the lane red: the Lemonade
+check is effective on the Windows Lemonade lanes, and `serve-05` on the vLLM
+lanes.
+
+`service-docs-10` and `11` (Linux only, `@requires-os:linux`) run `rocm serve`
+of a model that is already running, piped and with `--verbose`, which reuses
+the server without a GPU:
+both check the `docs` and `engine docs` rows printed and open the docs through
+the printed command. Two places stay without a scenario and are checked by hand
+in [manual-testing.md](manual-testing.md) section 4f: the `docs` row of the
+deployment summary (shown only on a terminal; the e2e harness pipes
+`rocm serve`'s output) and the rows of an attached fresh launch and its
+"detached - server still running" block, which need an engine to start. Both
+print the rows built by the same `launch_docs_rows`, whose unit test and
+`serve_summary`'s pin what they contain and where they go.
+
 ## E2E runs that test nothing fail
 
 `cargo xtask e2e` fails a run whose result could not mean anything, instead of

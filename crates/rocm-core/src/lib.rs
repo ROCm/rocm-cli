@@ -190,7 +190,7 @@ pub use net::{
     DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, HttpResponseParts, connect_tcp_stream,
     format_host_for_url, format_host_port, format_http_base_url, http_get_text,
     http_get_text_with_auth, http_get_with_auth, http_post_json_with_auth, parse_http_endpoint,
-    read_http_response_bounded, write_all_tcp_stream,
+    reachable_host, read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{
     AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV, DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs,

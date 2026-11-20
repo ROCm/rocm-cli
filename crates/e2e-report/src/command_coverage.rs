@@ -71,6 +71,7 @@ pub(crate) const KNOWN_COMMAND_SURFACE: &[&str] = &[
     "rocm comfyui logs",
     "rocm comfyui models-path",
     "rocm services list",
+    "rocm services docs",
     "rocm services logs",
     "rocm services stop",
     "rocm services restart",

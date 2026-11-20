@@ -62,6 +62,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the API docs command printed when it started opens the server's API docs
 
   # Large-model coverage (dogfooding W9): serve a representative large model for
   # each GPU platform end-to-end at least once. The model follows the lane's serve
@@ -88,6 +89,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the API docs command printed when it started opens the server's API docs
 
   # Explicit HF-checkpoint canary: `owner/repo:variant` runs the selected GPU
   # llama-server directly and fails if that backend binary is missing. Named
@@ -409,6 +411,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the API docs command printed when it started opens the server's API docs
 
   # Lifecycle parity for AIM (ROCMAI-554). AIM's engine integration is new
   # enough that nothing had yet proven a container-backed service can be

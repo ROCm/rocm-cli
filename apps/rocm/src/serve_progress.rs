@@ -1443,6 +1443,7 @@ mod tests {
             smoke_failure: None,
             api_key: None,
             notes: Vec::new(),
+            docs_rows: Vec::new(),
         };
         let rendered = crate::serve_summary::render_summary(&summary);
         // The message names only the hint: the rendered summary can carry an
