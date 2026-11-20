@@ -750,6 +750,18 @@ family is substituted for it. `rocm examine` reports the same conclusion on a
 
 These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
 
+On such an integrated GPU, `rocm serve` on Lemonade chooses the llama.cpp
+context window itself. Lemonade sizes it from the memory it can see and, when
+it can see none (it logs `memory undetectable, returning 4096`), uses 4096
+tokens whatever the model, which is less than the assistant's own prompt. `rocm`
+reads the model's GGUF header (from the cached file, or by a header-only range
+request to Hugging Face before the model is downloaded), estimates the largest
+context that fits in 75% of the pool the GPU shares with the operating system,
+and loads with that, at most 32768 tokens. The chosen size is written to the
+service log as `Context window: N tokens, ...`. A recipe that carries its own
+`--ctx-size` keeps it, a model whose header cannot be read or sized is loaded
+as before, and a discrete GPU is not affected.
+
 #### Compiler toolchain (--devel)
 
 Pass `--devel` to also install the compiler and headers needed to build GPU
@@ -1212,7 +1224,9 @@ advance how it will go.
 
 An integrated GPU whose pool **can** be read is judged on that pool — the
 memory its engine actually allocates from, not the small VRAM carve-out the
-BIOS reserves. That pool is shared with the operating system, so it is a
+BIOS reserves. That includes a host with no `amd-smi`, such as a Windows
+machine whose GPU has no ROCm build: its gfx target says it is an integrated
+GPU, and the pool is read without `amd-smi`. That pool is shared with the operating system, so it is a
 ceiling and not an allocation: a model that fits under it is answered
 `degraded` rather than `ready`, with the reason, because nothing here measures
 how much of the pool is free. A model larger than the ceiling is `blocked`, and

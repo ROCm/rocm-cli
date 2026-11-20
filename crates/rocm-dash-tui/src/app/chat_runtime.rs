@@ -58,6 +58,12 @@ fn chat_error_message(raw: &str) -> String {
 /// a 400 covers many unrelated mistakes, and only this one has a cause the
 /// user can act on. The token counts come out of the same body; a body that
 /// omits them still gets the sentence, without the numbers.
+///
+/// The sentence does not blame a tool result: the body does not say whether
+/// one was involved, and a small window (4,096 tokens, what Lemonade
+/// auto-tuned on a Vega iGPU) is already full from the assistant's own
+/// instructions and tool definitions before any tool runs. It names both
+/// causes, so it is true for either.
 fn context_overflow_message(raw: &str) -> Option<String> {
     if !raw.contains("exceed_context_size_error") {
         return None;
@@ -73,8 +79,10 @@ fn context_overflow_message(raw: &str) -> Option<String> {
         })
         .unwrap_or_default();
     Some(format!(
-        "A ROCm check returned more text than this model can read{counts}. \
-         Try a more specific question, or a model with a larger context."
+        "This request is larger than the model's context window{counts}. \
+         The assistant's built-in instructions and any long ROCm check result \
+         both count toward it. Try a more specific question, or use a model \
+         served with a larger context."
     ))
 }
 
@@ -833,9 +841,10 @@ mod tests {
         // What the user reads says what happened and what to do about it…
         assert_eq!(
             message,
-            "A ROCm check returned more text than this model can read \
-             (53,820 of 32,768 tokens). Try a more specific question, or a model \
-             with a larger context."
+            "This request is larger than the model's context window \
+             (53,820 of 32,768 tokens). The assistant's built-in instructions and \
+             any long ROCm check result both count toward it. Try a more specific \
+             question, or use a model served with a larger context."
         );
         // …and none of the provider's wire detail.
         for noise in ["HttpError", "400", "exceed_context_size_error", "n_ctx"] {
@@ -858,7 +867,7 @@ mod tests {
             "chat request failed: HttpError: 400 {\"error\":{\"type\":\"exceed_context_size_error\"}}",
         );
         assert!(
-            message.starts_with("A ROCm check returned more text"),
+            message.starts_with("This request is larger than the model's context window"),
             "{message}"
         );
         assert!(

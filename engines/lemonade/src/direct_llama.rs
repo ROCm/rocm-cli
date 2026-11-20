@@ -937,7 +937,10 @@ fn collect_hf_checkpoint_ggufs(cache_root: &Path, checkpoint: &HfCheckpoint) -> 
 /// Every cached GGUF matching a checkpoint's variant, across all hub cache roots,
 /// deduplicated by file name. Used to detect an ambiguous variant (more than one match)
 /// so the caller can refuse to pick arbitrarily.
-fn hf_checkpoint_gguf_matches(paths: &AppPaths, checkpoint: &HfCheckpoint) -> Vec<PathBuf> {
+pub(crate) fn hf_checkpoint_gguf_matches(
+    paths: &AppPaths,
+    checkpoint: &HfCheckpoint,
+) -> Vec<PathBuf> {
     hf_checkpoint_gguf_matches_in_roots(&hf_cache_roots(paths), checkpoint)
 }
 
