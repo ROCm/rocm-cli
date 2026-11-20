@@ -9,8 +9,9 @@
 //! This closes the gap where CI verifies release artifacts against the public key
 //! configured in its environment (see `scripts/release_readiness.py`) while
 //! installers and the binary trust a *separately embedded* copy. If those diverge,
-//! CI can bless a release that installers then reject once default-on verification
-//! lands. This check enforces a single source of truth: the committed
+//! CI can bless a release that installers then reject, since installers verify
+//! every install against the pinned release key unless the user supplies
+//! another. This check enforces a single source of truth: the committed
 //! `docs/keys/*.pem` files.
 //!
 //! Design notes:
@@ -845,6 +846,11 @@ fn resolve_ci_public_key(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Op
         .filter(|value| !value.trim().is_empty()))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the path is compiled in; `the_real_sources_pass_and_their_hardening_is_enforced` \
+              resolves it on every test run"
+)]
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is the `xtask/` crate dir; its parent is the repo root,
     // so this is correct regardless of the working directory CI invokes us from.

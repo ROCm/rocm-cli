@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
@@ -189,31 +189,36 @@ pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<Tc
         .to_socket_addrs()
         .with_context(|| format!("failed to resolve {host}:{port}"))?
         .collect();
-    if addrs.is_empty() {
-        bail!("no socket addresses resolved for {host}:{port}");
-    }
+    let stream = connect_first(&addrs, timeout, host, port)?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+    Ok(stream)
+}
+
+/// Connect to the first of `addrs` that accepts, naming `host`/`port` in the
+/// error when none does — or when there was nothing to try.
+fn connect_first(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream> {
     // Bound the connect as well as the reads: a probe against an engine that is
     // pinned solid must fail within the caller's timeout, not sit in the OS
     // default SYN retry window. Try every resolved address so `localhost`
     // resolving to `::1` first still reaches an IPv4-only listener.
     let mut last_err = None;
-    let mut connected = None;
-    for addr in &addrs {
+    for addr in addrs {
         match TcpStream::connect_timeout(addr, timeout) {
-            Ok(s) => {
-                connected = Some(s);
-                break;
-            }
+            Ok(stream) => return Ok(stream),
             Err(e) => last_err = Some(e),
         }
     }
-    let Some(stream) = connected else {
-        let e = last_err.expect("addrs non-empty");
-        return Err(anyhow::Error::new(e).context(format!("failed to connect to {host}:{port}")));
+    // No error recorded means no address was tried.
+    let Some(e) = last_err else {
+        bail!("no socket addresses resolved for {host}:{port}");
     };
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
-    Ok(stream)
+    Err(anyhow::Error::new(e).context(format!("failed to connect to {host}:{port}")))
 }
 
 pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
@@ -323,6 +328,38 @@ mod tests {
         ] {
             assert_eq!(reachable_host(bind), reached, "{bind}");
         }
+    }
+
+    #[test]
+    fn connect_first_with_no_addresses_is_an_error_not_a_panic() {
+        let error = connect_first(&[], Duration::from_secs(1), "example.test", 80)
+            .expect_err("nothing to connect to");
+        assert_eq!(
+            error.to_string(),
+            "no socket addresses resolved for example.test:80"
+        );
+    }
+
+    #[test]
+    fn connect_first_names_the_target_when_every_address_refuses() {
+        // Bind, take the port, then drop the listener so the port refuses.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = connect_first(&[addr], Duration::from_secs(2), "127.0.0.1", addr.port())
+            .expect_err("nothing listens on the port");
+        assert_eq!(
+            error.to_string(),
+            format!("failed to connect to 127.0.0.1:{}", addr.port())
+        );
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some(),
+            "the connect error is kept as the cause: {error:#}"
+        );
     }
 
     #[test]

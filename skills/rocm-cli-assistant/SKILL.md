@@ -16,10 +16,16 @@ Use this skill when answering ROCm CLI local assistant questions.
 - Interpret `running_state=running` as running, `running_state=starting` as starting, `running_state=not_running` as not running, and no matching row as unknown or not managed by ROCm CLI.
 - Treat `localhost` and `127.0.0.1` as the same loopback endpoint.
 
+## Tool Results
+
+- A result ending in `[output truncated: ... omitted ...]` is a partial result. Say in your answer that the list is partial and name the command the user can run in a terminal for the rest. Never present a truncated list as the complete one.
+- `rocm_command` with `["model"]` lists the recommended models, which is what most model questions need. `["model", "--verbose"]` adds the per-recipe diagnostics and is long; ask for it only when the user wants that detail.
+
 ## Setup And Install
 
 - `active_runtime_status=ready` means ROCm CLI has an active managed ROCm/TheRock runtime even if legacy system ROCm is not detected.
 - If the user asks to install ROCm/TheRock, require an explicit install folder or use the guided folder picker. Preserve the exact path with `--prefix`.
+- ROCm CLI refuses a value you choose for a tool that shows the user a command (install, engine install, serve, service stop, automations, `rocm_command`, a plan you request) if it holds a character a Windows shell reads as syntax, such as `'`, `&` or `%`; `path_exists` is not affected. A model or option value you give `serve` may use only letters, digits and `. _ - / : @ + \`, must not start with `-`, and only options `rocm serve` has. If the user's folder or model needs anything else, do not rewrite it; tell the user to run the `rocm` command themselves with that value.
 - After a non-TUI SDK install succeeds, tell the user it installed successfully and to run `rocm help`.
 
 ## Engines And Assistant

@@ -1035,6 +1035,181 @@ mod tests {
         .to_string()
     }
 
+    /// A completion whose message asks for `calls`, each `(tool, arguments)`.
+    fn tool_call_completion_body(calls: &[(&str, serde_json::Value)]) -> String {
+        let tool_calls = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                serde_json::json!({
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() },
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "choices": [{"message": {"content": "", "tool_calls": tool_calls}}]
+        })
+        .to_string()
+    }
+
+    /// A question none of the chat's own shortcuts answers, so the model is
+    /// asked and its tool calls are the ones that run.
+    const OPEN_CHAT_QUESTION: &str = "I would like some help figuring out what to do with my GPU";
+
+    /// What a one-shot chat turn left behind: what `rocm chat --prompt` would
+    /// print (it prints only an `Ok`), and the state the refusal message says
+    /// the turn did not change.
+    struct OneShotTurn {
+        rendered: Result<String>,
+        /// The install folder the model asked for, or its parent, exists
+        /// after the turn.
+        prefix_created: bool,
+        /// The managed services after the turn, by id; the planted assistant
+        /// is the only one before it.
+        service_ids: Vec<String>,
+        /// Runtimes registered after the turn; there are none before it.
+        registered_runtimes: usize,
+    }
+
+    /// Ask the one-shot chat, with ROCm tools, against a local model that
+    /// answers once with the body `make_body` builds from the folder the
+    /// model's calls name (inside this test's own root, so whether it was
+    /// created can be checked).
+    fn one_shot_chat_against(
+        name: &str,
+        make_body: impl FnOnce(&str) -> String,
+    ) -> Result<OneShotTurn> {
+        let (root, paths) = temp_app_paths(name);
+        paths.ensure()?;
+        let prefix = root.join("R&D").join("rocm");
+        let body = make_body(&prefix.to_string_lossy());
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            vec![body],
+        );
+        ready_builtin_planner_service(&paths, port)?;
+        let rendered = crate::chat::render_chat_prompt_text(
+            &paths,
+            "local",
+            None,
+            OPEN_CHAT_QUESTION,
+            true,
+            crate::ChatInferenceParams::default(),
+        );
+        assert_eq!(
+            server.join().expect("server thread")?,
+            1,
+            "the model is asked once"
+        );
+        let registry = crate::runtime_registry::runtime_registry_dir(&paths);
+        let turn = OneShotTurn {
+            rendered,
+            prefix_created: prefix.exists() || prefix.parent().is_some_and(std::path::Path::exists),
+            service_ids: crate::managed_service_status::load_managed_services(&paths)?
+                .into_iter()
+                .map(|record| record.service_id)
+                .collect(),
+            registered_runtimes: fs::read_dir(&registry).map_or(0, Iterator::count),
+        };
+        let _ = fs::remove_dir_all(root);
+        Ok(turn)
+    }
+
+    /// The state a refused turn must leave: nothing printed (so no
+    /// `advanced manual command:` line and no approval reaches the user), no
+    /// folder created, no server started, no runtime registered.
+    fn assert_nothing_changed_and_nothing_offered(turn: &OneShotTurn) {
+        assert!(turn.rendered.is_err(), "a refused turn prints nothing");
+        assert!(!turn.prefix_created, "the folder must not be created");
+        assert_eq!(
+            turn.service_ids,
+            ["svc-qwen-planner"],
+            "no server may start"
+        );
+        assert_eq!(turn.registered_runtimes, 0, "no runtime may be registered");
+    }
+
+    fn install_into(prefix: &str) -> serde_json::Value {
+        serde_json::json!({ "channel": "release", "format": "wheel", "prefix": prefix })
+    }
+
+    /// The calls in the provider's reply are the model's, so the model-only
+    /// rules apply to them through the real turn: a folder with `&` is refused,
+    /// and the message's claim (nothing changed, nothing offered to paste) is
+    /// checked against the state the turn left. The same folder from the
+    /// user's own prompt is accepted:
+    /// `a_folder_the_user_typed_is_rendered_whatever_it_holds`.
+    #[test]
+    fn a_model_reply_asking_for_an_unsafe_folder_is_refused_through_the_chat_turn() -> Result<()> {
+        let turn = one_shot_chat_against("chat-model-unsafe-folder", |prefix| {
+            tool_call_completion_body(&[("install_sdk", install_into(prefix))])
+        })?;
+        assert_nothing_changed_and_nothing_offered(&turn);
+        let error = turn.rendered.expect_err("refused").to_string();
+        assert!(
+            error.contains("'&'")
+                && error.contains("supply it yourself by running `rocm install sdk`"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A refusal after a read-only check and an approvable call the same reply
+    /// asked for: the check ran, and the approvable call's command line is not
+    /// printed either, so "nothing was changed, and no command was offered"
+    /// holds for the whole turn, not only for the refused call.
+    #[test]
+    fn a_refusal_after_earlier_calls_says_and_leaves_nothing_changed() -> Result<()> {
+        let turn = one_shot_chat_against("chat-model-refusal-after-check", |prefix| {
+            tool_call_completion_body(&[
+                ("path_exists", serde_json::json!({ "path": "/" })),
+                ("install_sdk", install_into(&prefix.replace("R&D", "plain"))),
+                ("install_sdk", install_into(prefix)),
+            ])
+        })?;
+        assert_nothing_changed_and_nothing_offered(&turn);
+        let error = turn
+            .rendered
+            .expect_err("the third call is refused")
+            .to_string();
+        assert!(
+            error.contains(
+                "Nothing was changed, and no command was offered to paste for this call."
+            ) && !error.contains("Nothing was run"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A model's request handed to the planner comes back with the values it
+    /// chose on the plan's `tool_call:` lines; those are held to the same
+    /// rules before the plan is shown.
+    #[test]
+    fn a_plan_for_a_model_request_with_an_unsafe_folder_is_refused() -> Result<()> {
+        let turn = one_shot_chat_against("chat-model-unsafe-plan", |prefix| {
+            tool_call_completion_body(&[(
+                "natural_language_plan",
+                serde_json::json!({ "request": format!("install therock into {prefix}") }),
+            )])
+        })?;
+        assert_nothing_changed_and_nothing_offered(&turn);
+        let error = turn
+            .rendered
+            .expect_err("the plan's folder must be refused")
+            .to_string();
+        assert!(
+            error.starts_with("the plan for the local assistant's request")
+                && error.contains("'&'"),
+            "{error}"
+        );
+        Ok(())
+    }
+
     fn ready_builtin_planner_service(paths: &AppPaths, port: u16) -> Result<()> {
         let mut qwen = ManagedServiceRecord::new(
             paths,
@@ -1130,7 +1305,7 @@ mod tests {
         // The fix: one build, reused for both the rendered text and the next
         // action. This is exactly what `plan_freeform_request_with_context`
         // (what `natural_language_plan` calls today) does.
-        let (text, action) =
+        let (text, action, _) =
             crate::freeform_planner::plan_freeform_request_with_context("serve", &paths, &config);
         let action = action.expect("provider-resolved plan should produce a next action");
         assert!(
@@ -1673,22 +1848,16 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = spawn_local_provider_test_server(
-            listener,
-            "Qwen/Qwen3.5",
-            move |stream, _request| {
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                )?;
+        let server =
+            spawn_local_provider_test_server(listener, "Qwen/Qwen3.5", move |stream, _request| {
+                write_chunked_sse_head(stream)?;
                 let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
                 write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
                 let done = "data: [DONE]\n\n";
                 write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", done.len(), done)?;
                 stream.flush()?;
                 Ok(())
-            },
-        );
+            });
 
         let mut ready = ManagedServiceRecord::new(
             &paths,
@@ -1751,25 +1920,41 @@ mod tests {
     fn ready_service_that_dies_mid_chunked_stream(
         name: &str,
     ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
+        ready_service_answering_chat_with(name, answer_then_die_on_a_chunk_boundary)
+    }
+
+    /// Sends the chunked SSE head and one content chunk, then returns, which
+    /// drops the stream: the client sees EOF on a chunk boundary.
+    fn answer_then_die_on_a_chunk_boundary(stream: &mut TcpStream) -> Result<()> {
+        write_chunked_sse_head(stream)?;
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
+        write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    fn write_chunked_sse_head(stream: &mut TcpStream) -> Result<()> {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )?;
+        Ok(())
+    }
+
+    /// A ready local service whose engine answers the chat request with
+    /// `respond` (after answering any `/v1/models` listing itself).
+    fn ready_service_answering_chat_with(
+        name: &str,
+        mut respond: impl FnMut(&mut TcpStream) -> Result<()> + Send + 'static,
+    ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
         let (root, paths) = temp_app_paths(name);
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let server = spawn_local_provider_test_server(
-            listener,
-            "Qwen/Qwen3.5",
-            move |stream, _request| {
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                )?;
-                let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
-                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
-                stream.flush()?;
-                // Returning drops the stream: the client sees EOF on a chunk boundary.
-                Ok(())
-            },
-        );
+        let server =
+            spawn_local_provider_test_server(listener, "Qwen/Qwen3.5", move |stream, _request| {
+                respond(stream)
+            });
         let mut ready = ManagedServiceRecord::new(
             &paths,
             "svc-ready",
@@ -1888,30 +2073,31 @@ mod tests {
     }
 
     /// `rocm serve`'s post-launch smoke test is the CLI's streaming consumer. An
-    /// engine that dies mid-answer must leave the deployment summary showing no
-    /// measurements (`n/a`) instead of hanging the command or reporting
-    /// throughput for an answer that never finished.
+    /// engine that dies mid-answer must make the smoke test fail, and the
+    /// deployment summary built from that outcome must say so (heading, status
+    /// and reason, metrics `n/a`) instead of hanging the command, presenting the
+    /// service as ready, or reporting throughput for an answer that never
+    /// finished.
     #[test]
-    fn serve_smoke_test_reports_no_metrics_when_engine_dies_mid_chunked_stream() -> Result<()> {
-        let (root, paths, server) =
-            ready_service_that_dies_mid_chunked_stream("serve-smoke-chunked-truncated")?;
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
-        });
-        let (outcome, served) = client_then_server(&receiver, server);
-        fs::remove_dir_all(root).ok();
-
-        let metrics = outcome.map_err(|_| {
-            anyhow::anyhow!(
-                "the serve smoke test never returned after the engine closed the connection"
-            )
-        })?;
-        // Empty metrics are also what a smoke test that never reached the
-        // engine returns, so this is what makes the assertion below mean
+    fn serve_smoke_test_fails_and_summary_says_so_when_engine_dies_mid_chunked_stream() -> Result<()>
+    {
+        // `smoke_outcome_against` also checks the engine side served its
+        // request: a failed outcome is also what a smoke test that never reached
+        // the engine returns, so that is what makes the assertion below mean
         // "the engine died mid-answer" rather than "nothing happened".
-        served.transpose()?;
-        assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
+        let smoke = smoke_outcome_against(
+            "serve-smoke-chunked-truncated",
+            answer_then_die_on_a_chunk_boundary,
+        )?;
+        // The asserts below do not interpolate the outcome or the rendered
+        // summary: `DeploymentSummary` carries an API key field, and echoing it
+        // trips CodeQL's `rust/cleartext-logging`.
+        let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke.clone() else {
+            anyhow::bail!("a stream that died mid-answer was reported as measured");
+        };
+        // The reason is the provider's own truncation message, not just any text.
+        assert!(reason.contains(LOCAL_STREAM_TRUNCATED));
+        let (metrics, smoke_failure) = smoke.into_parts();
         let rendered =
             crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {
                 engine: "vllm".to_owned(),
@@ -1923,12 +2109,204 @@ mod tests {
                 status: "ready".to_owned(),
                 already_running: false,
                 metrics,
+                smoke_failure,
                 api_key: None,
                 notes: Vec::new(),
                 docs_rows: Vec::new(),
             });
+        assert!(rendered.starts_with("Deployment summary (smoke test failed)\n"));
+        assert!(rendered.contains("started, smoke test failed"));
+        assert!(!rendered.contains("  ready\n"));
         assert!(rendered.contains("time to first token  n/a"));
         assert!(rendered.contains("throughput (approx)  n/a"));
+        assert!(rendered.contains(&reason));
+        assert!(rendered.contains("`rocm logs --service svc-ready`"));
+        Ok(())
+    }
+
+    /// Runs the smoke test against a ready service whose engine answers the chat
+    /// request with `respond`, and returns the outcome.
+    fn smoke_outcome_against(
+        name: &str,
+        respond: impl FnMut(&mut TcpStream) -> Result<()> + Send + 'static,
+    ) -> Result<crate::serve_summary::SmokeOutcome> {
+        let (root, paths, server) = ready_service_answering_chat_with(name, respond)?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
+        });
+        let (outcome, served) = client_then_server(&receiver, server);
+        fs::remove_dir_all(root).ok();
+        let smoke = outcome.map_err(|_| anyhow::anyhow!("the smoke test never returned"))?;
+        served.transpose()?;
+        Ok(smoke)
+    }
+
+    /// A chat request that completes without error is not a failed smoke test
+    /// just because no `content` token arrived: a reasoning model can spend its
+    /// small token budget on `reasoning_content` first, and the readiness probe
+    /// (`openai_chat_completion_probe`) already treats such a server as serving.
+    /// The metrics stay empty (`n/a`) and no failure is recorded.
+    #[test]
+    fn serve_smoke_test_is_not_a_failure_when_a_complete_stream_carries_no_content() -> Result<()> {
+        for (name, body) in [
+            (
+                "serve-smoke-reasoning-only",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+            ("serve-smoke-done-only", "data: [DONE]\n\n"),
+        ] {
+            let smoke = smoke_outcome_against(name, move |stream| {
+                write_chunked_sse_head(stream)?;
+                write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body)?;
+                stream.flush()?;
+                Ok(())
+            })?;
+            assert!(
+                smoke
+                    == crate::serve_summary::SmokeOutcome::Measured(
+                        crate::serve_summary::SmokeMetrics::default()
+                    ),
+                "a complete stream with no content token was not a measured, empty outcome"
+            );
+            let (metrics, smoke_failure) = smoke.into_parts();
+            assert!(smoke_failure.is_none());
+            assert!(metrics == crate::serve_summary::SmokeMetrics::default());
+        }
+        Ok(())
+    }
+
+    /// The reason in the summary is built from the engine's own words (here its
+    /// HTTP status line), so it must reach the terminal as one clean line: no
+    /// escape sequence, no control or format character, but still the status.
+    #[test]
+    fn serve_smoke_test_failure_reason_carries_no_terminal_control_sequences() -> Result<()> {
+        let smoke = smoke_outcome_against("serve-smoke-hostile-status", |stream| {
+            write!(
+                stream,
+                "HTTP/1.1 500 \u{1b}[31mBoom\u{7}\u{202e}x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )?;
+            stream.flush()?;
+            Ok(())
+        })?;
+        let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+            anyhow::bail!("an HTTP 500 was not reported as a failure");
+        };
+        assert!(reason.contains("500"));
+        assert!(reason.contains("Boom"));
+        assert!(
+            !reason
+                .chars()
+                .any(rocm_core::terminal::is_control_or_format),
+            "the failure reason still carries a control or format character"
+        );
+        Ok(())
+    }
+
+    /// An engine that dies *inside* a chunk leaves an error with a cause chain
+    /// (the truncation message wrapping the failed read). The summary's reason
+    /// must keep the cause, not just the outermost message.
+    #[test]
+    fn serve_smoke_test_failure_reason_keeps_the_cause_chain() -> Result<()> {
+        let smoke = smoke_outcome_against("serve-smoke-dies-inside-chunk", |stream| {
+            write_chunked_sse_head(stream)?;
+            // Promise 0x64 bytes, send three, close.
+            write!(stream, "64\r\nabc")?;
+            stream.flush()?;
+            Ok(())
+        })?;
+        let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+            anyhow::bail!("an engine that died inside a chunk was not reported as a failure");
+        };
+        assert!(reason.contains(LOCAL_STREAM_TRUNCATED));
+        assert!(
+            reason.contains("failed to read local provider SSE body"),
+            "the reason lost the cause behind the truncation message"
+        );
+        Ok(())
+    }
+
+    /// Any HTTP error status from the engine is a failed smoke test, with the
+    /// status in the reason: the check is stricter than the readiness probe's
+    /// "anything below 500", so a 4xx fails here too.
+    #[test]
+    fn serve_smoke_test_fails_on_any_non_200_status() -> Result<()> {
+        for (name, status_line, code) in [
+            ("serve-smoke-http-500", "500 Internal Server Error", "500"),
+            ("serve-smoke-http-401", "401 Unauthorized", "401"),
+            ("serve-smoke-http-404", "404 Not Found", "404"),
+        ] {
+            let smoke = smoke_outcome_against(name, move |stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )?;
+                stream.flush()?;
+                Ok(())
+            })?;
+            let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+                anyhow::bail!("an HTTP error status was not reported as a failure");
+            };
+            assert!(reason.contains(code), "the reason lost the status code");
+        }
+        Ok(())
+    }
+
+    /// An engine that reports a failure in-band, as a `data:` error payload in a
+    /// 200 stream followed by `[DONE]`, must fail the smoke test with the
+    /// engine's own message, whether it comes before or after content tokens.
+    /// Pins `run_smoke_test`'s doc comment and `parse_openai_sse_line`.
+    #[test]
+    fn serve_smoke_test_fails_on_an_in_band_error_payload_in_a_200_stream() -> Result<()> {
+        for (name, body) in [
+            (
+                "serve-smoke-in-band-error",
+                "data: {\"error\":{\"message\":\"CUDA out of memory\",\"type\":\"InternalServerError\"}}\n\ndata: [DONE]\n\n",
+            ),
+            (
+                "serve-smoke-in-band-error-after-content",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"object\":\"error\",\"message\":\"CUDA out of memory\"}\n\ndata: [DONE]\n\n",
+            ),
+        ] {
+            let smoke = smoke_outcome_against(name, move |stream| {
+                write_chunked_sse_head(stream)?;
+                write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body)?;
+                stream.flush()?;
+                Ok(())
+            })?;
+            let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+                anyhow::bail!("{name}: an in-band error payload was reported as measured");
+            };
+            assert!(
+                reason.contains("CUDA out of memory"),
+                "{name}: the reason dropped the engine's message"
+            );
+        }
+        Ok(())
+    }
+
+    /// A close-delimited stream (no chunking, no `Content-Length`) that ends
+    /// after some tokens is deliberately `Measured`: it has no framing to cut
+    /// short, so a clean close is indistinguishable from completion (see
+    /// `read_close_delimited_sse_body`). Pins `run_smoke_test`'s doc comment.
+    #[test]
+    fn serve_smoke_test_measures_a_close_delimited_stream_cut_after_a_token() -> Result<()> {
+        let smoke = smoke_outcome_against("serve-smoke-close-delimited", |stream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )?;
+            write!(
+                stream,
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n"
+            )?;
+            stream.flush()?;
+            Ok(())
+        })?;
+        let crate::serve_summary::SmokeOutcome::Measured(metrics) = smoke else {
+            anyhow::bail!("a close-delimited stream cut after a token was reported as failed");
+        };
+        assert!(metrics.ttft.is_some());
         Ok(())
     }
 

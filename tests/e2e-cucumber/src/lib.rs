@@ -2,6 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "e2e test-harness library: a fixture that cannot be set up must fail the scenario that uses it"
+)]
+
 pub mod binary_path;
 pub mod capability;
 pub mod chat_request;
@@ -12,6 +18,7 @@ pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
+pub mod lane_verdict;
 pub mod lemonade_backend;
 pub mod lemonade_diagnostics;
 pub mod lemonade_protocol;
@@ -36,6 +43,7 @@ pub mod stand_in_uname;
 pub mod stray_process;
 pub mod tasklist;
 pub mod terminal_size;
+pub mod torch_alignment_outcome;
 
 use std::path::{Path, PathBuf};
 
@@ -49,17 +57,26 @@ pub fn is_catalog_id(id: &str) -> bool {
     id.starts_with("fix-") || id.starts_with("info-")
 }
 
+/// `text` with every run of whitespace collapsed to one space.
+///
+/// A phrase in hard-wrapped prose then matches wherever its lines happen to
+/// break. The one place the readers of `SKILL.md` prose get their wrap handling
+/// from.
+#[must_use]
+pub fn flatten_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The whole number that follows `phrase` in a markdown document, and the text
 /// after that number.
 ///
-/// Both are read from the document with its whitespace collapsed first, because
-/// the sentences these fixtures sit in are hard-wrapped and the number can land
-/// on either side of a line break. `None` when the phrase is absent or is not
-/// followed by a digit. Shared by the two places that read a number out of
-/// `SKILL.md` prose, so the wrap handling lives in one function.
+/// Both are read from the document with its whitespace collapsed first (see
+/// [`flatten_whitespace`]), because the sentences these fixtures sit in are
+/// hard-wrapped and the number can land on either side of a line break. `None`
+/// when the phrase is absent or is not followed by a digit.
 #[must_use]
 pub fn number_after_phrase(md: &str, phrase: &str) -> Option<(u64, String)> {
-    let flat = md.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flatten_whitespace(md);
     let after = flat.split(phrase).nth(1)?;
     let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
     let number = digits.parse().ok()?;

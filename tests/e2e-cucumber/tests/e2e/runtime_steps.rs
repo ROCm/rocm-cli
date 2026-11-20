@@ -5,6 +5,9 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use e2e_cucumber::torch_alignment_outcome::{
+    EngineTorchRequirement, engine_import_verdict, is_settled,
+};
 
 #[given("a machine with no CLI-managed runtimes")]
 async fn setup_no_runtimes(world: &mut E2eWorld) {
@@ -326,44 +329,96 @@ async fn assert_runtime_can_still_use_the_gpu(world: &mut E2eWorld) {
 /// reading the verdict is what tells the settled states apart from each other and
 /// from a skip.
 fn torch_alignment_verdict(output: &str) -> &str {
-    output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("torch_alignment: "))
-        .unwrap_or_else(|| {
-            panic!("no torch alignment block, so the runtime was never settled:\n{output}")
-        })
+    torch_alignment_lines(output)[0]
         .split_whitespace()
         .next()
         .unwrap_or_default()
 }
 
-/// Verdicts that mean the runtime was settled and its torch left in a state this
-/// tool produces on purpose.
-///
-/// Four, not one. Whether a reinstall rewrites torch or finds it already correct
-/// depends on what the shared pre-warm tree held when the scenario started, and a
-/// torch that has already executed a GPU kernel with this SDK is kept exactly as
-/// it is and reported as `retained_*` — settled without anything being installed.
-const SETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
-    "realigned",
-    "already_aligned",
-    "retained_sdk_build",
-    "retained_engine_build",
-];
+/// The text after `torch_alignment: ` for every block in the output, reason
+/// included. Never empty: an install that printed none never settled the runtime.
+fn torch_alignment_lines(output: &str) -> Vec<&str> {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("torch_alignment: "))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "no torch alignment block, so the runtime was never settled:\n{output}"
+    );
+    lines
+}
 
-/// Verdicts that mean the question was left unanswered.
+/// The vLLM requirement the verdicts are judged against, asked of the runtime only
+/// when a `not_applicable` line makes it matter. Every other verdict is decided by
+/// its own text, so a probe that cannot run is never reported as an alignment result.
+fn engine_requirement_for(lines: &[&str], output: &str) -> EngineTorchRequirement {
+    if lines.iter().any(|line| line.starts_with("not_applicable")) {
+        engine_torch_requirement(output)
+    } else {
+        EngineTorchRequirement::Declared
+    }
+}
+
+/// Whether the vLLM installed in the runtime that `output` describes requires
+/// torch in its own package metadata.
 ///
-/// `not_applicable` is the one that would otherwise go unnoticed: it is what a
-/// manifest yielding no SDK build produces, which is exactly the repair path for
-/// every runtime installed before `sdk_torch` was recorded. `disabled` belongs
-/// here for every scenario that did not ask for the opt-out — seeing it means the
-/// opt-out was applied to a user who never set it.
-const UNSETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
-    "torch_alignment: unavailable",
-    "torch_alignment: install_failed",
-    "torch_alignment: not_applicable",
-    "torch_alignment: disabled",
-];
+/// Asked of the runtime's interpreter rather than read from the CLI's output, so
+/// the answer does not depend on the thing being judged. The ROCm 10.x vLLM wheel
+/// declares no torch and the engine install pins and realigns the torch trio
+/// itself, which is the case where this is `Absent` and `not_applicable` is the
+/// right verdict.
+fn engine_torch_requirement(output: &str) -> EngineTorchRequirement {
+    let python = super::examine_steps::field_value(output, "python_executable")
+        .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
+    let probe = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m, re\n\
+             names = [re.match(r'[A-Za-z0-9._-]+', r.split(';')[0].strip()) for r in (m.requires('vllm') or [])]\n\
+             print(any(n and n.group(0).lower().replace('_', '-') == 'torch' for n in names))",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to ask {python} for vllm's requirements: {error}"));
+    assert!(
+        probe.status.success(),
+        "asking {python} for vllm's requirements failed: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    if String::from_utf8_lossy(&probe.stdout).trim() == "True" {
+        EngineTorchRequirement::Declared
+    } else {
+        EngineTorchRequirement::Absent
+    }
+}
+
+/// The runtime's interpreter can import torch, torchvision, vLLM and its compiled
+/// extensions together.
+///
+/// Asked only where a `not_applicable` verdict means the alignment compared no pin,
+/// so nothing else vouches that the pair torch and torchvision came to rest on can
+/// register its operators. `vllm._C` and `vllm._rocm_C` are imported on their own
+/// because `import vllm` loads those compiled extensions lazily: a vLLM built
+/// against a different torch imports fine and only fails here, on an undefined
+/// torch symbol. The CLI installs only ROCm builds, so both are always present.
+/// The verdict itself is `engine_import_verdict`.
+fn assert_engine_stack_imports(output: &str) {
+    let python = super::examine_steps::field_value(output, "python_executable")
+        .unwrap_or_else(|| panic!("the install output names no python_executable:\n{output}"));
+    let probe = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import torch, torchvision, vllm, vllm._C, vllm._rocm_C",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {python}: {error}"));
+    if let Err(cause) = engine_import_verdict(
+        probe.status.success(),
+        &String::from_utf8_lossy(&probe.stderr),
+    ) {
+        panic!("the reinstalled runtime cannot import the stack vLLM needs ({cause}):\n{output}");
+    }
+}
 
 /// The alignment ran, and settled.
 ///
@@ -375,18 +430,22 @@ const UNSETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
 #[then("the torch alignment settled rather than being skipped")]
 async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
-    let verdict = torch_alignment_verdict(output);
-    assert!(
-        SETTLED_TORCH_ALIGNMENTS.contains(&verdict),
-        "torch alignment reached no settled outcome (`{verdict}`):\n{output}"
-    );
-    // Asserted negatively as well, because the check above reads only the first
-    // block and would pass on a second one that failed.
-    for unsettled in UNSETTLED_TORCH_ALIGNMENTS {
+    // Every block, not only the first: a second one that failed would otherwise
+    // pass behind a first that settled. `disabled` is unsettled here because it
+    // belongs only to the scenario that asked for the opt-out, and seeing it
+    // anywhere else means the opt-out was applied to a user who never set it.
+    // `not_applicable` is unsettled too, except over an engine that declares no
+    // torch requirement.
+    let lines = torch_alignment_lines(output);
+    let engine = engine_requirement_for(&lines, output);
+    for line in &lines {
         assert!(
-            !output.contains(unsettled),
-            "torch alignment reported `{unsettled}`:\n{output}"
+            is_settled(line, engine),
+            "torch alignment reached no settled outcome (`{line}`):\n{output}"
         );
+    }
+    if lines.iter().any(|line| line.starts_with("not_applicable")) {
+        assert_engine_stack_imports(output);
     }
     // Asserted on the verdict, not on the divergence lines. Requiring
     // `expected_divergence` whenever `divergence:` appears cannot fail: one render
@@ -412,11 +471,17 @@ async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
 /// the day, not of anything the scenario controls. Every other accepted verdict
 /// is one where torch was kept as it was, which is what the user asked for.
 ///
-/// `not_applicable` is rejected for a reason of its own: it is the generic bucket
-/// for "nothing to decide", and folding the opt-out into it leaves the user who
-/// set the variable unable to tell whether it took effect. The reason line is
-/// read too, so the block names the variable that caused the skip rather than
-/// leaving the reader to guess which of several causes applied.
+/// `not_applicable` is accepted only over an engine that declares no torch
+/// requirement (the ROCm 10.x discover install, where the CLI pins torch itself):
+/// there is no alignment to skip, so `disabled` cannot be printed. Any other
+/// `not_applicable` is the generic bucket for "nothing to decide", and folding the
+/// opt-out into it leaves the user who set the variable unable to tell whether it
+/// took effect. In the accepted case the output has to name the variable, which
+/// the `torch_kept:` line the next step requires does, so the reader is still told
+/// it was honoured. On this route the alignment returns `not_applicable` before it
+/// reads the opt-out, so the verdict is the same with or without the variable set
+/// and this step does not exercise that gate: the `realigned` rejection above rules
+/// out the one failure that matters, and the next step proves the torch was kept.
 #[then("the torch alignment reports the opt-out instead of rewriting torch")]
 async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
@@ -426,12 +491,15 @@ async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
         "torch was realigned even though the user opted out:\n{output}"
     );
     // Every settled state except the rewrite, plus the skip the opt-out produces.
-    let kept_torch = verdict == "disabled" || SETTLED_TORCH_ALIGNMENTS.contains(&verdict);
+    let lines = torch_alignment_lines(output);
+    let line = lines[0];
+    let kept_torch =
+        verdict == "disabled" || is_settled(line, engine_requirement_for(&lines, output));
     assert!(
         kept_torch,
-        "the opt-out left torch in a state this tool does not produce (`{verdict}`):\n{output}"
+        "the opt-out left torch in a state this tool does not produce (`{line}`):\n{output}"
     );
-    if verdict == "disabled" {
+    if verdict == "disabled" || verdict == "not_applicable" {
         assert!(
             output.contains("ROCM_CLI_DISABLE_TORCH_ALIGNMENT"),
             "the skipped alignment does not name the variable that skipped it:\n{output}"
@@ -574,22 +642,128 @@ async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
     world.cli_stderr = Some(stderr);
 }
 
-/// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
-/// install's version does not match Lemonade's packaged pin, Tier 1's install
-/// 404s (the pinned build predates a ROCm-7.14 asset), and Tier 2's newest
-/// build succeeds -- producing exactly this line. This is the one part of the
-/// alignment path with no other e2e coverage: the unit tests exercise the
-/// Tier 1/Tier 2/revert state machine directly (against injected install/align
-/// steps), but nothing else asserts that `rocm engines install lemonade`
-/// actually surfaces the outcome to the user.
-#[then("the CLI reports that Lemonade's ROCm backend was aligned to the active SDK")]
-async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
+/// The pin Lemonade installed against ends up equal to the active SDK, by
+/// whichever route this host takes:
+///
+/// - the active SDK differs from Lemonade's packaged `therock.version`, and the
+///   install aligns the pin to it and says so ("Aligned Lemonade's ROCm llama.cpp
+///   backend ..."), as on an SDK older than the pin (ROCm 7.14 against
+///   Lemonade 2026.44.1's 10.1.0, whose pinned llama.cpp build also ships a 7.14
+///   archive);
+/// - the active SDK already is the packaged pin (a ROCm 10.1 SDK), so there is
+///   nothing to align: no alignment line, no alignment attempt, and the ROCm
+///   backend installs as packaged.
+///
+/// Either way the pin in the installed `backend_versions.json` is read back and
+/// compared with the active runtime's own version from `rocm runtimes list`, and
+/// the selected backend must be `rocm`: a failed alignment reverts the pin to the
+/// packaged value and fails the comparison, and a message without the matching
+/// pin fails it too. The unit tests drive the Tier 1/Tier 2/revert state machine
+/// against injected steps; this is the only check that `rocm engines install
+/// lemonade` reaches a ROCm backend paired with the SDK on real hardware.
+#[then("Lemonade's ROCm backend is paired with the active SDK")]
+async fn assert_lemonade_backend_paired_with_active_sdk(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
     assert!(
         output
-            .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
-        "expected the install to report the ROCm backend alignment outcome:\n{output}"
+            .contains("Selected the best supported llama.cpp backend for this GPU: llamacpp:rocm"),
+        "expected Lemonade's ROCm llama.cpp backend to be selected:\n{output}"
     );
+    let pinned_version = installed_therock_pin(output);
+    let active_version = active_runtime_version(world);
+    if !is_plain_release_version(&active_version) {
+        // A dated (nightly) SDK is left alone by design: no alignment is
+        // attempted and the packaged pin stays.
+        assert_eq!(
+            pinned_version,
+            packaged_therock_pin(output),
+            "a nightly SDK ({active_version}) must leave Lemonade's packaged pin in place"
+        );
+        assert!(
+            !output.contains("Aligned Lemonade's ROCm")
+                && !stderr.contains("Aligned Lemonade's ROCm"),
+            "a nightly SDK ({active_version}) was aligned to:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+        return;
+    }
+    assert_eq!(
+        pinned_version, active_version,
+        "the installed backend_versions.json does not pin the active ROCm SDK:\nstdout:\n{output}\nstderr:\n{stderr}"
+    );
+    let packaged_version = packaged_therock_pin(output);
+    let reported_aligned = output
+        .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK");
+    if pinned_version == packaged_version {
+        // The active SDK is the packaged pin (ROCm 10.1 against Lemonade
+        // 2026.44.1), so the comparison above holds whatever the CLI did. The
+        // llama.cpp tag paired with that pin is a second signal: an alignment
+        // that rewrote the pin would also have moved it.
+        assert_eq!(
+            installed_backend_pin(output, "llamacpp", "rocm-stable"),
+            packaged_backend_pin(output, "llamacpp", "rocm-stable"),
+            "the active SDK is the packaged pin, yet the llama.cpp ROCm tag was rewritten:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+        // No alignment is attempted at all then, so none may be reported or
+        // logged.
+        assert!(
+            !reported_aligned
+                && !stderr.contains("Aligned Lemonade's ROCm backend to")
+                && !stderr.contains("could not align Lemonade's ROCm backend to"),
+            "the active SDK is the packaged pin, yet an alignment ran:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+    } else {
+        // The pin moved from the packaged {packaged_version} to the active SDK,
+        // so an alignment ran, and the install must say so: a CLI that aligns
+        // silently fails here.
+        assert!(
+            reported_aligned,
+            "the pin moved from the packaged {packaged_version} to {pinned_version}, but the \
+             install did not report the alignment:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// Whether `version` is a plain `major.minor.patch` release, the only kind
+/// Lemonade's backend alignment matches against (a nightly such as
+/// `7.14.0a20260601` is left alone).
+fn is_plain_release_version(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// `therock.version` in the `resources/backend_versions.json` of the runtime
+/// tree the install reports (`env_path:`).
+fn installed_therock_pin(output: &str) -> String {
+    installed_backend_pin(output, "therock", "version")
+        .unwrap_or_else(|| panic!("no therock.version in the installed backend_versions.json"))
+}
+
+/// `<section>.<key>` in the installed `resources/backend_versions.json`, e.g.
+/// `llamacpp.rocm-stable`, the llama.cpp tag that goes with the ROCm pin.
+fn installed_backend_pin(output: &str, section: &str, key: &str) -> Option<String> {
+    let env_path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let backend_versions_path =
+        std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    parsed[section][key].as_str().map(str::to_owned)
 }
 
 /// The Lemonade install `rocm serve` consults before it serves a GGUF directly:
@@ -733,9 +907,9 @@ async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
 /// (marked with `*`; see `ACTIVE_RUNTIME_MARKER` in `apps/rocm/src/main.rs`).
 ///
 /// Read independently of Lemonade's own reporting, on purpose: this is the
-/// comparator [`assert_packaged_pin_survives`] uses to prove the pin was not
-/// rewritten to match it, so it must not come from anything alignment itself
-/// could produce (there is no `ROCm SDK:` line in `rocm version` on this
+/// comparator [`assert_lemonade_backend_paired_with_active_sdk`] uses to prove
+/// the pin was aligned to it, so it must not come from anything alignment
+/// itself could produce (there is no `ROCm SDK:` line in `rocm version` on this
 /// branch -- that surface is a different, later change).
 fn active_runtime_version(world: &E2eWorld) -> String {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
@@ -753,12 +927,12 @@ fn active_runtime_version(world: &E2eWorld) -> String {
 /// The packaged pin was not rewritten.
 ///
 /// Reads `resources/backend_versions.json` inside the runtime tree the install
-/// itself reports (`env_path:`) and compares it against the active runtime's
-/// own version (from `rocm runtimes list`, not from anything Lemonade's
-/// alignment reports), rather than inferring the outcome from an absent log
-/// line alone. Both checks matter: the revert path can fail to restore the
-/// pin (best-effort, matching its sibling warnings) while still printing no
-/// "Aligned ..." line, so absence of that line alone cannot distinguish a
+/// itself reports (`env_path:`) and compares it with the copy inside the
+/// Lemonade archive the install verified, rather than inferring the outcome
+/// from an absent log line alone. The absent-line checks matter too: the
+/// revert path can fail to restore the pin (best-effort, matching its sibling
+/// warnings) while still printing no "Aligned ..." line, so absence of that
+/// line alone cannot distinguish a
 /// failed-restore from an honestly untouched pin -- hence also checking for
 /// the revert path's own "could not align ... reverting" warning, which does
 /// fire whenever a restore was attempted. `--reinstall` (the When's own
@@ -781,34 +955,86 @@ async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
         "an alignment attempt ran (and failed) instead of never starting:\n{stderr}"
     );
 
+    let pinned_version = installed_therock_pin(output);
+    let packaged_version = packaged_therock_pin(output);
+    // Where the active SDK already is the packaged pin (a ROCm 10.1 SDK against
+    // Lemonade 2026.44.1) the ROCm version alone cannot tell an untouched pin
+    // from one rewritten to the same value, so the llama.cpp tag paired with it
+    // is checked too.
+    assert_eq!(
+        pinned_version, packaged_version,
+        "the pin differs from the one the Lemonade archive ships even though the user opted out"
+    );
+    assert_eq!(
+        installed_backend_pin(output, "llamacpp", "rocm-stable"),
+        packaged_backend_pin(output, "llamacpp", "rocm-stable"),
+        "the llama.cpp ROCm tag differs from the one the Lemonade archive ships even though the user opted out"
+    );
+}
+
+/// `therock.version` as the Lemonade embeddable archive the install verified
+/// ships it, read from the cached archive beside the runtime tree
+/// (`<root>/downloads/` next to `<root>/runtime`) with the system `tar`, which
+/// reads both the Linux `.tar.gz` and, as bsdtar on Windows, the `.zip`. The
+/// archive is the one named by the install's `env_id`
+/// (`lemonade-embeddable-<version>`): the downloads directory is never pruned,
+/// so a runner that installed an earlier pin still holds that archive too.
+fn packaged_therock_pin(output: &str) -> String {
+    packaged_backend_pin(output, "therock", "version")
+        .unwrap_or_else(|| panic!("no therock.version in the packaged backend_versions.json"))
+}
+
+/// `<section>.<key>` as the cached Lemonade archive ships it; see
+/// [`packaged_therock_pin`].
+fn packaged_backend_pin(output: &str, section: &str, key: &str) -> Option<String> {
     let env_path = output
         .lines()
         .find_map(|line| line.trim().strip_prefix("env_path: "))
         .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
-    let backend_versions_path =
-        std::path::Path::new(env_path).join("resources/backend_versions.json");
-    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read {}: {error}",
-            backend_versions_path.display()
-        )
-    });
-    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
-        panic!(
-            "failed to parse {}: {error}",
-            backend_versions_path.display()
-        )
-    });
-    let pinned_version = parsed["therock"]["version"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
-
-    let active_version = active_runtime_version(world);
-    assert_ne!(
-        pinned_version, active_version,
-        "the packaged pin was rewritten to the active ROCm SDK version even though the user \
-         opted out"
+    let env_id = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_id: "))
+        .unwrap_or_else(|| panic!("no env_id in install output:\n{output}"));
+    let archive_prefix = format!("{env_id}-");
+    let downloads = std::path::Path::new(env_path)
+        .parent()
+        .unwrap_or_else(|| panic!("env_path {env_path} has no parent"))
+        .join("downloads");
+    // The archive's top-level directory is its file name without the
+    // extension. rocm-cli names the archive itself (`lemonade_archive_name`),
+    // always in lower case; the extension is compared ignoring ASCII case, as
+    // clippy's `case_sensitive_file_extension_comparisons` asks.
+    let archive_stem = |path: &std::path::Path| -> Option<String> {
+        let name = path.file_name()?.to_str()?;
+        [".tar.gz", ".zip"].iter().find_map(|extension| {
+            let split = name.len().checked_sub(extension.len())?;
+            let (stem, tail) = (name.get(..split)?, name.get(split..)?);
+            (tail.eq_ignore_ascii_case(extension) && stem.starts_with(&archive_prefix))
+                .then(|| stem.to_owned())
+        })
+    };
+    let (archive, stem) = std::fs::read_dir(&downloads)
+        .unwrap_or_else(|error| panic!("failed to list {}: {error}", downloads.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find_map(|path| archive_stem(&path).map(|stem| (path, stem)))
+        .unwrap_or_else(|| panic!("no cached {env_id} archive in {}", downloads.display()));
+    let member = format!("{stem}/resources/backend_versions.json");
+    let extracted = std::process::Command::new("tar")
+        .arg("-xOf")
+        .arg(&archive)
+        .arg(&member)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run tar on {}: {error}", archive.display()));
+    assert!(
+        extracted.status.success(),
+        "tar could not read {member} from {}: {}",
+        archive.display(),
+        String::from_utf8_lossy(&extracted.stderr)
     );
+    let parsed: serde_json::Value = serde_json::from_slice(&extracted.stdout)
+        .unwrap_or_else(|error| panic!("failed to parse {member}: {error}"));
+    parsed[section][key].as_str().map(str::to_owned)
 }
 
 /// The engine inventory reports a usable engine runtime.

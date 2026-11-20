@@ -44,15 +44,20 @@ const RAW_ARCH: &str = "gfx1200";
 const GROUP_FAMILY: &str = "gfx120X-all";
 
 const NEXT_ROCM_VERSION: &str = "10.0.0";
-const NEXT_TORCH_VERSION: &str = "2.10.0+rocm10.0.0";
-const NEXT_TORCHVISION_VERSION: &str = "0.25.0+rocm10.0.0";
+const NEXT_TORCH_VERSION: &str = "2.12.0+rocm10.0.0";
+const NEXT_TORCHVISION_VERSION: &str = "0.27.0+rocm10.0.0";
 const NEXT_TORCHAUDIO_VERSION: &str = "2.9.1+rocm10.0.0";
 
 /// A newer ROCm 10 build published beside `NEXT_ROCM_VERSION`, for the scenario
 /// that pins the older one.
 const NEWER_NEXT_ROCM_VERSION: &str = "10.1.0";
-const NEWER_NEXT_TORCH_VERSION: &str = "2.11.0+rocm10.1.0";
-const NEWER_NEXT_TORCHVISION_VERSION: &str = "0.26.0+rocm10.1.0";
+const NEWER_NEXT_TORCH_VERSION: &str = "2.13.0+rocm10.1.0";
+const NEWER_NEXT_TORCHVISION_VERSION: &str = "0.28.0+rocm10.1.0";
+/// Published for `NEWER_NEXT_ROCM_VERSION` after `NEWER_NEXT_TORCH_VERSION`, with
+/// no torchvision built for it. Left to `uv`, the SDK takes this one and the
+/// pair cannot register `torchvision::nms`; the vLLM discover row's series
+/// (torch 2.13, torchvision 0.28) is what keeps it off.
+const NEWER_NEXT_UNPAIRED_TORCH_VERSION: &str = "2.14.0+rocm10.1.0";
 /// The newer build's torchaudio, shaped like the live `whl-next` index's
 /// `+rocm10.1.0` builds: an original release (CPU-only on the live index), the
 /// hardware-verified rebuild, and a newer rebuild sharing the same label. The
@@ -396,10 +401,12 @@ fn arm_pip_fixture_env(world: &mut E2eWorld) {
 
 /// Two ROCm 10 builds on one ROCm 10 index, with each package's dependency
 /// contract shaped like the live preview index's: torch requires its exact
-/// `rocm` build and torchvision its exact torch, so pinning `rocm` carries both
-/// — but torchaudio requires neither, so nothing in its metadata ties it to a
-/// build. `torchaudio` lists the torchaudio builds the index publishes, each
-/// with its wheel tag.
+/// `rocm` build, so pinning `rocm` carries it. The older build's torchvision
+/// requires its exact torch; the newer build's requires any torch, and a newer
+/// torch than it was built against is published beside it (see
+/// `NEWER_NEXT_UNPAIRED_TORCH_VERSION`). Torchaudio requires neither, so
+/// nothing in its metadata ties it to a build. `torchaudio` lists the
+/// torchaudio builds the index publishes, each with its wheel tag.
 fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
     let served = root(world).join("therock-pip-fixtures").join("next");
     write_fixture(&served.join("index.html"), &aggregate_root_html());
@@ -416,10 +423,25 @@ fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
         ),
     ];
     let rocm = builds.map(|(rocm, ..)| (rocm, ANY_WHEEL_TAG, Vec::new()));
-    let torch =
-        builds.map(|(rocm, torch, _)| (torch, ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]));
-    let torchvision = builds.map(|(_, torch, torchvision)| {
-        (torchvision, ANY_WHEEL_TAG, vec![format!("torch=={torch}")])
+    let mut torch = builds
+        .map(|(rocm, torch, _)| (torch, ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]))
+        .to_vec();
+    // A torch newer than the one torchvision was built against, for the same
+    // `rocm` build, as the live index published for ROCm 10.1.0.
+    torch.push((
+        NEWER_NEXT_UNPAIRED_TORCH_VERSION,
+        ANY_WHEEL_TAG,
+        vec![format!("rocm=={NEWER_NEXT_ROCM_VERSION}")],
+    ));
+    // The newer build's torchvision names no exact torch, as on the live index,
+    // so only the series the SDK asks for keeps it off the newer torch above.
+    let torchvision = builds.map(|(rocm, torch, torchvision)| {
+        let requires = if rocm == NEWER_NEXT_ROCM_VERSION {
+            "torch".to_owned()
+        } else {
+            format!("torch=={torch}")
+        };
+        (torchvision, ANY_WHEEL_TAG, vec![requires])
     });
     let torchaudio = torchaudio
         .iter()
@@ -1462,10 +1484,27 @@ const QUOTED_FOLDER_NAME: &str = "it's-here";
     "the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote"
 )]
 async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld) {
-    let prefix = root(world)
-        .join(QUOTED_FOLDER_NAME)
-        .to_string_lossy()
-        .into_owned();
+    preview_unpinned_wheel_install_into(world, QUOTED_FOLDER_NAME);
+}
+
+/// The install folder chat-22's assistant asks for, inside the scenario's root:
+/// `&` starts a second command when a line holding it is pasted into `cmd.exe`,
+/// even inside the POSIX single quotes the CLI renders it in.
+pub(crate) const AMPERSAND_FOLDER_NAME: &str = "R&D-rocm";
+
+/// Where chat-22's folder lives, so the assistant's step and the user's own
+/// preview name the same one.
+pub(crate) fn ampersand_folder(world: &E2eWorld) -> std::path::PathBuf {
+    root(world).join(AMPERSAND_FOLDER_NAME)
+}
+
+#[when("the user previews that install into the same folder themselves")]
+async fn preview_install_into_the_ampersand_folder(world: &mut E2eWorld) {
+    preview_unpinned_wheel_install_into(world, AMPERSAND_FOLDER_NAME);
+}
+
+fn preview_unpinned_wheel_install_into(world: &mut E2eWorld, folder_name: &str) {
+    let prefix = root(world).join(folder_name).to_string_lossy().into_owned();
     preview_ok(
         world,
         &[
@@ -1486,6 +1525,15 @@ async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld)
 
 #[then("the dry-run command line names that folder as a single argument")]
 async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) {
+    assert_dry_run_command_names_folder(world, QUOTED_FOLDER_NAME);
+}
+
+#[then("the dry-run command line names the folder with an ampersand as a single argument")]
+async fn assert_dry_run_command_keeps_ampersand_folder_whole(world: &mut E2eWorld) {
+    assert_dry_run_command_names_folder(world, AMPERSAND_FOLDER_NAME);
+}
+
+fn assert_dry_run_command_names_folder(world: &E2eWorld, folder_name: &str) {
     let output = stdout(world);
     let line = output
         .lines()
@@ -1497,9 +1545,9 @@ async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) 
     // through symlinks, so the folder's parent may be spelled differently from
     // the one this step built. What must hold is that one whole word names it.
     assert!(
-        words.iter().any(|word| {
-            Path::new(word).file_name() == Some(std::ffi::OsStr::new(QUOTED_FOLDER_NAME))
-        }),
+        words
+            .iter()
+            .any(|word| { Path::new(word).file_name() == Some(std::ffi::OsStr::new(folder_name)) }),
         "the dry-run `command:` line must name the install folder as one argument, got `{line}`"
     );
 }
@@ -1950,7 +1998,7 @@ fn assert_version_resolution_extras(world: &mut E2eWorld, include_devel: bool) {
     };
     let expected = format!(
         "version_resolution_specs: rocm[{extras},device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
-         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] \
+         torch[device-{RAW_ARCH}]==2.12.* torchvision[device-{RAW_ARCH}]==0.27.* \
          torchaudio=={NEXT_TORCHAUDIO_VERSION}"
     );
     assert_contains(world, &expected, "version resolution extras");

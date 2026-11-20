@@ -35,9 +35,7 @@
 //! `build_libatomic_install_plan`, `build_libnuma_install_plan`) and the hints
 //! that name each runtime.
 
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
@@ -247,6 +245,10 @@ fn symlink_points_to(link: &Path, target: &Path) -> bool {
     std::fs::read_link(link).is_ok_and(|dest| dest == target)
 }
 
+/// File name of the `libmpi_cxx` stub [`ensure_mpi_cxx_compat`] writes into a compat
+/// directory.
+pub const MPI_CXX_STUB_NAME: &str = "libmpi_cxx.so.40";
+
 /// Prebuilt `libmpi_cxx.so.40` stub defining the legacy OpenMPI C++ binding
 /// symbols PyTorch references (see `build.rs`). Empty when the build host had no
 /// C compiler, in which case the shim is disabled.
@@ -313,7 +315,48 @@ pub fn ensure_mpi_cxx_compat(compat_dir: &Path) -> Option<PathBuf> {
     if MPI_CXX_STUB.is_empty() {
         return None;
     }
-    write_compat_file(compat_dir, "libmpi_cxx.so.40", MPI_CXX_STUB)
+    write_compat_file(compat_dir, MPI_CXX_STUB_NAME, MPI_CXX_STUB)
+}
+
+/// Whether the host has a real `libmpi_cxx.so*`.
+///
+/// That makes the stub [`ensure_mpi_cxx_compat`] writes unnecessary. It tells that
+/// case apart from the other reasons that function answers `None` (no stub
+/// embedded, stub not writable), where an existing stub may still be in use.
+#[cfg(target_os = "linux")]
+pub fn real_libmpi_cxx_present() -> bool {
+    find_libmpi_cxx().is_some()
+}
+
+/// Whether `compat_dir` holds a `libmpi_cxx.so.40` stub that shadows a real library.
+///
+/// That is a stub an earlier run wrote, on a host that has since gained a real
+/// `libmpi_cxx`. The caller passes whether the host has one, from
+/// [`real_libmpi_cxx_present`]. For a caller that puts `compat_dir` on a loader
+/// path and may not write.
+pub fn mpi_cxx_stub_shadows_real_library(compat_dir: &Path, real_libmpi_cxx_present: bool) -> bool {
+    real_libmpi_cxx_present
+        && compat_dir
+            .join(MPI_CXX_STUB_NAME)
+            .symlink_metadata()
+            .is_ok()
+}
+
+/// Remove the stub [`mpi_cxx_stub_shadows_real_library`] describes.
+///
+/// A no-op when the host has no real `libmpi_cxx`, because then the stub may be the
+/// library torch is loading (see [`real_libmpi_cxx_present`]), and when no stub is
+/// there. For a caller that is about to put `compat_dir` on a loader path.
+pub fn remove_stale_mpi_cxx_stub(compat_dir: &Path, real_libmpi_cxx_present: bool) {
+    if real_libmpi_cxx_present {
+        let _ = std::fs::remove_file(compat_dir.join(MPI_CXX_STUB_NAME));
+    }
+}
+
+/// Non-Linux hosts have no stub to tell apart.
+#[cfg(not(target_os = "linux"))]
+pub const fn real_libmpi_cxx_present() -> bool {
+    false
 }
 
 /// Non-Linux hosts never need the OpenMPI C++ bindings shim.
@@ -326,10 +369,11 @@ pub const fn ensure_mpi_cxx_compat(_compat_dir: &std::path::Path) -> Option<Path
 /// `target`, returning `compat_dir` on success.
 ///
 /// This is a generic symlink-based shim helper for managed-runtime libraries on
-/// hosts whose system or bundled library uses a different soname. Note that the
-/// OpenMPI C++ bindings shim no longer uses this path (it materializes a compiled
-/// `libmpi_cxx.so.40` stub via [`ensure_mpi_cxx_compat`]), and libnuma is
-/// deliberately *not* shimmed — the real numactl runtime is installed instead.
+/// hosts whose system or bundled library uses a different soname. It is used for
+/// the amd-smi link (see `ensure_amd_smi_compat`). The OpenMPI C++ bindings shim
+/// no longer uses this path (it materializes a compiled `libmpi_cxx.so.40` stub
+/// via [`ensure_mpi_cxx_compat`]), and libnuma is deliberately *not* shimmed —
+/// the real numactl runtime is installed instead.
 /// Returns `None` when `target` does not exist or the symlink cannot be created.
 #[cfg(target_os = "linux")]
 pub fn ensure_compat_symlink(compat_dir: &Path, link_name: &str, target: &Path) -> Option<PathBuf> {

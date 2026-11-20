@@ -141,7 +141,8 @@ fn debug_command_capture(line: String) {
 /// absolute path, so no `PATH` is involved. Each case that leaves a descendant
 /// holding a pipe gives it a short, fixed life, so a runner that waits for it is
 /// slow and cannot hang the suite.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod subprocess_runners_pair {
     use super::{candidate_with_debug, capture_optional_command_with_timeout};
     use crate::fake_executable::write_fake_executable;

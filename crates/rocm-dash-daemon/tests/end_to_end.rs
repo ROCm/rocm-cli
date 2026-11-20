@@ -8,6 +8,12 @@
 //!
 //! Exercises the daemon's public library surface (`rocm_dash_daemon::*`).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::time::Duration;
 
 use rocm_dash_core::protocol::Event;

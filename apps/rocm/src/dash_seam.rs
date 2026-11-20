@@ -61,6 +61,34 @@ impl RocmToolExecutor for BinToolExecutor {
         }
     }
 
+    /// The dashboard agent's own tool calls. The approval body built by
+    /// [`Self::execute`] shows the command line, which the operator may copy,
+    /// so a model-chosen value is held to `validate_model_chosen_tool_call`
+    /// first; a slash command the operator typed goes to [`Self::execute`]
+    /// directly and is not.
+    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: name.to_owned(),
+            arguments: args.clone(),
+        };
+        if let Err(e) = chat::validate_chat_tool_call(&call)
+            .and_then(|()| chat::validate_model_chosen_tool_call(&call))
+        {
+            return RocmToolOutcome::Error(e.to_string());
+        }
+        let outcome = self.execute(name, args);
+        // The plan for a request the model wrote holds values the model chose
+        // on its `tool_call:` lines, so it is checked before it is shown.
+        if name == "natural_language_plan"
+            && let RocmToolOutcome::Result(value) = &outcome
+            && let Err(e) = chat::validate_model_chosen_plan_result(value)
+        {
+            return RocmToolOutcome::Error(e.to_string());
+        }
+        outcome
+    }
+
     fn execute_approved(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
         // Replay the approved mutating call via the captured-subprocess path
         // (`allow_mutation = true`). `run_internal_mcp_call` re-validates the
@@ -156,6 +184,98 @@ mod tests {
             }
             other => panic!("expected ApprovalRequired for `install_sdk`, got {other:?}"),
         }
+    }
+
+    /// A safe call the dashboard agent makes reaches the same outcome as the
+    /// operator's: the model-only checks refuse, and otherwise change nothing.
+    /// A read-only tool returns its result (only `natural_language_plan`'s
+    /// result is read as a plan), a mutating one is staged for approval, and a
+    /// plan with nothing unsafe in it is shown.
+    #[test]
+    fn seam_passes_a_safe_model_call_through_like_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        match exec.execute_model_call("engines", &serde_json::json!({})) {
+            RocmToolOutcome::Result(v) => assert!(
+                v.pointer("/structuredContent/engines")
+                    .is_some_and(serde_json::Value::is_array),
+                "{v}"
+            ),
+            other => panic!("a safe read-only model call must run, got {other:?}"),
+        }
+        let install = serde_json::json!({
+            "channel": "release",
+            "format": "wheel",
+            "prefix": "/tmp/rocm-seam-model-prefix",
+        });
+        match exec.execute_model_call("install_sdk", &install) {
+            RocmToolOutcome::ApprovalRequired(intent) => assert_eq!(intent.name, "install_sdk"),
+            other => panic!("a safe mutating model call must be staged, got {other:?}"),
+        }
+        let plan = serde_json::json!({ "request": "install therock into /mnt/rocm" });
+        match exec.execute_model_call("natural_language_plan", &plan) {
+            RocmToolOutcome::Result(v) => assert!(
+                v.pointer("/structuredContent/planned_args")
+                    .is_some_and(serde_json::Value::is_array),
+                "{v}"
+            ),
+            other => panic!("a safe plan must be shown, got {other:?}"),
+        }
+    }
+
+    /// The dashboard agent's own call is held to the model-only rules, so a
+    /// folder with `&` in it never reaches the approval body the operator may
+    /// copy; the same folder typed by the operator (`/install <prefix>`, which
+    /// goes through `execute`) is theirs and is staged for approval.
+    #[test]
+    fn seam_refuses_a_model_chosen_value_but_not_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let args = serde_json::json!({
+            "channel": "release",
+            "format": "wheel",
+            "prefix": "/tmp/rocm-seam R&D",
+        });
+        match exec.execute_model_call("install_sdk", &args) {
+            RocmToolOutcome::Error(error) => assert!(
+                error.contains("supply it yourself by running `rocm install sdk`"),
+                "{error}"
+            ),
+            other => panic!("a model-chosen `&` must be refused, got {other:?}"),
+        }
+        match exec.execute("install_sdk", &args) {
+            RocmToolOutcome::ApprovalRequired(intent) => assert!(
+                intent
+                    .body
+                    .iter()
+                    .any(|line| line.contains("--prefix '/tmp/rocm-seam R&D'")),
+                "{:?}",
+                intent.body
+            ),
+            other => panic!("the operator's own folder must be staged, got {other:?}"),
+        }
+    }
+
+    /// A request the dashboard agent hands to the planner is the model's, so
+    /// the plan it comes back as is checked before the dashboard shows it; the
+    /// same request typed by the operator (`/plan`, through `execute`) is not.
+    #[test]
+    fn seam_refuses_a_plan_for_a_model_request_but_not_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let args = serde_json::json!({ "request": "install therock into /mnt/R&D/rocm" });
+        match exec.execute_model_call("natural_language_plan", &args) {
+            RocmToolOutcome::Error(error) => assert!(
+                error.starts_with("the plan for the local assistant's request")
+                    && error.contains("'&'"),
+                "{error}"
+            ),
+            other => panic!("the model's plan must be refused, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                exec.execute("natural_language_plan", &args),
+                RocmToolOutcome::Result(_)
+            ),
+            "the operator's own request is planned"
+        );
     }
 
     #[test]
@@ -317,6 +437,192 @@ mod tests {
         assert!(
             matches!(outcome, RocmToolOutcome::Error(_)),
             "approved-path execution must still reject an unsafe call, got {outcome:?}"
+        );
+    }
+
+    /// One approval-gated tool call per mutating tool, each carrying a second,
+    /// *different* payload under a nested `arguments` key. The outer object is
+    /// what the model's call looks like on its face; the inner one differs in
+    /// the fields the approval card shows, so any path that reads one object
+    /// for the card and the other for the command would be visible. The one
+    /// shared value is `install_sdk`'s `format`: `wheel` is the only format
+    /// valid on every platform, and the channel and prefix already differ.
+    fn nested_arguments_calls() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "launch_server",
+                serde_json::json!({
+                    "model": "shown/model",
+                    "arguments": { "model": "other/model", "port": 8123 },
+                }),
+            ),
+            (
+                "install_sdk",
+                serde_json::json!({
+                    "channel": "release",
+                    "format": "wheel",
+                    "prefix": "/tmp/rocm-seam-shown-prefix",
+                    "arguments": {
+                        "channel": "nightly",
+                        "format": "wheel",
+                        "prefix": "/tmp/rocm-seam-other-prefix",
+                    },
+                }),
+            ),
+            (
+                "install_engine",
+                serde_json::json!({
+                    "engine": "lemonade",
+                    "arguments": { "engine": "vllm", "reinstall": true },
+                }),
+            ),
+            (
+                "stop_server",
+                serde_json::json!({
+                    "service_id": "shown-service",
+                    "arguments": { "service_id": "other-service" },
+                }),
+            ),
+            (
+                "watcher_enable",
+                serde_json::json!({
+                    "watcher": "therock-update",
+                    "mode": "observe",
+                    "arguments": { "watcher": "server-recover", "mode": "contained" },
+                }),
+            ),
+            (
+                "watcher_disable",
+                serde_json::json!({
+                    "watcher": "therock-update",
+                    "arguments": { "watcher": "server-recover" },
+                }),
+            ),
+        ]
+    }
+
+    /// The command line the approved replay of `arguments` would run, read
+    /// through the two calls `run_internal_mcp_call`'s mutating arm makes
+    /// (`internal_mcp_tool_call`, then `rocm_chat_tool_requested_args`)
+    /// without spawning it.
+    fn approved_command_line(name: &str, arguments: &serde_json::Value) -> Option<String> {
+        let call = chat::internal_mcp_tool_call(name, arguments.clone()).ok()?;
+        let args = chat::rocm_chat_tool_requested_args(&call)?;
+        Some(crate::rocm_argv::format_structured_tool_call("rocm", &args))
+    }
+
+    /// The approval card for a mutating tool and the command its approval runs
+    /// must describe the same action. For every approval-gated tool, a call
+    /// carrying a nested `arguments` payload either never reaches a card, or
+    /// the command run on approval is exactly the one the card shows.
+    ///
+    /// This is the statement of the guarantee over the shared command builder
+    /// (`approved_command_line`): with both layers of the fix undone there (no
+    /// refusal, and `internal_mcp_tool_call` unwrapping the nested object) it
+    /// reports a disagreement for every tool. Either layer alone keeps it
+    /// green, by design, so each is pinned by its own test. Removing the
+    /// refusal fails `seam_refuses_nested_arguments_before_approval_and_on_replay`
+    /// and `validate_chat_tool_call_refuses_a_nested_arguments_field_for_every_tool`.
+    /// An unwrap added ahead of validation, in `internal_mcp_tool_call` or in
+    /// `run_internal_mcp_call` before it, fails
+    /// `seam_refuses_nested_arguments_before_approval_and_on_replay`, whose
+    /// approved replay then runs instead of being refused, and
+    /// `mcp_call_refuses_tool_fields_mixed_with_a_nested_arguments_object` in
+    /// `chat/mcp_bridge.rs`.
+    #[test]
+    fn seam_approval_card_matches_the_command_approval_runs() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let mut disagreements = Vec::new();
+        for (name, payload) in nested_arguments_calls() {
+            match exec.execute(name, &payload) {
+                RocmToolOutcome::Error(_) => {}
+                RocmToolOutcome::ApprovalRequired(intent) => {
+                    let ran = approved_command_line(&intent.name, &intent.arguments);
+                    if !ran.as_ref().is_some_and(|ran| intent.body.contains(ran)) {
+                        disagreements.push(format!(
+                            "`{name}`: the approval card shows {:?} but approving it runs {ran:?}",
+                            intent.body
+                        ));
+                    }
+                }
+                RocmToolOutcome::Result(v) => {
+                    panic!("`{name}` is approval-gated but ran without approval: {v}")
+                }
+            }
+        }
+        assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
+    }
+
+    /// The same calls with the nested payload removed are ordinary, valid
+    /// requests: each must still reach an approval card, and that card must
+    /// show exactly the command its approval runs. Without this the agreement
+    /// test above could pass by refusing every call.
+    #[test]
+    fn seam_approval_card_matches_the_command_for_plain_calls() {
+        let exec = BinToolExecutor::new(temp_paths());
+        for (name, mut payload) in nested_arguments_calls() {
+            payload
+                .as_object_mut()
+                .expect("fixture is an object")
+                .remove("arguments");
+            let RocmToolOutcome::ApprovalRequired(intent) = exec.execute(name, &payload) else {
+                panic!("plain `{name}` call must reach an approval card");
+            };
+            assert_eq!(
+                intent.arguments, payload,
+                "`{name}`: the intent replays the object the card was built from"
+            );
+            let ran = approved_command_line(&intent.name, &intent.arguments)
+                .unwrap_or_else(|| panic!("plain `{name}` call must be runnable once approved"));
+            assert!(
+                intent.body.contains(&ran),
+                "`{name}`: the approval card shows {:?} but approving it runs {ran}",
+                intent.body
+            );
+        }
+    }
+
+    /// A nested `arguments` payload is refused before any card is shown, and
+    /// the approved replay refuses it too, without spawning anything — so an
+    /// intent assembled some other way still cannot run the inner payload.
+    #[test]
+    fn seam_refuses_nested_arguments_before_approval_and_on_replay() {
+        let exec = BinToolExecutor::new(temp_paths());
+        for (name, payload) in nested_arguments_calls() {
+            match exec.execute(name, &payload) {
+                RocmToolOutcome::Error(e) => assert!(
+                    e.contains("nested `arguments`"),
+                    "`{name}`: refusal should name the nested field, got: {e}"
+                ),
+                other => panic!("`{name}` with a nested payload must be refused, got {other:?}"),
+            }
+            match exec.execute_approved(name, &payload) {
+                RocmToolOutcome::Error(e) => assert!(
+                    e.contains("nested `arguments`"),
+                    "`{name}`: replay refusal should name the nested field, got: {e}"
+                ),
+                other => panic!(
+                    "`{name}` replay with a nested payload must be refused before running, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Read-only tools go through the same gate: the result returned to the
+    /// model must describe the call the model made, not an object inside it.
+    #[test]
+    fn seam_refuses_nested_arguments_on_read_only_tools() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let outcome = exec.execute(
+            "rocm_command",
+            &serde_json::json!({
+                "args": ["engines"],
+                "arguments": { "args": ["runtimes", "activate", "some-runtime"] },
+            }),
+        );
+        assert!(
+            matches!(&outcome, RocmToolOutcome::Error(e) if e.contains("nested `arguments`")),
+            "read-only call with a nested payload must be refused, got {outcome:?}"
         );
     }
 }

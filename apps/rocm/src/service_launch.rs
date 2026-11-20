@@ -39,11 +39,15 @@
 //!
 //! - `endpoint_auth`: bind-host validation and the endpoint API key checks.
 //! - `launch_transaction`: the locked port allocation decision, the cleanup of a
-//!   failed launch, and the reuse refusals.
-//! - `spawn`: the detached engine child, its process and stdio plumbing, and
+//!   failed launch, the reuse refusals, and the guarded read-modify-write
+//!   (`update_managed_record_on_disk`) every launch write after the claim goes
+//!   through, so a stop or removal made meanwhile is not overwritten or undone.
+//! - `spawn`: the detached engine child, its process and stdio plumbing, the
+//!   startup check that fails a launch whose engine exits inside the settle
+//!   window (on Windows through the spawn's process handle), and
 //!   `ManagedLaunchReport`.
-//! - `readiness`: waiting on a service, its liveness, and the OOM fault-injection
-//!   seam.
+//! - `readiness`: waiting on a service, its liveness, and the fault-injection
+//!   seam (an OOM launch, or a ready launch).
 //! - `start`: the background launch path and its plain output.
 //! - `helper_autostart`: starting the background automation helper.
 //! - `attach`: the attached run and its log streaming.
@@ -68,7 +72,8 @@ pub(crate) use helper_autostart::{
     ensure_background_helper_running, ensure_background_helper_running_quiet,
 };
 pub(crate) use launch_transaction::{managed_service_reuse_refusal, no_usable_gpu_refusal};
-pub(crate) use readiness::e2e_simulate_oom_launch;
+pub(crate) use readiness::{e2e_simulate_oom_launch, e2e_simulate_startup_exit};
+pub(crate) use spawn::scripted_managed_engine_startup_failure;
 #[cfg(not(windows))]
 pub(crate) use spawn::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,

@@ -15,7 +15,7 @@
 //!
 //! Callers in other modules, production and test-only, reach the moved items
 //! through the `chat::` module boundary, so this module re-exports each one
-//! another module reads (`run_internal_mcp_call`,
+//! another module reads (`run_internal_mcp_call`, `mcp_call_cli_arguments`,
 //! `rocm_chat_tool_system_prompt_for_host`, the tool-policy items, `any_substring`
 //! and `ensure_flag`, and the test-only ones under `#[cfg(test)]`).
 
@@ -27,13 +27,18 @@ mod turn;
 // `deterministic_comfyui_tool_summary` lives in `summaries.rs` and stays
 // reachable here as `chat::deterministic_comfyui_tool_summary` for
 // `comfyui.rs`'s tests, which are its only readers outside `summaries.rs`.
-// Those tests are all `#[cfg(unix)]`, so the re-export is gated the same way:
-// on Windows it would be an unused import.
-#[cfg(all(test, unix))]
+// One of them runs on every platform, so the re-export is gated on `test`
+// alone.
+#[cfg(test)]
 pub(crate) use self::summaries::deterministic_comfyui_tool_summary;
 // `run_internal_mcp_call` lives in `mcp_bridge.rs` and stays reachable here as
-// `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`.
-pub(crate) use self::mcp_bridge::run_internal_mcp_call;
+// `chat::run_internal_mcp_call` for `main.rs` and `dash_seam.rs`;
+// `mcp_call_cli_arguments` likewise for `main.rs`'s `rocm mcp-call` dispatch.
+// `internal_mcp_tool_call` is read only by `dash_seam.rs`'s tests, so its
+// re-export is `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) use self::mcp_bridge::internal_mcp_tool_call;
+pub(crate) use self::mcp_bridge::{mcp_call_cli_arguments, run_internal_mcp_call};
 // `rocm_chat_tool_system_prompt_for_host` lives in `turn.rs` and stays
 // reachable here as `chat::rocm_chat_tool_system_prompt_for_host` for `dash.rs`.
 use self::turn::render_chat_prompt_result_with_progress;
@@ -49,7 +54,7 @@ pub(crate) use crate::rocm_argv::ensure_flag;
 // here as `chat::<item>` for `dash_seam.rs`. `ChatRocmCommandAction`,
 // `rocm_chat_tool_requested_args`, `chat_install_driver_action` and
 // `chat_rocm_command_action_from_args` are read through `chat::` only by other
-// modules' tests (`driver_plan.rs`, `system_packages.rs`), and this module does
+// modules' tests (`driver_plan.rs`, `system_packages.rs`, `dash_seam.rs`), and this module does
 // not call them itself, so their re-export below is `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) use crate::tool_policy::{
@@ -58,6 +63,7 @@ pub(crate) use crate::tool_policy::{
 };
 pub(crate) use crate::tool_policy::{
     chat_tool_approval_request, chat_tool_call_is_read_only, validate_chat_tool_call,
+    validate_model_chosen_plan_result, validate_model_chosen_tool_call,
 };
 use crate::{ChatInferenceParams, providers};
 use anyhow::{Context, Result};
@@ -125,23 +131,30 @@ fn piped_prompt_from_input(input: &str) -> Option<String> {
 }
 
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
-    let status = providers::provider_status(paths, provider)?;
+    Ok(render_chat_status_text(&providers::provider_status(
+        paths, provider,
+    )?))
+}
+
+/// The `rocm chat` status screen for `status`. The model names come from a
+/// provider's or a local server's listing, which this process did not write,
+/// so each is sanitized on its own before it is composed with the screen's
+/// lines; everything else on the screen is this process's own text.
+fn render_chat_status_text(status: &providers::ProviderStatus) -> String {
+    use rocm_core::terminal::sanitize_terminal_text;
     let mut output = String::new();
     let _ = writeln!(output, "Chat assistant");
     let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Assistant source: {}",
-        if status.provider == "local" {
-            "local model on this computer"
-        } else {
-            status.provider.as_str()
-        }
-    );
+    let source = if status.provider == "local" {
+        "local model on this computer".to_owned()
+    } else {
+        sanitize_terminal_text(&status.provider)
+    };
+    let _ = writeln!(output, "Assistant source: {source}");
     let _ = writeln!(
         output,
         "Status: {}",
-        plain_provider_auth_status(&status.auth_status)
+        sanitize_terminal_text(&plain_provider_auth_status(&status.auth_status))
     );
     let _ = writeln!(
         output,
@@ -156,8 +169,8 @@ pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<Strin
         let _ = writeln!(output, "Models: none found yet");
     } else {
         let _ = writeln!(output, "Models:");
-        for model in status.models {
-            let _ = writeln!(output, "  - {model}");
+        for model in &status.models {
+            let _ = writeln!(output, "  - {}", sanitize_terminal_text(model));
         }
     }
     let _ = writeln!(output);
@@ -166,7 +179,7 @@ pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<Strin
         "Choose Chat source to switch between local and remote assistants."
     );
     let _ = writeln!(output, "Choose Settings to manage saved keys and defaults.");
-    Ok(output)
+    output
 }
 
 fn plain_provider_auth_status(status: &str) -> String {
@@ -229,6 +242,39 @@ pub(crate) fn parse_positive_u32(value: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status screen prints model names a server listed and a provider
+    /// name from configuration: each is printed with its escape sequences
+    /// removed, and one left open cannot take the screen's own lines with it.
+    #[test]
+    fn the_status_screen_prints_listed_names_without_their_escapes() {
+        let status = providers::ProviderStatus {
+            provider: "remote\u{1b}]0;title\u{7}x".to_owned(),
+            auth_status: "ready".to_owned(),
+            models: vec![
+                "qwen\u{1b}]0;never closed".to_owned(),
+                "llama\u{9b}2K".to_owned(),
+            ],
+            tool_call_schema: String::new(),
+        };
+        assert_eq!(
+            render_chat_status_text(&status),
+            "Chat assistant\n\nAssistant source: remotex\nStatus: Ready\nROCm help: not available\n\
+             Models:\n  - qwen\n  - llama\n\n\
+             Choose Chat source to switch between local and remote assistants.\n\
+             Choose Settings to manage saved keys and defaults.\n"
+        );
+        // The status itself can come from a provider, so it is cleaned too.
+        let status = providers::ProviderStatus {
+            auth_status: "key_\u{1b}]0;title\u{7}rejected\u{9b}2K".to_owned(),
+            ..status
+        };
+        assert!(
+            render_chat_status_text(&status).contains("\nStatus: key rejected\n"),
+            "{:?}",
+            render_chat_status_text(&status)
+        );
+    }
 
     #[test]
     fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {

@@ -217,7 +217,8 @@ Feature: GPU detection and system inspection
   # half of that fix: `lspci` resolves a target from the marketing name, and on
   # an Instinct host `pci.ids` frequently spells that "Device 74a1", so without
   # `rocminfo` the per-node target the kernel reports is the only thing that can
-  # fill the field.
+  # fill the field. Where the name does resolve a target, the kernel's target
+  # replaces it (see examine-57).
   #
   # The step no-ops where a premise does not hold -- no readable KFD topology,
   # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
@@ -540,7 +541,7 @@ Feature: GPU detection and system inspection
     And the inspection's driver detail says the library is missing from the linker cache
 
   # A TheRock tarball keeps librocdxg.so beside libhsa-runtime64, which opens it by
-  # name and carries `RUNPATH $ORIGIN`, so the loader finds it from the runtime's own
+  # name and searches its own `$ORIGIN` directory, so the loader finds it from the runtime's own
   # directory: no linker-cache entry and no LD_LIBRARY_PATH. ROCM-30386 reported such
   # a machine as `wsl_rocdxg_missing` while its `rocminfo` enumerated the GPU. The
   # control is `examine-33`, the same machine with the library alone.
@@ -732,3 +733,157 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form and the time it takes is measured
     Then the inspection finishes long before the background process does
     And the inspection lists the GPU that lspci printed
+
+  # A ROCm wheel ships `librocdxg.so.1` beside `libhsa-runtime64`, but the HSA
+  # runtime opens `librocdxg.so`, a name the wheel does not ship, so on WSL2 it
+  # loads the host's librocdxg and never the copy it was built with. A 10.2 or
+  # newer nightly runtime then fails at first GPU use against a host
+  # `rocdxg-roct` 1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`), while
+  # `driver_status` still reads `wsl_rocdxg_ready`. The inspection lists such a
+  # copy; the control is the same runtime with `librocdxg.so` beside it. The
+  # install side of the same change (`rocm install sdk` linking the name) needs a
+  # real wheel download and is covered by unit tests only.
+  @id:examine-lists-a-runtime-librocdxg-its-runtime-does-not-load @requires-os:linux
+  Scenario: examine-49 - The inspection lists a managed runtime's librocdxg that its own runtime does not load
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the ROCDXG driver status "wsl_rocdxg_ready"
+    And the inspection lists that runtime's librocdxg as one its own runtime does not load
+
+  @id:examine-lists-no-runtime-librocdxg-when-the-runtime-loads-its-own @requires-os:linux
+  Scenario: examine-50 - The inspection lists nothing when the runtime has librocdxg.so beside its own copy
+    Given a WSL machine with a managed runtime that has librocdxg.so beside its own copy
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The advice names a command: it has to exist and has to clear the finding.
+  @id:examine-runtime-librocdxg-advice-clears-the-finding @requires-os:linux
+  Scenario: examine-51 - Running the command the inspection advises clears the runtime librocdxg finding
+    Given a WSL machine with a managed runtime that ships only a versioned librocdxg
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # The finding is advice about the WSL loader path; a native host with the same
+  # runtime gets none.
+  @id:examine-lists-no-runtime-librocdxg-off-wsl @requires-os:linux
+  Scenario: examine-52 - The inspection lists no runtime librocdxg on a machine that is not WSL
+    Given a machine that is not WSL with a managed runtime that ships only a versioned librocdxg
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # A broken `librocdxg.so` link is as bad as none: the loader's open() fails on
+  # it as on a missing file and the runtime loads the host's copy (observed with
+  # LD_DEBUG=libs on the 10.2 nightly, which still exited 139). The inspection
+  # lists it, and the advised command (which must replace a dangling link, so a
+  # plain `ln -s` is not enough) leaves the name reading as the runtime's own copy.
+  @id:examine-lists-a-dangling-runtime-librocdxg-link-and-the-advice-clears-it @requires-os:linux
+  Scenario: examine-53 - A dangling librocdxg.so link is listed and the advised command replaces it
+    Given a WSL machine with a managed runtime whose librocdxg.so is a link to a missing file
+    When the user inspects that machine in machine-readable form
+    Then the inspection lists that runtime's librocdxg as one its own runtime does not load
+    When the user runs the command the inspection advises for that runtime's librocdxg and inspects again
+    Then the inspection lists no runtime librocdxg that its own runtime does not load
+
+  # `examine` reports the active runtime's channel, package source, source layout
+  # and exact GPU target in the same words and from the same manifest fields as
+  # the `provenance:` line `rocm runtimes list` prints for it
+  # (`runtime-lifecycle-22`). The planted manifest needs no GPU or download, so
+  # this runs on the mock lane.
+  @id:examine-reports-where-the-active-runtime-came-from
+  Scenario: examine-54 - Examining the system says where the active runtime came from
+    Given the active runtime is a nightly runtime installed for one exact GPU
+    When the user inspects the system
+    Then the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from
+  # ROCMAI-40. The ROCm runtime can be told to show only some of a machine's
+  # GPUs (a visibility mask, for example to hide an integrated GPU), and the
+  # GPUs it lists then have to be matched to the ones the machine has. They were
+  # matched by list position, so with the first GPU hidden its entry took the
+  # second GPU's model name, architecture and integrated/discrete verdict, and
+  # the second kept none. Each is now matched by its own PCI address. The machine
+  # is simulated: a native Linux root whose kernel topology has two GPUs, at
+  # 0000:03:00.0 (gfx1100) and 0000:04:00.0 (gfx1101), an `lspci` stand-in that
+  # lists an empty bus, and a `rocminfo` stand-in that lists only the second, as
+  # "AMD Radeon RX 7800 XT" with that card's `BDFID`. The other rows (no address
+  # from the runtime, counts that differ, an address in two PCI domains, a
+  # partitioned card) are the unit tests in `examine/linux_gpus.rs`.
+  @id:examine-each-gpu-keeps-its-own-reading @requires-os:linux
+  Scenario: examine-55 - A GPU the ROCm runtime cannot see does not borrow another GPU's identity
+    Given a machine with two AMD GPUs of which the ROCm runtime can see only the second
+    When the user inspects that machine in machine-readable form
+    Then the second GPU is reported with the model name the runtime gave it, its own architecture and as a discrete GPU
+    And the first GPU is reported with its own architecture, no model name and no claim about whether it is integrated
+
+  # ROCMAI-40. `HSA_OVERRIDE_GFX_VERSION` makes the ROCm runtime report another
+  # GPU architecture than the card's own -- a common workaround for a card the
+  # runtime does not support -- and `rocminfo` inherits it. The runtime's reading
+  # is matched to the card by PCI address and supplies the model name, but it
+  # does not replace the architecture the card already has from the kernel, or
+  # the integrated/discrete verdict that follows from it, so `rocm diagnose`'s
+  # override check holds the card's native architecture against the framework's
+  # arch list. The machine is simulated: a native Linux root whose kernel
+  # topology has one gfx1103 integrated GPU at 0000:c4:00.0, an `lspci` stand-in
+  # that lists an empty bus, and a `rocminfo` stand-in that, like the real
+  # runtime, reports that GPU as gfx1100 at the same address only while
+  # HSA_OVERRIDE_GFX_VERSION is 11.0.0, which the scenario sets, and as an APU
+  # either way. The stand-in leaves a marker when it runs with the override,
+  # and the scenario requires it, so it cannot pass on the native listing.
+  # What it proves is that the overridden target does not replace the card's
+  # own. It does not prove where the integrated verdict comes from: gfx1103 is
+  # an APU under the target rule as well, so the runtime's `Memory Properties`
+  # reading deciding the verdict is proved by the unit test
+  # `a_matched_agents_verdict_is_its_memory_properties_reading_or_else_the_target_rule`.
+  @id:examine-overridden-runtime-target-keeps-native @requires-os:linux
+  Scenario: examine-56 - A runtime told to report a different GPU architecture does not change the architecture reported for the card
+    Given a machine whose integrated GPU the ROCm runtime is told to report as another architecture
+    When the user inspects that machine in machine-readable form
+    Then the integrated GPU is reported with its own architecture and as integrated
+    And the integrated GPU is reported with the model name the runtime gave it
+
+  # ROCMAI-40. The PCI scan can only guess a GPU's architecture from its model
+  # name, through a name table, and the guess can be wrong (for Krackan Point
+  # the name table says gfx1150 while the PCI device-id map says gfx1152; which
+  # is right is unconfirmed). The kernel states the architecture of each GPU it
+  # exposes, so where the two disagree at the same PCI address the kernel's is
+  # reported, and the integrated/discrete verdict follows it. The machine is
+  # simulated so the disagreement does not depend on any one table entry: a
+  # native Linux root whose `lspci` stand-in
+  # lists a "Phoenix1" (which the table reads as gfx1103, integrated) at
+  # 0000:05:00.0, and whose kernel topology has a gfx1100 node at that address.
+  @id:examine-kernel-architecture-outranks-the-name-guess @requires-os:linux
+  Scenario: examine-57 - The kernel's architecture is reported over one guessed from the GPU's model name
+    Given a machine whose PCI listing names a GPU model the kernel reports as another architecture
+    When the user inspects that machine in machine-readable form
+    Then the GPU is reported with the architecture the kernel gives it, as a discrete GPU
+
+  # ROCMAI-40. When the PCI listing cannot name a GPU at all (no model name the
+  # table knows, as on a Strix Halo whose `pci.ids` has no entry for it), the
+  # scan has no architecture for it and calls it discrete by default. The
+  # kernel's architecture fills that gap, and when it is an integrated GPU's the
+  # GPU is reported as integrated. This scenario covers the host where the ROCm
+  # runtime lists no GPU; a runtime that does list it states the verdict itself
+  # (unit-tested in `examine/linux_gpus.rs`). The machine is simulated: a native
+  # Linux root whose `lspci` stand-in lists a nameless "Device 7fff" at 0000:c3:00.0 (an id no table
+  # knows, so the gap does not depend on one table entry), whose kernel
+  # topology has a gfx1151 node at that address, and whose `rocminfo` stand-in
+  # lists no GPU.
+  @id:examine-kernel-architecture-fills-an-unnamed-gpu @requires-os:linux
+  Scenario: examine-58 - A GPU the PCI listing cannot name takes the kernel's architecture and is reported as integrated
+    Given a machine whose PCI listing cannot name its GPU and whose kernel reports an integrated architecture for it
+    When the user inspects that machine in machine-readable form
+    Then the unnamed GPU is reported with the kernel's architecture, as an integrated GPU
+
+  # ROCMAI-40. Without a bus address in the ROCm runtime's listing, nothing says
+  # which card a reading belongs to. Pairing the readings with the listed GPUs
+  # by position would be a guess, and on a multi-GPU host a wrong guess puts one
+  # card's model name and architecture on another, so the readings are not
+  # applied to any GPU and the inspection says so. The machine is simulated: a
+  # native Linux root whose kernel topology has two GPUs, at 0000:03:00.0
+  # (gfx1100) and 0000:04:00.0 (gfx1101), an `lspci` stand-in that lists an
+  # empty bus, and a `rocminfo` stand-in that lists both GPUs in the same order
+  # and with the same architectures but prints no `BDFID:` line for either.
+  @id:examine-unaddressed-runtime-readings-are-reported-not-guessed @requires-os:linux
+  Scenario: examine-59 - GPU readings the ROCm runtime does not tie to a card are reported, not guessed
+    Given a machine with two AMD GPUs whose ROCm runtime lists both without saying which card is which
+    When the user inspects that machine in machine-readable form
+    Then each GPU is reported with its own architecture and no model name
+    And the inspection says the runtime's readings could not be matched to a listed GPU

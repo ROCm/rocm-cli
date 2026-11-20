@@ -16,9 +16,11 @@
 //! place.
 //!
 //! This file is the module root. The exit codes, [`FixOptions`] and [`FixClass`]
-//! live in `fix/options.rs`, and the consent decision, the timeouts and the
-//! `fail!` helper in `fix/consent.rs`; the names are re-exported from here, so
-//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving. The
+//! live in `fix/options.rs` and are re-exported from here, so
+//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving.
+//! `fix/consent.rs` holds the consent decision, the timeouts, the `fail!`
+//! helper, and the one way a runner runs a host command and reports how it
+//! ended (`run_step`, `Step`, `CheckIn`, `StepFailure`, `read_failure`). The
 //! runners, one per auto-applicable fix, are in `fix/runners.rs`. The closed
 //! catalog (`RECIPES`, `FixRecipe`, the lookups by fix-id and the test-only
 //! oracles) is in `fix/catalog.rs`, its rendering in `fix/render.rs` and its
@@ -39,15 +41,18 @@ use render::{
 };
 use std::io::Write;
 
-pub(crate) use catalog::{COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, is_catalog_id};
+pub(crate) use catalog::{
+    COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, RENDER_GROUP_VERIFY, is_catalog_id,
+};
 pub use catalog::{class_on, needs_on};
+pub use consent::{DRY_RUN_NOTICE, NON_INTERACTIVE_REFUSAL};
 pub use manifest::{
     CATALOG_CONTRACT_VERSION, CatalogManifest, ManifestEntry, ManifestPlatform, catalog_manifest,
     catalog_manifest_json,
 };
 pub use options::{FixClass, FixOptions, exit};
 pub(crate) use render::format_flags;
-pub use render::list_recipes;
+pub use render::{fix_plan_text, list_recipes};
 // The catalog's test-only oracles, which the `diagnose` module holds its own copies of
 // a recipe to.
 #[cfg(test)]
@@ -89,14 +94,17 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 /// [`Plan::Unfixable`] from [`Plan::PrintSteps`], and the difference matters —
 /// the second tells the user to copy commands, which an unfixable entry does not
 /// have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `PartialEq`: `Run` carries a function pointer, whose comparison is not
+// meaningful. Tests match on the variant instead.
+#[derive(Debug, Clone, Copy)]
 enum Plan {
     /// The entry does not apply on the running OS.
     WrongMachine,
     /// No reliable fix exists. Name the problem and change nothing.
     Unfixable,
-    /// Hand off to the recipe's runner.
-    Run,
+    /// Hand off to the recipe's runner, carried here so [`act_on`] cannot
+    /// reach this arm without one.
+    Run(fn(&FixOptions) -> i32),
     /// The catalog says the CLI carries this out, and nothing can.
     MissingRunner,
     /// Print the steps for the user to carry out.
@@ -116,8 +124,8 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
     // real work to do there -- it reads the live value and scans five rc files
     // to name the ones that set it. Gating the runner on the class would throw
     // that away and print a generic "copy the commands above" in its place.
-    if recipe.runner.is_some() {
-        return Plan::Run;
+    if let Some(runner) = recipe.runner {
+        return Plan::Run(runner);
     }
     if platform.class.applies_itself() {
         return Plan::MissingRunner;
@@ -159,13 +167,12 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
             println!("The explanation above is the whole of what is known about it.");
             exit::OK
         }
-        Plan::Run => recipe
-            .runner
-            .expect("plan_of returns Run only when a runner is present")(opts),
+        Plan::Run(runner) => runner(opts),
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
             // carry it out with -> INTERNAL, not FAILED (which is reserved for
-            // "attempted, and the command failed"). Held by
+            // "attempted, and a command or the read it planned from failed").
+            // Held by
             // `a_recipe_that_acts_has_a_runner`.
             fail!("Internal error: a recipe the catalog says is applied here has no runner.");
             exit::INTERNAL
@@ -239,15 +246,16 @@ mod tests {
         // an assertion on the code would survive the unfixable arm being
         // disabled, and the user would be told to copy commands that do not
         // exist. This is the part that only holds while the arm is reached.
-        assert_eq!(
-            plan_of(&unfixable_recipe(FixClass::DiagnoseOnly)),
-            Plan::Unfixable,
+        assert!(
+            matches!(
+                plan_of(&unfixable_recipe(FixClass::DiagnoseOnly)),
+                Plan::Unfixable
+            ),
             "DIAGNOSE-ONLY must not fall through to the print-the-steps path"
         );
         for actionable in [FixClass::Auto, FixClass::NeedsArgument, FixClass::PrintOnly] {
-            assert_ne!(
-                plan_of(&unfixable_recipe(actionable)),
-                Plan::Unfixable,
+            assert!(
+                !matches!(plan_of(&unfixable_recipe(actionable)), Plan::Unfixable),
                 "{actionable:?} has something to offer and must not be treated as unfixable"
             );
         }
@@ -292,7 +300,8 @@ mod tests {
         // (`FixClass::applies_itself`); a runner-less `NeedsArgument` entry only
         // prints steps, so it is not this path.
         let recipe = unfixable_recipe(FixClass::Auto);
-        assert_eq!(plan_of(&recipe), Plan::MissingRunner);
+        let plan = plan_of(&recipe);
+        assert!(matches!(plan, Plan::MissingRunner), "{plan:?}");
         assert_eq!(
             act_on(&recipe, &FixOptions::default()),
             exit::INTERNAL,
@@ -877,10 +886,12 @@ mod tests {
             "apply",
             "act_on",
             "run_render_group",
+            "render_group_with",
             "run_unset_override",
             "run_unset_override_linux",
             "report_persistent_override",
             "run_unset_override_windows",
+            "unset_override_windows_with",
             "report_and_clear_override_windows",
             "run_path_export",
             "run_path_export_linux",
@@ -890,6 +901,7 @@ mod tests {
             "run_hip_visible_devices_linux",
             "pin_device_in_rc_file",
             "run_hip_visible_devices_windows",
+            "hip_visible_devices_windows",
         ] {
             assert!(
                 scan.checked.iter().any(|name| name == runner),

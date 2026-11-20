@@ -40,6 +40,7 @@ pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
+pub mod owner_only_file;
 mod package_plan;
 pub mod paths;
 pub mod placeholder;
@@ -47,12 +48,14 @@ mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
+pub mod recovery_hint;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
 pub mod report_trend;
 pub mod rocm_install;
 pub mod runtime;
+pub mod runtime_rocdxg;
 pub mod service_identity;
 pub mod service_record;
 mod sigpipe;
@@ -61,6 +64,7 @@ pub mod user_path;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod foreign_temp_probe;
+pub mod tensorizer_override;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
@@ -90,11 +94,11 @@ pub use command_capture::{
     CommandCapture, CommandOutcome, command_capture_text, run_rocm_capture_with_env,
 };
 pub use config::{
-    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
-    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
-    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
-    WatcherUserConfig, builtin_watcher, builtin_watchers,
+    AutomationsConfig, BuiltinWatcherSpec, CONFIG_LOCK_TIMEOUT, ConfigLock, DashboardConfig,
+    DashboardDaemonConfig, DashboardTuiConfig, EngineUserConfig, ManagedToolConfig,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig,
+    RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig,
+    WatcherMode, WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
 pub use confirm::{interactive_terminal, require_yes_or_interactive};
 pub use crypto::{
@@ -102,10 +106,12 @@ pub use crypto::{
     verify_rsa_pkcs1_sha256_signature,
 };
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, Route, VLLM_IMPORT_CANONICAL_SYMPTOM,
+    DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
+    VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
     VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
-    render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
-    vllm_oom_symptom_is_diagnosable,
+    diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
+    render_report_text as render_diagnose_text, vllm_extension_load_symptom_is_diagnosable,
+    vllm_import_symptom_is_diagnosable, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
@@ -120,36 +126,38 @@ pub use download::{
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
-    engine_state_inference_verified, managed_service_endpoint_model_ready,
+    JSON_STATE_LOCK_FILE_NAME, JsonStateFileRefused, JsonStateRefusal, SERVE_STARTUP_DEADLINE,
+    engine_state_inference_verified, json_state_lock_path, managed_service_endpoint_model_ready,
     managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model,
+    openai_chat_completion_status, openai_models_endpoint_has_model, write_json_state_file,
 };
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
 pub use fix::{
-    CATALOG_CONTRACT_VERSION, CatalogManifest, FixOptions, ManifestEntry, ManifestPlatform,
-    apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
-    list_recipes as list_fix_recipes,
+    CATALOG_CONTRACT_VERSION, CatalogManifest, DRY_RUN_NOTICE, FixOptions, ManifestEntry,
+    ManifestPlatform, NON_INTERACTIVE_REFUSAL, apply as apply_fix, catalog_manifest,
+    catalog_manifest_json, exit as fix_exit, fix_plan_text, list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
     normalize_therock_family,
 };
 pub use hardware_root::host_path;
+pub use host_gpu::ldconfig_cache;
 pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
     WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
     detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
-    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
-    is_wsl_host, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
-    windows_amd_gpu_listing,
+    detect_host_gpu_summary, detect_host_unified_memory_gib, detect_system_ram_gib,
+    has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, preferred_serve_engine_for_host_gpu_summary,
+    usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
 use host_gpu::{
     detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
-    detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
+    detect_wsl_summary, is_wsl1_kernel, ldconfig_lists_librocdxg,
 };
 pub use jsonl_store::jsonl_lock_path;
 pub use log_tail::{
@@ -158,9 +166,11 @@ pub use log_tail::{
     tail_log_decoded,
 };
 pub use managed_runtime::{
-    FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
-    active_managed_therock_channel, active_managed_therock_environment,
-    active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
+    FrameworkInterpreter, ManagedRuntimeEnvironment, RUNTIME_COMPAT_DIR_NAME,
+    active_managed_framework_interpreter, active_managed_therock_channel,
+    active_managed_therock_environment, active_managed_therock_version, amd_smi_link_missing,
+    detect_managed_therock_family, ensure_amd_smi_compat, prepend_runtime_paths,
+    remove_stale_numa_shim, runtime_loader_path_entries, runtime_loader_path_entries_read_only,
 };
 use managed_runtime::{collect_sdk_library_paths, managed_therock_sdk_probe_candidates};
 pub use model_catalog::{
@@ -191,16 +201,16 @@ pub use proc_lifecycle::{
     terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
     terminate_verified,
 };
+#[cfg(windows)]
+pub use process::{
+    DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
+    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+};
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
     is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
     lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
     terminate_process_tree, windows_system_tool,
-};
-#[cfg(windows)]
-pub use process::{
-    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
-    wait_for_process_exit,
 };
 pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{
@@ -242,6 +252,9 @@ pub use service_record::{
     engine_stop_decides_confirmation,
 };
 pub use sigpipe::with_sigpipe_ignored;
+pub use tensorizer_override::{
+    TENSORIZER_PYTHON314_FIX, tensorizer_override_requirement, vllm_tensorizer_override_installed,
+};
 pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
@@ -254,6 +267,14 @@ pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
     vllm_oom_display_line,
 };
+
+/// E2E-only switch that makes `rocm serve`'s managed engine die during startup.
+///
+/// Honoured only by a `rocm` binary built with the `e2e-test-hooks` feature; a
+/// release build has no code that reads it. Defined here, rather than in the
+/// binary that reads it, because the E2E suite sets it from another crate: one
+/// constant both sides name cannot drift the way two copies of the string could.
+pub const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
 pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";
