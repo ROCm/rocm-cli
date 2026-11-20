@@ -20,7 +20,8 @@ use crate::E2eWorld;
 use e2e_cucumber::serve_log::service_log_tail;
 
 use crate::e2e::serving_steps::{
-    SERVE_BASE_URL, ensure_serve_port_free, host_serve_target, serve_timeout_for,
+    MODELS_URL, SERVE_BASE_URL, SERVE_PORT, ensure_serve_port_free, host_serve_target,
+    serve_timeout_for,
 };
 
 /// A public bind listens on all interfaces, so the test still reaches the shared
@@ -48,7 +49,7 @@ async fn try_models_status(bearer: Option<&str>) -> Option<reqwest::StatusCode> 
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client");
-    let mut request = client.get(format!("{}/models", endpoint_url()));
+    let mut request = client.get(MODELS_URL.as_str());
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
@@ -115,6 +116,9 @@ async fn serve_public_bind(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
     ensure_serve_port_free().await;
     // No `--api-key`: the CLI must GENERATE one, which is the behaviour under test.
+    // `--port` is required: automatic port selection is refused on any host other
+    // than 127.0.0.1 (networking-04), and the endpoint checks poll SERVE_PORT.
+    let port = SERVE_PORT.to_string();
     let stdout = crate::run_rocm_ok(
         world,
         &[
@@ -125,6 +129,8 @@ async fn serve_public_bind(world: &mut E2eWorld) {
             "--managed",
             "--host",
             "0.0.0.0",
+            "--port",
+            &port,
             "--allow-public-bind",
         ],
     );

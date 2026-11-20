@@ -136,7 +136,7 @@ async fn model_is_ready_with_key(
 /// [`SERVE_PORT`]), and the model listing readiness is judged by.
 pub(crate) static SERVE_BASE_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1"));
-static MODELS_URL: LazyLock<String> =
+pub(crate) static MODELS_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1/models"));
 
 /// The one-line verdict on a `--managed` serve that launched cleanly and then
@@ -301,7 +301,7 @@ async fn serve_and_wait_with_key(
 /// service lives in a different isolated dir, so this scenario's `rocm` can't
 /// stop it. Left unchecked, servers accumulate and oversubscribe the GPU until
 /// the job times out.
-const SERVE_PORT: u16 = 11435;
+pub(crate) const SERVE_PORT: u16 = 11435;
 
 /// The port the CLI's built-in local assistant (lemonade Qwen3-4B) listens on.
 /// The CLI auto-starts this assistant independently of any scenario; on Instinct
