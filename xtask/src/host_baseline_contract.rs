@@ -139,11 +139,11 @@ mod tests {
 
     /// Every file `the_ci_host_floor_is_the_documented_product_floor` reads
     /// runs it when that file alone changes: `cargo xtask affected` (and the
-    /// pre-push hook, which selects the same way) must pick xtask for it. A
-    /// Markdown file gets there through `CROSS_CRATE_READS` (cross_crate_reads.rs),
-    /// whose entries `every_cross_crate_read_is_in_the_rust_filter` also holds
-    /// to CI's `rust` path category, and a Rust file by belonging to a crate
-    /// xtask depends on.
+    /// pre-push hook, which selects the same way) must pick xtask for it. Each
+    /// gets there through its row of `CROSS_CRATE_READS` (cross_crate_reads.rs):
+    /// the Markdown files through `README.md`, `docs/` and `skills/`, the Rust
+    /// files through `*.rs`. `every_cross_crate_read_is_in_the_rust_filter`
+    /// also holds those rows to CI's `rust` path category.
     #[test]
     fn every_floor_file_selects_the_test_that_reads_it() {
         let graph = crate::affected::load_graph().expect("read the workspace graph");

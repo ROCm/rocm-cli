@@ -128,7 +128,7 @@ runs:
             # tests read and run (the e2e lane and GPU preflight scripts, the
             # release-readiness script, both installers, Dependabot's
             # configuration); `rocm` and the e2e crate read the installers
-            # too. Two xtask tests keep these entries and `lychee.toml` above
+            # too. Three xtask tests keep these entries and `lychee.toml` above
             # in place, in different ways.
             # `every_cross_crate_read_selects_its_reader` fails when a file a
             # test reads through a path written out at the call
@@ -138,10 +138,13 @@ runs:
             # only a command reads: not `.github/scripts/**`, which a test
             # reads through the `SHARED_PREFLIGHT` const, nor `lychee.toml`,
             # which the `cargo xtask lychee` command reads through
-            # `LYCHEE_CONFIG` rather than a test. For `.github/scripts/**` and
-            # `lychee.toml` only `every_path_category_glob_is_pinned_by_a_sample`
-            # fails, and it checks that the glob is here, not that anything
-            # reads the file.
+            # `LYCHEE_CONFIG` rather than a test.
+            # `scripts_xtask_tests_read_are_in_the_rust_filter` covers the
+            # scripts: it fails when a script under `scripts/` or
+            # `.github/scripts/` that an xtask source names, in a const or
+            # anywhere else, is missing from this category. For `lychee.toml`
+            # only `every_path_category_glob_is_pinned_by_a_sample` fails, and
+            # it checks that the glob is here, not that anything reads the file.
             - 'scripts/**'
             - 'install*'
             - '.github/scripts/**'
