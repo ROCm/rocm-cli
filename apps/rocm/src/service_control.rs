@@ -490,7 +490,7 @@ fn restart_launch_lock_timeout() -> Duration {
 }
 
 /// Replaces the child `spawn()` of a restart (non-Windows only; Windows spawns
-/// through `rocm_core::spawn_detached_with_log`, which is what puts the
+/// through `rocm_core::spawn_detached_with_log_watching_startup`, which puts the
 /// restarted child's stdout/stderr into the service log). Test-only seam, so a
 /// test can observe the leased port at the exact instant production would spawn.
 type RestartSpawnOverride<'a> =
@@ -659,13 +659,18 @@ fn restart_internal_managed_service_inner(
         // this, a restarted engine's own output — including the final error
         // chain a failing `__engine-serve-http` prints to stderr — reaches
         // nothing and is lost.
-        let child_pid = rocm_core::spawn_detached_with_log(
+        // Zero settle: this path runs its own
+        // `ensure_restarted_child_survives_startup` below, so the spawn's own
+        // watch would only duplicate it.
+        let child_pid = rocm_core::spawn_detached_with_log_watching_startup(
             &current_exe,
             &serve_args,
             &env_refs,
             &record.log_path,
+            std::time::Duration::from_millis(0),
         )
-        .context("failed to restart managed engine process")?;
+        .context("failed to restart managed engine process")?
+        .pid;
         (
             child_pid,
             rocm_core::ManagedChildLiveness::from_pid(child_pid),

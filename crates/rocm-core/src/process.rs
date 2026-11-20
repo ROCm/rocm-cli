@@ -1261,13 +1261,18 @@ mod tests {
 
         let comspec = std::env::var_os("COMSPEC")
             .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
-        let pid = spawn_detached_with_log(
+        // Zero settle: this test is about the log attachment, not the startup
+        // watch, and a child that is meant to exit immediately must not be
+        // reported as having died inside the window.
+        let pid = spawn_detached_with_log_watching_startup(
             Path::new(&comspec),
             &["/c".to_owned(), script.to_string_lossy().into_owned()],
             &[],
             &log_path,
+            std::time::Duration::from_millis(0),
         )
-        .expect("spawn the detached child");
+        .expect("spawn the detached child")
+        .pid;
 
         let exit_code = wait_for_process_exit(pid).expect("wait for the detached child");
         let log = fs::read(&log_path).map_or_else(

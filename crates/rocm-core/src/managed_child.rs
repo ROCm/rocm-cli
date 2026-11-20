@@ -209,7 +209,7 @@ mod tests {
     /// scenarios run on the Linux no-GPU lane, where the Unix arm does the
     /// work. So without this, the half of the liveness check that decides
     /// crash-vs-starting on the reported platform had nothing exercising it,
-    /// while its sibling (`spawn_detached_with_log`) did.
+    /// while its sibling (`spawn_detached_with_log_watching_startup`) did.
     ///
     /// No reaping is involved here: the Windows arm reads the real exit code
     /// through `OpenProcess`/`GetExitCodeProcess`, so the contract is simply

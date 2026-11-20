@@ -853,7 +853,7 @@ pub(crate) fn mark_service_failed(manifest_path: &Path, engine_state_path: &Path
 /// renders, the exit really is unexplained — i.e. a crash. The service log is
 /// the only record of why, since the child is detached and writes nowhere else
 /// — platform-generic since ROCMAI-541 attaches it on Windows too (see
-/// `spawn_detached_with_log`).
+/// `spawn_detached_with_log_watching_startup`).
 pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
     let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
