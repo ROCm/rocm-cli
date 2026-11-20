@@ -85,4 +85,12 @@ mod tests {
         assert!(version_in(text, "absent").is_err());
         assert!(version_in("[runtime.lemonade]\n", "lemonade").is_err());
     }
+
+    #[test]
+    fn rejects_a_version_that_is_not_a_string() {
+        // `version = 11.5` parses as a float: the pin must be text, as the
+        // product's build script reads it, so this is an error, not "11.5".
+        let error = version_in("[runtime.lemonade]\nversion = 11.5\n", "lemonade").unwrap_err();
+        assert!(error.contains("no string `version`"), "{error}");
+    }
 }
