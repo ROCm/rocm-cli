@@ -1145,7 +1145,7 @@ Feature: Interactive dashboard
   # does not show. Two served models at twelve rows is past what even the grown
   # popup holds, so this is the overflow case on real geometry rather than a
   # fabricated one. The unit test
-  # `a_body_that_still_overflows_a_short_screen_says_so_and_keeps_the_buttons`
+  # `a_body_that_still_overflows_says_so_and_names_the_keys`
   # pins the same rule against a synthetic body; this proves a user can actually
   # reach it.
   @id:dash-quit-confirm-overflow-names-its-keys @requires-os:linux
