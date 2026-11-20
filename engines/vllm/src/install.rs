@@ -940,8 +940,7 @@ fn vllm_rocm10_discover_remaining_install_args(
 /// need the same `ignore-error-codes` treatment here. There is no CLI flag or
 /// env var for it, only this config file.
 fn write_vllm_index_uv_config(paths: &AppPaths, build: &VllmRocmDiscoverBuild) -> Result<PathBuf> {
-    std::fs::create_dir_all(&paths.cache_dir)
-        .with_context(|| format!("failed to create {}", paths.cache_dir.display()))?;
+    rocm_core::create_marked_root(&paths.cache_dir)?;
     let path = paths.cache_dir.join("vllm-rocm10-uv.toml");
     let contents = format!(
         "[[index]]\nurl = \"{}\"\nignore-error-codes = [403]\n",
@@ -2530,6 +2529,34 @@ fi
         assert!(
             contents.contains("ignore-error-codes = [403]"),
             "{contents}"
+        );
+        // It created the cache folder, so it marked it as ROCm CLI's own.
+        assert!(
+            paths
+                .cache_dir
+                .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+                .is_file()
+        );
+        Ok(())
+    }
+
+    /// A cache folder that already existed is not claimed as ROCm CLI's own.
+    #[test]
+    fn write_vllm_index_uv_config_leaves_an_existing_cache_folder_unmarked() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        std::fs::create_dir_all(&paths.cache_dir)?;
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+        write_vllm_index_uv_config(&paths, build)?;
+        assert!(
+            !paths
+                .cache_dir
+                .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+                .exists()
         );
         Ok(())
     }
