@@ -1752,29 +1752,6 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
     }
 }
 
-/// The human-readable twin of the machine-readable planted-machine step, for
-/// scenarios whose subject is a sentence the report prints rather than a field
-/// it serialises.
-///
-/// It has to be its own step rather than reusing "the user inspects the
-/// system", because that one runs through `run_rocm`, which does not consume
-/// `World::command_env` -- so a planted host root never reaches the child and
-/// the CLI silently describes the *runner* instead. A scenario wired to that
-/// step still passes while reporting the lane's own GPU (`gfx942` on the MI300X
-/// runners) under a claim about a planted Renoir APU, so examine-61/57/58 must
-/// use this one.
-/// `rocm engines` against a *planted* host.
-///
-/// Distinct from "the user lists available engines" because that step uses
-/// `run_rocm`, which does not carry the scenario's `command_env` — so a planted
-/// host root would never reach the child and the listing would describe the
-/// runner instead.
-#[when("the user lists available engines on that machine")]
-async fn user_lists_engines_on_planted_machine(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm_with_scenario_env(world, &["engines", "list"]);
-    world.cli_output = Some(stdout);
-}
-
 #[when("the user inspects that machine")]
 async fn user_inspects_planted_machine_text(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -4416,54 +4393,6 @@ async fn assert_vulkan_offered(world: &mut E2eWorld) {
     assert!(
         output.contains("vulkan: available"),
         "the machine-readable line must agree with the sentence:\n{output}"
-    );
-}
-
-/// `rocm engines`' one-line GPU banner, asserted against a *planted* host
-/// rather than a hand-picked `GpuSupportLevel` literal.
-///
-/// The unit tests for `gpu_execution_line` pass the level in directly, so they
-/// prove the mapping but not that any real probe reaches it. These two steps
-/// close that: the level is whatever the probe derives from the planted
-/// machine, and the banner is read out of real `rocm engines list` output.
-///
-/// Note this is a `rocm engines` surface, not a `rocm examine` one — `examine`'s
-/// own `engine_inventory:` block is built by a different function
-/// (`append_examine_engine_inventory`) that does not print this banner. Hence a
-/// separate scenario rather than another Then on examine-61.
-///
-/// A differential pair on purpose: each asserts its own sentence is present
-/// *and* the other's is absent, so merging the `VulkanOnly` arm into the shared
-/// no-backend arm fails one of the two instead of staying green.
-#[then("the engine list says the GPU path on this machine is Vulkan rather than ROCm")]
-async fn assert_banner_names_vulkan_as_the_gpu_path(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
-    assert!(
-        output.contains(
-            "GPU execution is required; on this GPU that is the Vulkan backend, not ROCm."
-        ),
-        "a Vulkan-only host's banner must name Vulkan as the GPU path:\n{output}"
-    );
-    assert!(
-        !output.contains("GPU execution is required; CPU execution is not supported."),
-        "the no-usable-backend banner must not also be printed for a Vulkan-only host:\n{output}"
-    );
-}
-
-#[then("the engine list says a GPU is required and the CPU is not an alternative")]
-async fn assert_banner_refuses_cpu_without_naming_a_backend(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
-    assert!(
-        output.contains("GPU execution is required; CPU execution is not supported."),
-        "a host with no established backend must still be refused the CPU:\n{output}"
-    );
-    assert!(
-        !output.contains("ROCm GPU execution is required."),
-        "no ROCm claim may be made for a host whose ROCm support was never established:\n{output}"
-    );
-    assert!(
-        !output.contains("that is the Vulkan backend, not ROCm."),
-        "no Vulkan claim may be made for a host whose Vulkan support is not established:\n{output}"
     );
 }
 

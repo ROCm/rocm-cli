@@ -994,29 +994,19 @@ Feature: GPU detection and system inspection
     And the inspection does not say a Vulkan driver is missing
     And the inspection names the installed Vulkan driver it could not confirm
 
-  # The `rocm examine` scenarios above cover the `rocm_support:` line. This pair
-  # covers the OTHER surface the same support level drives: the one-line banner
-  # at the top of `rocm engines`, which states whether a GPU is required and
-  # which backend supplies it.
+  # NOT covered end to end: the one-line banner at the top of `rocm engines`.
   #
-  # It needs its own scenario rather than another Then on examine-61, because a
-  # planted fixture reaches exactly one child process -- the scenario's
-  # `command_env` is moved into the first command it runs -- so a second command
-  # in the same scenario would read the runner's real host, not the planted one.
+  # A pair of scenarios was written for it and removed again. They planted a GPU
+  # the official stack rejects and differed only in whether a Vulkan driver
+  # answered, on the premise that the banner would say "Vulkan" for one and
+  # "a GPU is required" for the other. It cannot: `rocm engines` resolves its
+  # level through `host_gpu_support_level`, which passes
+  # `VulkanStatus::Unknown` on purpose so the listing stays cheap and never
+  # spawns `vulkaninfo`. Both hosts therefore read `VulkanOnly` from the gfx
+  # table alone. The no-driver arm failed, and the driver arm passed for a
+  # reason that had nothing to do with the driver it planted.
   #
-  # Until now that banner was only ever unit-tested against hand-picked
-  # `GpuSupportLevel` literals, so nothing proved a real probed host reaches its
-  # wording. The pair is the test: both plant a GPU the official stack rejects
-  # and differ only in whether a Vulkan driver answers, so merging the
-  # Vulkan-only arm into the shared no-backend arm fails one of the two.
-  @id:examine-engines-banner-names-vulkan @requires-os:linux
-  Scenario: examine-66 - The engine list tells a Vulkan-only machine which backend its GPU work runs on
-    Given a machine whose GPU has no official support but has a working Vulkan driver
-    When the user lists available engines on that machine
-    Then the engine list says the GPU path on this machine is Vulkan rather than ROCm
-
-  @id:examine-engines-banner-refuses-the-cpu @requires-os:linux
-  Scenario: examine-67 - The engine list still refuses the CPU on a machine with no usable GPU backend
-    Given a machine whose GPU has no official support and no Vulkan driver
-    When the user lists available engines on that machine
-    Then the engine list says a GPU is required and the CPU is not an alternative
+  # So the banner's wording stays unit-tested against `GpuSupportLevel`
+  # literals. Covering it end to end means either driving `rocm examine`'s
+  # banner (it does probe) or giving the listing a probe, which is the cost
+  # decision recorded on `host_gpu_support_level`.
