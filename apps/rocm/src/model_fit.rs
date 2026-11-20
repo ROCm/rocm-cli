@@ -241,6 +241,10 @@ pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
         // did not is one this listing leaves unfiltered either way.
         vram.is_some(),
         rocm_core::usable_amd_gpu_indices().as_deref(),
+        // The same read `host_accelerator_memory` makes, for the same reason:
+        // the classifier is a pure function of its arguments, so the aperture
+        // has to be supplied here rather than looked up inside it.
+        rocm_core::detect_host_unified_memory_gib(),
     );
     let gpu_gib = match accelerator {
         AcceleratorMemory::Dedicated(gib) => Some(gib),
