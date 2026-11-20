@@ -555,9 +555,9 @@ jobs:
   e2e-gpu-queue:
     name: E2E tests (MI300X, queue)
     runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API and copies files
-    # The queue run's own limit is 170 min; the dispatch and the download add
-    # minutes.
-    timeout-minutes: 180
+    # The queue run's own limit is 286 min; the dispatch and the download add
+    # 10 min: 296. A GitHub-hosted job ends at 360 min whatever is set here.
+    timeout-minutes: 296
     needs: [changes]
     permissions:
       actions: write

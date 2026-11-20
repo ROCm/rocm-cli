@@ -925,6 +925,58 @@ outcome for the stopping process itself; the JSON answer of the sandbox
 `stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
 as stopped).
 
+**An engine that dies at startup.** On Windows and Linux alike, a managed
+engine that exits within its first 200 ms fails `rocm serve --managed`
+instead of reporting a server that is still starting.
+To see it without a broken engine, build the CLI with its test hooks and arm
+the scripted death, which makes the spawned engine reject its arguments:
+
+```powershell
+cargo build -p rocm --features e2e-test-hooks
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"
+./target/debug/rocm serve qwen --engine lemonade --managed
+./target/debug/rocm services list --all
+```
+
+Expected result:
+
+- The serve exits non-zero with `managed engine exited immediately with status
+  ...; inspect <log path>`, where `<log path>` is the service's own log, plus a
+  tail of that log when the engine wrote anything to it. On Windows the status
+  is the engine's exit code too.
+- `rocm services list --all` shows the attempt as `stopped`. Running the same
+  `rocm serve` again fails again with the same `managed engine exited
+  immediately ...` error, rather than reporting the earlier attempt as already
+  running, and `rocm services list --all` then shows two `stopped` records.
+- An engine that dies later than that — while loading its runtime or model —
+  is not caught by this check; the serve then waits for readiness and reports
+  the service as still starting, as before.
+
+Unset the variable afterwards; a build without `--features e2e-test-hooks`
+ignores it.
+
+To see the stop-during-start case, run `rocm serve <model> --managed` in one
+terminal and, while it is still waiting for the server, `rocm services stop
+<service-id> --yes` from another. The serve exits non-zero with an error that
+begins "a stop was requested for managed service `<service-id>` while it was
+starting". Which advice follows depends on how far the stop has got:
+
+- If the stop has finished, the record reads `stopped`, `rocm services list
+  --all` shows the service as `stopped`, and the error ends "start it again with
+  `rocm serve`".
+- If the stop is still running (it can take tens of seconds), the record still
+  reads as live (`starting`, `running` or `ready`), and a new `rocm serve` for
+  the same model would reuse the service being stopped. The error then names
+  `rocm services stop <service-id> --yes` to run first. It waits for the
+  processes; once it reports the service stopped, `rocm services list --all`
+  shows `stopped` and `rocm serve` launches anew. A stop that cannot confirm the
+  processes gone says so and leaves the service live.
+
+This is the usual result, not a certain one: the launch reads the record and
+writes its readiness verdict as two separate steps, and a stop takes no lock on
+the record, so a stop that lands between the two is overwritten by the verdict
+and the serve reports the server as it found it.
+
 #### Windows host check
 
 The Windows build-and-test job runs the workspace unit tests, which include two
@@ -1270,6 +1322,51 @@ icacls <data>\remote-sessions\<session-id>.endpoint-key
 Expected result: exactly one entry, for your own account, with `(F)` and no
 `(I)` (inherited) flag — no `Administrators`, `SYSTEM`, `Users` or
 `Authenticated Users` entry, even when `<data>` is a folder those can read.
+
+#### Remote session records
+
+`rocm remote` keeps one record per session under `<data>/remote-sessions/`.
+These checks need no second machine. On Linux, after any `rocm remote serve`
+(or with a record copied in by hand), check the directory's mode:
+
+```bash
+stat -c '%a %U' <data>/remote-sessions
+```
+
+Expected result: `700` and your user name.
+
+Then make a record unusable and list the sessions. Copy a record aside first;
+these steps edit it:
+
+```bash
+cp <data>/remote-sessions/<session-id>.json /tmp/record.json
+sed -i 's/"remote_cli": *"[^"]*"/"remote_cli": "rocm; true #"/' \
+  <data>/remote-sessions/<session-id>.json
+rocm remote status
+rocm remote stop <session-id>
+```
+
+Expected result:
+
+- `status` prints `warning: ignoring a remote session record: refusing to act
+  on <path>: remote session names an unexpected remote CLI "rocm; true #"`,
+  with the remedy to set `"remote_cli"` back to `"rocm"` or
+  `"$HOME/.local/bin/rocm"`. It does not say `No remote sessions have been
+  started`; it says `1 remote session record(s) were refused` and that the
+  machine may still be serving a model. It exits 0 (scenario `remote-17`).
+- `stop` names the same record, exits non-zero and leaves the file in place
+  (scenario `remote-18`).
+- Following the remedy (set `"remote_cli"` back, or restore the copy) makes
+  `status` list the session again.
+- With a second record for the same machine on another port, `rocm remote stop
+  <short machine name>` and `rocm remote stop <full peer name>` are refused as
+  matching the refused record too, and stop nothing (scenarios `remote-21`,
+  `remote-22`).
+- Renaming the record to another session's name, or replacing it with a FIFO
+  (`mkfifo <data>/remote-sessions/x.json`), makes `status` refuse it and
+  return at once rather than hang.
+- Run as root with `sudo -E rocm remote status`, the records are refused as
+  owned by another user, with advice to run `rocm remote` as that user.
 
 ### 4a. Dashboard Doctor Report
 
@@ -1936,6 +2033,16 @@ Expected result:
 - The plan still asks for review before mutating actions.
 - `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
+- A plan whose command carries a value a Windows shell reads as syntax inside
+  single quotes, such as `'`, `&` or `%` (the full set is in
+  [llm-tool-use.md](llm-tool-use.md)), is not shown:
+  the CLI falls back to its own plan and its note says to supply that value
+  yourself. The same holds for `rocm chat --tools --prompt …`, where the
+  assistant's request is refused with that message on stderr and no
+  `advanced manual command:` line is printed. A folder in a request the CLI
+  recognises itself (`install therock into D:\R&D\rocm`) is shown as typed;
+  in other wording the folder reaches the CLI through the assistant's request
+  and is refused like any value the assistant chose.
 
 To turn provider-assisted planning back off:
 
@@ -1995,6 +2102,10 @@ Expected result:
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
   on that folder. It adds no line about how to remove anything (scenario
   `uninstall-09`).
+- With a `rocm remote` session record that is refused (see *Remote session
+  records* in section 4), the dry run warns that it `could not be used and may
+  still name models running on remote machines`, names the file, and says
+  `rocm remote stop` cannot reach it (scenario `uninstall-18`).
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
   is not an option and points to `--yes`, and ends with a `Try:` line that is
   your command with `--yes` in place of `--force` (scenario `uninstall-17`); a near miss such as `--forc` is an
@@ -2436,7 +2547,7 @@ Expected result:
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
 
-## 18. Settings Changed From Several Terminals At Once
+## 19. Settings Changed From Several Terminals At Once
 
 Commands that change settings take turns on `config.json`, so none of them
 undoes another's change. Scenario `config-12` checks this on the mock lane; this
@@ -2510,3 +2621,53 @@ Expected result:
 - Each loop prints `lost 0, failed 0`.
 - The scratch config folder lists `config.json` and `config.json.lock`; the
   lock file is expected and stays beside the settings.
+
+## 20. Curated Models Narrowed To This Machine
+
+Needs two hosts to be meaningful, **both with discrete GPUs**: one large (an
+MI300X) and one small (a 16 GiB Radeon or similar). The mock lane covers the
+logic with a forced memory figure; what it cannot do is read a real machine.
+
+An integrated GPU is deliberately *not* one of them yet. `rocm` classifies an
+APU's shared pool as unreadable rather than as a memory figure, so an APU takes
+the unmeasured branch below and its listing is **unchanged** by this check. That
+is the honest current behaviour, not an oversight: reading the pool is
+`rocmai-912` / #1054's `Unified { gtt_total_gib }`, and narrowing an APU on a
+figure nothing measured would be the invented claim this whole area exists to
+remove. Re-point this section at an APU once that lands.
+
+```bash
+rocm model
+```
+
+Expected result, on the large host:
+
+- The large models are still listed — the 54 GiB and 62 GiB recipes appear, not
+  only the small ones.
+- The listing ends with `Narrowed to what this machine can run`, possibly
+  followed by a count of further models that also fit.
+
+Expected result, on the small host:
+
+- The models listed are ones this machine's GPU memory can hold. On a 16 GiB
+  discrete card that means the smaller recipes, and none of the 17 GiB-and-larger
+  ones.
+- No row says `needs a larger GPU`: a recommendation and a refusal cannot both
+  be true of the same row.
+
+Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
+a GPU the CLI cannot measure, **or any APU** — see above):
+
+- The list is *not* narrowed, and ends with `This machine's GPU memory could not
+  be read, so these are not filtered to what it can run.` An unmeasured machine
+  must not be told its options are narrow.
+
+Then ask the assistant the same question, which must get the same answer:
+
+```bash
+echo '{"args":["model"]}' > args.json
+rocm mcp-call rocm_command --arguments-file args.json
+```
+
+- The recipes listed match what `rocm model` printed in the terminal, narrowing
+  and closing note included.

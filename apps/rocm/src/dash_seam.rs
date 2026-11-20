@@ -61,6 +61,34 @@ impl RocmToolExecutor for BinToolExecutor {
         }
     }
 
+    /// The dashboard agent's own tool calls. The approval body built by
+    /// [`Self::execute`] shows the command line, which the operator may copy,
+    /// so a model-chosen value is held to `validate_model_chosen_tool_call`
+    /// first; a slash command the operator typed goes to [`Self::execute`]
+    /// directly and is not.
+    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: name.to_owned(),
+            arguments: args.clone(),
+        };
+        if let Err(e) = chat::validate_chat_tool_call(&call)
+            .and_then(|()| chat::validate_model_chosen_tool_call(&call))
+        {
+            return RocmToolOutcome::Error(e.to_string());
+        }
+        let outcome = self.execute(name, args);
+        // The plan for a request the model wrote holds values the model chose
+        // on its `tool_call:` lines, so it is checked before it is shown.
+        if name == "natural_language_plan"
+            && let RocmToolOutcome::Result(value) = &outcome
+            && let Err(e) = chat::validate_model_chosen_plan_result(value)
+        {
+            return RocmToolOutcome::Error(e.to_string());
+        }
+        outcome
+    }
+
     fn execute_approved(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome {
         // Replay the approved mutating call via the captured-subprocess path
         // (`allow_mutation = true`). `run_internal_mcp_call` re-validates the
@@ -156,6 +184,98 @@ mod tests {
             }
             other => panic!("expected ApprovalRequired for `install_sdk`, got {other:?}"),
         }
+    }
+
+    /// A safe call the dashboard agent makes reaches the same outcome as the
+    /// operator's: the model-only checks refuse, and otherwise change nothing.
+    /// A read-only tool returns its result (only `natural_language_plan`'s
+    /// result is read as a plan), a mutating one is staged for approval, and a
+    /// plan with nothing unsafe in it is shown.
+    #[test]
+    fn seam_passes_a_safe_model_call_through_like_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        match exec.execute_model_call("engines", &serde_json::json!({})) {
+            RocmToolOutcome::Result(v) => assert!(
+                v.pointer("/structuredContent/engines")
+                    .is_some_and(serde_json::Value::is_array),
+                "{v}"
+            ),
+            other => panic!("a safe read-only model call must run, got {other:?}"),
+        }
+        let install = serde_json::json!({
+            "channel": "release",
+            "format": "wheel",
+            "prefix": "/tmp/rocm-seam-model-prefix",
+        });
+        match exec.execute_model_call("install_sdk", &install) {
+            RocmToolOutcome::ApprovalRequired(intent) => assert_eq!(intent.name, "install_sdk"),
+            other => panic!("a safe mutating model call must be staged, got {other:?}"),
+        }
+        let plan = serde_json::json!({ "request": "install therock into /mnt/rocm" });
+        match exec.execute_model_call("natural_language_plan", &plan) {
+            RocmToolOutcome::Result(v) => assert!(
+                v.pointer("/structuredContent/planned_args")
+                    .is_some_and(serde_json::Value::is_array),
+                "{v}"
+            ),
+            other => panic!("a safe plan must be shown, got {other:?}"),
+        }
+    }
+
+    /// The dashboard agent's own call is held to the model-only rules, so a
+    /// folder with `&` in it never reaches the approval body the operator may
+    /// copy; the same folder typed by the operator (`/install <prefix>`, which
+    /// goes through `execute`) is theirs and is staged for approval.
+    #[test]
+    fn seam_refuses_a_model_chosen_value_but_not_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let args = serde_json::json!({
+            "channel": "release",
+            "format": "wheel",
+            "prefix": "/tmp/rocm-seam R&D",
+        });
+        match exec.execute_model_call("install_sdk", &args) {
+            RocmToolOutcome::Error(error) => assert!(
+                error.contains("supply it yourself by running `rocm install sdk`"),
+                "{error}"
+            ),
+            other => panic!("a model-chosen `&` must be refused, got {other:?}"),
+        }
+        match exec.execute("install_sdk", &args) {
+            RocmToolOutcome::ApprovalRequired(intent) => assert!(
+                intent
+                    .body
+                    .iter()
+                    .any(|line| line.contains("--prefix '/tmp/rocm-seam R&D'")),
+                "{:?}",
+                intent.body
+            ),
+            other => panic!("the operator's own folder must be staged, got {other:?}"),
+        }
+    }
+
+    /// A request the dashboard agent hands to the planner is the model's, so
+    /// the plan it comes back as is checked before the dashboard shows it; the
+    /// same request typed by the operator (`/plan`, through `execute`) is not.
+    #[test]
+    fn seam_refuses_a_plan_for_a_model_request_but_not_the_operators_own() {
+        let exec = BinToolExecutor::new(temp_paths());
+        let args = serde_json::json!({ "request": "install therock into /mnt/R&D/rocm" });
+        match exec.execute_model_call("natural_language_plan", &args) {
+            RocmToolOutcome::Error(error) => assert!(
+                error.starts_with("the plan for the local assistant's request")
+                    && error.contains("'&'"),
+                "{error}"
+            ),
+            other => panic!("the model's plan must be refused, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                exec.execute("natural_language_plan", &args),
+                RocmToolOutcome::Result(_)
+            ),
+            "the operator's own request is planned"
+        );
     }
 
     #[test]

@@ -13734,14 +13734,37 @@ esac
         );
     }
 
-    /// The job's time limit, the lanes' wait and run limits and what the doc and
-    /// the workflow comment say of them move together: a lane may wait its whole
-    /// wait limit and then run its whole run limit, and the job's limit must
-    /// leave the 30 minutes finishing and publishing a run can take after both.
+    /// The nightly's lane wait and run limits, in seconds, as the doc's run inputs
+    /// give them, and the text the doc and `queue-run.yml`'s comment say of them.
+    /// The job's time limit follows from them in
+    /// `the_queue_job_timeouts_cover_the_publish_commands_bound`.
     #[test]
-    fn the_queue_run_timeout_covers_the_wait_and_run_limits_the_doc_gives() {
+    fn the_queue_run_limits_in_the_doc_and_the_workflow_comment_agree() {
         let doc = docs_nightly_on_the_queue();
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (wait_secs, run_secs) = queue_run_limits(&flat);
+        let wait_text = format!("{} h {} min", wait_secs / 3600, wait_secs % 3600 / 60);
+        assert!(flat.contains(&wait_text), "the doc must say {wait_text}");
+        let run_text = format!("{} h", run_secs / 3600);
+        assert_eq!(run_secs % 3600, 0, "the run limit is whole hours");
+        assert!(
+            flat.contains(&format!("{run_text} ({run_secs} s")),
+            "the doc's start section must give the run limit as {run_text} ({run_secs} s"
+        );
+        let text = read_workflow("queue-run.yml");
+        assert!(
+            text.contains(&format!("{wait_secs} s ({wait_text})")),
+            "queue-run.yml's comment must give the wait as {wait_secs} s ({wait_text})"
+        );
+        assert!(
+            text.contains(&format!("{run_text} counted from its start")),
+            "queue-run.yml's comment must give the run limit as {run_text}"
+        );
+    }
+
+    /// The nightly's lane wait and run limits as the doc's run inputs give them,
+    /// in seconds, each also in the doc's start section.
+    fn queue_run_limits(flat: &str) -> (u64, u64) {
         // The wait limit as the run inputs give it: the bullet "- the wait — ...
         // at most N seconds", anchored on the bullet's own opening like the run
         // limit below, so no earlier "at most N" in the doc can be picked up.
@@ -13772,49 +13795,127 @@ esac
             flat.contains(&format!("({run_secs} s")),
             "the doc's start section must give the same run limit"
         );
-        let run_text = format!("{} h", run_secs / 3600);
-        assert_eq!(run_secs % 3600, 0, "the run limit is whole hours");
-        assert!(
-            flat.contains(&format!("{run_text} ({run_secs} s")),
-            "the doc's start section must give the run limit as {run_text} ({run_secs} s"
-        );
-        let text = read_workflow("queue-run.yml");
-        assert!(
-            text.contains(&format!("{wait_secs} s ({wait_text})")),
-            "queue-run.yml's comment must give the wait as {wait_secs} s ({wait_text})"
-        );
-        assert!(
-            text.contains(&format!("{run_text} counted from its start")),
-            "queue-run.yml's comment must give the run limit as {run_text}"
-        );
-        let timeout_minutes: u64 = text
-            .lines()
-            .find_map(|line| line.strip_prefix("    timeout-minutes: "))
-            .expect("queue-run.yml's job has timeout-minutes")
-            .trim()
+        (wait_secs, run_secs)
+    }
+
+    /// The most seconds the publish command asks for a run and follows it, for
+    /// lanes that wait at most `wait_secs` to be started and run at most
+    /// `run_secs`. The command is kept with the queue side, outside this
+    /// repository, so its constants are written out here and in the doc, and this
+    /// is the one place that sums them: the start asked again for 3600 s, a pause
+    /// of 30 s and one last start call of 600 s; the wait for the run (the two
+    /// limits, 120 s for a cancelled lane to stop, 600 s for a passed lane's
+    /// files, one poll of 60 s and one finish of 1800 s); then one more poll, one
+    /// status call (60 s each) and a last finish.
+    fn publish_bound_secs(wait_secs: u64, run_secs: u64) -> u64 {
+        PUBLISH_START_SECS + publish_follow_secs(wait_secs, run_secs) + 60 + 60 + 1800
+    }
+
+    /// The start, asked again for 3600 s, a pause of 30 s and one last call of 600 s.
+    const PUBLISH_START_SECS: u64 = 3600 + 30 + 600;
+
+    /// The wait for a run, in the sum above.
+    fn publish_follow_secs(wait_secs: u64, run_secs: u64) -> u64 {
+        wait_secs + run_secs + 120 + 600 + 60 + 1800
+    }
+
+    /// The `timeout-minutes` of the one job block it is given.
+    fn job_timeout_minutes(block: &str) -> u64 {
+        job_scalar(block, "timeout-minutes")
             .parse()
-            .expect("timeout-minutes is a number");
+            .expect("timeout-minutes is a number")
+    }
+
+    /// A job that waits on the queue side must outlast the publish command: past
+    /// its time limit GitHub cuts the job off, the lane reads as cancelled and
+    /// nothing is published. Each run job's limit is the command's bound, rounded
+    /// up to a minute, plus the 20 minutes its comment names for the runner's own
+    /// delays; the gate job's is the pull request run's plus 10 minutes, and a
+    /// GitHub-hosted job ends at 360 minutes whatever it says.
+    #[test]
+    fn the_queue_job_timeouts_cover_the_publish_commands_bound() {
+        let doc = docs_nightly_on_the_queue();
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let margin = 20;
+        let mut run_timeouts = Vec::new();
+        // The lanes' wait and run limits: the nightly's are read from the doc's
+        // run inputs; a pull request's are the preset in the doc's "Pull requests"
+        // section, checked below.
+        let (nightly_wait, nightly_run) = queue_run_limits(&flat);
+        for (file, wait_secs, run_secs) in [
+            ("queue-run.yml", nightly_wait, nightly_run),
+            ("queue-pr-run.yml", 45 * 60, 75 * 60),
+        ] {
+            let bound_secs = publish_bound_secs(wait_secs, run_secs);
+            let follow_secs = publish_follow_secs(wait_secs, run_secs);
+            let bound = bound_secs.div_ceil(60);
+            let timeout = bound + margin;
+            let text = read_workflow(file);
+            assert_eq!(
+                job_timeout_minutes(job_block(&text, "run")),
+                timeout,
+                "{file}: timeout-minutes must be the publish command's {bound_secs} s bound ({bound} min) plus {margin} min"
+            );
+            // The comment's words, joined past the line breaks, from the bound to
+            // the timeout line: the totals it gives are the derived ones and the
+            // sentence ends at `timeout-minutes`, so a stale total cannot sit in
+            // the stretch the test reads.
+            let comment = text
+                .lines()
+                .map(|line| line.trim().trim_start_matches("# "))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let needed = format!(
+                "the publish command gives up after {bound} min at the latest (docs/nightly-on-the-queue.md has the sum). {margin} min are margin for the runner's own delays and the upload: {timeout} min. timeout-minutes: {timeout}"
+            );
+            assert!(
+                comment.contains(&needed),
+                "{file}: the comment above timeout-minutes must say: {needed}"
+            );
+            // The doc gives the same sums, step by step.
+            for needed in [
+                format!("the whole is {bound_secs} s, {bound} min"),
+                format!("`timeout-minutes` is {timeout}"),
+                format!("the wait is {follow_secs} s"),
+                format!("({PUBLISH_START_SECS} s)"),
+            ] {
+                assert!(
+                    flat.contains(&needed),
+                    "docs/nightly-on-the-queue.md must say, for {file}: {needed}"
+                );
+            }
+            run_timeouts.push(timeout);
+        }
         assert!(
-            timeout_minutes * 60 >= wait_secs + run_secs + 30 * 60,
-            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait and a {run_secs} s run"
+            flat.contains("lane that waits at most 45 minutes to be started and runs at most 75"),
+            "the doc must give a pull request's lane limits, 45 and 75 min, which the bound above uses"
         );
-        // What the timeout holds beyond the two limits and the 30 minutes: the
-        // margin the comment names. Derived, so it cannot drift from the number.
+        let selfhosted = read_workflow("e2e-selfhosted.yml");
+        let gate = job_timeout_minutes(job_block(&selfhosted, "e2e-gpu-queue"));
+        let pr_run = run_timeouts[1];
         assert_eq!(
-            (wait_secs + run_secs) % 60,
-            0,
-            "the limits are whole minutes"
+            gate,
+            pr_run + 10,
+            "e2e-gpu-queue waits for queue-pr-run.yml: its timeout-minutes is that job's {pr_run} plus 10"
         );
-        let margin_minutes = timeout_minutes - (wait_secs + run_secs) / 60 - 30;
-        // The comment's last lines and the timeout line, exactly: a stale total or
-        // margin anywhere else in the file cannot satisfy this.
+        for needed in [
+            format!("The queue run's own limit is {pr_run} min;"),
+            format!("add\n    # 10 min: {gate}. A GitHub-hosted job ends at 360 min"),
+        ] {
+            assert!(
+                selfhosted.contains(&needed),
+                "e2e-selfhosted.yml: the comment above e2e-gpu-queue's timeout-minutes must say: {needed}"
+            );
+        }
         assert!(
-            text.contains(&format!(
-                "    # publishing the run can take 30 min more, and {margin_minutes} min are margin for the\n\
-                 \x20   # runner's own delays: {timeout_minutes} min.\n\
-                 \x20   timeout-minutes: {timeout_minutes}\n"
+            gate <= 360,
+            "e2e-gpu-queue runs on a GitHub-hosted runner, which ends a job at 360 min: {gate} would never be reached"
+        );
+        assert!(
+            flat.contains(&format!(
+                "plus 10 min for the dispatch and the download: {gate}"
             )),
-            "queue-run.yml's comment must give the 30 min, the {margin_minutes} min margin and the {timeout_minutes} min total, right above timeout-minutes"
+            "docs/nightly-on-the-queue.md must give the gate job's {gate} min limit"
         );
     }
 

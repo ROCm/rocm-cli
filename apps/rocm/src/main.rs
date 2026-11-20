@@ -282,6 +282,12 @@ fn main() -> ExitCode {
 /// standard `Result<(), anyhow::Error>` `Termination` behavior (print the
 /// error to stderr, exit 1).
 fn exit_code_for(result: Result<()>) -> ExitCode {
+    exit_code_reporting_to(result, &mut io::stderr())
+}
+
+/// [`exit_code_for`] with the error report written to `stderr`, so a test can
+/// read what the user would see.
+fn exit_code_reporting_to(result: Result<()>, stderr: &mut dyn Write) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -294,11 +300,26 @@ fn exit_code_for(result: Result<()>) -> ExitCode {
                 // ignore a failed write here rather than `eprintln!`, which panics.
                 // A caller with a closed stderr pipe must still see exit code 1, not
                 // a panic that replaces it.
-                let _ = writeln!(io::stderr(), "Error: {e:?}");
+                let _ = writeln!(stderr, "{}", render_error_for_terminal(&e));
                 ExitCode::FAILURE
             }
         }
     }
+}
+
+/// The `Error: …` report `exit_code_for` prints, in the standard `{:?}` form,
+/// with terminal escape sequences and other display-altering characters
+/// removed: an error can quote text this process did not write — a model's
+/// tool name or argument, a provider's error body — and stderr is a terminal
+/// too.
+///
+/// Sanitized as a whole rather than cause by cause: the standard report puts
+/// each cause on its own line, and a string sequence left open ends at its
+/// line, so an open sequence in one message cannot reach the next cause or the
+/// `Caused by:` heading. Rebuilding the report from sanitized causes would have
+/// to reproduce anyhow's layout and would drop its backtrace.
+fn render_error_for_terminal(error: &anyhow::Error) -> String {
+    rocm_core::terminal::sanitize_terminal_text(&format!("Error: {error:?}"))
 }
 
 fn run() -> Result<()> {
@@ -805,10 +826,24 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Engines { command }) => engines(command),
         Some(Command::Model { verbose }) => {
             let paths = AppPaths::discover()?;
+            // Measure the host once and hand both renderers the same figures.
+            // These were hardcoded `None`, which left every fit verdict reading
+            // "unknown" and the recommendations unable to narrow to what this
+            // machine can run -- a 2 TB-RAM host was told its RAM telemetry was
+            // unavailable.
+            let (gpu_gib, host_ram_gib) = model_fit::host_model_listing_facts();
             let rendered = if verbose {
-                render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None)
+                render_model_registry_verbose_text_with_context_and_host(
+                    Some(&paths),
+                    gpu_gib,
+                    host_ram_gib,
+                )
             } else {
-                render_model_registry_text_with_context_and_host(Some(&paths), None, None)
+                render_model_registry_text_with_context_and_host(
+                    Some(&paths),
+                    gpu_gib,
+                    host_ram_gib,
+                )
             };
             print!("{rendered}");
             Ok(())
@@ -1419,6 +1454,49 @@ pub(crate) mod tests {
     fn exit_code_for_generic_error_is_failure() {
         let err = anyhow::anyhow!("boom");
         assert_eq!(super::exit_code_for(Err(err)), ExitCode::FAILURE);
+    }
+
+    /// `report` without the `Stack backtrace:` section anyhow appends when
+    /// `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` is set, so the tests below
+    /// compare the same text whether or not it is.
+    fn without_backtrace(report: &str) -> &str {
+        report
+            .split_once("\n\nStack backtrace")
+            .map_or(report, |(head, _)| head)
+    }
+
+    /// The report as `main` writes it to stderr: an OSC left open in the
+    /// outermost context costs the rest of that line, never the `Caused by:`
+    /// heading or the causes printed after it.
+    #[test]
+    fn an_error_report_on_stderr_carries_no_escape_and_loses_no_line() {
+        let error = anyhow::anyhow!("provider said `x`")
+            .context("chat request \u{9b}2Kfailed")
+            .context("rocm chat could not answer\u{1b}]0;never closed");
+        let mut stderr = Vec::new();
+        assert_eq!(
+            super::exit_code_reporting_to(Err(error), &mut stderr),
+            ExitCode::FAILURE
+        );
+        let stderr = String::from_utf8(stderr).expect("utf-8");
+        assert!(stderr.ends_with('\n'), "{stderr:?}");
+        assert_eq!(
+            without_backtrace(stderr.trim_end_matches('\n')),
+            "Error: rocm chat could not answer\n\nCaused by:\n    0: chat request failed\n    1: provider said `x`"
+        );
+    }
+
+    /// An error can quote a model's or a provider's text, and it is printed to
+    /// a terminal: the escape sequences go, the text around them stays, and
+    /// the `Caused by:` layout of the standard report survives.
+    #[test]
+    fn an_error_quoting_untrusted_text_is_printed_without_its_escapes() {
+        let error = anyhow::anyhow!("provider said `x\u{1b}[2K\u{1b}]0;title\u{7}y\u{9b}1A`")
+            .context("chat request failed");
+        assert_eq!(
+            without_backtrace(&super::render_error_for_terminal(&error)),
+            "Error: chat request failed\n\nCaused by:\n    provider said `xy`"
+        );
     }
 
     /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`

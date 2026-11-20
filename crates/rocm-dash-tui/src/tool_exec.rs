@@ -7,8 +7,10 @@
 //! Plain-data signatures ONLY (serde_json / std / serde). The bin (`apps/rocm`,
 //! which owns `rocm-core` and the tool engine) implements [`RocmToolExecutor`];
 //! the dash holds it as `Option<Arc<dyn RocmToolExecutor>>` and never depends on
-//! `rocm-core`. The trait has a read-only `execute` and a mutating
-//! `execute_approved` path, plus the approval descriptor.
+//! `rocm-core`. The trait has `execute` for the operator's own calls,
+//! `execute_model_call` for the agent's (the same, plus the checks only a value
+//! a model chose gets), and the mutating `execute_approved` path, plus the
+//! approval descriptor.
 
 use std::sync::Arc;
 
@@ -48,11 +50,21 @@ pub trait RocmToolExecutor: std::fmt::Debug + Send + Sync {
     /// (Return value carries `#[must_use]` via the `RocmToolOutcome` enum.)
     fn execute(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;
 
+    /// [`Self::execute`] for a call the chat *model* chose, as opposed to one
+    /// built from what the operator typed (a slash command). The bin holds a
+    /// model's values to stricter rules than the operator's own — a value the
+    /// operator typed is theirs to use — so the agent's tools call this and the
+    /// slash commands call [`Self::execute`]. Required, with no default, so a
+    /// new executor has to decide what a model's call is held to rather than
+    /// silently skipping the rules; one with no extra rules delegates to
+    /// [`Self::execute`].
+    fn execute_model_call(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;
+
     /// Run an *approved* mutating action via the bin's captured-subprocess path
     /// (piped stdout/stderr → JSON; no printing to the TUI terminal, so it is
     /// TUI-safe). Called only after the operator approves the modal, with the
     /// `(name, arguments)` taken from the [`ApprovalIntent`] that `execute()`
-    /// returned. It re-validates the call, so the safety validators remain the
+    /// or `execute_model_call()` returned. It re-validates the call, so the safety validators remain the
     /// single gate and an unapproved/invalid call can never run here. This is a
     /// blocking call — invoke it off the async event loop (spawn_blocking).
     fn execute_approved(&self, name: &str, args: &serde_json::Value) -> RocmToolOutcome;

@@ -396,15 +396,17 @@ pub(crate) enum Command {
     },
     /// [preview] Chat with a configured assistant provider.
     ///
-    /// In a terminal with no --prompt, opens the interactive chat (switch
-    /// providers there with /provider; --provider, --model, and --tools don't
-    /// apply). With --prompt, or a prompt piped on standard input, sends that one
-    /// prompt and prints the reply. Use `rocm config enable-provider` and
-    /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server. On Linux/WSL the interactive
-    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
-    /// and, like it, prints why that daemon was failing after it closes,
-    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
+    /// In a terminal with no --prompt, opens the interactive chat (switch providers
+    /// there with /provider; --provider, --model, and --tools don't apply). With
+    /// --prompt, or a prompt piped on standard input, sends that one prompt and prints
+    /// the reply without terminal escape sequences. With --tools, an assistant-chosen
+    /// value a Windows shell reads as syntax (', &, %) is refused, not offered to
+    /// paste, unless it came from your own request (`install therock into <folder>`).
+    /// Use `rocm config enable-provider` and `rocm config set-provider-key` first to
+    /// configure a remote provider; the `local` provider talks to a running server. On
+    /// Linux/WSL the interactive chat shares the dashboard's telemetry daemon the way
+    /// `rocm dash` does, and, like it, prints why that daemon was failing after it
+    /// closes, including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -500,7 +502,9 @@ rocm update --json")]
     },
     /// Show recommended local models and what this machine can run.
     ///
-    /// The default list is the curated recommendations. The AMD Inference Microservices
+    /// The default list is the curated recommendations, narrowed to the models this
+    /// machine's GPU memory can hold and saying so; where that memory could not be read
+    /// it is not narrowed, and says that instead. The AMD Inference Microservices
     /// (AIM) catalog of pre-built Docker images is not part of it: use --verbose to see
     /// every AIM image with the GPU families it supports, how many GPUs it needs, and
     /// whether it requires a Hugging Face token. Serve one with

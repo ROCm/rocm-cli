@@ -1103,11 +1103,30 @@ tear down, and refuse to publish over a Funnel-exposed port — and needs
 `cargo build -p rocm` first. It does not prove the endpoint carries traffic;
 that needs a real two-node tailnet.
 
+`remote-17` to `remote-22` cover what happens to a refused session record
+without a second machine: they plant the record on disk and check that
+`rocm remote status` counts it instead of reporting no sessions, that
+`rocm remote stop` names it and leaves it in place, that a record filed
+under another session's name is refused, that `rocm remote serve` over a
+refused record names it instead of offering `stop`, and that
+`rocm remote stop` with a name matching both a usable and a refused record
+stops nothing and names both, whether the name is the short target name or the
+full peer name. `uninstall-18`
+(`features/uninstall.feature`) checks that a dry-run uninstall names a refused
+record. All of these run on every lane. The refusals of records and session
+directories owned by another user are unit-tested only, because a scenario
+cannot create a file another user owns without privileges.
+
 The `rocm remote` cucumber scenarios that need a second machine carry
 `@requires-docker` and run only when `E2E_INCLUDE_DOCKER=1`, which the
 GitHub-hosted `E2E tests` lane sets. A working daemon alone is not enough — the
 self-hosted GPU runners have one but cannot reach the package mirror the fixture
-image builds from, so they skip those scenarios. To run them locally:
+image builds from, so they skip those scenarios. Among them, `remote-16` rewrites
+a recorded session so its remote command would also create a marker file on the
+container, and asserts that `rocm remote status` refuses the record, says why,
+counts it as refused rather than reporting no sessions, and that the marker never
+appears; `remote-10` also checks the sessions directory
+is left owner-only. To run them locally:
 
 ```bash
 E2E_INCLUDE_DOCKER=1 cargo xtask e2e
@@ -2729,6 +2748,80 @@ cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_withou
 cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
+What the chat prints from a model, and what it offers to paste, is covered by
+three more mock-lane scenarios in the same feature file (steps in
+[chat_steps.rs](../tests/e2e-cucumber/tests/e2e/chat_steps.rs)), and the
+error report every command prints by one in
+[runtime_lifecycle.feature](../tests/e2e-cucumber/features/runtime_lifecycle.feature)
+(steps in
+[runtime_lifecycle_steps.rs](../tests/e2e-cucumber/tests/e2e/runtime_lifecycle_steps.rs)):
+
+- `chat-21` (`chat-cli-reply-escapes-stripped`): a reply that conceals part of
+  a line with SGR 8, retitles the window and writes the clipboard (OSC 52, and
+  an 8-bit OSC) reaches stdout of `rocm chat --prompt` with no control
+  character and no sequence payload, and the concealed text printed where it
+  was. A title sequence the reply leaves open removes the rest of its own line
+  only: the line after it (`Still here.`) is printed.
+- `chat-22` (`chat-assistant-value-unsafe-to-paste-refused`): the assistant
+  asks `install_sdk` for a folder whose name holds `&`, which `cmd.exe` acts
+  on even inside the single quotes the line is rendered in. The CLI exits
+  non-zero, asked the assistant once, and prints nothing to stdout; stderr
+  holds the refusal, which names the character and says to run
+  `rocm install sdk` with the value, and no `advanced manual command:` or
+  `tool_call:` line. The user's own `rocm install sdk --dry-run` into that
+  folder (therock-next-15's pip index fixture and installed `uv`) is
+  accepted and names it as
+  one argument. That nothing was installed is checked by the chat-turn unit
+  tests in [providers.rs](../apps/rocm/src/providers.rs) listed below, not by
+  the scenario.
+- `chat-23` (`chat-assistant-plan-unsafe-to-paste-refused`): the assistant
+  asks `natural_language_plan` to plan an install into the same kind of
+  folder. The plan's `tool_call:` line would carry the folder, so the CLI
+  refuses the plan the same way, with the refusal naming the plan for the
+  assistant's request, and prints nothing to stdout.
+- `runtime-lifecycle-32` (`runtime-lifecycle-error-report-carries-no-escape`):
+  the error report every `rocm` command prints goes through the same cleaning.
+  `rocm runtimes activate` with a runtime name carrying a window-title and an
+  erase-line sequence fails, its report names the runtime with the sequences
+  removed and holds no control character, and no runtime is active.
+
+```bash
+cargo xtask e2e -- -n "chat-21"
+cargo xtask e2e -- -n "chat-22"
+cargo xtask e2e -- -n "chat-23"
+cargo xtask e2e -- -n "runtime-lifecycle-32"
+```
+
+The unit tests behind them: `sanitize_terminal_text`, `hides_or_moves_text`
+and `is_display_altering` in [terminal.rs](../crates/rocm-core/src/terminal.rs)
+(exact output for every introducer, an unterminated sequence ending at its
+line, the glyph-shaper rule and the default-ignorable table's edges), the
+paste-unsafe set in [shell_quote.rs](../apps/rocm/src/shell_quote.rs), the
+model-only refusals, the serve option and character rules and the plan check
+in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) (including that the same
+value passes `validate_chat_tool_call`, and that every tool that shows a
+command line is checked on it), the model-versus-user split in [turn.rs](../apps/rocm/src/chat/turn.rs)
+and [dash_seam.rs](../apps/rocm/src/dash_seam.rs), the chat turn against a
+local model in [providers.rs](../apps/rocm/src/providers.rs) (a refused
+folder, a refusal after a read-only check, a refused plan), the planner's
+check in [freeform_planner.rs](../apps/rocm/src/freeform_planner.rs), the
+status screen in [chat.rs](../apps/rocm/src/chat.rs), the error report as
+written to stderr in [main.rs](../apps/rocm/src/main.rs), and the dashboard
+agent's entry point in
+[tools.rs](../crates/rocm-dash-tui/src/agent/tools.rs):
+
+```bash
+cargo test -p rocm-core terminal::
+cargo test -p rocm --bin rocm shell_quote::
+cargo test -p rocm --bin rocm tool_policy::
+cargo test -p rocm --bin rocm chat::
+cargo test -p rocm --bin rocm dash_seam::
+cargo test -p rocm --bin rocm freeform_planner::tests::provider_planner_refuses
+cargo test -p rocm --bin rocm providers::tests::a_
+cargo test -p rocm --bin rocm tests::an_error
+cargo test -p rocm-dash-tui --lib agent::tools
+```
+
 Log browser smoke:
 
 ```bash
@@ -2806,6 +2899,77 @@ The e2e scenarios `serve-33`/`serve-34`/`serve-35` (`@requires-os:windows`) cove
 same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
+
+Managed-launch startup-death and record-write focused tests:
+
+```bash
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_child_that_exited_during_the_startup_window
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_signalled
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_handed
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_keeps_the_key
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_over_an_unreadable
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_does_not_recreate_a_removed_record
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_stop_settled_while_the_engine_spawns
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_publish_refused_by_a_
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_before_the_spawn
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::the_launch_does_not_own_a_record_a_stop
+cargo test -p rocm --bin rocm service_launch::readiness::tests::a_stop_requested_during_the_wait
+cargo test -p rocm --bin rocm service_launch::readiness::tests::the_advised_stop_frees_the_model
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_keeps_what_changed
+cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_does_not_recreate
+cargo test -p rocm --bin rocm service_launch::spawn::tests::the_publish_applies
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::the_launch_does_not_publish_over
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_before
+cargo test -p rocm --bin rocm service_launch::spawn::tests::an_engine_that_dies_at_startup_keeps
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_watched_spawn_seen_dead
+cargo test -p rocm --bin rocm service_launch::readiness::tests::an_engine_that_exited_during_the_wait
+cargo test -p rocm-core watched_detached_spawn   # Windows only
+cargo test -p rocm-core observe_early_exit       # Windows only
+```
+
+They pin that an engine seen dead inside the 200 ms startup window fails the
+launch naming its own log, on Windows from the exit code read through the
+process handle `CreateProcessW` returned (not by re-checking a pid Windows may
+already have reused); that cleanup never signals such an engine, since its pid is
+free; and that the launch's writes after its claim — the `running` record, the
+`stopped` mark of a failed launch, the readiness verdict — go to the record as it
+is on disk, so a `rocm services stop` made meanwhile keeps its stop marker and, once
+settled, its `stopped`, and a `rocm services remove` is not undone by re-creating the
+record. A stop counts from the moment it writes its marker, while the record still
+reads live, not only once it has settled: the publish then refuses and the failed
+launch terminates the engine the stop never saw, and a failed launch that spawned
+nothing leaves the claim to the stop instead of deleting it.
+A serve whose server is stopped during its readiness wait fails (non-zero exit) saying
+a stop was requested for it while it was starting, instead of reporting a launch, and while
+that stop is still running it names `rocm services stop <id> --yes` to run before serving
+again, since reuse would otherwise take the service being stopped
+(`the_advised_stop_frees_the_model_a_stop_in_flight_still_holds` runs that stop, confirmed,
+and checks reuse before and after); one whose
+server exited on its own during the wait (a record settled without a stop marker) fails
+saying it exited and naming `rocm logs --service <id>`. Each of those writes reads
+the record and then writes it, with no lock against a stop, so a stop landing
+between the two is still overwritten: the tests pin the narrowed race, not a
+closed one. The publish applies only the launch's own fields (engine and
+supervisor identities, `running`) over the record on disk, and a failed launch's
+cleanup leaves the endpoint key of a record a restart took over, or of one it
+cannot read, which it audits. A publish refused by a stop or a removal, and the
+cleanup terminating the engine it then names, run on the required Windows lane too
+(`a_publish_refused_by_a_*`, with a real child and a tree kill there).
+The `watched_detached_spawn_*` tests, and the one that drives the watch's failed wait
+and failed exit-code read (`observe_early_exit_*`), run on the required Windows lane.
+
+`serve-67` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
+`e2e-test-hooks` build scripts the managed engine's death (the spawned `rocm`
+gets an argument it rejects), and the scenario checks that the serve fails naming
+the engine's own log, that the record left on disk reads `stopped` and names no
+pid, and that serving the same model again reaches the engine launch again. It
+carries no host tag, so every lane built with the hooks runs it, including the
+self-hosted Windows lane; the required `windows-build-and-test` lane builds
+without the hooks and does not. Run it locally with:
+
+```bash
+cargo xtask e2e -- -n "serve-67 "
+```
 
 Serve resolver focused tests:
 
@@ -6753,8 +6917,9 @@ has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/)
 hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
 removes it afterwards. The stub replays recorded output for `rocm --version`,
 `rocm fix --json` and `rocm diagnose`, plus `rocm examine --json` for a case that
-names a `host` (below), and refuses every other command with exit code 2. It only
-prints text read from the recording, so whatever an agent asks it,
+names a `host` and `rocm fix <id>` with `--dry-run` or no flag for a case that names
+an `apply` fix (both below), and refuses every other command with exit code 2, `--yes`
+included. It only prints text read from the recording, so whatever an agent asks it,
 it cannot change a machine or send anything; that comes from answering a fixed set
 of commands, not from the refusals. It also refuses `diagnose` options the
 recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
@@ -6780,31 +6945,58 @@ cargo xtask eval-fixtures --check  # fail if any recording is missing, stale, or
 The manifest comes from the compiled catalog and each diagnosis from
 `rocm_core::run_diagnose`, run over the recorded examination in
 [`tests/remote-ssh/examination.json`](../tests/remote-ssh/examination.json), so a
-catalog change cannot leave a stale recording behind. After a change to the failure
-catalog or to what `rocm diagnose` prints, run `cargo xtask eval-fixtures` and commit
-the result; the check names what is out of date. CI runs the check, and
-`cargo test -p xtask` runs it too. Read the diff after regenerating: a recording that
-changed is output the skill is now graded against. What an older CLI printed cannot be
+catalog change cannot leave a stale generated recording behind. After a change to the
+failure catalog or to what `rocm diagnose` or `rocm fix --json` prints, including one
+that arrived with a rebase, run `cargo xtask eval-fixtures` and commit the result; the
+check names what is out of date. CI runs the check, and `cargo test -p xtask` runs it
+too. Read the diff after regenerating: it must be only the change in the catalog or the
+CLI, and a recording that changed is output the skill is now graded against. A premise
+test (`the_premise_a_judged_case_rests_on_is_what_its_replay_records`) states what each
+judged case needs its replay to hold, such as which match clears the threshold and which
+are `symptom_matched`; when it fails after regenerating, re-derive the premise from the
+new replay and do not loosen the assertion. What an older CLI printed cannot be
 generated. It was recorded once from a real older build and lives in
 [`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
 
-A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
-`examine-fails`. The stub then answers `rocm examine --json`, and a case without a
-`host` still refuses it. The reply is the recorded examination with the fields the host
-implies set, whatever the recording held for them, and its `status` is recomputed by
+A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found`,
+`examine-fails` or `container-small-shm` (an AMD GPU found, inside a Docker container
+with the default 64 MiB `/dev/shm`, which makes the shared-memory entry score from the
+host alone). The stub then answers `rocm examine --json`, and a case without a
+`host` still refuses it. The diagnosis a host gives is replayed too, so it is what the
+case's judged items rest on. The reply is the recorded examination with the fields the
+host implies set, whatever the recording held for them, and its `status` is recomputed by
 `Examination::compute_status`, the rule the probe uses, so a recording cannot say a
 status the other fields contradict. The real command prints those fields plus a
 `summary` object that only the `rocm` binary can build, so the replay leaves `summary`
 out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
-typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+typed, not probed: the one GPU of `amd-found` and `container-small-shm`, the container
+and `/dev/shm` figures of the latter, and the WSL facts of
 `wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
 with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
 exits 1 with a fixed message on stderr, which is what the case pins.
 
+A case may also name an `apply` fix id, for a case that reaches the apply step. The
+stub then answers `rocm fix <id> --dry-run` (the flag before or after the id) and
+`rocm fix <id>` with no flag, and never `--yes`, so an agent that applies before the
+user said OK meets the stub's refusal and the transcript shows the command. The fix
+must be `fix-4-render-group`, the only one whose layout around the plan the generator
+writes (another `auto` runner, such as fix-6, prints its own `Plan:` block, so naming
+one is refused), and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
+`linux`), and the case's symptom and host must make the replayed
+diagnosis match it, that is list it at or above `min_score_for_match`; otherwise the
+generator fails with "the replayed diagnosis carries no match for ...". The plan is the CLI's own (`rocm_core::fix_plan_text`), so it
+carries the command's wording; only the `Will run:` line the runner adds is not there,
+because it names the user and the machine. The layout around the plan (the blank line,
+then the notice) is written by hand in the generator and checked only against the
+committed replay. The bare command's refusal exit code
+and message, and the dry-run notice, are the CLI's own constants, so they cannot drift
+from the command's.
+
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
 case id, `current` or `older`, the error text the agent would pass as the symptom,
-and optionally a `host`), run the command above, and add the case to
+and optionally a `host` and an `apply` fix id, which must be `fix-4-render-group` and matched
+by the replayed diagnosis), run the command above, and add the case to
 [`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
 check also fails when a case id is not an id in `evals.json`, or when the part of the
 symptom before its first `:` does not appear in that case's prompt, because the hook
@@ -6812,13 +7004,13 @@ finds a replay by id and a recording for a different question grades nothing. A
 directory that no case owns fails the check, and the command never deletes one:
 remove it by hand.
 
-Limits worth knowing. A replay says what the catalog says for a recorded host
-with no GPU data, so it grades how the agent reads and relays an answer, not whether
+Limits worth knowing. A replay says what the catalog says for a typed host (the
+recorded examination, which has no GPU, with the fields a `host` implies changed), not
+for a real machine, so it grades how the agent reads and relays an answer, not whether
 the CLI is right about a real machine; and it answers `diagnose` with the same
 recorded output whatever `--symptom` is. The current-CLI replay's `--version` line
-is not the format the real `rocm --version` prints (the older-CLI replay prints that
-one), so only `fix --json` tells
-the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
+is a fixed marker that no real build prints (the older-CLI replay prints what an
+older build printed), so only `fix --json` tells the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
 pin matches, and `cargo test -p xtask` fails if a pin is quoted in `SKILL.md` or
 `reference.md`, where it would stop proving the replay ran.
 
@@ -6828,11 +7020,13 @@ On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionle
 include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
 directory and Python path without spaces; a path with spaces or parentheses is not
 exercised, and neither is the agent's own shell on the amd/skills Windows leg.
-The two cases about the older and the current CLI name no operating system in their
-prompts. They used to say "on Linux", and on a Windows host the agent answered that its
-own machine is Windows and declined to run the CLI at all, so the recorded replies never
-printed. The vLLM cases still say Linux on purpose: their catalog entries apply on Linux
-and WSL2 only, so they are not expected to pass on a Windows host.
+A replayed case whose answer does not depend on the platform names no operating system
+in its prompt. The older- and current-CLI prompts used to say "on Linux", and on a
+Windows host the agent answered that its own machine is Windows and declined to run the
+CLI at all, so the recorded replies never printed. A case that cannot pass on a Windows
+host, because its catalog entries apply on Linux and WSL2 only or because the command
+it expects depends on the shell, says so in its `note` in
+[`evals.json`](../skills/rocm-doctor/evals/evals.json).
 
 A real `rocm` on the machine can answer before the stub. The agent's shell does not
 always keep the stub first on `PATH`, so a machine that has a `rocm` installed (a

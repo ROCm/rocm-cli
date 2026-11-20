@@ -1325,9 +1325,16 @@ rocm model [--verbose]
 ```
 
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
-the hardware they target. Pass `--verbose` to list every recipe, including ones
-hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+the hardware they target. The recommendations are narrowed to the models this
+machine's GPU memory can hold, at most three per hardware group, and the listing
+says how many further curated models also fit. Where none of them fit it says so
+rather than printing an empty list, and where this machine's GPU memory could not
+be read the list is not narrowed at all and says it is not host-specific — an
+unmeasured machine is never told its options are narrow.
+
+Pass `--verbose` to list every recipe, including ones hidden from the default
+list and ones too large for this machine, with details such as aliases, data
+type, minimum GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
 images are among the hidden recipes: `--verbose` shows each one's supported GPU
 families, the GPU count it needs per family, and whether it needs a Hugging Face
 token (`requires_hf_token=yes`), and
@@ -1832,6 +1839,29 @@ alone: a healthy model with no endpoint needs `attach`, not a restart. `stop`
 withdraws the endpoint and stops the model, and keeps the session listed if it
 cannot confirm both. Use `--force` to forget one whose machine is gone.
 
+Sessions are recorded under the data directory in `remote-sessions/`, which is
+created accessible to your user only on Linux; `serve` refuses to use one that
+another user owns, and says so before it prepares the machine. If
+`remote-sessions` is a link to a directory other users can access, it is
+refused rather than changed: restrict the directory it points at with
+`chmod 700`. A record is skipped with a warning rather than acted on if it
+names a remote command other than the ones `serve` writes, if its session id
+holds anything but lowercase letters, digits and `-`, if it is not named after
+its own session id, if it is not a regular file, or, on Linux, if it is owned
+by another user. That includes running `rocm remote`
+under `sudo` against your own records: run it as the user who created the
+session. `status` with no session named counts refused records instead of
+reporting no sessions, since the model a refused record describes may still be
+running. `stop` cannot reach a refused record, and a session name that matches
+a refused record's file name as well as a usable session is refused as
+ambiguous rather than resolved to the usable one. Only the record's file name,
+which holds the peer name, is compared: a name that is not part of the peer
+name, such as an ssh alias or an IP address, cannot match a refused record, so
+use the exact session id when one is refused. `serve` on the machine and
+port a refused record names refuses with that record's warning instead of
+offering `stop`.
+Removing a record forgets the session but does not stop it on the machine.
+
 Communication with the machine uses your existing `ssh` setup. Set
 `ROCM_REMOTE_SSH_CONFIG` to point at a configuration file other than the
 default.
@@ -1921,6 +1951,20 @@ standard input, it sends one prompt and prints the reply.
   change the wait; an unset, empty, non-numeric or out-of-range value keeps the
   2 minutes.
   The timeout message names the wait that applied and this variable.
+
+With `--prompt`, the reply and tool output are printed with terminal escape
+sequences and invisible characters removed, so a reply cannot hide part of a
+line, retitle the window or write the clipboard; text it tried to hide is
+shown. Every `rocm` error report is printed the same way. A change the assistant asks for with `--tools` is not made from
+`--prompt`: it is shown as an `advanced manual command:` line, quoted for a
+POSIX shell. A value the assistant chose, in that line or in a plan it asked
+for, is refused if it holds a character a Windows shell reads as syntax even
+inside those quotes, such as `'`, `&` or `%`; the message tells you to run the
+command yourself with that value. A folder the CLI takes from your own
+request, such as `install therock into <folder>`, is shown as you typed it; a
+folder that reaches the CLI through the assistant's request is held to the
+rule, even if you named it first.
+See the LLM tool-use design notes in the documentation for the exact set.
 
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
@@ -2193,13 +2237,16 @@ When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the ROCm CLI binaries in that build
 directory.
 
-Before removing anything, `uninstall` prints warnings about two situations:
+Before removing anything, `uninstall` prints warnings, among them:
 
 - Managed service records exist. `uninstall` doesn't stop their background
   processes.
 - Remote sessions exist. For each one, run `rocm remote stop <session>` first.
   Otherwise the model keeps running on the remote machine with its endpoint
   published, and the record that tracked it is gone.
+- Remote session records exist that `rocm remote` refuses to use.
+  `rocm remote stop` cannot reach them, so check each machine they name before
+  uninstalling.
 
 It also lists the shared caches it leaves in place, when they live outside the
 ROCm CLI directories: a `uv` package cache that `UV_CACHE_DIR` or the default
