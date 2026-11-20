@@ -774,8 +774,8 @@ fn restart_internal_managed_service_inner(
 /// and the stop-vs-crash verdict are all injected, so a unit test drives every
 /// branch on every platform, including the Windows lane that actually calls it.
 ///
-/// Mirrors `service_launch::spawn`'s `ensure_spawned_child_survives_startup` on
-/// the launch path, deliberately and for the same reason: the call site is
+/// Mirrors `service_launch::spawn`'s `fail_if_engine_died_at_startup` on the
+/// launch path, deliberately and for the same reason: the call site is
 /// `#[cfg(windows)]`, so without the extraction the control flow around
 /// `settle_restart_startup_death` — detecting the dead child at all, and
 /// choosing between the two bails — would be exercised by nothing but a real
