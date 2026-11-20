@@ -516,14 +516,14 @@ mod tests {
     /// matching nothing: the scan stays green while the renamed call is
     /// outside it, which is the silent failure this module is written
     /// against. Matched on code with literals and comments stripped, so a
-    /// mention in a doc comment does not keep a dead entry alive, and this
-    /// file is skipped because its fixtures exist to spell the calls.
+    /// mention in a doc comment or a string does not keep a dead entry alive.
+    /// That stripping is also what lets this file be scanned with the rest:
+    /// `MUTATIONS` and the fixtures below spell the calls only inside string
+    /// literals, so nothing here can keep an entry alive either.
     #[test]
     fn every_listed_mutation_is_still_called_in_the_tree() {
-        let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/env_mutation_contract.rs");
         let code: Vec<String> = workspace_rust_sources()
             .iter()
-            .filter(|path| **path != this_file)
             .map(|path| {
                 let text = std::fs::read_to_string(path)
                     .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
