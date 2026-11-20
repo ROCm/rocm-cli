@@ -7,6 +7,11 @@
 // same way. Many steps neither `.await` nor mutate the world; allow both rather
 // than splitting the step API into sync/async and mut/non-mut variants.
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "cucumber step definitions run without `#[test]` fns; a failed step must panic its scenario"
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -159,8 +164,9 @@ pub struct E2eWorld {
     pub legacy_rocm_path: Option<PathBuf>,
     /// Per-scenario serve-readiness timeout override (seconds), set by the
     /// `before` hook from `expectations.toml` when this scenario is a known bug
-    /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
-    /// fail fast instead of burning the full cold-start window. `None` → the
+    /// with a `serve_timeout_secs` (which wins over a `@serve-timeout` tag), else
+    /// from that tag. Lets an xfail serve that never becomes ready fail fast
+    /// instead of burning the full cold-start window. `None` → the
     /// step's default / `E2E_SERVE_TIMEOUT_SECS`.
     pub serve_timeout_override: Option<u64>,
     /// Whether `expectations.toml` marks this scenario a known bug on this host,
@@ -185,6 +191,14 @@ pub struct E2eWorld {
     /// mock server and isolated directory so the child process never outlives
     /// the scenario. `None` for the non-interactive (piped `Command`) scenarios.
     pub tui: Option<e2e::tui_driver::TuiSession>,
+    /// A second dashboard open at the same time as `tui`, sharing its isolated
+    /// environment and so its telemetry socket (dash-56). Torn down in `Drop`
+    /// right after `tui`, for the same reasons.
+    pub second_tui: Option<e2e::tui_driver::TuiSession>,
+    /// How many dashboard connections to a telemetry daemon the client log
+    /// held when the first of two dashboards was quit (dash-56, dash-58), so a
+    /// later step can tell the surviving one has connected again.
+    pub dash_connections_before_quit: Option<usize>,
     /// Set by the "interactive chat uses an offline assistant" step so the chat
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
@@ -418,6 +432,8 @@ impl Default for E2eWorld {
             command_dir: None,
             route_statuses: Vec::new(),
             tui: None,
+            second_tui: None,
+            dash_connections_before_quit: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
             comfyui_baseline_distributions: None,
@@ -510,9 +526,11 @@ impl E2eWorld {
         if let Some(path) = &self.legacy_rocm_path {
             env.push(("ROCM_PATH", path.clone().into_os_string()));
         }
-        // When a scenario declares a longer serve-readiness window (via a
-        // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN per-engine readiness cap(s) to match. `rocm serve --managed`
+        // When a scenario declares a serve-readiness window (via a
+        // `@serve-timeout:<secs>` tag, or a matching xfail row's
+        // `serve_timeout_secs`, which wins over the tag and can be shorter →
+        // serve_timeout_override), also set the CLI's OWN per-engine readiness
+        // cap(s) to match, lowering them when the override is shorter. `rocm serve --managed`
         // otherwise kills/fails a server that isn't ready within its default (5
         // min, EAI-7393), which a large model's cold load legitimately exceeds —
         // so extending only the harness's poll (`model_is_ready`) isn't enough;
@@ -758,6 +776,9 @@ impl Drop for E2eWorld {
         if let Some(tui) = self.tui.take() {
             drop(tui);
         }
+        if let Some(tui) = self.second_tui.take() {
+            drop(tui);
+        }
         // Stop the automation daemon before the isolated directory it writes its
         // state and logs into is removed, so it never outlives the scenario.
         if let Some(daemon) = self.automation_daemon.take() {
@@ -827,6 +848,11 @@ impl Drop for E2eWorld {
         #[cfg(unix)]
         if self.isolated_root.is_some() {
             e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
+        }
+        // Likewise the telemetry socket's directory (dash-59).
+        #[cfg(unix)]
+        if let Some(root) = &self.isolated_root {
+            e2e::dash_steps::restore_telemetry_socket_dir_permissions(root.path());
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -1445,8 +1471,11 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
     inference_timeout_secs().max(world.serve_timeout_override.unwrap_or(0))
 }
 
-/// Discover the served model id over `/models` and POST one chat completion to
-/// it, returning the decoded response.
+/// POST one chat completion to the scenario's served model, returning the
+/// decoded response.
+///
+/// The model is discovered over `/models` from `world.model_name`, so a router
+/// listing several models is not chatted with at its first entry.
 ///
 /// `tools` is merged into the request body for the tool-definitions scenario.
 /// The exchange itself lives in [`e2e_cucumber::chat_request`], which runs it
@@ -1483,7 +1512,14 @@ pub async fn request_chat_completion(
     } else {
         vec![first, retry]
     };
-    e2e_cucumber::chat_request::request_chat_completion(&endpoint, prompt, tools, &budgets).await
+    e2e_cucumber::chat_request::request_chat_completion(
+        &endpoint,
+        world.model_name.as_deref(),
+        prompt,
+        tools,
+        &budgets,
+    )
+    .await
 }
 
 pub async fn send_chat(world: &mut E2eWorld) {
@@ -1682,10 +1718,10 @@ async fn run_suite() {
             let decl = ScenarioDecl::from_tags(&scenario.tags);
             if let Some(id) = &decl.id {
                 let engine = decl.effective_engine(cap);
-                // A `@serve-timeout:<secs>` tag on an expected-pass scenario (a
-                // genuinely slow serve, e.g. a large model) takes precedence;
-                // otherwise fall back to any xfail matrix override (fail-fast for
-                // a known-bug serve). Absent both → the step default.
+                // A matching xfail matrix override (fail-fast for a known-bug
+                // serve) takes precedence; otherwise a `@serve-timeout:<secs>` tag
+                // (a genuinely slow serve, e.g. a large model) applies. Absent
+                // both → the step default.
                 world.serve_timeout_override = matrix.serve_timeout_override(&decl, cap);
                 world.expect_xfail = matrix.is_xfail(id, cap, engine);
             }

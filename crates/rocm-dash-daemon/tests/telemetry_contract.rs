@@ -97,6 +97,12 @@
 //! - Daemon marks each assembled snapshot `Fresh` only when newly observed this
 //!   tick; otherwise `Held` until validity expires, then `gen_tps = None`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

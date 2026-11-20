@@ -29,6 +29,7 @@
 
 use anyhow::{Result, bail};
 use rocm_core::AppPaths;
+use rocm_core::recovery_hint::with_try;
 
 use crate::ServicesCommand;
 use crate::cli_audit::record_cli_audit_event;
@@ -151,11 +152,13 @@ pub(crate) fn run_approved_service_action(
 ) -> Result<()> {
     validate_service_id(service_id)?;
     if !yes {
-        bail!(
-            "{} local server `{service_id}` requires --yes.\n\nTry: {}",
-            service_action_verb(tool),
-            service_hints::service_action_hint(service_action_command(tool), service_id)
-        );
+        bail!(with_try(
+            format_args!(
+                "{} local server `{service_id}` requires --yes.",
+                service_action_verb(tool)
+            ),
+            &service_hints::service_action_hint(service_action_command(tool), service_id)
+        ));
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
     let result = run_internal_sandbox_tool(paths, sandbox_tool, Some(service_id.to_owned()), true)?;

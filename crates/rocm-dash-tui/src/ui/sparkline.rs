@@ -143,6 +143,11 @@ fn lit_dots(value: Option<u64>, max: u64, total_dot_rows: usize, row_top: usize)
 ///     3 ●            6 ●        bits 0x04 / 0x20
 ///     7 ●            8 ●        bits 0x40 / 0x80
 /// ```
+#[expect(
+    clippy::expect_used,
+    reason = "`code` is at most 0xFF, so the code point is always in the Braille Patterns \
+              block; `all_dots_is_full_braille_block` reaches the largest one on every test run"
+)]
 const fn braille_char(left: u8, right: u8) -> char {
     let mut code = 0u32;
     if left & 0b0001 != 0 {

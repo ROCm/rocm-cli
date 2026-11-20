@@ -120,11 +120,13 @@ they are not trust roots.
 ## Installer Verification
 
 Installers always verify checksums, and while a release key is pinned they
-verify the detached signature on every install whatever the channel. The
+verify the detached signature on every install whatever the channel, except
+a `pr-<number>` channel (see [Pull request builds](#pull-request-builds)). The
 release public key is pinned in both [install.sh](../install.sh) and
 [install.ps1](../install.ps1) (canonical copy
 [rocm-cli-release-current-public.pem](keys/rocm-cli-release-current-public.pem)),
-so a key always resolves and a missing `.sig` sidecar fails the install. An
+so a key always resolves and a missing `.sig` sidecar fails the install (again
+except on a `pr-<number>` channel, which empties the key list). An
 unset or `0` `ROCM_CLI_REQUIRE_SIGNATURE` does not turn verification off. A key
 supplied through `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` or
 `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` (or `install.ps1`'s `-SigningPublicKeyPath` or
@@ -173,6 +175,20 @@ loopback HTTP download, proving `install.ps1` verifies with native .NET crypto.
 All of those checks happen before activation. Run the current host's set with
 `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e` (see
 `docs/testing.md`).
+
+### Pull request builds
+
+The `pr-<number>` channel (`install.sh pr-1234`, or `ROCM_CLI_CHANNEL=pr-1234`
+for `install.ps1`) installs the bundle CI built for a pull request. That bundle
+is a workflow artifact, not a release asset: CI does not sign it, so the
+pinned release keys are not applied and the install trusts the bundle's
+`.sha256` sidecar alone, which guards the download but not its origin. The
+installer says so when it installs. Asking for a signature anyway, with
+`ROCM_CLI_REQUIRE_SIGNATURE=1` or a public key, fails instead of being skipped,
+and `ROCM_CLI_DOWNLOAD_BASE` is refused with this channel by both installers,
+`ROCM_CLI_ARCHIVE` and `ROCM_CLI_DOWNLOAD_ONLY` by `install.sh`, which is the
+one that has them. These builds are for trying a pull request, never for a
+release or an offline mirror.
 
 ## WSL ROCDXG Package Verification
 
@@ -318,6 +334,24 @@ the override *logic* does not exist at all in a build without
 environment entirely and unconditionally returns the hardcoded default URL, so
 a stray environment variable can never redirect a production install.
 
+## ComfyUI Default Address Port Override
+
+This one is not about download integrity; it is listed here beside the other
+`e2e-test-hooks` override. `rocm comfyui status` and the chat's status answer
+check ComfyUI's default address when rocm-cli has no record of the ComfyUI it
+started, or one it cannot parse; `rocm comfyui stop` checks it only for a record
+it cannot parse. The port of that address can be overridden, only in builds
+compiled with `e2e-test-hooks`, so an E2E scenario decides whether anything
+answers there:
+
+```text
+ROCM_CLI_COMFYUI_DEFAULT_ADDRESS_PORT_OVERRIDE
+```
+
+A build without the feature ignores it. In a build with it, a value that is set
+but is not a port number stops the command with a panic rather than probing the
+real port.
+
 ## Dashboard Test Clock File
 
 `rocm dash` checks for one test-only input that, unlike the override above, is
@@ -372,7 +406,7 @@ Cargo feature:
 ROCM_CLI_TEST_HOST_ROOT
 ```
 
-Same model as the ComfyUI override above: in a build without
+Same model as the ComfyUI source archive override above: in a build without
 `e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
 reads the environment, so a release build always probes the real machine. The
 re-rooting changes only where the probes read; the CLI still names the logical
@@ -447,7 +481,7 @@ signing public key (`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, else
 current release key, so CI verifies against the key users pin. The release and
 nightly workflows always run it; pull-request CI runs it when a
 change matches the `heavy` path filter in
-[ci.yml](../.github/workflows/ci.yml), which covers `docs/keys/`, the
+[classify-changes](../.github/actions/classify-changes/action.yml), which covers `docs/keys/`, the
 installers, every Rust source and `xtask/`. It reads the one assignment
 the installer actually uses, so each slot must be assigned exactly once as a
 plain declaration, and `install.sh` must mark both of its slots `readonly`.

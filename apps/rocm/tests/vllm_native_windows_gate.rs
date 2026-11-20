@@ -11,6 +11,11 @@
 //! error, and no managed-service record left behind. Native Windows only —
 //! on Linux and WSL vLLM is a supported engine and nothing here applies.
 #![cfg(windows)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

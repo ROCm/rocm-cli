@@ -87,13 +87,14 @@ pub(crate) fn usage_error(error: &SymptomFileError) -> clap::Error {
     let mut command = <crate::Cli as clap::CommandFactory>::command();
     // Building sets each subcommand's full `rocm diagnose` name for the usage line.
     command.build();
-    command
-        .find_subcommand_mut("diagnose")
-        .expect("the diagnose subcommand is defined")
-        .error(
-            clap::error::ErrorKind::ValueValidation,
-            format!("--symptom-file: {error}"),
-        )
+    let kind = clap::error::ErrorKind::ValueValidation;
+    let message = format!("--symptom-file: {error}");
+    // Without a `diagnose` subcommand the error still exits 2, with the
+    // top-level usage line instead.
+    match command.find_subcommand_mut("diagnose") {
+        Some(diagnose) => diagnose.error(kind, message),
+        None => command.error(kind, message),
+    }
 }
 
 /// The symptom text `rocm diagnose` matches on: `--symptom` as given, or the

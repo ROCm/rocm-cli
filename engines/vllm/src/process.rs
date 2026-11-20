@@ -897,9 +897,12 @@ fn wait_for_vllm_ready(
             .try_wait()
             .context("failed to poll vLLM server process status")?
         {
-            let log_context = startup_log_context(log_path);
             bail!(
-                "vLLM server process exited before becoming ready (status: {status}){log_context}"
+                "{}",
+                crate::startup_diagnostics::exited_before_ready_message(
+                    &status.to_string(),
+                    log_path
+                )
             );
         }
 
