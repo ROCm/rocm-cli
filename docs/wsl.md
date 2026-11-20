@@ -222,11 +222,16 @@ read nothing from the environment or the ROCm install. `fix-18-comgr-conflict` a
 [Diagnose a distro from Windows](#diagnose-a-distro-from-windows) later in this
 section).
 
-`fix-19-shm-too-small` is not a WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
-serving workload needs gigabytes of it. It reports below 1 GiB, so a WSL2 user
-can meet it on an otherwise healthy stack. Its guidance names the container and
-bare-metal cases; under WSL2 the remedy is the host one, remounting `/dev/shm`
-larger and adding the matching `/etc/fstab` line inside the distro.
+`fix-19-shm-too-small` is not a WSL entry. WSL2 mounts `/dev/shm` with no size
+limit of its own, so it gets half the VM's memory, which on a VM of ordinary
+size is well above the 1 GiB the entry reports below. It fires on WSL2 only
+when the allowance is under 1 GiB: inside a container running in the distro
+(Docker's default is 64 MiB), after a remount, or in a VM given about 2 GB or
+less in `.wslconfig` (`/dev/shm` is half the memory the kernel reports, and the
+kernel keeps part of what the VM is given for itself). Its guidance names the
+container and bare-metal cases; outside a container, under WSL2 the remedy is
+the host one, remounting `/dev/shm` larger and adding the matching
+`/etc/fstab` line inside the distro.
 
 `fix-18-comgr-conflict` also applies on WSL2: a wheel copy and a system copy of
 the code object manager library collide there exactly as they do on bare
