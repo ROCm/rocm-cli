@@ -104,6 +104,16 @@ const POPUP_MAX_ROWS: u16 = 24;
 /// Shared by every caller rendering through [`draw_approval_scrolled`], so the
 /// keys the dialog's own "More to read" row advertises are the keys that move
 /// it. A second hand-rolled copy is how that hint and its handler drift apart.
+///
+/// Deliberately not `app::scroll::ScrollState::scroll_by`, which is otherwise
+/// the one clamp for a `u16` offset against a bound. An approval republishes
+/// `max` on every draw, so a stored offset can outlive the bound it was
+/// clamped against when the dialog grows. This clamps the current offset
+/// *before* subtracting, so one PgUp is always one page back from what is on
+/// screen; `scroll_by` clamps after adding, which spends the first PgUp
+/// walking off a stale offset instead. `examine_manager`'s
+/// `page_up_works_at_once_after_the_dialog_grows` fails if the two are
+/// swapped.
 pub fn scrolled(current: u16, max: u16, key: KeyCode) -> Option<u16> {
     match key {
         KeyCode::PageDown => Some(current.saturating_add(APPROVAL_PAGE).min(max)),
