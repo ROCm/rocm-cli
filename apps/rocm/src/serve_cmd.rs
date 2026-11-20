@@ -1299,18 +1299,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Read what the engine actually selected rather than guessing from
             // the pre-launch GPU plan: `gpu_indices` above can be empty for a
             // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
-            // the server is running fine on it.
-            //
-            // Only for a launch this command performed — see
-            // [`serve_device_probe_opens`] for why skipping the reuse path is
-            // the point rather than tidiness.
-            //
-            // Asked more than once, briefly: `engines/lemonade` answers
-            // `"unknown"` until its own inference probe has come back, which is
-            // a real window right after a launch reports ready. The wait is
-            // bounded (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is a
-            // supported outcome — the summary then has no `device:` row, and
-            // `rocm services list` shows it once the engine can say.
+            // the server is running fine on it. Only for a launch this command
+            // performed — [`serve_device_probe_opens`] says why skipping the
+            // reuse path is the point rather than tidiness. Asked more than
+            // once, briefly: `engines/lemonade` answers `"unknown"` until its
+            // own inference probe returns, a real window right after a launch
+            // reports ready. The wait is bounded
+            // (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is supported —
+            // no `device:` row, and `rocm services list` shows it once it can.
             let device = serve_device_probe_opens(report.already_running, &report.status, || {
                 fetch_service_device_briefly(&paths, &selected_engine, &report.service_id)
             });
