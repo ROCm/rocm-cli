@@ -157,13 +157,16 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
         // `false`: the launcher has no live Services overlay to jump to
         // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
         // it must not advertise the `s` hint the dashboard's copy does.
-        crate::ui::approval::draw_approval(
-            f,
-            area,
-            &crate::ui::quit_confirm_request(state, false),
-            choice,
-            theme,
-        );
+        state
+            .quit_confirm_max_scroll
+            .set(crate::ui::approval::draw_approval_scrolled(
+                f,
+                area,
+                &crate::ui::quit_confirm_request(state, false),
+                choice,
+                state.quit_confirm_scroll,
+                theme,
+            ));
     }
 }
 
@@ -917,6 +920,119 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8] {
             let _ = render(&s, 0, 60, h);
         }
+    }
+
+    /// The `row N of M` position the overflow notice states, which is driven by
+    /// the scroll offset the call site passes down.
+    fn visible_row(screen: &str) -> Option<u16> {
+        let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        flat.split("row ").nth(1)?.split(' ').next()?.parse().ok()
+    }
+
+    /// ROCMAI-1050 at the launcher's own `draw_approval_scrolled` call site.
+    ///
+    /// Every other regression test for the height growth and the overflow
+    /// notice renders through `ui::draw`, the dashboard's call site. The key
+    /// routing is shared (`resolve_quit_confirm_key`), but this call site has
+    /// its own few lines of render glue — the `&quit_confirm_request(...)`,
+    /// the scroll it passes down and the `max_scroll` it writes back — and a
+    /// transposed argument there would not necessarily fail to compile. The
+    /// pre-existing test next to this one renders at a roomy 24 rows and then
+    /// only checks that short sizes do not panic, which a silently cut body
+    /// would also satisfy.
+    ///
+    /// Both directions are asserted. At twelve rows the body must still reach
+    /// the user *and* say there is more; at twenty-four it must not claim
+    /// there is more when everything fits, which is what a notice wired to
+    /// fire unconditionally would do.
+    ///
+    /// The scroll is actually driven rather than left at zero, which is what
+    /// makes the transposition above detectable at all. `quit_confirm_scroll`
+    /// (passed down) and `quit_confirm_max_scroll` (written back) are both
+    /// `u16`, so swapping them still compiles, and while both hold `0` a
+    /// swapped call renders byte-identically -- rendering twice at the top
+    /// proves nothing.
+    ///
+    /// Paging is what separates them: under the swap `max_scroll` is never
+    /// written, so `quit_confirm_scroll_key` clamps against `0`, the offset
+    /// cannot leave the top, and the position the notice reports stays put.
+    /// Asserting that position *advances* is therefore the check that fails
+    /// on a transposition. Verified by making that swap and watching this go
+    /// red.
+    #[test]
+    fn launcher_quit_prompt_on_a_short_terminal_shows_its_body_and_says_there_is_more() {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = base();
+        // Enough serving instances that the body cannot fit a short window:
+        // each contributes its own "stop it first" bullet and command line.
+        for i in 0..7 {
+            s.instances.insert(
+                format!("vllm-{i}"),
+                Instance {
+                    container_id: format!("vllm-{i}"),
+                    managed: true,
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: (0..7).map(|i| format!("vllm-{i}")).collect(),
+                ..Default::default()
+            },
+        )));
+        s.open_quit_confirm();
+
+        let short = render(&s, 0, 100, 12);
+        assert!(
+            short.contains("rocm services stop vllm-0 --yes"),
+            "the remediation must still reach the user on a short terminal, not be cut: {short:?}"
+        );
+        assert!(
+            short.contains("More to read") && short.contains("PgUp/PgDn"),
+            "and the body that does not fit must say so and name the keys: {short:?}"
+        );
+
+        // That render wrote `max_scroll` back through the `Cell`, and the body
+        // is still at the top -- so the two fields are equal-by-accident at 0.
+        let max_scroll = s.quit_confirm_max_scroll.get();
+        assert!(
+            max_scroll > 0,
+            "premise: the body must overflow, or there is nothing to scroll: {short:?}"
+        );
+        assert_eq!(
+            s.quit_confirm_scroll, 0,
+            "premise: the body starts at the top"
+        );
+
+        // Page down so the two hold DIFFERENT values; only now would swapping
+        // them at the call site change what is drawn.
+        assert!(
+            s.quit_confirm_scroll_key(crossterm::event::KeyCode::PageDown),
+            "PgDn must move a body that overflows"
+        );
+        assert!(
+            s.quit_confirm_scroll > 0,
+            "premise: PgDn must have moved the offset off the top"
+        );
+
+        let scrolled = render(&s, 0, 100, 12);
+        let before = visible_row(&short).expect("the notice states a row before scrolling");
+        let after = visible_row(&scrolled).expect("and after");
+        assert!(
+            after > before,
+            "paging must move the window this call site renders ({before} -> {after}):\n\
+             before: {short:?}\nafter: {scrolled:?}"
+        );
+
+        let roomy = render(&s, 0, 100, 24);
+        assert!(
+            !roomy.contains("More to read"),
+            "a body that fits must not claim there is more to read: {roomy:?}"
+        );
     }
 
     #[test]
