@@ -436,6 +436,7 @@ Minimum quality gate before upstream-ready status:
 
 ```bash
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets --features rocm/e2e-test-hooks -- -D warnings
 cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
 cargo test --workspace --all-targets
 prek run --all-files
@@ -444,7 +445,8 @@ cargo xtask e2e
 cargo xtask smoke
 ```
 
-- `cargo test` skips the scenarios §3 requires: the `e2e` target of [`tests/e2e-cucumber`](tests/e2e-cucumber/Cargo.toml) sets `test = false`. The same setting leaves the harness out of the workspace clippy run, hence the separate `-p e2e-cucumber` line. CI runs both clippy invocations.
+- `cargo test` skips the scenarios §3 requires: the `e2e` target of [`tests/e2e-cucumber`](tests/e2e-cucumber/Cargo.toml) sets `test = false`. The same setting leaves the harness out of the workspace clippy run, hence the separate `-p e2e-cucumber` line. CI runs all three clippy invocations.
+- The `--features rocm/e2e-test-hooks` clippy line lints the feature-on side of each `e2e-test-hooks` seam, which the plain run never compiles. The feature-on test steps are not part of this minimum gate: CI's `test` job runs them, and the pre-push hooks build with `e2e-test-hooks` off, so when a change touches code or tests behind `e2e-test-hooks`, also run the commands in [CI test selection](docs/testing.md#ci-test-selection) by hand.
 - A green `cargo xtask e2e` does not show that a gated scenario ran (§3 says what to put in the PR text); after a plain run, `tests/e2e-cucumber/results/platform.json` (written from `PlatformManifest` in [`expectation.rs`](tests/e2e-cucumber/src/expectation.rs)) lists each skipped scenario with its reason. A filtered `-n` or `--tags` run is not the minimum quality gate, and neither is a run with `ROCM_CLI_BINARY` set, which tests that prebuilt binary instead of building the change (`e2e_binaries_from` in [`e2e.rs`](xtask/src/e2e.rs)).
 - `prek run --all-files` rewrites files in some hooks, so start from a clean working tree, read the diff it leaves, and re-run the lines above it if it rewrote anything. Some hooks need a tool installed locally (see [CONTRIBUTING.md](CONTRIBUTING.md)); a hook that skips, or fails for want of its tool, is a check that did not run, so say exactly what was not run (below). prek shows a skipped hook as passed unless the hook is `verbose` in [`.pre-commit-config.yaml`](.pre-commit-config.yaml): `powershell-script-analyzer` skips on a non-Windows host that way.
 - `cargo xtask tpn --check` is the `third-party-notices` CI job's command. It is a separate line because the `cargo-tpn` hook inside prek skips silently without the pinned `cargo-about`; run directly, the command fails loudly without it (`run` in [`tpn.rs`](xtask/src/tpn.rs)), which is a check that did not run (below).

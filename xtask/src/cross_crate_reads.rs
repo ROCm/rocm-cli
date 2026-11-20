@@ -62,6 +62,9 @@ use crate::affected::{self, Graph, Selection};
 ///   steps.
 /// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
 ///   although it lives in the e2e crate.
+/// - `apps/rocm/Cargo.toml`: xtask's `e2e-test-hooks` contract in
+///   `workflow_contract` reads `rocm`'s `e2e-test-hooks` feature list, which
+///   must turn the feature on in every other crate with code behind it.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
     ("README.md", &["rocm", "xtask"]),
@@ -69,6 +72,7 @@ pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("skills/", &["rocm", "xtask"]),
     ("skills/rocm-doctor/", &["e2e-cucumber"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
+    ("apps/rocm/Cargo.toml", &["xtask"]),
 ];
 
 fn read_pattern_matches(pattern: &str, file: &str) -> bool {

@@ -47,6 +47,19 @@ item where it unwraps. It is `allow` rather than `expect` because that code is e
 to keep unwrapping, at the cost that clippy will not report the attribute if it ever
 stops.
 
+Run clippy with warnings as errors, once with the `e2e-test-hooks` feature off
+and once with it on:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features rocm/e2e-test-hooks -- -D warnings
+```
+
+Each run compiles code the other never sees: a test hook's `cfg(not(..))`
+fallback only with the feature off, and the hook itself, with the tests that
+exist only alongside it, only with the feature on. The CI `clippy` job runs both.
+The Windows clippy steps in the `windows-debug` job lint with the feature off only.
+
 ### Source file size
 
 No source file may exceed 1,500 production lines. Production lines leave out test-gated
@@ -729,8 +742,10 @@ for any changed Rust file (the `*.rs` entry of `CROSS_CRATE_READS`, see
 `apps/rocm` alone still runs this check on the pull request, whether or not its
 seed moved with it. The same `*.rs` entry runs the other source-scan contracts
 in `xtask` for any Rust change; a change confined to non-Rust files of a crate
-that `xtask` does not depend on meets them only in the merge queue, which runs
-the whole workspace. To prove a moved seed is read,
+that `xtask` does not depend on meets them in the Linux `coverage` job, which
+runs every crate's tests but `e2e-cucumber`'s whenever the `changes` job's
+`rust` category matches (as any file inside a crate does), and in the merge
+queue, which runs the whole workspace. To prove a moved seed is read,
 append a deliberately unparsable line to it, run the test with `--nocapture`
 (`cargo test -p <crate> <test name> -- --nocapture`), look for proptest's
 `unparsable line, ignoring` warning naming that path, and remove the line.
@@ -1218,6 +1233,48 @@ requests every category is on. The minimum quality gate in
 [AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
 that also narrows the local pre-push hooks (next section).
 
+The `test` job's affected-crates `cargo nextest run` builds with the
+`e2e-test-hooks` feature off, so the tests that exist only with it are not
+among them. More steps of the `test` job
+run them, each when its crate is in the selection or the selection is the
+whole workspace. Each runs that crate's whole suite with the feature on (the
+rocm-core one its library tests), not only the tests behind the feature:
+
+```bash
+cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
+cargo nextest run --locked -p rocm --features rocm/e2e-test-hooks
+```
+
+Tests gated on the feature being off, such as
+`runner_options_points_the_kfd_preflight_at_the_real_device` in
+[dash.rs](../apps/rocm/src/dash.rs) and
+`a_build_without_the_hook_ignores_the_variable` in
+[hardware_root.rs](../crates/rocm-core/src/hardware_root.rs), are not built by
+these steps; feature-off runs such as the plain `cargo nextest run` above
+run them.
+
+A contract test in [workflow_contract.rs](../xtask/src/workflow_contract.rs),
+`ci_lints_and_tests_every_crate_with_e2e_test_hooks_gated_tests`, finds every
+crate whose library, binary, proc-macro or build-script module tree has test
+code the feature changes: test code holding a `cfg(..)` or `cfg!(..)` the
+feature can turn on or a `cfg_attr(..)` naming it, test code behind such a gate,
+or a `mod x;` behind the feature, whose file it does not read. It fails while
+such a crate has no step like these, so a crate that gains such test code needs
+a step of its own. It does not read integration tests under a crate's `tests/`
+directory, so a test there behind the feature is not checked. It also checks
+that each such step has its exact `run:` and `if:` and no `continue-on-error`,
+that the `clippy` job runs both workspace clippy commands, feature off and on,
+and that every other crate with code behind the feature is in `rocm`'s
+`e2e-test-hooks` feature list. Run it on its own with:
+
+```bash
+cargo test -p xtask ci_lints_and_tests_every_crate_with_e2e_test_hooks_gated_tests
+```
+
+On a pull request the Linux `test` job runs it whenever a Rust file or
+`apps/rocm/Cargo.toml` changes, since either adds `xtask` to the selection, so a
+crate's first hooks-only test is checked on the pull request that adds it.
+
 ### Pre-push hook scope
 
 The pre-push hooks `cargo-clippy`, `cargo-clippy-e2e` and `cargo-test` in
@@ -1233,6 +1290,10 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
   `e2e-cucumber` (its scenarios run through `cargo xtask e2e`), or
   `--workspace --all-targets --exclude e2e-cucumber` for the whole workspace.
 
+The hooks build with `e2e-test-hooks` off, so the feature-on clippy and the feature-on
+test steps run only in CI, or by hand with the feature-on commands under
+[Local Verification](#local-verification) and [CI test selection](#ci-test-selection).
+
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
 so the selection is widened, in the hook and in CI's `test` job alike: any Rust file also selects
 `xtask` (its contract tests scan every source file), `README.md`, `docs/` and `skills/` also select
@@ -1241,7 +1302,8 @@ skill), `skills/rocm-doctor/` also selects `e2e-cucumber` (its `skill_reference`
 skill's catalog table; CI runs that test in the `test` job's `cargo nextest` over the selection
 and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose steps run when the
 `heavy` category matches, as every `skills/` change does, while the hook's `test`
-step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
+step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), `apps/rocm/Cargo.toml` also selects
+`xtask` (its `e2e-test-hooks` contract reads `rocm`'s feature list), and the
 e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
 [cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
 `include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
@@ -5991,8 +6053,8 @@ as itself rather than silently treated as an unknown distribution. The two
 host root and check that both `rocm examine` reads answer from it through the
 shared parser: the first at `/etc/os-release`, the second with only
 `/usr/lib/os-release` present, so the fallback is exercised through the real
-`host_path`-routed call sites, not just the helper in isolation; the feature
-they need is enabled only by its own CI step. The
+`host_path`-routed call sites, not just the helper in isolation; CI runs them
+in the `test` job's rocm-core `e2e-test-hooks` step. The
 `try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable`
 test runs the WSL remote probe's own shell fallback for real under `/bin/sh`
 against a primary that exists but cannot be sourced (a directory in its
@@ -6011,7 +6073,8 @@ and expects the real file back, and
 `system_packages::tests::the_install_hints_read_the_real_host_and_ignore_a_simulated_root`
 holds the three install hints to the same rule. Both live in that process
 rather than in `rocm-core`'s, so the environment variable they set cannot
-overlap a `rocm-core` test that reads host paths.
+overlap a `rocm-core` test that reads host paths. CI runs them in the `test`
+job's rocm `e2e-test-hooks` step.
 `system_packages::tests::no_caller_in_this_binary_reads_the_real_os_release_by_hand`
 fails when a source file of the `rocm` binary reads the file with its own
 resolver instead of calling it.
