@@ -55,6 +55,20 @@ The Linux silicon is MI300X, checked twice:
 - `e2e-gpu`, the second, runs on the self-hosted MI300X runner and reports as
   `e2e-gpu-selfhosted-report`.
 
+Either lane satisfies the MI300X requirement of a pull request, and the queue is
+the one to count on: the self-hosted runners can sit at zero replicas. The
+`E2E consolidated report (self-hosted)` job decides it
+([`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh)): MI300X counts as passed
+only when at least one lane passed **with an exported report**; a self-hosted
+lane that was cancelled, skipped or never got a runner counts as absent, not
+failed; a lane that ran and failed still fails the check; and when neither lane
+produced a passing report the check fails. A skipped lane, or one that exported
+no report, is never a pass. The report does not wait on `e2e-gpu` directly: a job
+queued for a runner cannot be timed out, so `e2e-gpu-settled` gives up on it after
+30 minutes in the queue and the run's leftover job is then cancelled. This applies
+to a pull request from this repository that the queue lane takes; a push or a
+dispatch has no queue lane, and only a lane that ran without a report fails there.
+
 vLLM is the effective engine on both; MI300X is the only silicon where it is.
 The Windows pool is the Strix Halo pool (`e2e-gpu-strix-windows` and
 `e2e-wsl`). The Strix Halo
