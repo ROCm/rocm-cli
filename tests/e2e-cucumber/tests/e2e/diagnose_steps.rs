@@ -249,6 +249,13 @@ const fn fix_id_for_the_other_os() -> &'static str {
 /// break a working Python environment.
 const COMGR_CONFLICT_FIX_ID: &str = "fix-18-comgr-conflict";
 
+/// The entry for a `/dev/shm` too small for a serving workload.
+const SHM_TOO_SMALL_FIX_ID: &str = "fix-19-shm-too-small";
+
+/// The allowance below which the CLI reports `SHM_TOO_SMALL_FIX_ID` (rocm-core's
+/// `SHM_MIN_BYTES`, which the fix notes publish as "below 1 GiB").
+const SHM_REPORTED_BELOW_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Contents planted in the scenario's own shell rc file. The assertion is that
 /// this survives the run byte for byte.
 const PLANTED_RC: &str = "# planted by the e2e suite; the fix must not touch this\n";
@@ -1805,6 +1812,160 @@ async fn assert_remedy_explained_not_applied(world: &mut E2eWorld) {
     assert!(
         lowered.contains("print-only"),
         "the CLI must say it only printed a plan:\n{output}"
+    );
+}
+
+/// This machine's `/dev/shm` size and its total memory, in bytes, measured with
+/// `df` and `/proc/meminfo` rather than through the CLI under test, so a step
+/// comparing the two is not the CLI agreeing with itself.
+fn measured_shm_and_memory() -> (u64, u64) {
+    let df = std::process::Command::new("df")
+        .args(["-B1", "--output=size", "/dev/shm"])
+        .output()
+        .expect("could not run df to measure /dev/shm");
+    let df_out = String::from_utf8_lossy(&df.stdout);
+    assert!(df.status.success(), "df /dev/shm failed:\n{df_out}");
+    let shm = df_out
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .next_back()
+        .unwrap_or_else(|| panic!("df printed no size for /dev/shm:\n{df_out}"));
+    let meminfo = std::fs::read_to_string("/proc/meminfo").expect("could not read /proc/meminfo");
+    let memory_kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|rest| {
+            rest.trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("/proc/meminfo has no MemTotal line:\n{meminfo}"));
+    (shm, memory_kib * 1024)
+}
+
+/// Whether `shm` is the kernel's tmpfs default for a machine with `memory`:
+/// half of it, give or take page rounding. The band is wide on purpose; what it
+/// tells apart is "half the memory" from "a fixed small default".
+fn is_half_of(shm: u64, memory: u64) -> bool {
+    let tenths = shm.saturating_mul(10) / memory.max(1);
+    (4..=5).contains(&tenths)
+}
+
+/// Bytes as a one-decimal GiB figure for an assertion message.
+fn gib_figure(bytes: u64) -> String {
+    format!("{:.1} GiB", gib(bytes))
+}
+
+#[given("a WSL machine whose shared memory is the usual half of its memory")]
+async fn wsl_machine_with_usual_shm(world: &mut E2eWorld) {
+    let (shm, memory) = measured_shm_and_memory();
+    // The premise, checked rather than assumed. A lane whose VM was given about
+    // 2 GB or less in .wslconfig (/dev/shm is half of MemTotal, and the kernel
+    // keeps part of the VM's memory, so that falls under 1 GiB), or whose
+    // /dev/shm was remounted, is not the
+    // machine this scenario is about, and has to say so with the figures
+    // rather than fail later on a finding that is correct for it.
+    assert!(
+        is_half_of(shm, memory) && shm >= SHM_REPORTED_BELOW_BYTES,
+        "this WSL machine's /dev/shm is {} ({shm} bytes) on {} of memory; the \
+         scenario needs WSL2's usual allowance of half the memory, at least {}. \
+         Give the VM more memory in .wslconfig or undo the /dev/shm remount.",
+        gib_figure(shm),
+        gib_figure(memory),
+        gib_figure(SHM_REPORTED_BELOW_BYTES)
+    );
+    world.shm_allowance_before = Some(shm);
+}
+
+#[then("the shared memory allowance is not reported as too small")]
+async fn assert_shm_not_reported_short(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose is a query and must exit 0:\nstderr:\n{stderr}"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    let matched = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array");
+    let reported = matched.iter().any(|entry| {
+        entry.get("id").and_then(serde_json::Value::as_str) == Some(SHM_TOO_SMALL_FIX_ID)
+    });
+    let shm = world.shm_allowance_before.unwrap_or_default();
+    assert!(
+        !reported,
+        "/dev/shm here is {} ({shm} bytes), above the {} the CLI reports below, so \
+         {SHM_TOO_SMALL_FIX_ID} must not be reported:\n{output}",
+        gib_figure(shm),
+        gib_figure(SHM_REPORTED_BELOW_BYTES)
+    );
+}
+
+#[when("the user asks the CLI to apply the fix for a shared memory allowance that is too small")]
+async fn user_applies_shm_fix(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", SHM_TOO_SMALL_FIX_ID]);
+    world.model_name = Some(SHM_TOO_SMALL_FIX_ID.to_string());
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("this machine's shared memory allowance is what it was")]
+async fn assert_shm_unchanged(world: &mut E2eWorld) {
+    let before = world
+        .shm_allowance_before
+        .expect("no Given measured /dev/shm");
+    let (after, _) = measured_shm_and_memory();
+    assert_eq!(
+        after,
+        before,
+        "a fix that only explains itself must leave /dev/shm as it was: {} before, \
+         {} after",
+        gib_figure(before),
+        gib_figure(after)
+    );
+}
+
+/// The sentence of fix-19's rationale that says what WSL2 gives `/dev/shm`.
+/// A pin, duplicated as `FIX_19_WSL2_SENTENCE` in the unit test
+/// `on_wsl2_the_shm_finding_follows_the_measured_allowance_not_a_container_default`
+/// (crates/rocm-core/src/diagnose/engine.rs); change both together.
+const FIX_19_WSL2_SENTENCE: &str = "WSL2 normally gives /dev/shm half the VM's memory, but it \
+    can still be short there inside a container, in a VM given little memory, or after a \
+    remount.";
+
+#[then("the reason the fix gives says WSL2 normally gives half the VM's memory")]
+async fn assert_shm_fix_reason_states_the_wsl2_rule(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().expect("no fix output");
+    let rationale = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Rationale:").map(str::trim))
+        .unwrap_or_else(|| panic!("the fix printed no Rationale: line:\n{output}"));
+    // A wording pin: it proves what the printed reason says, not that it is
+    // true. The reason's only statement about WSL2 has to be the pinned
+    // sentence -- it contains `FIX_19_WSL2_SENTENCE`, and mentions WSL nowhere
+    // else. What shows the sentence true: "half the VM's memory" is measured on
+    // this machine by the scenario's Given, "a WSL machine whose shared memory
+    // is the usual half of its memory" (df against /proc/meminfo); "can still
+    // be short" is shown by the unit test named on `FIX_19_WSL2_SENTENCE` (its
+    // 0.5 GiB assertion) and by rocm-core's
+    // `a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs`.
+    // Rewording the rationale means updating `FIX_19_WSL2_SENTENCE` here and in
+    // that unit test, which holds the catalog text the same way.
+    assert!(
+        rationale.contains(FIX_19_WSL2_SENTENCE),
+        "the reason's only statement about WSL2 has to be the pinned one, half the \
+         VM's memory:\n{FIX_19_WSL2_SENTENCE}\n\n{rationale}"
+    );
+    assert_eq!(
+        rationale.to_lowercase().matches("wsl").count(),
+        FIX_19_WSL2_SENTENCE.to_lowercase().matches("wsl").count(),
+        "the reason's only statement about WSL2 has to be the pinned one, half the \
+         VM's memory; it mentions WSL elsewhere too:\n{rationale}"
     );
 }
 

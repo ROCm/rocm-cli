@@ -58,7 +58,7 @@ pub use render::list_recipes;
 pub(crate) use catalog::{
     OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, assert_engine_shell_boundary_is_labelled,
     assert_needs_reboot_matches_the_catalog, assert_plan_matches_the_catalog_copy,
-    fails_in_windows_powershell, recipe_applies_on, recipe_linux_verify,
+    fails_in_windows_powershell, recipe_applies_on, recipe_linux_verify, recipe_rationale,
     recipe_verify_notes_and_run_commands, torch_rocm_indexes_named_in,
 };
 #[cfg(all(test, windows))]

@@ -158,9 +158,10 @@ const CHECKERS: &[Checker] = &[
     // until this has proved the approach.
     (Check::Text(check_18_comgr_conflict), &["linux", "wsl"]),
     // Both families, for the same reason. The shortage has nothing to do with
-    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs -- and WSL2 ships the
-    // same 64 MB default a container does, so leaving this tagged `linux` alone
-    // would silence it on one of the two platforms most likely to have it.
+    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs. WSL2 normally gives
+    // it half the VM's memory, but a container inside the distro, a VM given
+    // little memory or a remount can still leave it short, so leaving this
+    // tagged `linux` alone would silence a real shortage there.
     (Check::Text(check_19_shm_too_small), &["linux", "wsl"]),
     // Not "wsl": WSL2 reports no GPU topology (`gpus` is empty), so this check
     // has nothing to read there and would never fire.

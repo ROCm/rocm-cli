@@ -472,9 +472,12 @@ pub(super) fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str
 /// The shared-memory allowance below which a serving workload is in trouble.
 ///
 /// Chosen to separate the failure from the healthy majority rather than to
-/// describe what a workload wants. A container's default is 64 MB; an ordinary
-/// Linux host gives `/dev/shm` half its RAM, clearing this on anything with 2 GB
-/// or more. WSL2 ships the same 64 MB default a container does.
+/// describe what a workload wants. An ordinary Linux host, and WSL2 inside its
+/// VM, gives `/dev/shm` half the memory the kernel reports as `MemTotal`; a
+/// container's default is 64 MB. So this fires when `MemTotal` is under 2 GiB
+/// (the kernel keeps part of what it is given, so a machine or VM given about
+/// 2 GB or less is below that), inside a container, or after a remount shrinks
+/// it.
 ///
 /// This deliberately under-reports. A container given 2 GB is still short for a
 /// large model and will not be flagged here. That is the right way to be wrong:
@@ -715,9 +718,9 @@ mod tests {
 
     #[test]
     fn a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs() {
-        // The container default, which is also what WSL2 ships. The point of the
-        // entry is that it fires on machine state alone: the crash this prevents
-        // never names shared memory, so a user who pasted it would get nothing.
+        // The container default. The point of the entry is that it fires on
+        // machine state alone: the crash this prevents never names shared
+        // memory, so a user who pasted it would get nothing.
         let mut e = linux_base();
         e.shm_total_bytes = Some(64 * 1024 * 1024);
         e.shm_available_bytes = Some(64 * 1024 * 1024);
@@ -937,6 +940,64 @@ mod tests {
             "8 GiB is what the catalog itself tells users to ask for"
         );
     }
+
+    #[test]
+    fn on_wsl2_the_shm_finding_follows_the_measured_allowance_not_a_container_default() {
+        // WSL2 mounts /dev/shm as a tmpfs with no size= option, so it gets the
+        // kernel default of half the VM's memory: 24 GiB on a 48 GiB VM. It is
+        // short only when it has been shrunk -- a small VM, a remount, or a
+        // container inside the distro -- and the checker reads the measured size,
+        // so the reason `rocm fix` prints has to say the same thing.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let wsl_with = |total: u64| {
+            let mut e = wsl_base();
+            e.shm_total_bytes = Some(total);
+            e.shm_available_bytes = Some(total);
+            diagnose(&e, "")
+        };
+
+        assert!(
+            shm_finding(&wsl_with(24 * GIB)).is_none(),
+            "a WSL2 distro with its usual allowance has nothing to report"
+        );
+        assert!(
+            shm_finding(&wsl_with(GIB / 2)).is_some(),
+            "a shrunk allowance must still be reported on WSL2; the scope stays \
+             [\"linux\", \"wsl\"]"
+        );
+
+        let rationale =
+            crate::fix::recipe_rationale("fix-19-shm-too-small").expect("fix-19 is in the catalog");
+        // A wording pin: it proves what the rationale says, not that it is
+        // true. The reason's only statement about WSL2 has to be the pinned
+        // sentence -- it contains `FIX_19_WSL2_SENTENCE`, and mentions WSL
+        // nowhere else. What shows the sentence true: "half the VM's memory" is
+        // measured on a real distro by the Given of e2e scenario diagnose-87, "a
+        // WSL machine whose shared memory is the usual half of its memory" (df
+        // against /proc/meminfo); "can still be short" is shown by the 0.5 GiB
+        // assertion above and by
+        // `a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs`.
+        // Rewording the rationale means updating `FIX_19_WSL2_SENTENCE` here and
+        // its copy in tests/e2e-cucumber/tests/e2e/diagnose_steps.rs.
+        assert!(
+            rationale.contains(FIX_19_WSL2_SENTENCE),
+            "the reason's only statement about WSL2 has to be the pinned one, half \
+             the VM's memory:\n{FIX_19_WSL2_SENTENCE}\n\n{rationale}"
+        );
+        assert_eq!(
+            rationale.to_lowercase().matches("wsl").count(),
+            FIX_19_WSL2_SENTENCE.to_lowercase().matches("wsl").count(),
+            "the reason's only statement about WSL2 has to be the pinned one, half \
+             the VM's memory; it mentions WSL elsewhere too:\n{rationale}"
+        );
+    }
+
+    /// The sentence of fix-19's rationale that says what WSL2 gives `/dev/shm`.
+    /// A pin, duplicated as `FIX_19_WSL2_SENTENCE` in
+    /// tests/e2e-cucumber/tests/e2e/diagnose_steps.rs; change both together.
+    const FIX_19_WSL2_SENTENCE: &str = "WSL2 normally gives /dev/shm half the VM's memory, \
+        but it can still be short there inside a container, in a VM given little memory, or \
+        after a remount.";
 
     #[test]
     fn a_healthy_managed_installation_raises_no_report() {
