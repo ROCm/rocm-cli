@@ -43,7 +43,7 @@ pub(crate) use self::probe::{
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 pub(crate) use self::python::NEXT_MANAGED_PYTHON_VERSION;
 use self::python::{
-    ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
+    ensure_marked_uv_venv, managed_python_version, python_for_install, python_requirement,
     python_requirement_for_version,
 };
 use self::resolve::{
@@ -639,7 +639,7 @@ fn install_wheel_runtime(
         "Creating Python environment at {}.",
         install_root.display()
     ));
-    ensure_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
+    ensure_marked_uv_venv(paths, &uv, &python_launcher.executable, &install_root)?;
     let env_python = venv_python_path(&install_root);
     // `ensure_uv_venv` recreates an environment built for another interpreter, and
     // the recreated one holds no torch. Asked again, so that case installs the
@@ -998,9 +998,7 @@ fn install_tarball_runtime(
         }
     }
 
-    fs::create_dir_all(paths.cache_dir.join("therock"))?;
-    fs::create_dir_all(&install_root)?;
-    ensure_tarball_install_target_is_clean(&install_root)?;
+    prepare_tarball_install_root(paths, &install_root)?;
 
     if let Some(warning) = preflight_tarball_space(&artifact.url, &cache_path, &install_root)? {
         let _ = writeln!(output, "  {warning}");
@@ -1147,6 +1145,16 @@ fn resolved_install_root(
 ) -> PathBuf {
     let requested = prefix.unwrap_or_else(|| managed_runtime_root(paths, format, runtime_key));
     rocm_core::resolve_path_through_symlinks(&requested)
+}
+
+/// The folders a tarball install writes to before it downloads: the TheRock
+/// download cache, and `install_root`, marked as ROCm CLI's own when this is
+/// what creates it (so `rocm uninstall` may remove it later) and refused when
+/// it already holds something.
+fn prepare_tarball_install_root(paths: &AppPaths, install_root: &Path) -> Result<()> {
+    fs::create_dir_all(paths.cache_dir.join("therock"))?;
+    rocm_core::create_marked_root(install_root)?;
+    ensure_tarball_install_target_is_clean(install_root)
 }
 
 /// Refuses to extract a tarball into a root that already holds a payload.
@@ -1867,6 +1875,34 @@ mod tests {
         assert_eq!(
             warning,
             "ROCm 7.14.0 is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm 7.13.0 instead"
+        );
+    }
+
+    /// A tarball install marks the install folder as ROCm CLI's own when it
+    /// creates it, so `rocm uninstall` may remove it later, and leaves an
+    /// existing empty folder unmarked.
+    #[test]
+    fn a_tarball_install_marks_the_install_folder_it_creates_and_not_an_existing_one() {
+        let base = tempfile::tempdir().expect("scratch dir");
+        let paths = AppPaths {
+            config_dir: base.path().join("config"),
+            data_dir: base.path().join("data"),
+            cache_dir: base.path().join("cache"),
+        };
+        let fresh = base.path().join("new-prefix");
+        prepare_tarball_install_root(&paths, &fresh).expect("a new folder is prepared");
+        assert!(
+            fresh.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file(),
+            "the install folder it created is not marked"
+        );
+        assert!(paths.cache_dir.join("therock").is_dir());
+
+        let existing = base.path().join("existing-prefix");
+        fs::create_dir_all(&existing).unwrap();
+        prepare_tarball_install_root(&paths, &existing).expect("an empty folder is clean");
+        assert!(
+            !existing.join(rocm_core::ROCM_CLI_ROOT_MARKER).exists(),
+            "an existing install folder was marked"
         );
     }
 
