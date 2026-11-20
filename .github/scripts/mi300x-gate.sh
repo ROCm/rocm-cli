@@ -83,6 +83,7 @@ ran_without_report() {
   local result="$1" skipped="$2" artifact="$3"
   case "${result}" in
     skipped | abandoned | absent | "") return 1 ;;
+    *) ;;
   esac
   [[ "${skipped}" = true ]] && return 1
   ! grep -qxF -- "${artifact}" <<<"${artifacts}"
@@ -140,6 +141,9 @@ mark=":white_check_mark:"
   echo "### MI300X: ${mark} ${reason}"
   echo "- queue lane (\`e2e-gpu-queue\`): ${queue} (result: ${QUEUE_RESULT:-absent})"
   echo "- self-hosted lane (\`e2e-gpu\`): ${selfhosted} (result: ${selfhosted_result:-absent})"
+  if [[ "${queue}" = absent && "${required}" = true ]]; then
+    echo "- The queue lane did not run for this push (switched off, or refused for the nightly window), and a skipped lane is never a pass: re-run once it can, or when the self-hosted lane has a runner."
+  fi
   if [[ "${selfhosted}" = absent && "${required}" = true ]]; then
     echo "- A self-hosted lane that was cancelled, skipped or never got a runner counts as absent, not failed."
   fi
