@@ -3156,8 +3156,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             env_value(&step, "MI300X_REQUIRED"),
             "${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' \
              && github.event.pull_request.head.repo.full_name == github.repository \
-             && github.actor != 'dependabot[bot]' }}"
-                .replace(" \\\n             ", " "),
+             && github.actor != 'dependabot[bot]' }}",
             "MI300X_REQUIRED must hold the queue lane's whole `if`, joined by `&&`"
         );
         assert_eq!(
@@ -3210,8 +3209,9 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // The canceller runs the cancel, with a token, after every job it must not
         // cut off.
         assert!(
-            cancel.contains("gh run cancel \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\"")
-                && cancel.contains("/force-cancel")
+            cancel.contains(
+                "-X POST \"repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/force-cancel\""
+            ) && !cancel.contains("gh run cancel")
                 && cancel.contains("GH_TOKEN: ${{ github.token }}")
                 && cancel.contains("::warning::"),
             "the canceller must cancel this run with a token, tolerating a refusal:\n{cancel}"
@@ -3505,8 +3505,8 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
                 "skipped",
                 "abandoned",
                 &[],
-                0,
-                "self-hosted never got a runner",
+                1,
+                "self-hosted never got a runner and no queue lane covers it",
             ),
             ("skipped", "absent", &[], 0, "self-hosted not in the run"),
             ("skipped", "success", &[S], 0, "self-hosted passed"),
