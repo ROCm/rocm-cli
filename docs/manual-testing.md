@@ -523,6 +523,32 @@ ROCm backend directory under `bin/llamacpp/`, and run
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
 
+To check that a failed backend alignment is not repeated (Windows or native
+Linux with a GPU Lemonade runs its ROCm backend on, and an active managed ROCm
+SDK): build with `cargo build -p rocm --features rocm/e2e-test-hooks`, set
+`ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION=7.99.0` (a ROCm version Lemonade
+publishes no backend for), and run `rocm engines install lemonade --reinstall`,
+then `rocm engines install lemonade`. Expected result:
+
+- The first install prints `Warning: could not align Lemonade's ROCm backend to
+  7.99.0; reverting to the default pinned version.`, exits 0, and leaves
+  `.rocm-cli-alignment-failed.json` in the Lemonade runtime tree.
+- The second install prints no alignment warning and does not download or
+  reinstall the backend (`Using installed Lemonade llamacpp:rocm backend.`). It
+  prints `Lemonade's ROCm backend could not be aligned to ROCm 7.99.0 less than
+  an hour ago; ...`, naming `rocm engines install lemonade --reinstall` and
+  that an install run 24 hours from now or later tries it again, and exits 0.
+- Running the first command again attempts the alignment again (the warning
+  is back), because `--reinstall` removed the record with the runtime tree.
+- Not a manual step: when preparing the pinned backend fails on the second
+  install, its error says so, that the alignment was skipped because of the
+  earlier failure, and that `rocm engines install lemonade --reinstall`
+  re-extracts the runtime tree without that record; the record is kept and the
+  skip line above is not printed. There is no way to make that install fail on
+  demand, so this is covered by the unit test
+  `a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`
+  in [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs).
+
 To check what a Lemonade install says about its size (no download needed for
 the refusal): with a debug build, set
 `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
@@ -924,6 +950,58 @@ account may not open. The text of `rocm services stop` does not list a per-proce
 outcome for the stopping process itself; the JSON answer of the sandbox
 `stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
 as stopped).
+
+**An engine that dies at startup.** On Windows and Linux alike, a managed
+engine that exits within its first 200 ms fails `rocm serve --managed`
+instead of reporting a server that is still starting.
+To see it without a broken engine, build the CLI with its test hooks and arm
+the scripted death, which makes the spawned engine reject its arguments:
+
+```powershell
+cargo build -p rocm --features e2e-test-hooks
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"
+./target/debug/rocm serve qwen --engine lemonade --managed
+./target/debug/rocm services list --all
+```
+
+Expected result:
+
+- The serve exits non-zero with `managed engine exited immediately with status
+  ...; inspect <log path>`, where `<log path>` is the service's own log, plus a
+  tail of that log when the engine wrote anything to it. On Windows the status
+  is the engine's exit code too.
+- `rocm services list --all` shows the attempt as `stopped`. Running the same
+  `rocm serve` again fails again with the same `managed engine exited
+  immediately ...` error, rather than reporting the earlier attempt as already
+  running, and `rocm services list --all` then shows two `stopped` records.
+- An engine that dies later than that — while loading its runtime or model —
+  is not caught by this check; the serve then waits for readiness and reports
+  the service as still starting, as before.
+
+Unset the variable afterwards; a build without `--features e2e-test-hooks`
+ignores it.
+
+To see the stop-during-start case, run `rocm serve <model> --managed` in one
+terminal and, while it is still waiting for the server, `rocm services stop
+<service-id> --yes` from another. The serve exits non-zero with an error that
+begins "a stop was requested for managed service `<service-id>` while it was
+starting". Which advice follows depends on how far the stop has got:
+
+- If the stop has finished, the record reads `stopped`, `rocm services list
+  --all` shows the service as `stopped`, and the error ends "start it again with
+  `rocm serve`".
+- If the stop is still running (it can take tens of seconds), the record still
+  reads as live (`starting`, `running` or `ready`), and a new `rocm serve` for
+  the same model would reuse the service being stopped. The error then names
+  `rocm services stop <service-id> --yes` to run first. It waits for the
+  processes; once it reports the service stopped, `rocm services list --all`
+  shows `stopped` and `rocm serve` launches anew. A stop that cannot confirm the
+  processes gone says so and leaves the service live.
+
+This is the usual result, not a certain one: the launch reads the record and
+writes its readiness verdict as two separate steps, and a stop takes no lock on
+the record, so a stop that lands between the two is overwritten by the verdict
+and the serve reports the server as it found it.
 
 #### Windows host check
 
@@ -1981,6 +2059,16 @@ Expected result:
 - The plan still asks for review before mutating actions.
 - `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
+- A plan whose command carries a value a Windows shell reads as syntax inside
+  single quotes, such as `'`, `&` or `%` (the full set is in
+  [llm-tool-use.md](llm-tool-use.md)), is not shown:
+  the CLI falls back to its own plan and its note says to supply that value
+  yourself. The same holds for `rocm chat --tools --prompt …`, where the
+  assistant's request is refused with that message on stderr and no
+  `advanced manual command:` line is printed. A folder in a request the CLI
+  recognises itself (`install therock into D:\R&D\rocm`) is shown as typed;
+  in other wording the folder reaches the CLI through the assistant's request
+  and is refused like any value the assistant chose.
 
 To turn provider-assisted planning back off:
 
