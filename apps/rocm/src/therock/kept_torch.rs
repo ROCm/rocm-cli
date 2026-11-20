@@ -109,6 +109,19 @@ pub(super) fn plan_line(kept: &KeptTorch) -> String {
     )
 }
 
+/// The `torch_kept:` line a preview prints under the opt-out when the folder's
+/// venv may be reused: the install would then keep the torch that venv holds,
+/// and only running its Python could say which. A preview runs nothing from the
+/// install folder, so the line says it cannot tell. Every other preview plan
+/// creates or rebuilds the venv, or refuses the folder, so nothing is kept there
+/// and no line is printed.
+pub(super) fn preview_line(env_python: &Path) -> String {
+    format!(
+        "  torch_kept: cannot tell; ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set, so if the venv whose Python is {} is reused and holds torch, the install keeps that torch and hands uv only the ROCm packages, without the torch, torchvision and torchaudio requirements the commands shown include; this preview runs nothing from the install folder, so it does not know which torch that venv holds",
+        env_python.display()
+    )
+}
+
 /// The one `torch_kept:` line a real install prints, once the environment is
 /// prepared: the plan's line when the torch is kept, an explanation when the
 /// environment was recreated and the torch the plan counted on is gone.

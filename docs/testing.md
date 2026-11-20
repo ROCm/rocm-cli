@@ -1449,7 +1449,9 @@ rocm install sdk --channel release --format wheel < /dev/null   # expect the ref
 
 The preview path is unaffected: `--dry-run` returns before the gate is
 consulted, so `rocm install sdk --channel release --format wheel --dry-run`
-never prompts and never refuses, whatever the active default is.
+never prompts and never asks for that consent, whatever the active default is.
+It can still fail, or report that the install would refuse, for the Python and
+install-folder reasons below.
 
 The preview also prepares no Python. On a host with no usable Python, a real
 install downloads a managed `uv`, has it install Python, and saves that Python's
@@ -1475,8 +1477,8 @@ version, the torchaudio pin and that series bound), so the preview runs a `uv`
 that is already there (the one `ROCM_CLI_UV_BINARY` names, or the managed copy a
 previous install left) and, with none, stops before that step. It then prints
 what needs no `uv` (the ROCm version, the torchaudio pin, the requirements `uv`
-would be asked about), marks `target`, `runtime_key`, `package_specs`, `command`
-and `manifest` as `not resolved by this preview`, and says why in a
+would be asked about), marks `target`, `runtime_key`, `package_specs`,
+`python_env`, `command`, `env` and `manifest` as `not resolved by this preview`, and says why in a
 `resolution_note:` line and a progress line, in the voice of `python_note:`. It
 cannot say whether the published stack installs together either. A real install
 and `rocm update` still fetch `uv` as before, and a preview made after either
@@ -1581,6 +1583,48 @@ preview does still write its package-index cache under the cache folder.
 The `update_check` tool and the plain `rocm update` check (no `--apply`) are not
 previews in this sense: on a ROCm 10 or newer runtime they resolve with `uv` and
 can fetch it. They prepare no Python, though (see `update-09` and `update-10`).
+
+The preview runs nothing from the install folder. `install_sdk_dry_run` is a
+model-callable tool that runs without approval and with a model-chosen
+`--prefix`, so a folder holding a hostile `bin/python` must not be executed by
+it. The venv step is decided from the folder's files (`dry_run_venv_plan` in
+[venv.rs](../apps/rocm/src/therock/venv.rs), where its tests live too); where only running the
+folder's Python could tell whether its venv is reused, the preview says so and
+prints both outcomes (`command:` plus `command_if_rebuilt:` or
+`refusal_if_not_reused:`). The interpreter search stops the preview, saying it
+did not run it, when the Python it would check first is inside `--prefix`.
+`a_dry_run_reads_the_install_folder_and_runs_nothing_from_it` plants a Python
+that records every run in each folder state and asserts the lines and an empty
+record; `a_dry_run_runs_no_python_from_the_install_folder_while_searching` in
+[python.rs](../apps/rocm/src/therock/python.rs) covers `PATH`, an absolute `ROCM_CLI_PYTHON` and a bare one resolved through
+`PATH`. End to end, these scenarios run the real CLI with a loopback index, a fake
+`uv` and planted Pythons that record every run:
+
+- `runtime-33`: an unowned home folder is refused, by the preview and by the
+  install, and the advised empty folder works;
+- `runtime-34`: a rebuild of a folder ROCm CLI made keeps the ComfyUI data and
+  says why the old venv was not reused;
+- `runtime-35`: a preview of a folder holding someone else's venv says it
+  cannot tell and runs nothing;
+- `runtime-36`: a preview whose `ROCM_CLI_PYTHON` is inside the folder stops
+  without running it;
+- `runtime-37`: a preview with `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` set says it
+  cannot tell which torch a reused venv would keep, and runs nothing.
+
+`runtime-38` uses the same setup with a launcher outside every install folder:
+a `ROCM_CLI_PYTHON` relative to the folder the CLI runs in is accepted. All six
+are Linux-only because those stand-ins are shell scripts. Which preview plans
+print the `torch_kept:` line, one row per folder shape, is
+`a_preview_under_the_alignment_opt_out_cannot_tell_whether_torch_is_kept` in
+[wheel.rs](../apps/rocm/src/therock/resolve/wheel.rs), and
+`a_relative_interpreter_path_is_anchored_to_the_current_directory` in
+[python.rs](../apps/rocm/src/therock/python.rs) runs the path anchoring on
+every platform. The
+folder decision itself (empty, refused with the condition named, owned by the
+wheel marker) reads only files, so
+`the_venv_folder_decision_reads_files_on_every_platform` runs it on every
+platform, the Windows CI job included, with that platform's venv layout; no
+Windows test runs a preview or a rebuild against a planted interpreter.
 
 Then it verifies:
 

@@ -22,6 +22,7 @@ mod source;
 #[cfg(test)]
 mod test_support;
 mod update;
+mod venv;
 mod version;
 mod wheel_plan;
 
@@ -43,8 +44,7 @@ pub(crate) use self::probe::{
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 pub(crate) use self::python::NEXT_MANAGED_PYTHON_VERSION;
 use self::python::{
-    ensure_uv_venv, managed_python_version, python_for_install, python_requirement,
-    python_requirement_for_version,
+    managed_python_version, python_for_install, python_requirement, python_requirement_for_version,
 };
 use self::resolve::{
     AggregateDeviceTarget, PipRuntimePlan, canonical_auto_select_needs_next_python,
@@ -62,6 +62,7 @@ pub(crate) use self::update::{
     RuntimeUpdatePlan, maybe_refresh_startup_update_check, recorded_python_version,
     render_update_json, render_update_report, runtime_update_check, runtime_update_plan,
 };
+use self::venv::ensure_uv_venv;
 pub(crate) use self::version::runtime_version_display;
 use self::version::{
     parse_host_version, parse_version_for_ordering, runtime_version_build_date, version_relation,
@@ -414,7 +415,7 @@ fn install_wheel_runtime(
     // configuration. It asks what a real install would do instead and prints
     // that. A real install resolves, and so prepares, exactly as it always did.
     // It also prints the line naming the interpreter, once the decision is made.
-    let python = python_for_install(paths, python_requirement, dry_run)?;
+    let python = python_for_install(paths, python_requirement, dry_run, prefix.as_deref())?;
     let wheel_compatibility = python.wheel_compatibility()?;
     progress_line(format!(
         "Checking TheRock {} packages for this AMD GPU...",
@@ -493,13 +494,20 @@ fn install_wheel_runtime(
         &resolution.latest_version,
     );
     // Under the alignment opt-out an environment that already holds torch keeps it:
-    // the install then asks `uv` for the ROCm packages alone. Decided here, from the
-    // environment the install will run in, so the preview and the install name the
-    // same requirements.
+    // the install then asks `uv` for the ROCm packages alone. Only running the
+    // environment's Python can tell which torch it holds, and a preview runs nothing
+    // from the install folder, so a preview shows the full command and, where the
+    // venv may be reused, says it cannot tell; a real install asks here and again
+    // once the environment is prepared.
     let planned_env_python = venv_python_path(&install_root);
-    let planned_kept = kept_torch::kept_torch_stack(rocm_core::torch_alignment_disabled(), || {
-        kept_torch::installed_torch_stack(&planned_env_python)
-    });
+    let torch_alignment_disabled = rocm_core::torch_alignment_disabled();
+    let planned_kept = if dry_run {
+        None
+    } else {
+        kept_torch::kept_torch_stack(torch_alignment_disabled, || {
+            kept_torch::installed_torch_stack(&planned_env_python)
+        })
+    };
     let plan = WheelPlan {
         channel,
         version_selector,
@@ -516,14 +524,15 @@ fn install_wheel_runtime(
         torchaudio_pin: resolution.torchaudio_pin.as_ref(),
         no_wheel_warning: no_wheel_warning.as_deref(),
         stack: PlanStack::Resolved(ResolvedStack {
+            paths,
             compatibility_key: &resolution.package_versions.compatibility_key,
             install_root: &install_root,
             runtime_key: &runtime_key,
             package_specs: &wheel_composition.package_specs,
-            // A real install decides again once the environment is prepared (it may
-            // be recreated and lose its torch), and writes the one `torch_kept:` line
-            // then; a preview cannot know, so it prints the plan's.
-            kept_torch: if dry_run { planned_kept.as_ref() } else { None },
+            // A real install writes its one `torch_kept:` line once the environment
+            // is prepared (it may be recreated and lose its torch); a preview says
+            // what it could not tell.
+            torch_alignment_disabled,
             manifest_path: &manifest_path,
         }),
     };
@@ -1114,11 +1123,13 @@ fn runtime_key(
 }
 
 fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> PathBuf {
-    paths
-        .data_dir
-        .join("runtimes")
-        .join(format)
-        .join(runtime_key)
+    managed_format_root(paths, format).join(runtime_key)
+}
+
+/// The folder every managed runtime of `format` is created in, one per
+/// runtime key.
+fn managed_format_root(paths: &AppPaths, format: &str) -> PathBuf {
+    paths.data_dir.join("runtimes").join(format)
 }
 
 /// Where to build a runtime, resolved to its real location on disk first.

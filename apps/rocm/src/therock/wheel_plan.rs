@@ -15,16 +15,16 @@
 //! `command`). [`PlanStack::NeedsUv`] says those are not resolved, and why,
 //! where [`PlanStack::Resolved`] carries their values.
 
-use super::kept_torch::{self, KeptTorch};
+use super::kept_torch;
 use super::python::{PlannedPython, WheelCompatibility};
 use super::resolve::{AggregateDeviceTarget, TorchaudioPin, UnresolvedPipRuntime};
 use super::source::{RuntimeVersionSelector, TheRockChannel};
+use super::venv::dry_run_venv_plan;
 use super::{
     no_wheel_warning_for, render_canonical_provenance, runtime_version_display, venv_python_path,
     wheel_host_version_note,
 };
-use crate::shell_quote::shell_quote;
-use rocm_core::{uv_pip_install_base, uv_venv_args};
+use rocm_core::{AppPaths, uv_pip_install_base};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -69,15 +69,21 @@ pub(super) enum PlanStack<'a> {
 }
 
 pub(super) struct ResolvedStack<'a> {
+    /// What a preview's venv step reads the install folder against (the managed
+    /// runtimes folder, for ownership). Carried by the resolved stack, the one
+    /// case whose venv step is decided, so a resolved plan cannot be previewed
+    /// without it.
+    pub(super) paths: &'a AppPaths,
     pub(super) compatibility_key: &'a str,
     pub(super) install_root: &'a Path,
     pub(super) runtime_key: &'a str,
     pub(super) package_specs: &'a [String],
-    /// The torch stack the install leaves alone, when the opt-out asked for that and
-    /// the environment has one. The specs above stay the runtime's composition, as
-    /// recorded in its manifest; what `uv` is handed is [`kept_torch::install_specs`]
-    /// of them.
-    pub(super) kept_torch: Option<&'a KeptTorch>,
+    /// Whether `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` is set. A preview's commands
+    /// install `package_specs` in full, as the install does for an environment it
+    /// creates or rebuilds. Where the folder's venv may be reused, which only
+    /// running its Python could tell, the install would keep the torch it holds,
+    /// so the preview prints [`super::kept_torch::preview_line`] there.
+    pub(super) torch_alignment_disabled: bool,
     pub(super) manifest_path: &'a Path,
 }
 
@@ -198,22 +204,10 @@ pub(super) fn write_wheel_plan(output: &mut String, plan: &WheelPlan<'_>) {
             let _ = writeln!(output, "  package_specs: {NOT_RESOLVED}");
         }
     }
-    let kept = match &plan.stack {
-        PlanStack::Resolved(ResolvedStack { kept_torch, .. }) => *kept_torch,
-        PlanStack::NeedsUv { .. } => None,
-    };
     let _ = writeln!(
         output,
-        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction{}",
-        if kept.is_some() {
-            " (the torch, torchvision and torchaudio requirements are resolved but not installed; see torch_kept)"
-        } else {
-            ""
-        }
+        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
     );
-    if let Some(kept) = kept {
-        let _ = writeln!(output, "{}", kept_torch::plan_line(kept));
-    }
     if let Some(warning) = plan.no_wheel_warning {
         let _ = writeln!(output, "  warning: {warning}");
     }
@@ -229,8 +223,14 @@ pub(super) const UNRESOLVED_NOTE: &str = "no uv is installed, so a real install 
 /// not.`).
 pub(super) const UNRESOLVED_PROGRESS: &str = "No uv is installed; a real install would fetch it and resolve the torch and torchvision versions with `uv pip compile`. This preview does not.";
 
-/// The lines a preview adds after [`write_wheel_plan`]: the commands a real install
-/// would run, and where it would record the runtime.
+/// The lines a preview adds after [`write_wheel_plan`]: what the venv step would
+/// do, the commands a real install would run, and where it would record the
+/// runtime.
+///
+/// A resolved plan's venv step is decided by [`dry_run_venv_plan`] from the
+/// install folder's files, running nothing from it; that function also
+/// shell-quotes the commands, which a user is invited to paste and whose install
+/// root can come from a model-chosen `--prefix`.
 pub(super) fn write_dry_run_tail(output: &mut String, plan: &WheelPlan<'_>) {
     let _ = writeln!(output, "  mode: dry-run");
     match &plan.stack {
@@ -241,34 +241,26 @@ pub(super) fn write_dry_run_tail(output: &mut String, plan: &WheelPlan<'_>) {
             if matches!(plan.channel, TheRockChannel::Nightly) {
                 install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
             }
-            install_args.extend(kept_torch::install_specs(
-                stack.package_specs,
-                stack.kept_torch,
-            ));
-            let venv_args = uv_venv_args(&plan.python.venv_python_arg(), stack.install_root);
-            // This line is offered as the command to run, so it has to be one a
-            // shell reads back as the argv it previews. The install root in it
-            // comes from a `--prefix` the local assistant can choose
-            // (`install_sdk_dry_run` is a model-callable tool), so a bare or
-            // double-quoted value here would be a model-chosen value in a line a
-            // user is invited to paste.
-            let venv_args_display = venv_args
-                .iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let install_args_display = install_args
-                .iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let _ = writeln!(
-                output,
-                "  command: uv {venv_args_display} && uv {install_args_display}"
+            install_args.extend(stack.package_specs.iter().cloned());
+            let venv_plan = dry_run_venv_plan(
+                stack.paths,
+                &plan.python.venv_python_arg(),
+                stack.install_root,
+                &plan.wheel_compatibility.python_tag,
+                &install_args,
             );
+            let _ = writeln!(output, "  python_env: {}", venv_plan.python_env);
+            if stack.torch_alignment_disabled && venv_plan.reuse_undecided {
+                let _ = writeln!(output, "{}", kept_torch::preview_line(&env_python));
+            }
+            for (key, value) in &venv_plan.lines {
+                let _ = writeln!(output, "  {key}: {value}");
+            }
         }
         PlanStack::NeedsUv { .. } => {
+            let _ = writeln!(output, "  python_env: {NOT_RESOLVED}");
             let _ = writeln!(output, "  command: {NOT_RESOLVED}");
+            let _ = writeln!(output, "  env: {NOT_RESOLVED}");
         }
     }
     let _ = writeln!(

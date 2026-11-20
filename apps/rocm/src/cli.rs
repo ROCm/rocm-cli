@@ -920,6 +920,8 @@ rocm install sdk --version 10.0.0 --python-version 3.12")]
         #[arg(long, default_value = "wheel")]
         format: InstallFormat,
         /// Full folder path where the ROCm Python environment should be created.
+        /// Use an empty folder or one where a ROCm CLI install finished; any
+        /// other non-empty folder is refused with nothing changed.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
         /// Exact TheRock package version to install; with none, the channel's
@@ -973,6 +975,8 @@ rocm install sdk --version 10.0.0 --python-version 3.12")]
         /// host with no uv installed, the plan marks the package versions it
         /// would need uv to choose, and everything made from them, as not
         /// resolved.
+        /// Runs nothing from the install folder; where only its Python could
+        /// tell whether a venv there is reused, the plan shows both outcomes.
         #[arg(long)]
         dry_run: bool,
         /// Approve replacing the current active default ROCm runtime (and

@@ -5,26 +5,22 @@
 //! Managed Python for TheRock installs: finding an interpreter that can serve
 //! the install (an explicit `ROCM_CLI_PYTHON`, one on `PATH`, or the managed one
 //! `uv` provisions), the interpreter the layout requires (`python_requirement`),
-//! the wheel tags that interpreter reports, and creating the runtime's virtual
-//! environment.
+//! and the wheel tags that interpreter reports. The runtime's virtual
+//! environment is `venv`'s, which builds on this module.
 //!
 //! Builds on `io`, `process` and `source` (`python_requirement` takes a
-//! `SourceLayout`); nothing in those depends on this module. The one item it
-//! reads from `therock.rs` is `venv_python_path`, which stays there for good
-//! with the other keys and roots helpers.
+//! `SourceLayout`); nothing in those depends on this module.
 
 use super::io::{linux_temp_dir, windows_temp_dir};
 use super::process::{
-    capture_python_stdout, progress_line, progress_output_suppressed, run_command,
-    run_command_with_env,
+    capture_python_stdout, progress_line, progress_output_suppressed, run_command_in,
 };
 use super::source::SourceLayout;
-use super::venv_python_path;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, ensure_uv_binary, managed_tools_dir,
     normalize_runtime_path_for_host, runtime_is_windows, runtime_os_name, runtime_path_list_split,
-    unix_time_millis, uv_command_env, uv_venv_args,
+    unix_time_millis, uv_command_env,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -113,60 +109,6 @@ fn current_platform_wheel_tags() -> Result<Vec<String>> {
         (os, arch) => bail!("TheRock wheel filtering is not implemented for {os}/{arch}"),
     };
     Ok(vec![platform_tag.to_owned(), "any".to_owned()])
-}
-
-pub(super) fn ensure_uv_venv(
-    paths: &AppPaths,
-    uv: &Path,
-    python_launcher: &Path,
-    install_root: &Path,
-) -> Result<()> {
-    let env_python = venv_python_path(install_root);
-    if env_python.is_file() {
-        let reusable = run_command(
-            &env_python,
-            &["--version"],
-            "verify existing managed TheRock runtime Python",
-        )
-        .is_ok()
-            && wheel_compatibility_for_python(&env_python).is_ok_and(|existing| {
-                wheel_compatibility_for_python(python_launcher)
-                    .is_ok_and(|required| existing.python_tag == required.python_tag)
-            });
-        if reusable {
-            return Ok(());
-        }
-        // Same `install_root` can be reused across reinstalls (it's keyed on
-        // resolved version/build date, not on the interpreter), so an existing
-        // venv left over from a lower-tag requirement must not be mistaken for
-        // a compatible one just because it still runs.
-        progress_line(
-            "Existing Python environment does not match the required interpreter; recreating it.",
-        );
-        fs::remove_dir_all(install_root).with_context(|| {
-            format!(
-                "failed to remove incompatible Python environment at {}",
-                install_root.display()
-            )
-        })?;
-    }
-    let args = uv_venv_args(python_launcher, install_root);
-    run_command_with_env(
-        uv,
-        args.iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice(),
-        &uv_command_env(paths),
-        "create managed TheRock runtime virtual environment",
-    )?;
-    if !env_python.is_file() {
-        bail!(
-            "managed Python environment did not create expected executable: {}",
-            env_python.display()
-        );
-    }
-    Ok(())
 }
 
 fn python_venv_args(install_root: &Path) -> Vec<String> {
@@ -632,13 +574,18 @@ pub(super) fn resolve_python_launcher(
 /// returned ([`PlannedPython::progress_text`]), so a line that says what a real
 /// install would do cannot be printed on a path that ends in a refusal: the
 /// refusal returns before any such line exists.
+///
+/// `prefix` is the `--prefix` the install was given. A preview runs nothing
+/// from it, so an interpreter the search would have to run from inside it
+/// refuses the preview instead (see [`refuse_preview_python_in_prefix`]).
 pub(super) fn python_for_install(
     paths: &AppPaths,
     requirement: PythonRequirement,
     dry_run: bool,
+    prefix: Option<&Path>,
 ) -> Result<PlannedPython> {
     let python = if dry_run {
-        plan_python_launcher(paths, requirement)?
+        plan_python_launcher(paths, requirement, prefix)?
     } else {
         PlannedPython::Ready(resolve_python_launcher(paths, requirement)?)
     };
@@ -662,17 +609,20 @@ pub(super) fn python_for_install(
 pub(super) fn plan_python_launcher(
     paths: &AppPaths,
     requirement: PythonRequirement,
+    prefix: Option<&Path>,
 ) -> Result<PlannedPython> {
     let env = python_resolver_env_override().unwrap_or_else(PythonResolverEnv::from_process_env);
-    plan_python_launcher_in(paths, &env, requirement)
+    plan_python_launcher_in(paths, &env, requirement, prefix)
 }
 
 fn plan_python_launcher_in(
     paths: &AppPaths,
     env: &PythonResolverEnv,
     requirement: PythonRequirement,
+    prefix: Option<&Path>,
 ) -> Result<PlannedPython> {
-    let lookup = find_python_launcher_in(paths, env, requirement, LookupPurpose::Preview)?;
+    let lookup =
+        find_python_launcher_in(paths, env, requirement, LookupPurpose::Preview { prefix })?;
     Ok(match lookup {
         PythonLookup::Found(launcher) => PlannedPython::Ready(launcher),
         PythonLookup::NeedsManagedBootstrap => {
@@ -882,13 +832,51 @@ fn unchecked_tag_caveat(tag_check: TagCheck, requirement: PythonRequirement) -> 
 /// It changes only the wording of the two progress lines about a Python that
 /// turned out unusable: an install says what it goes on to do, a preview states
 /// the finding and leaves the prediction to the decision's own line.
+///
+/// A preview also carries the install's `--prefix`, from which it runs nothing.
 #[derive(Clone, Copy, Debug)]
-enum LookupPurpose {
+enum LookupPurpose<'a> {
     Install,
-    Preview,
+    Preview { prefix: Option<&'a Path> },
 }
 
-impl LookupPurpose {
+impl LookupPurpose<'_> {
+    /// Refuses a preview whose search would next run `candidate` (found
+    /// through `source`) from inside the install's `--prefix`.
+    ///
+    /// A preview runs nothing from the install folder: `install_sdk_dry_run`
+    /// is a model-callable tool with a model-chosen `--prefix`, and a folder
+    /// can hold a hostile `bin/python`. The search runs each interpreter it
+    /// meets, and skipping one would make the preview name a different
+    /// interpreter from the one the install would pick, so it stops and says
+    /// why instead. The interpreter's own folder is resolved but not the
+    /// interpreter: a venv's `bin/python` links to the base Python, and run
+    /// through that link it still reads the venv's `pyvenv.cfg` and imports
+    /// from its `site-packages`. An install is not affected.
+    fn refuse_preview_python_in_prefix(self, candidate: &Path, source: &str) -> Result<()> {
+        let Self::Preview {
+            prefix: Some(prefix),
+        } = self
+        else {
+            return Ok(());
+        };
+        let location = match (candidate.parent(), candidate.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                rocm_core::resolve_path_through_symlinks(parent).join(name)
+            }
+            _ => return Ok(()),
+        };
+        let prefix = rocm_core::resolve_path_through_symlinks(prefix);
+        if rocm_core::runtime_path_is_same_or_inside(&location, &prefix) {
+            bail!(
+                "this preview did not check the Python from {source} at {}: it is inside the install folder {}, and a preview runs nothing from the install folder. A real install would run it. Preview again with that Python out of the way (off PATH, or ROCM_CLI_PYTHON unset), or choose another --prefix",
+                candidate.display(),
+                prefix.display()
+            );
+        }
+        Ok(())
+    }
+
     /// The progress line for an interpreter (`subject`) that exists but cannot
     /// serve the install. Both purposes state the finding; an install then says
     /// what it goes on to do (`install_next_step`) and a preview stops.
@@ -904,7 +892,7 @@ impl LookupPurpose {
         );
         match self {
             Self::Install => format!("{finding}; {install_next_step}."),
-            Self::Preview => format!("{finding}."),
+            Self::Preview { .. } => format!("{finding}."),
         }
     }
 }
@@ -937,9 +925,24 @@ fn find_python_launcher_in(
     paths: &AppPaths,
     env: &PythonResolverEnv,
     requirement: PythonRequirement,
-    purpose: LookupPurpose,
+    purpose: LookupPurpose<'_>,
 ) -> Result<PythonLookup> {
     if let Some(value) = env.python_override.as_deref() {
+        // A bare name is run through `PATH`, so it is checked where it resolves.
+        let named = Path::new(value);
+        let runs = if named
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(named.to_path_buf())
+        } else {
+            resolve_program_on_path(value, &env.search_dirs)
+                .into_iter()
+                .next()
+        };
+        if let Some(runs) = runs.as_deref() {
+            purpose.refuse_preview_python_in_prefix(runs, "ROCM_CLI_PYTHON")?;
+        }
         python_launcher_install_ready(Path::new(value), requirement)
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLookup::Found(PythonLauncher {
@@ -950,6 +953,7 @@ fn find_python_launcher_in(
 
     let mut skipped_path_python = false;
     for candidate in python_path_candidates(&env.search_dirs) {
+        purpose.refuse_preview_python_in_prefix(&candidate, "PATH")?;
         match python_launcher_install_ready(&candidate, requirement) {
             Ok(()) => {
                 return Ok(PythonLookup::Found(PythonLauncher {
@@ -978,6 +982,8 @@ fn find_python_launcher_in(
     if let Some(manifest) = load_managed_python_manifest(paths)?
         && manifest.executable.is_file()
     {
+        purpose
+            .refuse_preview_python_in_prefix(&manifest.executable, "the saved managed Python")?;
         if python_launcher_install_ready(&manifest.executable, requirement).is_ok() {
             return Ok(PythonLookup::Found(PythonLauncher {
                 executable: manifest.executable,
@@ -1106,20 +1112,42 @@ fn python_tag_for_version(version: &str) -> Option<String> {
     Some(format!("cp{major}{minor}"))
 }
 
+/// Runs `python -m venv` into a fresh folder of its own, started in that
+/// folder. `-m` puts the working directory first on `sys.path`, so started in
+/// the user's working directory (which a `--dry-run --prefix .` makes the
+/// install folder) a `venv.py` there would run in place of the standard
+/// library's.
 fn verify_python_can_create_venv(program: &Path) -> Result<()> {
     let probe_root = python_venv_probe_temp_root()?;
     let probe_dir = probe_root.join("env");
     let args = python_venv_args(&probe_dir);
-    let result = run_command(
-        program,
+    let program = anchored_to_current_dir(program);
+    let result = run_command_in(
+        &program,
         args.iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
+        Some(&probe_root),
         "probe Python virtual environment support",
     );
     let _ = fs::remove_dir_all(&probe_root);
     result
+}
+
+/// `program` as a path that still names the same file once a child is started
+/// in another folder. On Unix a program path that has a directory part
+/// (`.venv/bin/python`, as `ROCM_CLI_PYTHON` or a relative `PATH` entry gives
+/// one) is resolved against the child's working directory, so the probe's own
+/// folder would otherwise stand in for the user's; Windows resolves it
+/// differently, and an absolute path means the same on both. A bare name
+/// (`python3`) is left alone: it is looked up on `PATH`, not in a folder, and
+/// anchoring it would stop that.
+fn anchored_to_current_dir(program: &Path) -> PathBuf {
+    if program.is_absolute() || program.components().count() < 2 {
+        return program.to_path_buf();
+    }
+    std::path::absolute(program).unwrap_or_else(|_| program.to_path_buf())
 }
 
 fn python_venv_probe_temp_root() -> Result<PathBuf> {
@@ -1139,6 +1167,10 @@ mod tests {
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
     use crate::therock::test_support::{RestoredEnv, test_paths};
+    #[cfg(unix)]
+    use crate::therock::test_support::{
+        plant_recording_venv_python, venv_rebuild_sandbox, write_fake_python_reporting,
+    };
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
@@ -1160,53 +1192,6 @@ PY
 fi
 echo Python 3.12.10
 "#;
-        write_fake_executable(&path, script)?;
-        Ok(path)
-    }
-
-    #[cfg(unix)]
-    fn write_fake_python_reporting(
-        dir: &Path,
-        name: &str,
-        tag: &str,
-        version: &str,
-    ) -> Result<PathBuf> {
-        use rocm_core::fake_executable::write_fake_executable;
-        let path = dir.join(name);
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
-        );
-        write_fake_executable(&path, script)?;
-        Ok(path)
-    }
-
-    #[cfg(unix)]
-    fn write_fake_uv_creating_venv(
-        dir: &Path,
-        name: &str,
-        tag: &str,
-        version: &str,
-    ) -> Result<PathBuf> {
-        use rocm_core::fake_executable::write_fake_executable;
-        let path = dir.join(name);
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
-  /bin/mkdir -p "$4/bin"
-  /bin/cat > "$4/bin/python" <<PY
-#!/bin/sh
-if [ "\$1" = "-c" ]; then
-  echo {tag}
-  exit 0
-fi
-echo {version}
-PY
-  /bin/chmod +x "$4/bin/python"
-  exit 0
-fi
-exit 1
-"#
-        );
         write_fake_executable(&path, script)?;
         Ok(path)
     }
@@ -1720,6 +1705,7 @@ exit 1
                 &self.paths,
                 python_requirement(SourceLayout::Canonical),
                 dry_run,
+                None,
             )
         }
 
@@ -1730,7 +1716,11 @@ exit 1
                 search_dirs: vec![self.search_dir.clone()],
                 ..PythonResolverEnv::from_process_env()
             });
-            plan_python_launcher(&self.paths, python_requirement(SourceLayout::Canonical))
+            plan_python_launcher(
+                &self.paths,
+                python_requirement(SourceLayout::Canonical),
+                None,
+            )
         }
 
         fn uv_was_run(&self) -> bool {
@@ -1871,7 +1861,7 @@ exit 1
                 managed_bootstrap_disabled: disabled,
             });
             PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
-            let result = python_for_install(&paths, requirement, dry_run);
+            let result = python_for_install(&paths, requirement, dry_run, None);
             let lines = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
             (result, lines)
         };
@@ -2019,7 +2009,7 @@ exit 1
                 ],
             ),
             (
-                LookupPurpose::Preview,
+                LookupPurpose::Preview { prefix: None },
                 [
                     "Python from PATH is not usable for this ROCm install (cp312 is required).",
                     "Saved managed Python is not usable for this ROCm install (cp312 is required).",
@@ -2675,47 +2665,6 @@ exit 1
         );
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn ensure_uv_venv_recreates_on_interpreter_tag_mismatch() {
-        // `install_root` is keyed on resolved version/build date, not on the
-        // interpreter, so a reinstall that now requires cp314 must not reuse a
-        // stale cp312 venv left over from before this tag check existed.
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cli-ensure-uv-venv-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(root.join("data")).unwrap();
-        fs::create_dir_all(root.join("cache")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-
-        let install_root = root.join("install");
-        let stale_bin = install_root.join("bin");
-        fs::create_dir_all(&stale_bin).unwrap();
-        write_fake_python_reporting(&stale_bin, "python", "cp312", "Python 3.12.10").unwrap();
-
-        let python_launcher =
-            write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
-        let uv = write_fake_uv_creating_venv(&root, "uv", "cp314", "Python 3.14.5").unwrap();
-
-        ensure_uv_venv(&paths, &uv, &python_launcher, &install_root).unwrap();
-
-        let env_python = venv_python_path(&install_root);
-        let compat = wheel_compatibility_for_python(&env_python).unwrap();
-        assert_eq!(
-            compat.python_tag, "cp314",
-            "stale cp312 venv must be recreated, not silently reused"
-        );
-
-        fs::remove_dir_all(root).ok();
-    }
-
     /// A stand-in `uv` that records every invocation and answers
     /// `python install` / `python find` without touching the network.
     /// Planted where `ensure_uv_binary` looks for the managed copy, so no
@@ -2929,5 +2878,165 @@ exit 1
             );
         }
         Ok(())
+    }
+
+    /// The interpreter search a preview runs is the other way a preview could
+    /// run something from the install folder: the folder's `bin` on `PATH`, or
+    /// `ROCM_CLI_PYTHON` naming a Python in it. A preview refuses there rather
+    /// than run it, and says so; the same search for an install, or a preview
+    /// with no `--prefix`, still runs it, which is what shows the refusal comes
+    /// from the guard and not from the Python.
+    #[test]
+    #[cfg(unix)]
+    fn a_dry_run_runs_no_python_from_the_install_folder_while_searching() {
+        let _lock = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = venv_rebuild_sandbox("preview-search");
+        let ran = root.join("prefix-python-ran.log");
+        let prefix = root.join("prefix");
+        plant_recording_venv_python(&prefix, &prefix, &ran);
+        let bin = prefix.join("bin");
+        fs::rename(bin.join("python"), bin.join("python3")).unwrap();
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let on_path = PythonResolverEnv {
+            python_override: None,
+            search_dirs: vec![bin.clone()],
+            managed_python_version: None,
+            managed_bootstrap_disabled: false,
+        };
+        let named = |value: &str| PythonResolverEnv {
+            python_override: Some(value.to_owned()),
+            ..on_path.clone()
+        };
+        let in_prefix = bin.join("python3").display().to_string();
+
+        for (env, source) in [
+            (on_path.clone(), "PATH"),
+            (named(&in_prefix), "ROCM_CLI_PYTHON"),
+            (named("python3"), "ROCM_CLI_PYTHON"),
+        ] {
+            let error = plan_python_launcher_in(&paths, &env, requirement, Some(&prefix))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with(&format!(
+                    "this preview did not check the Python from {source} at "
+                )) && error.contains(&format!(
+                    "inside the install folder {}, and a preview runs nothing from the install folder",
+                    prefix.display()
+                )),
+                "{error}"
+            );
+            assert!(!ran.exists(), "the preview ran {in_prefix} ({source})");
+        }
+
+        // A folder beside the prefix is not inside it.
+        let beside = root.join("prefix-other");
+        assert!(
+            plan_python_launcher_in(&paths, &on_path, requirement, Some(&beside)).is_ok()
+                && ran.exists(),
+            "with the Python outside the install folder, the preview checks it as before"
+        );
+        fs::remove_file(&ran).unwrap();
+        assert!(
+            plan_python_launcher_in(&paths, &on_path, requirement, None).is_ok() && ran.exists(),
+            "without a --prefix, the preview checks the PATH Python as before"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// `python -m venv` puts its working directory first on `sys.path`, so the
+    /// venv-support probe a preview runs on the host Python starts in a folder
+    /// of its own, not in the user's working directory, which
+    /// `--dry-run --prefix .` makes the install folder and where a `venv.py`
+    /// would otherwise run in place of the standard library's.
+    #[test]
+    #[cfg(unix)]
+    fn the_venv_probe_runs_in_a_folder_of_its_own() {
+        let (root, _paths) = venv_rebuild_sandbox("probe-cwd");
+        let log = root.join("probe-cwd.log");
+        let python = root.join("python3");
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-m\" ]; then pwd -P >> \"{}\"; /bin/mkdir -p \"$3\"; fi\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+
+        verify_python_can_create_venv(&python).unwrap();
+
+        let ran_in = fs::read_to_string(&log).unwrap();
+        let ran_in = Path::new(ran_in.trim());
+        let caller = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_ne!(
+            ran_in, caller,
+            "the probe ran in the caller's working directory"
+        );
+        assert!(
+            ran_in.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("rocm-cli-python-venv-probe-")),
+            "the probe ran in {}, not its own folder",
+            ran_in.display()
+        );
+        assert!(!ran_in.exists(), "the probe's folder is removed afterwards");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// `ROCM_CLI_PYTHON=.venv/bin/python` reaches the probe as a relative path
+    /// that works from the user's directory. The probe starts in a folder of its
+    /// own, so the path has to be anchored first or the launch fails and a Python
+    /// that works is reported as unusable. The relative path starts with `src/`,
+    /// which the test's working directory (the crate root) has and the probe's
+    /// fresh folder does not, so it names nothing from the probe's folder however
+    /// deep the temp folder is; the process's directory is not changed.
+    #[test]
+    #[cfg(unix)]
+    fn the_venv_probe_accepts_an_interpreter_given_as_a_relative_path() {
+        let (root, _paths) = venv_rebuild_sandbox("probe-relative");
+        let python = root.join("python3");
+        rocm_core::fake_executable::write_fake_executable(
+            &python,
+            "#!/bin/sh\nif [ \"$1\" = \"-m\" ]; then /bin/mkdir -p \"$3\"; fi\nexit 0\n",
+        )
+        .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            cwd.join("src").is_dir(),
+            "cargo runs tests from the crate root"
+        );
+        let mut relative = PathBuf::from("src");
+        for _ in cwd.components() {
+            relative.push("..");
+        }
+        relative.push(python.strip_prefix("/").unwrap());
+        assert!(relative.is_relative() && relative.components().count() > 2);
+
+        verify_python_can_create_venv(&relative)
+            .expect("a relative interpreter that works from here is usable");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// What the probe is handed, on every platform: a relative path with a
+    /// folder in it becomes the same path under the current directory, and a
+    /// bare name or an absolute path is passed on as it is.
+    #[test]
+    fn a_relative_interpreter_path_is_anchored_to_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let relative = Path::new(".venv").join("bin").join("python");
+        assert_eq!(
+            anchored_to_current_dir(&relative),
+            cwd.join(".venv").join("bin").join("python")
+        );
+        assert_eq!(
+            anchored_to_current_dir(Path::new("python3")),
+            Path::new("python3"),
+            "a bare name is looked up on PATH and stays as it is"
+        );
+        let absolute = cwd.join("python3");
+        assert_eq!(anchored_to_current_dir(&absolute), absolute);
     }
 }

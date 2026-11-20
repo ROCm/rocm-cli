@@ -411,10 +411,12 @@ pub(super) fn refuse_non_interactive_message(relation: &str) -> String {
 ///
 /// `--prefix` is the exception and the prompt does not claim otherwise:
 /// `resolved_install_root` uses the given folder verbatim for every version, so
-/// a second install into one prefix does replace the first in place (and
-/// `ensure_uv_venv` will `remove_dir_all` it outright if the existing venv's
-/// python no longer answers `--version`). The gate is unchanged either way —
-/// what is being consented to is the change of active default, not a deletion.
+/// a second install into one prefix does replace the first in place (and if
+/// the existing venv's python no longer answers `--version`, `ensure_uv_venv`
+/// rebuilds the venv's own files, and only when ROCm CLI can show it created
+/// that venv; see `clear_owned_venv_for_rebuild`). The gate is unchanged either
+/// way — what is being consented to is the change of active default, not a
+/// deletion.
 pub(super) fn confirm_overwrite_existing_sdk(
     channel: TheRockChannel,
     family: &str,

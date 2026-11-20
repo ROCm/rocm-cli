@@ -2633,7 +2633,9 @@ sdk install
   package_specs: not resolved by this preview
   package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction
   mode: dry-run
+  python_env: not resolved by this preview
   command: not resolved by this preview
+  env: not resolved by this preview
   activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process
   manifest: not resolved by this preview
 "
@@ -2692,6 +2694,7 @@ sdk install
         let install_root = PathBuf::from("/runtimes").join(&runtime_key);
         let manifest_path = PathBuf::from("/manifests").join(&runtime_key);
         let (python, compatibility) = clean_host_python();
+        let (paths_root, paths) = super::super::super::test_support::test_paths("plan-keys");
         let plan = WheelPlan {
             channel: TheRockChannel::Release,
             version_selector: None,
@@ -2708,17 +2711,19 @@ sdk install
             torchaudio_pin: resolution.torchaudio_pin.as_ref(),
             no_wheel_warning: None,
             stack: PlanStack::Resolved(ResolvedStack {
+                paths: &paths,
                 compatibility_key: &resolution.package_versions.compatibility_key,
                 install_root: &install_root,
                 runtime_key: &runtime_key,
                 package_specs: &composition.package_specs,
-                kept_torch: None,
+                torch_alignment_disabled: false,
                 manifest_path: &manifest_path,
             }),
         };
         let mut resolved = String::new();
         write_wheel_plan(&mut resolved, &plan);
         write_dry_run_tail(&mut resolved, &plan);
+        std::fs::remove_dir_all(paths_root).ok();
 
         let mut expected = plan_keys(&resolved);
         let at = expected
@@ -2738,26 +2743,27 @@ sdk install
         assert!(!resolved.contains("resolution_note"), "{resolved}");
     }
 
-    /// A kept torch changes what `uv` is handed and nothing the runtime is recorded as.
-    /// The preview's `command:` is the line a user is invited to run, so it has to
-    /// leave the torch stack out exactly as the install does, while `package_specs:`
-    /// stays the composition the manifest and the runtime key are made from.
+    /// Under the torch-alignment opt-out, the install keeps the torch a reused
+    /// venv holds, and only running the venv's Python can tell which. A preview
+    /// runs nothing from the install folder, so every command it shows installs
+    /// the full composition, and the `torch_kept:` line says it cannot tell in
+    /// exactly the plans where the venv may be reused. Every other plan creates
+    /// or rebuilds the venv (nothing to keep) or refuses the folder (nothing
+    /// runs), so no line is printed there. One row per folder shape, with and
+    /// without the opt-out; `package_specs:` stays the composition throughout.
     #[test]
-    fn a_kept_torch_is_left_out_of_the_command_but_not_out_of_the_composition() {
-        use super::super::super::kept_torch::{KeptTorch, kept_torch_stack};
+    fn a_preview_under_the_alignment_opt_out_cannot_tell_whether_torch_is_kept() {
+        use super::super::super::venv_python_path;
         use super::super::super::wheel_plan::{
             PlanStack, ResolvedStack, WheelPlan, write_dry_run_tail, write_wheel_plan,
         };
 
         let resolution = resolved_runtime();
         let composition = wheel_runtime_composition(&resolution, &resolution.device_target, false);
-        let install_root = PathBuf::from("/runtimes/kept");
         let manifest_path = PathBuf::from("/manifests/kept");
         let (python, compatibility) = clean_host_python();
-        let kept = kept_torch_stack(true, || {
-            Ok(vec![("torch".to_owned(), "2.9.0+gitd0c8b1f".to_owned())])
-        });
-        let render = |kept: Option<&KeptTorch>| {
+        let (paths_root, paths) = super::super::super::test_support::test_paths("kept-torch");
+        let render = |opted_out: bool, install_root: &Path| {
             let plan = WheelPlan {
                 channel: TheRockChannel::Release,
                 version_selector: None,
@@ -2774,11 +2780,12 @@ sdk install
                 torchaudio_pin: resolution.torchaudio_pin.as_ref(),
                 no_wheel_warning: None,
                 stack: PlanStack::Resolved(ResolvedStack {
+                    paths: &paths,
                     compatibility_key: &resolution.package_versions.compatibility_key,
-                    install_root: &install_root,
+                    install_root,
                     runtime_key: "kept",
                     package_specs: &composition.package_specs,
-                    kept_torch: kept,
+                    torch_alignment_disabled: opted_out,
                     manifest_path: &manifest_path,
                 }),
             };
@@ -2790,38 +2797,81 @@ sdk install
         let line = |text: &str, key: &str| {
             text.lines()
                 .find(|line| line.trim_start().starts_with(key))
-                .unwrap_or_else(|| panic!("no `{key}` line in:\n{text}"))
-                .to_owned()
+                .map(str::to_owned)
         };
+        // A folder with a Python, and `pyvenv.cfg` beside it when `cfg`.
+        let plant = |folder: &Path, cfg: bool| {
+            std::fs::create_dir_all(venv_python_path(folder).parent().unwrap()).unwrap();
+            std::fs::write(venv_python_path(folder), "not run by a preview").unwrap();
+            if cfg {
+                std::fs::write(folder.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+            }
+        };
+        let managed = paths.data_dir.join("runtimes").join("wheel");
+        let missing = paths_root.join("missing");
+        let reusable_owned = managed.join("reusable");
+        plant(&reusable_owned, true);
+        let broken_owned = managed.join("broken");
+        plant(&broken_owned, false);
+        let reusable_foreign = paths_root.join("cloned");
+        plant(&reusable_foreign, true);
+        let broken_foreign = paths_root.join("home");
+        plant(&broken_foreign, false);
+        let full_torch = "torch[device-gfx1200]==2.10.0+rocm10.0.0";
+        let composition_line = line(&render(false, &missing), "package_specs:");
 
-        let plain = render(None);
-        assert!(!plain.contains("torch_kept:"), "{plain}");
-        assert!(
-            line(&plain, "command:").contains("torch[device-gfx1200]==2.10.0+rocm10.0.0"),
-            "without a kept torch the command installs it: {plain}"
-        );
-
-        let kept_plan = render(kept.as_ref());
-        assert!(
-            line(&kept_plan, "torch_kept:").contains("torch 2.9.0+gitd0c8b1f"),
-            "{kept_plan}"
-        );
-        let command = line(&kept_plan, "command:");
-        assert!(
-            command.contains("rocm["),
-            "the SDK is still installed: {command}"
-        );
-        for left_out in ["torch[", "torchvision", "torchaudio"] {
-            assert!(
-                !command.contains(left_out),
-                "the command still installs `{left_out}`: {command}"
+        // (folder, the preview cannot tell whether its venv is reused)
+        for (folder, undecided) in [
+            (&missing, false),
+            (&reusable_owned, true),
+            (&broken_owned, false),
+            (&reusable_foreign, true),
+            (&broken_foreign, false),
+        ] {
+            let plain = render(false, folder);
+            assert_eq!(line(&plain, "torch_kept:"), None, "{plain}");
+            let previewed = render(true, folder);
+            // The line's claim about the real install (a reused venv keeps its torch and
+            // uv is handed only the ROCm packages) is proven by
+            // `an_opted_out_environment_with_torch_installs_only_the_rocm_packages` in
+            // `therock/kept_torch.rs` and end to end by `@id:runtime-torch-alignment-opt-out`.
+            let expected = undecided.then(|| {
+                format!(
+                    "  torch_kept: cannot tell; ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set, so if the venv whose Python is {} is reused and holds torch, the install keeps that torch and hands uv only the ROCm packages, without the torch, torchvision and torchaudio requirements the commands shown include; this preview runs nothing from the install folder, so it does not know which torch that venv holds",
+                    venv_python_path(folder).display()
+                )
+            });
+            assert_eq!(
+                line(&previewed, "torch_kept:"),
+                expected,
+                "{}:\n{previewed}",
+                folder.display()
             );
+            // The commands shown carry the full stack, as the line says.
+            let commands = previewed
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| {
+                    line.starts_with("command: uv ") || line.starts_with("command_if_rebuilt: uv ")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commands.is_empty(),
+                folder == &broken_foreign,
+                "only a refused folder has no command:\n{previewed}"
+            );
+            for command in commands {
+                assert!(command.contains("rocm["), "{command}");
+                for package in [full_torch, "torchvision", "torchaudio"] {
+                    assert!(
+                        command.contains(package),
+                        "leaves out `{package}`: {command}"
+                    );
+                }
+            }
+            assert_eq!(line(&previewed, "package_specs:"), composition_line);
         }
-        assert_eq!(
-            line(&kept_plan, "package_specs:"),
-            line(&plain, "package_specs:"),
-            "the composition the manifest records does not change"
-        );
+        std::fs::remove_dir_all(paths_root).ok();
     }
 
     // ---- the recorded device target ------------------------------------------
