@@ -86,11 +86,16 @@ jobs:
   # check stalls the queue forever — see the `commit-signatures` note below). A
   # pull request that changes a file no category names, and that the action's
   # `inert` list (files no gated job reads) does not name either, is forced to
-  # the full suite too, with a notice naming the file. Every path category includes
-  # `.github/workflows/**` and `.github/actions/**`, so any change to CI itself
+  # the full suite too, with a notice naming the file. Every path category but
+  # `runtimes` (below) includes `.github/workflows/**` and `.github/actions/**`, so any change to CI itself
   # triggers a full run; the `windows` output is not a path filter, but it is
   # true on every event except a manual dispatch that did not ask for binaries,
-  # so a change to CI always runs the Windows jobs too.
+  # so a change to CI always runs the Windows jobs too. `runtimes` is the
+  # exception on both counts: it is never forced and ignores CI edits, because
+  # its one job (`runtime-locks`) downloads every AMD wheel the locks name and
+  # is not a required check, so skipping it starves nothing. On `main` the gate
+  # is the offline `cargo xtask deps check` (run by `cargo test -p xtask`), and
+  # the weekly runtime-deps-update workflow regenerates the locks.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
     timeout-minutes: 20
@@ -111,6 +116,8 @@ jobs:
       tpn: ${{ steps.classify.outputs.tpn == 'true' }}
       docs: ${{ steps.classify.outputs.docs == 'true' }}
       skills: ${{ steps.classify.outputs.skills == 'true' }}
+      # Not forced: see the `changes` job comment above.
+      runtimes: ${{ steps.classify.outputs.runtimes == 'true' }}
       # Whether the Windows jobs run at all: every event except a manual dispatch
       # that did not ask for PR-style binaries. Both Windows work jobs gate on this
       # and the `windows-build-and-test` aggregator derives its expected skip from
@@ -346,6 +353,7 @@ jobs:
           python scripts/comfyui_therock_gpu_test.py --self-test
           python scripts/local_assistant_therock_gpu_test.py --self-test
           python scripts/vllm_therock_gpu_test.py --self-test
+          python scripts/validate_runtime_update.py --self-test
 
       - name: Portable WSL build deps self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -654,6 +662,21 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
+
+      # runtimes/bin/mise.cmd, the Windows bootstrap launcher, runs on no other
+      # job: download the pinned mise through it (checked against the digest
+      # embedded in the launcher) and check that it reports the pinned
+      # version. xtask's `the_launchers_pin_the_same_mise` ties the version
+      # here to both launchers.
+      - name: Bootstrap mise through the Windows launcher
+        if: needs.changes.outputs.heavy == 'true'
+        shell: cmd
+        env:
+          MISE_INSTALL_PATH: ${{ runner.temp }}\mise-bootstrap.exe
+        run: |
+          call runtimes\bin\mise.cmd --version > "%RUNNER_TEMP%\mise-version.txt" || exit /b 1
+          type "%RUNNER_TEMP%\mise-version.txt"
+          findstr /b /c:"2026.10.25 " "%RUNNER_TEMP%\mise-version.txt" || exit /b 1
 
       # The `clippy` job runs on Linux only, so it compiles the `cfg(unix)` side
       # of every platform conditional and never sees the `cfg(windows)` side.
@@ -1671,6 +1694,77 @@ jobs:
       - name: Check license headers
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
+
+  # Re-locks every runtime at its committed pins and fails if the result differs
+  # from what is committed, so a lock can only change through the mise `lock`
+  # or `update` task. AMD's wheel indexes publish no hashes, so uv has to
+  # download each wheel to hash it (docs/runtime-dependencies.md); the job
+  # therefore runs only when the runtime pins or their tooling change, frees
+  # disk first, and uploads what it generated so a missing or stale lock can be
+  # committed from the artifact instead of re-downloaded locally.
+  runtime-locks:
+    name: Runtime locks match their pins
+    needs: changes
+    # `runtimes` is only ever true from the pull-request path filter.
+    if: needs.changes.outputs.runtimes == 'true'
+    runs-on: ubuntu-24.04 # one LTS: runs mise and uv, which bring their own binaries; nothing here depends on the image
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}/runtimes
+      # The bootstrap wrapper takes MISE_VERSION as an override, and for any
+      # version but its own it trusts the checksum file it downloads beside the
+      # binary. Pin it empty so the wrapper's embedded checksums always apply.
+      MISE_VERSION: ""
+      # GitHub API lookups in `mise lock`; read-only.
+      GITHUB_TOKEN: ${{ github.token }}
+      # Hash each wheel and drop it, instead of keeping every wheel in uv's cache.
+      UV_NO_CACHE: "1"
+      UV_HTTP_TIMEOUT: "900"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          # This job runs upstream code (uv builds AMD's `rocm` sdist), so it
+          # must not save a cache later jobs would restore.
+          cache: false
+
+      - name: Free disk space for wheel downloads
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Re-lock at the committed pins
+        run: runtimes/bin/mise run --cd runtimes lock
+
+      # Re-hash every locked download against the lock, so a pin bump is
+      # checked on its own PR: Lemonade's digests come from mise's version
+      # index, which the Lemonade adapter trusts, and uv's `provenance` string
+      # is only what the locking job wrote.
+      - name: Check every locked download against the lock
+        run: cargo xtask deps verify-downloads
+
+      - name: Fail if any lock changed
+        run: |
+          git add -N runtimes
+          if ! git diff --exit-code --stat -- runtimes; then
+            echo "::error::A runtime lock is missing or stale, or AMD published a new build of an AMD-only package (those are not held back by a lock's cutoff). Commit the files from the 'runtime-locks' artifact, or run 'runtimes/bin/mise run --cd runtimes lock'."
+            exit 1
+          fi
+
+      - name: Upload the re-locked files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-locks
+          path: |
+            runtimes/mise.lock
+            runtimes/locks/
+          retention-days: 7
 
   docs-links:
     name: Markdown links resolve (lychee)

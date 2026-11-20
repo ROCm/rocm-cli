@@ -11,7 +11,8 @@
 //! whose files changed plus every crate that transitively depends on them, with
 //! a fall back to the whole workspace for anything that cannot be attributed to
 //! one crate (the lockfile, the root manifest, the toolchain file, workflow
-//! files, a doc an xtask test reads, an unrecognized path), widened with the
+//! files, a doc an xtask test reads, a file xtask compiles in by path, an
+//! unrecognized path), widened with the
 //! crates whose tests read a changed file from outside their own crate
 //! directory ([`crate::cross_crate_reads`]). CI stays the complete gate; this
 //! only makes the local early warning cheaper.

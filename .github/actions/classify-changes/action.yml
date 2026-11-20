@@ -1,9 +1,9 @@
 name: Classify changed paths
 description: >-
   Sort a pull request's changed files into the categories that gate CI jobs.
-  Every category is forced on when the event is not a pull request, or when a
-  changed file is in no category and not in the inert list (files no gated
-  job reads). Shared by the `changes` job of ci.yml and of
+  Every category but `runtimes` is forced on when the event is not a pull
+  request, or when a changed file is in no category and not in the inert
+  list (files no gated job reads). Shared by the `changes` job of ci.yml and of
   e2e-selfhosted.yml, so the two cannot drift apart.
 
 # Each workflow checks out the repository before `uses: ./.github/actions/...`,
@@ -12,10 +12,11 @@ description: >-
 # `pull-requests: read` on the calling job.
 #
 # Every output is the string 'true' or 'false'. A category is 'true' when the
-# pull request touches it, or when the run is forced. A run is forced off
-# pull_request (push, merge_group, workflow_dispatch), so post-merge `main` and
-# the merge queue always run the full suite and a required check is never
-# starved in the queue. It is also forced on a pull request that changes a
+# pull request touches it, or when the run is forced (every category except
+# `runtimes`, which is 'true' only when a pull request touches it). A run is
+# forced off pull_request (push, merge_group, workflow_dispatch), so post-merge
+# `main` and the merge queue always run the full suite and a required check is
+# never starved in the queue. It is also forced on a pull request that changes a
 # file matched by none of the categories below and not by `inert` either (the
 # list of files no gated job reads): a new kind of file runs everything until
 # someone decides which jobs it affects, instead of silently skipping the jobs
@@ -48,6 +49,12 @@ outputs:
   serve:
     description: The real-GPU serve matrix in e2e-selfhosted.yml must run.
     value: ${{ steps.filter.outputs.serve == 'true' || steps.all.outputs.forced == 'true' }}
+  runtimes:
+    description: >-
+      The runtime re-lock job must run. Never forced, unlike every other
+      output: that job downloads every AMD wheel the locks name and is not a
+      required check, so skipping it starves nothing.
+    value: ${{ steps.filter.outputs.runtimes == 'true' }}
 
 runs:
   using: composite
@@ -117,9 +124,11 @@ runs:
             # The committed per-crate coverage floors. Listed so that lowering
             # a floor re-runs the gate that floor controls.
             - 'coverage-floors.toml'
-            # rocm-deps compiles the pins into constants, so a pin change is a
-            # source change even though no *.rs file moved.
-            - 'runtime-deps.toml'
+            # rocm-deps compiles the pinned versions in runtimes/mise.lock
+            # into constants, and `cargo test -p xtask` checks every runtime
+            # lock, so a pin change is a source change even though no *.rs
+            # file moved.
+            - 'runtimes/**'
             # The published fix catalog `cargo xtask catalog` checks.
             - 'doctor-catalog.json'
             # `cargo xtask lychee` reads its configuration.
@@ -166,7 +175,7 @@ runs:
             - '.cargo/**'
             # The Windows lane's clippy steps gate on this category.
             - 'clippy.toml'
-            - 'runtime-deps.toml'
+            - 'runtimes/**'
             - 'scripts/**'
             - 'xtask/**'
             - 'engines/**'
@@ -253,6 +262,10 @@ runs:
             - 'crates/rocm-engine-protocol/**'
             - 'apps/rocm/**'
             - 'apps/rocmd/**'
+            # Lemonade's pinned version and digest (runtimes/mise.lock), so the
+            # weekly runtime update's pull request runs the GPU lanes that
+            # exercise it.
+            - 'runtimes/**'
             - 'tests/e2e-cucumber/**'
             - 'crates/e2e-report/**'
             - 'xtask/**'
@@ -271,6 +284,15 @@ runs:
             - '.cargo/**'
             - '.github/workflows/**'
             - '.github/actions/**'
+          # Runtime pins and the tooling that locks them, for ci.yml's
+          # `runtime-locks` job. Deliberately without `.github/workflows/**`
+          # and `.github/actions/**`: re-locking downloads every AMD wheel the
+          # locks name, so only a change that can alter a lock pays for it.
+          runtimes:
+            - 'runtimes/**'
+            - 'xtask/src/deps/**'
+            # Compiled into `cargo xtask deps` by path.
+            - 'crates/rocm-deps/src/pins_gen.rs'
           # Files no change-gated job reads: community-health files, GitHub's
           # issue and pull request templates, code ownership, the security
           # scanners' configuration (read only by
@@ -311,6 +333,7 @@ runs:
         CLASSIFIED_DOCS: ${{ steps.filter.outputs.docs_files }}
         CLASSIFIED_SKILLS: ${{ steps.filter.outputs.skills_files }}
         CLASSIFIED_SERVE: ${{ steps.filter.outputs.serve_files }}
+        CLASSIFIED_RUNTIMES: ${{ steps.filter.outputs.runtimes_files }}
         CLASSIFIED_INERT: ${{ steps.filter.outputs.inert_files }}
       run: |
         set -euo pipefail

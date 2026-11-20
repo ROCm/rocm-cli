@@ -1,0 +1,25 @@
+# uv resolver configuration for `cargo xtask deps lock` (see
+# docs/runtime-dependencies.md). Resolver settings only: the runtime profiles
+# and their pins live in profiles.toml.
+
+# Take each package from the first index that has a *compatible* version.
+# AMD's indexes mirror a few common packages (setuptools, numpy, ...) at a
+# single version; under uv's default `first-index` a requirement those mirrors
+# cannot satisfy would fail instead of falling through to PyPI. The opposite
+# risk — an AMD-only package resolved from PyPI — is closed by `deps check`,
+# which refuses a lock that takes any `vendor-packages` entry from a host
+# outside `vendor-hosts`.
+index-strategy = "unsafe-first-match"
+
+[[index]]
+name = "rocm-stable-next"
+url = "https://stable.repo.amd.com/rocm/whl-next/"
+# AMD's indexes answer 403 for a package they do not host; let uv move on.
+ignore-error-codes = [403, 404]
+
+[[index]]
+name = "rocm-frameworks-vllm"
+url = "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/"
+ignore-error-codes = [403, 404]
+
+# PyPI stays the default (last) index.

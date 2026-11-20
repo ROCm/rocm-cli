@@ -20,3 +20,36 @@ misconfigurations:
     paths:
       - tests/remote-ssh/Dockerfile
     statement: Test-only sshd stand-in; port 22 is the thing under test.
+
+vulnerabilities:
+  # runtimes/locks/pylock.vllm-rocm10-1-linux.toml locks AMD's vLLM build for
+  # ROCm 10.1. The vLLM 0.29.1 and flash-attn 2.8.3 builds it locks are the
+  # newest AMD publishes for that line (rocm.frameworks.amd.com/whl-multi-arch/vllm),
+  # so no re-lock can clear these, and nothing installs from this lock yet
+  # (ROCMAI-922 adds the installer, which must not ship these builds unpatched).
+  # Scoped to that one file and set to expire, so the findings return.
+  - id: CVE-2026-114053 # vllm, fixed in 0.31.0
+    paths:
+      - runtimes/locks/pylock.vllm-rocm10-1-linux.toml
+    statement: Newest AMD vLLM build for ROCm 10.1; lock not yet installed from (ROCMAI-922).
+    expired_at: 2027-02-10
+  - id: CVE-2026-114055 # vllm, fixed in 0.31.0
+    paths:
+      - runtimes/locks/pylock.vllm-rocm10-1-linux.toml
+    statement: Newest AMD vLLM build for ROCm 10.1; lock not yet installed from (ROCMAI-922).
+    expired_at: 2027-02-10
+  - id: CVE-2026-115912 # vllm, fixed in 0.32.0
+    paths:
+      - runtimes/locks/pylock.vllm-rocm10-1-linux.toml
+    statement: Newest AMD vLLM build for ROCm 10.1; lock not yet installed from (ROCMAI-922).
+    expired_at: 2027-02-10
+  - id: CVE-2026-115915 # vllm, fixed in 0.32.0
+    paths:
+      - runtimes/locks/pylock.vllm-rocm10-1-linux.toml
+    statement: Newest AMD vLLM build for ROCm 10.1; lock not yet installed from (ROCMAI-922).
+    expired_at: 2027-02-10
+  - id: CVE-2026-31253 # flash-attn, no fixed release
+    paths:
+      - runtimes/locks/pylock.vllm-rocm10-1-linux.toml
+    statement: Only AMD flash-attn build for ROCm 10.1; lock not yet installed from (ROCMAI-922).
+    expired_at: 2027-02-10
