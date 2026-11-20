@@ -62,6 +62,10 @@ use crate::affected::{self, Graph, Selection};
 ///   steps.
 /// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
 ///   although it lives in the e2e crate.
+/// - the e2e Lemonade install steps and serving steps: `rocm-engine-lemonade`'s
+///   `alignment_record` tests `include_str!` them to check that the record's
+///   file name and the reinstall command the steps hard-code still match the
+///   engine's.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
     ("README.md", &["rocm", "xtask"]),
@@ -69,6 +73,14 @@ pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("skills/", &["rocm", "xtask"]),
     ("skills/rocm-doctor/", &["e2e-cucumber"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
+    (
+        "tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs",
+        &["rocm-engine-lemonade"],
+    ),
+    (
+        "tests/e2e-cucumber/tests/e2e/serving_steps.rs",
+        &["rocm-engine-lemonade"],
+    ),
 ];
 
 fn read_pattern_matches(pattern: &str, file: &str) -> bool {

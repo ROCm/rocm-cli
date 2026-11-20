@@ -13,9 +13,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use crate::REINSTALL_LEMONADE_COMMAND;
 use crate::ROCM_BACKEND_NAME;
+use crate::alignment_record::{
+    AlignmentFailure, StoredAlignmentFailure, clear_alignment_failure, read_alignment_failure,
+    unix_secs, write_alignment_failure,
+};
 use crate::install::{LemonadeInstallManifest, PinFileBackup};
 use crate::llamacpp_backend::{
     ROCM_LLAMACPP_BACKEND_DIRS, best_llamacpp_backend_for_host,
@@ -68,6 +73,15 @@ fn lemonade_backend_alignment_disabled() -> bool {
 /// Lemonade ships and installs once more (a forced reinstall), so that branch can
 /// rewrite `backend_versions.json` and replace the selected backend.
 ///
+/// An alignment that fails is recorded in the runtime tree
+/// ([`crate::alignment_record`]), and for the next
+/// [`ALIGNMENT_RETRY_AFTER`](crate::alignment_record::ALIGNMENT_RETRY_AFTER) the same
+/// alignment is not tried again: the backend already pinned is installed without
+/// forcing a reinstall, and a line says so and how to try again sooner. If that
+/// fails, the error says the alignment was skipped because of the record and that
+/// `--reinstall` re-extracts the runtime tree without it, so it tries the
+/// alignment again.
+///
 /// Returns the aligned version string when one was applied and verified, so the caller
 /// can surface it in the install response.
 pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
@@ -78,6 +92,8 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
         manifest,
         lemonade_backend_alignment_disabled(),
         !runtime_is_linux() && !runtime_is_windows(),
+        SystemTime::now,
+        |message| eprintln!("{message}"),
         || active_rocm_sdk_version_for_alignment(paths),
         read_backend_versions_therock_version,
         best_llamacpp_backend_for_host,
@@ -95,6 +111,8 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
                 try_llamacpp_backend_alignment,
                 install_best_llamacpp_backend,
                 newest_llamacpp_rocm_stable_tag_for,
+                SystemTime::now,
+                &mut |message| eprintln!("Warning: {message}"),
             )
         },
     )
@@ -122,11 +140,17 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
 /// false` here as well as there. `align`'s own `if disabled` branch exists only so
 /// its unit tests can pin the state machine's half of the contract (the pin and
 /// llama.cpp tag staying untouched) without duplicating this whole call chain.
+///
+/// `now` is the clock the recorded-failure check reads, and `notice` receives the
+/// lines that check prints, so a test can drive the 24-hour window and assert each
+/// line together with the install it describes.
 #[allow(clippy::too_many_arguments)]
 fn prepare_llamacpp_backend_for_active_rocm_impl(
     manifest: &mut LemonadeInstallManifest,
     disabled: bool,
     unsupported_platform: bool,
+    now: impl Fn() -> SystemTime,
+    mut notice: impl FnMut(String),
     mut active_rocm_sdk_version: impl FnMut() -> Result<Option<String>>,
     mut pinned_version_lookup: impl FnMut(&Path) -> Option<String>,
     mut selected_backend_lookup: impl FnMut(&LemonadeInstallManifest) -> Result<Option<String>>,
@@ -195,6 +219,52 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
             restore_packaged_pins,
             &mut |message| eprintln!("Warning: {message}"),
         );
+    }
+
+    // An earlier install already tried this same alignment and it failed. Its
+    // revert put the pin back to `pinned_version`, which still differs from the
+    // target, so without this check every install would download both tiers'
+    // builds and force-reinstall the pinned backend again. Checked before the
+    // backend probe below, which starts `lemond`: an alignment is only recorded as
+    // failed after that probe chose the ROCm backend.
+    match read_alignment_failure(&manifest.runtime_dir) {
+        StoredAlignmentFailure::Recorded(failure) => {
+            let now = now();
+            if failure.skips_alignment(&target_version, &pinned_version, &manifest.version, now) {
+                // Not forced: the backend the revert installed is the one wanted.
+                // The line is printed only once that install has succeeded, since
+                // it says the pinned backend is in use. A failure says the record
+                // is why no alignment was tried, and how to remove it, whichever
+                // step of the install failed.
+                fallback_install(manifest, false)
+                    .with_context(|| failure.skipped_install_failure(now))?;
+                notice(failure.skip_notice(now));
+                return Ok(None);
+            }
+        }
+        // Removed rather than only skipped: left in place it would print this
+        // warning on every install, and whether the alignment then runs is decided
+        // below (the probe can still skip it), so the warning claims neither.
+        // Accepted risk: a transient read failure (e.g. a sharing violation during a
+        // concurrent install's rename) deletes a valid record, costing one extra
+        // alignment attempt.
+        StoredAlignmentFailure::Unreadable(reason) => {
+            notice(match clear_alignment_failure(&manifest.runtime_dir) {
+                Ok(()) => format!(
+                    "Warning: removed an unreadable record of an earlier failed Lemonade \
+                     backend alignment ({reason})."
+                ),
+                // `reason` and `error` both name the record's path; `error`'s
+                // root cause is the part `reason` does not already say.
+                Err(error) => format!(
+                    "Warning: the record of an earlier failed Lemonade backend alignment is \
+                     unreadable ({reason}) and could not be removed ({}); \
+                     `{REINSTALL_LEMONADE_COMMAND}` removes it.",
+                    error.root_cause()
+                ),
+            });
+        }
+        StoredAlignmentFailure::Absent => {}
     }
 
     // Verification below requires the backend Lemonade selects to be `rocm`
@@ -266,8 +336,15 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
 /// the shared tree would reintroduce the orphan problem above.
 ///
 /// Scope: only the branch where the kept pin equals the active ROCm version calls
-/// this. Other `fallback_install` call sites (no active SDK, an unreadable pin, a
-/// failed backend probe) install what the file pins and do not restore.
+/// this. Every other `fallback_install` call in
+/// [`prepare_llamacpp_backend_for_active_rocm_impl`] installs what the file pins
+/// and does not restore: the alignment opt-out, an unsupported platform, no active
+/// SDK version, an unreadable pin, a recorded failure that skips the alignment
+/// ([`crate::alignment_record`]), a failed backend probe, and a probe that selects a
+/// backend other than ROCm (Vulkan, or none). The ones inside
+/// [`align_llamacpp_backend_to_version`] (its opt-out, a pin that cannot be written,
+/// and the revert, which puts back the pin the alignment started from rather than
+/// the packaged one) do not call `restore_packaged_pins` either.
 ///
 /// What is reported when it does not recover:
 /// - a failed restore reports the original install error, which is the one the
@@ -355,6 +432,11 @@ fn install_pinned_backend_or_restore_packaged_pins(
 /// chain above it. The user-facing announcement lives in
 /// [`prepare_llamacpp_backend_for_active_rocm_impl`] as well, so it fires on every
 /// skip path the opt-out affects, not only the one this function's own gate reaches.
+///
+/// A revert whose fallback install succeeds records the failure
+/// ([`crate::alignment_record`]), stamped with `now`, so the next install does not
+/// repeat it; a verified alignment removes any such record. `warn` receives the
+/// warning printed when either fails, so a test asserts it with the file state.
 #[allow(clippy::too_many_arguments)]
 fn align_llamacpp_backend_to_version(
     manifest: &mut LemonadeInstallManifest,
@@ -365,6 +447,8 @@ fn align_llamacpp_backend_to_version(
     mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
     mut newest_tag_with_asset: impl FnMut(&str) -> Result<String>,
+    now: impl Fn() -> SystemTime,
+    warn: &mut impl FnMut(String),
 ) -> Result<Option<String>> {
     if disabled {
         fallback_install(manifest, false)?;
@@ -385,6 +469,7 @@ fn align_llamacpp_backend_to_version(
     // check above), so a backend already on disk was installed against the OLD
     // pin and must not be trusted just because it happens to still resolve.
     if align(manifest, target_version, true, "its pinned llama.cpp build") {
+        forget_alignment_failure(manifest, warn);
         return Ok(Some(target_version.to_owned()));
     }
 
@@ -396,9 +481,10 @@ fn align_llamacpp_backend_to_version(
     // archive for the active ROCm version instead, still paired with that version,
     // forcing a real reinstall attempt regardless of whatever Tier 1 left on disk.
     let pinned_tag = read_backend_versions_llamacpp_tag(backend_versions_path);
-    let found_tag_applied = match newest_tag_with_asset(target_version) {
+    let found_tag_lookup = newest_tag_with_asset(target_version);
+    let found_tag_applied = match &found_tag_lookup {
         Ok(tag) if pinned_tag.as_deref() != Some(tag.as_str()) => {
-            match write_backend_versions_llamacpp_tag(backend_versions_path, &tag) {
+            match write_backend_versions_llamacpp_tag(backend_versions_path, tag) {
                 Ok(()) => true,
                 Err(error) => {
                     eprintln!(
@@ -427,6 +513,7 @@ fn align_llamacpp_backend_to_version(
             "the newest llama.cpp build for this ROCm version",
         )
     {
+        forget_alignment_failure(manifest, warn);
         return Ok(Some(target_version.to_owned()));
     }
 
@@ -469,6 +556,22 @@ fn align_llamacpp_backend_to_version(
     match fallback_install(manifest, true) {
         Ok(()) => {
             resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, true);
+            // Recorded only once the pinned backend is back in place: the record
+            // tells the next install to reuse it rather than reinstall it.
+            let failure = AlignmentFailure {
+                target_rocm_version: target_version.to_owned(),
+                pinned_rocm_version: pinned_version.to_owned(),
+                pinned_llamacpp_tag: pinned_tag,
+                latest_llamacpp_tag: found_tag_lookup.ok(),
+                lemonade_version: manifest.version.clone(),
+                failed_at_unix_secs: unix_secs(now()),
+            };
+            if let Err(error) = write_alignment_failure(&manifest.runtime_dir, &failure) {
+                warn(format!(
+                    "could not record that aligning Lemonade's ROCm backend to {target_version} \
+                     failed, so the next install tries it again: {error:#}"
+                ));
+            }
             Ok(None)
         }
         Err(error) => {
@@ -477,6 +580,31 @@ fn align_llamacpp_backend_to_version(
             resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, false);
             Err(error)
         }
+    }
+}
+
+/// Remove the record of an earlier failed alignment once an alignment has been
+/// verified, so it cannot skip a later one. Best-effort, with a warning: a record
+/// left behind is not read while the pin equals the version it was aligned to,
+/// which is what a verified alignment leaves. It is read by any later install
+/// whose pin differs from the active ROCm version, and skips that install's
+/// alignment when its target, pin and Lemonade version all match the attempt and
+/// it is under [`ALIGNMENT_RETRY_AFTER`] old. A record outlives a verified
+/// alignment only when this removal failed (records are written only on a failed
+/// alignment, and every verified one removes them here). Only then can a stale-pin
+/// restore ([`install_pinned_backend_or_restore_packaged_pins`]), putting the
+/// packaged pin back with the active ROCm version unchanged, meet a record of a
+/// failed alignment from that pin to that version: it then skips the alignment,
+/// with a notice naming a failure the later alignment superseded, until it
+/// expires or `--reinstall` removes it.
+///
+/// [`ALIGNMENT_RETRY_AFTER`]: crate::alignment_record::ALIGNMENT_RETRY_AFTER
+fn forget_alignment_failure(manifest: &LemonadeInstallManifest, warn: &mut impl FnMut(String)) {
+    if let Err(error) = clear_alignment_failure(&manifest.runtime_dir) {
+        warn(format!(
+            "could not remove the record of an earlier failed Lemonade backend alignment: \
+             {error:#}"
+        ));
     }
 }
 
@@ -719,12 +847,24 @@ fn remove_backend_versions_llamacpp_tag(path: &Path) -> Result<()> {
 /// config would discard the active runtime key and let version selection guess the
 /// most-recently-installed runtime, then mutate Lemonade based on that guess.
 fn active_rocm_sdk_version_for_alignment(paths: &AppPaths) -> Result<Option<String>> {
+    // e2e-only: a black-box scenario names a ROCm version no Lemonade backend
+    // build exists for, so the alignment fails the same way on every GPU lane
+    // without planting a fake runtime in the runtime tree other scenarios share.
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(version) = std::env::var_os(ALIGNMENT_TARGET_TEST_ENV) {
+        return Ok(Some(version.to_string_lossy().into_owned()));
+    }
     let config = RocmCliConfig::load(paths)?;
     let Some(version) = active_managed_therock_version(paths, &config)? else {
         return Ok(None);
     };
     Ok(looks_like_plain_semver(&version).then_some(version))
 }
+
+/// Test-only override of the ROCm version [`active_rocm_sdk_version_for_alignment`]
+/// reports.
+#[cfg(feature = "e2e-test-hooks")]
+const ALIGNMENT_TARGET_TEST_ENV: &str = "ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION";
 
 /// Whether `version` is a plain `major.minor.patch` string with no build/date suffix
 /// (e.g. `10.0.0`, not `7.14.0a20260601`).
@@ -1411,6 +1551,8 @@ mod tests {
                 Ok(())
             },
             |_target| panic!("disabled means tier 2's tag lookup must not run either"),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(result.unwrap(), None);
@@ -1441,6 +1583,8 @@ mod tests {
             &mut manifest,
             true,
             false,
+            || SystemTime::UNIX_EPOCH,
+            |_| {},
             || panic!("disabled means the active SDK version must never be probed"),
             |_path| panic!("disabled means the packaged pin must never be read"),
             |_manifest| panic!("disabled means the vulkan-fallback probe must never run"),
@@ -1473,6 +1617,8 @@ mod tests {
             &mut manifest,
             false,
             true,
+            || SystemTime::UNIX_EPOCH,
+            |_| {},
             || panic!("unsupported platform means the active SDK version must never be probed"),
             |_path| panic!("unsupported platform means the packaged pin must never be read"),
             |_manifest| {
@@ -1507,6 +1653,8 @@ mod tests {
             &mut manifest,
             false,
             false,
+            || SystemTime::UNIX_EPOCH,
+            |_| {},
             || Ok(Some("7.14.0".to_owned())),
             |_path| Some("10.1.0".to_owned()),
             |_manifest| Err(anyhow!("lemond failed to start")),
@@ -1543,6 +1691,8 @@ mod tests {
             &mut manifest,
             false,
             false,
+            || SystemTime::UNIX_EPOCH,
+            |_| {},
             || Ok(Some("7.14.1".to_owned())),
             |_path| Some("7.14.1".to_owned()),
             |_manifest| panic!("an equal pin never reaches the backend probe"),
@@ -1954,7 +2104,7 @@ mod tests {
         // warning says the CLI is already doing the equivalent, so it must not
         // repeat that advice.
         let first = anyhow!("HTTP error 403 for the pinned tarball")
-            .context("run `rocm engines install lemonade --reinstall` and then retry `rocm serve`");
+            .context(crate::llamacpp_backend::BACKEND_INSTALL_RETRY_FAILED);
         let flow = restore_flow(vec![Err(first), Ok(())], restore_writing_packaged);
 
         assert!(flow.result.is_ok());
@@ -2008,6 +2158,8 @@ mod tests {
             },
             |_manifest, _force_reinstall| panic!("tier 1 succeeded; no fallback install"),
             |_target| panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(result.unwrap(), Some("7.14.0".to_owned()));
@@ -2253,6 +2405,8 @@ mod tests {
                 );
                 Ok("b12003".to_owned())
             },
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(result.unwrap(), Some("7.14.0".to_owned()));
@@ -2292,6 +2446,8 @@ mod tests {
                 Ok(())
             },
             |_target| Ok("b12003".to_owned()),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(result.unwrap(), None);
@@ -2338,6 +2494,8 @@ mod tests {
                 Ok(())
             },
             |_target| Ok("b12003".to_owned()),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(result.unwrap(), None);
@@ -2377,6 +2535,8 @@ mod tests {
             // The pinned tag is the build Tier 2 found, which Tier 1 already tried:
             // Tier 2's own reinstall must not be attempted.
             |_target| Ok("b11580".to_owned()),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(result.unwrap(), None);
@@ -2422,6 +2582,8 @@ mod tests {
                 Ok(())
             },
             |_target| bail!("network unavailable"),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert_eq!(
@@ -2462,6 +2624,8 @@ mod tests {
                 bail!("network unavailable")
             },
             |_target| Ok("b12003".to_owned()),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
         );
 
         assert!(
@@ -2472,6 +2636,13 @@ mod tests {
             fs::read(rocm_dir.join(&server)).unwrap(),
             b"pre-existing",
             "the pre-existing backend must be restored, not left deleted"
+        );
+        // A failure is recorded only once the pinned backend is back in place; a
+        // record here would tell the next install to reuse a backend that failed
+        // to install.
+        assert!(
+            matches!(read_alignment_failure(&dir), StoredAlignmentFailure::Absent),
+            "no record is written when the revert's install fails"
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -2590,5 +2761,869 @@ mod tests {
 
         fs::remove_file(path_dir.join("hipblas.dll")).unwrap();
         assert!(!windows_backend_resolves(&backend_dir, &search_dirs));
+    }
+
+    // The record of a failed alignment (ROCMAI-437). Each test below is one row of
+    // the record's state matrix: no record, a record that applies, one for another
+    // target, an expired one, an unreadable one, a record that cannot be written,
+    // an alignment that later succeeds, the opt-out, and an install that fails
+    // after the record skipped the alignment. A revert whose install fails writes
+    // no record: that is asserted in
+    // `align_revert_restores_the_backend_dir_when_the_fallback_install_fails`.
+    // `--reinstall` removing the record is in `install.rs`
+    // (`reinstall_removes_the_record_of_a_failed_alignment`).
+
+    const RECORD_TARGET: &str = "7.99.0";
+    const RECORD_PIN: &str = "7.13.0";
+    const FAILED_AT: u64 = 1_800_000_000;
+    const HOUR: u64 = 60 * 60;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn recorded_failure(target: &str, failed_at_unix_secs: u64) -> AlignmentFailure {
+        AlignmentFailure {
+            target_rocm_version: target.to_owned(),
+            pinned_rocm_version: RECORD_PIN.to_owned(),
+            pinned_llamacpp_tag: Some("b9752".to_owned()),
+            latest_llamacpp_tag: Some("b10952".to_owned()),
+            lemonade_version: rocm_deps::LEMONADE_VERSION.to_owned(),
+            failed_at_unix_secs,
+        }
+    }
+
+    /// A runtime directory whose `backend_versions.json` pins [`RECORD_PIN`].
+    fn runtime_dir_with_packaged_pin(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = scratch_dir(tag);
+        let pin_file = dir.join(BACKEND_VERSIONS_RESOURCE);
+        fs::create_dir_all(pin_file.parent().unwrap()).unwrap();
+        write_backend_versions_fixture(&pin_file, RECORD_PIN, "b9752");
+        (dir, pin_file)
+    }
+
+    struct PrepareRun {
+        result: Result<Option<String>>,
+        align_calls: usize,
+        installs: Vec<bool>,
+        notices: Vec<String>,
+    }
+
+    /// Runs `prepare` for an active SDK at [`RECORD_TARGET`] against the real pin
+    /// file and record in `dir`, with a stand-in `align` that only counts its calls
+    /// and a fallback install that returns `install_result`.
+    fn prepare_against_record(
+        dir: &Path,
+        disabled: bool,
+        now: SystemTime,
+        install_result: fn() -> Result<()>,
+    ) -> PrepareRun {
+        prepare_against_record_with_probe(dir, disabled, now, install_result, || {
+            Ok(Some(ROCM_BACKEND_NAME.to_owned()))
+        })
+    }
+
+    /// [`prepare_against_record`] with the backend probe's answer scripted.
+    fn prepare_against_record_with_probe(
+        dir: &Path,
+        disabled: bool,
+        now: SystemTime,
+        install_result: fn() -> Result<()>,
+        probe: fn() -> Result<Option<String>>,
+    ) -> PrepareRun {
+        prepare_against_record_as(
+            dir,
+            rocm_deps::LEMONADE_VERSION,
+            disabled,
+            now,
+            install_result,
+            probe,
+        )
+    }
+
+    /// [`prepare_against_record_with_probe`] for an install of Lemonade
+    /// `lemonade_version` rather than the pinned one.
+    fn prepare_against_record_as(
+        dir: &Path,
+        lemonade_version: &str,
+        disabled: bool,
+        now: SystemTime,
+        install_result: fn() -> Result<()>,
+        probe: fn() -> Result<Option<String>>,
+    ) -> PrepareRun {
+        let mut manifest = test_manifest(dir.to_path_buf());
+        manifest.version = lemonade_version.to_owned();
+        let mut align_calls = 0;
+        let mut installs = Vec::new();
+        let mut notices = Vec::new();
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            disabled,
+            false,
+            || now,
+            |message| notices.push(message),
+            || Ok(Some(RECORD_TARGET.to_owned())),
+            read_backend_versions_therock_version,
+            |_manifest| probe(),
+            |_manifest, force_reinstall| {
+                installs.push(force_reinstall);
+                install_result()
+            },
+            |_manifest| panic!("a pin that differs from the target never restores"),
+            |_manifest, _path, _target, _pinned, _disabled| {
+                align_calls += 1;
+                Ok(None)
+            },
+        );
+        PrepareRun {
+            result,
+            align_calls,
+            installs,
+            notices,
+        }
+    }
+
+    #[test]
+    fn a_failed_alignment_is_not_repeated_by_the_next_install_within_a_day() {
+        // The regression: a failed alignment reverts the pin to a version that still
+        // differs from the active SDK, so before the record every later install ran
+        // both tiers and the forced reinstall again. The first prepare runs the real
+        // tier/revert state machine; the second must not reach it.
+        let (dir, pin_file) = runtime_dir_with_packaged_pin("record-not-repeated");
+        let mut tier_attempts = 0;
+        let mut first_installs = Vec::new();
+        let mut manifest = test_manifest(dir.clone());
+        let first = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            false,
+            false,
+            || at(FAILED_AT),
+            |message| panic!("nothing is recorded yet, so nothing is noticed: {message}"),
+            || Ok(Some(RECORD_TARGET.to_owned())),
+            read_backend_versions_therock_version,
+            |_manifest| Ok(Some(ROCM_BACKEND_NAME.to_owned())),
+            |_manifest, _force| panic!("the first install aligns rather than installing directly"),
+            |_manifest| panic!("a pin that differs from the target never restores"),
+            |manifest, path, target, pinned, disabled| {
+                align_llamacpp_backend_to_version(
+                    manifest,
+                    path,
+                    target,
+                    pinned,
+                    disabled,
+                    |_manifest, _target, _force, _label| {
+                        tier_attempts += 1;
+                        false
+                    },
+                    |_manifest, force_reinstall| {
+                        first_installs.push(force_reinstall);
+                        Ok(())
+                    },
+                    |_target| Ok("b10952".to_owned()),
+                    || at(FAILED_AT),
+                    &mut |message| panic!("the record is writable: {message}"),
+                )
+            },
+        );
+        assert_eq!(first.unwrap(), None);
+        assert_eq!(tier_attempts, 2, "the first install tries both tiers");
+        assert_eq!(
+            first_installs,
+            [true],
+            "and force-reinstalls the pinned backend"
+        );
+        assert_eq!(
+            read_alignment_failure(&dir),
+            StoredAlignmentFailure::Recorded(recorded_failure(RECORD_TARGET, FAILED_AT)),
+            "the failure is recorded with what was tried"
+        );
+
+        let now = at(FAILED_AT + HOUR);
+        let second = prepare_against_record(&dir, false, now, || Ok(()));
+
+        assert_eq!(second.result.unwrap(), None);
+        assert_eq!(
+            second.align_calls, 0,
+            "the recorded alignment is not tried again"
+        );
+        assert_eq!(
+            second.installs,
+            [false],
+            "the pinned backend is reused, not force-reinstalled"
+        );
+        assert_eq!(
+            second.notices,
+            [recorded_failure(RECORD_TARGET, FAILED_AT).skip_notice(now)]
+        );
+        let notice = &second.notices[0];
+        assert!(
+            notice.contains("aligned to ROCm 7.99.0 1 hour ago"),
+            "{notice}"
+        );
+        // Pins the advice only. That `--reinstall` removes the record is
+        // `reinstall_removes_the_record_of_a_failed_alignment` in `install.rs`, and
+        // that the alignment then runs is `with_no_record_the_alignment_runs_as_before`.
+        assert!(
+            notice.contains(crate::REINSTALL_LEMONADE_COMMAND),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("otherwise an install run 23 hours from now or later tries it again."),
+            "{notice}"
+        );
+        assert_eq!(
+            read_backend_versions_therock_version(&pin_file).as_deref(),
+            Some(RECORD_PIN),
+            "the notice says the pinned backend is in use, and the pin is untouched"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_no_record_the_alignment_runs_as_before() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-absent");
+
+        let run = prepare_against_record(&dir, false, at(FAILED_AT), || Ok(()));
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.align_calls, 1);
+        assert!(
+            run.installs.is_empty(),
+            "align owns every install on this path"
+        );
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable record is handled where any record is read, before the
+    /// backend probe: by the time the probe runs (the alignment can still go
+    /// ahead), the record is already gone and its warning already printed.
+    #[test]
+    fn an_unreadable_record_is_removed_and_reported_before_the_backend_probe_runs() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-corrupt-before-probe");
+        let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+        fs::write(&record_path, b"{ torn").unwrap();
+        let mut manifest = test_manifest(dir.clone());
+        let notices = std::cell::RefCell::new(Vec::new());
+        let mut probe_calls = 0;
+        let mut align_calls = 0;
+
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            false,
+            false,
+            || at(FAILED_AT),
+            |message| notices.borrow_mut().push(message),
+            || Ok(Some(RECORD_TARGET.to_owned())),
+            read_backend_versions_therock_version,
+            |_manifest| {
+                probe_calls += 1;
+                assert!(
+                    !record_path.exists(),
+                    "the probe ran before the unreadable record was removed"
+                );
+                assert_eq!(
+                    notices.borrow().len(),
+                    1,
+                    "the probe ran before the warning was printed"
+                );
+                Ok(Some(ROCM_BACKEND_NAME.to_owned()))
+            },
+            |_manifest, _force_reinstall| panic!("align owns every install on this path"),
+            |_manifest| panic!("a pin that differs from the target never restores"),
+            |_manifest, _path, _target, _pinned, _disabled| {
+                align_calls += 1;
+                Ok(None)
+            },
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(probe_calls, 1);
+        assert_eq!(align_calls, 1);
+        assert!(
+            notices.borrow()[0].starts_with("Warning: removed an unreadable record"),
+            "{:?}",
+            notices.borrow()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The record is checked before the backend probe, which starts `lemond`: an
+    /// install the record skips never pays for that probe.
+    #[test]
+    fn a_record_that_applies_skips_before_the_backend_probe_runs() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-skips-probe");
+        write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+
+        let run = prepare_against_record_with_probe(
+            &dir,
+            false,
+            at(FAILED_AT + HOUR),
+            || Ok(()),
+            || panic!("the record skipped the alignment; the backend probe must not run"),
+        );
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.align_calls, 0);
+        assert_eq!(run.installs, vec![false]);
+        assert_eq!(run.notices.len(), 1, "{:?}", run.notices);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_for_another_pin_does_not_skip_the_alignment() {
+        // Target and Lemonade version as recorded; only the pin on disk differs
+        // from the one the failed attempt started from.
+        let (dir, pin_file) = runtime_dir_with_packaged_pin("record-other-pin");
+        write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+        write_backend_versions_fixture(&pin_file, "7.12.0", "b9752");
+
+        let run = prepare_against_record(&dir, false, at(FAILED_AT + HOUR), || Ok(()));
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(
+            run.align_calls, 1,
+            "the pin changed since the failure, so the alignment runs"
+        );
+        assert!(run.installs.is_empty());
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_from_another_lemonade_version_does_not_skip_the_alignment() {
+        // Target and pin as recorded; only the installed Lemonade differs from the
+        // one the failed attempt ran in.
+        let (dir, _) = runtime_dir_with_packaged_pin("record-other-lemonade");
+        write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+        let other_lemonade = format!("{}-next", rocm_deps::LEMONADE_VERSION);
+
+        let run = prepare_against_record_as(
+            &dir,
+            &other_lemonade,
+            false,
+            at(FAILED_AT + HOUR),
+            || Ok(()),
+            || Ok(Some(ROCM_BACKEND_NAME.to_owned())),
+        );
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(
+            run.align_calls, 1,
+            "another Lemonade version ships other builds, so the alignment runs"
+        );
+        assert!(run.installs.is_empty());
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_for_another_rocm_version_does_not_skip_the_alignment() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-other-target");
+        let other = recorded_failure("7.98.0", FAILED_AT);
+        write_alignment_failure(&dir, &other).unwrap();
+
+        let run = prepare_against_record(&dir, false, at(FAILED_AT + HOUR), || Ok(()));
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(
+            run.align_calls, 1,
+            "the active SDK changed, so the alignment runs"
+        );
+        assert!(run.installs.is_empty());
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_a_day_old_no_longer_skips_the_alignment() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-expired");
+        write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+
+        let run = prepare_against_record(&dir, false, at(FAILED_AT + 24 * HOUR), || Ok(()));
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(
+            run.align_calls, 1,
+            "after 24 hours the alignment is tried again"
+        );
+        assert!(run.installs.is_empty());
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+
+        let just_inside =
+            prepare_against_record(&dir, false, at(FAILED_AT + 24 * HOUR - 1), || Ok(()));
+        assert_eq!(
+            just_inside.align_calls, 0,
+            "one second earlier it is still skipped"
+        );
+        assert_eq!(just_inside.installs, [false]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The record is consulted only once an install could align. On every path
+    /// that returns before that, an unreadable record is left as it is and
+    /// nothing is said about it, as docs/engine-plugins.md states.
+    #[test]
+    fn an_unreadable_record_is_left_alone_and_unmentioned_by_every_install_that_cannot_align() {
+        type SdkLookup = fn() -> Result<Option<String>>;
+        type PinLookup = fn(&Path) -> Option<String>;
+        let target: SdkLookup = || Ok(Some(RECORD_TARGET.to_owned()));
+        let packaged_pin: PinLookup = read_backend_versions_therock_version;
+        let rows: [(&str, bool, bool, SdkLookup, PinLookup); 6] = [
+            ("opt-out", true, false, target, packaged_pin),
+            ("unsupported platform", false, true, target, packaged_pin),
+            (
+                "no active ROCm version",
+                false,
+                false,
+                || Ok(None),
+                packaged_pin,
+            ),
+            (
+                "active ROCm version lookup fails",
+                false,
+                false,
+                || Err(anyhow!("no runtime record")),
+                packaged_pin,
+            ),
+            ("unreadable pin", false, false, target, |_path| None),
+            (
+                "pin equals the active ROCm version",
+                false,
+                false,
+                target,
+                |_path| Some(RECORD_TARGET.to_owned()),
+            ),
+        ];
+        for (label, disabled, unsupported_platform, sdk, pin) in rows {
+            let (dir, _) = runtime_dir_with_packaged_pin("record-corrupt-early-exit");
+            let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+            fs::write(&record_path, b"{ torn").unwrap();
+            let mut manifest = test_manifest(dir.clone());
+            let mut notices = Vec::new();
+            let mut installs = Vec::new();
+
+            let result = prepare_llamacpp_backend_for_active_rocm_impl(
+                &mut manifest,
+                disabled,
+                unsupported_platform,
+                || at(FAILED_AT),
+                |message| notices.push(message),
+                sdk,
+                pin,
+                |_manifest| panic!("{label}: the backend probe is past the record"),
+                |_manifest, force_reinstall| {
+                    installs.push(force_reinstall);
+                    Ok(())
+                },
+                |_manifest| panic!("{label}: the pinned install succeeded; nothing restores"),
+                |_manifest, _path, _target, _pinned, _disabled| {
+                    panic!("{label}: this install cannot align")
+                },
+            );
+
+            assert_eq!(result.unwrap(), None, "{label}");
+            assert_eq!(installs, vec![false], "{label}");
+            assert!(notices.is_empty(), "{label}: {notices:?}");
+            assert_eq!(
+                fs::read(&record_path).unwrap(),
+                b"{ torn",
+                "{label}: the record is left as it was"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// An unreadable record is removed whatever happens next, so the warning
+    /// says only that, and is true on each path below: the alignment runs, the
+    /// probe fails, or the probe selects Vulkan (both of which skip it).
+    #[test]
+    fn an_unreadable_record_is_removed_with_one_warning_on_every_path() {
+        type Probe = fn() -> Result<Option<String>>;
+        let probes: [(&str, Probe, usize, Vec<bool>); 3] = [
+            ("rocm", || Ok(Some(ROCM_BACKEND_NAME.to_owned())), 1, vec![]),
+            (
+                "probe error",
+                || Err(anyhow!("lemond failed to start")),
+                0,
+                vec![false],
+            ),
+            ("vulkan", || Ok(Some("vulkan".to_owned())), 0, vec![false]),
+        ];
+        for (label, probe, align_calls, installs) in probes {
+            let (dir, _) = runtime_dir_with_packaged_pin("record-corrupt");
+            let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+            fs::write(&record_path, b"{ torn").unwrap();
+
+            let run =
+                prepare_against_record_with_probe(&dir, false, at(FAILED_AT), || Ok(()), probe);
+
+            assert_eq!(run.result.unwrap(), None, "{label}");
+            assert_eq!(run.align_calls, align_calls, "{label}");
+            assert_eq!(run.installs, installs, "{label}");
+            assert_eq!(run.notices.len(), 1, "{label}: {:?}", run.notices);
+            assert!(
+                run.notices[0].starts_with(
+                    "Warning: removed an unreadable record of an earlier failed Lemonade \
+                     backend alignment"
+                ),
+                "{label}: {:?}",
+                run.notices
+            );
+            assert!(
+                !record_path.exists(),
+                "{label}: the warning says the record was removed"
+            );
+
+            let next =
+                prepare_against_record_with_probe(&dir, false, at(FAILED_AT), || Ok(()), probe);
+            assert!(
+                next.notices.is_empty(),
+                "{label}: the warning does not recur: {:?}",
+                next.notices
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// When the unreadable record cannot be removed either, the warning says so
+    /// and names the command that does remove it (`--reinstall` deletes the
+    /// runtime tree; `reinstall_removes_the_record_of_a_failed_alignment` in
+    /// `install.rs` proves that), and the alignment still runs.
+    #[test]
+    fn an_unreadable_record_that_cannot_be_removed_names_the_command_that_removes_it() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-corrupt-stuck");
+        // A directory where the record file goes: reading a directory as a file
+        // fails, and so does removing it as one, since `remove_file` refuses any
+        // directory, empty or not.
+        let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+        fs::create_dir_all(&record_path).unwrap();
+        // What the platform says when that removal fails, so the warning can be held
+        // to carrying it on Linux and Windows alike.
+        let removal_error = fs::remove_file(&record_path).unwrap_err().to_string();
+
+        let run = prepare_against_record(&dir, false, at(FAILED_AT), || Ok(()));
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(
+            run.align_calls, 1,
+            "an unreadable record does not skip the alignment"
+        );
+        assert_eq!(run.notices.len(), 1, "{:?}", run.notices);
+        assert!(
+            run.notices[0].starts_with(
+                "Warning: the record of an earlier failed Lemonade backend alignment is \
+                 unreadable (could not read "
+            ) && run.notices[0].contains(&format!("`{}`", crate::REINSTALL_LEMONADE_COMMAND)),
+            "{:?}",
+            run.notices
+        );
+        assert_eq!(
+            run.notices[0]
+                .matches(record_path.display().to_string().as_str())
+                .count(),
+            1,
+            "the path is named once: {:?}",
+            run.notices
+        );
+        assert!(
+            run.notices[0].contains(&format!("and could not be removed ({removal_error}); ")),
+            "expected the removal's own error `{removal_error}`: {:?}",
+            run.notices
+        );
+        assert!(record_path.is_dir(), "the warning says it was not removed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Preparing the skipped alignment's pinned backend fails: the error says so
+    /// without claiming an install ran or which backend, says why no alignment was
+    /// tried and what `--reinstall` does, and keeps the error beneath, whether that
+    /// is `lemond` not starting, a transient failure, or the backend retry's own
+    /// `--reinstall` advice. That `--reinstall` removes the record is
+    /// `reinstall_removes_the_record_of_a_failed_alignment` in `install.rs`; that
+    /// the next install then aligns is `with_no_record_the_alignment_runs_as_before`.
+    #[test]
+    fn a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing() {
+        const CONTEXT: &str = concat!(
+            "preparing Lemonade's llama.cpp backend as pinned for ROCm 7.13.0 failed; the \
+             alignment to ROCm 7.99.0 was skipped because it failed 1 hour ago. `",
+            reinstall_lemonade_command!(),
+            "` re-extracts the runtime tree without that record, so it tries the alignment \
+             again (downloading the backend again)"
+        );
+        type Install = fn() -> Result<()>;
+        let rows: [(&str, Install, String); 3] = [
+            (
+                // The shape `spawn_lemond` returns: nothing was installed, and no
+                // backend kind is known yet.
+                "lemond does not start",
+                || {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                        .context("failed to start /opt/lemonade/bin/lemond")
+                },
+                format!("{CONTEXT}: failed to start /opt/lemonade/bin/lemond: entity not found"),
+            ),
+            (
+                "transient",
+                || bail!("timed out waiting for lemond to start"),
+                format!("{CONTEXT}: timed out waiting for lemond to start"),
+            ),
+            (
+                "the backend retry's own advice",
+                || {
+                    Err(anyhow!("backend download failed"))
+                        .context(crate::llamacpp_backend::BACKEND_INSTALL_RETRY_FAILED)
+                },
+                format!(
+                    "{CONTEXT}: {}: backend download failed",
+                    crate::llamacpp_backend::BACKEND_INSTALL_RETRY_FAILED
+                ),
+            ),
+        ];
+        for (label, install, chain) in rows {
+            let (dir, _) = runtime_dir_with_packaged_pin("record-skip-install-fails");
+            let failure = recorded_failure(RECORD_TARGET, FAILED_AT);
+            write_alignment_failure(&dir, &failure).unwrap();
+
+            let run = prepare_against_record(&dir, false, at(FAILED_AT + HOUR), install);
+
+            let error = run.result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                failure.skipped_install_failure(at(FAILED_AT + HOUR)),
+                "{label}"
+            );
+            assert_eq!(format!("{error:#}"), chain, "{label}");
+            assert_eq!(run.align_calls, 0, "{label}");
+            assert_eq!(run.installs, [false], "{label}");
+            assert!(
+                run.notices.is_empty(),
+                "{label}: the notice says the pinned backend is in use, which it is not: {:?}",
+                run.notices
+            );
+            assert_eq!(
+                read_alignment_failure(&dir),
+                StoredAlignmentFailure::Recorded(failure),
+                "{label}: the record is kept"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The skip decision, the notice and the error context must all use the one
+    /// `now` the decision read: a message that reads the clock again can name an
+    /// age, or a time left, that the decision never saw. The clock here moves on
+    /// by five hours each time it is read, so a second read shows in the text.
+    #[test]
+    fn the_skip_messages_use_the_time_the_skip_decision_read() {
+        type Install = fn() -> Result<()>;
+        let rows: [(&str, Install, bool); 2] = [
+            ("the install succeeds", || Ok(()), false),
+            (
+                "the install fails",
+                || bail!("backend download failed"),
+                true,
+            ),
+        ];
+        for (label, install, fails) in rows {
+            let (dir, _) = runtime_dir_with_packaged_pin("record-one-clock-read");
+            let failure = recorded_failure(RECORD_TARGET, FAILED_AT);
+            write_alignment_failure(&dir, &failure).unwrap();
+            let clock = std::cell::Cell::new(FAILED_AT + HOUR);
+            let mut manifest = test_manifest(dir.clone());
+            let mut notices = Vec::new();
+            let mut align_calls = 0;
+
+            let result = prepare_llamacpp_backend_for_active_rocm_impl(
+                &mut manifest,
+                false,
+                false,
+                || {
+                    let now = clock.get();
+                    clock.set(now + 5 * HOUR);
+                    at(now)
+                },
+                |message| notices.push(message),
+                || Ok(Some(RECORD_TARGET.to_owned())),
+                read_backend_versions_therock_version,
+                |_manifest| Ok(Some(ROCM_BACKEND_NAME.to_owned())),
+                |_manifest, _force_reinstall| install(),
+                |_manifest| panic!("a pin that differs from the target never restores"),
+                |_manifest, _path, _target, _pinned, _disabled| {
+                    align_calls += 1;
+                    Ok(None)
+                },
+            );
+
+            let decided_at = at(FAILED_AT + HOUR);
+            assert_eq!(align_calls, 0, "{label}: the record skipped the alignment");
+            assert_eq!(result.is_err(), fails, "{label}: {result:?}");
+            match result {
+                Ok(aligned) => {
+                    assert_eq!(aligned, None, "{label}");
+                    assert_eq!(notices, [failure.skip_notice(decided_at)], "{label}");
+                    assert!(notices[0].contains("1 hour ago"), "{label}: {notices:?}");
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error.to_string(),
+                        failure.skipped_install_failure(decided_at),
+                        "{label}"
+                    );
+                    assert!(error.to_string().contains("1 hour ago"), "{label}: {error}");
+                    assert!(notices.is_empty(), "{label}: {notices:?}");
+                }
+            }
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn the_opt_out_leaves_a_record_alone() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-opt-out");
+        write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+        let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+        let before = fs::read(&record_path).unwrap();
+
+        let run = prepare_against_record(&dir, true, at(FAILED_AT + HOUR), || Ok(()));
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.align_calls, 0);
+        assert_eq!(run.installs, [false]);
+        assert!(
+            run.notices.is_empty(),
+            "the opt-out prints its own line, not the record's: {:?}",
+            run.notices
+        );
+        assert_eq!(fs::read(&record_path).unwrap(), before);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_verified_alignment_removes_the_record_of_an_earlier_failure() {
+        for tier2 in [false, true] {
+            let (dir, pin_file) = runtime_dir_with_packaged_pin("record-cleared");
+            write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+            let mut manifest = test_manifest(dir.clone());
+            let mut attempts = 0;
+            let mut warnings = Vec::new();
+
+            let result = align_llamacpp_backend_to_version(
+                &mut manifest,
+                &pin_file,
+                RECORD_TARGET,
+                RECORD_PIN,
+                false,
+                |_manifest, _target, _force, _label| {
+                    attempts += 1;
+                    !tier2 || attempts == 2
+                },
+                |_manifest, _force| panic!("a verified alignment needs no fallback install"),
+                |_target| Ok("b10952".to_owned()),
+                || at(FAILED_AT + 25 * HOUR),
+                &mut |message| warnings.push(message),
+            );
+
+            assert_eq!(result.unwrap(), Some(RECORD_TARGET.to_owned()));
+            assert_eq!(
+                read_alignment_failure(&dir),
+                StoredAlignmentFailure::Absent,
+                "tier {} succeeded, so the record must go",
+                if tier2 { 2 } else { 1 }
+            );
+            assert!(warnings.is_empty(), "{warnings:?}");
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_removed_after_a_verified_alignment_warns_and_keeps_the_alignment() {
+        let (dir, pin_file) = runtime_dir_with_packaged_pin("record-not-removable");
+        // A directory where the record file goes: `remove_file` refuses any
+        // directory, empty or not.
+        let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+        fs::create_dir_all(&record_path).unwrap();
+        let mut manifest = test_manifest(dir.clone());
+        let mut warnings = Vec::new();
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &pin_file,
+            RECORD_TARGET,
+            RECORD_PIN,
+            false,
+            |_manifest, _target, _force, _label| true,
+            |_manifest, _force| panic!("a verified alignment needs no fallback install"),
+            |_target| panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
+            || at(FAILED_AT),
+            &mut |message| warnings.push(message),
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            Some(RECORD_TARGET.to_owned()),
+            "the alignment itself succeeded and is kept"
+        );
+        assert_eq!(
+            read_backend_versions_therock_version(&pin_file).as_deref(),
+            Some(RECORD_TARGET)
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "could not remove the record of an earlier failed Lemonade backend alignment"
+            ),
+            "{warnings:?}"
+        );
+        assert!(record_path.is_dir(), "the warning says it was not removed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_written_warns_and_the_install_still_succeeds() {
+        let (dir, pin_file) = runtime_dir_with_packaged_pin("record-unwritable");
+        // A non-empty directory where the record file goes: no write can replace it.
+        let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+        fs::create_dir_all(record_path.join("occupied")).unwrap();
+        let mut manifest = test_manifest(dir.clone());
+        let mut installs = Vec::new();
+        let mut warnings = Vec::new();
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &pin_file,
+            RECORD_TARGET,
+            RECORD_PIN,
+            false,
+            |_manifest, _target, _force, _label| false,
+            |_manifest, force_reinstall| {
+                installs.push(force_reinstall);
+                Ok(())
+            },
+            |_target| Ok("b10952".to_owned()),
+            || at(FAILED_AT),
+            &mut |message| warnings.push(message),
+        );
+
+        assert_eq!(result.unwrap(), None, "the install itself succeeded");
+        assert_eq!(installs, [true]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("could not record")
+                && warnings[0].contains("the next install tries it again"),
+            "{warnings:?}"
+        );
+        assert!(
+            !matches!(
+                read_alignment_failure(&dir),
+                StoredAlignmentFailure::Recorded(_)
+            ),
+            "nothing was recorded, so the warning's claim holds"
+        );
+        assert_eq!(
+            read_backend_versions_therock_version(&pin_file).as_deref(),
+            Some(RECORD_PIN)
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }

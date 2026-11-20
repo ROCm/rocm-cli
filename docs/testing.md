@@ -1223,7 +1223,10 @@ skill's catalog table; CI runs that test in the `test` job's `cargo nextest` ove
 and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose steps run when the
 `heavy` category matches, as every `skills/` change does, while the hook's `test`
 step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
-e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it), and the e2e
+Lemonade install steps and serving steps also select `rocm-engine-lemonade` (its
+`alignment_record` tests `include_str!` them to check that the record's file name and the reinstall
+command they hard-code still match the engine's). The table is `CROSS_CRATE_READS` in
 [cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
 `include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
 code (not in comments or string literals) that leave their crate and fails unless each one is
@@ -3085,6 +3088,64 @@ has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
 lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
+
+Lemonade failed-alignment record focused tests (ROCMAI-437; a failed
+alignment is not repeated by the next install for 24 hours; see
+[Lemonade backend alignment on engine install](engine-plugins.md#lemonade-backend-alignment-on-engine-install)):
+
+```bash
+cargo test -p rocm-engine-lemonade --lib -- alignment_record:: \
+  backend_alignment::tests::a_record backend_alignment::tests::an_unreadable_record \
+  backend_alignment::tests::with_no_record backend_alignment::tests::a_failed_alignment_is_not_repeated \
+  backend_alignment::tests::a_skipped_alignment backend_alignment::tests::the_opt_out_leaves_a_record \
+  backend_alignment::tests::a_verified_alignment_removes_the_record \
+  backend_alignment::tests::align_revert_restores_the_backend_dir \
+  install::tests::reinstall_removes_the_record_of_a_failed_alignment
+```
+
+The filters are module-qualified because a bare `record` also matches unrelated
+tests of Lemonade's install record and server state.
+
+The tests are in
+[alignment_record.rs](../engines/lemonade/src/alignment_record.rs) and
+[backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs), one per
+state of the record described in the section linked above, and their names say
+which: no record (`with_no_record_the_alignment_runs_as_before`), one that
+applies (the regression test,
+`a_failed_alignment_is_not_repeated_by_the_next_install_within_a_day`: the
+second install calls no alignment tier and installs without forcing, and its
+notice is asserted with the pin file), one that applies checked before the
+backend probe starts `lemond`
+(`a_record_that_applies_skips_before_the_backend_probe_runs`), one for another
+ROCm version, one for another pin
+(`a_record_for_another_pin_does_not_skip_the_alignment`), one from another
+Lemonade version
+(`a_record_from_another_lemonade_version_does_not_skip_the_alignment`), one a
+day old, one an early exit never consults (one table test,
+a row per exit, with an unreadable record on disk), an unreadable one past
+those exits (removed with a warning on every path: probe error, Vulkan and
+ROCm, in `an_unreadable_record_is_removed_with_one_warning_on_every_path`; and,
+on the ROCm-probe path only, the probe asserting from inside that the removal
+and warning came first, in
+`an_unreadable_record_is_removed_and_reported_before_the_backend_probe_runs`), one that cannot be removed either, one that cannot be written, one
+a later verified alignment removes, one that cannot be removed after that
+alignment, a revert whose install fails writing none (asserted in
+`align_revert_restores_the_backend_dir_when_the_fallback_install_fails`), the
+opt-out leaving one alone, and a skipped alignment whose install fails
+(`a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`:
+its error chain asserted in three rows, `lemond` not starting, a transient
+failure and the backend retry's own advice, each with the kept record and no
+notice). Removal by `--reinstall` is
+`reinstall_removes_the_record_of_a_failed_alignment` in
+[install.rs](../engines/lemonade/src/install.rs), and
+`the_record_file_name_matches_the_one_the_e2e_steps_hard_code` reads the e2e
+steps' copy of the record's file name, so the two cannot drift. The scenario
+`runtime-lemonade-backend-alignment-failure-remembered` (runtime-33 in
+[runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature))
+runs the two installs for real on the `@nightly @requires-gpu` Lemonade lanes
+(not under WSL2); it targets ROCm 7.99.0 through
+`ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION`, compiled only into the
+`rocm/e2e-test-hooks` build.
 
 vLLM endpoint-key coverage: `VLLM_API_KEY` on its own makes vLLM check the key
 only under a fixed set of path prefixes (`/v1` and a few others), while the
