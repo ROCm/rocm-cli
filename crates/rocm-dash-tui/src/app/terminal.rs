@@ -9,13 +9,16 @@
 //! process-wide `SHUTTING_DOWN` latch that decides which of several racing
 //! paths restores the terminal and exits the process; the termination-signal
 //! watcher (`spawn_termination_watcher`, whose `TerminationSignals` has a
-//! `cfg(unix)` and a `cfg(windows)` variant); and the Ctrl+C key path
-//! (`is_ctrl_c`, `exit_on_ctrl_c`) that raw mode forces onto the key loops.
+//! `cfg(unix)` and a `cfg(windows)` variant); the Ctrl+C key path
+//! (`is_ctrl_c`, `exit_on_ctrl_c`) that raw mode forces onto the key loops;
+//! and the pre-exit hook (`set_pre_exit_hook`) both of those forced exits run
+//! once the terminal is restored, so a caller can still print to it.
 //!
 //! A leaf module, split out of `app/event_loop.rs`: the loop calls into it and
 //! nothing here calls back.
 
 use std::io;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{DisableMouseCapture, KeyCode, KeyEvent, KeyModifiers};
@@ -189,14 +192,20 @@ pub(super) fn write_restore_sequences<W: io::Write>(out: &mut W) -> io::Result<(
 /// during startup is latched by the already-installed OS handlers.
 ///
 /// The watcher ends the process with [`std::process::exit`], which does not
-/// unwind — this is deliberate. SIGTERM/SIGINT means "stop now", so we restore
-/// the terminal and leave promptly rather than racing an orderly teardown
+/// unwind — this is deliberate. Between restoring the terminal and exiting it
+/// runs the pre-exit hook, if one is registered ([`set_pre_exit_hook`]), which
+/// is how work the caller would have done after `run` still happens.
+/// SIGTERM/SIGINT means "stop now", so we restore the terminal and leave
+/// promptly rather than racing an orderly teardown
 /// against an imminent default-disposition kill. Two consequences are accepted
 /// as the intended behavior: (1) an in-flight focused install/serve child is
 /// left to the OS rather than reaped via `kill_on_drop`, matching the
 /// pre-existing default disposition and avoiding truncating a mid-write child on
-/// the way out; and (2) `run_async`'s embedded-daemon socket is not unlinked
-/// here, but the daemon unlinks a stale socket on its next bind, so it self-heals.
+/// the way out; and (2) `run_async`'s embedded daemon does not remove its socket
+/// here. The OS releases the socket's ownership lock as the process exits, so
+/// the next daemon to claim the path -- another dashboard still open, which
+/// takes over within a poll, or the next one started -- finds nobody answering
+/// on the left-over socket and replaces it.
 ///
 /// More than one watcher can be live at once — bare `rocm` escalates from the
 /// hub into a dashboard session, so the hub's process-lifetime watcher and
@@ -215,8 +224,83 @@ pub fn spawn_termination_watcher() -> color_eyre::Result<tokio::task::JoinHandle
             return;
         };
         restore_terminal();
+        run_pre_exit_hook(&PRE_EXIT_HOOK);
         std::process::exit(code);
     }))
+}
+
+/// Work a caller wants done when the process is ended by a signal or a typed
+/// Ctrl-C rather than by `run` returning: the two forced exits
+/// ([`spawn_termination_watcher`]'s watcher and [`exit_on_ctrl_c`]) end in
+/// `std::process::exit`, so nothing after `run` in the caller ever runs on
+/// them. `rocm dash` registers one to print its telemetry daemon's failure
+/// report on those exits too.
+type PreExitHook = Box<dyn FnOnce() + Send>;
+
+/// The registered [`PreExitHook`], if any. Process-global for the same reason
+/// as [`SHUTTING_DOWN`]: the forced exits are process-global.
+static PRE_EXIT_HOOK: Mutex<Option<PreExitHook>> = Mutex::new(None);
+
+/// Register `hook` to run once if the process is ended by a signal or a
+/// typed Ctrl-C.
+///
+/// It runs after the terminal is restored and before the process exits. It
+/// replaces any hook registered before, and is cleared when the returned guard
+/// is dropped: a caller drops it once `run` returns, before its own normal-exit
+/// work, so from then on it does not run, and never after the session it was
+/// registered for (bare `rocm` hosts several sessions in one process). One
+/// window remains: a signal that resolves in the instant before `run` cancels
+/// its watcher still ends the process from that watcher, hook included (see
+/// the `signal_task.abort()` comment in `event_loop.rs`'s `run`), and if `run`
+/// has returned by then the caller's normal-exit work can run as well -- for
+/// `rocm dash`, printing the same report twice before the process exits.
+///
+/// The hook runs on whichever thread ends the process -- a Tokio worker for a
+/// signal, the key loop's thread for Ctrl-C -- so it must be synchronous and
+/// bounded: the process is waiting on it to exit.
+#[must_use = "dropping the guard clears the hook at once"]
+pub fn set_pre_exit_hook(hook: impl FnOnce() + Send + 'static) -> PreExitHookGuard {
+    set_pre_exit_hook_on(&PRE_EXIT_HOOK, Box::new(hook));
+    PreExitHookGuard(())
+}
+
+/// Clears the hook [`set_pre_exit_hook`] registered when dropped.
+#[derive(Debug)]
+pub struct PreExitHookGuard(());
+
+impl Drop for PreExitHookGuard {
+    fn drop(&mut self) {
+        clear_pre_exit_hook_on(&PRE_EXIT_HOOK);
+    }
+}
+
+fn set_pre_exit_hook_on(slot: &Mutex<Option<PreExitHook>>, hook: PreExitHook) {
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+}
+
+fn clear_pre_exit_hook_on(slot: &Mutex<Option<PreExitHook>>) {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+}
+
+/// Run the hook registered on `slot`, if any, at most once: it is taken out
+/// of the slot first, and run outside the lock. Both forced exits call this
+/// on [`PRE_EXIT_HOOK`] between [`restore_terminal`] and `process::exit`;
+/// parameterised over the slot so a test can drive a fresh one.
+fn run_pre_exit_hook(slot: &Mutex<Option<PreExitHook>>) {
+    let hook = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        // A hook that panics must not stop the exit it runs on: in the
+        // signal watcher that would leave the process running with the
+        // signal swallowed.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
+    }
 }
 
 /// Process-global "some watcher has claimed the termination path" latch.
@@ -289,7 +373,8 @@ pub(crate) const fn is_ctrl_c(k: KeyEvent) -> bool {
 }
 
 /// End the process from a typed Ctrl-C, taking exactly the path an externally
-/// delivered SIGINT takes: claim the shutdown latch, restore the terminal, exit
+/// delivered SIGINT takes: claim the shutdown latch, restore the terminal, run
+/// the pre-exit hook ([`set_pre_exit_hook`]) if one is registered, exit
 /// [`EXIT_CODE_SIGINT`]. Shared by the dashboard event loop and the launcher
 /// menu — the two key loops are separate, and routing both here is what stops
 /// the gesture from meaning different things in the two windows.
@@ -300,6 +385,7 @@ pub(crate) const fn is_ctrl_c(k: KeyEvent) -> bool {
 pub(crate) fn exit_on_ctrl_c() -> ! {
     if claim_shutdown(&SHUTTING_DOWN) {
         restore_terminal();
+        run_pre_exit_hook(&PRE_EXIT_HOOK);
         std::process::exit(EXIT_CODE_SIGINT);
     }
     // Lost the race to a watcher that has already claimed the shutdown and is
@@ -749,5 +835,35 @@ mod tests {
             emitted.contains("\x1b[?25h"),
             "expected the show-cursor sequence in {emitted:?}"
         );
+    }
+
+    /// A registered pre-exit hook runs once when the forced-exit path runs it
+    /// -- a second run finds nothing -- and a cleared one does not run at all.
+    #[test]
+    fn a_pre_exit_hook_runs_once_and_not_after_it_is_cleared() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let slot: Mutex<Option<PreExitHook>> = Mutex::new(None);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = || {
+            let runs = Arc::clone(&runs);
+            Box::new(move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            }) as PreExitHook
+        };
+
+        run_pre_exit_hook(&slot);
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "nothing registered");
+
+        set_pre_exit_hook_on(&slot, counter());
+        run_pre_exit_hook(&slot);
+        run_pre_exit_hook(&slot);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "it runs once");
+
+        set_pre_exit_hook_on(&slot, counter());
+        clear_pre_exit_hook_on(&slot);
+        run_pre_exit_hook(&slot);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "a cleared hook never runs");
     }
 }

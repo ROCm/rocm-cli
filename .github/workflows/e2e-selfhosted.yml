@@ -38,7 +38,8 @@ on:
     # branch-push trigger).
     branches: [main, "release/**"]
   # Mirror ci.yml: run on PRs against ANY base branch so a stacked PR still gets
-  # the GPU lanes. Affected-crate/heavy selection diffs against github.base_ref.
+  # the GPU lanes. The `serve` gate comes from the pull request's changed files
+  # (see .github/actions/classify-changes), whatever its base branch.
   pull_request:
     # `closed` (merge OR close) joins the PR's concurrency group below, so it
     # supersedes that PR's earlier run. It runs only the no-op `pr-closed` job;
@@ -105,9 +106,12 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Trimmed copy of ci.yml's `changes` job: cross-workflow `needs` is impossible,
-  # so this workflow computes its own `heavy` gate to avoid running the expensive
-  # GPU lanes on a doc-only PR. Off pull_request (push/merge_group) heavy is
+  # This workflow's own `changes` job (cross-workflow `needs` is impossible),
+  # classifying paths through the same .github/actions/classify-changes action
+  # as ci.yml, so the two cannot disagree about what a change touches. The GPU
+  # lanes gate on `serve`, so a doc-only PR does not run them. Off pull_request
+  # (push/merge_group/dispatch), and on a pull request that changes a file
+  # neither a category nor the action's `inert` list names, every category is
   # forced true, matching ci.yml.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
@@ -119,89 +123,31 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
-      # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
+      # The string 'true' or 'false'; consumers compare `== 'true'`. Narrow
+      # GPU-serve gate; forced true off-PR so the merge queue runs the
       # full matrix (every lane but MI300X and Strix Ubuntu, which skip
       # merge_group) and its
       # required checks are never starved.
-      serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
-      # ROCMAI-430: the three most recent rows of the official release list
-      # (rocm.docs.amd.com/en/latest/release/versions.html, see
+      serve: ${{ steps.classify.outputs.serve == 'true' }}
+      # ROCMAI-430: the three newest final releases on the release channel's
+      # package indexes (resolved at run time, see
       # xtask/src/rocm_releases.rs), fanned out ONLY on a release-branch push —
       # everywhere else (PR, merge queue, manual dispatch) this stays a
       # single-element `current` matrix, same cost as before this existed.
       sdk_version_matrix: ${{ steps.sdk_matrix.outputs.matrix }}
+      # The versions n-1/n-2 resolve to, read once here so every leg of the run
+      # pins the same ones even if a release is published meanwhile. `{}` when
+      # the matrix is only `current`.
+      sdk_pins: ${{ steps.sdk_pins.outputs.pins }}
     steps:
+      # The local action below is read from the checked-out workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Filter changed paths (pull requests only)
-        id: filter
-        if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        with:
-          filters: |
-            # Same `heavy` set as ci.yml: anything that can affect the E2E suite.
-            heavy:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              # The Lemonade version and archive digest the build compiles in
-              # (runtimes/mise.lock), so the weekly runtime update's pull
-              # request runs the GPU lanes that exercise it.
-              - 'runtimes/**'
-              - 'scripts/**'
-              - 'xtask/**'
-              - 'engines/**'
-              - '**/*.py'
-              - '**/*.sh'
-              - '**/*.ps1'
-              - '**/*.feature'
-              - 'tests/e2e-cucumber/**'
-              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
-              # rocm_doctor_skill.feature scenarios parse its catalog table and
-              # compare it to `rocm fix`. A skill-only edit must therefore run
-              # this job too, same as ci.yml's `heavy` filter.
-              - 'skills/**'
-              - 'install*'
-              - 'docs/keys/**'
-              - '.github/workflows/**'
-            # The real-GPU serve matrix (e2e-gpu*). Narrower than `heavy`: only
-            # paths that can change serve BEHAVIOUR or the GPU E2E harness — NOT a
-            # blanket `**/*.rs`. Compile coverage for every crate already runs on
-            # ci.yml's always-on build/test lanes, so a dash-only or unrelated-
-            # crate Rust PR need not fire the heavy serve matrix. Err toward
-            # inclusion — Cargo.lock, the toolchain, and the workflow itself are
-            # broad safety nets so a transitive-dep or CI change still runs the
-            # matrix. (Excluded on purpose: crates/rocm-dash-* — they build into
-            # `rocm` but cannot change serve behaviour.)
-            serve:
-              - 'engines/**'
-              # Lemonade's pinned version and digest (runtimes/mise.lock).
-              - 'runtimes/**'
-              - 'crates/rocm-core/**'
-              - 'crates/rocm-engine-protocol/**'
-              - 'apps/rocm/**'
-              - 'apps/rocmd/**'
-              - 'tests/e2e-cucumber/**'
-              - 'crates/e2e-report/**'
-              - 'xtask/**'
-              - '**/*.feature'
-              - 'scripts/**'
-              # Root manifest only (NOT `**/Cargo.toml` — that would re-include
-              # the excluded dash crates): `[workspace.dependencies]` edits here
-              # can change a serving crate's deps without touching Cargo.lock.
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              - '.github/workflows/**'
-
-      - name: Force full run off pull requests
-        id: all
-        if: github.event_name != 'pull_request'
-        run: echo "forced=true" >> "$GITHUB_OUTPUT"
+      - name: Classify changed paths
+        id: classify
+        uses: ./.github/actions/classify-changes
 
       - name: Compute sdk_version matrix (ROCMAI-430)
         id: sdk_matrix
@@ -210,6 +156,17 @@ jobs:
             echo 'matrix=["current","n-1","n-2"]' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve n-1/n-2 pins once (ROCMAI-430)
+        id: sdk_pins
+        env:
+          SDK_MATRIX: ${{ steps.sdk_matrix.outputs.matrix }}
+        run: |
+          if [[ "${SDK_MATRIX}" == *n-1* ]]; then
+            echo "pins=$(cargo xtask release-pins)" >> "$GITHUB_OUTPUT"
+          else
+            echo 'pins={}' >> "$GITHUB_OUTPUT"
           fi
 
   # Exists only to start a run in the PR's concurrency group when the PR is
@@ -516,6 +473,7 @@ jobs:
           fi
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps, not one templated `name:` (ROCMAI-430):
@@ -803,10 +761,11 @@ jobs:
     # this replaced, and a run took 26m54s against the old 35min cap (run
     # 34489547654) versus 18-19m on a warm static host — keep the same headroom
     # ratio the 35 was chosen for.
-    # An include_nightly dispatch also runs the AIM serve scenarios (serve-26/27,
-    # @nightly, up to 1200s readiness each on a cold pull) and the large-model
-    # serve, which cannot fit the 45min budget of an ordinary push run.
-    timeout-minutes: ${{ inputs.include_nightly && 105 || 45 }}
+    # An include_nightly dispatch also runs the AIM serve scenarios
+    # (serve-26/27/63, @nightly, up to 1200s readiness each on a cold pull) and
+    # the large-model serve, which cannot fit the 45min budget of an ordinary
+    # push run.
+    timeout-minutes: ${{ inputs.include_nightly && 125 || 45 }}
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
@@ -947,6 +906,7 @@ jobs:
         env:
           MATRIX_CHANNEL: ${{ matrix.channel }}
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps per the `sdk_version` leg, same as
@@ -1294,6 +1254,7 @@ jobs:
           }
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       - name: Upload E2E report (current)
@@ -1347,8 +1308,9 @@ jobs:
       matrix:
         sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
-    # `serve` like the sibling lanes rather than the broader `heavy`: the
-    # consolidated report gates on `serve` too, so a heavy-but-not-serve change
+    # `serve` like the sibling lanes rather than on the classify-changes
+    # action's broader `heavy` category: the consolidated report gates on
+    # `serve` too, so a change that matches `heavy` but not `serve`
     # would otherwise run this lane and then discard its artifact unreported.
     if: >-
       always()
@@ -1830,7 +1792,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:GITHUB_EVENT_INPUTS_NAME_FILTER'
+          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:E2E_RELEASE_PINS:GITHUB_EVENT_INPUTS_NAME_FILTER'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1878,6 +1840,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # actions/upload-artifact runs on the Windows host, not inside the WSL
@@ -1971,8 +1934,9 @@ jobs:
       - e2e-wsl
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
-    # produced. On dispatch `serve` is unset, so also run when the trigger was
-    # manual; `always()` still lets it collect partial/failed tiers.
+    # produced. `changes` forces `serve` on for a dispatch; the dispatch clause
+    # also runs the report when `changes` itself failed and left `serve` empty.
+    # `always()` still lets it collect partial/failed tiers.
     if: >-
       always()
       && (needs.changes.outputs.serve == 'true'

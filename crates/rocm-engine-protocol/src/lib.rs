@@ -10,8 +10,9 @@ mod protocol_version;
 pub use protocol_version::engine_contract;
 pub use protocol_version::{
     INCOMPATIBLE_PROTOCOL_CODE, INVALID_PAYLOAD_CODE, INVALID_REQUEST_CODE,
-    PRE_VERSIONING_PROTOCOL, ProtocolMismatch, UNKNOWN_METHOD_CODE, answer_engine_request,
-    engine_protocol_compatible, incompatible_request_response,
+    PRE_VERSIONING_PROTOCOL, ProtocolMismatch, RESPONSE_SERIALIZATION_FAILED_CODE,
+    UNKNOWN_METHOD_CODE, answer_engine_request, engine_protocol_compatible,
+    incompatible_request_response,
 };
 mod stdio_client;
 pub use stdio_client::{
@@ -25,6 +26,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub mod endpoint_auth;
 
 /// The version of the engine stdio protocol this build speaks.
 ///
@@ -472,15 +475,27 @@ pub struct EngineResponseEnvelope {
 }
 
 impl EngineResponseEnvelope {
+    /// A successful envelope carrying `data`.
+    ///
+    /// Every response type here serializes infallibly in practice; should one
+    /// ever fail (a map with non-string keys, a custom `Serialize` error), the
+    /// engine answers with a [`RESPONSE_SERIALIZATION_FAILED_CODE`] failure envelope
+    /// instead of panicking mid-request.
     pub fn success<T>(data: T) -> Self
     where
         T: Serialize,
     {
-        Self {
-            protocol_version: Some(ENGINE_PROTOCOL_VERSION.to_owned()),
-            ok: true,
-            data: Some(serde_json::to_value(data).expect("serializable response")),
-            error: None,
+        match serde_json::to_value(data) {
+            Ok(value) => Self {
+                protocol_version: Some(ENGINE_PROTOCOL_VERSION.to_owned()),
+                ok: true,
+                data: Some(value),
+                error: None,
+            },
+            Err(error) => Self::failure(
+                RESPONSE_SERIALIZATION_FAILED_CODE,
+                format!("failed to serialize the engine response: {error}"),
+            ),
         }
     }
 
@@ -776,6 +791,37 @@ pub struct LogsResponse {
 
 #[cfg(test)]
 mod tests {
+    /// A payload whose `Serialize` impl always fails.
+    struct Unserializable;
+
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refused on purpose"))
+        }
+    }
+
+    #[test]
+    fn success_with_an_unserializable_payload_is_a_failure_envelope() {
+        let envelope = EngineResponseEnvelope::success(Unserializable);
+        assert!(!envelope.ok);
+        assert!(envelope.data.is_none());
+        let error = envelope.error.expect("a failure envelope carries an error");
+        assert_eq!(error.code, RESPONSE_SERIALIZATION_FAILED_CODE);
+        assert!(
+            error.message.contains("refused on purpose"),
+            "the serializer's own error is kept: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn success_with_a_serializable_payload_carries_it() {
+        let envelope = EngineResponseEnvelope::success(serde_json::json!({"k": 1}));
+        assert!(envelope.ok);
+        assert!(envelope.error.is_none());
+        assert_eq!(envelope.data, Some(serde_json::json!({"k": 1})));
+    }
+
     fn resolve_response(served: Option<&str>) -> ResolveModelResponse {
         ResolveModelResponse {
             canonical_model_id: "image:tag".to_owned(),
@@ -1098,6 +1144,10 @@ mod tests {
         assert_eq!(UNKNOWN_METHOD_CODE, "unknown_method");
         assert_eq!(INVALID_REQUEST_CODE, "invalid_request");
         assert_eq!(INVALID_PAYLOAD_CODE, "invalid_payload");
+        assert_eq!(
+            RESPONSE_SERIALIZATION_FAILED_CODE,
+            "response_serialization_failed"
+        );
     }
 
     /// A field this build does not know, as a newer protocol on the same minor

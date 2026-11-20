@@ -18,6 +18,7 @@ mod catalog;
 mod chat_import_contract;
 mod coverage;
 mod crate_edges;
+mod cross_crate_reads;
 mod dash_text_edit_contract;
 mod demos;
 mod deps;
@@ -107,9 +108,11 @@ pub(crate) enum Command {
     /// must also mark it `readonly`), and a slot whose canonical key is not
     /// published yet must be empty.
     VerifyPinnedKeys,
-    /// Print the workspace crates affected by a git range (changed crates plus
-    /// their transitive dependents) as `cargo` package-selection flags, so CI
-    /// can build/test only what a change can reach instead of `--workspace`.
+    /// Print the workspace crates affected by a git range (changed crates, the
+    /// crates whose tests read a changed file from outside their own
+    /// directory, and their transitive dependents) as `cargo`
+    /// package-selection flags, so CI can build/test only what a change can
+    /// reach instead of `--workspace`.
     ///
     /// Output is `--workspace` (fall back to the full workspace — used whenever a
     /// change can't be confined to specific crates, e.g. `Cargo.lock` or the
@@ -130,8 +133,9 @@ pub(crate) enum Command {
     ///
     /// The step runs over the whole workspace whenever the affected crates
     /// cannot be determined, and prints why. It is skipped only when the
-    /// selection is known and has nothing for the step to check. CI always
-    /// checks the whole workspace.
+    /// selection is known and has nothing for the step to check. CI's Windows
+    /// debug job (for any Rust change), the merge queue and `main` check the
+    /// whole workspace.
     ///
     /// A step that already passed on this exact tree (same cargo command,
     /// toolchain and environment, clean working tree) is skipped, and a pass is
@@ -320,13 +324,19 @@ pub(crate) enum Command {
             conflicts_with_all = ["version", "release_label"]
         )]
         build_date: Option<String>,
-        /// Pin the pre-warmed SDK to one of the official release list's three
-        /// most recent versions (see `rocm_releases`), for the self-hosted
-        /// sdk_version matrix. `current` tracks the channel's latest, same as
-        /// omitting `--version`/`--build-date` entirely.
+        /// Pin the pre-warmed SDK to one of the three newest final releases
+        /// listed on the release channel's package indexes (see
+        /// `rocm_releases`), for the self-hosted sdk_version matrix. `current` tracks the channel's latest, same as
+        /// omitting `--version`/`--build-date` entirely. When
+        /// `E2E_RELEASE_PINS` holds the JSON `release-pins` printed, `n-1`/`n-2`
+        /// use those versions instead of reading the indexes again.
         #[arg(long, conflicts_with_all = ["version", "build_date"])]
         release_label: Option<rocm_releases::ReleaseLabel>,
     },
+    /// Print, as one JSON object, the versions `n-1` and `n-2` resolve to on the
+    /// release channel's package indexes right now. The E2E workflow's `changes`
+    /// job runs it once and hands the result to every sdk_version leg.
+    ReleasePins,
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
     /// stdout for `$GITHUB_STEP_SUMMARY`.
@@ -498,7 +508,10 @@ fn run() -> Result<()> {
             release_label,
         } => {
             let resolved_version = match release_label {
-                Some(label) => label.pin().map(str::to_owned),
+                Some(label) => match rocm_releases::pins_from_env()? {
+                    Some(pins) => label.pin_from(&pins)?,
+                    None => label.pin()?,
+                },
                 None => version,
             };
             e2e_prewarm::run(
@@ -508,6 +521,12 @@ fn run() -> Result<()> {
                 resolved_version.as_deref(),
                 build_date.as_deref(),
             )?;
+        }
+        Command::ReleasePins => {
+            println!(
+                "{}",
+                serde_json::to_string(&rocm_releases::resolve_pins()?)?
+            );
         }
         Command::E2eReport {
             artifacts_dir,

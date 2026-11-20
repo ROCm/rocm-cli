@@ -48,6 +48,7 @@ mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
+pub mod recovery_hint;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
@@ -93,11 +94,11 @@ pub use command_capture::{
     CommandCapture, CommandOutcome, command_capture_text, run_rocm_capture_with_env,
 };
 pub use config::{
-    AutomationsConfig, BuiltinWatcherSpec, DashboardConfig, DashboardDaemonConfig,
-    DashboardTuiConfig, EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig, RocmCliConfig,
-    SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode,
-    WatcherUserConfig, builtin_watcher, builtin_watchers,
+    AutomationsConfig, BuiltinWatcherSpec, CONFIG_LOCK_TIMEOUT, ConfigLock, DashboardConfig,
+    DashboardDaemonConfig, DashboardTuiConfig, EngineUserConfig, ManagedToolConfig,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig,
+    RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig,
+    WatcherMode, WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
 pub use confirm::{interactive_terminal, require_yes_or_interactive};
 pub use crypto::{
@@ -106,10 +107,11 @@ pub use crypto::{
 };
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
-    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
+    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
     diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
-    render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
-    vllm_oom_symptom_is_diagnosable,
+    render_report_text as render_diagnose_text, vllm_extension_load_symptom_is_diagnosable,
+    vllm_import_symptom_is_diagnosable, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
@@ -124,7 +126,7 @@ pub use download::{
 pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use endpoint_readiness::{
     EndpointReadiness, EndpointReadinessOutcome, INFERENCE_PROBE_TIMEOUT,
-    JSON_STATE_LOCK_FILE_NAME, JsonStateFileRefused, JsonStateRefusal,
+    JSON_STATE_LOCK_FILE_NAME, JsonStateFileRefused, JsonStateRefusal, SERVE_STARTUP_DEADLINE,
     engine_state_inference_verified, json_state_lock_path, managed_service_endpoint_model_ready,
     managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
     openai_chat_completion_status, openai_models_endpoint_has_model, write_json_state_file,
@@ -147,9 +149,9 @@ pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
     WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
     detect_gpu_driver_version, detect_host_gfx_target, detect_host_gpu_diagnostics,
-    detect_host_gpu_summary, detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device,
-    is_wsl_host, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
-    windows_amd_gpu_listing,
+    detect_host_gpu_summary, detect_host_unified_memory_gib, detect_system_ram_gib,
+    has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, preferred_serve_engine_for_host_gpu_summary,
+    usable_amd_gpu_indices, windows_amd_gpu_listing,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -199,16 +201,16 @@ pub use proc_lifecycle::{
     terminate_recorded_pid, terminate_recorded_pid_within, terminate_recorded_service_pids,
     terminate_verified,
 };
+#[cfg(windows)]
+pub use process::{
+    DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
+    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+};
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
     is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
     lease_loopback_port_or_bind_error, probe_process, process_is_running, terminate_process,
     terminate_process_tree, windows_system_tool,
-};
-#[cfg(windows)]
-pub use process::{
-    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
-    wait_for_process_exit,
 };
 pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{
@@ -265,6 +267,14 @@ pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
     vllm_oom_display_line,
 };
+
+/// E2E-only switch that makes `rocm serve`'s managed engine die during startup.
+///
+/// Honoured only by a `rocm` binary built with the `e2e-test-hooks` feature; a
+/// release build has no code that reads it. Defined here, rather than in the
+/// binary that reads it, because the E2E suite sets it from another crate: one
+/// constant both sides name cannot drift the way two copies of the string could.
+pub const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
 pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";

@@ -18,6 +18,14 @@
 //! private one. Unix-only, because the fake is a shell script; the pure parts
 //! of the client are tested on every platform without it.
 
+// Compiled only for tests (directly or through `test-support`), but outside a
+// `#[cfg(test)]` item, so clippy cannot tell it is test code.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-support stand-in; a failure must panic the planting test"
+)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};

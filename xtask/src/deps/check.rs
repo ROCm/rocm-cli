@@ -149,9 +149,12 @@ pub(crate) fn lock_problems(
     }
 
     for requirement in &profile.requirements {
-        // `Profiles::parse` refused any requirement that does not parse.
-        let requirement =
-            Requirement::parse(requirement).expect("profile requirements are validated on load");
+        // `Profiles::parse` refused any requirement that does not parse; one
+        // that got past it is reported here rather than panicking.
+        let Ok(requirement) = Requirement::parse(requirement) else {
+            out.push(format!("{requirement:?} is not a valid requirement"));
+            continue;
+        };
         match versions.get(&requirement.name) {
             None => out.push(format!("{}: required but not locked", requirement.name)),
             Some(version) if !requirement.matches(version) => out.push(format!(

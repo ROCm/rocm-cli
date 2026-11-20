@@ -92,7 +92,7 @@ pub fn render(text: &str) -> Result<String, String> {
             out,
             "/// Version of `{tool}` locked in `runtimes/mise.lock`.\npub const {ident}_VERSION: &str = {version:?};"
         )
-        .expect("writing to a String cannot fail");
+        .map_err(|err| format!("formatting the generated constants: {err}"))?;
         for (platform, (url, sha256)) in assets {
             let prefix = format!("{ident}_{}", platform.to_uppercase().replace('-', "_"));
             writeln!(
@@ -102,7 +102,7 @@ pub fn render(text: &str) -> Result<String, String> {
                  /// Hex SHA-256 of that download, from `runtimes/mise.lock`.\n\
                  pub const {prefix}_SHA256: &str = {sha256:?};"
             )
-            .expect("writing to a String cannot fail");
+            .map_err(|err| format!("formatting the generated constants: {err}"))?;
         }
     }
     Ok(out)

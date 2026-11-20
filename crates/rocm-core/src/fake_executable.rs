@@ -67,11 +67,13 @@ pub fn write_fake_executable(path: &Path, contents: impl AsRef<[u8]>) -> io::Res
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| step_error(path, "spawn the writer", &error))?;
-    let write_result = writer
-        .stdin
-        .take()
-        .expect("stdin was requested as a pipe")
-        .write_all(contents.as_ref());
+    // `stdin` was requested as a pipe, so it is always present; were it not,
+    // the error is still reported after the child is reaped rather than
+    // leaving it running.
+    let write_result = match writer.stdin.take() {
+        Some(mut stdin) => stdin.write_all(contents.as_ref()),
+        None => Err(io::Error::other("the writer has no stdin pipe")),
+    };
     let output = writer
         .wait_with_output()
         .map_err(|error| step_error(path, "wait for the writer", &error))?;

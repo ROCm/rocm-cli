@@ -108,6 +108,12 @@ fn mail_to(destination: &str, report: &Report) -> String {
     // `expect` rather than a fallible return: every field of `Report` is a
     // `String`, a `u32` or a `bool`, so this has no failing case to handle,
     // and inventing one would add a branch no test could ever reach.
+    #[expect(
+        clippy::expect_used,
+        reason = "every `Report` field serializes (see the comment above); \
+                  `the_link_body_is_the_report_the_user_was_shown_and_nothing_more` \
+                  serializes one on every test run"
+    )]
     let body = serde_json::to_string_pretty(report).expect("a report has no unserializable field");
     // The address is not escaped. RFC 6068 allows `@` and `.` unescaped in the
     // address part, and a percent-escaped `@` there is handled poorly by some

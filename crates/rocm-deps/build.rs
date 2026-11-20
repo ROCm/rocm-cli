@@ -12,6 +12,12 @@
 //! where a download comes from is checked by `cargo xtask deps check`, which
 //! also runs this generator (`xtask/src/deps/mod.rs` includes it by path).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "build script: a panic is how a build script reports failure to cargo"
+)]
+
 use std::path::PathBuf;
 use std::{env, fs};
 

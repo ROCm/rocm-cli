@@ -846,6 +846,11 @@ fn resolve_ci_public_key(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Op
         .filter(|value| !value.trim().is_empty()))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the path is compiled in; `the_real_sources_pass_and_their_hardening_is_enforced` \
+              resolves it on every test run"
+)]
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is the `xtask/` crate dir; its parent is the repo root,
     // so this is correct regardless of the working directory CI invokes us from.

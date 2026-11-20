@@ -98,10 +98,12 @@ pub(crate) fn drop_orphaned_endpoint_key_on_already_running(
 /// The one such case today: Windows managed Lemonade. Its server reads the
 /// value-typed `LEMONADE_API_KEY` env var, but the Windows detached-spawn
 /// primitive only carries path-valued env overrides, so the key never reaches it.
-/// The vllm engine enforces auth wherever it runs (`VLLM_API_KEY` plus the
-/// every-route middleware in `engines/vllm/src/endpoint_auth.rs`), and loopback
-/// binds (`public_bind == false`) need no key — both pass. `is_windows` is a parameter
-/// so both branches are unit-testable off-Windows.
+/// The vllm and aim engines enforce auth wherever they run (`VLLM_API_KEY` plus
+/// the every-route middleware in `crates/rocm-engine-protocol/src/endpoint_auth.rs`,
+/// which an AIM serve through `serve_http` — the path `rocm serve` takes —
+/// verifies before serving), and loopback binds (`public_bind == false`) need no
+/// key — both pass. `is_windows` is a parameter so both branches are
+/// unit-testable off-Windows.
 pub(crate) fn ensure_public_bind_engine_supported(
     engine: &str,
     public_bind: bool,
