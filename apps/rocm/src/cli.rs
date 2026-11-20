@@ -922,13 +922,10 @@ rocm install sdk --version 10.0.0 --python-version 3.12")]
         /// Full folder path where the ROCm Python environment should be created.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
-        /// TheRock package version to install; with none, the channel's newest
-        /// build.
-        ///
-        /// `major.minor.patch` is exact, including a prerelease suffix.
-        /// `major.minor` (for example `10.1`) selects the newest stable
-        /// release in that line. An earlier ROCm 7 release such as 7.14.1 or
-        /// the 7.14 line is supported, for a wheel install only.
+        /// TheRock version to install; with none, the channel's newest build.
+        /// `major.minor.patch` is exact, including a prerelease suffix, and
+        /// `major.minor` (e.g. `10.1`) is the newest stable release of that
+        /// line. An earlier ROCm 7 release (7.14.1, or the 7.14 line) is wheel-only.
         #[arg(long, conflicts_with = "build_date")]
         version: Option<String>,
         /// Pick the TheRock package built on this date; nightlies from before
@@ -1731,7 +1728,8 @@ mod tests {
             "`--version` must say a three-component pin is exact:\n{version_help}"
         );
         assert!(
-            version_help.contains("`major.minor` (for example `10.1`) selects the newest stable"),
+            version_help
+                .contains("`major.minor` (e.g. `10.1`) is the newest stable release of that line"),
             "`--version` must say a two-component pin selects the newest stable \
              release in that line:\n{version_help}"
         );
