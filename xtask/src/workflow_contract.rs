@@ -13581,11 +13581,7 @@ esac
 
     /// The `timeout-minutes` of the one job block it is given.
     fn job_timeout_minutes(block: &str) -> u64 {
-        block
-            .lines()
-            .find_map(|line| line.strip_prefix("    timeout-minutes: "))
-            .expect("the job has timeout-minutes")
-            .trim()
+        job_scalar(block, "timeout-minutes")
             .parse()
             .expect("timeout-minutes is a number")
     }
