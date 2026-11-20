@@ -52,7 +52,9 @@ pub(crate) enum DepsCommand {
         /// missing or invalid). Defaults to 0. AMD's indexes publish no upload
         /// times, so the AMD-only packages named in the profile policy are
         /// exempt from every cutoff; everything else, including what those
-        /// indexes mirror from PyPI, is held back.
+        /// indexes mirror from PyPI, is held back. A value that reaches before
+        /// year 0 is refused before anything runs, even when no new cutoff
+        /// would be set.
         #[arg(long)]
         cooldown_days: Option<u32>,
     },

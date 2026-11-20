@@ -119,6 +119,9 @@ fn run_with(
             "no profile named {name:?}"
         );
     }
+    // Before uv runs or any index is fetched, so an unusable `--cooldown-days`
+    // downloads nothing (`an_unusable_cooldown_runs_no_uv`).
+    let new_cutoff = cutoff_before(now, options.cooldown_days.unwrap_or(0))?;
     ensure_pinned_uv(root, uv)?;
 
     fs::create_dir_all(work)?;
@@ -128,7 +131,6 @@ fn run_with(
         &profiles,
         undated_index_projects(&uv_config, &profiles, uv)?,
     );
-    let new_cutoff = cutoff_before(now, options.cooldown_days.unwrap_or(0));
     let cleared: Vec<String> = uv_env_to_clear(env_keys.into_iter());
 
     let uv_config_text = fs::read_to_string(&uv_config)
@@ -265,10 +267,16 @@ struct CompileInputs<'a> {
 }
 
 /// `days` days before `now`, to the second, as the RFC 3339 cutoff uv takes.
-fn cutoff_before(now: chrono::DateTime<chrono::Utc>, days: u32) -> String {
-    (now - chrono::Duration::days(i64::from(days)))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+/// A cutoff before year 0 is an error: RFC 3339 writes a four-digit year,
+/// 0000 to 9999, chrono's `%Y` writes an earlier year with a sign, and
+/// chrono's `-` operator would panic once the result leaves its own range.
+fn cutoff_before(now: chrono::DateTime<chrono::Utc>, days: u32) -> Result<String> {
+    use chrono::Datelike as _;
+    let cutoff = chrono::TimeDelta::try_days(i64::from(days))
+        .and_then(|cooldown| now.checked_sub_signed(cooldown))
+        .filter(|cutoff| cutoff.year() >= 0)
+        .with_context(|| format!("a cooldown of {days} days reaches before year 0"))?;
+    Ok(cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// The `uv` arguments for one profile and OS.
@@ -528,8 +536,63 @@ linux = "x86_64-manylinux_2_28"
 
     #[test]
     fn a_cutoff_is_the_cooldown_before_now_to_the_second() {
-        assert_eq!(cutoff_before(now(), 7), "2026-10-30T12:00:00Z");
-        assert_eq!(cutoff_before(now(), 0), "2026-11-06T12:00:00Z");
+        assert_eq!(cutoff_before(now(), 7).unwrap(), "2026-10-30T12:00:00Z");
+        assert_eq!(cutoff_before(now(), 0).unwrap(), "2026-11-06T12:00:00Z");
+    }
+
+    /// The flag is a plain `u32`. Its largest value leaves chrono's range,
+    /// where `-` would panic, and a smaller one still reaches before year 0,
+    /// which RFC 3339 cannot write; both are errors. Day 1 of year 0 is not.
+    #[test]
+    fn a_cooldown_reaching_before_year_zero_is_an_error_not_a_panic() {
+        for days in [u32::MAX, 800_000] {
+            let err = cutoff_before(now(), days).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("a cooldown of {days} days reaches before year 0")
+            );
+        }
+        let to_year_zero =
+            (now().date_naive() - chrono::NaiveDate::from_ymd_opt(0, 1, 1).unwrap()).num_days();
+        let days = u32::try_from(to_year_zero).unwrap();
+        assert_eq!(cutoff_before(now(), days).unwrap(), "0000-01-01T12:00:00Z");
+        assert!(cutoff_before(now(), days + 1).is_err());
+    }
+
+    /// An unusable cooldown is refused before uv is asked anything, so it
+    /// downloads nothing and changes no lock.
+    #[test]
+    fn an_unusable_cooldown_runs_no_uv() {
+        struct Untouchable;
+        impl Uv for Untouchable {
+            fn version(&self) -> Result<String> {
+                panic!("uv --version ran")
+            }
+            fn compile(&self, _: Command) -> Result<()> {
+                panic!("uv pip compile ran")
+            }
+            fn index_page(&self, url: &str) -> Result<String> {
+                panic!("{url} was fetched")
+            }
+        }
+        let root = workspace();
+        let options = LockOptions {
+            cooldown_days: Some(u32::MAX),
+            ..plain()
+        };
+        let err = run_with(
+            root.path(),
+            &root.path().join("work"),
+            &options,
+            &Untouchable,
+            vec![],
+            now(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("reaches before year 0"),
+            "{err:#}"
+        );
     }
 
     #[test]
