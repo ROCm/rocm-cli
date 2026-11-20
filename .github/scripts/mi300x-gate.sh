@@ -32,7 +32,8 @@
 # no either-or, and the lanes are judged as the generic missing-report check
 # judges every other lane: a lane that ran (succeeded, failed, or was cut off by
 # its timeout, which GitHub reports as cancelled) and exported no report fails
-# the check, and an absent lane does not. A lane that ran, failed and did export
+# the check, and so does a lane that never got a runner (`abandoned`: there is
+# no queue lane to cover it), while a skipped or missing one does not. A lane that ran, failed and did export
 # its report is the report's to show, as before.
 #
 # Inputs (environment):
@@ -118,6 +119,11 @@ else
   if [[ "${settle_unknown}" = true ]]; then
     verdict=1
     reason="the self-hosted lane's result is unknown (the settle job ${SETTLE_RESULT})"
+  elif [[ "${selfhosted_result}" = abandoned ]]; then
+    # No queue lane to fall back on: a lane that never got a runner is the only
+    # MI300X signal missing, and it failed the check before this job gave up on it.
+    verdict=1
+    reason="the self-hosted lane never got a runner and no queue lane covers it"
   elif ran_without_report "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT}" ||
     ran_without_report "${selfhosted_result}" "" "${SELFHOSTED_ARTIFACT}"; then
     verdict=1

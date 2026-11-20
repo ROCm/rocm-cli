@@ -2023,18 +2023,13 @@ jobs:
         # (a read-only token on a dependabot or fork run) is left as it was before
         # this job, with a warning, not turned red.
         run: |
-          gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || echo "::warning::could not cancel run ${GITHUB_RUN_ID}; the MI300X self-hosted leg stays queued"
-          # A job whose `if` keeps its condition true through a cancellation (the
-          # lane's `always()`) is not cancelled by it, so look: a leg still queued
-          # after the cancel is ended by a force-cancel, which ignores `if`. Every
-          # other job has finished (this job needs them), bar this one.
-          sleep 30
-          queued=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100&filter=latest" \
-            --jq '[.jobs[] | select(.status == "queued" and (.name | startswith("E2E tests (MI300X,")))] | length') || queued=0
-          if [ "${queued:-0}" -gt 0 ]; then
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/force-cancel" ||
-              echo "::warning::could not force-cancel run ${GITHUB_RUN_ID}; the MI300X self-hosted leg stays queued"
-          fi
+          # A force-cancel, not a plain cancel: a leg whose `if` is `always()` (the
+          # lane's) survives a plain cancel, and a plain cancel from here would end
+          # THIS step too (a step with no `if` does not run on after a cancel), so
+          # nothing after it would run. A force-cancel ignores `if`, and every other
+          # job has finished (this job needs them).
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/force-cancel" ||
+            echo "::warning::could not cancel run ${GITHUB_RUN_ID}; the MI300X self-hosted leg stays queued"
 
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
