@@ -34,6 +34,7 @@ pub mod hardware_root;
 pub mod host_gpu;
 mod jsonl_store;
 pub mod log_tail;
+pub mod managed_child;
 pub mod managed_runtime;
 pub mod model_catalog;
 pub mod model_readiness;
@@ -165,6 +166,7 @@ pub use log_tail::{
     service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
     tail_log_decoded,
 };
+pub use managed_child::ManagedChildLiveness;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, RUNTIME_COMPAT_DIR_NAME,
     active_managed_framework_interpreter, active_managed_therock_channel,
@@ -204,7 +206,8 @@ pub use proc_lifecycle::{
 #[cfg(windows)]
 pub use process::{
     DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
-    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+    spawn_detached_with_log_watching_startup, spawn_hidden_console_no_inherit,
+    spawn_hidden_console_with_log, wait_for_process_exit,
 };
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,

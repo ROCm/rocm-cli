@@ -13,8 +13,8 @@
 //! environment variables every managed child inherits
 //! (`app_path_env_var_values`/`app_path_env_var_refs`, over
 //! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`), and polling a freshly launched service until it can
-//! actually answer inference requests (`wait_for_service_http_ready`,
-//! `wait_for_service_http_ready_with_progress`,
+//! actually answer inference requests
+//! (`wait_for_service_http_ready_with_progress`,
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `http_post_local_service_json`, `service_http_readiness_response_ready`,
 //! `lemonade_health_ready_for_model`, `model_list_ready_for_model`,
@@ -70,9 +70,11 @@
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
 //! `managed_service_launcher_path` is `pub(crate)`, read from
 //! `service_launch.rs` and `service_control.rs`'s `restart_internal_managed_service_with`.
-//! `wait_for_service_http_ready` is `pub(crate)`, read from `service_control.rs`'s
-//! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
-//! is `pub(crate)`, read from `service_launch.rs`. `service_http_lists_model` and
+//! `wait_for_service_http_ready_with_progress` is `pub(crate)`, read from
+//! `service_launch.rs` and from `service_control.rs`'s
+//! `restart_internal_managed_service_with` — the latter for its per-tick hook
+//! rather than for progress, so a stop landing inside the readiness wait is
+//! seen (ROCMAI-541). `service_http_lists_model` and
 //! `service_http_inference_answers`, the two halves of its readiness probe, are
 //! `pub(crate)`, read from `serve_progress.rs`'s `wait_for_serve_startup`. `http_post_local_service_json`
 //! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
@@ -304,25 +306,6 @@ pub(crate) fn managed_service_launcher_path() -> Result<PathBuf> {
         return Ok(rocm_core::normalize_runtime_path_for_storage(&current_exe));
     }
     Ok(current_exe)
-}
-
-pub(crate) fn wait_for_service_http_ready(
-    engine: &str,
-    host: &str,
-    port: u16,
-    canonical_model_id: &str,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> EndpointReadiness {
-    wait_for_service_http_ready_with_progress(
-        engine,
-        host,
-        port,
-        &|| canonical_model_id.to_owned(),
-        endpoint_api_key,
-        timeout,
-        &mut |_elapsed| {},
-    )
 }
 
 /// Wait until the service can actually serve, reporting how far it got.
@@ -846,13 +829,14 @@ mod tests {
             Ok(())
         });
 
-        let readiness = wait_for_service_http_ready(
+        let readiness = wait_for_service_http_ready_with_progress(
             "vllm",
             "127.0.0.1",
             port,
-            "Qwen3-0.6B-GGUF",
+            &|| "Qwen3-0.6B-GGUF".to_owned(),
             None,
             Duration::from_millis(600),
+            &mut |_elapsed| {},
         );
 
         assert_eq!(
@@ -900,13 +884,14 @@ mod tests {
             Ok(())
         });
 
-        let readiness = wait_for_service_http_ready(
+        let readiness = wait_for_service_http_ready_with_progress(
             "vllm",
             "127.0.0.1",
             port,
-            "Qwen3-0.6B-GGUF",
+            &|| "Qwen3-0.6B-GGUF".to_owned(),
             None,
             Duration::from_secs(5),
+            &mut |_elapsed| {},
         );
 
         assert_eq!(readiness, EndpointReadiness::Serving);
@@ -960,13 +945,14 @@ mod tests {
         });
 
         let started = Instant::now();
-        let readiness = wait_for_service_http_ready(
+        let readiness = wait_for_service_http_ready_with_progress(
             "vllm",
             "127.0.0.1",
             port,
-            "Qwen3-0.6B-GGUF",
+            &|| "Qwen3-0.6B-GGUF".to_owned(),
             None,
             Duration::from_secs(5),
+            &mut |_elapsed| {},
         );
 
         assert_eq!(readiness, EndpointReadiness::Serving);

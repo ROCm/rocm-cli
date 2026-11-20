@@ -25,6 +25,7 @@ use crate::endpoint_keys;
 use crate::engine_runtime_select::wait_for_service_http_ready_with_progress;
 use crate::serve_progress;
 use crate::service_hints;
+use crate::services_text::read_optional_tail_lines;
 use crate::status_for_readiness;
 #[cfg(feature = "e2e-oom-fault-injection")]
 use anyhow::Context;
@@ -35,6 +36,7 @@ use rocm_core::{AppPaths, EndpointReadiness, ManagedServiceRecord};
 #[cfg(feature = "e2e-oom-fault-injection")]
 use rocm_engine_protocol::{DevicePolicy, ResolveModelResponse};
 use std::fmt::Write as _;
+use std::path::Path;
 use std::time::Duration;
 
 /// How long one `--wait` readiness pass polls: the same budget after which a
@@ -102,7 +104,32 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
     record_still_live(&latest, pid_alive)
 }
 
-/// Record a server that died mid-start as stopped, leaving a manifest that a
+/// What an exit nobody asked for is recorded as.
+///
+/// `failed` is overloaded: to a reader of `rocm services list` it means "this
+/// died on its own", and to `rocmd` it is the restart trigger
+/// (`manifest_service_recovery_reason` in
+/// apps/rocmd/src/watchers/server_recover.rs recovers `failed`, and
+/// `find_recoverable_service` only skips a record carrying a stop marker).
+/// Exit points differ in which of the two they can afford, so each names its
+/// own policy rather than inheriting one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnexplainedDeath {
+    /// ROCMAI-541's exit points: the launch, the attached session and `--wait`
+    /// reported the death only through the record, so a crash recorded as
+    /// `stopped` was indistinguishable from an operator's own stop. Recording
+    /// it as the crash it was is the whole fix, and `rocmd` restarting a
+    /// crashed server afterwards is supervision working.
+    IsACrash,
+    /// The interactive startup wait, which hands the user a loud synchronous
+    /// `ServeStartupFailed` instead, so the record is not the only thing
+    /// saying the launch failed. Stamping `failed` here would additionally
+    /// make `rocmd` restart the server behind the error just printed, so this
+    /// path keeps the clean `stopped` it chose deliberately.
+    IsRecordedAsStopped,
+}
+
+/// Record how a server that died mid-start died, leaving a manifest that a
 /// `services stop` already settled untouched. A `failed` state the engine
 /// reported is persisted rather than overwritten, so the reason survives.
 ///
@@ -111,24 +138,117 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
 /// between (`restart_managed_service` in apps/rocmd/src/supervise.rs records
 /// the new pid through `record_spawned_supervisor`), and that restart is left alone rather than written back to
 /// `stopped`.
-fn settle_exited_service(paths: &AppPaths, service_id: &str, pid_alive: &dyn Fn(u32) -> bool) {
+///
+/// Returns whether the death was **asked for**, so the caller can say so. The
+/// `--wait` message used to read "the server exited before it became ready"
+/// even for a `rocm services stop` issued from another shell, which is a true
+/// sentence told in a way that reads as a failure.
+///
+/// The verdict is read off the *same* snapshot that gets stamped below, through
+/// [`record_shows_stop_was_requested`] rather than a second
+/// [`managed_service_stop_was_requested`] call. It used to be its own
+/// independent file read, taken a line before this one: a stop landing in the
+/// gap pinned `deliberate` to `false` from the stale first read while the
+/// second could already show the record live, and the two together stamped
+/// `failed` on a death that had in fact just been asked for. One read cannot
+/// disagree with itself.
+fn settle_exited_service(
+    paths: &AppPaths,
+    service_id: &str,
+    pid_alive: &dyn Fn(u32) -> bool,
+    unexplained: UnexplainedDeath,
+) -> bool {
     let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
-        return;
+        // No snapshot to judge from and nothing to stamp. The standalone read
+        // is sound *here* precisely because this branch writes nothing, so
+        // there is no second read for it to contradict.
+        return managed_service_stop_was_requested(paths, service_id);
     };
+    let deliberate = record_shows_stop_was_requested(&latest);
     let on_disk = latest.status.clone();
     let _ = latest.refresh_from_engine_state();
     if crate::managed_service_status::managed_service_is_live(&latest) {
+        // A recorded pid is alive again: `rocmd` restarted the service between
+        // the caller observing the death and this read, so there is no death
+        // here to characterise and the restart is left exactly as it is.
+        // Checked before the verdict below, which would otherwise stamp a
+        // live, freshly restarted record as `failed`.
         if crate::managed_service_status::recorded_service_pids(&latest)
             .into_iter()
             .any(pid_alive)
         {
-            return;
+            return deliberate;
         }
-        latest.status = "stopped".to_owned();
+        // The record still reads live even after the death was observed, so
+        // nothing has recorded *why* it died: the engine's own in-process
+        // backstop (`record_engine_serve_http_failure`) never got to run. A
+        // SIGKILL, an OOM kill or a segfault all land here — plausible for an
+        // inference server, which is why the surrounding code already carries
+        // OOM guidance — and calling any of them a clean stop is the ROCMAI-541
+        // defect at the one exit point the launch/attach/restart fix did not
+        // cover.
+        //
+        // An engine that *did* stamp `failed` itself is not reached: that record
+        // no longer reads live, so it takes the branch below and keeps its own
+        // reason.
+        if deliberate || unexplained == UnexplainedDeath::IsRecordedAsStopped {
+            latest.status = "stopped".to_owned();
+        } else {
+            latest.status = "failed".to_owned();
+            // The engine state file is what ROCMAI-541's acceptance criterion
+            // names, and `latest.write()` below only covers the manifest. A
+            // merge, not a whole-file write, for the same reason
+            // `mark_service_failed` uses one.
+            let _ = rocm_core::merge_json_state_file(
+                &latest.engine_state_path,
+                &serde_json::json!({ "status": "failed" }),
+            );
+        }
     } else if latest.status == on_disk {
-        return;
+        // The refresh learned nothing, so the snapshot in hand says no more
+        // than what is already on disk and must NOT be written back whole:
+        // anything a concurrent writer put there after this read was taken
+        // would go with it. That is what this early return protects, and
+        // `a_wait_death_is_a_crash_unless_a_stop_asked_for_it`'s third arm
+        // pins it by planting a key the record type does not model.
+        //
+        // But "nothing new to write" is not the same as "nothing to correct".
+        // `managed_service_status`'s liveness reconciliation demotes any
+        // record whose recorded PIDs are gone to `stopped`, unconditionally
+        // and with no idea why they went — a `rocm services` or `rocm dash`
+        // listing running alongside this wait is enough. When that lands
+        // before the read above, `on_disk` is already `stopped`, the status
+        // after the refresh matches it, and this return left the manifest
+        // reading `stopped` for a death nothing asked for: the caller
+        // correctly reports a crash while `rocm services list` shows a clean
+        // stop. That is ROCMAI-541's own acceptance criterion failing through
+        // the one interleaving the stamp above cannot reach, because by then
+        // the record no longer reads live.
+        //
+        // Corrected through the same read-modify-write merge
+        // `mark_service_failed` uses, so the fix does not reintroduce the
+        // clobber this branch exists to prevent: only the `status` key is
+        // replaced, under the state-file lock. A record already reading
+        // `failed` is left alone — the engine's own reason is on it, and
+        // rewriting it would be the invisible no-op write the guard above
+        // forbids.
+        if unexplained == UnexplainedDeath::IsACrash && !deliberate && latest.status != "failed" {
+            mark_service_failed(&latest.manifest_path, &latest.engine_state_path);
+        }
+        return deliberate;
     }
+    // A whole-record write, not the `merge_json_state_file` the branch above
+    // uses, and deliberately so: reaching here means `refresh_from_engine_state`
+    // adopted fields from the engine state file (`engine_pid`,
+    // `engine_start_ticks`, `served_model_id`) alongside the status verdict, and
+    // merging only `status` would drop them. The clobber window the other branch
+    // guards against is the *opposite* case — nothing new learned, so writing the
+    // stale snapshot back could only overwrite a concurrent writer. This is the
+    // codebase's established convention for `ManagedServiceRecord`
+    // (`stop_internal_managed_service_confirmed_with` does the same), so the
+    // window here is the pre-existing one rather than a new hazard.
     let _ = latest.write();
+    deliberate
 }
 
 /// The failure a `--wait` ends with when the server died before it became
@@ -147,16 +267,29 @@ pub(super) fn died_during_wait(
     {
         return None;
     }
+    if settle_exited_service(paths, service_id, &pid_alive, UnexplainedDeath::IsACrash) {
+        // A `rocm services stop` from another shell ends the wait too, and it is
+        // not a launch that failed. The wait still ends non-zero, because the
+        // thing the caller asked to wait for did not happen — but it says which
+        // of the two it was instead of reporting an operator's own stop as the
+        // server failing to come up.
+        return Some(anyhow!(
+            "the server for service `{service_id}` was stopped before it became ready"
+        ));
+    }
     let message = format!(
         "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `{}` for its output",
         crate::service_hints::service_logs_hint(service_id)
     );
-    Some(anyhow!(settle_ended_launch(
+    // The record is already settled above — the verdict it returned is what
+    // chose the message — so only the audit line and the memory guidance are
+    // left. Settling a second time would re-stamp a record that a concurrent
+    // writer may have moved on since.
+    Some(anyhow!(report_ended_launch(
         paths,
         service_id,
         "exited during --wait",
-        message,
-        &pid_alive
+        message
     )))
 }
 
@@ -174,10 +307,27 @@ pub(super) fn settle_ended_launch(
     paths: &AppPaths,
     service_id: &str,
     why: &str,
-    mut message: String,
+    message: String,
     pid_alive: &dyn Fn(u32) -> bool,
 ) -> String {
-    settle_exited_service(paths, service_id, pid_alive);
+    settle_exited_service(
+        paths,
+        service_id,
+        pid_alive,
+        UnexplainedDeath::IsRecordedAsStopped,
+    );
+    report_ended_launch(paths, service_id, why, message)
+}
+
+/// The reporting half of [`settle_ended_launch`], for a caller that settled the
+/// record itself because it needed [`settle_exited_service`]'s verdict —
+/// whether the death was asked for — to choose `message` in the first place.
+fn report_ended_launch(
+    paths: &AppPaths,
+    service_id: &str,
+    why: &str,
+    mut message: String,
+) -> String {
     crate::record_cli_audit_event(
         paths,
         "service",
@@ -672,12 +822,846 @@ pub(super) fn wait_on_existing_service(
     Ok(report)
 }
 
+/// Retire a crashed service: mark the manifest and the engine's own state file
+/// `failed`. The engine process is gone and cannot stamp its own file, so this
+/// does it on the engine's behalf.
+///
+/// Both writes are merges, never a whole-record `ManagedServiceRecord::write()`,
+/// because every caller holds a copy of the record captured before the crash:
+/// writing that back wholesale would erase a `stop_requested_unix_ms` a
+/// concurrent stop may have written in the same window. Stamping the manifest
+/// alone is not enough either — `refresh_from_engine_state` reads the engine
+/// state file back into a newer manifest, so an unstamped state file would undo
+/// the manifest write on the next refresh.
+///
+/// Best-effort by design: a crash report must not be lost because the
+/// bookkeeping behind it could not be written.
+pub(crate) fn mark_service_failed(manifest_path: &Path, engine_state_path: &Path) {
+    let _ =
+        rocm_core::merge_json_state_file(manifest_path, &serde_json::json!({ "status": "failed" }));
+    let _ = rocm_core::merge_json_state_file(
+        engine_state_path,
+        &serde_json::json!({ "status": "failed" }),
+    );
+}
+
+/// Render an unexpected managed-engine exit for the user, when the engine was
+/// already running and then disappeared on its own — unlike
+/// [`managed_engine_startup_failure_detail`], there is no [`ExitStatus`] to
+/// quote here. Callers reach this only after [`managed_service_stop_was_requested`]
+/// has already ruled out an intentional/external stop, so by the time this
+/// renders, the exit really is unexplained — i.e. a crash. The service log is
+/// the only record of why, since the child is detached and writes nowhere else
+/// — platform-generic since ROCMAI-541 attaches it on Windows too (see
+/// `spawn_detached_with_log_watching_startup`).
+pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
+    let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+    if recent_lines.is_empty() {
+        format!(
+            "managed engine for service `{service_id}` exited unexpectedly; inspect {}",
+            log_path.display()
+        )
+    } else {
+        format!(
+            "managed engine for service `{service_id}` exited unexpectedly; inspect {} \
+             (or `rocm services logs {service_id}`)\n\nrecent service log output:\n{}",
+            log_path.display(),
+            recent_lines.join("\n")
+        )
+    }
+}
+
+/// Whether the on-disk manifest shows this exit was something other than a
+/// crash: an operator-requested stop either still in flight
+/// (`stop_requested_unix_ms`) or already confirmed
+/// (`settled_stop_unix_ms`).
+///
+/// Two markers, and no status term. The record's `status` is deliberately NOT
+/// evidence here - any concurrent reader can write `stopped` onto a record
+/// naming dead pids, which is what relabelled a crash as a clean stop and
+/// reproduced ROCMAI-541 inside its own fix. See the long account below.
+///
+/// `AttachOutcome::Stop` only ever fires from *this* attached session's own
+/// keystroke reader (Ctrl-C) — it says nothing about a stop triggered any
+/// other way. `rocm services stop <id>` run from another shell and `rocm
+/// dash`'s stop action both kill the pid a watching session (this attach
+/// loop, or a background launch/restart's readiness wait) cares about by
+/// signalling it directly, after writing `stop_requested_unix_ms` first —
+/// which is what lands here, in `ServerExited`, rather than `Stop`, and is
+/// otherwise indistinguishable from a crash (ROCMAI-541). `rocmd`'s own
+/// restart-recovery watcher (`restart_managed_service` in
+/// `apps/rocmd/src/supervise.rs`) is a different case: it only ever fires once
+/// the manifest or the endpoint already shows the service dead or
+/// unreachable on its own, and reacts by clearing `stop_requested_unix_ms`
+/// and re-exec'ing a fresh supervisor — it does not itself signal the old
+/// engine, so that path is already a genuine crash by the time this check
+/// runs, and correctly still reads as one (no marker was ever set for it).
+///
+/// Read fresh from disk — never a `record` some caller captured at spawn
+/// time, which cannot reflect a stop another process requested afterward. A
+/// manifest that cannot be read at all falls through to "not a requested
+/// stop": that is itself anomalous, and silently treating it as a clean stop
+/// would risk masking a real crash.
+///
+/// # Why neither term is the record's `status`
+///
+/// This used to read `status == "stopped"`, and that was never proof of an
+/// intentional stop. `managed_service_status::refresh_managed_service_runtime_liveness`
+/// reconciles *any* record whose tracked pids are all dead to `"stopped"`,
+/// saying so in its own comment ("dead pids alone do not distinguish a stopped
+/// service from a crashed one"), and writes no marker doing it. So an ordinary
+/// concurrent `rocm services` / `rocm dash` / `rocmd` read landing between a
+/// crash and this check relabelled the crash as a clean stop, and it was
+/// reported as one — exit 0, "server process exited", the original ROCMAI-541
+/// symptom reappearing inside its own fix.
+///
+/// The term could not simply be dropped, because a *confirmed* stop used to
+/// clear its own marker and the status was then the only trace it left:
+/// removing it turned `serve-scripted-external-stop-while-attached` (serve-65)
+/// red, which also meant that scenario was passing on the unsound term and so
+/// could not tell a stop from a crash at all.
+///
+/// Both halves are fixed by making the stop's own evidence durable instead:
+/// `stop_internal_managed_service_confirmed_with` now *moves* its marker into
+/// [`ManagedServiceRecord::settled_stop_unix_ms`] rather than dropping it. That
+/// field already existed for the sibling case (a pending marker consumed by the
+/// refresh), is written only by a stop, and is cleared by
+/// [`ManagedServiceRecord::reset_for_restart`] — so a stop settled before a
+/// relaunch cannot mask a crash after it. Nothing a crash can do sets either
+/// field.
+///
+/// [`StopWatch`] still narrows the live window for a stop that is requested and
+/// confirmed entirely between two polls.
+pub(crate) fn managed_service_stop_was_requested(paths: &AppPaths, service_id: &str) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id)
+        .is_ok_and(|(record, _)| record_shows_stop_was_requested(&record))
+}
+
+/// The predicate [`managed_service_stop_was_requested`] is made of, over a
+/// record a caller already holds — see that function for why these two fields
+/// and not the status are the evidence.
+///
+/// Split out, rather than spelled a second time at the one call site that has
+/// its snapshot in hand ([`settle_exited_service`]), so the two cannot drift:
+/// the whole point of `settled_stop_unix_ms` is that it answers where the
+/// short-lived `stop_requested_unix_ms` has already been consumed, and a call
+/// site that re-tested only the marker would silently lose exactly that half
+/// while still reading as if it asked the shared question.
+pub(crate) const fn record_shows_stop_was_requested(record: &ManagedServiceRecord) -> bool {
+    record.stop_requested_unix_ms.is_some() || record.settled_stop_unix_ms.is_some()
+}
+
+/// The live half of [`managed_service_stop_was_requested`]: the in-flight
+/// marker only, without its confirmed-stop term (`settled_stop_unix_ms`).
+///
+/// For the one caller whose own precondition is a stop this process just
+/// performed: a restart confirms a stop before it respawns, and that
+/// confirmation *settles* the marker into `settled_stop_unix_ms`.
+/// `record_restarted_child` does not publish `running` until the new child
+/// clears its early-exit window, so inside that window the settled field is
+/// still set from *this restart's own* stop — and the full predicate would
+/// therefore fire unconditionally, reporting every early crash as a deliberate
+/// stop, dropping the exit status and log tail and leaving the engine state
+/// file unstamped.
+///
+/// The marker alone is sound evidence here precisely because that preceding
+/// stop cleared it (`stop_internal_managed_service_confirmed_with`): anything
+/// still set has been written since this restart began, so it belongs to a
+/// *new* stop racing the restart rather than to the one the restart performed.
+pub(crate) fn managed_service_stop_marker_present(paths: &AppPaths, service_id: &str) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id)
+        .is_ok_and(|(record, _)| record.stop_requested_unix_ms.is_some())
+}
+
+/// Latches an operator-requested stop seen at any point while a managed child
+/// is being watched.
+///
+/// `stop_requested_unix_ms` is a stop's *live* evidence (see
+/// [`managed_service_stop_was_requested`] for why the record's status is no
+/// evidence at all), but it is deliberately short-lived:
+/// `stop_internal_managed_service_confirmed_with` writes it before it signals
+/// anything and takes it away again once the stop is confirmed. A watcher that
+/// only reads it *after* noticing the child is gone can therefore arrive after
+/// the marker is gone, and report a deliberate stop as a crash.
+///
+/// Sampling on every liveness poll catches any stop that was still in flight
+/// while the child was being watched — in particular an *unconfirmed* stop,
+/// which re-stamps the marker and deliberately leaves the status at
+/// `ready`/`running`, since that stop did not happen and must not be claimed.
+///
+/// It is a narrowing, not a closure: a stop that is requested, signals, and
+/// confirms entirely inside one poll interval takes its marker away before the
+/// next sample, so the latch misses it. What catches that case is not this
+/// latch and not the record's status, but the fact that a confirmed stop
+/// *moves* its marker into [`ManagedServiceRecord::settled_stop_unix_ms`]
+/// rather than dropping it — so the one-shot
+/// [`managed_service_stop_was_requested`] at the end of a wait still finds the
+/// evidence through its second term. (An earlier version of this comment
+/// credited a `status == "stopped"` term in that predicate. There is no such
+/// term; removing it as unsound is what this change is for, and making the
+/// stop's own evidence durable is what replaced it.)
+///
+/// The residual gap is now narrow and named: `reset_for_restart` clears both
+/// fields, on purpose, so a stop settled before a relaunch cannot mask a crash
+/// after it — which also means a stop whose record is reset for relaunch
+/// between the stop and the end of the wait leaves nothing for either check to
+/// find. A crash never writes either field, so neither this latch nor that
+/// predicate can produce a false "stopped" of its own.
+#[derive(Default)]
+pub(crate) struct StopWatch {
+    seen: bool,
+}
+
+impl StopWatch {
+    /// Check the marker once, keeping any previous sighting. Cheap enough to
+    /// call on every poll: one small JSON read, and it stops reading entirely
+    /// once latched.
+    pub(crate) fn sample(&mut self, paths: &AppPaths, service_id: &str) {
+        if !self.seen {
+            // The MARKER alone, never `managed_service_stop_was_requested`.
+            // Historically that was because the predicate also accepted
+            // `status == "stopped"`, which liveness reconciliation (`rocmd`,
+            // `dash`, `rocm services`) writes for a *crashed* server, so
+            // latching on it turned a crash reconciled mid-wait into a clean
+            // stop and exit 0 — the original bug. That term is gone, and the
+            // narrower reason it leaves behind still holds: this samples
+            // repeatedly and latches forever, so it may only fire on evidence
+            // written *during* the watch. `stop_requested_unix_ms` is exactly
+            // that — short-lived, and taken away again the moment a stop
+            // confirms. `settled_stop_unix_ms` is durable on purpose and can
+            // outlive the stop that wrote it, so latching on it could report a
+            // death as asked-for on the strength of an earlier stop.
+            //
+            // The one-shot check at the end of a wait does take the durable
+            // field, because it has no second chance to see a marker already
+            // consumed; it accepts the mirror-image exposure in exchange, held
+            // down by `reset_for_restart` clearing both fields on every
+            // relaunch.
+            self.seen = managed_service_stop_marker_present(paths, service_id);
+        }
+    }
+
+    /// Whether a stop was requested at any point during the watch.
+    pub(crate) const fn stop_was_requested(&self) -> bool {
+        self.seen
+    }
+}
+
+/// Whether the service's files on disk still name the supervisor the caller
+/// spawned, read fresh rather than from a spawn-time snapshot.
+///
+/// `supervisor_pid`/`supervisor_start_ticks` are the right pair to compare on:
+/// `refresh_from_engine_state` never touches them, and a legitimate restart
+/// does rewrite them (`record_supervisor_identity` at the top of the spawn
+/// path), so they distinguish "these files still describe the child I am
+/// watching" from "a restart has already replaced it". The pid alone would not
+/// — pids are recycled, which is what the start-time token rules out.
+pub(super) fn still_watching_this_supervisor(
+    paths: &AppPaths,
+    service_id: &str,
+    supervisor_pid: u32,
+    supervisor_start_ticks: Option<u64>,
+) -> bool {
+    crate::services_text::read_managed_service_manifest(paths, service_id).is_ok_and(
+        |(current, _)| {
+            current.supervisor_pid == supervisor_pid
+                && current.supervisor_start_ticks == supervisor_start_ticks
+        },
+    )
+}
+
+/// Decide a managed launch's final status from the HTTP readiness wait and the
+/// child's liveness, and retire a child that died before reaching `Serving` as
+/// a failure rather than quietly reporting whatever lower status the readiness
+/// wait happened to see last.
+///
+/// A readiness wait that only times out (never reaches [`EndpointReadiness::Serving`])
+/// is ambiguous on its own: the process could still be loading a large model, or
+/// it could already be dead (ROCMAI-541 — this was previously indistinguishable,
+/// so `rocm serve` reported `starting` and exited 0 either way). `child_is_alive`
+/// resolves it and is injected so the dead-child branch is unit-testable without
+/// spawning a real process — mirroring `autostart_spawn_in_flight`'s `pid_alive`
+/// parameter elsewhere in this file. The real caller backs it with
+/// [`rocm_core::ManagedChildLiveness`] rather than a bare `process_is_running`
+/// pid probe: on Unix a signal probe alone succeeds for a zombie child this
+/// process has not reaped yet (see that type's doc comment), which previously
+/// left this exact check inert on Linux despite the readiness/liveness split
+/// existing. `Serving` always succeeds regardless of the live check: inference
+/// having already answered is a stronger readiness signal than a liveness check
+/// taken afterward, which could itself lose a race against the same process
+/// exiting right after serving the probe.
+///
+/// On the failure branch this also marks the engine's own state file `failed`
+/// (best-effort): the engine process is gone and cannot do it for itself, and
+/// without this the state file can be left reading `starting` indefinitely (see
+/// `run_builtin_engine_serve_http`'s own, primary fix for the common case where
+/// the engine process is alive long enough to run that logic itself).
+///
+/// A dead-and-not-`Serving` child is still ambiguous one level further: it
+/// could be a crash, or it could be a `rocm services stop`/`rocm dash` stop
+/// that landed during this readiness wait — see
+/// [`managed_service_stop_was_requested`]'s doc comment (ROCMAI-541). That
+/// check is read fresh from disk, never from `record`, which was captured at
+/// spawn time and cannot reflect a stop requested since. When it fires,
+/// `record` is refreshed from disk too — rather than left as that stale
+/// spawn-time snapshot — so that a caller's own follow-up write of `record`
+/// carries the stop marker forward instead of clobbering it. Returns `false`
+/// in that case so the caller knows to skip any further bookkeeping that
+/// would otherwise write back over it; `true` otherwise (the normal path,
+/// unchanged).
+///
+/// Marks the manifest itself via a merge (`merge_json_state_file`), not a
+/// whole-file `record.write()`: `record` is this function's own stale,
+/// spawn-time snapshot, and writing it back wholesale would erase a
+/// `stop_requested_unix_ms` a concurrent stop just wrote to disk — the same
+/// hazard the merge above (and the attach path's equivalent write) already
+/// guards against.
+pub(super) fn finalize_managed_launch_readiness(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    readiness: EndpointReadiness,
+    mut child_is_alive: impl FnMut() -> bool,
+    stop_seen_while_waiting: bool,
+) -> Result<bool> {
+    if readiness != EndpointReadiness::Serving && !child_is_alive() {
+        // The latch first, then a fresh read: a stop that began and finished
+        // inside the readiness wait has already cleared its own marker, so the
+        // point check below cannot see it (see `StopWatch`).
+        if stop_seen_while_waiting || managed_service_stop_was_requested(paths, &record.service_id)
+        {
+            if let Ok((on_disk, _)) =
+                crate::services_text::read_managed_service_manifest(paths, &record.service_id)
+            {
+                *record = on_disk;
+            }
+            return Ok(false);
+        }
+        // Only stamp the service's own files while they still describe the
+        // child this invocation spawned. `child_is_alive` is bound to this
+        // `rocm serve`'s own pid, but the files are named by `service_id`, so a
+        // restart that lands inside this readiness wait leaves them describing
+        // a different, possibly healthy child. `reset_for_restart` clears the
+        // stop evidence the branch above looks for, so without this check the
+        // two true facts "no stop evidence" and "my child is dead" combine into
+        // `failed` on somebody else's record -- and stick, because
+        // `refresh_managed_service_runtime_liveness_with` short-circuits on a
+        // `failed` status and never re-probes to correct it.
+        //
+        // The attached path has guarded this since ROCMAI-541; this is the same
+        // guard for the background launch, which is the more common one.
+        if still_watching_this_supervisor(
+            paths,
+            &record.service_id,
+            record.supervisor_pid,
+            record.supervisor_start_ticks,
+        ) {
+            record.status = "failed".to_owned();
+            mark_service_failed(&record.manifest_path, &record.engine_state_path);
+        }
+        bail!(
+            "{}",
+            managed_engine_exit_failure_detail(&record.service_id, &record.log_path)
+        );
+    }
+    record.status = status_for_readiness(readiness).to_owned();
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::service_launch::test_support::reusable_record;
     use crate::tests::test_paths;
     use std::fs;
+
+    /// ROCMAI-541: the service log tail must reach the user, and a missing log
+    /// must still name the service and where to look rather than being silent.
+    #[test]
+    fn exit_failure_detail_quotes_the_service_log_tail_when_present() {
+        let (root, paths) = test_paths("exit-failure-detail-log-present");
+        paths.ensure().expect("ensure paths");
+        let log_path = paths.service_log_path("svc-dead-1");
+        fs::create_dir_all(log_path.parent().expect("log parent")).expect("mkdir log dir");
+        fs::write(
+            &log_path,
+            "Model pulled successfully\nFATAL: HOME is unset\n",
+        )
+        .expect("write log");
+
+        let detail = managed_engine_exit_failure_detail("svc-dead-1", &log_path);
+
+        assert!(detail.contains("svc-dead-1"), "{detail}");
+        assert!(detail.contains("exited unexpectedly"), "{detail}");
+        assert!(detail.contains("FATAL: HOME is unset"), "{detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exit_failure_detail_names_the_service_even_without_a_log() {
+        let (root, paths) = test_paths("exit-failure-detail-log-absent");
+        let log_path = paths.service_log_path("svc-dead-2");
+        // Deliberately never created.
+        let detail = managed_engine_exit_failure_detail("svc-dead-2", &log_path);
+        assert!(detail.contains("svc-dead-2"), "{detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541: `AttachOutcome::Stop` only ever fires from this
+    /// session's own keystroke reader, never from `rocm services stop`
+    /// another shell issued, `rocm dash`, or `rocmd`'s restart-recovery — all
+    /// of which kill the watched pid directly and so land in `ServerExited`.
+    /// The manifest's stop marker is what tells the two apart; this covers
+    /// every state that marker can be in before `managed_service_stop_was_requested`
+    /// is consulted.
+    #[test]
+    fn stop_was_requested_true_for_in_flight_or_confirmed_stop() {
+        let (root, paths) = test_paths("stop-was-requested-true");
+        paths.ensure().expect("ensure paths");
+        let make_record = |service_id: &str| {
+            ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "lemonade",
+                "qwen",
+                "qwen-canonical",
+                "127.0.0.1",
+                11540,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                None,
+            )
+        };
+
+        // An unconfirmed stop: the marker is set but the status is left
+        // `ready`/`running` until termination is confirmed (see
+        // `stop_internal_managed_service_confirmed_with`).
+        let mut in_flight = make_record("svc-stop-in-flight");
+        in_flight.status = "running".to_owned();
+        in_flight.stop_requested_unix_ms = Some(1);
+        in_flight.write().expect("write in-flight record");
+        assert!(managed_service_stop_was_requested(
+            &paths,
+            "svc-stop-in-flight"
+        ));
+
+        // A confirmed stop moves its marker into `settled_stop_unix_ms` rather
+        // than dropping it. This used to assert that `status: "stopped"` alone
+        // was enough, which is what let a reconciled crash pass as a stop — see
+        // `a_reconciled_crash_is_not_evidence_of_a_stop_but_a_settled_one_is`.
+        let mut confirmed = make_record("svc-stop-confirmed");
+        confirmed.status = "stopped".to_owned();
+        confirmed.settled_stop_unix_ms = Some(1);
+        confirmed.write().expect("write confirmed-stop record");
+        assert!(managed_service_stop_was_requested(
+            &paths,
+            "svc-stop-confirmed"
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The complement: a plain running service with no stop marker and no
+    /// `stopped` status must not be mistaken for an intentional stop — an
+    /// unexplained exit from this state is exactly ROCMAI-541's crash case.
+    #[test]
+    fn stop_was_requested_false_for_a_live_service_or_a_missing_manifest() {
+        let (root, paths) = test_paths("stop-was-requested-false");
+        paths.ensure().expect("ensure paths");
+        let mut running = ManagedServiceRecord::new(
+            &paths,
+            "svc-stop-not-requested",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11541,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        running.status = "running".to_owned();
+        running.write().expect("write running record");
+        assert!(!managed_service_stop_was_requested(
+            &paths,
+            "svc-stop-not-requested"
+        ));
+
+        // A manifest that cannot be read at all (never written here) must
+        // fail closed too — see this function's doc comment.
+        assert!(!managed_service_stop_was_requested(
+            &paths,
+            "svc-never-existed"
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541 acceptance criterion 2: a managed engine that died before
+    /// ever answering HTTP must fail `rocm serve` with both a non-zero exit
+    /// code and a message naming it, not just the unreadable "starting"
+    /// status the readiness timeout alone used to leave behind. `pid_is_running`
+    /// is injected (`|_| false`) rather than spawning and killing a real
+    /// process, the same seam `autostart_spawn_in_flight` above uses for an
+    /// identical reason: this repo cannot spawn and reap a real child inside a
+    /// `cargo test` run portably across Linux and Windows.
+    #[test]
+    fn finalize_managed_launch_readiness_fails_closed_when_the_child_died() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-dead-child");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-dead-3",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11530,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
+        fs::write(&record.log_path, "Model pulled successfully\n")?;
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let result = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
+
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(&root);
+            panic!("a dead child must fail the launch, not report `starting`");
+        };
+        // ROCMAI-541 AC2: the failure must name the service and carry the log
+        // tail, not just the unreadable "starting" status the old readiness
+        // timeout alone left behind.
+        //
+        // This deliberately does not also assert
+        // `crate::exit_code_for(Err(error)) == ExitCode::FAILURE`: every
+        // `anyhow::Error` that is not a `FixExitCode`/`ClapExitCode` downcast
+        // maps to `ExitCode::FAILURE` there (see `exit_code_for`), and
+        // `bail!(...)` here can never produce either downcast — so that
+        // assertion could not fail regardless of whether this function is
+        // correct, and would misleadingly suggest the real `run()` call chain
+        // (clap parsing, `start_managed_service`, `exit_code_for`) is exercised
+        // here. It is not; this test calls `finalize_managed_launch_readiness`
+        // directly.
+        let message = error.to_string();
+        assert!(message.contains("svc-dead-3"), "{message}");
+        assert!(message.contains("Model pulled successfully"), "{message}");
+
+        // Both the manifest and the engine's own state file must read `failed`
+        // (AC3) — the manifest because this function already held it, and the
+        // engine state file because the engine process that owns it is gone and
+        // cannot write "failed" there itself.
+        assert_eq!(record.status, "failed");
+        let (reread, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-dead-3")?;
+        assert_eq!(reread.status, "failed");
+        let engine_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record.engine_state_path)?)?;
+        assert_eq!(engine_state["status"], "failed");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A restart that lands inside this invocation's readiness wait must not be
+    /// stamped `failed` by it.
+    ///
+    /// The two facts this function decides on are both still true in that case:
+    /// this invocation's own child really is dead, and `reset_for_restart` has
+    /// already cleared the stop evidence the branch above looks for. What is no
+    /// longer true is that the service's files describe *this* child — the
+    /// restart rewrote `supervisor_pid`/`supervisor_start_ticks` — and stamping
+    /// them would mislabel a service that may be serving. It sticks, too:
+    /// `refresh_managed_service_runtime_liveness_with` short-circuits on a
+    /// `failed` status and never re-probes to correct it.
+    ///
+    /// The launch still fails for the caller, because this invocation's child
+    /// did die; what the guard changes is whose record pays for it. Removing
+    /// the `still_watching_this_supervisor` call fails this test.
+    #[test]
+    fn finalize_managed_launch_readiness_does_not_stamp_a_restarted_service() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-restarted");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-restarted-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11531,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
+        fs::write(&record.log_path, "Model pulled successfully\n")?;
+        record.status = "running".to_owned();
+        record.write()?;
+
+        // What a restart leaves behind: the same `service_id`, a different
+        // supervisor. Written to disk only -- `record` keeps this invocation's
+        // own identity, which is exactly the divergence the guard reads.
+        let (mut restarted, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-restarted-1")?;
+        restarted.supervisor_pid = record.supervisor_pid.wrapping_add(1);
+        restarted.supervisor_start_ticks = Some(4_242_424_242);
+        restarted.status = "running".to_owned();
+        restarted.write()?;
+
+        let result = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        );
+
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(&root);
+            panic!("this invocation's child died, so its own launch must still fail");
+        };
+        assert!(error.to_string().contains("svc-restarted-1"));
+
+        // The restarted service's record must be untouched by this invocation.
+        let (reread, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-restarted-1")?;
+        assert_eq!(
+            reread.status, "running",
+            "a restarted service was stamped `failed` by an older invocation's readiness wait"
+        );
+        assert_ne!(record.status, "failed");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The same readiness timeout must NOT be treated as a failure while the
+    /// child is still alive — a large model can legitimately take longer than
+    /// the readiness budget to load, and that must keep reporting `starting`
+    /// with exit code 0, not regress into the failure path above.
+    #[test]
+    fn finalize_managed_launch_readiness_keeps_reporting_starting_while_alive() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-alive-child");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-alive-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11531,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || true,
+            false,
+        )?;
+
+        assert_eq!(record.status, "starting");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A readiness wait that already confirmed `Serving` must not be
+    /// second-guessed by a liveness check that could itself lose a race against
+    /// the same process exiting right after answering the probe.
+    #[test]
+    fn finalize_managed_launch_readiness_trusts_a_confirmed_serving_result() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-serving-raced");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-served-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11532,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Serving,
+            || false,
+            false,
+        )?;
+
+        assert_eq!(record.status, "ready");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The `stop_seen_while_waiting` latch, which nothing else exercised:
+    /// every other caller test passes `false`, so deleting the latch left the
+    /// whole suite green.
+    ///
+    /// The case it exists for is a stop that both begins and finishes inside
+    /// the readiness wait. `stop_internal_managed_service_confirmed_with`
+    /// clears its own marker once it confirms, so by the time the one-shot
+    /// check runs there is nothing left on disk to find — only the latch,
+    /// sampled while the marker was briefly up, still knows. Here the manifest
+    /// is deliberately left with NO marker and a non-`stopped` status, so the
+    /// point check cannot answer and the latch is the only thing that can.
+    #[test]
+    fn finalize_managed_launch_readiness_trusts_the_latch_after_the_marker_is_cleared() -> Result<()>
+    {
+        let (root, paths) = test_paths("finalize-readiness-latched-stop");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-latched-stop",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11534,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write()?;
+
+        // What `StopWatch` would have latched: sample while the marker is up,
+        // then let the confirmed stop clear it again, as production does.
+        let mut watch = StopWatch::default();
+        let mut marked = record.clone();
+        marked.stop_requested_unix_ms = Some(4_242);
+        marked.write()?;
+        watch.sample(&paths, "svc-latched-stop");
+        marked.stop_requested_unix_ms = None;
+        marked.write()?;
+        assert!(
+            watch.stop_was_requested(),
+            "the watch must latch a marker it saw, and keep it after the clear"
+        );
+        assert!(
+            !managed_service_stop_was_requested(&paths, "svc-latched-stop"),
+            "the one-shot check must be blind here, or this test would pass \
+             without the latch"
+        );
+
+        let proceed = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            watch.stop_was_requested(),
+        )?;
+
+        let (on_disk, _) =
+            crate::services_text::read_managed_service_manifest(&paths, "svc-latched-stop")?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !proceed,
+            "a latched stop must tell the caller to skip its own follow-up write"
+        );
+        assert_ne!(
+            on_disk.status, "failed",
+            "a stop the latch saw must not be recorded as a crash"
+        );
+        Ok(())
+    }
+
+    /// ROCMAI-541: a `rocm services stop`/`rocm dash` stop that lands
+    /// during the 45s launch readiness wait must not be reported as a crash —
+    /// no `failed` status, no non-zero exit — and the in-memory `record` must
+    /// come back refreshed from disk so a caller's own follow-up write cannot
+    /// clobber the stop marker the stop itself just wrote.
+    #[test]
+    fn finalize_managed_launch_readiness_treats_a_requested_stop_as_clean() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-requested-stop");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-stopped-during-launch",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11533,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "running".to_owned();
+        record.write()?;
+
+        // Simulate a concurrent `rocm services stop` landing mid-wait: it
+        // writes the marker (and, once confirmed, `status: "stopped"`) to the
+        // manifest on disk — never through this stale in-memory `record`.
+        let mut stopped_on_disk = record.clone();
+        stopped_on_disk.status = "stopped".to_owned();
+        stopped_on_disk.stop_requested_unix_ms = Some(999);
+        stopped_on_disk.write()?;
+
+        let proceed = finalize_managed_launch_readiness(
+            &paths,
+            &mut record,
+            EndpointReadiness::Unreachable,
+            || false,
+            false,
+        )?;
+
+        assert!(
+            !proceed,
+            "a requested stop must tell the caller to skip its own follow-up write"
+        );
+        assert_eq!(record.status, "stopped", "record is refreshed from disk");
+        assert_eq!(record.stop_requested_unix_ms, Some(999));
+
+        let (on_disk, _) = crate::services_text::read_managed_service_manifest(
+            &paths,
+            "svc-stopped-during-launch",
+        )?;
+        assert_eq!(
+            on_disk.status, "stopped",
+            "the manifest must not be overwritten with `failed`"
+        );
+        assert_eq!(on_disk.stop_requested_unix_ms, Some(999));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
 
     /// The startup wait's sample comes from the manifest on disk: the
     /// engine's own `failed`, liveness by pid (supervisor or engine), and the
@@ -828,30 +1812,372 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The residual ROCMAI-541 race, closed.
+    ///
+    /// `refresh_managed_service_runtime_liveness` reconciles any record with
+    /// dead tracked pids to `"stopped"` without writing any marker, so when this
+    /// predicate also accepted `status == "stopped"`, a crash that any
+    /// concurrent `rocm services`/`rocm dash`/`rocmd` read happened to reconcile
+    /// became indistinguishable from a deliberate stop — and was reported as
+    /// one, exit 0.
+    ///
+    /// Both directions are pinned. The first arm is the regression itself; the
+    /// second is what stopped the term being removable before, and would fail
+    /// for a fix that simply deleted the status term without making the stop's
+    /// own evidence durable.
     #[test]
-    fn settle_exited_service_demotes_a_live_manifest_and_spares_a_settled_one() {
+    fn a_reconciled_crash_is_not_evidence_of_a_stop_but_a_settled_one_is() {
+        let (root, paths) = test_paths("stop-evidence");
+        paths.ensure().expect("paths");
+
+        // What the liveness reconciliation leaves behind for a crash: status
+        // `stopped`, and no marker of any kind.
+        let mut crashed = record_tracking_pid(&paths, 0, "stopped");
+        crashed.stop_requested_unix_ms = None;
+        crashed.settled_stop_unix_ms = None;
+        crashed.write().expect("write");
+        assert!(
+            !managed_service_stop_was_requested(&paths, &crashed.service_id),
+            "a status nobody can vouch for must not pass as proof of a stop"
+        );
+
+        // What a confirmed stop leaves behind: the marker moved to the durable
+        // field. Same status, opposite verdict - which is the whole point.
+        let mut settled =
+            ManagedServiceRecord::read_manifest(&paths, &crashed.service_id).expect("read");
+        settled.settled_stop_unix_ms = Some(4_321);
+        settled.write().expect("write");
+        assert!(
+            managed_service_stop_was_requested(&paths, &settled.service_id),
+            "a stop that confirmed and cleared its own marker still has to be recognised"
+        );
+
+        // And a relaunch clears it, so an old stop cannot mask a later crash.
+        let mut relaunched =
+            ManagedServiceRecord::read_manifest(&paths, &crashed.service_id).expect("read");
+        relaunched.reset_for_restart();
+        relaunched.write().expect("write");
+        assert!(
+            !managed_service_stop_was_requested(&paths, &relaunched.service_id),
+            "the stop before a relaunch says nothing about the run after it"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A `--wait` that ends in a death nobody asked for is a crash, and used to
+    /// be written as `stopped` whatever happened. That is the same defect
+    /// ROCMAI-541 fixes on the launch, attach and restart paths, left open at
+    /// the one exit point none of them covers: a death that bypasses the
+    /// engine's own backstop (SIGKILL, OOM kill, segfault) leaves the record
+    /// still reading live, so there is nothing on disk saying why.
+    ///
+    /// All three arms are pinned together because they are one decision. Only
+    /// asserting the crash arm would pass a version that stopped reading the
+    /// stop marker entirely and called every `--wait` death a crash — the
+    /// mirror-image defect, and the one that would start telling users a
+    /// deliberate stop had failed.
+    #[test]
+    fn a_wait_death_is_a_crash_unless_a_stop_asked_for_it() {
         let (root, paths) = test_paths("wait-settle");
         paths.ensure().expect("paths");
         let mut record = record_tracking_pid(&paths, 4_242, "starting");
         record.write().expect("write");
         // A manifest whose recorded process is alive again was restarted by
-        // `rocmd` after the caller decided the server ended: left alone.
-        settle_exited_service(&paths, &record.service_id, &|_| true);
+        // `rocmd` after the caller decided the server ended: left alone, and
+        // checked before the crash/stop verdict so a restart is never stamped.
+        settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| true,
+            UnexplainedDeath::IsACrash,
+        );
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "starting");
-        settle_exited_service(&paths, &record.service_id, &|_| false);
-        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
-        assert_eq!(after.status, "stopped");
 
-        // A record that already failed keeps its reason: the guard, not the
-        // overwrite, is what spares it (a `stopped` -> `stopped` rewrite would
-        // be invisible).
+        // The stop arm, while nothing has stamped `failed` anywhere: the marker
+        // is the sound evidence, so a stop that landed during the wait settles
+        // as a clean stop.
+        record.stop_requested_unix_ms = Some(1);
+        record.status = "starting".to_owned();
+        record.write().expect("write");
+        assert!(
+            settle_exited_service(
+                &paths,
+                &record.service_id,
+                &|_| false,
+                UnexplainedDeath::IsACrash,
+            ),
+            "it must report the death as deliberate, so `--wait` can say so"
+        );
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(
+            after.status, "stopped",
+            "a stop that asked for this death must not be reported as a crash"
+        );
+
+        // Same service, same death, with nothing having asked for it.
+        record.stop_requested_unix_ms = None;
+        record.status = "starting".to_owned();
+        record.write().expect("write");
+        settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(
+            after.status, "failed",
+            "nothing asked this server to stop, so its death is a crash"
+        );
+        let engine_state = fs::read_to_string(&record.engine_state_path).expect("engine state");
+        assert!(
+            engine_state.contains("\"failed\""),
+            "the engine state file is the one ROCMAI-541 names: {engine_state}"
+        );
+
+        // A record that already failed keeps its reason — but the status alone
+        // cannot show that, because a `failed` -> `failed` rewrite is
+        // invisible: delete the `latest.status == on_disk` early return and the
+        // status assertion still passes. What that guard actually controls is
+        // whether the stale snapshot is written back AT ALL, so that is what
+        // this arm pins.
+        //
+        // The stand-in for "something a concurrent writer put on disk after
+        // this snapshot was taken" is a key the record type does not know.
+        // `ManagedServiceRecord` does not deny unknown fields, so a read drops
+        // the key and `write()` re-serializes without it: the key survives
+        // exactly when the early return skips the write, and is gone the moment
+        // it does not. That makes this a deterministic proxy for the concurrent
+        // overwrite the guard exists to avoid, with no race to win.
         record.status = "failed".to_owned();
         record.write().expect("write");
-        settle_exited_service(&paths, &record.service_id, &|_| false);
+        let planted_manifest = fs::read_to_string(&record.manifest_path).expect("manifest");
+        let mut planted: serde_json::Value =
+            serde_json::from_str(&planted_manifest).expect("manifest json");
+        planted["written_by_someone_else"] = serde_json::json!("concurrent");
+        fs::write(
+            &record.manifest_path,
+            serde_json::to_vec_pretty(&planted).expect("serialize"),
+        )
+        .expect("plant a concurrent writer's field");
+
+        settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
+
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
+        let reread: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record.manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(
+            reread
+                .get("written_by_someone_else")
+                .and_then(serde_json::Value::as_str),
+            Some("concurrent"),
+            "the refresh learned nothing, so the stale snapshot must not be written back over \
+             whatever else reached disk meanwhile: that is what the `latest.status == on_disk` \
+             early return protects, and what the status assertion above cannot see"
+        );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// ROCMAI-541 review: a crash must still be recorded as one when a
+    /// concurrent listing has already reconciled the record to `stopped`.
+    ///
+    /// `managed_service_status`'s liveness refresh demotes any record whose
+    /// recorded PIDs are gone to `stopped`, unconditionally and without
+    /// knowing why they went — `rocm services` and `rocm dash` both run it. A
+    /// listing that lands between the death and `settle_exited_service`'s own
+    /// read therefore leaves `on_disk == "stopped"`, and the refresh from the
+    /// engine state file (which a SIGKILL/OOM-kill never got to write) learns
+    /// nothing, so `latest.status == on_disk` and the early return fires with
+    /// `deliberate == false`. Before this fix that returned the right verdict
+    /// to the caller — the `--wait` said the server exited — while leaving
+    /// `rocm services list` showing a clean stop forever, which is the exact
+    /// acceptance criterion this change set exists to meet.
+    ///
+    /// The planted key is the same stand-in the arm above uses, and is the
+    /// other half of the assertion: the correction has to go through
+    /// `mark_service_failed`'s read-modify-write merge, not `latest.write()`,
+    /// or it fixes the status by reintroducing the clobber the early return is
+    /// there to prevent. Both assertions have to hold at once; either one
+    /// alone admits a wrong implementation.
+    #[test]
+    fn a_crash_is_still_recorded_when_a_listing_already_reconciled_it_to_stopped() {
+        let (root, paths) = test_paths("wait-settle-after-reconcile");
+        paths.ensure().expect("paths");
+        // The record exactly as a concurrent listing's liveness refresh leaves
+        // it: demoted to `stopped` because the PIDs are gone, with neither
+        // half of the stop evidence set, because nobody asked for this death.
+        let mut record = record_tracking_pid(&paths, 0, "stopped");
+        record.stop_requested_unix_ms = None;
+        record.settled_stop_unix_ms = None;
+        record.write().expect("write");
+        let planted_manifest = fs::read_to_string(&record.manifest_path).expect("manifest");
+        let mut planted: serde_json::Value =
+            serde_json::from_str(&planted_manifest).expect("manifest json");
+        planted["written_by_someone_else"] = serde_json::json!("concurrent");
+        fs::write(
+            &record.manifest_path,
+            serde_json::to_vec_pretty(&planted).expect("serialize"),
+        )
+        .expect("plant a concurrent writer's field");
+
+        let deliberate = settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
+
+        assert!(
+            !deliberate,
+            "a status a liveness refresh wrote is not evidence anyone asked for this death"
+        );
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(
+            after.status, "failed",
+            "the death was reported as a crash, so the manifest must not be left reading \
+             `stopped` by a listing that happened to run first"
+        );
+        let engine_state = fs::read_to_string(&record.engine_state_path).expect("engine state");
+        assert!(
+            engine_state.contains("\"failed\""),
+            "the engine state file is the one ROCMAI-541 names: {engine_state}"
+        );
+        let reread: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record.manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(
+            reread
+                .get("written_by_someone_else")
+                .and_then(serde_json::Value::as_str),
+            Some("concurrent"),
+            "the correction must be a merge of the `status` key, not a write-back of the \
+             stale snapshot: fixing the status by clobbering the concurrent writer trades \
+             one defect for the one the early return exists to prevent"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other side of the correction above: a record that already reads
+    /// `failed` has nothing to correct, so the early return must still write
+    /// nothing at all.
+    ///
+    /// Without the `!= "failed"` term the correction would run here too. The
+    /// manifest status would not visibly change — a `failed` -> `failed` merge
+    /// is invisible, which is why the sibling test's planted key cannot see it
+    /// — but `mark_service_failed` also stamps the engine state file, and
+    /// *that* is observable: a record whose engine never wrote one would come
+    /// back from a no-op settle with a state file this process invented. That
+    /// is what pins the guard.
+    #[test]
+    fn a_record_that_already_failed_is_left_entirely_alone() {
+        let (root, paths) = test_paths("wait-settle-already-failed");
+        paths.ensure().expect("paths");
+        // The engine stamped the manifest itself and got no further: its own
+        // reason is on the record, and no engine state file exists.
+        let mut record = record_tracking_pid(&paths, 0, "failed");
+        record.stop_requested_unix_ms = None;
+        record.settled_stop_unix_ms = None;
+        record.write().expect("write");
+        let _ = fs::remove_file(&record.engine_state_path);
+        let planted_manifest = fs::read_to_string(&record.manifest_path).expect("manifest");
+        let mut planted: serde_json::Value =
+            serde_json::from_str(&planted_manifest).expect("manifest json");
+        planted["written_by_someone_else"] = serde_json::json!("concurrent");
+        fs::write(
+            &record.manifest_path,
+            serde_json::to_vec_pretty(&planted).expect("serialize"),
+        )
+        .expect("plant a concurrent writer's field");
+
+        assert!(!settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        ));
+
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "failed");
+        let reread: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record.manifest_path).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(
+            reread
+                .get("written_by_someone_else")
+                .and_then(serde_json::Value::as_str),
+            Some("concurrent"),
+            "nothing changed, so nothing may be written back"
+        );
+        assert!(
+            !record.engine_state_path.exists(),
+            "a settle with nothing to correct must not invent an engine state file the \
+             engine never wrote"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// ROCMAI-541 review: `settle_exited_service`'s verdict and the record it
+    /// stamps now come from one snapshot, asked through the same predicate
+    /// [`managed_service_stop_was_requested`] uses.
+    ///
+    /// The case that pins it is a stop whose *marker* has already been consumed
+    /// — a concurrent `rocm services`/`dash` listing saw the signalled PIDs gone
+    /// first and moved `stop_requested_unix_ms` into `settled_stop_unix_ms`,
+    /// which is the whole reason that durable field exists. A call site that
+    /// re-spelled the test inline as "the marker is set" would find nothing and
+    /// stamp `failed` on a death the operator asked for, while still reading as
+    /// though it asked the shared question. Deleting either term of
+    /// `record_shows_stop_was_requested` fails one of these two arms.
+    ///
+    /// What this does **not** cover is the interleaving itself. The defect was
+    /// two independent reads with a stop landing between them; the fix is that
+    /// there is now only one read, which is a structural property, not one a
+    /// single-threaded test can falsify. No read-injection seam exists here to
+    /// drive it, and none is added for this.
+    #[test]
+    fn a_wait_death_is_deliberate_on_either_half_of_the_stop_evidence() {
+        for consumed_by_a_listing in [false, true] {
+            let (root, paths) =
+                test_paths(&format!("wait-settle-evidence-{consumed_by_a_listing}"));
+            paths.ensure().expect("paths");
+            let mut record = record_tracking_pid(&paths, 0, "starting");
+            if consumed_by_a_listing {
+                record.stop_requested_unix_ms = None;
+                record.settled_stop_unix_ms = Some(7);
+            } else {
+                record.stop_requested_unix_ms = Some(7);
+                record.settled_stop_unix_ms = None;
+            }
+            record.write().expect("write");
+
+            let deliberate = settle_exited_service(
+                &paths,
+                &record.service_id,
+                &|_| false,
+                UnexplainedDeath::IsACrash,
+            );
+            let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+
+            assert!(
+                deliberate,
+                "a stop is a stop whether or not a listing has already settled \
+                 its marker (consumed={consumed_by_a_listing})"
+            );
+            assert_eq!(
+                after.status, "stopped",
+                "and the record it stamps must agree with that verdict, not \
+                 call the operator's own stop a crash (consumed={consumed_by_a_listing})"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -954,7 +2280,12 @@ mod tests {
             )),
             "{message}"
         );
-        assert_eq!(status(), "stopped");
+        // `failed`, not `stopped`: nothing asked this server to stop, so the
+        // death is a crash. This assertion used to read "stopped", which was
+        // the ROCMAI-541 defect surviving at the `--wait` exit point — see
+        // `a_wait_death_is_a_crash_unless_a_stop_asked_for_it`.
+        assert_eq!(status(), "failed");
+
         // The `--wait` death is audited like the interactive wait's.
         let errors = launch_errors();
         assert!(
@@ -962,6 +2293,47 @@ mod tests {
                 .iter()
                 .any(|event| event.message.contains("exited during --wait")),
             "{errors:?}"
+        );
+
+        // And a stop issued from another shell during the wait gets its own
+        // sentence, rather than being reported as the launch failing to come
+        // up. Re-plant the record live with a stop marker on it.
+        let mut stopped = ManagedServiceRecord::read_manifest(&paths, &id).expect("read");
+        stopped.status = "starting".to_owned();
+        stopped.supervisor_pid = std::process::id();
+        stopped.stop_requested_unix_ms = Some(1);
+        stopped.write().expect("write");
+        // The crash arm above stamped the *engine state file* `failed`, and
+        // `settle_exited_service` refreshes the record from it — so without
+        // clearing it this arm would re-adopt the previous arm's verdict and
+        // the state assertion below would fail on fixture carry-over rather
+        // than on the behaviour. Found by adding that assertion.
+        let _ = fs::remove_file(&stopped.engine_state_path);
+        let error =
+            died_during_wait(&paths, &id, true, pending, |_| false).expect("the wait still ends");
+        let message = error.to_string();
+        assert!(
+            message.contains("was stopped before it became ready"),
+            "an operator's own stop must not read as the server failing to start: {message}"
+        );
+        assert!(
+            !message.contains("exited before it became ready"),
+            "{message}"
+        );
+
+        // The message and the state it leaves, pinned together. Asserting only
+        // the wording would stay green if the same stop were still recorded as
+        // a crash — the user would read "stopped" and `rocm services list`
+        // would say `failed`.
+        let after = ManagedServiceRecord::read_manifest(&paths, &id).expect("read");
+        assert_ne!(
+            after.status, "failed",
+            "a stop reported as a stop must not also be recorded as a crash"
+        );
+        let engine_state = fs::read_to_string(&after.engine_state_path).unwrap_or_default();
+        assert!(
+            !engine_state.contains("\"failed\""),
+            "nor may its engine state file say failed: {engine_state}"
         );
         let _ = fs::remove_dir_all(root);
     }
