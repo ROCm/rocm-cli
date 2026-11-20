@@ -28,10 +28,10 @@ The lane set is whatever GPU models the queue has. The 11-13 run
 the only scheduled coverage of that hardware, since `e2e-selfhosted.yml` no
 longer has a W7900 lane.
 
-**The remaining gap is native Windows and WSL.** The queue runs Linux pods, so
-the native Windows and WSL lanes stay on their dedicated runners, in `nightly.yml`
-and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml); nothing
-here replaces them. Which checks are required before merging is a repository
+**The remaining gap is Strix Halo.** The queue has no Strix lane and runs Linux
+pods, so the Strix Halo nightlies (Ubuntu, Windows and WSL) stay on the shared Strix pool,
+in `nightly.yml` and [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml);
+nothing here replaces them. Which checks are required before merging is a repository
 setting, outside this page.
 
 This page is the **contract** between this repository and the queue side: what
@@ -55,6 +55,69 @@ however started, is unfinished. GitHub keeps at most one job waiting, so a
 third dispatch, or the nightly schedule, replaces a dispatch still waiting
 and that one never runs. The branch must exist in this repository;
 otherwise the job fails at once.
+
+## Pull requests
+
+A pull request from this repository also runs its MI300X check on the queue.
+The gate job `e2e-gpu-queue` in
+[`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml) runs on a
+GitHub-hosted runner, holds no queue credential and needs only `actions: write`:
+it dispatches [`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) on
+`main` with the pull request's branch, waits for that run, and publishes the
+release-channel report of the MI300X lane as `e2e-gpu-report`, the MI300X cell
+of the consolidated report. The run's files are the artifact
+`queue-pr-run-results` from `queue-pr-run.yml`, as `queue-run-results` is
+`queue-run.yml`'s.
+The self-hosted MI300X lane of the same pull request uploads
+`e2e-gpu-selfhosted-report`, shown beside it as "MI300X (self-hosted)": the queue
+run is the primary MI300X check and the self-hosted one the second.
+
+A pull request's run is a preset of the queue side: one GPU model (MI300X), the
+`release` channel alone and no `@nightly` scenarios, a lane that waits at most 45
+minutes to be started and runs at most 75, and a limited number of such runs
+at once (the queue side sets the limit). The
+queue side does not take one while the nightly goes, or when it has no healthy
+MI300X worker: the gate job then fails with the reason the queue gave, which is
+capacity, not a failing test (the consolidated report's missing-report check
+then flags the lane too). The nightly window is the exception, being by design:
+the gate ends green with a note in its summary to re-run once the window has
+passed (the queue side defines the window), and
+the consolidated report reads the lane as skipped, not missing. A superseded push cancels the gate job, which cancels
+the run it started, freeing the runner; the queue side's lanes are left to their
+own budgets. The queue run tests the branch as it is when the run starts, not
+the pull request's merge with its base, which the self-hosted lane checks out.
+A pull request from a fork gets no queue run, since
+its token cannot dispatch, and neither does one from Dependabot, whose token is
+read-only whatever the workflow asks for (its gate is skipped) and the queue only checks out branches of this
+repository. `e2e-selfhosted.yml` is the only workflow that may name
+`queue-pr-run.yml`; the runner is set up to run `queue-pr-run.yml` only as it is
+on `main`, never the pull request's own copy of any workflow.
+
+**Merge order.** The queue side (the runner's allow-list and the pull request
+run kind) goes live before the gate does anything. The gate is switched by the
+repository variable `QUEUE_PR_GATE`: until it is `true` the gate ends green with
+a note in its summary, as a skip, not a pass of the MI300X check, and the
+self-hosted `e2e-gpu` is the only MI300X check that runs. Set it once the queue
+side is deployed. Without it, merging `queue-pr-run.yml` first would turn every
+pull request red.
+
+The gate and the queue side agree on two things, and the queue side is not in
+this repository, so the gate's tests pin the gate's half only (the
+`queue_gate_script_*` tests in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs), whose fixtures use
+the same two constants the script is checked against):
+
+- **A refusal.** A run the queue did not take publishes `refused.txt` in
+  `queue-pr-run-results`, whose first line is the reason. A reason that starts
+  with `nightly:` is the nightly window and skips the gate; any other reason
+  fails it.
+- **The report.** The MI300X lane's release-channel report is
+  `mi300x/release/results/report.json` in that artifact, and its whole
+  `results` directory is the job's report. A run with none fails the gate.
+
+GitHub cancels an older run of a branch that is still pending when a newer run
+of the same branch is dispatched; the gate of the older run then sees a run
+that left no report, and fails with that message.
 
 ## Publishing a finished run
 
@@ -125,7 +188,11 @@ limit (see the run's inputs above). Each channel starts with the GPU preflight, 
 channel's job in `nightly.yml` does, so a model server the previous channel's
 suite left on the GPU is reclaimed first; the lane log shows it. Both always
 run, so a failing channel does not hide the other, and the lane fails if either
-did.
+did. The default command also declares that every lane has a GPU
+(`E2E_EXPECT_GPU`, default `1`), so a channel whose suite finds no usable AMD
+GPU, or runs no GPU scenario (`@requires-gpu` or `@requires-multi-gpu`), fails
+instead of passing with every GPU scenario skipped; see "Lane verdict" in the
+[E2E README](../tests/e2e-cucumber/README.md).
 
 A lane starts cold, so its first steps fetch from the network: the build
 packages, the rustup installer, the toolchain and the crates for the host
@@ -135,10 +202,15 @@ model downloads are left to the tools doing them, so a model that downloads
 more slowly than its scenario waits fails that scenario. The lane fetches only
 the host's crates, so it refuses to start with `CARGO_BUILD_TARGET` set.
 
-The queue's results are an additional signal, not a replacement: the lanes
-write only into the queue artifact, and the `e2e-gpu-<channel>-report`
-artifacts that `nightly.yml`'s consolidated report reads are not produced from
-them.
+The queue is the only scheduled run of the R9700, MI350P and W7900 lanes: their
+self-hosted nightly jobs were removed from `nightly.yml`. The MI300X nightly
+job is still there, and the queue's `mi300x` lane is an additional signal to it.
+The lanes write only into the queue artifact, and the
+`e2e-gpu-<channel>-report` artifacts that `nightly.yml`'s consolidated report
+reads are not produced from them. The report fetches the queue's artifact
+itself instead, so the support matrix, the `E2E-Support-Matrix` and
+`Release-Readiness` wiki pages and the release-readiness verdict keep every
+GPU the queue tests: see [The support matrix and the wiki](#the-support-matrix-and-the-wiki).
 
 ## Output
 
@@ -166,6 +238,11 @@ default command writes each channel's suite results to `/out/<channel>/results`.
 Widening what is collected is not the fix for a missing file; writing the file
 to `/out` is.
 
+The default command, when it exits non-zero once its arguments are accepted,
+also writes `/out/lane-status.txt` (its exit status and the channels that
+failed). It is not written on a pass, for a refused argument (a bad
+`E2E_CHANNELS` or a set `CARGO_BUILD_TARGET`), or when a signal is sent to the script itself.
+
 A lane passes when its command exits zero. Capturing the command's output into
 `lane.log` does not affect that status.
 
@@ -192,12 +269,85 @@ that line is what counts: a blocking lane without a result fails the run.
 result is not a pass, but they point at queue capacity or infrastructure
 rather than at a regression.
 
+## The support matrix and the wiki
+
+`nightly.yml`'s `e2e-report-nightly` job builds the consolidated support
+matrix, which `publish-e2e-wiki` publishes as the `E2E-Support-Matrix` wiki page
+and `release-readiness-nightly` reads its GO/NO-GO verdict from (see
+[ci-hardware-testing.md](ci-hardware-testing.md)). It also reads the queue's
+lanes, from the queue's own results, so retiring a self-hosted nightly lane
+that the queue covers drops no GPU from either page, and a GPU that only the
+queue has (MI325X, MI350X, MI355X) is on them.
+
+- **Which run.** The newest `queue-run-results` artifact of a run on this
+  repository's `main` that finished, and started, in the last 24 hours,
+  whatever the run's conclusion was: a red lane fails the run, and its artifact
+  is still uploaded. The job finds the artifact by name, not through the
+  workflow that makes it, because no other workflow may name that one (see
+  below). The run also has to have tested `main`: a run started from `main` can
+  be asked to test another branch (the `branch` input), and the job log names
+  the branch it did. `queue-run.yml` starts at 02:17 UTC and the nightly
+  starts at 06:00 UTC, its report job after its GPU lanes have finished, so a
+  run that took under about three and a half hours is in the night's report. A
+  run that is still going, that started on an earlier day or that tested
+  another branch is not imported, and neither is a run published again by
+  `nightly-queue.yml`. The job looks at the five newest runs of the window and
+  takes the first that tested `main`, so a run of another branch does not hide
+  an earlier run of `main`.
+- **Which lanes, and whether each blocks.** The artifact holds the lanes'
+  files and nothing else about the run, so the job reads the run's job log, whose
+  lane matrix is the only place the queue prints which lanes it ran and which of
+  them can fail the run (the `GATE` column). Only the tested branch and commit
+  and each lane's name, phase, exit status and gate are taken from it, each
+  checked against a strict pattern first. A lane whose name is not a plain
+  lowercase word (letters, digits and dashes, and not ending in `-advisory`,
+  `-release` or `-nightly`) is shown as `unnamed-1` and so on, as a blocking
+  lane with no result. Without the log nothing is imported.
+- **What is imported.** For each lane and channel,
+  `<lane>/<channel>/results/{report.json,platform.json,commands.jsonl}`, the
+  three files the report reads, as an artifact named
+  `e2e-queue-<lane>[-advisory]-<channel>-report`. The `lane.log`, the JUnit and
+  HTML output and the harness diagnostics are not copied, and nothing the
+  queue's scan withheld is brought back. The lane's `platform_slug` is replaced
+  by `queue-<lane>-<channel>`: the slug is the report's column identity, and
+  queue lanes of different models report the same one (an MI325X lane probes as
+  `mi300x`, an MI350X or MI355X lane as `mi350p`). The lane command therefore
+  has to keep writing those files to `/out/<channel>/results`, as
+  [`scripts/run-e2e-lane.sh`](../scripts/run-e2e-lane.sh) does.
+- **How it reads.** A queue row is labelled `MI325X (queue) Linux (release)`,
+  so it is not confused with the self-hosted MI300X lane, and a lane the queue
+  does not block on is `MI325X (queue, advisory) Linux (release)`. The page
+  opens with a `Queue lanes` table: one row per lane the queue ran, with its
+  gate, phase, exit status and the channels that reported.
+- **What counts towards the verdict.** The same as for the queue's own run. A
+  blocking lane's failures are in the `E2E` failure count. An advisory lane's are
+  shown but left out of it. A lane that came back with no result, or whose
+  channel is missing after it did not finish cleanly, is shown as `EMPTY` and
+  counts for a blocking lane, because a blocking lane without a result is not
+  a pass.
+- **When there is nothing to import.** No run in the window, a run of another
+  branch, an artifact or log that cannot be downloaded or an import that fails
+  never fails the nightly report: the page opens with a `Queue lanes` note
+  saying that no queue lanes are in it tonight and why, and the rest is built as
+  before. A queue that never ran is not a pass, so the
+  release-readiness verdict is `NO-GO` with the failing gate `queue lanes
+  absent: <reason>`; its `E2E` row is marked "queue lanes missing" and a warning
+  under the table names the reason.
+
+What is public follows from the queue's own rules: the artifact is public and
+already scanned, only three of its files are used, and the log is the public job
+log.
+
 ## What the workflow requires
 
-- a self-hosted Linux runner registered with the `queue-report` label alone,
+- self-hosted Linux runners registered with the `queue-report` label alone,
   without GitHub's default `self-hosted`, OS and architecture labels, so only a
-  job naming `queue-report` lands on it, providing
-  the queue side's publish command and read access to the queue side's results
+  job naming `queue-report` lands on them, each providing
+  the queue side's publish command and read access to the queue side's results.
+  Each run holds a runner for as long as it lasts, so there are as many runners
+  as runs may go at once (the queue side limits pull request runs to that
+  number); a job beyond them waits in GitHub's queue, outside the queue side's
+  limits, and a gate job that waits for such a job can reach its own timeout
 - a registered runner name and host name that do not identify internal
   infrastructure, since GitHub prints both into every job log
 
@@ -211,7 +361,7 @@ this repository can still name the runner's label, which is one reason the
 runner holds no credential, below. On `main`, the tests also refuse any
 other workflow that names the `queue-report` label or these workflows, so none
 sends a job to the runner or waits on them by mistake. The runner is set up to
-run only these two workflows as they are on `main`, by a check on the runner
+run only the allow-listed queue workflows as they are on `main`, by a check on the runner
 that runs before any step. That check lives outside this repository, so
 nothing here can verify it; the runner is still treated as untrusted, as above
 and below. Whether this
@@ -251,7 +401,7 @@ file.
 credential and sends nothing to the queue: the runner, which sits next to the
 queue side, asks it for a run of a branch, and the queue side starts it with
 its own credential. It believes the request because of where it comes from,
-which is why the runner is set up to run only these two workflows from `main`
+which is why the runner is set up to run only the allow-listed queue workflows from `main`
 (a setting outside this repository). A request can start a run of a branch
 already in this repository, and that branch's lane command then runs in the
 lane pods. The lane spec gives those pods no queue or cluster credential and

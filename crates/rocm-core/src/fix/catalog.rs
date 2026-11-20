@@ -170,6 +170,15 @@ impl FixRecipe {
     }
 }
 
+/// The ids of the recipes whose runners name themselves in a recovery line
+/// ("re-run `rocm fix <id>`"). One constant serves the catalog entry and the
+/// runner's message, so the command a stopped fix tells the user to re-run is
+/// always a recipe that exists.
+pub(super) const UNSET_OVERRIDE_ID: &str = "fix-2-unset-override";
+pub(super) const RENDER_GROUP_ID: &str = "fix-4-render-group";
+pub(super) const PATH_ID: &str = "fix-6-path";
+pub(super) const IGPU_DGPU_ID: &str = "fix-9-igpu-dgpu";
+
 /// The recipe registry. Mirrors the diagnosis catalog; only the small, safe
 /// fixes carry a `runner`, and what each one does can differ by platform.
 pub(super) const RECIPES: &[FixRecipe] = &[
@@ -204,7 +213,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-2-unset-override",
+        fix_id: UNSET_OVERRIDE_ID,
         title: "Unset HSA_OVERRIDE_GFX_VERSION",
         rationale: "HSA_OVERRIDE_GFX_VERSION is set, but your GPU now has a native wheel. The override hides the real gfx and causes page faults / OUT_OF_REGISTERS at runtime.",
         commands: &[
@@ -258,7 +267,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-4-render-group",
+        fix_id: RENDER_GROUP_ID,
         title: "Add user to render/video groups",
         rationale: "The current user can't open /dev/kfd because they aren't in the render group. Adding the user is the safe, standard fix.",
         commands: &["sudo usermod -a -G render,video \"$USER\""],
@@ -296,7 +305,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-6-path",
+        fix_id: PATH_ID,
         title: "Add the ROCm/HIP bin directory to PATH",
         rationale: "Linux: ROCm is installed but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
         commands: &[
@@ -383,7 +392,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
     FixRecipe {
-        fix_id: "fix-9-igpu-dgpu",
+        fix_id: IGPU_DGPU_ID,
         title: "Hide the iGPU with HIP_VISIBLE_DEVICES",
         rationale: "Both an APU iGPU and a discrete AMD GPU are visible. Pin the runtime to the dGPU so the iGPU doesn't destabilise it.",
         commands: &[
@@ -705,7 +714,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         verify_linux: None,
         notes: &[
             "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. `rocm install driver` prints the plan first so the URL and the package are reviewable before anything runs.",
-            "The download is checked against a digest pinned for that ROCDXG release. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
+            "The package is checked against a digest pinned for that ROCDXG release, on the copy root installs from a directory only root can write. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_WSL,
@@ -732,7 +741,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-wsl-5-distro-too-old",
         title: "Move to a distro release the WSL path supports",
-        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked against, so the engine cannot start there at all. This is a hard floor, not a recommendation.",
+        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor the pinned Lemonade embeddable is linked against (newer Lemonade releases need more), so the engine cannot start there at all. This is a hard floor, not a recommendation.",
         commands: &[
             "# From Windows, install a supported distro alongside the current one:",
             "#   wsl --install -d Ubuntu-24.04",
@@ -948,6 +957,47 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         applies_on: DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS,
         runner: None,
     },
+    // Print-only: the remedy is a different distro or a system package, and
+    // neither is something the CLI should change for the user.
+    FixRecipe {
+        fix_id: "fix-23-vllm-extension-load",
+        title: "Find why a vLLM compiled extension did not load (op missing from torch.ops)",
+        rationale: "vLLM imports some of its compiled extensions inside a try that only logs a warning, so the engine starts without them and fails later, at the first call to an op the missing extension registers: AttributeError: '_OpNamespace' '_C' object has no attribute '<op>'. The cause is whatever stopped the extension loading. The common one is a wheel built against a newer glibc than the host has (`version `GLIBC_2.NN' not found`), which no reinstall changes; the other is a system library the extension links that is not installed.",
+        commands: &[
+            "# --- step 1 of 3, in YOUR shell ---",
+            "# Opens an INTERACTIVE subshell with the engine's environment active,",
+            "# and does not return until you leave it. Run this line on its own.",
+            "rocm engines shell vllm",
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---",
+            "# Import every vLLM op library. The first one that fails raises the",
+            "# loader's error, which vLLM itself only logged as a warning.",
+            "python -c \"import importlib, pathlib, torch, vllm; [importlib.import_module('vllm.' + p.name.split('.')[0]) for p in sorted(pathlib.Path(vllm.__file__).parent.glob('_*.so'))]; print('every vllm extension loads')\"",
+            "# The C library version this host has:",
+            "ldd --version | head -n 1",
+            "# Then leave the subshell:",
+            "exit",
+            "# --- step 3 of 3, back in YOUR OWN shell ---",
+            "# If the error says version `GLIBC_2.NN' not found, the wheel was built",
+            "# against a newer glibc than this host has. Run the engine on a distro",
+            "# whose glibc is at least 2.NN (Ubuntu 24.04 ships 2.39), on the host,",
+            "# in a container or in a WSL distro.",
+            "# If it says a library cannot be opened, install the distro package",
+            "# that provides that library.",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> --engine vllm",
+        verify_linux: None,
+        notes: &[
+            "vLLM logs the cause near the top of the startup log, as a warning that starts with `Failed to import from vllm.`, and carries on. The AttributeError comes later, from the first call to an op that extension registers.",
+            "Reinstalling the engine fetches the same wheel, built against the same glibc, so it does not fix a glibc version error.",
+        ],
+        doc_url: None,
+        // Matches `check_23_vllm_extension_load`'s `["linux", "wsl"]`.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
+        runner: None,
+    },
 ];
 
 /// Assert that a recipe whose steps span more than one shell says which shell
@@ -1122,7 +1172,8 @@ pub(crate) fn recipe_linux_verify(fix_id: &str) -> Option<&'static str> {
 }
 
 /// What one Windows shell did with a line typed into it.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) struct ShellRun {
     pub shell: &'static str,
     pub success: bool,
@@ -1145,7 +1196,8 @@ pub(crate) struct ShellRun {
 /// session's path, which lists the PowerShell 7 modules first. 5.1 then picks
 /// the PSReadLine built for 7, cannot load it, and writes "Cannot load PSReadline
 /// module" to stderr, which the tests below treat as a failure of the line.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) fn run_typed_in_powershell(text: &str, env: &[(&str, Option<&str>)]) -> ShellRun {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1174,7 +1226,8 @@ pub(crate) fn run_typed_in_powershell(text: &str, env: &[(&str, Option<&str>)]) 
 
 /// Runs `line` the way a user would type it into cmd (`cmd /C`, with the line
 /// passed unquoted and unescaped). `env` is as for [`run_typed_in_powershell`].
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) fn run_typed_in_cmd(line: &str, env: &[(&str, Option<&str>)]) -> ShellRun {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1200,7 +1253,8 @@ pub(crate) fn run_typed_in_cmd(line: &str, env: &[(&str, Option<&str>)]) -> Shel
 }
 
 /// Runs one printed line in cmd and in Windows PowerShell, in that order.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 pub(crate) fn run_typed_in_cmd_and_powershell(
     line: &str,
     env: &[(&str, Option<&str>)],
@@ -1211,7 +1265,8 @@ pub(crate) fn run_typed_in_cmd_and_powershell(
     ]
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 fn shell_run(shell: &'static str, out: std::process::Output) -> ShellRun {
     ShellRun {
         shell,
@@ -1440,6 +1495,22 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn rocdxg_missing_note_says_the_checked_copy_is_the_installed_one() {
+        // Pins the wording only. That the plan really checks the copy root
+        // installs, from a directory only root can write, is proved by
+        // `wsl_rocdxg_generated_steps_install_exactly_the_verified_file` in
+        // `apps/rocm/src/driver_plan/rocdxg.rs`, which executes the generated
+        // steps.
+        let recipe = find_recipe("fix-wsl-3-rocdxg-missing").expect("recipe exists");
+        assert!(
+            recipe.notes.iter().any(|n| n.contains("digest")
+                && n.contains("on the copy root installs from a directory only root can write")),
+            "{:?}",
+            recipe.notes
+        );
+    }
+
     // Ubuntu 26.04 gets the DKMS driver plan (`dkms_driver_plan_is_supported`),
     // so no recipe may still describe it as in-tree or unplanned.
     #[test]
@@ -1576,12 +1647,30 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 22 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 23 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
-        // fix-21-msvc-redist-outdated, fix-22-display-driver-old and the
-        // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL
-        // ones.
-        assert_eq!(count, 29, "expected 29 catalog entries");
+        // fix-21-msvc-redist-outdated, fix-22-display-driver-old,
+        // fix-23-vllm-extension-load and the informational
+        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
+        assert_eq!(count, 30, "expected 30 catalog entries");
+    }
+
+    #[test]
+    fn the_extension_load_recipe_is_print_only_on_the_engine_hosts() {
+        // The remedy is another distro or a system package. Neither is a change
+        // the CLI makes for the user, so there is no runner and no host where
+        // it is anything but print-only.
+        let recipe = find_recipe("fix-23-vllm-extension-load")
+            .expect("fix-23-vllm-extension-load must be in the catalog");
+        assert!(recipe.runner.is_none());
+        assert_eq!(recipe.os_scope(), vec!["linux", "wsl"]);
+        for os in recipe.os_scope() {
+            assert_eq!(
+                recipe.platform(os).map(|p| p.class),
+                Some(FixClass::PrintOnly),
+                "{os}: fix-23 must stay print-only"
+            );
+        }
     }
 
     /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.

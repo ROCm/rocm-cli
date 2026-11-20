@@ -219,18 +219,17 @@ impl GenerationObservationTracker {
 
         // Discard samples outside the rate window (older than newest − rate_window).
         let window_chrono = to_chrono(self.rate_window);
-        while self.samples.len() > 1 {
-            let front_ts = self.samples.front().unwrap().0;
-            if observed_at.signed_duration_since(front_ts) > window_chrono {
-                self.samples.pop_front();
-            } else {
-                break;
-            }
+        while self.samples.len() > 1
+            && let Some(&(front_ts, _)) = self.samples.front()
+            && observed_at.signed_duration_since(front_ts) > window_chrono
+        {
+            self.samples.pop_front();
         }
 
         // Compute rate when ≥ 2 samples exist in the window.
-        if self.samples.len() >= 2 {
-            let &(oldest_ts, oldest_count) = self.samples.front().unwrap();
+        if self.samples.len() >= 2
+            && let Some(&(oldest_ts, oldest_count)) = self.samples.front()
+        {
             let newest_count = total; // self.samples.back() is (observed_at, total)
             let dt_ms = observed_at
                 .signed_duration_since(oldest_ts)

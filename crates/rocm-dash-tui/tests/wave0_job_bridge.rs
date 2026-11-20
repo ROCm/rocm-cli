@@ -19,7 +19,7 @@ use rocm_dash_core::state::{JobStatus, State, StateEvent};
 use rocm_dash_tui::jobs;
 use rocm_dash_tui::ui::approval::{ApprovalChoice, ApprovalRequest, draw_approval};
 use rocm_dash_tui::ui::exec::display_args;
-use rocm_dash_tui::ui::job_console::draw_job_console;
+use rocm_dash_tui::ui::job_console::{ConsoleExit, draw_job_console};
 use rocm_dash_tui::ui::theme::Theme;
 use tokio::sync::mpsc;
 
@@ -160,7 +160,7 @@ fn job_console_snapshot_renders_status_and_output() {
     }
     let job = state.job("serve").unwrap();
     let out = render(140, 32, |f| {
-        draw_job_console(f, f.area(), job, (0, 0), 0, &theme);
+        draw_job_console(f, f.area(), job, (0, 0), 0, ConsoleExit::Immediate, &theme);
     });
 
     assert!(out.contains("rocm serve llama3"), "title shows the command");
@@ -234,7 +234,7 @@ fn job_console_snapshot_quotes_args_containing_spaces() {
     });
     let job = state.job("install").unwrap();
     let out = render(140, 32, |f| {
-        draw_job_console(f, f.area(), job, (0, 0), 0, &theme);
+        draw_job_console(f, f.area(), job, (0, 0), 0, ConsoleExit::Immediate, &theme);
     });
 
     assert!(

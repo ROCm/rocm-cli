@@ -31,7 +31,9 @@ use crate::ui::theme::{Theme, readable_text_on};
 pub enum ConsoleOutcome {
     /// Ctrl+C cancelled the running job — the caller runs these effects.
     Cancelled(Vec<SideEffect>),
-    /// `q` — the caller closes the whole overlay.
+    /// `q` (on any job) or Esc (on a still-running one) — the caller leaves
+    /// the console. What leaving *does* is the caller's call; the two
+    /// possibilities are named by [`ConsoleExit`].
     Closed,
     /// Esc/Enter on a terminal job — the caller dismisses the console (returns
     /// to the screen body), and may clear any transient message.
@@ -41,12 +43,34 @@ pub enum ConsoleOutcome {
     Unhandled,
 }
 
-/// Whether Esc on `job` fully closes the owning overlay, rather than merely
-/// dismissing the console back to the screen body.
+/// What an overlay does with a [`ConsoleOutcome::Closed`] on a running job.
+///
+/// This is the one thing that is NOT uniform across the managers, named here
+/// so the hints can say which applies.
+///
+/// `on_console_key` itself is uniform: `q` and Esc never get swallowed. This
+/// only records what the owner does next, and it only drives wording — the
+/// console footer hint below and the dashboard footer's Esc chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleExit {
+    /// Leaving is immediate and the job keeps running in the background. Every
+    /// manager except the one below.
+    Immediate,
+    /// Leaving opens the owner's confirmation modal first, because leaving a
+    /// launch that is still starting can hide a near-immediate failure. Only
+    /// `ui::serve_wizard`'s running launch console does this.
+    Confirmed,
+}
+
+/// Whether Esc on `job` leaves the console entirely (a
+/// [`ConsoleOutcome::Closed`]), rather than merely dismissing it back to the
+/// screen body.
 ///
 /// `true` when the job is still running; `false` once it's finished or
-/// missing. Shared by [`on_console_key`] and the dashboard footer's Esc-chip
-/// label so the two can't drift out of sync.
+/// missing. Shared by [`on_console_key`], the dashboard footer's Esc-chip
+/// label and `AppState::console_exit` so they can't drift out of sync. Note
+/// that "leaves the console" is not the same as "closes the overlay" for a
+/// [`ConsoleExit::Confirmed`] owner, which asks first.
 pub fn console_esc_closes(job: Option<&JobState>) -> bool {
     job.is_some_and(|j| !j.is_terminal())
 }
@@ -58,12 +82,18 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ConsoleOutcome::Cancelled(jobs.apply(StateEvent::CancelJob(job_id.to_string())))
         }
-        // `q` always closes the overlay so the user is never trapped mid-job
-        // (the job keeps running in the background).
+        // `q` is always answered with `Closed`, never swallowed, so the user is
+        // never trapped mid-job. The invariant is about the key reaching the
+        // owner, not about what the owner then does: a `ConsoleExit::Immediate`
+        // owner leaves at once and the job keeps running in the background,
+        // while the one `ConsoleExit::Confirmed` owner (`ui::serve_wizard`'s
+        // still-starting launch) turns this into its detach-confirm modal, from
+        // which one more key leaves. Nothing here is conditional on the owner —
+        // that asymmetry lives entirely in the caller.
         KeyCode::Char('q') => ConsoleOutcome::Closed,
-        // Esc on a still-running job leaves the overlay (the job keeps running in
-        // the background) — the conventional "get me out" key, so the user is
-        // never trapped during a long step (e.g. a managed serve readiness wait).
+        // Esc on a still-running job means the same as `q` above — the
+        // conventional "get me out" key, so the user is never trapped during a
+        // long step (e.g. a managed serve readiness wait).
         KeyCode::Esc if console_esc_closes(jobs.job(job_id)) => ConsoleOutcome::Closed,
         // On a finished (or vanished) job, Esc/Enter dismiss the console back to
         // the screen body.
@@ -83,14 +113,16 @@ fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color
 ///
 /// `scroll` is `(vertical_line, horizontal_col)` of the first visible cell (the
 /// caller clamps it). `tick_count` drives the running-job progress spinner.
-/// Returns the scrollbar handles drawn this frame so the caller can record them
-/// for mouse hit-testing.
+/// `exit` is what the owning overlay does when the user leaves, which only the
+/// footer hint depends on. Returns the scrollbar handles drawn this frame so
+/// the caller can record them for mouse hit-testing.
 pub fn draw_job_console(
     f: &mut Frame,
     area: Rect,
     job: &JobState,
     scroll: (u16, u16),
     tick_count: u64,
+    exit: ConsoleExit,
     theme: &Theme,
 ) -> Vec<ScrollbarHandle> {
     let popup = centered_rect(90, 84, 140, 40, area);
@@ -223,14 +255,20 @@ pub fn draw_job_console(
         ),
     ];
 
-    // Footer: key hints. While running, Esc leaves the overlay (the job keeps
-    // running in the background) and Ctrl+C cancels — advertise both so the user
-    // is never left feeling trapped during a long step (e.g. a managed serve's
-    // readiness wait).
-    let hints = if matches!(job.status, JobStatus::Running) {
-        "Esc close (keeps running) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
-    } else {
-        "Enter/Esc dismiss · wheel / PgUp·PgDn scroll"
+    // Footer: key hints. While running, Esc leaves the console and Ctrl+C
+    // cancels — advertise both so the user is never left feeling trapped during
+    // a long step (e.g. a managed serve's readiness wait). What leaving does
+    // differs by owner, so the hint is picked from `exit` rather than hard-coded
+    // to the common case: saying "keeps running" over a console whose Esc opens
+    // a confirmation would describe behaviour the key no longer has.
+    let hints = match (matches!(job.status, JobStatus::Running), exit) {
+        (true, ConsoleExit::Immediate) => {
+            "Esc close (keeps running) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
+        }
+        (true, ConsoleExit::Confirmed) => {
+            "Esc leave (asks first) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
+        }
+        (false, _) => "Enter/Esc dismiss · wheel / PgUp·PgDn scroll",
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -268,12 +306,14 @@ mod tests {
             on_console_key("j", &mut s, ctrl_c),
             ConsoleOutcome::Cancelled(_)
         ));
-        // `q` closes regardless of job state.
+        // `q` yields `Closed` regardless of job state. What the owning overlay
+        // then does is its own choice (see `ConsoleExit`): all but one leave at
+        // once, the serve wizard's still-starting launch asks first.
         assert!(matches!(
             on_console_key("j", &mut s, k(KeyCode::Char('q'))),
             ConsoleOutcome::Closed
         ));
-        // Esc on a RUNNING job closes the overlay (job keeps running in the bg).
+        // Esc on a RUNNING job yields `Closed` too — same handoff as `q`.
         let mut s2 = State::default();
         s2.apply(StateEvent::StartJob {
             id: "j".into(),
@@ -399,7 +439,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+            draw_job_console(f, f.area(), job, (0, 0), 0, ConsoleExit::Immediate, &t);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -421,6 +461,59 @@ mod tests {
     }
 
     #[test]
+    fn running_console_hint_names_the_owners_exit_not_a_fixed_one() {
+        // The hint is the console's own promise about Esc. For an
+        // `Immediate` owner that promise is "close (keeps running)"; for the
+        // one `Confirmed` owner it must NOT say that, because Esc there opens
+        // a question instead. Both wordings are checked from the same job, so
+        // a hint hard-coded back to either case fails on the other row.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        let job = s.job("j").unwrap();
+
+        let render = |exit: ConsoleExit| {
+            let backend = TestBackend::new(100, 30);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| {
+                draw_job_console(f, f.area(), job, (0, 0), 0, exit, &t);
+            })
+            .unwrap();
+            let out: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            out
+        };
+
+        let immediate = render(ConsoleExit::Immediate);
+        assert!(
+            immediate.contains("Esc close (keeps running)"),
+            "an immediate owner still promises a plain close: {immediate:?}"
+        );
+
+        let confirmed = render(ConsoleExit::Confirmed);
+        assert!(
+            confirmed.contains("Esc leave (asks first)"),
+            "a confirming owner must advertise the question: {confirmed:?}"
+        );
+        assert!(
+            !confirmed.contains("keeps running"),
+            "the stale 'close (keeps running)' wording must not survive here: {confirmed:?}"
+        );
+    }
+
+    #[test]
     fn running_status_keeps_compact_chip() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -437,7 +530,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+            draw_job_console(f, f.area(), job, (0, 0), 0, ConsoleExit::Immediate, &t);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -473,7 +566,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+            draw_job_console(f, f.area(), job, (0, 0), 0, ConsoleExit::Immediate, &t);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();

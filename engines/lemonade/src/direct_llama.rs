@@ -142,9 +142,10 @@ pub(crate) fn serve_direct_after_router_failure(
     // would record the service as failed for good (`refresh_from_engine_state`
     // ignores later states once a record is `failed`), so the state says
     // `starting` for the whole fallback and goes to `failed` if the fallback
-    // does not produce a running server. The router's server pid goes too:
-    // `identity_from_state` prefers it over the launcher's, so leaving the dead
-    // router's pid in place would point a `stop` during the fallback at a
+    // does not produce a running server (unless the file has become unusable,
+    // which refuses the mark and is left as it was). The router's server pid
+    // goes too: `identity_from_state` prefers it over the launcher's, so leaving
+    // the dead router's pid in place would point a `stop` during the fallback at a
     // process that is gone (or, once reused, at an unrelated one) instead of the
     // launcher that is about to start the direct server.
     crate::state::merge_json_state(
@@ -408,7 +409,7 @@ fn serve_direct_llama_server_within(
     let mut command = direct_llama_server_command(request, server, model_path);
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
-    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
+    // CLI-managed owner-only key file via `--api-key-file` (a path, not the value, so the
     // secret never lands in the process table). Reusing the managed file rather than
     // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
     // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
@@ -522,9 +523,10 @@ impl DirectServerSteps for RealDirectServerSteps<'_> {
 
 /// Own a just-spawned direct llama-server. Every step after the spawn, state
 /// writes and the final wait included, runs under one guard: any failure stops and
-/// reaps the child (`Child` does not kill on drop) and marks the state `failed`,
-/// so the server can never keep running with no state that stop and health can
-/// reach.
+/// reaps the child (`Child` does not kill on drop), so the server can never keep
+/// running with no state that stop and health can reach, and then marks the state
+/// `failed`. A state file that is empty, torn or not a JSON object refuses that
+/// mark and is left as it was.
 fn supervise_direct_server<S: DirectServerSteps>(
     child: &mut Child,
     state_path: &Path,
@@ -821,7 +823,8 @@ pub(crate) fn resolve_direct_llama_checkpoint(
     // Only the single-checkpoint shape is supported directly. Extra files,
     // multimodal inputs, options and unknown fields belong to Lemonade's router.
     // In the 11.5.1 source, size/suggested describe catalog entries and these
-    // labels classify chat models. Other labels can change launch flags (MTP).
+    // labels classify chat models; 2026.44.1 also tags those models `chat`.
+    // Other labels can change launch flags (MTP).
     if checkpoint.variant.is_none()
         || fields.iter().any(|(key, value)| match key.as_str() {
             "recipe" | "checkpoint" => false,
@@ -829,7 +832,10 @@ pub(crate) fn resolve_direct_llama_checkpoint(
             "suggested" => !value.is_boolean(),
             "labels" => !value.as_array().is_some_and(|labels| {
                 labels.iter().all(|label| {
-                    matches!(label.as_str(), Some("reasoning" | "tool-calling" | "tools"))
+                    matches!(
+                        label.as_str(),
+                        Some("chat" | "reasoning" | "tool-calling" | "tools")
+                    )
                 })
             }),
             _ => true,
@@ -1384,7 +1390,7 @@ mod tests {
     fn simple_registered_models_with_chat_labels_serve_directly() {
         let dir = scratch_dir("registered-labels");
         let manifest = test_manifest(dir.join("runtime"));
-        for label in ["reasoning", "tool-calling", "tools"] {
+        for label in ["chat", "reasoning", "tool-calling", "tools"] {
             write_registry(
                 &manifest,
                 serde_json::json!({"Labelled-GGUF": {
@@ -1399,6 +1405,41 @@ mod tests {
                     Some(DirectLlamaModel::Checkpoint(_))
                 ),
                 "{label}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Admitting `chat` must not let a launch-changing label or field ride along
+    /// with it: any one disallowed entry sends the model to the router.
+    #[test]
+    fn serving_regression_chat_label_with_launch_changing_entry_uses_router() {
+        let dir = scratch_dir("registered-chat-mixed");
+        let manifest = test_manifest(dir.join("runtime"));
+        for (name, labels, mmproj) in [
+            ("mtp after chat", serde_json::json!(["chat", "mtp"]), false),
+            ("mtp before chat", serde_json::json!(["mtp", "chat"]), false),
+            (
+                "unknown after chat",
+                serde_json::json!(["chat", "unknown"]),
+                false,
+            ),
+            ("chat with mmproj", serde_json::json!(["chat"]), true),
+        ] {
+            let mut metadata = serde_json::json!({
+                "recipe": "llamacpp",
+                "checkpoint": "owner/repo:Q4_0",
+                "labels": labels,
+            });
+            if mmproj {
+                metadata["mmproj"] = serde_json::json!("owner/repo:mmproj.gguf");
+            }
+            write_registry(&manifest, serde_json::json!({"Mixed-GGUF": metadata}));
+            assert!(
+                resolve_direct_llama_model(&manifest, "Mixed-GGUF")
+                    .unwrap()
+                    .is_none(),
+                "{name}"
             );
         }
         fs::remove_dir_all(dir).unwrap();
@@ -1970,11 +2011,11 @@ mod tests {
     #[test]
     fn direct_serve_binary_finds_build_numbered_nesting() {
         // Some Lemonade llama.cpp releases extract one level deeper than
-        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b9752/llama-server`.
+        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b11580/llama-server`.
         let dir = scratch_dir("find-server-nested");
         let runtime_dir = dir.join("runtime");
         let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let nested = llamacpp.join("rocm-stable").join("llama-b9752");
+        let nested = llamacpp.join("rocm-stable").join("llama-b11580");
         fs::create_dir_all(&nested).unwrap();
         let server = nested.join(platform_binary_name("llama-server"));
         fs::write(&server, b"x").unwrap();
@@ -2406,6 +2447,45 @@ mod tests {
                 "size": 63.0
             }
         })
+    }
+
+    /// The entry for the default small model as the pinned 2026.44.1 release
+    /// ships it: the same checkpoint as in 11.5.1, now also labelled `chat`.
+    #[test]
+    fn the_pinned_release_catalog_entry_for_the_small_model_routes_direct() {
+        let dir = scratch_dir("pinned-release-catalog");
+        let mut manifest = test_manifest(dir.join("runtime"));
+        manifest.backend_name = "vulkan".to_owned();
+        write_registry(
+            &manifest,
+            serde_json::json!({
+                "Qwen3-0.6B-GGUF": {
+                    "checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_0",
+                    "recipe": "llamacpp",
+                    "suggested": true,
+                    "labels": ["chat", "reasoning"],
+                    "size": 0.38
+                }
+            }),
+        );
+        let binary = manifest
+            .runtime_dir
+            .join("bin/llamacpp/vulkan")
+            .join(platform_binary_name("llama-server"));
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"x").unwrap();
+        let route = serving_route(&manifest, &serve_request("Qwen3-0.6B-GGUF"), true).unwrap();
+        let ServeRoute::Direct { model, server } = route else {
+            panic!(
+                "a `chat`-labelled registered GGUF should serve directly, not through the router"
+            );
+        };
+        assert_eq!(server, binary);
+        assert!(
+            matches!(&model, DirectLlamaModel::Checkpoint(found) if found.model_ref() == "unsloth/Qwen3-0.6B-GGUF:Q4_0"),
+            "{model:?}"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

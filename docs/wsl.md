@@ -15,9 +15,9 @@ The AMD WSL path is:
 
 1. Windows 11 with the AMD Adrenalin WSL-capable driver.
 2. WSL2 with Ubuntu 24.04 or newer. Ubuntu 22.04 is not supported: it ships
-   glibc 2.35, below the minimum that every published Lemonade embeddable
-   requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the Lemonade engine cannot
-   start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
+   glibc 2.35, below what the Lemonade embeddable ROCm CLI pins requires
+   (glibc 2.38 and `GLIBCXX_3.4.32`; newer Lemonade releases need more), so
+   the Lemonade engine cannot start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
 
@@ -57,6 +57,16 @@ SHA-256 digest for each published ROCDXG release and checks the `.deb` against
 it; on a mismatch the plan stops before `apt install` runs the package's
 maintainer scripts as root. Nothing needs to be set for this.
 
+The check covers the exact file root installs. The `.deb` is downloaded without
+`sudo`, as whoever runs `rocm`, into a private `mktemp -d` directory, copied by
+root into `/var/cache/rocm-cli/rocdxg/` (which only root can write), checked
+there, then installed from there and removed. It is never staged under a fixed
+name in a shared directory such as `/tmp`, where another local user could
+replace it between the check and the install. A package that fails the check,
+or that `apt` fails to install, is left in that root-only directory; the next
+run for the same version replaces it, and `sudo rm -f
+/var/cache/rocm-cli/rocdxg/*.deb` clears what an abandoned version left.
+
 To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
 Because ROCm CLI has no digest for a release it predates, supply one:
 
@@ -80,9 +90,15 @@ unverified.
 ### Doing it by hand
 
 The equivalent manual steps, for reference or for a host where the CLI is not
-installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
-the package's maintainer scripts as root. `rocm install driver` checks the
-download against a digest pinned in the ROCm CLI source
+installed yet. Do not skip the `sha256sum -c` check, because `apt install`
+runs the package's maintainer scripts as root, and run it on the root-owned
+copy rather than on a file in `/tmp` that another user could swap after it is
+checked. Each command in the chain runs only if the one before it succeeded,
+so a failed download stops the block before the check rather than letting it
+check and reinstall a copy an earlier run left staged. The chain runs in a
+subshell whose exit removes the private download directory either way, and the
+block's exit status is the chain's, so a failed download, check or install
+does not report success. `rocm install driver` checks the root-owned copy against a digest pinned in the ROCm CLI source
 (`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_plan/rocdxg.rs`), which also
 catches a replaced release asset. A digest read from the release page at
 install time catches only a corrupted download. For a version listed in
@@ -94,12 +110,19 @@ ROCDXG_VERSION=<version>
 ROCDXG_SHA256=<64-hex-sha256>
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
-curl -L -o "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb" \
-  "https://github.com/ROCm/librocdxg/releases/download/v${ROCDXG_VERSION}/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
-printf '%s  %s\n' "${ROCDXG_SHA256}" \
-  "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb" | sha256sum -c -
-sudo apt install -y "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
-sudo ldconfig
+ROCDXG_DEB="rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
+ROCDXG_STAGED="/var/cache/rocm-cli/rocdxg/${ROCDXG_DEB}"
+(
+  d="$(mktemp -d)" && trap 'rm -rf "$d"' EXIT &&
+  sudo install -d -m 0755 -o root -g root /var/cache/rocm-cli /var/cache/rocm-cli/rocdxg &&
+  curl -L --fail -o "$d/${ROCDXG_DEB}" \
+    "https://github.com/ROCm/librocdxg/releases/download/v${ROCDXG_VERSION}/${ROCDXG_DEB}" &&
+  sudo install -m 0644 "$d/${ROCDXG_DEB}" "${ROCDXG_STAGED}" &&
+  printf '%s  %s\n' "${ROCDXG_SHA256}" "${ROCDXG_STAGED}" | sha256sum -c - &&
+  sudo apt install -y "${ROCDXG_STAGED}" &&
+  sudo rm -f "${ROCDXG_STAGED}" &&
+  sudo ldconfig
+)
 ```
 
 Source-build alternative. Set `win_sdk` to the Windows SDK version installed on
@@ -185,12 +208,13 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
-Eight entries that are not WSL-specific also run on WSL: `fix-1-arch`,
+Nine entries that are not WSL-specific also run on WSL: `fix-1-arch`,
 `fix-2-unset-override`, `fix-6-path`, `fix-8-wheel-rocm`, `fix-16-vllm-oom`,
-`fix-17-torch-dlpack`, `fix-18-comgr-conflict`, and `fix-19-shm-too-small`.
-`fix-16-vllm-oom` and `fix-17-torch-dlpack` are driven by the error text you
-pass with `--symptom` (or `--symptom-file`) and read nothing from the
-environment or the ROCm install. `fix-18-comgr-conflict` and
+`fix-17-torch-dlpack`, `fix-18-comgr-conflict`, `fix-19-shm-too-small`, and
+`fix-23-vllm-extension-load`.
+`fix-16-vllm-oom`, `fix-17-torch-dlpack` and `fix-23-vllm-extension-load` are
+driven by the error text you pass with `--symptom` (or `--symptom-file`) and
+read nothing from the environment or the ROCm install. `fix-18-comgr-conflict` and
 `fix-19-shm-too-small` apply when you run `rocm diagnose` inside the distro. A
 `--distro` run skips both (see
 [Diagnose a distro from Windows](#diagnose-a-distro-from-windows) later in this
@@ -314,11 +338,43 @@ below.
   entry
 - whether `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`
   (`wsl_librocdxg_beside_runtime`). The runtime opens `librocdxg.so` by name and
-  carries `RUNPATH $ORIGIN`, so a TheRock tarball under `/opt/rocm-<version>`,
+  searches its own directory (`$ORIGIN`; the wheel runtimes' `libhsa-runtime64.so.1`
+  carries it as a `DT_RPATH`, per `readelf -d`), so a TheRock tarball under `/opt/rocm-<version>`,
   which keeps the two side by side and registers nothing with `ldconfig`, loads
   with neither the cache nor the variable. `driver_status` is
   `wsl_rocdxg_ready` when any of the three sources finds the library, and
   `wsl_rocdxg_missing` only when none does
+- a managed wheel runtime whose own `librocdxg.so.1` its runtime does not load
+  (`wsl_runtime_librocdxg` in the text form, `summary.unlinked_runtime_librocdxg`
+  in `--json`; printed only when there is one). The wheel ships
+  `librocdxg.so.1` beside `libhsa-runtime64`, but the runtime opens
+  `librocdxg.so`, which the wheel does not ship (or which is a link to a file
+  that is missing: the loader's `open` fails on a broken link as on an absent
+  file), so it loads the host's copy.
+  A host `rocdxg-roct` older than the runtime expects then fails at first GPU
+  use, for example ROCm 10.2 and 10.3 nightly runtimes against `rocdxg-roct`
+  1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`, then a segmentation
+  fault), while `driver_status` still reads `wsl_rocdxg_ready`, which describes
+  the host's plumbing. Wheel runtime installs and updates (`rocm install sdk`, `rocm update --apply`)
+  link `librocdxg.so` to the runtime's own copy on WSL (tarballs ship both
+  names, and an adopted runtime is never linked); for a runtime installed earlier the line names the
+  `ln -sfn librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same
+  (`-fn` so that it also replaces a dangling `librocdxg.so`; the install replaces
+  one atomically, and leaves alone a `librocdxg.so` that resolves when it is
+  checked; the install refuses at its final check if the name resolves by then,
+  and a name that becomes a working link between that check and the rename is
+  replaced). The
+  versioned name is the fixed `librocdxg.so.1`: a wheel whose soname changes is
+  not detected or linked, and a dangling `librocdxg.so` beside a runtime with no
+  `librocdxg.so.1` is not detected. A `librocdxg.so.1` that is itself dangling or
+  a link loop is not listed or linked either, and is deliberately not reported
+  (nothing valid to link to).
+  The mechanism (the unversioned open skipping the runtime's directory and
+  landing on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2
+  nightly; which component requests `hsaKmtSetPersistingCacheSize` is not
+  identified. The line is a pointer, not a verdict: it appears for every such runtime,
+  including ones that work with the host's copy, because the files alone do not
+  say which symbols the runtime needs
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
