@@ -17,8 +17,8 @@ mod single_report;
 pub use consolidated::html::{RunMeta, generate_consolidated};
 pub use consolidated::markdown::consolidated_summary_markdown;
 pub use consolidated::{
-    ADVISORY_QUEUE_MARKER, PlatformReports, artifact_name_for_platform_slug, load_platform_reports,
-    queue_artifact_name, queue_lane_gpu,
+    ADVISORY_QUEUE_MARKER, PlatformReports, PlatformStatus, artifact_name_for_platform_slug,
+    load_platform_reports, platform_status, queue_artifact_name, queue_lane_gpu,
 };
 pub use parse::{XfailReport, evaluate_xfail, scenario_results_by_id};
 pub use single_report::generate;
@@ -36,3 +36,30 @@ pub use single_report::generate;
 /// typo previously would not fail to compile or fail a test, silently turning
 /// `@requires-oom-fault-injection` into a skip (green suite, zero coverage).
 pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
+
+/// Environment variable in which a CI lane declares whether it has a GPU.
+///
+/// `1` means the lane runs on GPU hardware, so the `e2e-cucumber` harness fails
+/// before any scenario runs when its capability probe finds no usable AMD GPU,
+/// and after the run when no `@requires-gpu` (or `@requires-multi-gpu`)
+/// scenario executed. `0` means the lane deliberately has no usable GPU (the
+/// WSL lanes, whose distro is left without ROCm's WSL driver bridge). Unset or
+/// empty leaves the lane undeclared, as on the GitHub-hosted lanes and local
+/// runs; any other value is an error.
+///
+/// Shared by the harness, which reads it, and xtask's workflow contract test,
+/// which checks that every self-hosted E2E lane sets it, so the two cannot name
+/// different variables.
+pub const EXPECT_GPU_ENV: &str = "E2E_EXPECT_GPU";
+
+/// File the pre-warm leaves in the shared runtimes directory when the serving
+/// engine cannot be installed for a reason that is no failure of the lane.
+///
+/// It sits in `E2E_SHARED_RUNTIMES_DIR`; its content is the reason the suite
+/// reports for each scenario skipped because of it.
+///
+/// Shared between the producer (`xtask e2e-prewarm`) and the consumer
+/// (`e2e_cucumber::capability`) for the reason [`OOM_FAULT_INJECTION_ENV`] is:
+/// a name that drifts apart turns the skip into a silent no-op, and the
+/// scenarios then fail one by one instead.
+pub const ENGINE_NOT_APPLICABLE_MARKER: &str = "e2e-engine-not-applicable.txt";

@@ -67,6 +67,7 @@ use crate::gpu_policy::{
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
 use crate::serve_port;
+use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
     ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
     engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
@@ -79,8 +80,8 @@ use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
     managed_service_reuse_refusal, no_usable_gpu_refusal, print_managed_launch_plain,
-    resolve_endpoint_auth, run_attached_service, start_managed_service, validate_bind_host,
-    wait_begin_client_config,
+    resolve_endpoint_auth, run_attached_service, scripted_managed_engine_startup_failure,
+    start_managed_service, validate_bind_host, wait_begin_client_config,
 };
 use crate::{
     GatedEngineAction, SandboxToolArg, cli_progress, device_policy_name,
@@ -420,17 +421,17 @@ fn aim_board_note(
 /// policy, on a host the probe *authoritatively* reports as having no usable
 /// AMD GPU.
 ///
-/// Not "exactly when the bail fires". In every build the bail is also skipped
-/// when this gate's own answer is a live service to reuse (`reuse_existing`).
-/// E2E builds add two more skip terms (see the `if` below it), each env-gated
-/// and compiled in only with its feature: `!e2e_simulate_oom_launch()`
-/// (`e2e-oom-fault-injection`, either mode) stands in for the GPU the
-/// fabricated-launch scenarios' lane does not have, and `!scripted_free_space` (`e2e-test-hooks`) lets the
-/// Lemonade free-space refusal, which `rocm serve` only reaches past the bail,
-/// be exercised on a GPU-less lane. Under either hook the gate can open while
-/// the bail cannot fire. That is deliberate — the pre-gate must still behave as
-/// it would on a real GPU-less host — and it costs nothing in a shipped binary,
-/// where neither hook term can be true.
+/// Not "exactly when the bail fires", and the difference is only in test-hook
+/// builds: the bail is also waived by `gpu_bail_waived_by_test_hook` in
+/// `serve()` — the scripted Lemonade free-space override, the simulated OOM
+/// launch (either mode), the stand-in engine that exits during startup, and the
+/// scripted engine startup death — each compiled in only with a test feature
+/// and armed by an environment variable. Under any of them the gate can open
+/// while the bail cannot fire. That is deliberate — each stands in for the GPU
+/// its lane does not have, or lets a refusal that `rocm serve` only reaches past
+/// the bail run on a GPU-less lane, so the pre-gate must still behave as it
+/// would on a real GPU-less host — and it costs nothing in a shipped binary,
+/// where none of the terms can be true.
 ///
 /// `host_has_no_usable_gpu` is therefore the bail's own predicate, computed once
 /// by the caller and handed to both, so the two cannot drift apart. They did:
@@ -771,7 +772,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             || selection.env_id.is_some()
             || engine_manages_own_runtime(&selected_engine);
         if can_resolve_model {
-            if engine_manages_own_runtime(&selected_engine) {
+            // Not under the scripted startup death, as for the same call below:
+            // that scenario asserts the launch, and a real runtime download is
+            // exactly what its ungated lane cannot do.
+            if engine_manages_own_runtime(&selected_engine)
+                && !scripted_managed_engine_startup_failure()
+            {
                 ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
             }
             let probe = engine_request::<_, ResolveModelResponse>(
@@ -866,19 +872,24 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // Skipped for cpu_only and when reusing an already-running service (nothing is
     // launched); permissive when availability cannot be probed on this platform
     // (probe returns `None`). The E2E-only launch fault injection (either mode)
-    // stands in for the GPU its lane does not have.
+    // and the startup-exit stand-in engine stand in for the GPU they do not have.
     //
     // The scripted free-space override waives it too: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
     // reaches past this bail.
     let scripted_free_space = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_FREE_SPACE_BYTES").is_some();
-    if !cpu_only
-        && !scripted_free_space
-        && !e2e_simulate_oom_launch()
-        && !reuse_existing
-        && host_has_no_usable_gpu
-    {
+    // The scripted startup-death scenario bypasses the same host precondition, for
+    // the same reason: it asserts what happens *after* a spawn, so it must reach
+    // one without real GPU hardware.
+    //
+    // Every test hook that waives this bail is named here once, so the bail and
+    // `gpu_refusal_waived_for_reuse` below cannot disagree about which ones do.
+    let gpu_bail_waived_by_test_hook = scripted_free_space
+        || e2e_simulate_oom_launch()
+        || crate::service_launch::e2e_simulate_startup_exit()
+        || scripted_managed_engine_startup_failure();
+    if !cpu_only && !gpu_bail_waived_by_test_hook && !reuse_existing && host_has_no_usable_gpu {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
     // The Docker probe comes after every refusal that needs no daemon (the AIM
@@ -887,11 +898,11 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     ensure_engine_allowed_on_platform(&selected_engine, GatedEngineAction::Serve)?;
     // Whether the refusal above was waived *only* because a live service was
     // expected to be reused. `reuse_existing` already implies `!cpu_only` and
-    // `host_has_no_usable_gpu` (the pre-gate requires both), so the scripted
-    // free-space override is the one remaining term. Handed to the spawn, which
+    // `host_has_no_usable_gpu` (the pre-gate requires both), so the test-hook
+    // waiver is the one remaining term. Handed to the spawn, which
     // re-checks reuse authoritatively under the launch lock and raises the
     // refusal itself if the service is gone by then.
-    let gpu_refusal_waived_for_reuse = reuse_existing && !scripted_free_space;
+    let gpu_refusal_waived_for_reuse = reuse_existing && !gpu_bail_waived_by_test_hook;
     // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
@@ -992,9 +1003,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             device_policy_name(&device_policy)
         );
     }
+    // Preparation is skipped for the scripted startup-death scenario too: it
+    // asserts the launch, not the install, and a real runtime download is exactly
+    // what the ungated lane cannot do.
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
         && resolved_model.is_none()
+        && !scripted_managed_engine_startup_failure()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
@@ -1128,10 +1143,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
-            "Starting {model} on {selected_engine}…"
-        )));
+        let starting = serve_progress::starting_label(&model, &selected_engine);
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(starting.clone()));
         spinner.borrow_mut().tick();
+        let mut shown = starting;
+        // Interactive summary (stdout and stderr both terminals) follows
+        // download / load / health until ready or a bounded failure. Piped
+        // output, or a redirected stderr, keeps the historical 45-second
+        // status budget so a serve that never answers does not block CI.
+        // `--wait` keeps waiting past either, until the server answers or dies.
+        let policy = serve_progress::ServeStartupPolicy::for_background_serve(
+            summary_mode,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        );
         // The key is shown when the wait begins, since Ctrl-C or a failed wait
         // would otherwise leave a running authenticated server whose key was never
         // printed. It is then not repeated in the summary below.
@@ -1154,6 +1178,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             require_api_key,
             gpu_refusal_waived_for_reuse,
             wait,
+            &policy,
             // Named with the id the launch resolved to: an already-starting
             // server keeps its own, not the one generated above. The spinner
             // has no id on it, and a non-TTY stderr gets no spinner at all.
@@ -1161,7 +1186,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 spinner.borrow_mut().clear();
                 eprintln!(
                     "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
-                     Follow: rocm logs --service {waiting_on} --follow"
+                     Follow: {}",
+                    crate::service_hints::service_logs_follow_hint(waiting_on)
                 );
                 if let Some(config) = wait_begin_client_config(
                     waiting_on,
@@ -1177,13 +1203,26 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                     print!("{config}");
                 }
             },
-            &mut |_elapsed| spinner.borrow_mut().tick(),
+            &mut |view: &ServeStartupView| {
+                let mut spinner = spinner.borrow_mut();
+                if view.label == shown {
+                    spinner.tick();
+                } else {
+                    shown.clone_from(&view.label);
+                    spinner.set_label(view.label.clone());
+                }
+            },
         );
         // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
         let report = match launched {
             Ok(report) => report,
             Err(error) => {
                 spinner.borrow_mut().clear();
+                if let Some(warning) = supervise_after_launch_error(&error, || {
+                    ensure_background_helper_running_quiet(summary_mode)
+                }) {
+                    eprintln!("{warning}");
+                }
                 return Err(error);
             }
         };
@@ -1403,6 +1442,35 @@ fn collect_serve_notes(
         }
     }
     notes
+}
+
+/// Start supervision after `start_managed_service` failed, when that failure
+/// left a launched server behind. Returns the warning to print when the
+/// helper itself would not start.
+///
+/// Only a startup stop that left the server running
+/// ([`serve_progress::ServeStartupFailed`] with `server_running`) leaves a
+/// process to supervise. A stop on an engine that failed or a process that
+/// exited has already been settled and reported as failed, so the CLI does not
+/// start the helper for it. Other errors either come before the child
+/// exists (the claiming record is written first, as `starting`, and `rocmd`
+/// treats it as any stale start), or from a child that already exited or an
+/// I/O error writing its record, which did not start the helper before this
+/// wait existed either. The startup failure stays the error the user reads; a
+/// helper failure is a warning beside it.
+fn supervise_after_launch_error(
+    error: &anyhow::Error,
+    start_helper: impl FnOnce() -> Result<()>,
+) -> Option<String> {
+    error
+        .downcast_ref::<serve_progress::ServeStartupFailed>()
+        .filter(|stop| stop.server_running)
+        .and_then(|_| start_helper().err())
+        .map(|helper| {
+            format!(
+                "warning: the background helper did not start, so nothing restarts this server if it fails: {helper:#}"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -2262,5 +2330,63 @@ mod tests {
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
         );
+    }
+
+    #[test]
+    fn a_startup_stop_starts_supervision_and_keeps_its_own_error() {
+        use std::cell::Cell;
+        let stop = || -> anyhow::Error {
+            serve_progress::ServeStartupFailed {
+                message: "qwen on vllm stopped making download progress".to_owned(),
+                server_running: true,
+            }
+            .into()
+        };
+        // Row: startup stop, helper starts. Helper called, nothing to warn.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&stop(), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+        assert_eq!(warning, None);
+
+        // Row: startup stop, helper fails. The warning names the helper
+        // error; the startup failure is still what the caller returns.
+        let warning = super::supervise_after_launch_error(&stop(), || anyhow::bail!("no daemon"))
+            .expect("a helper that failed is reported");
+        assert!(
+            warning.starts_with("warning: the background helper did not start"),
+            "{warning}"
+        );
+        assert!(warning.contains("no daemon"), "{warning}");
+
+        // Row: the server ended (engine failed, process exited). It was
+        // settled and reported as failed, so no helper is started to restart
+        // it behind that error.
+        let called = Cell::new(false);
+        let ended: anyhow::Error = serve_progress::ServeStartupFailed {
+            message: "qwen on vllm failed: the server process exited".to_owned(),
+            server_running: false,
+        }
+        .into();
+        let warning = super::supervise_after_launch_error(&ended, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get(), "an ended launch starts no helper");
+        assert_eq!(warning, None);
+
+        // Row: any other launch error. No helper.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&anyhow::anyhow!("spawn failed"), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(
+            !called.get(),
+            "a launch that never ran a server starts no helper"
+        );
+        assert_eq!(warning, None);
     }
 }

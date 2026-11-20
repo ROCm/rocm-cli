@@ -29,6 +29,9 @@ mod backend_alignment;
 mod device_policy;
 mod direct_llama;
 mod footprint;
+// Linux only: Windows `lemond` has no glibc or OpenSSL floor to check.
+#[cfg(any(target_os = "linux", test))]
+mod host_libraries;
 mod install;
 mod llamacpp_backend;
 mod process;
@@ -60,8 +63,12 @@ pub(crate) const ROCM_BACKEND_NAME: &str = "rocm";
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
-const STOP_GRACE: Duration = Duration::from_secs(10);
-/// Lemonade state identifies the actual llama-server process directly.
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(10);
+/// The scope a stop by recorded state uses. The recorded `server_pid` is the
+/// `llama-server` itself on the direct-serve path, but `lemond` on the router
+/// path, which runs the model in a `llama-server` child of its own. A
+/// `Single` stop of `lemond` that escalates to `SIGKILL` can therefore leave
+/// that child running; widening the scope is a follow-up.
 const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Single;
 
 #[derive(Parser)]
@@ -187,8 +194,7 @@ pub fn run_cli() -> Result<()> {
             gpu_selection: crate::device_policy::parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
-            let envelope = read_request()?;
-            print_json(&handle_envelope(envelope))?;
+            print_json(&answer_stdio(&read_request()?))?;
         }
         CommandKind::ServeHttp {
             service_id,
@@ -253,6 +259,11 @@ pub fn builtin_serve_http(
 }
 
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
+    // Refuse a request made for a protocol this engine cannot serve before its
+    // payload is read: in another protocol the payload may mean something else.
+    if let Some(refusal) = rocm_engine_protocol::incompatible_request_response(&envelope) {
+        return refusal;
+    }
     match envelope.method {
         EngineMethod::Detect => {
             deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |_| {
@@ -297,7 +308,10 @@ where
             Ok(response) => EngineResponseEnvelope::success(response),
             Err(error) => EngineResponseEnvelope::failure("request_failed", format_error(&error)),
         },
-        Err(error) => EngineResponseEnvelope::failure("invalid_payload", error.to_string()),
+        Err(error) => EngineResponseEnvelope::failure(
+            rocm_engine_protocol::INVALID_PAYLOAD_CODE,
+            error.to_string(),
+        ),
     }
 }
 
@@ -400,6 +414,22 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .env_root
         .as_deref()
         .map(normalize_runtime_path_for_host);
+    // Refused before anything is downloaded: a `lemond` built against a newer
+    // glibc or OpenSSL than the host has exits at once with a loader error,
+    // which used to reach the user only as "did not become ready".
+    // The line saying what the refusal left undone follows the branch: an
+    // install whose pinned tree is already in place would have downloaded
+    // nothing anyway.
+    #[cfg(target_os = "linux")]
+    crate::host_libraries::refuse_if_host_too_old(
+        rocm_deps::LEMONADE_VERSION,
+        &crate::install::LINUX_LEMOND_NEEDS,
+        &crate::host_libraries::probe_host_libraries(),
+        &crate::footprint::host_refusal_outcome(
+            crate::footprint::pinned_tree_in_place(&paths, env_root.as_deref()).as_deref(),
+        ),
+        crate::host_libraries::host_library_check_disabled(),
+    )?;
     // Announced and space-checked before anything is downloaded: a fresh tree
     // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
     if let Some(preflight) = crate::footprint::plan_install_preflight(
@@ -520,7 +550,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     let serve_request = launch_serve_request(&request, &state_path, &log_path);
     let current_exe =
         std::env::current_exe().context("failed to discover current Lemonade engine binary")?;
-    let args = crate::process::serve_http_command_args(&serve_request);
+    let args = crate::process::serve_http_command_args(&serve_request)?;
     crate::state::write_running_state(
         &serve_request,
         &runtime,
@@ -836,12 +866,21 @@ pub(crate) fn current_unix_millis() -> u128 {
         .as_millis()
 }
 
-fn read_request() -> Result<EngineRequestEnvelope> {
+/// The request text on stdin, read to its end. It is decoded by
+/// [`answer_stdio`], which judges its protocol version first.
+fn read_request() -> Result<String> {
     let mut buffer = String::new();
     std::io::stdin()
         .read_to_string(&mut buffer)
         .context("failed to read stdin for engine request")?;
-    serde_json::from_str(&buffer).context("failed to parse engine request envelope")
+    Ok(buffer)
+}
+
+/// The answer to the request `text` read on stdin: its protocol version is
+/// judged before its method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), then it is handled.
+fn answer_stdio(text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle_envelope)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -995,7 +1034,7 @@ mod tests {
             );
             assert_eq!(serve.model_ref, resolved.canonical_model_id, "{requested}");
             // The wrapper process is started with that same identity.
-            let args = crate::process::serve_http_command_args(&serve);
+            let args = crate::process::serve_http_command_args(&serve).unwrap();
             assert_eq!(args[2], reported, "{args:?}");
         }
     }
@@ -1046,6 +1085,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn write_registry(manifest: &install::LemonadeInstallManifest) {
+        write_registry_with_labels(manifest, &["reasoning"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_registry_with_labels(manifest: &install::LemonadeInstallManifest, labels: &[&str]) {
         let resources = manifest.runtime_dir.join("resources");
         std::fs::create_dir_all(&resources).unwrap();
         std::fs::write(
@@ -1056,7 +1100,7 @@ mod tests {
                     "checkpoint": "owner/serve-test-repo:Q4_0",
                     "suggested": true,
                     "size": 0.38,
-                    "labels": ["reasoning"]
+                    "labels": labels
                 }
             })
             .to_string(),
@@ -1215,6 +1259,50 @@ mod tests {
         assert_eq!(state["model_ref"], "qwen-smoke");
         assert_eq!(state["canonical_model_id"], "qwen-smoke");
         assert_eq!(state["status"], "stopped");
+    }
+
+    /// The pinned 2026.44.1 catalog labels its small chat models `chat`. A serve
+    /// of such a name must take the direct route, not start the router; the
+    /// recorded load method says which one served.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_registered_name_labelled_chat_is_served_directly_through_serve_http() {
+        use crate::test_http::{Reply, fake_runtime, spawn_fixture};
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let manifest = fake_runtime::manifest(dir, 0, None);
+        write_registry_with_labels(&manifest, &["chat", "reasoning"]);
+        install_fake_llama_server(&manifest, "#!/bin/sh\nexit 0\n");
+        let gguf = dir.join(
+            "cache/huggingface/hub/models--owner--serve-test-repo/snapshots/rev/model-Q4_0.gguf",
+        );
+        std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
+        std::fs::write(&gguf, b"gguf").unwrap();
+        let (port, server) = spawn_fixture(Duration::from_secs(10), |recorded| {
+            let chat = recorded.method == "POST";
+            Reply {
+                status: 200,
+                body: if chat {
+                    json!({"choices": [{"message": {"content": "ok"}}]})
+                } else {
+                    json!({"data": [{"id": "Qwen3-0.6B-GGUF"}]})
+                }
+                .to_string(),
+                last: chat,
+            }
+        });
+        let mut request = fake_request(dir, "Qwen3-0.6B-GGUF");
+        request.port = port;
+        let context = fake_context(dir, manifest);
+        serve_http_resolving(request.clone(), |_| Ok(context)).unwrap();
+        server.join().unwrap();
+
+        let state = crate::state::read_service_state(&request.state_path).unwrap();
+        assert_eq!(
+            state["load_response"]["method"], "lemonade-packaged-llama-server",
+            "{state}"
+        );
+        assert_eq!(state["backend_mode"], "lemonade-packaged-llama-server");
     }
 
     #[cfg(target_os = "linux")]
@@ -1593,5 +1681,16 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{model_ref} must still resolve: {error}"));
             assert_eq!(response.canonical_model_id, DEFAULT_MODEL);
         }
+    }
+
+    /// The engine protocol contract, the same check every engine runs: see
+    /// [`rocm_engine_protocol::engine_contract`].
+    #[test]
+    fn stdio_answers_hold_the_engine_protocol_contract() {
+        rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+            "lemonade",
+            answer_stdio,
+            handle_envelope,
+        );
     }
 }

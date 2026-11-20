@@ -84,6 +84,14 @@ pub(crate) fn write_marked_row(
 /// (side effects, audit events) with the printing stays hand-written.
 pub(crate) trait JsonOrText: Serialize {
     fn render_text(&self) -> String;
+
+    /// The JSON form, without the trailing newline. Pretty `serde_json` by
+    /// default; a command whose output can carry text it did not write
+    /// overrides this to keep the wire form ASCII (`rocm diagnose`, see
+    /// `rocm_core::render_diagnose_json`).
+    fn render_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
 }
 
 /// Writes `value` to `writer` as pretty JSON followed by one newline when
@@ -98,7 +106,8 @@ fn write_json_or_text(
     value: &impl JsonOrText,
 ) -> Result<()> {
     let rendered = if json {
-        let mut document = serde_json::to_string_pretty(value)
+        let mut document = value
+            .render_json()
             .context("failed to serialize the command output as JSON")?;
         document.push('\n');
         document
@@ -231,6 +240,39 @@ mod tests {
         assert!(
             chain.contains("failed to serialize") && chain.contains("deliberately unserializable"),
             "unexpected error: {chain}"
+        );
+    }
+
+    /// Serializes fine through serde but overrides `render_json` with one that
+    /// fails, the way `rocm diagnose`'s ASCII rendering can: the hook's own
+    /// error is what has to reach the caller, and nothing may be written.
+    struct RenderJsonFails;
+
+    impl Serialize for RenderJsonFails {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str("serializes fine")
+        }
+    }
+
+    impl JsonOrText for RenderJsonFails {
+        fn render_text(&self) -> String {
+            panic!("JSON mode must not render the text form");
+        }
+
+        fn render_json(&self) -> serde_json::Result<String> {
+            Err(serde::ser::Error::custom("the render_json hook failed"))
+        }
+    }
+
+    #[test]
+    fn a_failing_render_json_hook_is_an_error_and_writes_nothing() {
+        let mut output = Vec::new();
+        let error = write_json_or_text(&mut output, true, &RenderJsonFails)
+            .expect_err("the hook's failure must surface");
+        assert!(output.is_empty(), "nothing is written on failure");
+        assert!(
+            format!("{error:#}").contains("the render_json hook failed"),
+            "unexpected error: {error:#}"
         );
     }
 

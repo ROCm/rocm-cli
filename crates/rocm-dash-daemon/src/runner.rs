@@ -1150,6 +1150,9 @@ pub async fn run_loop(
         if let Some(b) = bench.as_mut() {
             match b.drain() {
                 Ok(rows) if !rows.is_empty() => {
+                    // dash-58 (`dash_steps.rs`) counts this line in the client
+                    // log to know a daemon has read the results; keep the
+                    // wording in step with it.
                     info!(count = rows.len(), "bench rows broadcast");
                     runner.state.apply(StateEvent::BenchmarkRows(rows.clone()));
                     if let Ok(mut br) = bench_ring.lock() {

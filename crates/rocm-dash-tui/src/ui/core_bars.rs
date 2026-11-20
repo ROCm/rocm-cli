@@ -170,6 +170,11 @@ const fn slot(core: usize, n: usize, width: usize) -> (usize, usize) {
     (start, start + bar_w)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "`code` is at most 0xFF, so the code point is always in the Braille Patterns \
+              block; `full_value_fills_block` reaches the largest one on every test run"
+)]
 const fn braille_both_cols(mask: u8) -> char {
     let mut code = 0u32;
     if mask & 0b0001 != 0 {

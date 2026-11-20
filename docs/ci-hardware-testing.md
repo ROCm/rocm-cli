@@ -46,9 +46,18 @@ been removed from `nightly.yml`: they never got a runner. The queue (below) is
 the scheduled run of R9700 (`r9700s`), MI350P (`mi350p`) and W7900
 (`w7900-dual`). The decommissioning of the runners themselves is separate.
 
-A pull request now runs on exactly one Linux GPU node and one Windows GPU
-pool: MI300X (`e2e-gpu`, the only lane where vLLM is the effective engine) and
-the Strix Halo pool (`e2e-gpu-strix-windows` and `e2e-wsl`). The Strix Halo
+A pull request now runs on one Linux GPU silicon and one Windows GPU pool.
+The Linux silicon is MI300X, checked twice:
+
+- `e2e-gpu-queue`, the primary, dispatches `queue-pr-run.yml` on the shared GPU
+  queue and publishes the queue run's release report as the `e2e-gpu-report`
+  cell.
+- `e2e-gpu`, the second, runs on the self-hosted MI300X runner and reports as
+  `e2e-gpu-selfhosted-report`.
+
+vLLM is the effective engine on both; MI300X is the only silicon where it is.
+The Windows pool is the Strix Halo pool (`e2e-gpu-strix-windows` and
+`e2e-wsl`). The Strix Halo
 Ubuntu lane (`e2e-gpu-strix-ubuntu`) no longer starts on `pull_request` or in
 the merge queue; it keeps its `push`/dispatch triggers and also runs nightly
 (`e2e-gpu-nightly-strix` on the same shared Strix pool labels). There is no
@@ -156,20 +165,31 @@ scenario to pass / xfail / skip for that host from its `@id` and
 `@requires-*` tags, a capability probe, and `expectations.toml` — there is no
 separate tier flag or tag filter to maintain.
 
-| Job | Workflow | Platform | Runner labels |
-|---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` |
-| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
-| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
-| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
+| Job | Workflow | Platform | Runner labels | GPU declared (`E2E_EXPECT_GPU`) |
+|---|---|---|---|---|
+| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` | unset |
+| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` | `1` |
+| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` | `1` |
+| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` | `1` |
+| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` | `0` |
 
 On `pull_request` and `merge_group`, `e2e-gpu-strix-ubuntu` is skipped; it still
 runs on `push` and dispatch. Over 7 days 35% of its merge-queue jobs (98 of 281)
 were cancelled at the 45 min cap; the check is not required and the queue does
 not wait for it. On a
-PR the other lanes above run (one Linux node, MI300X, and the Windows Strix Halo
-pool).
+PR the other lanes above run: MI300X (`e2e-gpu`, beside the queue gate
+`e2e-gpu-queue` described earlier) and the Windows Strix Halo pool.
+
+The last column is the lane's declaration of whether it has a GPU. On a lane
+that declares `1`, the harness fails before any scenario runs if its capability
+probe finds no usable AMD GPU, and after the run if no `@requires-gpu` (or
+`@requires-multi-gpu`) scenario executed; on every lane it fails if the probe
+could not read the binary under test or if no scenario executed at all. `nightly.yml`'s self-hosted lanes
+declare the same way (`0` only for `e2e-wsl-nightly`), as does every lane of
+[`run-e2e-lane.sh`](../scripts/run-e2e-lane.sh). `every_self_hosted_lane_declares_whether_it_has_a_gpu`
+in [`workflow_contract.rs`](../xtask/src/workflow_contract.rs) fails when a
+self-hosted lane declares neither. See the [E2E README](../tests/e2e-cucumber/README.md)'s
+"Lane verdict".
 
 `e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
 nightly]` axis: two concurrent legs on the same job, channel-suffixed artifact
@@ -208,8 +228,9 @@ mixed-silicon pool. `every_self_hosted_lane_pins_a_hardware_label` in
 the lane simply passes on the wrong GPU and reports under the label it was
 named for.
 
-No workflow other than [`queue-run.yml`](../.github/workflows/queue-run.yml)
-and [`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) may name the
+No workflow other than [`queue-run.yml`](../.github/workflows/queue-run.yml),
+[`nightly-queue.yml`](../.github/workflows/nightly-queue.yml) and
+[`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) may name the
 `queue-report` label.
 The shared-queue publishing runner carries that label alone, without GitHub's
 default `self-hosted`, OS and architecture labels, so a job reaches it only by
@@ -220,6 +241,39 @@ against mistakes, not evasion. The runner is registered to this repository
 alone, so no runner group reaches it. See
 [nightly-on-the-queue.md](nightly-on-the-queue.md).
 
+`e2e-gpu` starts with a stale-run guard (`pull_request` only). Once the job
+has a runner it asks the API for the PR's state and current head. If the PR is
+closed, or its head differs from the event's head sha, it records `stale` and
+skips every remaining step without failing the job, so the MI300X is free
+within seconds. It is a step because a job-level `if` is evaluated before the
+job is queued. The guard only reads (`pull-requests: read`); it holds no write
+token, because the job runs PR code on a persistent runner. A second job,
+`cancel-stale-run`, on a GitHub-hosted runner with no checkout and
+`actions: write`, then cancels the run, which frees the PR's concurrency group
+and stops its other stale lanes. That follows the split this document already
+draws between internal and external contributors: only a same-repo PR is sent a
+cancel, while a fork PR (an external contributor, whose hardware lanes are held
+for approval where the repository setting requires it, with a read-only token) just has `e2e-gpu`
+skip its steps and the rest of its run continue. A failed cancel is tolerated.
+The consolidated report does not count a lane that skipped itself as a missing
+report, and says so in its summary. `e2e-report` is gated on `always()`, so it
+still runs after the cancel, but its missing-report check is gated on
+`!cancelled()` and is skipped in a cancelled run. The exemption is therefore for
+runs that are not cancelled: a fork PR (no cancel is sent), or a cancel that
+fails or loses a race with the check. If the PR cannot be read, the job runs as
+before. Only the MI300X lane is guarded: a stale run whose MI300X job already
+finished, or never gets to run, keeps its queued Strix jobs until something else
+cancels them. A consequence: a re-run of an older run, or of a PR's run after it
+merged, cancels itself at this step; to test a specific commit on MI300X, push a
+branch or tag at it and use `workflow_dispatch` on that.
+
+The guard treats any API head that differs from the event's as newer, so a read
+that lags a fresh push can end a current run and, for a same-repo PR, cancel all
+of it, non-blocking lanes included. To recover, re-run the cancelled run from the
+Actions tab ("Re-run all jobs"): by then the API reports the current head, so the
+guard passes. If the PR has moved on or merged since, a re-run would cancel
+itself again; use `workflow_dispatch` on the branch instead.
+
 `e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
@@ -227,8 +281,8 @@ resolve to skip here, and known bugs resolve to xfail from
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
 and `e2e-wsl`) run on AMD GPU systems, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
-scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
-described below.
+scenarios that the mock job cannot. The WSL lane declares no usable GPU
+(`E2E_EXPECT_GPU=0`) and its GPU preflight is advisory, as described below.
 
 `e2e-wsl` runs on the DevLab Dispatch pool. Its WSL2/Ubuntu-24.04 distro is
 built fresh inside every job (see above), so there is nothing of its own for
@@ -242,9 +296,13 @@ preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
 with no hand filtering. It covers WSL host detection, the
 Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
 machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
-what the lane is proving out: where it is unavailable the capability probe
-resolves those scenarios to not-applicable and the rest of the suite still
-runs. Scenarios the product deliberately routes around on WSL carry
+what the lane is proving out. The lane declares `E2E_EXPECT_GPU=0` (forwarded
+into the guest through `WSLENV`), because its distro is deliberately left
+without the driver bridge (see "What the WSL distro needs"): the capability
+probe resolves `@requires-gpu` scenarios to not-applicable, the harness prints
+a note saying so rather than failing, and the rest of the suite still runs. If
+the probe finds a usable GPU anyway, the harness notes that the declaration is
+stale and runs the GPU scenarios. Scenarios the product deliberately routes around on WSL carry
 `@requires-bare-metal`;
 scenarios whose premise *is* a WSL host carry `@requires-wsl`, and this is the
 only lane that runs them.
@@ -269,7 +327,9 @@ driver scenarios assert on the plan that command produces — a lane that
 pre-installed it would hand those scenarios a host already in the state the
 command under test exists to reach. That costs no coverage today, because
 `rocm-smi` is absent too, so `@requires-gpu` scenarios resolve to skip either
-way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
+way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`). This is why
+the lane declares `E2E_EXPECT_GPU=0`; a lane that provisions the bridge
+declares `1` instead.
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
 `/dev/dxg` and dxcore alone are not enough, `librocdxg.so` must be present and
@@ -286,7 +346,7 @@ not applicable, instead of failing them on a premise the host cannot meet.
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
 `e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
-pull request runs only the MI300X and Windows Strix Halo pool lanes among them);
+pull request runs only the MI300X (queue and self-hosted) and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
 platforms (it adds MI300X's `e2e-gpu-nightly` and the Strix Halo Ubuntu,
 Windows and WSL2 nightly lanes) with the `@nightly` scenarios included. The
@@ -314,9 +374,10 @@ On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
 wiki, overwriting it each night (the page header names the run, commit and
 date). It skips cancelled runs and runs that consolidated no platforms. It also
-skips (silently, leaving the previous page in place) when `e2e-report-nightly`
-fails, which includes any lane's `release` or `nightly` leg dying before it
-uploads its report. One-time
+runs when `e2e-report-nightly` failed, which includes any lane's `release` or
+`nightly` leg dying before it uploads its report: that is a broken nightly, and
+the grid is then most worth reading. The page guard still leaves the previous
+page in place when the consolidation has no platform table. One-time
 setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
@@ -365,14 +426,14 @@ The narrative job drafts prose from those facts via `actions/ai-inference`
 fail without blocking the table). `publish-release-readiness-wiki` then
 publishes the verdict table, plus the narrative if one was produced, to the
 `Release-Readiness` wiki page, gated on `main`/repo like `publish-e2e-wiki`
-and sharing its one-time wiki setup and skip-on-degenerate-table guard — but
-unlike `publish-e2e-wiki`, it still runs (and publishes an explicit
-"evidence unavailable" notice) when `release-readiness-nightly` fails
-outright, instead of leaving the wiki showing a stale verdict with no sign
-it's stale.
+and sharing its one-time wiki setup and skip-on-degenerate-table guard. Like
+`publish-e2e-wiki`, it still runs after its upstream job failed, and it also
+publishes an explicit "evidence unavailable" notice when
+`release-readiness-nightly` fails outright, instead of leaving the wiki showing
+a stale verdict with no sign it's stale.
 
 The lane artifacts are named canonically (`e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`,
-`e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
+`e2e-gpu-report`, `e2e-gpu-selfhosted-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
 `e2e-gpu-strix-ubuntu-n-2-report`, `e2e-gpu-strix-ubuntu-report`,
 `e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
 `e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
@@ -390,6 +451,59 @@ of the same platform in separate columns. An unrecognised name renders as a
 guessed platform on Linux, which would report a Windows lane as Linux;
 `xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
 against it.
+
+## GPU visibility on the hardware pool
+
+A hardware job does not necessarily get every GPU its host has. On the
+self-hosted pool, and on the shared GPU queue's Linux pods
+([nightly-on-the-queue.md](nightly-on-the-queue.md)), the PCI bus listing
+(`lspci`, `/sys/bus/pci`, and possibly `/sys/class/drm`) describes the whole
+host. What the job can use can be narrower, and shows in what it can read
+through the kernel's compute topology (`/sys/class/kfd/kfd/topology/nodes`)
+and the render nodes (`/dev/dri/renderD*`). On the MI300X lane a job has
+seen eight AMD GPUs on the bus but one kernel GPU node and one render
+device; on the MI350P and Radeon R9700 lanes, one kernel GPU node with
+several AMD GPUs on the bus (their exact bus and render-device counts were
+not recorded). What restricts a job is set outside this repository, by the
+runner's or the queue's own isolation, which this repository cannot verify
+([nightly-on-the-queue.md](nightly-on-the-queue.md#why-it-works-this-way)).
+How many a job gets is a property of the runner, not of the change under
+test, and can differ between lanes and over time.
+
+Write a GPU-count assertion against what the job can reach, never against
+the bus:
+
+- compare against the KFD GPU nodes (nodes reporting a nonzero
+  `gfx_target_version`: read from the node's `properties` file, or from a
+  standalone `gfx_target_version` file where `properties` states none, as the
+  product does), or against the AMD entries in
+  `rocm examine --json`'s `gpus[]`, which is that set whenever KFD reports at
+  least one GPU node: `examine` matches the kernel's GPU nodes to the PCI scan
+  by address;
+- do not assert that the bus count equals the reachable count, in either
+  direction: when KFD reports at least one GPU node, AMD devices on the bus
+  that the kernel does not expose appear only in a `notes` entry, not in
+  `gpus[]`, and a partitioned Instinct shows
+  several GPU nodes for one PCI address;
+- derive the expected number from the host at run time rather than
+  hard-coding it, and gate a premise of more than one GPU with
+  `@requires-multi-gpu`, which counts those same KFD GPU nodes. It falls
+  back to the amdgpu DRM cards where KFD lists no GPU node or `/dev/kfd`
+  exists but its topology cannot be read, a hedge rather than a description
+  of known hardware; on that fallback the count can describe the whole host
+  rather than this job.
+
+examine-17 (`@id:examine-lists-every-gpu-with-its-address-and-target` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature), step
+`assert_gpus_match_kfd_nodes` in
+[examine_steps.rs](../tests/e2e-cucumber/tests/e2e/examine_steps.rs)) is the
+worked example of comparing `gpus[]` with the KFD GPU nodes, though its step
+reads `gfx_target_version` from `properties` only, without the standalone-file
+fallback the first bullet describes. The product side is
+`apply_kernel_gpu_membership` in
+[linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs). A red lane
+where the bus and the kernel disagree is the environment, not a regression:
+re-express the assertion, do not tag it out or weaken it.
 
 ## Engine is not an independently selectable axis
 
@@ -426,8 +540,9 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 - Strix Halo is `gfx1151` on every OS, so all three Strix lanes
   (Ubuntu, Windows, WSL2) and their nightly counterparts are lemonade-only —
   no matrix value turns a Strix lane into a vLLM lane.
-- `e2e-gpu` (MI300X) is the only per-PR lane where vLLM is the effective
-  engine.
+- MI300X is the only silicon where vLLM is the effective engine, so the
+  per-PR vLLM lanes are the two MI300X checks: `e2e-gpu-queue` (on the queue)
+  and `e2e-gpu` (self-hosted).
 - Adding a vLLM lane to the default-engine lanes above means adding hardware
   from a vLLM-eligible family, not adding an `engine:` value to a workflow
   matrix. A scenario that needs a specific engine regardless of host pins it
@@ -442,11 +557,14 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 are not required for merging and so are skipped in the merge queue rather
 than left queued on limited runner capacity or hung at their cap after its PR
 has merged) when the workflow's own `changes` job's
-`serve` path filter is `true`. A new push to a pull request
+`serve` path filter is `true`. That job classifies paths
+through the [classify-changes](../.github/actions/classify-changes/action.yml)
+action that `ci.yml`'s `changes` job uses too, so both workflows read one
+definition of each category. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
-lane: they run only on the Windows Strix Halo and WSL2 lanes (both set
+silicon (`e2e-gpu-queue` and `e2e-gpu`): they run only on the Windows Strix Halo and WSL2 lanes (both set
 `E2E_MERGE_QUEUE` for `merge_group`), and the only vLLM serve
 before a change lands is the per-PR canary (`serve-05`), which runs when the
 `serve` filter matches. **The merge queue has no native Linux GPU lane**: MI300X
@@ -460,16 +578,23 @@ listed `pull_request` activity type) that joins that PR's group and runs only a
 no-op job, so it supersedes the PR's earlier run and frees runners where the
 cancel completes. A run whose job is still queued for a runner may not finish
 cancelling, so it can keep its place in the queue until the runner picks the
-job up.
+job up. For a same-repo PR whose MI300X job is that one, its stale-run guard
+(see Platforms) ends the job as its first step and a hosted job cancels the run;
+the Strix lanes carry no guard.
 
 On a release-branch push, every self-hosted GPU job additionally expands into
 a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three
 legs, each pinning `cargo xtask e2e-prewarm --release-label <leg>` to a
 different TheRock SDK version (`current` tracks the channel's latest;
-`n-1`/`n-2` pin the prior two released versions from
-[`xtask/src/rocm_releases.rs`](../xtask/src/rocm_releases.rs), a static table
-seeded from the official
-[release list](https://rocm.docs.amd.com/en/latest/release/versions.html)).
+`n-1`/`n-2` pin the prior two final releases, read at run time from the
+release channel's package indexes by
+[`xtask/src/rocm_releases.rs`](../xtask/src/rocm_releases.rs)). The lookup
+merges the ROCm 7 and ROCm 10 indexes and fails if either is unreachable
+(each listing is fetched with up to three `curl` retries), so a new release
+moves the pins with no edit. The `changes` job resolves the pins once with
+`cargo xtask release-pins` and hands them to every leg as `E2E_RELEASE_PINS`,
+so all legs of one run pin the same versions even if a release is published
+mid-run.
 Off a release-branch push the matrix resolves to `[current]` only, so an
 ordinary PR run is unaffected. Each leg uploads its own artifact (the
 `-n-1`/`-n-2` suffix above); the pre-warm's runtime-key design lets all three
@@ -490,7 +615,10 @@ that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — s
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
 filter is forced `true`, so the full matrix (minus MI300X and Strix Ubuntu
-in the merge queue) always runs there. Unlike the
+in the merge queue) always runs there. It is also forced `true` on a pull
+request that changes a file that neither a category of the action nor its
+`inert` list (files no gated job reads, such as the issue templates) names, so
+a new kind of file runs the matrix until it is classified. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
@@ -524,6 +652,65 @@ Dispatch the GPU lanes with, e.g.:
 ```bash
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
+
+## Nightly lanes that never get a runner
+
+GitHub cannot time a job out while it waits for a runner: `timeout-minutes`
+only counts once a runner has taken the job, and a job that is still queued
+after 24 hours is cancelled. A lane whose runner pool is offline or saturated
+therefore held `nightly.yml` pending for a day, and the report and readiness
+jobs, which wait on every lane, never ran.
+
+`nightly.yml` bounds that wait itself:
+
+- `e2e-lanes-settled` stands in for the lanes in the report job's `needs`. It
+  polls the run's own job list
+  ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
+  once every lane leg has finished or can be given up on: a leg still queued
+  after `QUEUE_DEADLINE_MINUTES` (60, or the `queue_deadline_minutes` dispatch
+  input) is abandoned unless another leg of the same lane has started or
+  finished (a pool with one runner serves a lane's `release` and `nightly` legs
+  one after the other, so the queued leg is waiting its turn, not unserved).
+  A leg that started, or that is queued behind a started sibling, is waited for
+  but abandoned at `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold
+  the wait either.
+  A lane that starts just inside the queue deadline still has its full
+  `timeout-minutes`, so the script refuses a queue deadline that, plus
+  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
+  minutes, at most 120.
+- `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
+  whatever finished. An abandoned lane has no report artifact, so the report
+  job's missing-report check flags it by name, the consolidated grid shows the
+  gap and readiness reads it as a failed report rather than as success.
+- `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
+  which is what stops the abandoned legs from holding the run open until the
+  24-hour limit. It runs only when something was abandoned or the settle job
+  itself failed or was cancelled (nothing else bounds the wait then; GitHub
+  reports a job killed by its own `timeout-minutes` as `cancelled`), and only
+  after the report and readiness jobs are done, because cancelling the run also
+  skips any job that is still gated on `!cancelled()`. The settle script fails
+  itself when the run's job list stays unreadable for long enough to span the
+  hard deadline, rather than polling until the job's cap.
+
+To try a change to these jobs from a branch without publishing a nightly
+release, dispatch the workflow with `skip_build` set:
+
+```bash
+gh workflow run nightly.yml --ref <branch> -f skip_build=true
+```
+
+Add `-f queue_deadline_minutes=5` to give up on lanes that have no runner after
+five minutes, which exercises the give-up and cancel path without a long wait.
+
+That skips the Linux and Windows builds and the release publish, and runs the
+lanes, the report, readiness and the settle job. The wiki publishers run only
+from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
+
+A lane added to `nightly.yml` must be added to the `LANES` list of
+`e2e-lanes-settled`;
+`nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
+and also fails if a job waits on a lane directly. The per-PR workflow
+does not use this mechanism.
 
 ## The shared pre-warmed runtime
 
@@ -577,6 +764,32 @@ Pre-warm then:
 - activates the runtime a reuse actually means — after a repair that is the
   replacement named by `target=`, not the superseded manifest the line belongs to;
 - ensures the default engine is installed even when the runtime itself is reused;
+- removes the active runtime before deciding when its Python cannot `import
+  torchvision.ops` because torch and torchvision do not match (the
+  `operator torchvision::nms does not exist` error) and the default engine
+  imports torch, so the decision that follows installs afresh. It does not do
+  this for a pre-warm pinned to an exact version, for a runtime the report
+  marks `ahead_of_index`, or when `rocm update` cannot say which: the runtime
+  stays, and the check below fails with the manual advice. Any other import
+  failure is left for the check below. A mismatch that the engine install itself
+  creates on a reused runtime is found by that check, fails this run, and is
+  removed at the start of the next one;
+- then fails the pre-warm if the active runtime's Python cannot `import
+  torchvision.ops`, where the default engine imports torch (every engine but
+  Lemonade; for Lemonade the finding is a warning). A mismatch would otherwise
+  fail each vLLM serve scenario after its readiness timeout. The probe runs the
+  runtime's own interpreter, which is where vLLM installs its packages, with the
+  library directories the runtime's manifest records on the loader path, and is
+  killed after 120 seconds. The error names the runtime; for a mismatch it says
+  to run the pre-warm again, which removes the runtime and reinstalls, and for
+  another failure, or a mismatch the repair declined, it gives the `rocm runtimes uninstall` command with the
+  pre-warm tree's directories. If the runtime was installed by that same run,
+  the installer produced the broken pair and the error says so instead. The
+  check is skipped for a runtime with no torchvision, a tree with no active
+  runtime or no recorded interpreter, and a shared library that fails to load
+  when the manifest records no library directories to supply (a warning). An
+  unreadable `active.json` or registry manifest, a marker without
+  `runtime_key`, or an interpreter that will not start fails the pre-warm;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
   (a pinned build newer than the index must not be rolled back and cannot be
   reproduced from the index, so it is never offered a repair), or when freshness
@@ -611,6 +824,21 @@ that runtime's own stale composition via repair, but never follows
 side-by-side runtime only when no match is found. See
 [`decide()`](../xtask/src/e2e_prewarm.rs)'s doc comment for the full rationale.
 
+Two failures of the pre-warm's installs are not the lane's failure:
+
+- **A server error from the index.** `rocm install sdk` and `rocm update --apply`
+  are run again, up to four attempts a minute apart, when the CLI reports
+  `HTTP 5xx while fetching <url>`. Anything else, a 404 included, fails on the
+  first attempt.
+- **vLLM refusing an unpinned nightly SDK** (`has no static build pin`). The pre-warm
+  records the reason in `e2e-engine-not-applicable.txt` in the runtimes directory,
+  and the suite reports the scenarios that serve with vLLM (serve, bench and chat scenarios, and any that pin the engine) as not applicable
+  instead of running each into the refusal. A pinned nightly, the release channel
+  and every other engine's failure stay fatal. This is temporary: remove it, the
+  marker and its reader in the harness once vLLM wheels for the 10.3 SDK exist and
+  the discover table in
+  [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) has a 10.3 row.
+
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
@@ -621,9 +849,16 @@ it reports. They run with `continue-on-error: false`, so a real
 regression shows red instead of always green. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
-job, naming the lane, rather than silently dropping out of the grid; on a
+job, naming the lane, rather than silently dropping out of the grid (a lane that
+skipped itself as stale is the exception); on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
+
+A lane the harness failed after its run (no scenario executed, or no GPU
+scenario, `@requires-gpu` or `@requires-multi-gpu`, on an `E2E_EXPECT_GPU=1`
+lane) records the reason in its `platform.json`, and its row reads FAIL with the reason under "Needs
+attention: platforms" (step summary and HTML report alike), even when every
+scenario it resolved was a skip.
 
 ### Timeouts on the Strix lanes
 
@@ -663,9 +898,14 @@ required list.
 
 Self-hosted runners are not used for untrusted fork pull requests: GitHub
 does not dispatch self-hosted-runner jobs from an external fork's
-`pull_request` event without explicit approval. The hardware jobs only run
+`pull_request` event without approval (see the repository setting below). The hardware jobs only run
 against branches and PRs within the repository (and on `workflow_dispatch`,
-which requires write access to trigger).
+which requires write access to trigger), unless a maintainer approves a fork
+run (see below). A same-repo PR's token can be granted write scopes, and only the
+GitHub-hosted `cancel-stale-run` job holds one (`actions: write`) in
+`e2e-selfhosted.yml`; the self-hosted jobs, which run PR code, hold read scopes
+only. Whether GitHub requires approval for every fork run or only a first-time
+contributor's is a repository setting, not something these workflows control.
 
 That holds for every self-hosted runner here, and so does its limit: approval
 does not change what an approved fork job may do, and labels do not restrict

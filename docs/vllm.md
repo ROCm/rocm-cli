@@ -20,6 +20,18 @@ runtime check, download, or launch; `rocm engines list` shows the same decision
 as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
 serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
+On Linux and WSL, an installed vLLM is also checked by importing its compiled
+extensions (`vllm._C`, `vllm._rocm_C`, `vllm._C_stable_libtorch`) after `torch`,
+in the runtime's own Python. A wheel built against a different torch than the
+one beside it fails that import: `rocm engines list` then shows
+`runtime: installed, not usable` with the failing module, and
+`rocm serve --engine vllm` starts no server: the engine process exits before starting
+vLLM, and `rocm logs` for the service shows the same guidance. The check is
+best-effort and reports nothing when it cannot run (a vLLM found through
+`ROCM_CLI_VLLM_COMMAND` or on `PATH`, where no Python interpreter is known, a
+`torch` that does not import, a probe that fails for another reason
+or exceeds one minute); an extension absent from the wheel is not a failure.
+
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
@@ -109,15 +121,33 @@ SDK and torch wheels are published for 3.10 to 3.14, and `rocm install sdk
 vLLM install then refuses that runtime; re-running the install with
 `--python-version 3.14` moves it back.
 
-This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
-through *different* rows: they pin different vLLM minors and read vLLM from
-different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
-host from 10.0's production index. Both rows take their torch stack from the
-same `whl-next` index, which is also where `rocm install sdk` resolves either
-SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
-resolves its own torch, torchvision, and torchaudio pins fresh from the row's
-own static version prefixes, instead of reusing what the SDK install resolved.
-The SDK install might have resolved a different torch version than the row pins.
+This route is selected by `major.minor`, so `10.0.0`, `10.1.0` and `10.2.0`
+discover through *different* rows, each pinning its own vLLM minor. `10.0.0` reads
+vLLM from the production index; `10.1.0` and `10.2.0` read it from a separate
+staging host, where AMD stages their vLLM builds. The `10.0.0` and `10.1.0` rows
+take their torch stack from the stable `whl-next` index, which is also where
+`rocm install sdk` resolves those SDKs' own `+rocmX.Y` torch from. For those two
+rows vLLM's discovery is independent of the SDK install: it resolves its own
+torch, torchvision, and torchaudio pins fresh from the row's own static version
+prefixes, instead of reusing what the SDK install resolved. The SDK install might
+have resolved a different torch version than the row pins.
+
+The `10.2.0` row does not discover its torch stack: it keeps the torch,
+torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,
+torchvision `0.29.*`, torchaudio `2.11.*`, all `+rocm10.2.0aDATE`), checks them
+against the row's series and the SDK's ROCm line, and realigns to those exact
+builds from the index the SDK was installed from (the one its runtime manifest
+records, so a nightly SDK uses the nightly index and a release SDK the release
+one; the row's nightly index when no manifest for the SDK's interpreter recorded
+one or the registry could not be read, and the install output says which). A series match
+would not work there: the nightly index serves 10.2 and 10.3 builds side by side and the newest `torch 2.14.*` is a
+`+rocm10.3` build. The staging host's `+rocm10.2.0rcN` torch is not used: it
+requires `rocm==10.2.0rc2` and `amd-torch-device-gfx*==...rc2` payloads that
+staging does not serve. The row has been installed and imported (`import
+vllm._C`) against a 10.2 SDK. A GPU serve has been run on WSL2 only with the
+runtime linked to its own `librocdxg.so`, never against a release SDK, and the 10.2 vLLM
+wheel is published for `linux_x86_64` only. The nightly channel resolves to
+ROCm 10.3, which has no vLLM build and no row.
 
 One value flows the other way. A row's exact torchaudio pin, where it has one
 instead of a series, is also the hardware-verified build `rocm install sdk` pins
@@ -408,6 +438,11 @@ rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
 rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
 ```
 
+The `vllm: ` in that symptom is what lets the diagnosis claim the line for
+vLLM: the line on its own is what any PyTorch program prints. To diagnose your
+own failing line without editing it, name the engine instead:
+`rocm diagnose --symptom '<the error>' --engine vllm`.
+
 ## Engine import failures
 
 A startup failure can also come from the engine failing to import, with no
@@ -446,6 +481,71 @@ user's own line stays visible in the message above it.
 The command only reports. On Linux and WSL it matches the conditional
 engine-reinstall remediation (`fix-17-torch-dlpack`), which `rocm fix` prints
 and does not run.
+
+## Compiled extension load failures
+
+vLLM ships compiled extensions (`vllm/_C*.abi3.so`, `vllm/_rocm_C.abi3.so`,
+`vllm/_moe_C*.abi3.so`). When one of them cannot be loaded, vLLM logs a warning
+such as
+``Failed to import from vllm._C_stable_libtorch with ImportError("...: version `GLIBC_2.38' not found ...")``
+and carries on. The engine fails later, on the first op that extension would
+have registered:
+`AttributeError: '_OpNamespace' '_C' object has no attribute 'get_cuda_view_from_cpu_tensor'`.
+A common cause is an extension built against a newer glibc than the host has,
+for example a wheel that needs glibc 2.38 on Debian 12 (glibc 2.36). A
+reinstall downloads the same wheel, so it does not help.
+
+The startup failure message then adds a paragraph that names the failure and
+points at `rocm diagnose`:
+
+```text
+Detected a vLLM compiled extension that failed to load (<line>).
+For conditional remediation, run `rocm diagnose --symptom '<symptom>'`.
+```
+
+- **When it fires.** The hint needs the `AttributeError` for an op missing from
+  one of vLLM's own op namespaces (`_C`, `_rocm_C`, `_moe_C`, `_C_cache_ops`,
+  and so on). An op missing from a PyTorch namespace such as `_c10d_functional`
+  does not count. The warning alone does not fire it either, because vLLM
+  continues past the warning and the launch may have failed for another reason.
+- **How far back it looks.** The echoed log tail is the last 80 lines, and by
+  the time the engine gives up the API server's own traceback fills them. This
+  hint therefore reads up to the last 2000 lines of the startup log. The engine
+  creates that log afresh for each launch, so the wider window still covers only
+  the launch that failed.
+- **The line it names.** The last `Failed to import from vllm.` warning, when
+  the log has one, because it names the cause (a glibc version, a missing
+  library). Otherwise the `AttributeError` line.
+- **The command it prints.** It quotes the `AttributeError` line when that line
+  is one intact single-quoted argument that `rocm diagnose` recognises. The real
+  line quotes its namespace and op name, so in practice the command quotes the
+  canonical symptom,
+  `vllm: AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor`.
+
+### What `rocm diagnose` needs to see
+
+`_C` is the ordinary name for a compiled extension across the PyTorch ecosystem
+— torchvision, xformers, bitsandbytes, apex, detectron2 and mmcv all ship one,
+and all raise the same `AttributeError: '_OpNamespace' '_C' object has no
+attribute '...'` when theirs fails to load. `rocm diagnose` therefore scores that
+line only when the text also identifies vLLM: the word `vllm`, vLLM's
+`EngineCore` process prefix, or one of its own extension names (`_rocm_C`,
+`_moe_C`, `_C_cache_ops`, `_C_stable_libtorch`). A real log line carries one of
+those — the error arrives as
+`(EngineCore pid=629513) ERROR ... AttributeError: '_OpNamespace' '_C' ...` — and
+so does the command the startup hint prints. A bare `AttributeError` line copied
+out on its own does not: paste the surrounding log lines with it, or run the
+command the startup failure printed.
+
+The other signals this entry scores (`Failed to import from vllm._...`, a
+`vllm/_*.abi3.so` path, `GLIBC_2.NN' not found`) need no such context; a glibc
+error on its own stays a weak signal, well below the match threshold, because
+any binary can print one.
+
+On Linux and WSL that command matches `fix-23-vllm-extension-load`. The fix is
+print-only: `rocm fix` prints a plan that imports each extension inside
+`rocm engines shell vllm` to name the one that fails and why, and does not
+change anything.
 
 ## Tool calling
 

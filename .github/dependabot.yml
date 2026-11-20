@@ -3,16 +3,24 @@ updates:
   # Keep GitHub Actions pinned to SHAs but current: Dependabot reads the version
   # from the trailing `# vX.Y.Z` comment on each `uses:` and opens PRs that bump
   # the SHA when a new release lands, so pinning for supply-chain safety does not
-  # mean going stale.
+  # mean going stale. `/` covers the workflows under .github/workflows only;
+  # Dependabot does not follow a local `uses: ./...` into a composite action, so
+  # each local action's directory is listed too, by name rather than by glob, so
+  # the list can be compared with the actions on disk:
+  # `dependabot_bumps_the_pins_in_every_local_action` (xtask/src/workflow_contract.rs)
+  # fails until a new action under .github/actions/ is added here.
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/classify-changes
     schedule:
       interval: weekly
     # Wait out the window in which a compromised release is typically found and
     # yanked before adopting it. Bumping a pinned SHA is the one moment the pin
     # stops protecting us: the bump PR itself runs the new action's code on CI —
     # including the self-hosted GPU lanes, which every Dependabot PR reaches
-    # because each path filter in ci.yml folds in `.github/workflows/**` — before
+    # because each path category in .github/actions/classify-changes/action.yml
+    # folds in `.github/workflows/**` and `.github/actions/**` — before
     # a human has read the diff. Those runners keep state across jobs, so the
     # blast radius outlives the run. GitHub already applies 3 days by default;
     # published Actions compromises have gone unnoticed for longer than that, so
@@ -23,7 +31,8 @@ updates:
     # merge queue already builds `main` + PR and runs the full required set
     # against that merged tree, so an out-of-date branch is not a merge blocker.
     # Left on `auto`, Dependabot re-pushes every open PR each time `main` moves,
-    # and because every path filter in ci.yml folds in `.github/workflows/**`,
+    # and because every path category in .github/actions/classify-changes/
+    # action.yml folds in `.github/workflows/**` and `.github/actions/**`,
     # each of those re-pushes drags the whole suite — self-hosted GPU lanes
     # included — through a full rerun that changes no outcome. Disable it and let
     # the queue be the thing that reconciles with `main`. Cost: Dependabot also

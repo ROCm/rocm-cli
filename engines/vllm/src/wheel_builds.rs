@@ -332,7 +332,7 @@ mod tests {
         // with no row still fails closed instead of taking the 7.2.3 default
         // pin; other lines (and unparsable text) resolve that default.
         assert_eq!(
-            discover_readers(Some("10.2.0")),
+            discover_readers(Some("10.3.0")),
             DiscoverReaders {
                 row: None,
                 route: VllmInstallRoute::Static,
@@ -540,6 +540,7 @@ mod tests {
             Some("2.11.0.2")
         );
         assert_eq!(verified_torchaudio_release("10.0.0"), None);
+        // The 10.2 row's torchaudio is a series match, hardware-unverified.
         assert_eq!(verified_torchaudio_release("10.2.0"), None);
         assert_eq!(verified_torchaudio_release("7.2.3"), None);
     }
@@ -559,7 +560,11 @@ mod tests {
             verified_torch_stack_series("10.0.0"),
             Some(("2.12", "0.27"))
         );
-        assert_eq!(verified_torch_stack_series("10.2.0"), None);
+        assert_eq!(
+            verified_torch_stack_series("10.2.0"),
+            Some(("2.14", "0.29"))
+        );
+        assert_eq!(verified_torch_stack_series("10.3.0"), None);
         assert_eq!(verified_torch_stack_series("7.2.3"), None);
     }
     /// An unknown 10.x line fails closed rather than silently resolving the
@@ -567,7 +572,7 @@ mod tests {
     /// [`rocm_sdk_major_matches`] alongside the narrower row lookup.
     #[test]
     fn unknown_rocm10_line_still_fails_closed() {
-        let err = install_target(None, Some("10.2.0")).expect_err("10.2.0 has no vLLM build");
+        let err = install_target(None, Some("10.3.0")).expect_err("10.3.0 has no vLLM build");
         let rendered = format!("{err:#}");
         assert!(
             !rendered.contains("7.2.3"),

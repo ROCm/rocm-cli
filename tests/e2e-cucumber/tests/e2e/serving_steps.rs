@@ -74,10 +74,9 @@ fn serve_timeout_secs() -> u64 {
 
 /// Serve-readiness timeout for a scenario: a per-scenario override set by the
 /// `before` hook takes precedence over the global `E2E_SERVE_TIMEOUT_SECS` /
-/// default. The override is a `@serve-timeout:<secs>` tag on an expected-pass
-/// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
-/// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
-/// it fails fast).
+/// default. The override is an `expectations.toml` xfail `serve_timeout_secs`
+/// (shorten a known-bug serve so it fails fast), else a `@serve-timeout:<secs>`
+/// tag (lengthen a genuinely slow serve, e.g. a large model).
 pub(crate) fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override
@@ -96,9 +95,25 @@ pub(crate) async fn model_is_ready(
     expect_model: Option<&str>,
     timeout_secs: u64,
 ) -> bool {
+    model_is_ready_with_key(models_url, expect_model, timeout_secs, None).await
+}
+
+/// [`model_is_ready`] against an endpoint protected by `api_key`, which a
+/// keyless listing would only ever see refused.
+async fn model_is_ready_with_key(
+    models_url: &str,
+    expect_model: Option<&str>,
+    timeout_secs: u64,
+    api_key: Option<&str>,
+) -> bool {
+    let client = reqwest::Client::new();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
-        if let Ok(resp) = reqwest::get(models_url).await
+        let mut request = client.get(models_url);
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+        if let Ok(resp) = request.send().await
             && resp.status().is_success()
         {
             match expect_model {
@@ -216,19 +231,46 @@ async fn serve_and_wait(
     model: &str,
     ready_substr: &str,
 ) -> String {
+    serve_and_wait_with_key(world, args, model, ready_substr, None).await
+}
+
+/// [`serve_and_wait`], protecting the endpoint with `api_key` when one is
+/// given: `--require-api-key` is appended and the key travels in
+/// `ROCM_SERVE_API_KEY`, never argv, which is recorded verbatim in the
+/// uploaded `results/commands.jsonl`.
+async fn serve_and_wait_with_key(
+    world: &mut E2eWorld,
+    args: &[&str],
+    model: &str,
+    ready_substr: &str,
+    api_key: Option<&str>,
+) -> String {
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
+    // The key goes through `ROCM_SERVE_API_KEY`, as `rocm serve --help`
+    // advises, not `--api-key`: argv is recorded verbatim in the uploaded
+    // `results/commands.jsonl`.
+    let mut args = args.to_vec();
+    let mut envs = Vec::new();
+    if let Some(key) = api_key {
+        args.push("--require-api-key");
+        envs.push(("ROCM_SERVE_API_KEY", key));
+    }
+    let args = args.as_slice();
     // Bounded: a `rocm serve` that never returns must fail this scenario, not
     // stall the lane until the job is cancelled. The bound is the readiness
     // timeout plus a margin, so a slow cold start fails through the CLI's own
     // diagnostic rather than a harness kill; readiness polling keeps the plain
     // timeout.
-    let (stdout, stderr, rc) = crate::run_rocm_bounded(
+    let (stdout, stderr, rc) = crate::run_rocm_bounded_with_env(
         world,
         args,
+        &envs,
         e2e_cucumber::serve_log::serve_cli_budget(timeout_secs),
     );
-    if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
+    if rc == 0
+        && model_is_ready_with_key(&MODELS_URL, Some(ready_substr), timeout_secs, api_key).await
+    {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
         return stdout;
@@ -624,9 +666,339 @@ fn claim_relaunch() -> bool {
         .is_ok()
 }
 
+#[when("the user serves a model on GPU under a real terminal")]
+async fn user_serves_gpu_model_under_pty(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    // Same free-port precondition as `serve_gpu_model`: a leaked server from a
+    // prior scenario would answer for this one.
+    let _ = ensure_serve_port_free().await;
+    // Summary mode (the interactive status line) is `stdout is a terminal` and
+    // neither `--verbose` nor `--foreground`, so the PTY is the whole setup.
+    let session = TuiSession::spawn(world, &["serve", model, "--engine", engine, "--managed"])
+        .unwrap_or_else(|e| panic!("failed to spawn `rocm serve` under a pty: {e}"));
+    world.tui = Some(session);
+}
+
+/// The id the wait line's `rocm logs --service <id> --follow` names.
+fn followed_service_id(screen: &str) -> Option<String> {
+    let rest = screen.split("rocm logs --service ").nth(1)?;
+    let id = rest.split_whitespace().next()?;
+    Some(id.trim_matches('\'').to_owned())
+}
+
+#[then("the terminal names the command that follows the server's log")]
+async fn terminal_names_log_command(world: &mut E2eWorld) {
+    let timeout = Duration::from_secs(serve_timeout_for(world));
+    let session = world.tui.as_mut().expect("no pty session for `rocm serve`");
+    session
+        .wait_for_screen("rocm logs --service ", timeout)
+        .await
+        .unwrap_or_else(|e| panic!("the wait line never named a log command: {e}"));
+    let screen = session.screen_text();
+    assert!(
+        screen.contains("Ctrl-C stops waiting"),
+        "the wait line does not say Ctrl-C stops waiting, not the server:\n{screen}"
+    );
+    followed_service_id(&screen)
+        .unwrap_or_else(|| panic!("no service id after `rocm logs --service`:\n{screen}"));
+}
+
+#[then("the named log command runs successfully")]
+async fn named_log_command_runs(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no pty session for `rocm serve`")
+        .screen_text();
+    let id = followed_service_id(&screen)
+        .unwrap_or_else(|| panic!("no service id after `rocm logs --service`:\n{screen}"));
+    // Without `--follow`, which never returns. The same id and subcommand the
+    // hint names, so a hint that points at nothing fails here.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--service", &id]);
+    assert_eq!(
+        rc, 0,
+        "`rocm logs --service {id}` failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[then("the serve exits cleanly and the endpoint lists the model")]
+async fn serve_exits_and_endpoint_lists_model(world: &mut E2eWorld) {
+    let timeout = Duration::from_secs(serve_timeout_for(world));
+    let (_, _, ready_substr) = host_serve_target();
+    world
+        .tui
+        .as_mut()
+        .expect("no pty session for `rocm serve`")
+        .assert_exits_cleanly("the interactive serve", timeout)
+        .await;
+    assert!(
+        model_is_ready(&MODELS_URL, Some(ready_substr), 30).await,
+        "serve exited 0 but {} does not list {ready_substr}",
+        MODELS_URL.as_str()
+    );
+    world.endpoint = Some(SERVE_BASE_URL.to_string());
+}
+
+#[given("a managed engine will exit while it starts")]
+async fn arm_startup_exit_stand_in(world: &mut E2eWorld) {
+    // Consumed by `e2e_simulate_startup_exit` in
+    // `apps/rocm/src/service_launch/readiness.rs`; spelled out on both sides
+    // for the same reason as `ROCM_E2E_SIMULATE_OOM_LAUNCH`. A typo does not
+    // arm the stand-in, the no-GPU pre-flight refuses, and the Then steps fail.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_STARTUP_EXIT", "1".into()));
+}
+
+#[when("the user serves a model with that engine under a real terminal")]
+async fn serve_with_startup_exit_stand_in(world: &mut E2eWorld) {
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-startup-exit",
+        ],
+    )
+    .unwrap_or_else(|e| panic!("failed to spawn `rocm serve` under a pty: {e}"));
+    let code = session
+        .wait_for_exit_code(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("`rocm serve` did not exit: {e}"));
+    world.tui = Some(session);
+    world.cli_rc = Some(code);
+}
+
+/// The final screen with all whitespace removed: the 80-column PTY wraps the
+/// failure message across rows.
+fn startup_exit_screen(world: &E2eWorld) -> (String, String) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no pty session for `rocm serve`")
+        .screen_text();
+    (screen_without_whitespace(&screen), screen)
+}
+
+/// The id in the failure's "The log is `rocm logs --service <id>`".
+fn failed_launch_service_id(world: &E2eWorld) -> String {
+    let (flat, screen) = startup_exit_screen(world);
+    let marker = "Thelogis`rocmlogs--service";
+    let rest = flat
+        .split(marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the failure does not name `rocm logs --service`:\n{screen}"));
+    let id = rest
+        .split('`')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('\'');
+    assert!(!id.is_empty(), "no service id in the log hint:\n{screen}");
+    id.to_owned()
+}
+
+#[then("the serve fails saying the server process exited")]
+async fn serve_fails_with_process_exited(world: &mut E2eWorld) {
+    let (flat, screen) = startup_exit_screen(world);
+    let code = world.cli_rc;
+    assert!(
+        code.is_some_and(|code| code != 0),
+        "an engine that exited during startup must fail the serve (exit {code:?}):\n{screen}"
+    );
+    assert!(
+        flat.contains("failed:theserverprocessexited"),
+        "the failure must say the server process exited:\n{screen}"
+    );
+    assert!(
+        flat.contains("Theserverdidnotstart"),
+        "the failure must say the server did not start, not that it is still running:\n{screen}"
+    );
+}
+
+#[then("the failure names the command that shows the server's log")]
+async fn failure_names_log_command(world: &mut E2eWorld) {
+    failed_launch_service_id(world);
+}
+
+#[then("that log command shows the engine's last line")]
+async fn log_command_shows_engine_line(world: &mut E2eWorld) {
+    let id = failed_launch_service_id(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--service", &id]);
+    assert_eq!(
+        rc, 0,
+        "`rocm logs --service {id}` failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("e2e stand-in engine: exiting during startup"),
+        "`rocm logs --service {id}` does not show the engine's last line:\n{stdout}"
+    );
+}
+
+#[then("the failed launch is recorded as stopped")]
+async fn failed_launch_recorded_stopped(world: &mut E2eWorld) {
+    let id = failed_launch_service_id(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "list", "--all", "--json"]);
+    assert_eq!(rc, 0, "`rocm services list --all --json` failed:\n{stderr}");
+    let records: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("services list --json did not parse: {e}\n{stdout}"));
+    let status = records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|record| record.get("service_id").and_then(serde_json::Value::as_str) == Some(&id))
+        .and_then(|record| record.get("status").and_then(serde_json::Value::as_str))
+        .unwrap_or_else(|| panic!("no record for {id}:\n{stdout}"))
+        .to_owned();
+    // `stopped`, not `failed`: `rocmd` restarts a `failed` record with no stop
+    // marker, behind the error the user just read.
+    assert_eq!(status, "stopped", "{stdout}");
+}
+
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
     serve_gpu_model(world).await;
+}
+
+/// The key the keyed-serve scenario protects its endpoint with. A fixed value:
+/// what that scenario checks is whether the key is enforced, not how it is minted.
+const PROTECTED_ENDPOINT_KEY: &str = "e2e-protected-endpoint-key-7f3a91c2";
+
+#[given("a model is being served on GPU behind an API key")]
+async fn setup_gpu_model_behind_key(world: &mut E2eWorld) {
+    serve_gpu_model_with_key(world, Some(PROTECTED_ENDPOINT_KEY)).await;
+}
+
+/// Server routes outside the OpenAI `/v1` API that can run the model, read its
+/// tokenizer or report on it. Each must demand the key like `/v1` does; the
+/// bodies are valid requests, so a refusal can only come from authentication.
+fn routes_outside_the_openai_api(
+    model: &str,
+) -> Vec<(reqwest::Method, &'static str, serde_json::Value)> {
+    vec![
+        (
+            reqwest::Method::POST,
+            "/invocations",
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 8,
+            }),
+        ),
+        (
+            reqwest::Method::POST,
+            "/tokenize",
+            serde_json::json!({"model": model, "prompt": "Hello"}),
+        ),
+        (
+            reqwest::Method::POST,
+            "/detokenize",
+            serde_json::json!({"model": model, "tokens": [9707]}),
+        ),
+        (reqwest::Method::GET, "/metrics", serde_json::Value::Null),
+    ]
+}
+
+/// The liveness probe, the one route the middleware answers without the key.
+const HEALTH_ROUTE: &str = "GET /health";
+
+/// Call every route in [`routes_outside_the_openai_api`] and then `GET /health`,
+/// with or without the key, recording each status in `world.route_statuses`.
+async fn call_routes_outside_the_openai_api(world: &mut E2eWorld, api_key: Option<&str>) {
+    let model = world.model_name.clone().expect("no model served");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_mins(2))
+        .build()
+        .expect("http client");
+    let base = format!("http://127.0.0.1:{SERVE_PORT}");
+    world.route_statuses.clear();
+    for (method, path, body) in routes_outside_the_openai_api(&model) {
+        let mut request = client.request(method.clone(), format!("{base}{path}"));
+        if !body.is_null() {
+            request = request.json(&body);
+        }
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+        let status = request
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{method} {base}{path} failed: {e}"))
+            .status()
+            .as_u16();
+        world
+            .route_statuses
+            .push((format!("{method} {path}"), status));
+    }
+    let mut health = client.get(format!("{base}/health"));
+    if let Some(key) = api_key {
+        health = health.bearer_auth(key);
+    }
+    let status = health
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {base}/health failed: {e}"))
+        .status()
+        .as_u16();
+    world.route_statuses.push((HEALTH_ROUTE.to_owned(), status));
+}
+
+#[when("a client calls the server's routes without the key")]
+async fn client_calls_routes_without_key(world: &mut E2eWorld) {
+    call_routes_outside_the_openai_api(world, None).await;
+}
+
+#[when("the client repeats those calls with the key")]
+async fn client_repeats_calls_with_key(world: &mut E2eWorld) {
+    call_routes_outside_the_openai_api(world, Some(PROTECTED_ENDPOINT_KEY)).await;
+}
+
+#[then("every route outside the OpenAI API refuses the call as unauthorized")]
+async fn assert_other_routes_refused(world: &mut E2eWorld) {
+    let others: Vec<_> = world
+        .route_statuses
+        .iter()
+        .filter(|(route, _)| route != HEALTH_ROUTE)
+        .collect();
+    assert!(!others.is_empty(), "no routes were called");
+    let unrefused: Vec<_> = others
+        .into_iter()
+        .filter(|(_, status)| *status != 401)
+        .collect();
+    assert!(
+        unrefused.is_empty(),
+        "routes answered a client without the key instead of 401: {unrefused:?}"
+    );
+}
+
+#[then("the health check answers without the key")]
+async fn assert_health_answers(world: &mut E2eWorld) {
+    let health = world
+        .route_statuses
+        .iter()
+        .find(|(route, _)| route == HEALTH_ROUTE)
+        .expect("the health check was not called");
+    assert!(
+        (200..300).contains(&health.1),
+        "{HEALTH_ROUTE} answered {}; the liveness probe must stay open",
+        health.1
+    );
+}
+
+#[then("every one of those calls succeeds")]
+async fn assert_all_routes_succeed(world: &mut E2eWorld) {
+    assert!(!world.route_statuses.is_empty(), "no routes were called");
+    let failed: Vec<_> = world
+        .route_statuses
+        .iter()
+        .filter(|(_, status)| !(200..300).contains(status))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "routes refused a client presenting the key: {failed:?}"
+    );
 }
 
 #[when("the user serves a model on GPU from the installed runtime")]
@@ -639,6 +1011,12 @@ async fn user_serves_gpu_model_from_installed_runtime(world: &mut E2eWorld) {
 }
 
 async fn serve_gpu_model(world: &mut E2eWorld) {
+    serve_gpu_model_with_key(world, None).await;
+}
+
+/// Serve the host's GPU model, protecting the endpoint with `api_key` when one
+/// is given (`--require-api-key`, so even this loopback bind demands it).
+async fn serve_gpu_model_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
     // explicit engine matching this host. This step is a *precondition* for
     // scenarios that test inference/chat behavior, so it must not fail for
@@ -677,12 +1055,24 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
     for attempt in 1..=attempts {
         made = attempt;
         let device_state = ensure_serve_port_free().await;
-        let (stdout, stderr, rc) = crate::run_rocm_bounded(
+        let mut args = vec!["serve", model, "--engine", engine, "--managed"];
+        // The key goes through `ROCM_SERVE_API_KEY`, as `rocm serve --help`
+        // advises, not `--api-key`: argv is recorded verbatim in the uploaded
+        // `results/commands.jsonl`.
+        let mut envs = Vec::new();
+        if let Some(key) = api_key {
+            args.push("--require-api-key");
+            envs.push(("ROCM_SERVE_API_KEY", key));
+        }
+        let (stdout, stderr, rc) = crate::run_rocm_bounded_with_env(
             world,
-            &["serve", model, "--engine", engine, "--managed"],
+            &args,
+            &envs,
             e2e_cucumber::serve_log::serve_cli_budget(timeout_secs),
         );
-        if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
+        if rc == 0
+            && model_is_ready_with_key(&MODELS_URL, Some(ready_substr), timeout_secs, api_key).await
+        {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
             return;
@@ -878,10 +1268,21 @@ async fn setup_aim_model(world: &mut E2eWorld) {
     serve_aim_canary(world).await;
 }
 
+#[given("a model is being served on aim behind an API key")]
+async fn setup_aim_model_behind_key(world: &mut E2eWorld) {
+    serve_aim_canary_with_key(world, Some(PROTECTED_ENDPOINT_KEY)).await;
+}
+
 /// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
 /// Factored out so the lifecycle-parity scenario can call it a second time,
 /// after stopping the service, without duplicating the image/profile pin.
 async fn serve_aim_canary(world: &mut E2eWorld) {
+    serve_aim_canary_with_key(world, None).await;
+}
+
+/// [`serve_aim_canary`], protecting the endpoint with `api_key` when one is
+/// given (`--require-api-key`, so even this loopback bind demands it).
+async fn serve_aim_canary_with_key(world: &mut E2eWorld, api_key: Option<&str>) {
     // Serves via the raw AIM Docker image reference rather than the catalog
     // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
     // canary pinned to one exact image/profile, not a catalog-discovery test.
@@ -899,7 +1300,7 @@ async fn serve_aim_canary(world: &mut E2eWorld) {
     // (not the Docker image reference) as `model` — confirmed live on Strix
     // Halo.
     let model = "Qwen/Qwen3.5-9B";
-    serve_and_wait(
+    serve_and_wait_with_key(
         world,
         &[
             "serve",
@@ -912,6 +1313,7 @@ async fn serve_aim_canary(world: &mut E2eWorld) {
         ],
         model,
         "Qwen3.5-9B",
+        api_key,
     )
     .await;
 }
@@ -3270,6 +3672,124 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
     );
 }
 
+#[given("a managed vLLM launch whose compiled extension will fail to load")]
+async fn plant_extension_load_launch(world: &mut E2eWorld) {
+    // The `extension-load` mode of the same hook `@id:serve-oom-launch-memory-guidance`
+    // arms, and the premise belongs in the premise step for the same reason.
+    //
+    // What the hook fabricates is only what a GPU-less lane cannot produce: that
+    // the vLLM process died, and the raw startup log it had written when it did
+    // (vLLM's own `Failed to import from vllm._C_stable_libtorch` warning, the
+    // engine core's `AttributeError`, and enough API-server traceback to push
+    // both out of the echoed tail). None of rocm-cli's own wording is planted.
+    // Every sentence the `Then` steps below assert is derived from that log by
+    // `startup_log_context` / `extension_load_failure_hint` in
+    // `engines/vllm/src/startup_diagnostics.rs` — the engine code this scenario
+    // exists to cover, which `@id:diagnose-recognises-a-vllm-extension-load-failure`
+    // cannot reach because it drives `rocm diagnose` and never `rocm serve`.
+    //
+    // Consumed by `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch/readiness.rs`; spelled out on both sides
+    // because the shipped binary's crate must not depend on this harness.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "extension-load".into()));
+}
+
+#[when("the user serves a model on that launch")]
+async fn user_serves_the_failing_extension_launch(world: &mut E2eWorld) {
+    // `--managed` rather than the interactive summary: the surface under test is
+    // the launch failure `rocm serve` reports, which is raised before any
+    // summary is rendered, and plain output keeps the long `rocm diagnose`
+    // command off an 80-column PTY's wrap boundaries.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-extension-load",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the startup failure names the vLLM compiled extension that did not load")]
+async fn assert_extension_load_failure_named(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert_ne!(world.cli_rc, Some(0), "the launch must fail:\n{output}");
+    assert!(
+        output.contains("Detected a vLLM compiled extension that failed to load"),
+        "the startup failure must say what it detected:\n{output}"
+    );
+    // The line it names is the one that carries the *cause*, which in the
+    // planted log is vLLM's import warning — and that line sits far above the
+    // echoed tail, so a hint that only read the tail would name the
+    // `AttributeError` instead and never mention glibc at all.
+    assert!(
+        output.contains("Failed to import from vllm._C_stable_libtorch"),
+        "the failure must name the extension whose import failed:\n{output}"
+    );
+    assert!(
+        output.contains("GLIBC_2.38' not found"),
+        "the failure must carry the loader's own reason:\n{output}"
+    );
+}
+
+#[then("the startup failure points at a diagnose command that reports a cause")]
+async fn assert_extension_load_diagnose_command(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // The real `AttributeError` quotes its namespace, so the printed command
+    // falls back to the canonical symptom. Asserting the exact argument is what
+    // discriminates: a hint that quoted the unquotable raw line, or that fell
+    // back to another entry's canonical symptom, fails here.
+    let command = format!(
+        "rocm diagnose --symptom '{}'",
+        rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+    );
+    assert!(
+        output.contains(&command),
+        "the startup failure must print `{command}`:\n{output}"
+    );
+    // ...and that command must actually report the cause, run as printed, on
+    // this machine. Without this the scenario would pass on a command that finds
+    // nothing, which is the failure mode the canonical symptom exists to avoid.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            rocm_core::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+            "--json",
+        ],
+    );
+    assert_eq!(rc, 0, "{stdout}\n{stderr}");
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("rocm diagnose --json must emit JSON");
+    // The threshold is read out of the report rather than written here, the way
+    // the diagnose scenarios read it, so this cannot drift from the CLI's own.
+    let threshold = report["min_score_for_match"].as_i64().unwrap_or(i64::MAX);
+    let score = report["matched"]
+        .as_array()
+        .and_then(|matches| {
+            matches
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some("fix-23-vllm-extension-load"))
+        })
+        .and_then(|entry| entry["score"].as_i64())
+        .unwrap_or(0);
+    assert!(
+        score >= threshold,
+        "the command the startup failure printed must report the extension-load \
+         cause, scored {score} against a threshold of {threshold}:\n{stdout}"
+    );
+}
+
 /// A managed vLLM launch that became ready, whose engine (a mock) answers
 /// `/v1/models` but fails every chat request with HTTP 500. The launch is
 /// fabricated by the `ready` mode of the same test-only hook that
@@ -4089,6 +4609,160 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
         claim_path.display(),
         std::fs::read_to_string(&claim_path).ok()
     );
+}
+
+/// Arms the scripted startup death. Also waives serve's no-GPU pre-flight and
+/// engine preparation, so the black-box test reaches a real spawn on a host with
+/// neither GPU hardware nor an installed runtime.
+#[given("the managed engine dies during startup")]
+async fn managed_engine_dies_during_startup(world: &mut E2eWorld) {
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
+}
+
+#[then("serving fails and names the engine's own log")]
+async fn assert_startup_death_names_log(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // A binary built without `rocm/e2e-test-hooks` never arms the scripted death:
+    // on a GPU lane it launches a real engine, which this exit-code check is the
+    // first to notice — so it names the feature as the likely cause.
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "an engine that died at startup must fail the serve (if it did not die at \
+         all, check the binary under test was built with `rocm/e2e-test-hooks`):\n{output}"
+    );
+    // See the note in assert_lemonade_preparation_retry_is_bounded: the seam that
+    // scripts the death also waives the no-GPU pre-flight, so this refusal can
+    // only appear when the binary under test was built without the feature. That
+    // diagnosis is specific to a host with no usable GPU, where the pre-flight is
+    // what stops such a binary.
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached the \
+         engine launch:\n{output}"
+    );
+    assert!(
+        output.contains("managed engine exited immediately"),
+        "expected the launch to report the engine's immediate exit:\n{output}"
+    );
+    // The child is detached, so its own log is the only account of why it died —
+    // the user has to be told where it is. The path is read off the record the
+    // launch left behind, not matched as a `.log` suffix that any incidental
+    // mention of a log would satisfy; and it is the path `rocm` itself recorded,
+    // so a Windows 8.3 short form cannot make the comparison disagree with itself.
+    //
+    // The two platforms reach this through different branches of the message.
+    // On Unix the parent redirects the child's stdio into the log, so the dead
+    // child's output is there and the message carries a tail. On Windows the
+    // detached spawn does not redirect, and the scripted child never receives
+    // `--log`, so the log stays empty and only the no-tail branch runs. Naming
+    // the path is the claim both branches share, and it is the one pinned here.
+    let records = lemonade_service_records(world);
+    let log_paths: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["log_path"].as_str())
+        .collect();
+    assert!(
+        !log_paths.is_empty(),
+        "the failed launch left no lemonade service record"
+    );
+    assert!(
+        log_paths.iter().any(|path| output.contains(path)),
+        "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
+    );
+    assert_failed_launches_left_their_claims(&records, 1);
+}
+
+/// Every lemonade service record in the scenario's isolated data folder, read
+/// raw from disk.
+fn lemonade_service_records(world: &E2eWorld) -> Vec<serde_json::Value> {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    std::fs::read_dir(&services)
+        .unwrap_or_else(|e| panic!("no services dir at {}: {e}", services.display()))
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(|record| record["engine"] == "lemonade")
+        .collect()
+}
+
+/// `launches` failed launches of an engine that died at startup each left one
+/// record: `stopped`, and still the claim as it was written.
+fn assert_failed_launches_left_their_claims(records: &[serde_json::Value], launches: usize) {
+    // Read raw from disk, not through `rocm services`, whose liveness refresh
+    // would rewrite the very fields pinned here. `stopped`, not `failed`:
+    // `rocmd`'s recovery restarts a managed `failed` record that carries no stop
+    // marker, which would respawn the launch this serve just reported as failed.
+    let statuses: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["stopped"; launches],
+        "each failed launch must leave its record `stopped`, not claiming the engine \
+         and model"
+    );
+    // The startup check saw the child die, so the record never names it: the
+    // pid is free, and a later stop or cleanup must not signal whatever process
+    // reuses it. On Windows no start-time token was captured for the dead
+    // engine, so nothing else would tell that process from it. Both platforms
+    // leave the claim as it was written, before any child was put on record.
+    let pids: Vec<(serde_json::Value, serde_json::Value)> = records
+        .iter()
+        .map(|record| {
+            (
+                record["supervisor_pid"].clone(),
+                record["engine_pid"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pids,
+        vec![(serde_json::json!(0), serde_json::Value::Null); launches],
+        "a child the startup check saw die must not be named by the record"
+    );
+}
+
+#[when("the user serves the same model again")]
+async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
+    // Re-arm the scripted death: the runner consumes the scenario env on each
+    // invocation, and the retry has to die the same way to be recognisable.
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
+    user_serves_with_failing_lemonade_preparation(world).await;
+}
+
+#[then("that serve reaches the engine launch again and fails the same way")]
+async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
+    // The retry reaches the engine launch again and dies there the same way,
+    // rather than being answered by the first launch's record as an engine already
+    // starting. The `stopped` status asserted by the previous step is what frees
+    // the engine and model for it.
+    let output = serve_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the retry should fail the same way, not succeed:\n{output}"
+    );
+    assert!(
+        output.contains("managed engine exited immediately"),
+        "the retry must reach the engine launch again rather than being turned \
+         away by the previous failed launch:\n{output}"
+    );
+    // The retry's own cleanup left its record the same way, beside the first.
+    assert_failed_launches_left_their_claims(&lemonade_service_records(world), 2);
 }
 
 /// Serve this host's small model on loopback with `--require-api-key`, so the

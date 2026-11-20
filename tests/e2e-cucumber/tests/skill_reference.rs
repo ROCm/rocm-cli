@@ -15,6 +15,12 @@
 //! checks is that the document uses the vocabulary the CLI prints, so the
 //! comparison there can stay a literal one.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

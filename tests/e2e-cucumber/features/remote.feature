@@ -80,6 +80,7 @@ Feature: Working with GPU machines over a private network
     Then the user is given an endpoint and a credential
     And the user is told the endpoint is reachable by the whole network
     And the machine is publishing that endpoint
+    And the session is recorded where only the user can reach it
 
   @id:remote-status-reports-both-halves @requires-docker
   Scenario: remote-11 - Status reports the model and the endpoint separately
@@ -131,3 +132,66 @@ Feature: Working with GPU machines over a private network
     When the user serves a model on that machine
     Then the user is told it is already serving and given the exact command to stop it
     And running that command on the machine stops it
+
+  # A session record names the command this tool runs on the machine. One that
+  # has been edited to name something else must be refused before it reaches
+  # the machine, not merely reported oddly after it ran there.
+  @id:remote-status-refuses-altered-record @requires-docker
+  Scenario: remote-16 - A session record altered to run something else is refused, not run
+    Given a model serving on a reachable GPU machine
+    When the session record is altered to run an extra command on that machine
+    And the user asks about their remote sessions
+    Then the user is told the session record was refused
+    And the extra command never ran on the machine
+
+  # The same refusal without a machine: a record already on disk that names a
+  # remote command this tool never writes. Runs on every lane, because nothing
+  # here reaches the network.
+  @id:remote-status-counts-refused-record
+  Scenario: remote-17 - A refused session record is counted, not reported as no sessions
+    Given a session record on this machine that names a remote command this tool never writes
+    When the user asks about their remote sessions
+    Then the user is told the session record was refused
+
+  @id:remote-stop-names-refused-record
+  Scenario: remote-18 - Stopping a refused session names the record instead of claiming nothing is recorded
+    Given a session record on this machine that names a remote command this tool never writes
+    When the user asks to stop that session
+    Then the user is told the record was refused and how to clear it
+    And the session record is left in place
+
+  @id:remote-status-refuses-misnamed-record
+  Scenario: remote-19 - A session record filed under another session's name is refused
+    Given a session record on this machine filed under a name other than its own session
+    When the user asks about their remote sessions
+    Then the user is told the session record is not named after its session
+
+  # `serve` computes the same session id for the same machine and port, so a
+  # refused record already filed under it blocks the serve. `stop` cannot reach
+  # it, so the refusal must not send the user there.
+  @id:remote-serve-refuses-over-refused-record
+  Scenario: remote-20 - Serving over a refused session record names the record instead of offering stop
+    Given a private network with a GPU machine and a phone
+    And a session record for the GPU machine that names a remote command this tool never writes
+    When the user asks to serve a model on the GPU machine
+    Then the user is told the session record cannot be used and `stop` cannot reach it
+    And the session record is left in place
+
+  # A refused record is never picked, but it still counts when the user names a
+  # session by a fragment: it may be the one they meant, and resolving the name
+  # to the other session would stop a model nobody asked to stop. Both the short
+  # target name and the full peer name a user copies from the tailnet count,
+  # though the record's file name spells the peer name's dots as dashes.
+  @id:remote-stop-fragment-matching-a-refused-record-is-ambiguous
+  Scenario: remote-21 - Stopping by a name that also matches a refused record is refused and names both
+    Given a usable session record and a refused one for the same GPU machine
+    When the user asks to stop the session on that machine by the name "gpu-box"
+    Then the user is told "gpu-box" also matches the refused record
+    And both session records are left in place
+
+  @id:remote-stop-peer-name-matching-a-refused-record-is-ambiguous
+  Scenario: remote-22 - Stopping by the full peer name that also matches a refused record is refused and names both
+    Given a usable session record and a refused one for the same GPU machine
+    When the user asks to stop the session on that machine by the name "gpu-box.example-tailnet.ts.net"
+    Then the user is told "gpu-box.example-tailnet.ts.net" also matches the refused record
+    And both session records are left in place

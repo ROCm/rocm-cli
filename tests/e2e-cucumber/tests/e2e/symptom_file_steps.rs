@@ -306,8 +306,9 @@ async fn told_how_to_end(world: &mut E2eWorld) {
     // The hint's own words. The end-of-input key it names is the one the When
     // step pressed, and the CLI finished because of it -- for the Linux key:
     // the scenario runs on Linux and WSL only, and the Windows key (Ctrl-Z then
-    // Enter) is checked by hand in docs/manual-testing.md section 13. The hint
-    // is wider than the terminal, so where it wraps is ignored.
+    // Enter) is checked by hand in docs/manual-testing.md's "Pasting An Error
+    // Into `rocm diagnose`" section. The hint is wider than the terminal, so
+    // where it wraps is ignored.
     assert!(
         squeeze(screen).contains(&squeeze(
             "Paste the error text, then end it with Ctrl-D at the start of a line \
