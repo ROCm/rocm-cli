@@ -278,13 +278,67 @@ stops being needed, or whose file moves. A new field reuses the helper; a new
 exception is a reviewed entry in that list.
 
 Where it runs: the pre-push hook (`cargo xtask pre-push-check`) selects `xtask`
-for any Rust change, the `windows-debug` job runs `cargo test --workspace` on
-every pull request that changes Rust, and the merge queue and post-merge runs
-test the whole workspace. The Linux pull-request lane (`cargo xtask affected`)
-selects `xtask` for any Rust change too, because its contract tests scan every
-source file (see [CI test selection](#ci-test-selection)), so a pull request that
-touches nothing but `crates/rocm-dash-tui` runs this test on Linux as well. The
+for any Rust change, the `windows-debug` job runs
+`cargo test --workspace --all-targets` on every pull request that changes Rust,
+and the merge queue and post-merge runs test the whole workspace. The Linux
+pull-request lane (`cargo xtask affected`) selects `xtask` for any Rust change
+too, because its contract tests scan every source file (see
+[CI test selection](#ci-test-selection)), so a pull request that touches
+nothing but `crates/rocm-dash-tui` runs this test on Linux as well. The
 module-import contract above has the same property.
+
+### Capability-tagged scenarios name their OS
+
+A capability tag (`@requires-gpu`, `@requires-engine:<e>`, `@requires-docker`
+and the rest) asks what the host has, not which OS it runs, so the Windows GPU
+lane runs every `@requires-gpu` scenario. A scenario whose premise exists on
+one OS only also carries `@requires-os:<os>`, or `@requires-wsl` where the
+premise is WSL2 itself. `@requires-os:linux` still admits WSL2, which reports
+itself as Linux, so add `@requires-bare-metal` too when WSL2 lacks the
+interface. examine-17 is the case that prompted this: its step reads the KFD
+topology, found none on the Windows lane, and passed without asserting
+anything.
+
+[platform_tags.rs](../tests/e2e-cucumber/tests/platform_tags.rs) reads the
+`.feature` files the e2e harness reads by default (every `*.feature` under
+`tests/e2e-cucumber/features/`, recursively, extension in any case), expands
+Scenario Outlines the way cucumber does, and parses each scenario's tags with
+the harness's own `ScenarioDecl::from_tags`. A capability tag there is any
+`@requires-*` tag `ScenarioDecl` reads except `@requires-os:<os>` and
+`@requires-wsl`, the two that decide the OS. It fails on:
+
+- a capability-tagged scenario with neither OS-deciding tag whose `@id` is not
+  in its `ALLOWED_ANY_OS` list, including one with no `@id` at all
+- two scenarios with the same `@id`
+- a tag `ScenarioDecl` reads on a `Feature:` or `Rule:` line, which it never
+  sees there: the harness builds each scenario's `ScenarioDecl` from that
+  scenario's own tags. Other tags there are not reported, since cucumber's own
+  runner reads Feature and Rule tags for `@serial`, `@retry` and `--tags`
+- finding no `.feature` file, or no scenario, which would leave every other
+  check passing over nothing
+- an `ALLOWED_ANY_OS` entry that is listed twice, has an empty reason, names no
+  scenario, names one with no capability tag, or names one whose tags already
+  decide its OS
+
+Each entry's reason says why the scenario's steps hold on every OS a lane runs
+it on. The guard checks only that the OS is decided: whether a Linux scenario
+also needs `@requires-bare-metal` is left to review, and it pins that tag only
+on examine-17. Run it on its own with:
+
+```bash
+cargo test -p e2e-cucumber --test platform_tags
+```
+
+It reads tags, not steps, so whether an entry's reason is still true is a
+review question: a step that starts reading something only one OS has turns
+its entry wrong without failing anything here. Where it runs: the
+`windows-debug` job runs `cargo test --workspace --all-targets` on every pull
+request that changes Rust or a `.feature` file, both of which its `heavy` path
+filter matches, so a tag-only edit is checked there. The Linux `test` job
+(`Test (affected crates)`) runs it whenever `cargo xtask affected` selects
+`e2e-cucumber`, which any change under `tests/e2e-cucumber/` does, a `.feature`
+file included, since that path also passes the job's `rust` path filter. The
+pre-push hook does not run `e2e-cucumber`'s tests.
 
 ### Tests that run a fake executable
 
@@ -1988,12 +2042,17 @@ AIM serve and restart canaries and the AIM endpoint-key check) are `@nightly`
 for cost: each pulls the AIM image and a 9B
 checkpoint on a cold runner and may wait up to 1200s for readiness, which on the
 Strix Ubuntu job, back when it ran on pull requests (about 25 minutes without
-them, 45 minute cap) used up the whole budget. They still need `@requires-engine:aim`,
-i.e. Docker reachable and a Radeon or Strix Halo GPU, so they run only where
-`E2E_INCLUDE_NIGHTLY=1` is set on such a host: the nightly Strix Halo lane, or an
-`include_nightly` dispatch of `e2e-selfhosted.yml` (whose Strix Ubuntu job then
-gets a 125 minute cap). `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins
-the tagging and that they stay reachable when the opt-in is set.
+them, 45 minute cap) used up the whole budget. They still need
+`@requires-engine:aim`, i.e. Docker reachable and a Radeon or Strix Halo GPU,
+and `@requires-os:linux` (the CLI refuses AIM on native Windows), so they run
+only where `E2E_INCLUDE_NIGHTLY=1` is set on such a host, which includes the
+nightly Strix Halo Ubuntu lane (`e2e-gpu-nightly-strix`) and the Strix Ubuntu
+job of an `include_nightly` dispatch of `e2e-selfhosted.yml` (which then gets a
+125 minute cap). The Windows nightly lane (`e2e-gpu-nightly-strix-windows`) is
+excluded by the OS tag; on the WSL2 nightly lane (`e2e-wsl-nightly`) they run
+only if `docker info` succeeds in its distro, which the workflow does not set
+up. `aim_serve_scenarios_stay_off_the_per_pr_lanes` pins the tagging and that
+they stay reachable when the opt-in is set.
 
 All three scenarios skip on a host without Docker; the `e2e-gpu-nightly-strix` job
 logs whether Docker is reachable ("Report whether Docker is reachable").
@@ -4031,8 +4090,10 @@ this harness's platform filter, so selecting a Windows scenario by name or tag
 on Linux runs it against Linux behavior instead of skipping it. The Windows
 install steps also require a native Windows build before any CLI invocation.
 [driver_host_guard.rs](../tests/e2e-cucumber/tests/driver_host_guard.rs) checks
-that ordering without running an installer. Do not run these scenarios on a
-non-Windows host.
+that ordering without running an installer. The same test target also tests the
+native-Windows check itself, and the check that the KFD topology step
+(examine-17) runs to refuse any host but bare-metal Linux.
+Do not run these scenarios on a non-Windows host.
 
 `serve-16` (`@id:serve-absent-gpu-index-rejected`,
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)) runs
@@ -5268,8 +5329,9 @@ selects nothing and the run fails with `0 scenarios executed` (see
   replaces it.
 
 Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-28,
-serve-30 and serve-32 also carry `@requires-os:linux`.
+GPU), so they get their live coverage on the GitHub-hosted mock lane. All four
+also carry `@requires-os:linux`: the usable-GPU probe the no-GPU refusal keys on
+exists only on Linux, so on native Windows that refusal never fires.
 
 The fifth is the pre-gate's other half, and it is the one that needs real
 hardware:

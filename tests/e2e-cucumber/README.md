@@ -195,7 +195,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-dir-permissions` | Premise is a directory that refuses new files once its write bits are cleared. Resolves to **skip** for a user those bits do not bind: root, which is what the self-hosted WSL2 guest runs the suite as. The capability probe's `dir_permissions_bind` clears the write bits on a directory under the temp root and tries to create a file in it. `@requires-os:linux` cannot express this: root on Linux is still `linux`, and the scenario would pass without testing anything. Always **skip** on Windows, which has no such bits. |
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
-| `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
+| `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. A capability tag such as `@requires-gpu` does not decide the OS, so an OS-specific scenario carries this too (or `@requires-wsl` where the premise is WSL2 itself): see "Capability-tagged scenarios name their OS" in [docs/testing.md](../../docs/testing.md). |
 | `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch so `rocm serve`'s summary can be verified without a GPU: one that runs out of GPU memory (the OOM guidance), or, in its `ready` mode, one that becomes ready and then fails its smoke test, or one that dies on a vLLM compiled extension that failed to load - and whatever modes are added next (`e2e_simulate_oom_launch` in [readiness.rs](../../apps/rocm/src/service_launch/readiness.rs) is the list). On Linux the same feature also carries a stand-in engine (`ROCM_E2E_SIMULATE_STARTUP_EXIT=1`) that logs a line and exits during startup, so the interactive startup wait's failure path runs for real. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). A matching xfail row's `serve_timeout_secs` overrides it, even with a shorter value, which also lowers the CLI's own readiness caps. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
@@ -296,7 +296,13 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 3. Implement step functions: Given = setup, When = action, Then = assertion.
 4. Register the module in `tests/e2e.rs` with `pub mod <name>_steps;`.
 5. Run to verify.
-6. If a step needs to fake a subprocess the CLI shells out to (`uv`, a runtime's
+6. If the scenario carries a capability tag (`@requires-gpu`,
+   `@requires-docker`, ...), also decide its OS: add `@requires-os:<os>` or
+   `@requires-wsl`, plus `@requires-bare-metal` where WSL2 lacks the interface,
+   or give its `@id` a reviewed `ALLOWED_ANY_OS` entry with a reason.
+   `cargo test -p e2e-cucumber --test platform_tags` checks it; see
+   [Capability-tagged scenarios name their OS](../../docs/testing.md#capability-tagged-scenarios-name-their-os).
+7. If a step needs to fake a subprocess the CLI shells out to (`uv`, a runtime's
    `python`, `tailscale`), add a `[[bin]]` under [`src/bin/`](src/bin/) rather
    than writing a shell/batch script: it builds on every platform cargo already
    targets. [`fixture_binary`](src/fixture_binary.rs)'s `fixture_binary()`
@@ -306,7 +312,7 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
    [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
    [`fake-tailscale`](src/bin/fake-tailscale.rs), and
    [`fake-gh`](src/bin/fake-gh.rs) for the pattern.
-7. If a step asserts a GPU count, compare it against the GPUs the job can
+8. If a step asserts a GPU count, compare it against the GPUs the job can
    reach, not the cards on the PCI bus: see
    [GPU visibility on the hardware pool](../../docs/ci-hardware-testing.md#gpu-visibility-on-the-hardware-pool).
 

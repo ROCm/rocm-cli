@@ -171,7 +171,7 @@ Feature: TheRock "next" ROCm 10 install layout
   # this line and still be unservable, so this scenario reuses the same
   # serve/chat steps every other engine-canary scenario does rather than
   # stopping at "install reported the right pins".
-  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm
+  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm @requires-os:linux
   Scenario: therock-next-09 - Installing vLLM against a live ROCm 10 preview runtime reports the discovery pins
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK from the ROCm 10 preview source with no family override

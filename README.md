@@ -1609,7 +1609,8 @@ when `ROCR_VISIBLE_DEVICES` is set, because the two orderings can diverge.
 
 #### Reuse is exempt from the no-GPU refusal
 
-Under the default `gpu_required` policy, `rocm serve` on a host with no usable
+Under the default `gpu_required` policy, on Linux (including WSL2), where the
+CLI can probe which GPUs are usable, `rocm serve` on a host with no usable
 AMD GPU fails fast with `no usable AMD GPU detected`, before any engine is
 prepared or downloaded. A `rocm serve` that matches an **already-running
 managed service for the same engine and model** now skips that refusal and

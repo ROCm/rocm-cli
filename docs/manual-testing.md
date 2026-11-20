@@ -1603,10 +1603,9 @@ Expected result:
 
 **Linux or WSL only.** Unlike the rest of this file, the commands below are
 bash, not PowerShell, and they pin `--engine vllm`, which is unsupported on
-native Windows. The behaviour itself is not platform-specific; only this recipe
-for reproducing it is. On native Windows, substitute `--engine lemonade`
-throughout and set the mask with `$env:HIP_VISIBLE_DEVICES = ""` (and clear it
-with `Remove-Item Env:HIP_VISIBLE_DEVICES` afterwards).
+native Windows. The refusal itself is Linux-only too: on native Windows
+`probe_usable_amd_gpu_indices` answers unknown rather than "no GPU", so `serve`
+does not refuse there and this section has nothing to check.
 
 This is a change to a refusal you may be relying on, so check both halves. Mask
 every device to stand in for a host with no usable AMD GPU — the same condition
@@ -2233,7 +2232,7 @@ Expected result:
 
 The automated scenario is the `@nightly` `serve-aim-key-guards-every-route` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature),
-which runs only on a nightly host with Docker and a Radeon or Strix Halo GPU.
+which runs only on a Linux nightly host with Docker and a Radeon or Strix Halo GPU.
 
 ## 12. Background Automation Helper
 

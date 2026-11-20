@@ -179,12 +179,23 @@ state-matrix rule above governs a missing lifecycle state; for a code site a rev
 its disposition (changed, or left and why) goes in the reply to that thread as well as in
 the PR text.
 
-**Platform-gated code gets a test that runs on its gate.** When a `cfg(windows)` path
-cannot be driven by e2e, put its logic behind a pure helper or an injectable function
-(a script runner, a clock) so a unit test runs on the Windows CI job, including the error
-and timeout paths. A value matched across files (a version tag, a sentinel string) gets
-one shared constant and a test tying the producer to the consumer. If a path stays
-untested, say which and why in the PR text.
+**Platform-conditional behavior is verified on the platform it targets.** A change that
+takes effect on one platform only — a `cfg(windows)` or `cfg(unix)` branch, a read of an
+interface one OS alone has (sysfs, a Win32 call), a scenario whose premise is
+OS-specific — names in the PR text that platform and the check that runs there and would
+fail without the change. A test that runs only elsewhere is not that check, and neither
+is one that runs on the target but returns early when its premise is missing. For a
+`cfg(windows)` path e2e cannot drive, put its logic behind a pure helper or an injectable
+function (a script runner, a clock) so a unit test runs on the Windows CI job, including
+the error and timeout paths. A value matched across files (a version tag, a sentinel
+string) gets one shared constant and a test tying the producer to the consumer. If a path
+stays untested, say which and why in the PR text.
+
+**A capability tag is not a platform tag.** A scenario whose premise exists on one OS only
+carries `@requires-os:<os>` (or `@requires-wsl` where the premise is WSL2 itself), plus
+`@requires-bare-metal` where WSL2 lacks the interface, even when `@requires-gpu` or another
+capability tag already gates it; "Capability-tagged scenarios name their OS" in
+[docs/testing.md](docs/testing.md) says why and what checks it.
 
 ## 4) Live State Verification Before Any External Claim
 
@@ -577,7 +588,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 11. User approval obtained for any high-blast-radius external action — *§1*
 12. Force-push's live review/approval state checked before proposing or executing one — *§1*
 13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
-14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
+14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-conditional behavior verified by a check that runs on its target platform — *§3*
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 17. Comments and doc lines this change adds or edits that state how the code behaves checked against that code; each that is the reason for a decision names where the code makes it true — *§3*

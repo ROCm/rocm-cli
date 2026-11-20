@@ -161,7 +161,7 @@ Feature: Runtime lifecycle state machine
   # design and it is never stale — on a lemonade-default host the report would
   # correctly say `services_on_previous_runtime: 0` and asserting a restart there
   # would be a guaranteed false failure. Same reasoning as `serve-11`.
-  @id:runtime-lifecycle-activate-restart-services-succeeds @requires-gpu @requires-engine:vllm
+  @id:runtime-lifecycle-activate-restart-services-succeeds @requires-gpu @requires-engine:vllm @requires-os:linux
   Scenario: runtime-lifecycle-12 - Activating with --restart-services --yes stops and respawns the running server
     Given a managed runtime is active
     And a model is being served on GPU

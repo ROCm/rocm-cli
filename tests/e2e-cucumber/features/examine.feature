@@ -24,8 +24,12 @@ Feature: GPU detection and system inspection
   # from the KFD topology in sysfs, while `examine` reaches its answer through the
   # CLI's own probe. Detection used to look for `gfx_target_version` as a standalone
   # file, which no kernel exposes, and silently fell back to decoding a GC IP
-  # version -- naming an MI300X `gfx943` instead of `gfx942`. Only the GPU lane can
-  # exercise this; there is no KFD topology to read on the mock lane.
+  # version -- naming an MI300X `gfx943` instead of `gfx942`. The cross-check
+  # returns early wherever it cannot read a usable KFD target, so on native
+  # Windows and WSL2 it checks nothing; `assert_gpu_target_matches_kfd` in
+  # examine_steps.rs lists the exact cases. The driver step passes on the
+  # `driver_status` line `examine` always prints, so where the cross-check
+  # returns early the scenario asserts only that `examine` names a gfx target.
   @id:examine-detects-gpu-and-driver @requires-gpu
   Scenario: examine-04 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
@@ -101,15 +105,9 @@ Feature: GPU detection and system inspection
 
   # Leaving the frameworks out is the variant pinned here: the outcome is
   # identical on every host, whereas asserting that a *named* framework was
-  # probed would depend on what happens to be installed.
-  #
-  # @requires-bare-metal because the probe never reaches its framework step on
-  # WSL2 — it returns as soon as it recognises the platform — so `framework`
-  # stays "unknown" there whatever the flag says. That the probe gives up that
-  # early is its own defect, tracked separately; this scenario is about whether
-  # the choice is reachable, and it cannot answer that where no choice is acted
-  # on at all.
-  @id:examine-can-skip-framework-probing @requires-bare-metal
+  # probed would depend on what happens to be installed. The probe honours the
+  # choice on every platform, WSL2 included, so the scenario carries no tag.
+  @id:examine-can-skip-framework-probing
   Scenario: examine-10 - The user can leave the frameworks out of the inspection
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks
@@ -220,11 +218,17 @@ Feature: GPU detection and system inspection
   # fill the field. Where the name does resolve a target, the kernel's target
   # replaces it (see examine-57).
   #
-  # The step no-ops where a premise does not hold -- no readable KFD topology,
-  # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
-  # target -- because on such a host the answer it would otherwise flag is the
-  # correct one.
-  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu
+  # The KFD topology exists only on bare-metal Linux -- native Windows has no
+  # sysfs and WSL2 exposes no KFD nodes -- so the scenario is tagged for that
+  # host. `@requires-gpu` alone let the Windows GPU lane run it, where the step
+  # found no topology and passed without asserting anything.
+  #
+  # The step still no-ops where a premise does not hold on Linux -- no readable
+  # KFD topology, no `lspci` to supply PCI addresses, or a topology whose nodes
+  # disagree on a target -- because on such a host the answer it would
+  # otherwise flag is the correct one. That early return covers a Linux host
+  # missing a premise; it is not a substitute for the OS tags.
+  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu @requires-os:linux @requires-bare-metal
   Scenario: examine-17 - The machine-readable report lists every GPU the kernel sees
     Given a machine with an AMD GPU
     When the user inspects the system both for reading and for scripting
