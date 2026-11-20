@@ -5483,10 +5483,12 @@ row is the backend and ordinal with no name — correct and unspecific, rather
 than specific and wrong. No CI lane has two AMD GPUs, so that branch is covered
 by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
 
-**`rocm examine` prints a `rocm_support` line on every host**, at one of three
-levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only, or unknown.
-Unknown covers both "nothing detected" and "a target this build's catalog does
-not recognise" — conflating the latter with "confirmed to have no ROCm build"
+**`rocm examine` prints a `rocm_support` line on every host**, at one of five
+levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only,
+Vulkan-unconfirmed, no-GPU-backend, or unknown. The three middle levels are
+decided by probing for a Vulkan driver rather than by the gfx table. Unknown
+covers both "nothing detected" and "a target this build's catalog does not
+recognise" — conflating the latter with "confirmed to have no ROCm build"
 would turn a detection gap into a claim about the hardware. `examine-60` holds
 the line against the `detected_gfx_target` and `compatible_therock_family` the
 same report prints, so every lane checks the level its own hardware implies:
