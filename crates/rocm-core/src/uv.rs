@@ -1427,7 +1427,8 @@ All installed packages are compatible
 /// `crate::archive_props`. Extraction here is the system `tar` resolved from
 /// `PATH`, so these exercise the host's `tar` (GNU tar on the Linux CI
 /// runners) through `extract_archive`.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod archive_properties {
     use std::path::Path;
 

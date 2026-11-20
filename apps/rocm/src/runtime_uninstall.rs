@@ -179,17 +179,8 @@ pub(crate) fn plan_runtime_uninstall(
     let manifests = therock::load_runtime_manifests(paths)?;
     let manifest = select_runtime_manifest(&manifests, selector)?.clone();
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    let was_active = current_runtime_manifest(config, &manifests)
-        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
-    let clears_default_runtime = config
-        .default_runtime_id
-        .as_deref()
-        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
-        && (was_active
-            || !manifests.iter().any(|other| {
-                other.runtime_key != manifest.runtime_key
-                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
-            }));
+    let (was_active, clears_default_runtime) =
+        active_and_default_state(config, &manifests, &manifest);
     let install_root_decision = should_remove_runtime_install_root(&manifest)?;
     let holds_lemonade_tree =
         rocm_engine_lemonade::install_tree_dirs(&rocm_engine_lemonade::install_tree_root(
@@ -209,6 +200,31 @@ pub(crate) fn plan_runtime_uninstall(
         lemonade_install_inside,
         holds_lemonade_tree,
     })
+}
+
+/// Whether `manifest` is the runtime `config` has in use, and whether removing
+/// it clears `config.default_runtime_id`: the default names this manifest's
+/// `runtime_id` and either this manifest was the active one, or no other
+/// install in `manifests` shares that id (the id is shared across side-by-side
+/// installs, so removing one sibling does not by itself orphan the default
+/// while others remain). `manifests` includes `manifest`.
+fn active_and_default_state(
+    config: &RocmCliConfig,
+    manifests: &[therock::InstalledRuntimeManifest],
+    manifest: &therock::InstalledRuntimeManifest,
+) -> (bool, bool) {
+    let was_active = current_runtime_manifest(config, manifests)
+        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
+    let clears_default_runtime = config
+        .default_runtime_id
+        .as_deref()
+        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
+        && (was_active
+            || !manifests.iter().any(|other| {
+                other.runtime_key != manifest.runtime_key
+                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
+            }));
+    (was_active, clears_default_runtime)
 }
 
 /// Re-derives the uninstall plan from disk and refuses to proceed if it no
@@ -287,8 +303,8 @@ pub(crate) fn apply_runtime_uninstall(
     let RuntimeUninstallPlan {
         manifest,
         registry_path,
-        was_active,
-        clears_default_runtime,
+        was_active: _,
+        clears_default_runtime: _,
         install_root_decision,
         lemonade_install_inside: _,
         holds_lemonade_tree,
@@ -316,6 +332,60 @@ pub(crate) fn apply_runtime_uninstall(
             )
         })?;
     }
+
+    let (was_active, default_runtime_cleared) = forget_removed_runtime(paths, config, &manifest)?;
+
+    // Decided from the folder actually removed, not from the plan: the record
+    // is only stale once its files are gone.
+    let lemonade_record = removed_install_root
+        .as_deref()
+        .map_or(RecordCleanup::NotAffected, |removed| {
+            rocm_engine_lemonade::forget_install_record_inside(paths, removed)
+        });
+    // An unreadable record says nothing about this runtime unless the runtime
+    // could have held Lemonade; otherwise the line would repeat on every runtime
+    // uninstall for as long as the record stays unreadable.
+    let lemonade_record = match lemonade_record {
+        RecordCleanup::Unreadable(_) if !holds_lemonade_tree => RecordCleanup::NotAffected,
+        other => other,
+    };
+
+    Ok(RuntimeUninstallResult {
+        runtime_id: manifest.runtime_id,
+        runtime_key: manifest.runtime_key,
+        registry_path,
+        removed_install_root,
+        lemonade_record,
+        read_only: manifest.read_only,
+        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
+        was_active,
+        default_runtime_cleared,
+    })
+}
+
+/// Drop every reference the settings and the active-runtime marker hold to
+/// the runtime whose registry entry was just removed, and return whether it
+/// was the active runtime and whether the default runtime was cleared.
+///
+/// Both are decided here, from the settings on disk under the config lock, not
+/// taken from the plan: the plan may be minutes old (the confirmation prompt,
+/// the folder removal), another command may have activated a different runtime
+/// meanwhile, and saving the copy the plan was made from would undo whatever
+/// that command saved. The caller's `config` gets the settings as saved.
+fn forget_removed_runtime(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    manifest: &therock::InstalledRuntimeManifest,
+) -> Result<(bool, bool)> {
+    let lock = RocmCliConfig::lock(paths)?;
+    *config = lock.load()?;
+    // The registry entry is gone, so it is added back for the decision the
+    // plan made with it present.
+    let mut manifests = therock::load_runtime_manifests(paths)?;
+    manifests.retain(|other| other.runtime_key != manifest.runtime_key);
+    manifests.push(manifest.clone());
+    let (was_active, clears_default_runtime) =
+        active_and_default_state(config, &manifests, manifest);
 
     let mut config_changed = false;
     if config
@@ -350,7 +420,7 @@ pub(crate) fn apply_runtime_uninstall(
         config_changed = true;
     }
     if config_changed {
-        config.save(paths)?;
+        lock.save(config)?;
     }
 
     if active_runtime_marker_matches(paths, &manifest.runtime_key)? {
@@ -368,33 +438,7 @@ pub(crate) fn apply_runtime_uninstall(
         // that names the removed runtime is dropped, as the config already did.
         forget_active_runtime_rollback_target(paths, &manifest.runtime_key)?;
     }
-
-    // Decided from the folder actually removed, not from the plan: the record
-    // is only stale once its files are gone.
-    let lemonade_record = removed_install_root
-        .as_deref()
-        .map_or(RecordCleanup::NotAffected, |removed| {
-            rocm_engine_lemonade::forget_install_record_inside(paths, removed)
-        });
-    // An unreadable record says nothing about this runtime unless the runtime
-    // could have held Lemonade; otherwise the line would repeat on every runtime
-    // uninstall for as long as the record stays unreadable.
-    let lemonade_record = match lemonade_record {
-        RecordCleanup::Unreadable(_) if !holds_lemonade_tree => RecordCleanup::NotAffected,
-        other => other,
-    };
-
-    Ok(RuntimeUninstallResult {
-        runtime_id: manifest.runtime_id,
-        runtime_key: manifest.runtime_key,
-        registry_path,
-        removed_install_root,
-        lemonade_record,
-        read_only: manifest.read_only,
-        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
-        was_active,
-        default_runtime_cleared: clears_default_runtime,
-    })
+    Ok((was_active, clears_default_runtime))
 }
 
 pub(crate) fn should_remove_runtime_install_root(
@@ -595,8 +639,10 @@ mod tests {
             config.previous_runtime_key.as_deref(),
             Some(previous.runtime_key.as_str())
         );
-        // The uninstall reads this in-memory config, so nothing is saved.
+        // Saved: the uninstall reads the settings from disk, under the config
+        // lock, not from the copy passed to it.
         config.previous_runtime_key = None;
+        config.save(&paths)?;
         let read_marker = || -> Result<crate::runtime_registry::ActiveRuntimeMarker> {
             Ok(serde_json::from_slice(&fs::read(
                 active_runtime_marker_path(&paths),
@@ -607,7 +653,7 @@ mod tests {
             before.previous_runtime_key.as_deref(),
             Some(previous.runtime_key.as_str())
         );
-        assert_eq!(config.previous_runtime_key, None);
+        assert_eq!(RocmCliConfig::load(&paths)?.previous_runtime_key, None);
 
         uninstall_runtime(&paths, &mut config, &previous.runtime_key)?;
 
@@ -1297,6 +1343,103 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    // ── Settings changed while an uninstall ran ────────────────────
+
+    /// Two installed runtimes, `old` activated and then `new`, so `new` is the
+    /// active runtime and `old` its rollback target, in the settings on disk.
+    fn two_activated_runtimes(
+        paths: &AppPaths,
+    ) -> Result<(
+        therock::InstalledRuntimeManifest,
+        therock::InstalledRuntimeManifest,
+    )> {
+        let old = write_test_pip_runtime(
+            paths,
+            "release-pip-gfx1151-7-13-0",
+            "therock-release:gfx1151",
+            "7.13.0",
+            10,
+        )?;
+        let new = write_test_pip_runtime(
+            paths,
+            "nightly-pip-gfx1151-7-14-0a1",
+            "therock-nightly:gfx1151",
+            "7.14.0a1",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        crate::runtimes_cmd::activate_runtime(paths, &mut config, &old.runtime_key)?;
+        crate::runtimes_cmd::activate_runtime(paths, &mut config, &new.runtime_key)?;
+        Ok((old, new))
+    }
+
+    /// The uninstall changes the settings on disk, not the copy it was handed:
+    /// a setting another command saved after that copy was read survives, and
+    /// so does the uninstall's own change (the rollback target it removed).
+    #[test]
+    fn uninstall_keeps_a_setting_saved_after_its_settings_were_read() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-keeps-newer-setting");
+        let (old, new) = two_activated_runtimes(&paths)?;
+        let mut stale = RocmCliConfig::load(&paths)?;
+        RocmCliConfig::update(&paths, |config| {
+            config.telemetry.mode = rocm_core::TELEMETRY_MODE_OFF.to_owned();
+            Ok(())
+        })?;
+
+        uninstall_runtime(&paths, &mut stale, &old.runtime_key)?;
+
+        let saved = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            saved.telemetry.mode,
+            rocm_core::TELEMETRY_MODE_OFF,
+            "the uninstall saved its stale copy over a newer setting"
+        );
+        assert_eq!(saved.previous_runtime_key, None);
+        assert_eq!(
+            saved.active_runtime_key.as_deref(),
+            Some(new.runtime_key.as_str())
+        );
+        assert_eq!(
+            serde_json::to_value(&stale)?,
+            serde_json::to_value(&saved)?,
+            "the caller gets the settings as saved"
+        );
+        Ok(())
+    }
+
+    /// The plan is made while `new` is active and says the default runtime
+    /// would be cleared. Before it is applied another command activates `old`.
+    /// The uninstall decides again from the settings on disk: `new` is no
+    /// longer the active runtime and the default now names `old`, so the
+    /// default is kept and the result does not report it cleared.
+    #[test]
+    fn uninstall_decides_the_default_from_the_settings_it_changes() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-redecides-default");
+        let (old, new) = two_activated_runtimes(&paths)?;
+        let mut config = RocmCliConfig::load(&paths)?;
+        let plan = plan_runtime_uninstall(&paths, &config, &new.runtime_key)?;
+        assert!(plan.was_active && plan.clears_default_runtime);
+        let mut other_terminal = RocmCliConfig::load(&paths)?;
+        crate::runtimes_cmd::activate_runtime(&paths, &mut other_terminal, &old.runtime_key)?;
+
+        let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
+
+        let saved = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            saved.active_runtime_key.as_deref(),
+            Some(old.runtime_key.as_str())
+        );
+        assert_eq!(
+            saved.default_runtime_id.as_deref(),
+            Some(old.runtime_id.as_str())
+        );
+        assert!(!result.was_active, "{result:?}");
+        assert!(!result.default_runtime_cleared, "{result:?}");
         Ok(())
     }
 }

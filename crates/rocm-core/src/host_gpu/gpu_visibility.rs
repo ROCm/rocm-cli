@@ -168,15 +168,16 @@ fn windows_gpu_listing_from(adapters: usize, hip_mask: Option<String>) -> Window
     )
 }
 
-/// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
+/// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs exposed"
 /// figure. KFD counts *compute* nodes and is authoritative for HIP ordinals, so
 /// it wins whenever it reports at least one GPU. DRM is used only as the
 /// zero-KFD fallback, so that a host KFD does not account for is not wrongly
-/// told it has no GPU and blocked from serving. The fallback was added when the
-/// KFD count read a node file that no kernel exposes and so came back zero
-/// everywhere; how often a correctly-read KFD still reports zero has not been
-/// surveyed, so treat this as a hedge rather than a description of known
-/// hardware.
+/// told it has no GPU and blocked from serving. On that fallback the figure
+/// counts the host's AMD DRM cards, which on a shared host can be more than
+/// this process is exposed to. The fallback was added when the KFD count read
+/// a node file that no kernel exposes and so came back zero everywhere; how
+/// often a correctly-read KFD still reports zero has not been surveyed, so
+/// treat this as a hedge rather than a description of known hardware.
 ///
 /// DRM must not *raise* a nonzero KFD count: a display/render-only AMD DRM card
 /// with no KFD compute node (e.g. KFD=1, DRM=2) would otherwise invent a usable
@@ -492,8 +493,11 @@ mod tests {
         assert_eq!(combine_amd_gpu_counts(Some(2), Some(8)), Some(2));
         // KFD larger than DRM (e.g. multi-partition compute nodes): KFD still wins.
         assert_eq!(combine_amd_gpu_counts(Some(3), Some(1)), Some(3));
-        // Strix Halo shape: KFD reports 0 GPU nodes, DRM sees the iGPU → 1 present.
+        // Zero KFD GPU nodes: DRM answers instead, a hedge for a host whose KFD
+        // lists no GPU node rather than a description of known hardware.
         assert_eq!(combine_amd_gpu_counts(Some(0), Some(1)), Some(1));
+        // Zero KFD GPU nodes and DRM unreadable: still an authoritative zero.
+        assert_eq!(combine_amd_gpu_counts(Some(0), None), Some(0));
         // Discrete GPUs: both surfaces agree.
         assert_eq!(combine_amd_gpu_counts(Some(8), Some(8)), Some(8));
         // One surface unreadable → use the other.

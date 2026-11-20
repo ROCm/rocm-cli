@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -444,8 +444,11 @@ async fn stream_messages(state: ProxyState, key: Option<String>, request: Value)
     };
     let mut response = Response::new(Body::from_stream(events));
     let headers = response.headers_mut();
-    headers.insert("content-type", "text/event-stream".parse().expect("static"));
-    headers.insert("cache-control", "no-cache".parse().expect("static"));
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     response
 }
 

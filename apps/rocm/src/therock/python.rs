@@ -215,7 +215,14 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
 /// `config.json` for the managed-Python step, failing with what was left
 /// alone and how to recover (the advice comes from [`RocmCliConfig::load`]).
 fn load_config_for_managed_python(paths: &AppPaths) -> Result<RocmCliConfig> {
-    RocmCliConfig::load(paths).with_context(|| {
+    managed_python_config_context(RocmCliConfig::load(paths), paths)
+}
+
+fn managed_python_config_context(
+    loaded: Result<RocmCliConfig>,
+    paths: &AppPaths,
+) -> Result<RocmCliConfig> {
+    loaded.with_context(|| {
         format!(
             "cannot record the managed Python in {} because that file cannot be read; it was \
              left unchanged",
@@ -234,8 +241,13 @@ fn load_config_for_managed_python(paths: &AppPaths) -> Result<RocmCliConfig> {
 /// new runtime loads it strictly). `ensure_managed_python` checks the file
 /// before it downloads anything, so this only fails there when the file
 /// changed meanwhile.
+///
+/// The file is loaded again here, under the config lock, rather than reusing
+/// the copy checked before the download: saving that copy would undo whatever
+/// another command saved while uv and Python were fetched.
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
-    let mut config = load_config_for_managed_python(paths)?;
+    let lock = RocmCliConfig::lock(paths)?;
+    let mut config = managed_python_config_context(lock.load(), paths)?;
     config.tools.insert(
         "python".to_owned(),
         ManagedToolConfig {
@@ -243,7 +255,7 @@ fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
             managed: true,
         },
     );
-    config.save(paths)
+    lock.save(&config)
 }
 
 fn managed_python_bootstrap_disabled() -> bool {
@@ -2852,9 +2864,11 @@ exit 1
     }
 
     /// A config.json that reads fine but cannot be saved: its folder is made
-    /// read-only, so the save cannot create its temp file. Both paths must
-    /// report that the interpreter was not recorded, rather than finish as if
-    /// it had been. Skipped where the folder stays writable (running as root).
+    /// read-only, so the save cannot create its temp file. The config lock file
+    /// is created first, so the lock still opens and it is the save that fails,
+    /// not the lock. Both paths must report that the interpreter was not
+    /// recorded, rather than finish as if it had been. Skipped where the folder
+    /// stays writable (running as root).
     #[cfg(unix)]
     #[test]
     fn ensure_managed_python_fails_when_the_record_cannot_be_saved() -> Result<()> {
@@ -2887,6 +2901,7 @@ exit 1
             }
             plant_fake_uv(&paths, &python, &root.join("uv.log"))?;
             RocmCliConfig::default().save(&paths)?;
+            drop(RocmCliConfig::lock(&paths)?);
             fs::set_permissions(&paths.config_dir, fs::Permissions::from_mode(0o555))?;
             let probe = paths.config_dir.join("probe");
             if fs::write(&probe, b"").is_ok() {
@@ -2904,9 +2919,13 @@ exit 1
             let Err(error) = result else {
                 panic!("reuse={reuse}: an unsaved record must fail the step");
             };
+            let message = format!("{error:#}");
             assert!(
-                format!("{error:#}").contains("config.json"),
-                "reuse={reuse}: {error:#}"
+                message.contains(&format!(
+                    "failed to write {}",
+                    paths.config_path().display()
+                )) && !message.contains("lock file"),
+                "reuse={reuse}: the save, not the lock, must be what failed: {message}"
             );
         }
         Ok(())

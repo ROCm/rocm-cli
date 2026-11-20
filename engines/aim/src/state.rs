@@ -158,13 +158,30 @@ pub(crate) fn write_running_state(
     host: &str,
     port: u16,
     device_policy: DevicePolicy,
-    gpu_indices: &[u32],
+    gpu_indices: Option<&[u32]>,
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<()> {
     let endpoint = endpoint_url(host, port);
     // No GPU was attached, so there is no device to probe for or name. See
     // [`reported_device`] for why this is gated rather than probed anyway.
     let uses_gpu = device_policy != DevicePolicy::CpuOnly;
+    // `None` means this launch reattached to a container that was already
+    // running, so it never chose any ordinals. This is a whole-document write
+    // (`write_json_state_file`), so writing an empty list here would not record
+    // "unknown" — it would delete the ordinals and the GPU name the launch that
+    // actually started the container recorded, leaving `device:` unable to name
+    // a device for a server that still has one. Carry both forward instead.
+    let (gpu_indices, gpu_name) = match gpu_indices {
+        Some(indices) => (
+            json!(indices),
+            json!(recorded_gpu_name(
+                uses_gpu,
+                indices,
+                rocm_core::pinned_gpu_name
+            )),
+        ),
+        None => recorded_gpu_identity(state_path),
+    };
     // `extra_env` can carry secrets (e.g. an HF token passed via `--engine-env`);
     // this state file is status/introspection only (never read back to relaunch
     // the container, see `crate::process::launch_service`), so redact values
@@ -188,9 +205,9 @@ pub(crate) fn write_running_state(
             // key, read the same way, as `engines/lemonade` and
             // `engines/vllm`, so one multi-GPU host does not report
             // `rocm gpu 1 (…)` for those two and a bare `rocm` for this one.
-            // Empty for a CPU-only launch, and for a container this call found
-            // already running (that launch pinned it, and this one cannot know
-            // what it chose).
+            // Empty for a CPU-only launch; carried forward from the previous
+            // state file for a container this call found already running (that
+            // launch pinned it, and this one cannot know what it chose).
             "gpu_indices": gpu_indices,
             // The host's GPU name, so the `device:` row names a device and not
             // only a backend (ROCMAI-550). Captured once here rather than
@@ -198,11 +215,50 @@ pub(crate) fn write_running_state(
             // ready service on its render path. `rocm_core::pinned_gpu_name`
             // declines on any host where more than one AMD GPU could be the
             // one that answered, and is not asked at all when no GPU was
-            // attached.
-            "gpu_name": uses_gpu.then(|| rocm_core::pinned_gpu_name(gpu_indices)).flatten(),
+            // attached. Carried forward alongside the ordinals on a reattach,
+            // since re-probing could answer for a different GPU than the one
+            // that launch pinned.
+            "gpu_name": gpu_name,
             "engine_recipe": engine_recipe,
             "started_at_unix_ms": current_unix_millis(),
         }),
+    )
+}
+
+/// The GPU name a launch records against its ordinals, or `None` when the
+/// launch attached no GPU at all.
+///
+/// `probe` is a parameter rather than a direct call to
+/// [`rocm_core::pinned_gpu_name`] so that both branches are reachable from a
+/// test on any host. That probe declines on a machine where more than one AMD
+/// GPU could be the one that answered, and on a machine with none — which is
+/// every CI runner — so a test that let it through would see `None` whether or
+/// not the `uses_gpu` gate was honoured, and would stay green if a `cpu_only`
+/// launch started probing the host again. The same reason
+/// `model_fit::unsupported_here_for` takes its `ruled_out` instead of
+/// re-deriving it.
+fn recorded_gpu_name(
+    uses_gpu: bool,
+    gpu_indices: &[u32],
+    probe: impl Fn(&[u32]) -> Option<String>,
+) -> Option<String> {
+    uses_gpu.then(|| probe(gpu_indices)).flatten()
+}
+
+/// The `gpu_indices` and `gpu_name` already on disk for this service, for a
+/// launch that reattached and so cannot supply its own.
+///
+/// Returns JSON `null` for either key that is absent or unreadable, which is
+/// what every other writer of this file already means by "not known" — a
+/// first-ever write has no prior document, and a truncated one is no more
+/// authoritative than none.
+fn recorded_gpu_identity(state_path: &Path) -> (Value, Value) {
+    let Ok(previous) = read_service_state(state_path) else {
+        return (Value::Null, Value::Null);
+    };
+    (
+        previous.get("gpu_indices").cloned().unwrap_or(Value::Null),
+        previous.get("gpu_name").cloned().unwrap_or(Value::Null),
     )
 }
 
@@ -427,13 +483,71 @@ mod tests {
             "127.0.0.1",
             8000,
             DevicePolicy::GpuPreferred,
-            &[0],
+            Some(&[0]),
             Some(&hint),
         )
         .unwrap();
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("hf_super_secret"));
         assert!(on_disk.contains("HF_TOKEN"));
+    }
+
+    /// `rocm serve` against a container that is already up reattaches instead
+    /// of launching, so it never chooses GPU ordinals — but it still rewrites
+    /// this state file, and [`write_state`] replaces the document whole. The
+    /// launch that *did* start the container is the only one that knows what it
+    /// pinned, so a reattach must carry those forward rather than write an
+    /// empty list over them: otherwise `rocm serve` on a running service
+    /// silently drops the `device:` row's GPU for a server that still has one.
+    ///
+    /// Both keys are asserted. `gpu_name` is what the row actually prints, and
+    /// `first_gpu_index_from_state` reads `gpu_indices` to decide whether to
+    /// print an ordinal at all, so losing either one degrades the row.
+    #[test]
+    fn a_reattach_keeps_the_gpu_the_launch_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-reattach.json");
+        let write = |gpu_indices: Option<&[u32]>| {
+            write_running_state(
+                &path,
+                "svc-reattach",
+                "some/model",
+                Some("Org/Served"),
+                "127.0.0.1",
+                8000,
+                DevicePolicy::GpuPreferred,
+                gpu_indices,
+                None,
+            )
+            .unwrap();
+        };
+
+        // The launch. Plant a name the way a real one would, since
+        // `pinned_gpu_name` declines on a host like CI's.
+        write(Some(&[1]));
+        let mut planted = read_service_state(&path).unwrap();
+        planted["gpu_name"] = json!("AMD Instinct MI300X");
+        write_state(&path, &planted).unwrap();
+
+        // The reattach: same service, no ordinals of its own.
+        write(None);
+
+        let after = read_service_state(&path).unwrap();
+        assert_eq!(
+            after.get("gpu_indices"),
+            Some(&json!([1])),
+            "a reattach must not erase the ordinals the launch pinned: {after}"
+        );
+        assert_eq!(
+            after.get("gpu_name"),
+            Some(&json!("AMD Instinct MI300X")),
+            "nor the GPU name they resolved to: {after}"
+        );
+        assert_eq!(
+            rocm_engine_protocol::first_gpu_index_from_state(&after),
+            Some(1),
+            "and the device row must still find an ordinal to print: {after}"
+        );
     }
 
     /// ROCMAI-550 changed the device this engine reports for an existing
@@ -463,7 +577,7 @@ mod tests {
             "127.0.0.1",
             8000,
             DevicePolicy::GpuRequired,
-            &[1],
+            Some(&[1]),
             None,
         )
         .unwrap();
@@ -510,8 +624,17 @@ mod tests {
     /// `rocm (AMD Instinct MI300X)` for a container that used no GPU — the
     /// invented claim the whole ticket exists to remove.
     ///
-    /// Drops to red if `write_running_state` probes for a name regardless of
-    /// the policy, or if `reported_device` goes back to hardcoding `rocm`.
+    /// Drops to red if the policy stops gating the probe, or if
+    /// `reported_device` goes back to hardcoding `rocm`.
+    ///
+    /// The gate is asserted through [`recorded_gpu_name`] with a stub probe
+    /// that always answers, because the real one
+    /// ([`rocm_core::pinned_gpu_name`]) declines on a host with no AMD GPU or
+    /// with more than one — so on every CI runner the recorded name is `None`
+    /// either way, and reading it off the written state file alone would pass
+    /// whether or not the policy was consulted. That assertion is kept too,
+    /// since it is what the file actually ends up holding; it is just not the
+    /// one carrying the claim.
     #[test]
     fn a_cpu_only_launch_claims_neither_rocm_nor_a_gpu_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -524,16 +647,31 @@ mod tests {
             "127.0.0.1",
             8000,
             DevicePolicy::CpuOnly,
-            &[],
+            Some(&[]),
             None,
         )
         .unwrap();
+
+        // The gate itself, on a probe that cannot decline: a `cpu_only` launch
+        // must not reach it even when the host would answer.
+        let always_answers = |_: &[u32]| Some("AMD Instinct MI300X".to_owned());
+        assert_eq!(
+            recorded_gpu_name(false, &[0], always_answers),
+            None,
+            "a cpu-only launch must not probe the host for a GPU name"
+        );
+        assert_eq!(
+            recorded_gpu_name(true, &[0], always_answers),
+            Some("AMD Instinct MI300X".to_owned()),
+            "premise: with a GPU attached the same probe is consulted, so the \
+             assertion above is about the policy and not about the probe"
+        );
 
         let state = read_service_state(&path).unwrap();
         assert_eq!(
             state.get("gpu_name"),
             Some(&Value::Null),
-            "a cpu-only launch must not have the host GPU probed for it: {state}"
+            "and the written state file carries no name: {state}"
         );
         assert_eq!(reported_device(&state), "cpu");
 
@@ -622,7 +760,7 @@ mod tests {
             "127.0.0.1",
             8000,
             DevicePolicy::GpuRequired,
-            &[0],
+            Some(&[0]),
             None,
         )
         .unwrap();

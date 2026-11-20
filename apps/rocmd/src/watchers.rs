@@ -120,43 +120,43 @@ where
 
     let gpu_metrics_due_now = gpu_metrics_due(state, now);
     let gpu_thermal_protect_due_now = gpu_thermal_protect_due(state, now);
-    let snapshot = (gpu_metrics_due_now || gpu_thermal_protect_due_now).then(gpu_snapshot);
+    // One snapshot serves both GPU watchers, and only the watchers that are due
+    // read it, inside the scope where it exists.
+    if let Some(snapshot) = (gpu_metrics_due_now || gpu_thermal_protect_due_now).then(gpu_snapshot)
+    {
+        if gpu_metrics_due_now {
+            let available = snapshot.amd_smi_available && snapshot.monitor_snapshot.is_some();
+            events.push(AutomationTriggerEvent {
+                at_unix_ms: now,
+                kind: if available {
+                    "gpu.metrics".to_owned()
+                } else {
+                    "gpu.metrics_unavailable".to_owned()
+                },
+                source: "gpu_telemetry".to_owned(),
+                watcher_hint: Some("gpu-metrics".to_owned()),
+                service_id: None,
+                reason: if available {
+                    Some("amd_smi_snapshot_available".to_owned())
+                } else {
+                    snapshot
+                        .note
+                        .clone()
+                        .or_else(|| Some("amd_smi_snapshot_unavailable".to_owned()))
+                },
+                payload: json!({
+                    "amd_smi_available": snapshot.amd_smi_available,
+                    "static_available": snapshot.static_snapshot.is_some(),
+                    "monitor_available": snapshot.monitor_snapshot.is_some(),
+                    "summary": gpu_snapshot_summary(&snapshot),
+                    "interval_ms": GPU_METRICS_INTERVAL_MS,
+                }),
+            });
+        }
 
-    if gpu_metrics_due_now {
-        let snapshot = snapshot
-            .as_ref()
-            .expect("GPU snapshot should be collected for due metrics");
-        let available = snapshot.amd_smi_available && snapshot.monitor_snapshot.is_some();
-        events.push(AutomationTriggerEvent {
-            at_unix_ms: now,
-            kind: if available {
-                "gpu.metrics".to_owned()
-            } else {
-                "gpu.metrics_unavailable".to_owned()
-            },
-            source: "gpu_telemetry".to_owned(),
-            watcher_hint: Some("gpu-metrics".to_owned()),
-            service_id: None,
-            reason: if available {
-                Some("amd_smi_snapshot_available".to_owned())
-            } else {
-                snapshot
-                    .note
-                    .clone()
-                    .or_else(|| Some("amd_smi_snapshot_unavailable".to_owned()))
-            },
-            payload: json!({
-                "amd_smi_available": snapshot.amd_smi_available,
-                "static_available": snapshot.static_snapshot.is_some(),
-                "monitor_available": snapshot.monitor_snapshot.is_some(),
-                "summary": gpu_snapshot_summary(snapshot),
-                "interval_ms": GPU_METRICS_INTERVAL_MS,
-            }),
-        });
-    }
-
-    if gpu_thermal_protect_due_now && let Some(snapshot) = snapshot.as_ref() {
-        events.extend(gpu_pressure_events(now, snapshot));
+        if gpu_thermal_protect_due_now {
+            events.extend(gpu_pressure_events(now, &snapshot));
+        }
     }
 
     Ok(events)
@@ -469,6 +469,135 @@ mod tests {
                 .iter()
                 .any(|event| event.watcher_hint.as_deref() == Some("gpu-thermal-protect"))
         );
+        Ok(())
+    }
+
+    /// Both GPU watchers due share one amd-smi snapshot, and the metrics event
+    /// comes before the pressure event.
+    #[test]
+    fn both_due_gpu_watchers_share_one_snapshot_in_metrics_then_pressure_order() -> Result<()> {
+        let (root, paths) = temp_app_paths("event-bus-gpu-both-due");
+        let state = test_runtime_state(vec![
+            test_watcher_snapshot("gpu-metrics", WatcherMode::Observe, None),
+            test_watcher_snapshot("gpu-thermal-protect", WatcherMode::Propose, None),
+        ]);
+        let mut snapshot_calls = 0;
+
+        let events = collect_automation_events_with_gpu_snapshot(&paths, &state, || {
+            snapshot_calls += 1;
+            hot_gpu_snapshot()
+        })?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(snapshot_calls, 1);
+        let gpu_kinds: Vec<&str> = events
+            .iter()
+            .filter(|event| event.source == "gpu_telemetry")
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(gpu_kinds, ["gpu.metrics", "gpu.thermal_pressure"]);
+        Ok(())
+    }
+
+    /// A snapshot hot enough for a pressure event, for the one-due cases.
+    fn hot_gpu_snapshot() -> CodexBridgeGpuSnapshot {
+        CodexBridgeGpuSnapshot {
+            amd_smi_available: true,
+            static_snapshot: None,
+            monitor_snapshot: Some(json!({
+                "gpu_data": [
+                    { "gpu": 0, "hotspot_temperature": { "value": 96.0 } }
+                ]
+            })),
+            note: None,
+        }
+    }
+
+    /// Only the metrics watcher due: one snapshot, and no pressure event even
+    /// though the snapshot would raise one.
+    #[test]
+    fn only_metrics_due_emits_metrics_without_pressure() -> Result<()> {
+        let (root, paths) = temp_app_paths("event-bus-gpu-metrics-only-due");
+        let state = test_runtime_state(vec![
+            test_watcher_snapshot("gpu-metrics", WatcherMode::Observe, None),
+            test_watcher_snapshot(
+                "gpu-thermal-protect",
+                WatcherMode::Propose,
+                Some(unix_time_millis()),
+            ),
+        ]);
+        let mut snapshot_calls = 0;
+
+        let events = collect_automation_events_with_gpu_snapshot(&paths, &state, || {
+            snapshot_calls += 1;
+            hot_gpu_snapshot()
+        })?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(snapshot_calls, 1);
+        let gpu_kinds: Vec<&str> = events
+            .iter()
+            .filter(|event| event.source == "gpu_telemetry")
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(gpu_kinds, ["gpu.metrics"]);
+        Ok(())
+    }
+
+    /// Only the thermal watcher due: one snapshot, and no metrics event.
+    #[test]
+    fn only_thermal_due_emits_pressure_without_metrics() -> Result<()> {
+        let (root, paths) = temp_app_paths("event-bus-gpu-thermal-only-due");
+        let state = test_runtime_state(vec![
+            test_watcher_snapshot(
+                "gpu-metrics",
+                WatcherMode::Observe,
+                Some(unix_time_millis()),
+            ),
+            test_watcher_snapshot("gpu-thermal-protect", WatcherMode::Propose, None),
+        ]);
+        let mut snapshot_calls = 0;
+
+        let events = collect_automation_events_with_gpu_snapshot(&paths, &state, || {
+            snapshot_calls += 1;
+            hot_gpu_snapshot()
+        })?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(snapshot_calls, 1);
+        let gpu_kinds: Vec<&str> = events
+            .iter()
+            .filter(|event| event.source == "gpu_telemetry")
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(gpu_kinds, ["gpu.thermal_pressure"]);
+        Ok(())
+    }
+
+    /// GPU watchers that are enabled but not yet due take no amd-smi snapshot.
+    #[test]
+    fn gpu_watchers_not_due_take_no_snapshot() -> Result<()> {
+        let (root, paths) = temp_app_paths("event-bus-gpu-none-due");
+        let just_ran = Some(unix_time_millis());
+        let state = test_runtime_state(vec![
+            test_watcher_snapshot("gpu-metrics", WatcherMode::Observe, just_ran),
+            test_watcher_snapshot("gpu-thermal-protect", WatcherMode::Propose, just_ran),
+        ]);
+        let mut snapshot_calls = 0;
+
+        let events = collect_automation_events_with_gpu_snapshot(&paths, &state, || {
+            snapshot_calls += 1;
+            CodexBridgeGpuSnapshot {
+                amd_smi_available: false,
+                static_snapshot: None,
+                monitor_snapshot: None,
+                note: None,
+            }
+        })?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(snapshot_calls, 0);
+        assert!(!events.iter().any(|event| event.source == "gpu_telemetry"));
         Ok(())
     }
 

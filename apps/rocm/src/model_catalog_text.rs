@@ -12,6 +12,13 @@
 //! `format_bytes`, the human-readable size formatter the verbose listing uses,
 //! lives here too and is also read from `storage.rs` and `automations.rs`.
 //!
+//! Two items here exist so that nothing has to read a listing back as prose:
+//! `text_is_model_catalog_listing` recognises either listing from the header
+//! each one writes, and `model_recipe_engine_availability` answers "can this
+//! host run this recipe's preferred engines" as values. `chat/summaries.rs`
+//! uses both to build the chat's deterministic model summary, which used to be
+//! parsed out of the verbose listing's `aliases=[…] min_gpu_mem=…` rows.
+//!
 //! Relocated verbatim from `examine_report_text.rs`, which keeps the
 //! `rocm examine` report and the engine-inventory listing. The two halves do not
 //! call each other: this module reaches only the engine-availability helpers in
@@ -27,15 +34,109 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rocm_core::{
-    AppPaths, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
-    builtin_model_recipes, detect_host_gfx_target, load_model_recipe_registry,
-    model_artifact_cache_status, model_catalog_platforms, model_recipe_featured,
-    model_recipe_target_platform_label, normalize_therock_family, platform_matches_gfx_family,
+    AppPaths, GfxSupport, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
+    builtin_model_recipes, detect_host_gfx_target, engine_recipe_gfx_support,
+    load_model_recipe_registry, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family,
 };
 use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
 
 use crate::engine_ipc::{builtin_engine_available, resolve_engine_binary_path_with_paths};
 use crate::{PlatformRuleOut, engine_ruled_out_by_platform_with};
+
+/// The first words of every curated `rocm model` heading, whichever recipe
+/// source produced it — see [`model_catalog_header`].
+const MODEL_CATALOG_HEADER_PREFIX: &str = "Recommended models";
+
+/// The first line of the `rocm model --verbose` listing.
+const MODEL_CATALOG_VERBOSE_HEADER: &str = "model recipes";
+
+/// Whether `text` is one of the two `rocm model` listings this module renders.
+///
+/// Both headers are matched, because the chat tool renders the curated listing
+/// and `rocm model --verbose` renders the other, and a reader that recognises
+/// only one silently stops recognising the listing when the caller switches —
+/// which is how the chat's deterministic model summary disappeared in #1041.
+/// It is deliberately only an identification: everything a caller needs *about*
+/// the models comes from `load_model_recipe_registry`, not from this text.
+pub(crate) fn text_is_model_catalog_listing(text: &str) -> bool {
+    text.lines().map(str::trim).any(|line| {
+        line.starts_with(MODEL_CATALOG_HEADER_PREFIX) || line == MODEL_CATALOG_VERBOSE_HEADER
+    })
+}
+
+/// Where this host's adapter for one engine was found, before the platform
+/// gate has a say. The variants are what
+/// [`append_model_engine_support_lines`] prints as `built_in`, `available
+/// path=…`, `unavailable reason=…` and `not_checked`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelEngineLocation {
+    /// The adapter is compiled into this binary.
+    BuiltIn,
+    /// A discovered or installed engine plugin binary.
+    Plugin(std::path::PathBuf),
+    /// No adapter could be resolved; the string is the reason to show.
+    Unavailable(String),
+    /// Nothing was looked up, because the caller had no [`AppPaths`].
+    NotChecked,
+}
+
+/// One preferred engine's standing on this host: where its adapter is, and
+/// whether the platform gate rules it out regardless.
+///
+/// Returned instead of rendered so the `rocm model --verbose` listing and the
+/// chat's deterministic model summary answer the question the same way. The
+/// summary used to re-read the listing's `engine_support:` lines, which made a
+/// rewording of those lines silently change the summary.
+#[derive(Debug, Clone)]
+pub(crate) struct ModelEngineAvailability {
+    pub(crate) engine: String,
+    pub(crate) location: ModelEngineLocation,
+    pub(crate) platform_rule_out: PlatformRuleOut,
+}
+
+/// [`model_recipe_engine_availability_with`] with the real Docker probe, for a
+/// caller asking about a recipe or two rather than the whole catalog.
+pub(crate) fn model_recipe_engine_availability(
+    recipe: &ModelRecipeRecord,
+    paths: Option<&AppPaths>,
+) -> Vec<ModelEngineAvailability> {
+    let docker_reachable = once_per_call(rocm_engine_aim::builtin_docker_daemon_reachable);
+    model_recipe_engine_availability_with(recipe, paths, &docker_reachable)
+}
+
+/// Each of `recipe`'s preferred engines, in order, with where its adapter is
+/// and what the platform gate says. `docker_reachable` is injected so a caller
+/// listing the whole catalog answers one `docker info` for all of it.
+pub(crate) fn model_recipe_engine_availability_with(
+    recipe: &ModelRecipeRecord,
+    paths: Option<&AppPaths>,
+    docker_reachable: &dyn Fn() -> bool,
+) -> Vec<ModelEngineAvailability> {
+    recipe
+        .preferred_engines
+        .iter()
+        .map(|engine| ModelEngineAvailability {
+            engine: engine.clone(),
+            location: engine_adapter_location(engine, paths),
+            platform_rule_out: engine_ruled_out_by_platform_with(engine, docker_reachable),
+        })
+        .collect()
+}
+
+fn engine_adapter_location(engine: &str, paths: Option<&AppPaths>) -> ModelEngineLocation {
+    if builtin_engine_available(engine) {
+        return ModelEngineLocation::BuiltIn;
+    }
+    let Some(paths) = paths else {
+        return ModelEngineLocation::NotChecked;
+    };
+    match resolve_engine_binary_path_with_paths(engine, paths) {
+        Ok(path) => ModelEngineLocation::Plugin(path),
+        Err(error) => ModelEngineLocation::Unavailable(model_registry_reason(error.to_string())),
+    }
+}
 
 /// The per-hardware-group heading in `rocm model`, carrying the "this is the
 /// box you are on" marker when the group matches the detected host GPU.
@@ -53,6 +154,162 @@ fn model_catalog_platform_heading(label: &str, your_gpu: bool) -> String {
     }
 }
 
+/// How many models each hardware group offers.
+///
+/// `rocm model` is a recommendation, not an inventory: the built-in catalog
+/// showed two per group before this, and `--verbose` is where the whole list
+/// lives. Selecting by fit widens the candidate pool from the four `featured`
+/// recipes to every recipe that runs here, so without a cap a large GPU would
+/// get forty rows where it used to get two.
+const MAX_RECOMMENDATIONS_PER_PLATFORM: usize = 3;
+
+/// Whether this host's GPU memory is known to cover the recipe's minimum.
+///
+/// Same arithmetic as [`model_recipe_gpu_fit_label`], which words it for one
+/// row; this answers it for selection.
+///
+/// **A recipe with no declared minimum does not fit.** That reads backwards
+/// until you look at which recipes those are: every one of the seven in the
+/// built-in catalog is a model too large to size for a single GPU --
+/// Llama-3.1-405B, DeepSeek-V4-Flash, MiniMax-M3, GLM-5.2 and their like. The
+/// field is absent because nobody could put a single number on them, not
+/// because they are free. Reading the gap as "fits anything" recommended a 405B
+/// model to a quarter-gigabyte host, which is the same
+/// unknown-treated-as-a-fact error this listing exists to stop -- committed
+/// about the recipe instead of about the machine.
+///
+/// They stay reachable: `rocm serve` takes any model, and `rocm model
+/// --verbose` lists every recipe with what it needs. What they do not do is
+/// get *recommended* on the strength of a figure nobody supplied.
+fn recipe_fits_gpu(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: f64) -> bool {
+    recipe
+        .min_gpu_mem_gb
+        .is_some_and(|required| aggregate_gpu_vram_gib >= f64::from(required))
+}
+
+/// The recommendation order within one hardware group: most capable first.
+///
+/// `featured` leads, because a curator marking a recipe still means something.
+/// It is the *primary* key, not a tie-break: a featured recipe that fits
+/// outranks a larger one that also fits. What changed is that it no longer
+/// decides *eligibility* — before, only `featured` recipes were offered at all,
+/// which is how a small host was shown four models it could not run and none of
+/// the ones it could. Ordering, not selection. After that the largest model
+/// that fits comes first, since a host that can run it generally should.
+fn recommendation_rank(recipe: &ModelRecipeRecord) -> (bool, u32) {
+    (
+        !model_recipe_featured(recipe),
+        u32::MAX - recipe.min_gpu_mem_gb.unwrap_or(0),
+    )
+}
+
+/// What a hardware group offers, and how much it left out.
+///
+/// `offered` is capped at [`MAX_RECOMMENDATIONS_PER_PLATFORM`]; `also_fit` is
+/// how many further recipes this host could run but the cap dropped. Reporting
+/// that count is what keeps the narrowing legible: a short list with nothing
+/// said about it reads as "the catalog is small" rather than "there is more
+/// behind `--verbose`".
+struct PlatformOffer<'a> {
+    offered: Vec<&'a ModelRecipeRecord>,
+    also_fit: usize,
+}
+
+/// Choose what one hardware group recommends for this host.
+///
+/// `fit` is `None` on a host whose GPU memory could not be read. That case
+/// falls back to the curated `featured` short list, uncapped and unnarrowed by
+/// memory, because a machine the CLI could not measure must not be told its
+/// options are narrow. It is the same `Unknown`-is-not-`Absent` rule
+/// `model_readiness` applies to a verdict, applied to a listing.
+///
+/// The engine gate still applies there. Whether vLLM can run is decided by
+/// [`engine_ruled_out_by_platform_with`] from the OS and Docker alone, so an
+/// unreadable memory figure says nothing about it — and two of the four
+/// `featured` recipes are vLLM-only, which native Windows cannot serve at any
+/// size.
+fn platform_offer<'a>(
+    candidates: &[&'a ModelRecipeRecord],
+    fit: Option<f64>,
+    engine_allowed: &dyn Fn(&ModelRecipeRecord) -> bool,
+) -> PlatformOffer<'a> {
+    let Some(available) = fit else {
+        return PlatformOffer {
+            offered: candidates
+                .iter()
+                .copied()
+                .filter(|recipe| model_recipe_featured(recipe))
+                .filter(|recipe| engine_allowed(recipe))
+                .collect(),
+            also_fit: 0,
+        };
+    };
+    let mut runnable = candidates
+        .iter()
+        .copied()
+        .filter(|recipe| recipe_fits_gpu(recipe, available))
+        .filter(|recipe| engine_allowed(recipe))
+        .collect::<Vec<_>>();
+    runnable.sort_by_key(|recipe| recommendation_rank(recipe));
+    let also_fit = runnable
+        .len()
+        .saturating_sub(MAX_RECOMMENDATIONS_PER_PLATFORM);
+    runnable.truncate(MAX_RECOMMENDATIONS_PER_PLATFORM);
+    PlatformOffer {
+        offered: runnable,
+        also_fit,
+    }
+}
+
+/// Whether the platform gate lets this recipe's engine run on this host.
+///
+/// Without it a native-Windows host is recommended vLLM models it cannot serve,
+/// which is the same class of wrong answer as recommending one that does not
+/// fit — the listing would just be confidently wrong about the engine instead
+/// of the memory.
+///
+/// The GPU family is the third way to be confidently wrong, and the heading
+/// above this listing claims the list is narrowed to what the machine can run.
+/// An engine recipe that names `supported_gfx_families` this host is not in
+/// cannot serve the model here at all, so offering it makes that heading false.
+fn recipe_engine_allowed(
+    recipe: &ModelRecipeRecord,
+    docker_reachable: &dyn Fn() -> bool,
+    host_gfx_family: Option<&str>,
+) -> bool {
+    recipe.preferred_engines.first().is_none_or(|engine| {
+        engine_ruled_out_by_platform_with(engine, docker_reachable) == PlatformRuleOut::Allowed
+            && !recipe_engine_gfx_unsupported(recipe, engine, host_gfx_family)
+    })
+}
+
+/// Whether this recipe's first-choice engine names GPU families and this host's
+/// is not among them.
+///
+/// Only [`GfxSupport::Unsupported`] narrows: `Unrestricted` already covers both
+/// "the engine recipe names no families" and "no family is known for this
+/// host", so an unmeasured host filters nothing here — the same rule the
+/// memory gate follows when `fit` is `None`. The verdict is
+/// [`engine_recipe_gfx_support`] rather than a second comparison of the family
+/// strings, so this listing and `serve_cmd`'s own AIM gate cannot drift into
+/// disagreeing about which host can run a recipe.
+fn recipe_engine_gfx_unsupported(
+    recipe: &ModelRecipeRecord,
+    engine: &str,
+    host_gfx_family: Option<&str>,
+) -> bool {
+    recipe
+        .engine_recipes
+        .iter()
+        .find(|record| record.engine.eq_ignore_ascii_case(engine))
+        .is_some_and(|record| {
+            matches!(
+                engine_recipe_gfx_support(record, host_gfx_family),
+                GfxSupport::Unsupported
+            )
+        })
+}
+
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
     _paths: Option<&AppPaths>,
@@ -68,50 +325,101 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         }
     };
     let _ = writeln!(output, "{}", model_catalog_header(&registry));
-    // Curated view: for the built-in catalog show only the featured short list;
-    // a configured index is already curated, so show all of it. Group either way
-    // by the hardware path each model targets.
+    // A configured index is already curated by whoever signed it, so it is shown
+    // whole and not re-filtered here. The built-in catalog is the one this
+    // selection is for.
     let show_all = !matches!(registry.source, ModelRecipeRegistrySource::BuiltIn);
-    let visible = registry
-        .recipes
-        .iter()
-        .filter(|recipe| show_all || model_recipe_featured(recipe))
-        .collect::<Vec<_>>();
+    // Only the built-in catalog is narrowed to what runs here; `None` also means
+    // "do not filter", which is what an unmeasured host gets.
+    let fit = if show_all {
+        None
+    } else {
+        aggregate_gpu_vram_gib
+    };
+    let visible = registry.recipes.iter().collect::<Vec<_>>();
     let platforms = model_catalog_platforms(&registry);
     let host_gfx_family = detect_host_gfx_target()
         .as_deref()
         .and_then(normalize_therock_family);
+    // One `docker info` answers every AIM recipe in the listing, as the verbose
+    // renderer already does.
+    let docker_reachable = once_per_call(rocm_engine_aim::builtin_docker_daemon_reachable);
+    let engine_allowed = |recipe: &ModelRecipeRecord| {
+        recipe_engine_allowed(recipe, &docker_reachable, host_gfx_family.as_deref())
+    };
+    let mut offered_any = false;
+    let mut also_fit_total = 0usize;
     for platform in &platforms {
-        let mut group = visible
+        let candidates = visible
             .iter()
+            .copied()
             .filter(|recipe| rocm_core::model_recipe_targets_platform(recipe, platform))
-            .peekable();
-        if group.peek().is_none() {
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
             continue;
         }
+        let offer = if show_all {
+            PlatformOffer {
+                offered: candidates.clone(),
+                also_fit: 0,
+            }
+        } else {
+            platform_offer(&candidates, fit, &engine_allowed)
+        };
+        if offer.offered.is_empty() {
+            continue;
+        }
+        offered_any = true;
+        also_fit_total += offer.also_fit;
         let your_gpu = host_gfx_family
             .as_deref()
             .is_some_and(|family| platform_matches_gfx_family(platform, family));
         let heading = model_catalog_platform_heading(&platform.label, your_gpu);
         let _ = writeln!(output, "\n{heading}");
-        for recipe in group {
+        for recipe in offer.offered {
             // Show the canonical Hugging Face id (the reliable serve target) and
-            // the quant that fits this hardware. Append a fit verdict only when the
-            // host GPU VRAM is known — otherwise every row would read "GPU fit
-            // unknown", which is noise.
+            // the quant that fits this hardware. Append a fit verdict only where
+            // both sides of the comparison are known — on an unmeasured host
+            // every row would read "GPU fit unknown", which is noise, and on a
+            // recipe with no declared minimum there is nothing to compare.
             let detail = recipe
                 .quantization
                 .clone()
                 .unwrap_or_else(|| model_recipe_memory_label(recipe));
-            let fit = if aggregate_gpu_vram_gib.is_some() {
-                format!(
-                    "  {}",
-                    model_recipe_gpu_fit_label(recipe, aggregate_gpu_vram_gib)
-                )
-            } else {
-                String::new()
-            };
-            let _ = writeln!(output, "  {}  {}{}", recipe.canonical_model_id, detail, fit);
+            let fit_label = aggregate_gpu_vram_gib
+                .and_then(|available| model_recipe_gpu_fit_label(recipe, available))
+                .map_or_else(String::new, |label| format!("  {label}"));
+            let _ = writeln!(
+                output,
+                "  {}  {}{}",
+                recipe.canonical_model_id, detail, fit_label
+            );
+        }
+    }
+    // Say why the list is the length it is. Without this a narrowed list reads
+    // as a small catalog, and an empty one reads as a broken command.
+    if !show_all {
+        if fit.is_none() {
+            let _ = writeln!(
+                output,
+                "\nThis machine's GPU memory could not be read, so these are not filtered to what \
+                 it can run. `rocm diagnose --model <model>` checks one against this host."
+            );
+        } else if !offered_any {
+            let _ = writeln!(
+                output,
+                "\nNone of the curated models fit this machine's GPU memory. You can still serve \
+                 a smaller model of your own, and `rocm model --verbose` lists every curated \
+                 recipe with what it needs."
+            );
+        } else if also_fit_total > 0 {
+            let _ = writeln!(
+                output,
+                "\nNarrowed to what this machine can run; {also_fit_total} more curated model(s) \
+                 also fit. `rocm model --verbose` lists them all."
+            );
+        } else {
+            let _ = writeln!(output, "\nNarrowed to what this machine can run.");
         }
     }
     if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
@@ -135,16 +443,21 @@ fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
     )
 }
 
+/// How a recipe's declared GPU minimum compares with this host's memory.
+///
+/// `None` where the recipe declares no minimum: the comparison has no subject,
+/// and saying "fits" on the strength of a figure nobody wrote down is the same
+/// unknown-read-as-a-fact that [`recipe_fits_gpu`] exists to refuse.
 fn model_recipe_gpu_fit_label(
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
-) -> &'static str {
-    match (recipe.min_gpu_mem_gb, aggregate_gpu_vram_gib) {
-        (Some(required), Some(available)) if available >= f64::from(required) => "fits this GPU",
-        (Some(_), Some(_)) => "needs a larger GPU",
-        (Some(_), None) => "GPU fit unknown",
-        (None, _) => "fits",
-    }
+    available_gib: f64,
+) -> Option<&'static str> {
+    let required = recipe.min_gpu_mem_gb?;
+    Some(if available_gib >= f64::from(required) {
+        "fits this GPU"
+    } else {
+        "needs a larger GPU"
+    })
 }
 
 pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
@@ -153,7 +466,7 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     host_ram_gib: Option<f64>,
 ) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "model recipes");
+    let _ = writeln!(output, "{MODEL_CATALOG_VERBOSE_HEADER}");
     let registry = match load_model_recipe_registry() {
         Ok(registry) => registry,
         Err(error) => {
@@ -251,11 +564,11 @@ fn append_model_recipe_staleness_lines(
 fn model_catalog_header(registry: &ModelRecipeRegistry) -> String {
     match &registry.source {
         ModelRecipeRegistrySource::BuiltIn => {
-            "Recommended models - run one with `rocm serve <model>`".to_owned()
+            format!("{MODEL_CATALOG_HEADER_PREFIX} - run one with `rocm serve <model>`")
         }
         ModelRecipeRegistrySource::SignedIndex { index_path, .. } => {
             format!(
-                "Recommended models - from recipe index {}",
+                "{MODEL_CATALOG_HEADER_PREFIX} - from recipe index {}",
                 index_path.display()
             )
         }
@@ -650,14 +963,12 @@ fn append_model_fit_lines(
                 );
                 // Not `/examine`: an `Examination` is a static host snapshot and
                 // carries no VRAM figure at all, so sending the user there for a
-                // missing VRAM reading is a confident dead end. But naming
-                // `amd-smi metric --json` directly is just as much of one here:
-                // every production caller of this function hardcodes
-                // `aggregate_gpu_vram_gib = None`, so the reading this function
-                // sees never changes no matter what the user runs. `rocm
-                // diagnose --model` is the command that actually threads a live
-                // reading through (`host_accelerator_memory`), so it is pointed
-                // at instead of a command this one cannot act on.
+                // missing VRAM reading is a confident dead end. Nor `amd-smi
+                // metric --json`: reaching this branch means the measurement
+                // this path already attempted came back empty, so repeating it
+                // raw answers nothing. `rocm diagnose --model` classifies the
+                // same reading against one model (`host_accelerator_memory`) and
+                // says why it is missing, which is what the user needs here.
                 let _ = writeln!(
                     output,
                     "      action: run `rocm diagnose --model {}` for a live reading",
@@ -769,45 +1080,39 @@ fn append_model_engine_support_lines(
     }
 
     let _ = writeln!(output, "      engine_support:");
-    for engine in &recipe.preferred_engines {
-        if builtin_engine_available(engine) {
-            if let Some(note) = model_registry_adapter_availability_note(engine, docker_reachable) {
+    for support in model_recipe_engine_availability_with(recipe, paths, docker_reachable) {
+        let engine = &support.engine;
+        let note = model_registry_adapter_availability_note(support.platform_rule_out);
+        match (&support.location, note) {
+            (ModelEngineLocation::BuiltIn, Some(note)) => {
                 let _ = writeln!(
                     output,
                     "        {engine}: adapter_available path=<built-in> {note}"
                 );
-            } else {
+            }
+            (ModelEngineLocation::BuiltIn, None) => {
                 let _ = writeln!(output, "        {engine}: built_in");
             }
-        } else if let Some(paths) = paths {
-            match resolve_engine_binary_path_with_paths(engine, paths) {
-                Ok(path) => {
-                    if let Some(note) =
-                        model_registry_adapter_availability_note(engine, docker_reachable)
-                    {
-                        let _ = writeln!(
-                            output,
-                            "        {engine}: adapter_available path={} {note}",
-                            path.display()
-                        );
-                    } else {
-                        let _ = writeln!(
-                            output,
-                            "        {engine}: available path={}",
-                            path.display()
-                        );
-                    }
-                }
-                Err(error) => {
-                    let _ = writeln!(
-                        output,
-                        "        {engine}: unavailable reason={}",
-                        model_registry_reason(error.to_string())
-                    );
-                }
+            (ModelEngineLocation::Plugin(path), Some(note)) => {
+                let _ = writeln!(
+                    output,
+                    "        {engine}: adapter_available path={} {note}",
+                    path.display()
+                );
             }
-        } else {
-            let _ = writeln!(output, "        {engine}: not_checked");
+            (ModelEngineLocation::Plugin(path), None) => {
+                let _ = writeln!(
+                    output,
+                    "        {engine}: available path={}",
+                    path.display()
+                );
+            }
+            (ModelEngineLocation::Unavailable(reason), _) => {
+                let _ = writeln!(output, "        {engine}: unavailable reason={reason}");
+            }
+            (ModelEngineLocation::NotChecked, _) => {
+                let _ = writeln!(output, "        {engine}: not_checked");
+            }
         }
     }
     let _ = writeln!(
@@ -817,11 +1122,10 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-fn model_registry_adapter_availability_note(
-    engine: &str,
-    docker_reachable: &dyn Fn() -> bool,
+const fn model_registry_adapter_availability_note(
+    ruled_out: PlatformRuleOut,
 ) -> Option<&'static str> {
-    match engine_ruled_out_by_platform_with(engine, docker_reachable) {
+    match ruled_out {
         PlatformRuleOut::Allowed => None,
         PlatformRuleOut::AimDockerUnavailable => Some(
             "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
@@ -1040,12 +1344,31 @@ mod tests {
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
         assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
-        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
-        assert!(rendered.contains("Qwen/Qwen3.6-27B"));
-        assert!(rendered.contains("BF16"));
+        // The Instinct group's featured recipes are vLLM-only, which native
+        // Windows cannot serve at any size, so the group belongs in the listing
+        // exactly where the platform gate allows vLLM. Asserted both ways
+        // rather than skipped on Windows, so the gate is pinned on the platform
+        // it actually fires on. vLLM's rule-out does not consult Docker.
+        //
+        // Matched as a whole row, not by model id: the closing guidance names
+        // `Qwen/Qwen3.6-27B` as its `rocm serve` example and is printed whatever
+        // the platform, so a bare id is present even where the row is not.
+        let vllm_allowed =
+            engine_ruled_out_by_platform_with("vllm", || false) == PlatformRuleOut::Allowed;
+        for vllm_only in [
+            "AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)",
+            "Qwen/Qwen3.6-27B  BF16",
+        ] {
+            assert_eq!(
+                rendered.contains(vllm_only),
+                vllm_allowed,
+                "`{vllm_only}` belongs in the listing exactly where vLLM is allowed \
+                 (allowed here: {vllm_allowed}):\n{rendered}"
+            );
+        }
         // Multi-GPU-only models are not featured (single-GPU serving only).
         assert!(!rendered.contains("GLM-5.2"));
         assert!(!rendered.contains("DeepSeek-V4-Flash"));
@@ -1066,13 +1389,296 @@ mod tests {
 
     #[test]
     fn render_model_registry_text_shows_fit_when_gpu_known() {
-        // With a known aggregate VRAM, each row gains a concrete fit verdict.
-        // 60 GiB fits Qwen3.6-27B (~54) but not Gemma-4-31B (~62).
+        // With a known aggregate VRAM the listing is narrowed to what this host
+        // can run, so every row that survives says so. 60 GiB fits Qwen3.6-27B
+        // (~54) but not Gemma-4-31B (~62), and the one that does not fit is no
+        // longer offered rather than offered with a refusal beside it --
+        // "recommended" and "needs a larger GPU" cannot both be true of a row.
         let rendered = render_model_registry_text_with_context_and_host(None, Some(60.0), None);
 
         assert!(rendered.contains("fits this GPU"));
-        assert!(rendered.contains("needs a larger GPU"));
+        assert!(
+            !rendered.contains("needs a larger GPU"),
+            "a model this host cannot run must not be recommended to it: {rendered}"
+        );
         assert!(!rendered.contains("GPU fit unknown"));
+        assert!(
+            rendered.contains("Narrowed to what this machine can run"),
+            "the narrowing must be stated, or a short list reads as a small catalog: {rendered}"
+        );
+    }
+
+    /// A signed index is shown whole rather than narrowed, so its rows are the
+    /// one place a recipe with no declared minimum still reaches the fit label
+    /// on a measured host. A bare "fits" there would assert something nobody
+    /// measured — the same reading [`recipe_fits_gpu`] refuses.
+    #[test]
+    fn a_recipe_with_no_declared_minimum_claims_no_fit() {
+        let recipes = builtin_model_recipes();
+        let undeclared = recipes
+            .iter()
+            .find(|recipe| recipe.min_gpu_mem_gb.is_none())
+            .expect("the catalog ships recipes with no declared GPU minimum");
+
+        assert_eq!(
+            model_recipe_gpu_fit_label(undeclared, 0.25),
+            None,
+            "a model with no declared minimum must not be labelled against a host's memory"
+        );
+    }
+
+    /// The defect this whole change exists for: `featured` is a static flag, and
+    /// on the current catalog its four recipes need 17, 22, 54 and 62 GiB while
+    /// the eight recipes at or below 8 GiB carry it on none of them. A small or
+    /// integrated GPU was therefore recommended four models it cannot run, and
+    /// shown none of the ones it can.
+    #[test]
+    fn a_small_host_is_offered_models_it_can_actually_run() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, Some(8.0), &|_| true);
+
+        assert!(
+            !offer.offered.is_empty(),
+            "the catalog ships recipes an 8 GiB host can run; offering none would be wrong"
+        );
+        for recipe in &offer.offered {
+            assert!(
+                recipe_fits_gpu(recipe, 8.0),
+                "offered a model this host cannot run: {} needs {:?} GiB",
+                recipe.canonical_model_id,
+                recipe.min_gpu_mem_gb
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_host_still_sees_the_large_models() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, Some(640.0), &|_| true);
+
+        assert!(
+            offer
+                .offered
+                .iter()
+                .any(|recipe| recipe.min_gpu_mem_gb.is_some_and(|min| min >= 48)),
+            "a host with plenty of memory must still be offered the large models"
+        );
+    }
+
+    /// A machine the CLI could not measure must not be told its options are
+    /// narrow. This is the `Unknown`-is-not-`Absent` rule `model_readiness`
+    /// applies to a verdict, applied to a listing -- and it is the behaviour
+    /// most likely to regress silently, because an unmeasured host looks the
+    /// same as a host with no memory until you read what it was offered.
+    #[test]
+    fn an_unmeasured_host_is_not_filtered_at_all() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, None, &|_| true);
+
+        assert_eq!(
+            offer.also_fit, 0,
+            "nothing was narrowed, so nothing was left out"
+        );
+        assert!(
+            offer
+                .offered
+                .iter()
+                .all(|recipe| model_recipe_featured(recipe)),
+            "an unmeasured host keeps the curated short list"
+        );
+        assert!(
+            !offer.offered.is_empty(),
+            "the curated list is what an unmeasured host still gets"
+        );
+        assert!(
+            offer
+                .offered
+                .iter()
+                .any(|recipe| recipe.min_gpu_mem_gb.is_some_and(|needed| needed > 50)),
+            "a model far larger than any small host is still offered when no figure ruled it out"
+        );
+    }
+
+    /// An unreadable memory figure says nothing about whether vLLM can run, so
+    /// the relaxation in [`platform_offer`] must be to the memory filter alone.
+    /// Native Windows cannot serve a vLLM recipe at any size, and two of the
+    /// four `featured` recipes are vLLM-only.
+    #[test]
+    fn an_unmeasured_host_still_has_its_engine_gate_applied() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+        let not_lemonade = |recipe: &ModelRecipeRecord| {
+            recipe
+                .preferred_engines
+                .first()
+                .is_some_and(|engine| engine == "lemonade")
+        };
+
+        let offer = platform_offer(&candidates, None, &not_lemonade);
+
+        assert!(
+            !offer.offered.is_empty(),
+            "the recipes the gate allows are still offered"
+        );
+        assert!(
+            offer.offered.iter().all(|recipe| not_lemonade(recipe)),
+            "a recipe the platform rules out is not offered to an unmeasured host either: {:?}",
+            offer
+                .offered
+                .iter()
+                .map(|recipe| &recipe.canonical_model_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The third way this listing could be confidently wrong, after memory and
+    /// the engine's platform. The heading says the list is narrowed to what the
+    /// machine can run, but the GPU family was never checked, so an engine
+    /// recipe naming `supported_gfx_families` without this host's was offered
+    /// anyway — a model that cannot be served here at all.
+    ///
+    /// All four arms together, because the gate must narrow in exactly one of
+    /// them. Narrowing on an unknown host would hide the whole catalog from
+    /// anyone whose GPU was not detected, and narrowing on a recipe that names
+    /// no families would hide most of the catalog outright; asserting only the
+    /// first arm would pass a gate that did both.
+    ///
+    /// Lemonade, not vLLM or AIM: those two are ruled out by the *platform*
+    /// gate inside [`recipe_engine_allowed`] whenever it runs on native
+    /// Windows, which would make the first arm below pass there for a reason
+    /// that has nothing to do with the GPU family, and make the other three
+    /// impossible. Lemonade is `PlatformRuleOut::Allowed` everywhere, so what
+    /// this asserts is the same on every runner — the same hazard
+    /// `unsupported_here_for` takes its `ruled_out` as a parameter to avoid.
+    #[test]
+    fn a_recipe_its_engine_cannot_run_on_this_gpu_is_not_offered() {
+        let mut recipe = resolve_builtin_model_recipe("qwen").expect("qwen recipe");
+        recipe.preferred_engines = vec!["lemonade".to_owned()];
+        let with_families = |families: &[&str]| rocm_core::ModelRecipeEngineRecord {
+            engine: "lemonade".to_owned(),
+            supported_gfx_families: families.iter().map(|f| (*f).to_owned()).collect(),
+            ..Default::default()
+        };
+        let allowed = |recipe: &ModelRecipeRecord, family: Option<&str>| {
+            recipe_engine_allowed(recipe, &|| true, family)
+        };
+        // The premise, asserted rather than trusted: `runtime_is_windows` is a
+        // `const fn`, so the platform gate cannot be simulated and this test is
+        // only as portable as its engine. If this engine ever becomes
+        // platform-gated, say so here instead of failing below as a baffling
+        // "offered a recipe it should not have".
+        assert!(
+            engine_ruled_out_by_platform_with("lemonade", || true) == PlatformRuleOut::Allowed,
+            "this test's engine must not be platform-gated on any runner, or the arms below \
+             stop being about the GPU family at all"
+        );
+
+        recipe.engine_recipes = vec![with_families(&["gfx94X-dcgpu"])];
+        assert!(
+            !allowed(&recipe, Some("gfx110X-all")),
+            "a host whose family the engine recipe does not list cannot run it, so it must \
+             not be offered"
+        );
+        assert!(
+            allowed(&recipe, Some("gfx94X-dcgpu")),
+            "the same recipe on a host it does list is offered"
+        );
+        assert!(
+            allowed(&recipe, None),
+            "an unmeasured host narrows nothing here, exactly as `fit: None` does for memory"
+        );
+
+        recipe.engine_recipes = vec![with_families(&[])];
+        assert!(
+            allowed(&recipe, Some("gfx110X-all")),
+            "a recipe naming no families runs anywhere and must stay offered"
+        );
+    }
+
+    /// Also the regression test for reading an absent `min_gpu_mem_gb` as "fits
+    /// anything": the seven recipes without one are the largest models in the
+    /// catalog, so that reading offered Llama-3.1-405B and DeepSeek-V4-Flash to
+    /// a quarter-gigabyte host.
+    #[test]
+    fn a_host_too_small_for_anything_is_offered_nothing_rather_than_the_wrong_thing() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, Some(0.25), &|_| true);
+
+        assert!(
+            offer.offered.is_empty(),
+            "a machine too small for every curated model must be offered none of them: {:?}",
+            offer
+                .offered
+                .iter()
+                .map(|recipe| &recipe.canonical_model_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The same rule stated from the other side, so it survives a catalog that
+    /// one day sizes those models: a recipe with no declared minimum is never
+    /// recommended on a fit-filtered host, however much memory it has.
+    #[test]
+    fn a_recipe_with_no_declared_minimum_is_never_recommended_by_fit() {
+        let recipes = builtin_model_recipes();
+        let unsized_ids = recipes
+            .iter()
+            .filter(|recipe| recipe.min_gpu_mem_gb.is_none())
+            .map(|recipe| recipe.canonical_model_id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !unsized_ids.is_empty(),
+            "the catalog still ships recipes with no minimum; otherwise this test guards nothing"
+        );
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, Some(100_000.0), &|_| true);
+
+        for recipe in &offer.offered {
+            assert!(
+                !unsized_ids.contains(&recipe.canonical_model_id),
+                "{} declares no GPU minimum, so no host can be told it fits",
+                recipe.canonical_model_id
+            );
+        }
+    }
+
+    /// Without the platform gate a native-Windows host is recommended vLLM
+    /// models it cannot serve -- confidently wrong about the engine instead of
+    /// the memory, which is the same defect wearing a different hat.
+    #[test]
+    fn an_engine_the_platform_rules_out_is_never_offered() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, Some(640.0), &|_| false);
+
+        assert!(
+            offer.offered.is_empty(),
+            "no engine can run here, so nothing can be recommended"
+        );
+    }
+
+    #[test]
+    fn models_beyond_the_cap_are_counted_rather_than_silently_dropped() {
+        let recipes = builtin_model_recipes();
+        let candidates = recipes.iter().collect::<Vec<_>>();
+
+        let offer = platform_offer(&candidates, Some(640.0), &|_| true);
+
+        assert_eq!(offer.offered.len(), MAX_RECOMMENDATIONS_PER_PLATFORM);
+        assert!(
+            offer.also_fit > 0,
+            "a host that can run far more than the cap shows must be told how many more"
+        );
     }
 
     #[test]
@@ -1120,11 +1726,9 @@ mod tests {
         assert!(rendered.contains("recommended_system_ram: 16 GiB"));
         assert!(rendered.contains("system_ram_fit: unknown"));
         assert!(rendered.contains("gpu_fit: unknown"));
-        // Every production caller of this function hardcodes
-        // `aggregate_gpu_vram_gib = None` (see `Command::Model` and the `/model`
-        // assistant tool), so this branch is the only one `rocm model` ever
-        // actually reaches -- its remediation must name a command this same
-        // path can act on, not one whose reading this function never sees.
+        // This branch is what a host whose VRAM could not be read reaches, and
+        // its remediation must name a command that explains the gap rather than
+        // the raw measurement this path already tried and got nothing from.
         assert!(rendered.contains("action: run `rocm diagnose --model"));
         assert!(!rendered.contains("amd-smi metric --json"));
         assert!(rendered.contains("engine_support:"));
@@ -1413,13 +2017,119 @@ mod tests {
     /// keeps the `runtime:` label half of the same check.
     #[test]
     fn vllm_adapter_availability_note_is_explicit_on_native_windows() {
+        let ruled_out = engine_ruled_out_by_platform_with("vllm", || true);
         if cfg!(windows) {
             assert!(
-                model_registry_adapter_availability_note("vllm", &|| true)
+                model_registry_adapter_availability_note(ruled_out)
                     .is_some_and(|note| note.contains("unsupported_native_windows"))
             );
         } else {
-            assert!(model_registry_adapter_availability_note("vllm", &|| true).is_none());
+            assert!(model_registry_adapter_availability_note(ruled_out).is_none());
         }
+    }
+
+    /// The values the summary and the listing now share: every preferred
+    /// engine of every recipe answered for, in the recipe's order, and the
+    /// platform gate's verdict carried alongside the adapter's location rather
+    /// than folded into it — on native Windows a resolved vLLM adapter is
+    /// still ruled out. Run over the whole catalog because a summary that
+    /// names recipes by id must not depend on which one it asks about.
+    #[test]
+    fn engine_availability_answers_for_every_preferred_engine_in_order() {
+        let (_root, paths) = test_paths("engine-availability-values");
+        // Injected rather than probed: a real `docker info` per AIM recipe
+        // would make this test the slowest in the crate.
+        let docker_reachable = || true;
+        let mut multi_engine_recipes = 0_usize;
+        for recipe in builtin_model_recipes() {
+            let engines =
+                model_recipe_engine_availability_with(&recipe, Some(&paths), &docker_reachable);
+            assert_eq!(
+                engines
+                    .iter()
+                    .map(|engine| engine.engine.as_str())
+                    .collect::<Vec<_>>(),
+                recipe
+                    .preferred_engines
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "{}",
+                recipe.canonical_model_id
+            );
+            multi_engine_recipes += usize::from(engines.len() > 1);
+            for engine in &engines {
+                assert_eq!(
+                    engine.platform_rule_out,
+                    engine_ruled_out_by_platform_with(&engine.engine, docker_reachable),
+                    "{}: {engine:?}",
+                    recipe.canonical_model_id
+                );
+                if cfg!(windows) && engine.engine == "vllm" {
+                    assert_eq!(
+                        engine.platform_rule_out,
+                        PlatformRuleOut::NativeWindowsVllm,
+                        "native Windows rules vLLM out however its adapter resolved"
+                    );
+                }
+            }
+        }
+        assert!(
+            multi_engine_recipes > 0,
+            "the catalog must still exercise a recipe with more than one preferred engine"
+        );
+    }
+
+    /// `None` paths means "nothing was looked up", not "unavailable": the
+    /// listing prints `not_checked` for it and the summary must not read it as
+    /// a missing engine. Driven with an engine name this build has no adapter
+    /// for, because every engine the catalog names is compiled in — with a
+    /// real one the lookup never leaves the `built_in` branch and this would
+    /// assert nothing.
+    #[test]
+    fn engine_availability_without_paths_is_not_checked_rather_than_unavailable() {
+        let (_root, paths) = test_paths("engine-availability-not-checked");
+        let mut recipe = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct")
+            .expect("the catalog carries the 8 GiB-class recipe");
+        recipe.preferred_engines = vec!["not-a-built-in-engine".to_owned()];
+        assert!(
+            !builtin_engine_available("not-a-built-in-engine"),
+            "the stand-in engine must have no built-in adapter, or this proves nothing"
+        );
+
+        let unchecked = model_recipe_engine_availability_with(&recipe, None, &|| true);
+        assert_eq!(unchecked.len(), 1);
+        assert_eq!(unchecked[0].location, ModelEngineLocation::NotChecked);
+
+        let looked_up = model_recipe_engine_availability_with(&recipe, Some(&paths), &|| true);
+        assert_eq!(looked_up.len(), 1);
+        assert!(
+            matches!(looked_up[0].location, ModelEngineLocation::Unavailable(_)),
+            "a looked-up engine with no adapter is unavailable, not unchecked: {:?}",
+            looked_up[0]
+        );
+    }
+
+    /// Both listings have to be recognisable as the model catalog, because the
+    /// chat tool renders the curated one and `rocm model --verbose` the other.
+    /// Recognising only one is the #1041 regression.
+    #[test]
+    fn both_model_listings_are_recognised_as_the_model_catalog() {
+        let (_root, paths) = test_paths("model-listing-recognition");
+        for listing in [
+            render_model_registry_text_with_context_and_host(Some(&paths), None, None),
+            render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None),
+        ] {
+            assert!(
+                text_is_model_catalog_listing(&listing),
+                "unrecognised model listing:\n{listing}"
+            );
+        }
+        assert!(!text_is_model_catalog_listing(
+            "examine:\n  legacy_rocm_status: not_detected\n"
+        ));
+        assert!(!text_is_model_catalog_listing(
+            "* lemonade\n  runtime: gfx120X-all\n"
+        ));
     }
 }

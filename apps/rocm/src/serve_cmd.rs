@@ -66,7 +66,9 @@ use crate::gpu_policy::{
     serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::serve_device_probe::serve_device_probe_opens;
 use crate::serve_port;
+use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
     ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
     engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
@@ -453,32 +455,6 @@ fn reuse_pregate_opens<T>(
 ) -> Option<T> {
     (!cpu_only && host_has_no_usable_gpu)
         .then(live_services_for_model)
-        .flatten()
-}
-
-/// Whether the deployment summary may spend a device probe, given what the
-/// launch report says happened.
-///
-/// `!already_running` is the load-bearing half, not a cosmetic echo of the
-/// smoke test's gate. A service that was already running is `"ready"` by
-/// definition, so keying on the status alone opens this on *every* repeat
-/// `rocm serve` of a live model — and the probe is not free: on a miss it costs
-/// `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` plus one in-flight probe, about 14s
-/// with Lemonade's 8s inference probe, paid sequentially before the summary's
-/// remaining waits. That is a long stall bought for a row this command cannot
-/// learn anything new for — the engine answered the same thing when the service
-/// was launched, and a *running* service's device is what `rocm services list`
-/// reads, with its own budget for exactly that.
-///
-/// `probe` is a closure rather than a value for that reason: on the reuse path
-/// the cost must not be paid at all, which is what the unit test pins.
-fn serve_device_probe_opens<T>(
-    already_running: bool,
-    status: &str,
-    probe: impl FnOnce() -> Option<T>,
-) -> Option<T> {
-    (!already_running && status == "ready")
-        .then(probe)
         .flatten()
 }
 
@@ -890,8 +866,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
-    // E2E-only launch fault injection (either mode) likewise stands in for the
-    // GPU it does not have.
+    // E2E-only launch fault injection (either mode) and the startup-exit
+    // stand-in engine likewise stand in for the GPU they do not have.
     //
     // The scripted free-space override opens the same waiver: it exists to refuse a
     // Lemonade install on a drive that cannot hold it, which `rocm serve` only
@@ -906,6 +882,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !cpu_only
         && !scripted_backend_failure
         && !e2e_simulate_oom_launch()
+        && !crate::service_launch::e2e_simulate_startup_exit()
         && !reuse_existing
         && host_has_no_usable_gpu
     {
@@ -1158,10 +1135,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(format!(
-            "Starting {model} on {selected_engine}…"
-        )));
+        let starting = serve_progress::starting_label(&model, &selected_engine);
+        let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(starting.clone()));
         spinner.borrow_mut().tick();
+        let mut shown = starting;
+        // Interactive summary (stdout and stderr both terminals) follows
+        // download / load / health until ready or a bounded failure. Piped
+        // output, or a redirected stderr, keeps the historical 45-second
+        // status budget so a serve that never answers does not block CI.
+        // `--wait` keeps waiting past either, until the server answers or dies.
+        let policy = serve_progress::ServeStartupPolicy::for_background_serve(
+            summary_mode,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        );
         // The key is shown when the wait begins, since Ctrl-C or a failed wait
         // would otherwise leave a running authenticated server whose key was never
         // printed. It is then not repeated in the summary below.
@@ -1184,6 +1170,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             require_api_key,
             gpu_refusal_waived_for_reuse,
             wait,
+            &policy,
             // Named with the id the launch resolved to: an already-starting
             // server keeps its own, not the one generated above. The spinner
             // has no id on it, and a non-TTY stderr gets no spinner at all.
@@ -1191,7 +1178,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 spinner.borrow_mut().clear();
                 eprintln!(
                     "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
-                     Follow: rocm logs --service {waiting_on} --follow"
+                     Follow: {} --follow",
+                    crate::service_hints::service_logs_hint(waiting_on)
                 );
                 if let Some(config) = wait_begin_client_config(
                     waiting_on,
@@ -1207,13 +1195,26 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                     print!("{config}");
                 }
             },
-            &mut |_elapsed| spinner.borrow_mut().tick(),
+            &mut |view: &ServeStartupView| {
+                let mut spinner = spinner.borrow_mut();
+                if view.label == shown {
+                    spinner.tick();
+                } else {
+                    shown.clone_from(&view.label);
+                    spinner.set_label(view.label.clone());
+                }
+            },
         );
         // `Spinner` has no `Drop`: clear its row so `Error:` is not glued to it.
         let report = match launched {
             Ok(report) => report,
             Err(error) => {
                 spinner.borrow_mut().clear();
+                if let Some(warning) = supervise_after_launch_error(&error, || {
+                    ensure_background_helper_running_quiet(summary_mode)
+                }) {
+                    eprintln!("{warning}");
+                }
                 return Err(error);
             }
         };
@@ -1455,6 +1456,35 @@ fn collect_serve_notes(
     notes
 }
 
+/// Start supervision after `start_managed_service` failed, when that failure
+/// left a launched server behind. Returns the warning to print when the
+/// helper itself would not start.
+///
+/// Only a startup stop that left the server running
+/// ([`serve_progress::ServeStartupFailed`] with `server_running`) leaves a
+/// process to supervise. A stop on an engine that failed or a process that
+/// exited has already been settled and reported as failed, so the CLI does not
+/// start the helper for it. Other errors either come before the child
+/// exists (the claiming record is written first, as `starting`, and `rocmd`
+/// treats it as any stale start), or from a child that already exited or an
+/// I/O error writing its record, which did not start the helper before this
+/// wait existed either. The startup failure stays the error the user reads; a
+/// helper failure is a warning beside it.
+fn supervise_after_launch_error(
+    error: &anyhow::Error,
+    start_helper: impl FnOnce() -> Result<()>,
+) -> Option<String> {
+    error
+        .downcast_ref::<serve_progress::ServeStartupFailed>()
+        .filter(|stop| stop.server_running)
+        .and_then(|_| start_helper().err())
+        .map(|helper| {
+            format!(
+                "warning: the background helper did not start, so nothing restarts this server if it fails: {helper:#}"
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,63 +1554,6 @@ mod tests {
         // reachable `serve()` input — see the `cpu_only` binding in `serve`.
         assert!(
             reuse_pregate_opens(true, host_has_no_usable_gpu(Some(&[])), || Some(())).is_none()
-        );
-    }
-
-    /// Regression coverage for the device probe's gate (ROCMAI-550 review).
-    ///
-    /// The gate shipped as `report.status == "ready"` alone, under a comment
-    /// claiming it was "the same gate as the smoke test" — which it was not: the
-    /// smoke test and the Anthropic-endpoint wait beside it both also require
-    /// `!already_running`. A reused service is `"ready"` by definition, so the
-    /// omission made every repeat `rocm serve` of a live model pay the probe's
-    /// full retry budget (plus one in-flight probe, ~14s with Lemonade) before
-    /// printing a summary of a launch that did not happen.
-    ///
-    /// The probe is asserted *not consulted*, not merely that the row is absent:
-    /// the cost is the bug, and a gate that probed and then discarded the answer
-    /// would satisfy a value-only assertion.
-    #[test]
-    fn the_device_probe_is_not_spent_on_a_service_that_was_already_running() {
-        let mut probed = false;
-        assert!(
-            serve_device_probe_opens(true, "ready", || {
-                probed = true;
-                Some("gpu")
-            })
-            .is_none(),
-            "a reused service must not open the device probe: it is `ready` by \
-             definition, so the budget would be spent on every repeat `serve`"
-        );
-        assert!(
-            !probed,
-            "the probe must not even be called on the reuse path — the wall time \
-             is the regression, not the `device:` row"
-        );
-
-        // A launch that is not ready has nothing to ask the engine about yet.
-        let mut probed_starting = false;
-        assert!(
-            serve_device_probe_opens(false, "starting", || {
-                probed_starting = true;
-                Some("gpu")
-            })
-            .is_none()
-        );
-        assert!(!probed_starting);
-
-        // The row itself still works for the case it was added for: a fresh
-        // launch that reached ready, where the engine knows what it selected.
-        assert_eq!(
-            serve_device_probe_opens(false, "ready", || Some("gpu")),
-            Some("gpu"),
-            "a fresh ready launch must still read the engine's device, or the \
-             Vulkan-only `device:` row this PR adds is gone"
-        );
-        // `None` from the engine stays a supported answer: no row, no error.
-        assert_eq!(
-            serve_device_probe_opens(false, "ready", || Option::<&str>::None),
-            None
         );
     }
 
@@ -2369,5 +2342,63 @@ mod tests {
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
         );
+    }
+
+    #[test]
+    fn a_startup_stop_starts_supervision_and_keeps_its_own_error() {
+        use std::cell::Cell;
+        let stop = || -> anyhow::Error {
+            serve_progress::ServeStartupFailed {
+                message: "qwen on vllm stopped making download progress".to_owned(),
+                server_running: true,
+            }
+            .into()
+        };
+        // Row: startup stop, helper starts. Helper called, nothing to warn.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&stop(), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+        assert_eq!(warning, None);
+
+        // Row: startup stop, helper fails. The warning names the helper
+        // error; the startup failure is still what the caller returns.
+        let warning = super::supervise_after_launch_error(&stop(), || anyhow::bail!("no daemon"))
+            .expect("a helper that failed is reported");
+        assert!(
+            warning.starts_with("warning: the background helper did not start"),
+            "{warning}"
+        );
+        assert!(warning.contains("no daemon"), "{warning}");
+
+        // Row: the server ended (engine failed, process exited). It was
+        // settled and reported as failed, so no helper is started to restart
+        // it behind that error.
+        let called = Cell::new(false);
+        let ended: anyhow::Error = serve_progress::ServeStartupFailed {
+            message: "qwen on vllm failed: the server process exited".to_owned(),
+            server_running: false,
+        }
+        .into();
+        let warning = super::supervise_after_launch_error(&ended, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get(), "an ended launch starts no helper");
+        assert_eq!(warning, None);
+
+        // Row: any other launch error. No helper.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&anyhow::anyhow!("spawn failed"), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(
+            !called.get(),
+            "a launch that never ran a server starts no helper"
+        );
+        assert_eq!(warning, None);
     }
 }

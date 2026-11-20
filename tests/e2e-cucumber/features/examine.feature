@@ -217,7 +217,8 @@ Feature: GPU detection and system inspection
   # half of that fix: `lspci` resolves a target from the marketing name, and on
   # an Instinct host `pci.ids` frequently spells that "Device 74a1", so without
   # `rocminfo` the per-node target the kernel reports is the only thing that can
-  # fill the field.
+  # fill the field. Where the name does resolve a target, the kernel's target
+  # replaces it (see examine-57).
   #
   # The step no-ops where a premise does not hold -- no readable KFD topology,
   # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
@@ -793,6 +794,100 @@ Feature: GPU detection and system inspection
     Given the active runtime is a nightly runtime installed for one exact GPU
     When the user inspects the system
     Then the runtime state names the channel, package source, source layout and exact GPU target that runtime was installed from
+  # ROCMAI-40. The ROCm runtime can be told to show only some of a machine's
+  # GPUs (a visibility mask, for example to hide an integrated GPU), and the
+  # GPUs it lists then have to be matched to the ones the machine has. They were
+  # matched by list position, so with the first GPU hidden its entry took the
+  # second GPU's model name, architecture and integrated/discrete verdict, and
+  # the second kept none. Each is now matched by its own PCI address. The machine
+  # is simulated: a native Linux root whose kernel topology has two GPUs, at
+  # 0000:03:00.0 (gfx1100) and 0000:04:00.0 (gfx1101), an `lspci` stand-in that
+  # lists an empty bus, and a `rocminfo` stand-in that lists only the second, as
+  # "AMD Radeon RX 7800 XT" with that card's `BDFID`. The other rows (no address
+  # from the runtime, counts that differ, an address in two PCI domains, a
+  # partitioned card) are the unit tests in `examine/linux_gpus.rs`.
+  @id:examine-each-gpu-keeps-its-own-reading @requires-os:linux
+  Scenario: examine-55 - A GPU the ROCm runtime cannot see does not borrow another GPU's identity
+    Given a machine with two AMD GPUs of which the ROCm runtime can see only the second
+    When the user inspects that machine in machine-readable form
+    Then the second GPU is reported with the model name the runtime gave it, its own architecture and as a discrete GPU
+    And the first GPU is reported with its own architecture, no model name and no claim about whether it is integrated
+
+  # ROCMAI-40. `HSA_OVERRIDE_GFX_VERSION` makes the ROCm runtime report another
+  # GPU architecture than the card's own -- a common workaround for a card the
+  # runtime does not support -- and `rocminfo` inherits it. The runtime's reading
+  # is matched to the card by PCI address and supplies the model name, but it
+  # does not replace the architecture the card already has from the kernel, or
+  # the integrated/discrete verdict that follows from it, so `rocm diagnose`'s
+  # override check holds the card's native architecture against the framework's
+  # arch list. The machine is simulated: a native Linux root whose kernel
+  # topology has one gfx1103 integrated GPU at 0000:c4:00.0, an `lspci` stand-in
+  # that lists an empty bus, and a `rocminfo` stand-in that, like the real
+  # runtime, reports that GPU as gfx1100 at the same address only while
+  # HSA_OVERRIDE_GFX_VERSION is 11.0.0, which the scenario sets, and as an APU
+  # either way. The stand-in leaves a marker when it runs with the override,
+  # and the scenario requires it, so it cannot pass on the native listing.
+  # What it proves is that the overridden target does not replace the card's
+  # own. It does not prove where the integrated verdict comes from: gfx1103 is
+  # an APU under the target rule as well, so the runtime's `Memory Properties`
+  # reading deciding the verdict is proved by the unit test
+  # `a_matched_agents_verdict_is_its_memory_properties_reading_or_else_the_target_rule`.
+  @id:examine-overridden-runtime-target-keeps-native @requires-os:linux
+  Scenario: examine-56 - A runtime told to report a different GPU architecture does not change the architecture reported for the card
+    Given a machine whose integrated GPU the ROCm runtime is told to report as another architecture
+    When the user inspects that machine in machine-readable form
+    Then the integrated GPU is reported with its own architecture and as integrated
+    And the integrated GPU is reported with the model name the runtime gave it
+
+  # ROCMAI-40. The PCI scan can only guess a GPU's architecture from its model
+  # name, through a name table, and the guess can be wrong (for Krackan Point
+  # the name table says gfx1150 while the PCI device-id map says gfx1152; which
+  # is right is unconfirmed). The kernel states the architecture of each GPU it
+  # exposes, so where the two disagree at the same PCI address the kernel's is
+  # reported, and the integrated/discrete verdict follows it. The machine is
+  # simulated so the disagreement does not depend on any one table entry: a
+  # native Linux root whose `lspci` stand-in
+  # lists a "Phoenix1" (which the table reads as gfx1103, integrated) at
+  # 0000:05:00.0, and whose kernel topology has a gfx1100 node at that address.
+  @id:examine-kernel-architecture-outranks-the-name-guess @requires-os:linux
+  Scenario: examine-57 - The kernel's architecture is reported over one guessed from the GPU's model name
+    Given a machine whose PCI listing names a GPU model the kernel reports as another architecture
+    When the user inspects that machine in machine-readable form
+    Then the GPU is reported with the architecture the kernel gives it, as a discrete GPU
+
+  # ROCMAI-40. When the PCI listing cannot name a GPU at all (no model name the
+  # table knows, as on a Strix Halo whose `pci.ids` has no entry for it), the
+  # scan has no architecture for it and calls it discrete by default. The
+  # kernel's architecture fills that gap, and when it is an integrated GPU's the
+  # GPU is reported as integrated. This scenario covers the host where the ROCm
+  # runtime lists no GPU; a runtime that does list it states the verdict itself
+  # (unit-tested in `examine/linux_gpus.rs`). The machine is simulated: a native
+  # Linux root whose `lspci` stand-in lists a nameless "Device 7fff" at 0000:c3:00.0 (an id no table
+  # knows, so the gap does not depend on one table entry), whose kernel
+  # topology has a gfx1151 node at that address, and whose `rocminfo` stand-in
+  # lists no GPU.
+  @id:examine-kernel-architecture-fills-an-unnamed-gpu @requires-os:linux
+  Scenario: examine-58 - A GPU the PCI listing cannot name takes the kernel's architecture and is reported as integrated
+    Given a machine whose PCI listing cannot name its GPU and whose kernel reports an integrated architecture for it
+    When the user inspects that machine in machine-readable form
+    Then the unnamed GPU is reported with the kernel's architecture, as an integrated GPU
+
+  # ROCMAI-40. Without a bus address in the ROCm runtime's listing, nothing says
+  # which card a reading belongs to. Pairing the readings with the listed GPUs
+  # by position would be a guess, and on a multi-GPU host a wrong guess puts one
+  # card's model name and architecture on another, so the readings are not
+  # applied to any GPU and the inspection says so. The machine is simulated: a
+  # native Linux root whose kernel topology has two GPUs, at 0000:03:00.0
+  # (gfx1100) and 0000:04:00.0 (gfx1101), an `lspci` stand-in that lists an
+  # empty bus, and a `rocminfo` stand-in that lists both GPUs in the same order
+  # and with the same architectures but prints no `BDFID:` line for either.
+  @id:examine-unaddressed-runtime-readings-are-reported-not-guessed @requires-os:linux
+  Scenario: examine-59 - GPU readings the ROCm runtime does not tie to a card are reported, not guessed
+    Given a machine with two AMD GPUs whose ROCm runtime lists both without saying which card is which
+    When the user inspects that machine in machine-readable form
+    Then each GPU is reported with its own architecture and no model name
+    And the inspection says the runtime's readings could not be matched to a listed GPU
+
 
   # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
   # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
@@ -809,7 +904,7 @@ Feature: GPU detection and system inspection
   # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
   # fails here.
   @id:examine-reports-this-hosts-rocm-support-level
-  Scenario: examine-55 - System inspection says whether this machine's GPU is supported by ROCm
+  Scenario: examine-60 - System inspection says whether this machine's GPU is supported by ROCm
     When the user inspects the system
     Then the inspection states this host's ROCm support level
     And the support level agrees with the GPU the inspection detected
@@ -826,7 +921,7 @@ Feature: GPU detection and system inspection
   # machine nobody has looked at, and these scenarios are what keep those
   # answers distinguishable.
   @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
-  Scenario: examine-56 - A GPU the official stack rejects is told which way it can still run models
+  Scenario: examine-61 - A GPU the official stack rejects is told which way it can still run models
     Given a machine whose GPU has no official support but has a working Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -841,7 +936,7 @@ Feature: GPU detection and system inspection
   # why a failing probe must not be promoted to one), and this scenario covers
   # that narrower claim rather than the driverless host.
   @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
-  Scenario: examine-57 - A machine with no way to run models is not told it has one
+  Scenario: examine-62 - A machine with no way to run models is not told it has one
     Given a machine whose GPU has no official support and no Vulkan driver
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -853,33 +948,33 @@ Feature: GPU detection and system inspection
   # reporting a GPU path - the one outcome the no-fallback rule exists to
   # prevent, reached through a backend rather than a policy change.
   @id:examine-does-not-count-a-software-renderer-as-a-gpu-path @requires-os:linux
-  Scenario: examine-58 - A software renderer does not count as a way to run on the GPU
+  Scenario: examine-63 - A software renderer does not count as a way to run on the GPU
     Given a machine whose GPU has no official support and only a software renderer
     When the user inspects that machine
     Then the inspection does not claim models can run through Vulkan
     And the inspection says the only renderer it found runs on the CPU
 
-  # The shape examine-57 does not reach. examine-57 plants a `vulkaninfo` that
+  # The shape examine-62 does not reach. examine-62 plants a `vulkaninfo` that
   # runs and reports no devices, which is the only shape that earns a confirmed
   # absence; this host has no `vulkaninfo` to ask at all, and must be told the
   # check could not be made rather than either promised Vulkan or declared to
   # have nothing.
   #
   # Known gap, measured rather than assumed: a real `vulkaninfo` on a Linux host
-  # with no reachable driver does NOT produce examine-57's shape. It prints
+  # with no reachable driver does NOT produce examine-62's shape. It prints
   # "Found no drivers!" and exits 1, which this probe classifies as
   # inconclusive — so such a host lands at *this* scenario's level rather than
-  # examine-57's. Telling "no drivers" apart from "the tool is broken" needs the
+  # examine-62's. Telling "no drivers" apart from "the tool is broken" needs the
   # loader's own message, which the shared capture discards.
   @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
-  Scenario: examine-59 - A machine that cannot be checked for Vulkan is not told either way
+  Scenario: examine-64 - A machine that cannot be checked for Vulkan is not told either way
     Given a machine whose GPU has no official support and no way to check Vulkan
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
     And the inspection does not claim models can run through Vulkan
     And the inspection says it could not confirm whether a Vulkan driver is there
 
-  # examine-58 with one thing changed: the manifest beside the software renderer
+  # examine-63 with one thing changed: the manifest beside the software renderer
   # names a real GPU driver. That is the common `render`-group permission shape
   # -- the driver is installed, and the user's own account cannot open the
   # device, so the loader falls back to llvmpipe -- and it is the one case where
@@ -887,12 +982,12 @@ Feature: GPU detection and system inspection
   # driver was found - install one" would contradict the `icds` field of the
   # same report and name an install the host has already done.
   #
-  # The pair is the test: examine-58 and this scenario plant the same
+  # The pair is the test: examine-63 and this scenario plant the same
   # enumeration and differ only in the manifest, so an implementation that reads
   # the devices before the manifests passes one and fails the other instead of
   # collapsing both into a confirmed absence.
   @id:examine-does-not-deny-an-installed-vulkan-driver-a-software-renderer-masks @requires-os:linux
-  Scenario: examine-60 - An installed GPU driver masked by a software renderer is not reported as missing
+  Scenario: examine-65 - An installed GPU driver masked by a software renderer is not reported as missing
     Given a machine whose GPU has no official support and a Vulkan driver masked by a software renderer
     When the user inspects that machine
     Then the inspection reports the GPU as unsupported by the official stack
@@ -904,7 +999,7 @@ Feature: GPU detection and system inspection
   # at the top of `rocm engines`, which states whether a GPU is required and
   # which backend supplies it.
   #
-  # It needs its own scenario rather than another Then on examine-56, because a
+  # It needs its own scenario rather than another Then on examine-61, because a
   # planted fixture reaches exactly one child process -- the scenario's
   # `command_env` is moved into the first command it runs -- so a second command
   # in the same scenario would read the runner's real host, not the planted one.
@@ -915,13 +1010,13 @@ Feature: GPU detection and system inspection
   # and differ only in whether a Vulkan driver answers, so merging the
   # Vulkan-only arm into the shared no-backend arm fails one of the two.
   @id:examine-engines-banner-names-vulkan @requires-os:linux
-  Scenario: examine-61 - The engine list tells a Vulkan-only machine which backend its GPU work runs on
+  Scenario: examine-66 - The engine list tells a Vulkan-only machine which backend its GPU work runs on
     Given a machine whose GPU has no official support but has a working Vulkan driver
     When the user lists available engines on that machine
     Then the engine list says the GPU path on this machine is Vulkan rather than ROCm
 
   @id:examine-engines-banner-refuses-the-cpu @requires-os:linux
-  Scenario: examine-62 - The engine list still refuses the CPU on a machine with no usable GPU backend
+  Scenario: examine-67 - The engine list still refuses the CPU on a machine with no usable GPU backend
     Given a machine whose GPU has no official support and no Vulkan driver
     When the user lists available engines on that machine
     Then the engine list says a GPU is required and the CPU is not an alternative

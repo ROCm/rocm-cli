@@ -27,6 +27,7 @@
 
 use super::summaries::managed_service_running_state;
 use crate::automations::{render_automations_text, render_daemon_text};
+use crate::examine_report_text::host_gpu_support_level;
 use crate::freeform_planner::{format_structured_tool_call, plan_freeform_request_with_context};
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
 use crate::rocm_argv::{chat_cli_arg_value, chat_cli_has_flag};
@@ -44,10 +45,9 @@ use crate::uninstall_plan::render_uninstall_dry_run;
 use crate::update_cmd::render_update_text;
 use crate::{
     build_codex_bridge_gpu_snapshot, build_codex_bridge_snapshot,
-    builtin_codex_bridge_engine_inventory, cli_version_string, host_gpu_support_level,
-    record_cli_audit_event, render_config_text, render_engine_inventory_text_with_paths,
-    render_examine_text, render_examine_text_with_paths,
-    render_model_registry_text_with_context_and_host,
+    builtin_codex_bridge_engine_inventory, cli_version_string, record_cli_audit_event,
+    render_config_text, render_engine_inventory_text_with_paths, render_examine_text,
+    render_examine_text_with_paths, render_model_registry_text_with_context_and_host,
     render_model_registry_verbose_text_with_context_and_host, render_setup_status_text,
     therock_install_version_selector,
 };
@@ -568,13 +568,21 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         // whole context, so the one tool call a small model reaches for when
         // asked what it can run ended the turn with a provider error. The
         // verbose dump is still reachable, but only when it was asked for.
+        //
+        // Both measure the host the same way `Command::Model` in `main.rs`
+        // does. An assistant asked what this machine can run must get the
+        // answer a person typing `rocm model` gets, and the recommendation
+        // list is narrowed to the host's memory — so passing no host facts
+        // here would hand the assistant the unnarrowed list while the terminal
+        // showed the narrowed one.
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
         {
+            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_text_with_context_and_host(
                 Some(paths),
-                None,
-                None,
+                gpu_gib,
+                host_ram_gib,
             ))
         }
         [command, flag]
@@ -582,10 +590,11 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command.eq_ignore_ascii_case("models"))
                 && flag.eq_ignore_ascii_case("--verbose") =>
         {
+            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_verbose_text_with_context_and_host(
                 Some(paths),
-                None,
-                None,
+                gpu_gib,
+                host_ram_gib,
             ))
         }
         [command] if command.eq_ignore_ascii_case("daemon") => {
@@ -1451,8 +1460,13 @@ mod tests {
     /// context. Asking a small model "which LLMs can this machine support"
     /// makes it call exactly this, so the one question the tool exists for
     /// used to end in a provider context-overflow error.
+    ///
+    /// Scope, stated plainly because the first assertion below reads stronger
+    /// than it is: this pins *which renderer* the tool uses, not that the
+    /// listing was narrowed to the host. The narrowing is `model-catalog-09`'s,
+    /// on a lane that can plant a capacity.
     #[test]
-    fn chat_model_tool_returns_the_curated_list_rocm_model_prints() {
+    fn chat_model_tool_returns_the_curated_listing_not_the_verbose_dump() {
         let (_root, paths) = test_paths("mcp-model-curated");
 
         let result = run_internal_mcp_call(
@@ -1464,13 +1478,24 @@ mod tests {
         .expect("read-only rocm_command model should run");
         let text = mcp_tool_result_text(&result);
 
-        // The same recipes, from the same renderer `rocm model` calls.
-        let curated = render_model_registry_text_with_context_and_host(Some(&paths), None, None);
+        // A consistency check, and only that: the expected value is built from
+        // the same renderer, on the same host facts, that production just used,
+        // so the two agree whenever the tool calls that renderer at all. It
+        // cannot detect a MISSING narrowing -- on a host the test process reads
+        // no GPU for, both sides are the unnarrowed listing and this still
+        // passes. `model-catalog-09` is the guard for the narrowing itself, on
+        // a lane that can plant a capacity.
+        let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
+        let curated =
+            render_model_registry_text_with_context_and_host(Some(&paths), gpu_gib, host_ram_gib);
         assert!(
             text.contains(curated.trim()),
             "the tool must return what `rocm model` prints:\n{text}"
         );
-        // And not the per-recipe diagnostics, which are what made it huge.
+        // This is the assertion that discriminates, and the one this test is
+        // named for: the per-recipe diagnostics are what made the dump huge, so
+        // a tool that fell back to `--verbose` fails here regardless of what
+        // the host measured.
         assert!(
             !text.contains("aliases=["),
             "the verbose dump must not be the default:\n{text}"
@@ -1640,6 +1665,38 @@ mod tests {
             !crate::driver_install::driver_install_state_path(&paths).exists(),
             "a refused call must not create driver install state"
         );
+    }
+
+    /// The seam #1041 broke: the chat `model` tool's own output has to be
+    /// something `deterministic_chat_tool_summary` recognises, or the "ROCm CLI
+    /// summary" block silently stops appearing for model questions. Asserted
+    /// through this dispatch rather than against a renderer, so re-pointing
+    /// these arms at a different renderer fails here instead of in review.
+    #[test]
+    fn the_chat_model_tool_output_still_produces_the_deterministic_summary() {
+        let (_root, paths) = test_paths("chat-model-tool-summary");
+        for args in [
+            vec!["model".to_owned()],
+            vec!["models".to_owned()],
+            vec!["model".to_owned(), "--verbose".to_owned()],
+        ] {
+            let text = run_rocm_read_only_in_process(&paths, &args)
+                .unwrap_or_else(|error| panic!("`rocm {args:?}` must run in process: {error}"));
+            let summary = super::super::summaries::deterministic_chat_tool_summary(&paths, &text)
+                .unwrap_or_else(|| panic!("`rocm {args:?}` output must summarize, got:\n{text}"));
+            assert!(
+                summary.contains("Recommended local assistant: qwen"),
+                "`rocm {args:?}`: {summary}"
+            );
+            assert!(
+                summary.contains("Tiny smoke test: qwen-smoke"),
+                "`rocm {args:?}`: {summary}"
+            );
+            assert!(
+                summary.contains("8 GiB-class option: llama"),
+                "`rocm {args:?}`: {summary}"
+            );
+        }
     }
 
     #[test]

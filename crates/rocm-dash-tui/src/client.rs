@@ -165,6 +165,9 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
         None => return Err(anyhow!("connection closed before Welcome")),
     };
 
+    // dash-56 and dash-58 (`dash_steps.rs`) count this line, with its
+    // `rocm_dash_tui::client` target, in the client log to tell a reconnection
+    // from the connection a dashboard already had; keep them in step.
     info!(host = %host, version = %daemon_version, "connected");
     let _ = tx.send(ClientMsg::Connected {
         host: host.clone(),

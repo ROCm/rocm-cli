@@ -14,7 +14,9 @@
 //!
 //! The probes live in child modules: `capture` (optional-command capture),
 //! `os_facts` (kernel, distro, CPU and RAM), `linux` (sysfs, KFD and DRM),
-//! `gpu_visibility` (which GPUs this process may use), `windows_inventory` (the
+//! `gpu_visibility` (which GPUs this process may use), `unified_memory` (the
+//! pool an APU's engine allocates a model from, which is neither its VRAM
+//! carve-out nor installed RAM), `windows_inventory` (the
 //! Windows display-adapter inventory), `wsl` (WSL detection and the Windows host
 //! driver as seen from the guest), `render` (the `rocm examine` text of an
 //! `ExamineSummary`), `diagnostics` (the GPU detection diagnostics text) and
@@ -54,6 +56,7 @@ mod gpu_visibility;
 pub(crate) mod linux;
 mod os_facts;
 mod render;
+mod unified_memory;
 mod vulkan;
 mod windows_inventory;
 mod wsl;
@@ -72,8 +75,10 @@ use linux::detect_linux_amdgpu_driver_version;
 use linux::detect_linux_primary_gpu_name;
 pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
+pub(crate) use linux::pci_bus_device_function;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
+pub use unified_memory::detect_host_unified_memory_gib;
 pub use vulkan::{
     VulkanDevice, VulkanEvidence, VulkanStatus, VulkanSupport, amd_icd_driver_label,
     classify_vulkan_support, detect_vulkan_support, icd_driver_label, icd_is_gpu_driver,

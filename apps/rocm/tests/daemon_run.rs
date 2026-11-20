@@ -9,6 +9,12 @@
 //! spawn the built binary, read stdout until the banner appears (or a short
 //! timeout elapses), then kill the process.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test crate: its helpers sit outside `#[test]` fns, and a failure must fail the test"
+)]
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

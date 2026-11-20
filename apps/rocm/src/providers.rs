@@ -2077,6 +2077,39 @@ mod tests {
         Ok(())
     }
 
+    /// An engine that reports a failure in-band, as a `data:` error payload in a
+    /// 200 stream followed by `[DONE]`, must fail the smoke test with the
+    /// engine's own message, whether it comes before or after content tokens.
+    /// Pins `run_smoke_test`'s doc comment and `parse_openai_sse_line`.
+    #[test]
+    fn serve_smoke_test_fails_on_an_in_band_error_payload_in_a_200_stream() -> Result<()> {
+        for (name, body) in [
+            (
+                "serve-smoke-in-band-error",
+                "data: {\"error\":{\"message\":\"CUDA out of memory\",\"type\":\"InternalServerError\"}}\n\ndata: [DONE]\n\n",
+            ),
+            (
+                "serve-smoke-in-band-error-after-content",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"object\":\"error\",\"message\":\"CUDA out of memory\"}\n\ndata: [DONE]\n\n",
+            ),
+        ] {
+            let smoke = smoke_outcome_against(name, move |stream| {
+                write_chunked_sse_head(stream)?;
+                write!(stream, "{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body)?;
+                stream.flush()?;
+                Ok(())
+            })?;
+            let crate::serve_summary::SmokeOutcome::Failed(reason) = smoke else {
+                anyhow::bail!("{name}: an in-band error payload was reported as measured");
+            };
+            assert!(
+                reason.contains("CUDA out of memory"),
+                "{name}: the reason dropped the engine's message"
+            );
+        }
+        Ok(())
+    }
+
     /// A close-delimited stream (no chunking, no `Content-Length`) that ends
     /// after some tokens is deliberately `Measured`: it has no framing to cut
     /// short, so a clean close is indistinguishable from completion (see

@@ -133,7 +133,9 @@ pub(crate) fn kfd_gpu_nodes_in(nodes_dir: &Path) -> Option<Vec<KfdGpuNode>> {
 /// 12032, 17920, 23808, 35584, 43520, 49664 and 55808, which decode to exactly
 /// the eight addresses `lspci -D` lists for its accelerators (EAI-8449).
 ///
-/// `None` when the property is absent or zero. Zero is refused rather than
+/// `None` when the property is absent, zero, or wider than 16 bits (which
+/// `pci_dev_id()` cannot produce; see [`pci_bus_device_function`]). Zero is
+/// refused rather than
 /// decoded: `0000:00:00.0` is the host bridge, so emitting it would be a
 /// wrong-but-plausible address that could match an unrelated PCI entry.
 #[cfg(any(target_os = "linux", test))]
@@ -141,16 +143,39 @@ fn kfd_node_pci_id(properties: &str) -> Option<String> {
     let location = kfd_property_value(properties, "location_id")?
         .parse::<u32>()
         .ok()?;
-    if location == 0 {
-        return None;
-    }
     let domain = kfd_property_value(properties, "domain")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
-    let bus = (location >> 8) & 0xff;
-    let device = (location >> 3) & 0x1f;
-    let function = location & 0x7;
-    Some(format!("{domain:04x}:{bus:02x}:{device:02x}.{function}"))
+    let bdf = pci_bus_device_function(location)?;
+    Some(format!("{domain:04x}:{bdf}"))
+}
+
+/// The `bus:device.function` part of a PCI address, spelled as `lspci` spells
+/// it, from the kernel's `pci_dev_id()` encoding: `(bus << 8) | devfn`, with
+/// `devfn` packing the device number in bits 3..8 and the function in bits
+/// 0..3. So `4352` (`0x1100`) is `11:00.0`.
+///
+/// Two readings carry an address in this encoding, and both decode through
+/// here so they cannot disagree about a card: the KFD topology's `location_id`
+/// (`kfd_node_pci_id`, which adds the `domain` property in front) and
+/// `rocminfo`'s per-agent `BDFID`, which has no domain at all
+/// (`examine::linux_gpus`, which matches each `rocminfo` agent onto the GPU
+/// with this address).
+///
+/// `None` for zero, for the reason `kfd_node_pci_id` gives: `00:00.0` is the
+/// host bridge, and `rocminfo` prints `BDFID: 0` for its CPU agents, so a zero
+/// is "no address" rather than an address that could match an unrelated entry.
+/// `None` above `0xffff` too, which the encoding cannot produce.
+pub(crate) fn pci_bus_device_function(dev_id: u32) -> Option<String> {
+    // Above 16 bits is no `pci_dev_id()`: decoding only the low 16 would turn
+    // it into an address that could belong to another card.
+    if dev_id == 0 || dev_id > 0xffff {
+        return None;
+    }
+    let bus = (dev_id >> 8) & 0xff;
+    let device = (dev_id >> 3) & 0x1f;
+    let function = dev_id & 0x7;
+    Some(format!("{bus:02x}:{device:02x}.{function}"))
 }
 
 /// The KFD-topology read, against a caller-supplied nodes directory.
@@ -232,6 +257,69 @@ pub(super) fn linux_drm_amdgpu_card_count_in(class_dir: &Path) -> Option<usize> 
         })
         .count();
     Some(count)
+}
+
+/// The amdgpu GTT aperture cap, in bytes, for the one AMD DRM card this host
+/// has. `None` when there is no such figure to read.
+///
+/// `mem_info_gtt_total` is the kernel's own ceiling on how much system memory
+/// the amdgpu allocator may hand out as GPU-addressable GTT. That is the pool an
+/// engine serves a model from on an APU, where `mem_info_vram_total` reports only
+/// the fixed BIOS carve-out. It is a *measurement*, not the "half of installed
+/// RAM" rule of thumb that happens to be the driver's default: `amdgpu.gttsize`
+/// and the BIOS both move it, and the point of reading the file is that whatever
+/// moved it is already accounted for.
+///
+/// Reads through [`host_path`], so the E2E suite can plant one.
+#[cfg(target_os = "linux")]
+pub(super) fn linux_drm_amdgpu_gtt_total_bytes() -> Option<u64> {
+    linux_drm_amdgpu_gtt_total_bytes_in(&host_path("/sys/class/drm"))
+}
+
+/// [`linux_drm_amdgpu_gtt_total_bytes`] against a caller-supplied DRM class
+/// directory, so it can be driven from a planted tree rather than only on a
+/// machine that has the file. Same seam as [`linux_kfd_gpu_node_count_in`].
+///
+/// Enumerates primary `card<N>` nodes the same way
+/// [`linux_drm_amdgpu_card_count`] does (connector sub-nodes like `card0-DP-1`
+/// skipped, [`is_amdgpu_device`] deciding what is an AMD card) and answers only
+/// when **exactly one** AMD card is found. More than one card is ambiguous: this
+/// figure is attributed to a particular device by the caller, and the GTT
+/// aperture is per-device, so handing back one card's figure for a host that has
+/// two would name the wrong pool. Zero AMD cards is `None`, the same "nothing to
+/// report" the caller gets from an unreadable file.
+#[cfg(any(target_os = "linux", test))]
+fn linux_drm_amdgpu_gtt_total_bytes_in(drm_dir: &Path) -> Option<u64> {
+    let mut found: Option<u64> = None;
+    let mut cards = 0usize;
+    for entry in fs::read_dir(drm_dir).ok()?.flatten() {
+        let card_path = entry.path();
+        let Some(name) = card_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device_dir = card_path.join("device");
+        if !is_amdgpu_device(&device_dir) {
+            continue;
+        }
+        cards += 1;
+        if let Some(bytes) = read_sysfs_u64(&device_dir.join("mem_info_gtt_total")) {
+            found = Some(bytes);
+        }
+    }
+    // A single AMD card only: see the doc comment.
+    if cards == 1 { found } else { None }
+}
+
+/// A sysfs file whose whole contents are one unsigned integer. `None` when the
+/// file is absent, unreadable, or holds something else -- which is the
+/// "unparseable" half of what keeps
+/// [`crate::model_readiness::AcceleratorMemory::UnifiedMemoryUnreadable`] alive.
+#[cfg(any(target_os = "linux", test))]
+fn read_sysfs_u64(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
 }
 
 /// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
@@ -505,6 +593,115 @@ mod tests {
         Ok(())
     }
 
+    /// Plant one DRM card under `drm_dir`, with whatever of the two memory
+    /// counters the caller names.
+    fn plant_drm_card(
+        drm_dir: &Path,
+        name: &str,
+        vendor: &str,
+        gtt_total: Option<&str>,
+        vram_total: Option<&str>,
+    ) -> Result<()> {
+        let device = drm_dir.join(name).join("device");
+        fs::create_dir_all(&device)?;
+        fs::write(device.join("vendor"), format!("{vendor}\n"))?;
+        if let Some(gtt) = gtt_total {
+            fs::write(device.join("mem_info_gtt_total"), format!("{gtt}\n"))?;
+        }
+        if let Some(vram) = vram_total {
+            fs::write(device.join("mem_info_vram_total"), format!("{vram}\n"))?;
+        }
+        Ok(())
+    }
+
+    /// The whole point of the file: on an APU the VRAM counter beside it is the
+    /// BIOS carve-out and the GTT counter is the pool the engine allocates
+    /// from. They are read from the same directory and must not be confused,
+    /// so both are planted and only one is expected back.
+    #[test]
+    fn the_gtt_aperture_is_read_and_not_the_vram_carve_out() -> Result<()> {
+        let (root, _) = temp_app_paths("drm-gtt-aperture");
+        let drm = root.join("drm");
+        // A Strix-Halo-shaped reading: a ~4 GiB carve-out beside a 60 GiB
+        // aperture.
+        let gtt = 64_424_509_440_u64; // 60 GiB
+        plant_drm_card(
+            &drm,
+            "card0",
+            "0x1002",
+            Some(&gtt.to_string()),
+            Some("4294967296"),
+        )?;
+        // A connector sub-node must not be mistaken for a second card — and it
+        // is planted as a *complete* AMD device, with its own vendor id and a
+        // different GTT figure, so the `!name.contains('-')` filter is the only
+        // thing excluding it. Planted empty (as this was), `is_amdgpu_device`
+        // rejected it on the missing vendor id and the test stayed green with
+        // that filter deleted, proving nothing about the connector rule.
+        plant_drm_card(
+            &drm,
+            "card0-DP-1",
+            "0x1002",
+            Some("1073741824"),
+            Some("4294967296"),
+        )?;
+
+        let found = linux_drm_amdgpu_gtt_total_bytes_in(&drm);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(found, Some(gtt));
+        Ok(())
+    }
+
+    /// Absent, unparseable, non-AMD and absent-directory all read as "no figure
+    /// to report" -- which is what keeps `UnifiedMemoryUnreadable` alive rather
+    /// than letting a failed read become a number.
+    #[test]
+    fn an_unreadable_gtt_aperture_reports_nothing_rather_than_a_number() -> Result<()> {
+        let (root, _) = temp_app_paths("drm-gtt-unreadable");
+
+        // An AMD card with no `mem_info_gtt_total` (an older kernel).
+        let absent = root.join("absent");
+        plant_drm_card(&absent, "card0", "0x1002", None, Some("4294967296"))?;
+        assert_eq!(linux_drm_amdgpu_gtt_total_bytes_in(&absent), None);
+
+        // A file holding something that is not a count.
+        let garbage = root.join("garbage");
+        plant_drm_card(&garbage, "card0", "0x1002", Some("not-a-number"), None)?;
+        assert_eq!(linux_drm_amdgpu_gtt_total_bytes_in(&garbage), None);
+
+        // A card that is not AMD's: `i915` exposes no such file, and even if a
+        // directory carried one it is not an AMD part's aperture.
+        let intel = root.join("intel");
+        plant_drm_card(&intel, "card0", "0x8086", Some("64424509440"), None)?;
+        assert_eq!(linux_drm_amdgpu_gtt_total_bytes_in(&intel), None);
+
+        // No DRM class directory at all.
+        assert_eq!(
+            linux_drm_amdgpu_gtt_total_bytes_in(&root.join("nowhere")),
+            None
+        );
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    /// Two AMD cards: the aperture is per-device and the caller attributes the
+    /// answer to one GPU, so handing back whichever card `read_dir` happened to
+    /// reach last would name the wrong pool. Answer only when there is one card
+    /// to mean.
+    #[test]
+    fn two_amd_cards_leave_the_gtt_aperture_unattributable() -> Result<()> {
+        let (root, _) = temp_app_paths("drm-gtt-two-cards");
+        let drm = root.join("drm");
+        plant_drm_card(&drm, "card0", "0x1002", Some("64424509440"), None)?;
+        plant_drm_card(&drm, "card1", "0x1002", Some("8589934592"), None)?;
+
+        let found = linux_drm_amdgpu_gtt_total_bytes_in(&drm);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(found, None);
+        Ok(())
+    }
+
     #[test]
     fn kfd_topology_names_the_gpu_when_no_tooling_is_installed() -> Result<()> {
         // Covers the standalone-file fallback; see
@@ -720,6 +917,23 @@ mod tests {
         );
         // A node that states no location at all cannot be placed on the bus.
         assert_eq!(kfd_node_pci_id("gfx_target_version 90402\n"), None);
+    }
+
+    #[test]
+    fn a_dev_id_decodes_every_function_bit_and_refuses_zero_and_wider_values() {
+        // The decode both the KFD topology and `rocminfo`'s `BDFID` go through,
+        // pinned to literal addresses: a test that only compares the two sides
+        // stays green when the shared decode is wrong on both. Functions 5 and
+        // 7 use the function's high bit, which a two-bit mask would drop.
+        assert_eq!(pci_bus_device_function(0x1c7).as_deref(), Some("01:18.7"));
+        assert_eq!(pci_bus_device_function(0x305).as_deref(), Some("03:00.5"));
+        assert_eq!(pci_bus_device_function(49_920).as_deref(), Some("c3:00.0"));
+        assert_eq!(pci_bus_device_function(0xfffe).as_deref(), Some("ff:1f.6"));
+        assert_eq!(pci_bus_device_function(0), None);
+        // Past 16 bits is not this encoding; its low 16 bits (0x0300, a real
+        // card's address) must not be read as one.
+        assert_eq!(pci_bus_device_function(0x1_0300), None);
+        assert_eq!(pci_bus_device_function(0xffff).as_deref(), Some("ff:1f.7"));
     }
 
     #[test]

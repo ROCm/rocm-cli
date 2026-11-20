@@ -28,6 +28,7 @@ use rocm_core::{
 };
 
 use crate::engine_inventory;
+use crate::examine_report_text::engine_inventory_note;
 use crate::managed_service_status::load_managed_services;
 
 pub(crate) fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
@@ -37,11 +38,7 @@ pub(crate) fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridg
     // takes exactly the two fields this summary already carries, so the engine
     // list costs no detection the snapshot was not doing anyway.
     let examine = ExamineSummary::gather()?;
-    let gpu_support_level = rocm_core::gpu_support_level(
-        examine.detected_gfx_target.as_deref(),
-        examine.compatible_therock_family.as_deref(),
-        examine.vulkan_status(),
-    );
+    let gpu_support_level = rocm_core::gpu_support_level_for_examine(&examine);
     Ok(CodexBridgeSnapshot {
         protocol: "rocmd-codex-bridge-v0".to_owned(),
         generated_at_unix_ms: rocm_core::unix_time_millis(),
@@ -97,7 +94,7 @@ pub(crate) fn builtin_codex_bridge_engine_inventory(
         .iter()
         .map(|(id, summary)| CodexBridgeEngine {
             id: (*id).to_owned(),
-            summary: crate::engine_inventory_note(id, summary, gpu_support_level).to_owned(),
+            summary: engine_inventory_note(id, summary, gpu_support_level).to_owned(),
             default_for_platform: *id == default_engine,
             installed_binary: true,
             binary_path: binary_path.clone(),
