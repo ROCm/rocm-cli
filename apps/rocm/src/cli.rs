@@ -396,19 +396,17 @@ pub(crate) enum Command {
     },
     /// [preview] Chat with a configured assistant provider.
     ///
-    /// In a terminal with no --prompt, opens the interactive chat (switch
-    /// providers there with /provider; --provider, --model, and --tools don't
-    /// apply). With --prompt, or a prompt piped on standard input, sends that one
-    /// prompt and prints the reply, with terminal escape sequences removed. With
-    /// --tools, a value the assistant chose that a Windows shell would read as
-    /// syntax, such as ', & or %, is refused rather than shown in a command to
-    /// paste or in a plan; a folder the CLI takes from your own request, as in
-    /// `install therock into <folder>`, is not held to that. Use `rocm config
-    /// enable-provider` and `rocm config set-provider-key` first to configure a
-    /// remote provider; the `local` provider talks to a running server. On
-    /// Linux/WSL the interactive chat shares the dashboard's telemetry daemon the
-    /// way `rocm dash` does, and, like it, prints why that daemon was failing
-    /// after it closes, including when it is ended with Ctrl-C, SIGINT or SIGTERM.
+    /// In a terminal with no --prompt, opens the interactive chat (switch providers
+    /// there with /provider; --provider, --model, and --tools don't apply). With
+    /// --prompt, or a prompt piped on standard input, sends that one prompt and prints
+    /// the reply without terminal escape sequences. With --tools, an assistant-chosen
+    /// value a Windows shell reads as syntax (', &, %) is refused, not offered to
+    /// paste, unless it came from your own request (`install therock into <folder>`).
+    /// Use `rocm config enable-provider` and `rocm config set-provider-key` first to
+    /// configure a remote provider; the `local` provider talks to a running server. On
+    /// Linux/WSL the interactive chat shares the dashboard's telemetry daemon the way
+    /// `rocm dash` does, and, like it, prints why that daemon was failing after it
+    /// closes, including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
