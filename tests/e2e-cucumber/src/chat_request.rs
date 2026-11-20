@@ -18,9 +18,30 @@ use std::time::Duration;
 
 use crate::model_id::model_ids_match;
 
-/// Discover the served model id over `{endpoint}/models` and POST one chat
-/// completion to it, returning the decoded response. `tools` is merged into the
-/// request body for the tool-definitions scenario.
+/// Whether the request lets a reasoning model think before it answers.
+///
+/// A scenario that only asserts a reply from the right model has no use for the
+/// thinking, and a small reasoning model turns it into an unbounded cost: on
+/// gfx1151, `Hello` to `Qwen3.5-0.8B-GGUF` ran 149 to 4085 tokens (4085 is the
+/// context limit, reached with the thinking never closed and `content` empty),
+/// from 2 s to 47 s, and the longer runs outlast the harness's 10 s budget
+/// (issue #1157). A `max_tokens` cap does not fix that: at 16 to 256 tokens the
+/// whole reply was still thinking and `content` came back empty, which the
+/// reply assertions reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    /// Leave it to the model's chat template, as a user's own request would.
+    ModelDefault,
+    /// Send `chat_template_kwargs.enable_thinking = false`, which llama.cpp
+    /// (Lemonade's router passes the field on) and vLLM apply to the template;
+    /// a template without the switch ignores it.
+    Off,
+}
+
+/// Discover the served model over `{endpoint}/models` and POST one chat to it.
+///
+/// `tools` is merged into the request body for the tool-definitions scenario;
+/// `thinking` is applied by [`chat_body`].
 ///
 /// `expected_model` is the model the scenario served. The id sent is the entry
 /// of `/models` that identifies it (see [`pick_model`]), because a router such
@@ -31,29 +52,37 @@ use crate::model_id::model_ids_match;
 /// Makes one attempt per entry of `attempt_budgets`, each bounded by its entry,
 /// and moves to the next only on a TRANSPORT failure of either request (the
 /// `send`, not the decode). A malformed reply is a server-contract violation
-/// rather than a flake, so it panics on the spot. Panics with every attempt's
-/// diagnostics once the attempts run out.
+/// rather than a flake, so it panics on the spot. Once the attempts run out it
+/// returns every attempt's diagnostics as the error instead, so the caller can
+/// add what only it can reach (the service's log, see
+/// [`crate::serve_log::chat_failure_evidence`]) before failing the step.
 ///
 /// The exchange runs on the runtime's worker threads (see the module docs), so
 /// a step blocking the thread that awaits this does not count against the
 /// budgets.
 ///
+/// # Errors
+///
+/// The diagnostics of every attempt, when each of them failed in transport.
+///
 /// # Panics
 ///
-/// If every attempt fails in transport, a reply is not JSON, `/models` names no
-/// model, or none of the models it names is `expected_model`.
+/// If a reply is not JSON, `/models` names no model, or none of the models it
+/// names is `expected_model`.
 pub async fn request_chat_completion(
     endpoint: &str,
     expected_model: Option<&str>,
     prompt: &str,
     tools: Option<serde_json::Value>,
+    thinking: Thinking,
     attempt_budgets: &[Duration],
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let exchange = tokio::spawn(exchange(
         endpoint.to_owned(),
         expected_model.map(str::to_owned),
         prompt.to_owned(),
         tools,
+        thinking,
         attempt_budgets.to_vec(),
     ));
     match exchange.await {
@@ -72,8 +101,9 @@ async fn exchange(
     expected_model: Option<String>,
     prompt: String,
     tools: Option<serde_json::Value>,
+    thinking: Thinking,
     attempt_budgets: Vec<Duration>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let attempts = attempt_budgets.len();
     let models_url = format!("{endpoint}/models");
     let chat_url = format!("{endpoint}/chat/completions");
@@ -111,13 +141,7 @@ async fn exchange(
         let model = pick_model(&models, expected_model.as_deref())
             .unwrap_or_else(|reason| panic!("GET {models_url}: {reason}"));
 
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}]
-        });
-        if let Some(tools) = tools.clone() {
-            body["tools"] = tools;
-        }
+        let body = chat_body(&model, &prompt, tools.clone(), thinking);
 
         // Time the POST on its own: the discovery round trip ahead of it is
         // cheap and constant, and mixing it in would blur the number that
@@ -136,10 +160,10 @@ async fn exchange(
                         diagnostics.join("\n")
                     );
                 }
-                return response
+                return Ok(response
                     .json()
                     .await
-                    .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}"));
+                    .unwrap_or_else(|e| panic!("POST {chat_url} returned non-JSON: {e}")));
             }
             Err(error) => diagnostics.push(format!(
                 "attempt {attempt} (budget {budget_secs}s): POST {chat_url} failed after \
@@ -150,10 +174,33 @@ async fn exchange(
         }
     }
 
-    panic!(
+    Err(format!(
         "chat request failed after {attempts} attempt(s):\n{}",
         diagnostics.join("\n")
-    );
+    ))
+}
+
+/// The JSON body of one chat completion request.
+///
+/// No `max_tokens`, on purpose: see [`Thinking`] for why a cap would swap a
+/// timeout for an empty reply on a reasoning model.
+fn chat_body(
+    model: &str,
+    prompt: &str,
+    tools: Option<serde_json::Value>,
+    thinking: Thinking,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}]
+    });
+    if let Some(tools) = tools {
+        body["tools"] = tools;
+    }
+    if thinking == Thinking::Off {
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+    }
+    body
 }
 
 /// The id in a `/models` reply to send the chat to.
@@ -225,7 +272,7 @@ fn describe_request_error(error: &reqwest::Error) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{pick_model, request_chat_completion};
+    use super::{Thinking, chat_body, pick_model, request_chat_completion};
     use crate::chat_response_is_successful;
     use crate::mock_server::MockServer;
 
@@ -246,11 +293,81 @@ mod tests {
         let budgets = [budget];
 
         let (response, ()) = tokio::join!(
-            request_chat_completion(&endpoint, Some("TestModel/E2E-1B"), "Hello", None, &budgets),
+            request_chat_completion(
+                &endpoint,
+                Some("TestModel/E2E-1B"),
+                "Hello",
+                None,
+                Thinking::Off,
+                &budgets
+            ),
             blocking_step,
         );
 
+        let response = response.expect("the server answered at once");
         assert!(chat_response_is_successful(&response), "{response}");
+    }
+
+    /// Every attempt failing in transport is returned with each attempt's
+    /// diagnostics, not panicked, so the step can add the service's log to it.
+    #[tokio::test]
+    async fn exhausted_attempts_are_returned_with_every_attempts_diagnostics() {
+        // Reserve a port and release it: nothing listens, so the connection is
+        // refused at once on every attempt.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("cannot reserve a port")
+            .local_addr()
+            .expect("no local address")
+            .port();
+        let budgets = [Duration::from_secs(2), Duration::from_secs(2)];
+
+        let report = request_chat_completion(
+            &format!("http://127.0.0.1:{port}/v1"),
+            None,
+            "Hello",
+            None,
+            Thinking::Off,
+            &budgets,
+        )
+        .await
+        .expect_err("nothing is listening");
+
+        assert!(
+            report.starts_with("chat request failed after 2 attempt(s):"),
+            "{report}"
+        );
+        assert!(report.contains("attempt 1 ("), "{report}");
+        assert!(report.contains("attempt 2 ("), "{report}");
+    }
+
+    /// Issue #1157: an unbounded reasoning pass on `Hello` outran the budget, so
+    /// a scenario asking only for a reply turns the thinking off. Left to the
+    /// model, the field is absent (the tool-definitions scenario, and a user's
+    /// own request, are not changed).
+    #[test]
+    fn thinking_is_switched_off_only_when_asked_and_no_token_cap_is_sent() {
+        let off = chat_body("m", "Hello", None, Thinking::Off);
+        assert_eq!(
+            off["chat_template_kwargs"],
+            serde_json::json!({"enable_thinking": false})
+        );
+        // A cap would leave a reasoning model's `content` empty, see `Thinking`.
+        assert!(off.get("max_tokens").is_none(), "{off}");
+
+        let default = chat_body("m", "Hello", None, Thinking::ModelDefault);
+        assert!(default.get("chat_template_kwargs").is_none(), "{default}");
+    }
+
+    /// The tool definitions still travel with the request when thinking is off.
+    #[test]
+    fn tools_are_merged_into_the_body() {
+        let tools = serde_json::json!([{"type": "function"}]);
+
+        let body = chat_body("m", "Hi", Some(tools.clone()), Thinking::ModelDefault);
+
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"][0]["content"], "Hi");
     }
 
     fn listing(ids: &[&str]) -> serde_json::Value {

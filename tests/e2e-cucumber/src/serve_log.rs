@@ -360,12 +360,131 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
     report
 }
 
+/// How long the router's `/health` gets to answer while a chat failure is being
+/// reported. It is asked after the chat itself gave up, so a router that hangs
+/// must not hang the report as well.
+const HEALTH_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// How much of the `/health` reply to quote.
+const MAX_HEALTH_BYTES: usize = 2048;
+
+/// The log of the managed service whose record names `endpoint`, if there is
+/// exactly one.
+///
+/// A record is `<services_dir>/<service_id>.json` and the service's log is
+/// `<services_dir>/<service_id>.log`, the `log_path:` that `rocm serve --managed`
+/// prints. Matching by endpoint is what ties a chat to its service when the
+/// scenario's own steps did not keep the serve output.
+fn service_log_for_endpoint(
+    services_dir: &Path,
+    endpoint: &str,
+) -> Result<std::path::PathBuf, String> {
+    let entries = std::fs::read_dir(services_dir)
+        .map_err(|error| format!("cannot read {}: {error}", services_dir.display()))?;
+    let mut matches = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if record["endpoint_url"].as_str() == Some(endpoint)
+            && let Some(id) = record["service_id"].as_str()
+        {
+            matches.push(services_dir.join(format!("{id}.log")));
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(format!(
+            "no service record in {} names {endpoint}",
+            services_dir.display()
+        )),
+        count => Err(format!(
+            "{count} service records in {} name {endpoint}",
+            services_dir.display()
+        )),
+    }
+}
+
+/// `GET {endpoint}/health`, spelled out for a failure report.
+///
+/// Lemonade's router answers it (under `/v1`, not at the server root) with each
+/// model it has loaded, whether that model's backend is alive and whether it is
+/// busy generating, which tells a backend that is still generating from a router
+/// that is gone.
+async fn health_report(endpoint: &str) -> String {
+    let url = format!("{}/health", endpoint.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(HEALTH_PROBE_BUDGET)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return format!("GET {url}: <no HTTP client: {error}>"),
+    };
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<unreadable body: {error}>"));
+            let body: String = body.chars().take(MAX_HEALTH_BYTES).collect();
+            format!("GET {url}: {status} {body}")
+        }
+        Err(error) => format!(
+            "GET {url}: <failed within {}s: {error}>",
+            HEALTH_PROBE_BUDGET.as_secs()
+        ),
+    }
+}
+
+/// What a chat that never completed leaves to be read: the service's own log
+/// and the router's `/health`.
+///
+/// The harness only sees the client side of such a failure (a timeout reads the
+/// same whether the backend was generating, hung or gone), and the service log
+/// is deleted with the scenario's temp directory when teardown stops the
+/// service, so the log is copied into `results_dir` here, as a failed serve step
+/// does. Everything is reported as text rather than failed, because this only
+/// runs while another failure is being reported (see [`archive_service_log`]).
+pub async fn chat_failure_evidence(
+    endpoint: &str,
+    services_dir: &Path,
+    results_dir: &Path,
+    scenario: &str,
+) -> String {
+    use crate::section;
+
+    let health = health_report(endpoint).await;
+    let log = match service_log_for_endpoint(services_dir, endpoint) {
+        Ok(path) => {
+            let pointer = format!("log_path: {}", path.display());
+            let tail = service_log_tail(&pointer);
+            let archived = archive_service_log(&pointer, results_dir, scenario);
+            format!(
+                "{}\n{}",
+                section("service log (tail)", &tail),
+                section("service log (full)", &archived)
+            )
+        }
+        Err(reason) => section("service log", &format!("<not read: {reason}>")),
+    };
+    format!("{}\n{log}", section("router health", &health))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
-        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_engine,
-        serve_attempt_report, serve_cli_budget, service_log_tail, slugify, tail_lines,
+        chat_failure_evidence, engine_from_serve_args, health_report, parse_log_path, read_clamped,
+        read_clamped_file, reported_engine, serve_attempt_report, serve_cli_budget,
+        service_log_for_endpoint, service_log_tail, slugify, tail_lines,
     };
 
     #[test]
@@ -714,5 +833,139 @@ managed service launched
         }
         // A silent stream is a finding, so it is labelled rather than dropped.
         assert!(report.contains("stderr: (empty)"), "{report}");
+    }
+
+    /// A scenario's services directory as `rocm serve --managed` leaves it: a
+    /// record and a log per service, named by the service id.
+    fn services_dir_with(records: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("cannot create a temp dir");
+        for (id, endpoint, log) in records {
+            std::fs::write(
+                dir.path().join(format!("{id}.json")),
+                serde_json::json!({"service_id": id, "endpoint_url": endpoint}).to_string(),
+            )
+            .expect("cannot write the record");
+            std::fs::write(dir.path().join(format!("{id}.log")), log)
+                .expect("cannot write the log");
+        }
+        dir
+    }
+
+    #[test]
+    fn the_log_found_is_the_one_of_the_service_serving_the_endpoint() {
+        let dir = services_dir_with(&[
+            ("svc-a", "http://127.0.0.1:1111/v1", "log a"),
+            ("svc-b", "http://127.0.0.1:2222/v1", "log b"),
+        ]);
+
+        let log = service_log_for_endpoint(dir.path(), "http://127.0.0.1:2222/v1")
+            .expect("one record names the endpoint");
+        assert_eq!(log, dir.path().join("svc-b.log"));
+
+        // No record, or two, is a reason in the report rather than a guess.
+        let missing = "http://127.0.0.1:3333/v1";
+        let reason = service_log_for_endpoint(dir.path(), missing).expect_err("no record");
+        assert!(reason.contains(missing), "{reason}");
+        let twice = services_dir_with(&[
+            ("svc-a", "http://127.0.0.1:1111/v1", ""),
+            ("svc-c", "http://127.0.0.1:1111/v1", ""),
+        ]);
+        let reason = service_log_for_endpoint(twice.path(), "http://127.0.0.1:1111/v1")
+            .expect_err("two records");
+        assert!(reason.starts_with("2 service records"), "{reason}");
+    }
+
+    /// Issue #1157: a chat that timed out left no trace of the router or backend.
+    /// The report quotes the log, archives it where CI uploads it, and says what
+    /// `/health` answered (here: nothing listens, which is itself the finding).
+    #[tokio::test]
+    async fn a_failed_chat_reports_the_service_log_and_archives_it() {
+        let endpoint = {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("cannot reserve a port")
+                .local_addr()
+                .expect("no local address")
+                .port();
+            format!("http://127.0.0.1:{port}/v1")
+        };
+        let services = services_dir_with(&[(
+            "lemonade-qwen",
+            &endpoint,
+            "router: loading\nbackend: llama-server stalled\n",
+        )]);
+        let results = tempfile::tempdir().expect("cannot create a results dir");
+
+        let report = chat_failure_evidence(
+            &endpoint,
+            services.path(),
+            results.path(),
+            "serve-57 - A registered vision GGUF",
+        )
+        .await;
+
+        assert!(report.contains("backend: llama-server stalled"), "{report}");
+        assert!(
+            report.contains(
+                "archived to service-logs/serve-57-a-registered-vision-gguf--lemonade-qwen.log"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("/health: <failed within"), "{report}");
+        let archived = results
+            .path()
+            .join("service-logs/serve-57-a-registered-vision-gguf--lemonade-qwen.log");
+        assert_eq!(
+            std::fs::read_to_string(archived).expect("the log was not archived"),
+            "router: loading\nbackend: llama-server stalled\n"
+        );
+    }
+
+    /// A chat with no service record still reports, with the reason, rather
+    /// than failing the failure report.
+    #[tokio::test]
+    async fn a_failed_chat_without_a_service_record_says_so() {
+        let services = tempfile::tempdir().expect("cannot create a temp dir");
+        let results = tempfile::tempdir().expect("cannot create a results dir");
+
+        let report = chat_failure_evidence(
+            "http://127.0.0.1:9/v1",
+            services.path(),
+            results.path(),
+            "scenario",
+        )
+        .await;
+
+        assert!(report.contains("<not read: no service record"), "{report}");
+        assert!(!results.path().join("service-logs").exists());
+    }
+
+    /// The probe asks `{endpoint}/health`, where Lemonade's router answers (the
+    /// server root has none, it is a 404), and quotes what it said: `is_busy`
+    /// is what tells a backend still generating from one that is gone.
+    #[tokio::test]
+    async fn the_health_report_quotes_what_the_endpoints_health_route_says() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("cannot bind");
+        let port = listener.local_addr().expect("no local address").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("no request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).expect("cannot read the request");
+            let body = r#"{"all_models_loaded":[{"is_busy":true}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("cannot answer");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+
+        let report = health_report(&format!("http://127.0.0.1:{port}/v1")).await;
+
+        let request = server.join().expect("the server thread panicked");
+        assert!(request.starts_with("GET /v1/health "), "{request}");
+        assert!(report.contains("200 OK"), "{report}");
+        assert!(report.contains(r#""is_busy":true"#), "{report}");
     }
 }

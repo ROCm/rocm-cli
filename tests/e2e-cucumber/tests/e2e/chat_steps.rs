@@ -60,8 +60,15 @@ async fn send_chat_with_tools(world: &mut E2eWorld) {
             "parameters": {"type": "object", "properties": {}}
         }
     }]);
-    let response =
-        crate::request_chat_completion(world, "What GPUs are available?", Some(tools)).await;
+    // Thinking stays as the model's template has it: this scenario is about
+    // what a request carrying tool definitions does, not about a plain reply.
+    let response = crate::request_chat_completion(
+        world,
+        "What GPUs are available?",
+        Some(tools),
+        e2e_cucumber::chat_request::Thinking::ModelDefault,
+    )
+    .await;
     world.chat_response = Some(response);
 }
 
