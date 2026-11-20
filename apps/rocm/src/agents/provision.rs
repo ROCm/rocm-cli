@@ -138,6 +138,7 @@ pub(crate) fn run(
     let snapshot_dir = provision_dir.join("snapshot");
     snapshot.write(&snapshot_dir, &provision_dir.join("original"))?;
     let resolver_workaround = policy::axis_123_workaround_enabled();
+    let host = HostAccess::discover(resolver_workaround, &store.tools.join("host-bin"))?;
     let policy_path = provision_dir.join("policy.yaml");
     std::fs::write(
         &policy_path,
@@ -146,14 +147,21 @@ pub(crate) fn run(
             mise_dir: &mise_dir,
             snapshot_dir: &snapshot_dir,
             store_dir: &store.root,
+            host_read_only: &host.read_only,
             resolver_workaround,
         }),
     )?;
     let sandbox = Sandbox {
         axis,
+        host: &host,
         policy_path: &policy_path,
         store: &store,
-        env: provision_env(&store, &snapshot_dir, snapshot.lock.is_some())?,
+        env: provision_env(
+            &store,
+            &[&mise_dir, &host.bin_dir],
+            &snapshot_dir,
+            snapshot.lock.is_some(),
+        )?,
         mise: &mise,
         snapshot_dir: &snapshot_dir,
     };
@@ -239,9 +247,89 @@ pub(crate) fn run(
     })
 }
 
+/// The host side of the provisioning sandbox: the paths it may read, the
+/// programs on its command line (resolved: `/bin/sh` is a symlink), and
+/// `bin_dir`, the sandbox's only `PATH` entry besides mise.
+struct HostAccess {
+    read_only: Vec<PathBuf>,
+    env: PathBuf,
+    sh: PathBuf,
+    bin_dir: PathBuf,
+}
+
+impl HostAccess {
+    /// `bin_dir` gets one symlink per allowed host program, by its usual name,
+    /// so a `#!/usr/bin/env bash` script finds it. Putting `/usr/bin` on `PATH`
+    /// instead would let mise *see* every host tool (Landlock does not hide a
+    /// file's existence) and pick one, as it did with the host's `rustup`. The
+    /// dir is outside the store, so the sandbox cannot repoint the links.
+    fn discover(resolver_workaround: bool, bin_dir: &Path) -> Result<Self> {
+        let mut programs = Vec::new();
+        for program in policy::PROVISION_HOST_PROGRAMS {
+            let resolved = Path::new(program)
+                .canonicalize()
+                .with_context(|| format!("{program} is needed to provision and was not found"))?;
+            let name = Path::new(program).file_name().expect("program has a name");
+            link(&resolved, &bin_dir.join(name))?;
+            programs.push(resolved);
+        }
+        let existing = policy::PROVISION_HOST_READ_ONLY
+            .iter()
+            .filter_map(|p| Some((PathBuf::from(p), Path::new(p).canonicalize().ok()?)));
+        let mut read_only = without_resolver_overlap(existing, resolver_workaround);
+        read_only.extend(programs.iter().cloned());
+        read_only.push(bin_dir.to_path_buf());
+        let [env, sh] = <[PathBuf; 2]>::try_from(programs).expect("two programs");
+        Ok(Self {
+            read_only,
+            env,
+            sh,
+            bin_dir: bin_dir.to_path_buf(),
+        })
+    }
+}
+
+/// Points `at` to `target`, replacing what was there in one rename so a
+/// concurrent provisioning never sees it missing.
+fn link(target: &Path, at: &Path) -> Result<()> {
+    std::fs::create_dir_all(at.parent().expect("link has a dir"))?;
+    if std::fs::read_link(at).is_ok_and(|current| current == target) {
+        return Ok(());
+    }
+    let tmp = at.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, &tmp)?;
+    #[cfg(not(unix))]
+    bail!("toolchain provisioning is only supported on Linux");
+    #[cfg(unix)]
+    {
+        std::fs::rename(&tmp, at)?;
+        Ok(())
+    }
+}
+
+/// `(path, resolved)` pairs to grant read-only. With the ROCm/axis#123
+/// workaround on, a path resolving under its read-write resolver dir (here
+/// `/etc/resolv.conf`, a symlink into it) is left out: AXIS refuses
+/// overlapping read-only and read-write grants, and the read-write grant
+/// already lets it be read.
+fn without_resolver_overlap(
+    paths: impl Iterator<Item = (PathBuf, PathBuf)>,
+    resolver_workaround: bool,
+) -> Vec<PathBuf> {
+    paths
+        .filter(|(_, resolved)| {
+            !(resolver_workaround && resolved.starts_with(policy::AXIS_123_RESOLVER_DIR))
+        })
+        .map(|(path, _)| path)
+        .collect()
+}
+
 /// The provisioning sandbox's whole environment (it starts from `env -i`).
 fn provision_env(
     store: &Store,
+    path: &[&Path],
     snapshot_dir: &Path,
     locked: bool,
 ) -> Result<Vec<(String, String)>> {
@@ -249,7 +337,14 @@ fn provision_env(
     let mut env = vec![
         ("HOME".into(), w("tmp")?),
         ("TMPDIR".into(), w("tmp")?),
-        ("PATH".into(), "/usr/bin:/bin".into()),
+        // mise and the allowed host programs only; no host program directory.
+        (
+            "PATH".into(),
+            path.iter()
+                .map(|dir| path_str(dir))
+                .collect::<Result<Vec<_>>>()?
+                .join(":"),
+        ),
         ("MISE_DATA_DIR".into(), w("data")?),
         ("MISE_CACHE_DIR".into(), w("cache")?),
         ("MISE_STATE_DIR".into(), w("state")?),
@@ -276,6 +371,14 @@ fn provision_env(
         ("MISE_NO_ENV".into(), "1".into()),
         ("MISE_NO_HOOKS".into(), "1".into()),
         ("MISE_PARANOID".into(), "1".into()),
+        // No usage pings to the mise versions host (`GET /t?tool=..&version=..
+        // &os=..&arch=..`, seen in MISE_DEBUG output); version lists from it
+        // are still used.
+        (TELEMETRY_OFF.0.into(), TELEMETRY_OFF.1.into()),
+        // mise's default `npm` launcher for node is a bash script that also
+        // needs coreutils, none of which the sandbox has; without it, `npm`
+        // is npm's own launcher, run by the installed node.
+        ("MISE_NODE_NPM_SHIM".into(), "0".into()),
         (
             "MISE_DISABLE_BACKENDS".into(),
             mise_snapshot::DISABLED_BACKENDS.join(","),
@@ -293,10 +396,14 @@ fn provision_env(
     Ok(env)
 }
 
+/// Turns off mise's install tracking; set for the agent's own mise too.
+pub(crate) const TELEMETRY_OFF: (&str, &str) = ("MISE_USE_VERSIONS_HOST_TRACK", "0");
+
 /// One provisioning sandbox: the same policy and environment for every mise
 /// command run in it.
 struct Sandbox<'a> {
     axis: &'a Path,
+    host: &'a HostAccess,
     policy_path: &'a Path,
     store: &'a Store,
     env: Vec<(String, String)>,
@@ -311,17 +418,13 @@ impl Sandbox<'_> {
         cmd.args(["run", "--policy"])
             .arg(self.policy_path)
             .arg("--")
-            .arg("env")
+            .arg(&self.host.env)
             .arg("-i")
             .args(self.env.iter().map(|(k, v)| format!("{k}={v}")));
         if let Some(file) = stdout_to {
-            cmd.args([
-                "/bin/sh",
-                "-c",
-                "out=$1; shift; exec \"$@\" > \"$out\"",
-                "sh",
-            ])
-            .arg(file);
+            cmd.arg(&self.host.sh)
+                .args(["-c", "out=$1; shift; exec \"$@\" > \"$out\"", "sh"])
+                .arg(file);
         }
         cmd.arg(self.mise)
             .arg("-C")
@@ -450,10 +553,38 @@ mod tests {
     }
 
     #[test]
+    fn a_host_path_under_the_rw_resolver_grant_is_dropped_only_with_the_workaround() {
+        let paths = || {
+            [
+                ("/etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf"),
+                ("/etc/ssl", "/etc/ssl"),
+            ]
+            .into_iter()
+            .map(|(p, r)| (PathBuf::from(p), PathBuf::from(r)))
+        };
+        assert_eq!(
+            without_resolver_overlap(paths(), true),
+            [PathBuf::from("/etc/ssl")]
+        );
+        assert_eq!(
+            without_resolver_overlap(paths(), false),
+            [PathBuf::from("/etc/resolv.conf"), PathBuf::from("/etc/ssl")]
+        );
+    }
+
+    #[test]
     fn the_provisioning_env_disables_env_scripts_hooks_and_plugin_backends() {
         let store = Store::new(Path::new("/data/agents"));
-        let env =
-            provision_env(&store, Path::new("/data/agents/x/provision/snapshot"), true).unwrap();
+        let env = provision_env(
+            &store,
+            &[
+                Path::new("/data/agents/tools/mise-1"),
+                Path::new("/data/agents/tools/host-bin"),
+            ],
+            Path::new("/data/agents/x/provision/snapshot"),
+            true,
+        )
+        .unwrap();
         let get = |k: &str| {
             env.iter()
                 .find(|(key, _)| key == k)
@@ -462,6 +593,11 @@ mod tests {
         assert_eq!(get("MISE_NO_ENV"), Some("1"));
         assert_eq!(get("MISE_NO_HOOKS"), Some("1"));
         assert_eq!(get("MISE_LOCKED"), Some("1"));
+        assert_eq!(get("MISE_USE_VERSIONS_HOST_TRACK"), Some("0"));
+        assert_eq!(
+            get("PATH"),
+            Some("/data/agents/tools/mise-1:/data/agents/tools/host-bin")
+        );
         let disabled = get("MISE_DISABLE_BACKENDS").unwrap();
         for backend in ["asdf", "vfox", "cargo", "npm"] {
             assert!(disabled.split(',').any(|b| b == backend), "{disabled}");
@@ -469,7 +605,8 @@ mod tests {
         for allowed in mise_snapshot::ALLOWED_BACKENDS {
             assert!(!disabled.split(',').any(|b| b == *allowed), "{disabled}");
         }
-        let unlocked = provision_env(&store, Path::new("/s/snapshot"), false).unwrap();
+        let unlocked =
+            provision_env(&store, &[Path::new("/m")], Path::new("/s/snapshot"), false).unwrap();
         assert!(!unlocked.iter().any(|(k, _)| k == "MISE_LOCKED"));
     }
 }

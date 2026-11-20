@@ -37,6 +37,13 @@ pub(crate) const DISABLED_BACKENDS: &[&str] = &[
     "asdf", "cargo", "conda", "dotnet", "forgejo", "gem", "gitlab", "go", "npm", "packslip",
     "pypi", "s3", "spinel", "spm", "http", "vfox",
 ];
+/// Core tools whose mise installer is not a checksum-verified download, so
+/// provisioning refuses them by name (bare or `core:`), with the reason.
+pub(crate) const REFUSED_CORE_TOOLS: &[(&str, &str)] = &[(
+    "rust",
+    "mise installs it by running rustup's bootstrap shell script from https://sh.rustup.rs, \
+     which needs curl and fetches rustup-init without a checksum mise verifies",
+)];
 /// Larger config files are refused rather than read.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -281,6 +288,13 @@ fn parse_mise_toml(
 /// A tool is a bare registry name (`node`, `jq`) or `backend:spec` with an
 /// allow-listed backend. Bracketed tool options (`ubi:o/r[exe=x]`) are refused.
 fn check_tool(tool: &str, at: &str) -> Result<()> {
+    let core_name = tool.strip_prefix("core:").unwrap_or(tool);
+    if let Some((_, why)) = REFUSED_CORE_TOOLS
+        .iter()
+        .find(|(name, _)| *name == core_name)
+    {
+        bail!("{at}: `{tool}` cannot be provisioned: {why}");
+    }
     let name_ok = |s: &str, extra: &[char]| {
         !s.is_empty()
             && s.chars()
@@ -473,6 +487,21 @@ disable_backends = []
             snap(&[("mise.toml", &format!("[tools]\n\"{tool}\" = \"1\"\n"))])
                 .unwrap_or_else(|e| panic!("{tool}: {e:#}"));
         }
+    }
+
+    #[test]
+    fn core_tools_without_a_verified_download_are_refused_in_either_spelling() {
+        for tool in ["rust", "core:rust"] {
+            let e = err(&[("mise.toml", &format!("[tools]\n\"{tool}\" = \"latest\"\n"))]);
+            assert!(
+                e.contains("cannot be provisioned") && e.contains("sh.rustup.rs"),
+                "{tool}: {e}"
+            );
+        }
+        let e = err(&[(".tool-versions", "rust 1.90.0\n")]);
+        assert!(e.contains(".tool-versions line 1"), "{e}");
+        // `aqua:rust-lang/...`-style names are not the core tool.
+        snap(&[("mise.toml", "[tools]\n\"aqua:x/rust\" = \"1\"\n")]).unwrap();
     }
 
     #[test]

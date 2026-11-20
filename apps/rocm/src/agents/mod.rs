@@ -418,6 +418,10 @@ fn run_agent(
                 "MISE_STATE_DIR".into(),
                 path_str(&home.join(".local/state/mise"))?,
             ),
+            (
+                provision::TELEMETRY_OFF.0.into(),
+                provision::TELEMETRY_OFF.1.into(),
+            ),
         ]);
     }
     sandbox_env.extend(backend.model_env);
