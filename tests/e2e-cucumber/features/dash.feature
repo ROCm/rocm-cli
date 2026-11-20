@@ -1116,3 +1116,18 @@ Feature: Interactive dashboard
     Then the dashboard exits from the signal with code 130
     And the dashboard reports that its telemetry daemon could not use that file
     And that file is left in place
+
+  # ROCMAI-1288: with Caps Lock on, the terminal sends the uppercase letter, and
+  # the letter shortcuts matched only the lowercase one, so `S` did not open the
+  # services manager and `Q` did not quit. A PTY cannot toggle Caps Lock; the
+  # steps send the uppercase byte, which is what the terminal delivers with it on.
+  @id:dash-caps-lock-letter-shortcuts @requires-os:linux
+  Scenario: dash-63 - Letter shortcuts still work with Caps Lock on
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the services manager with Caps Lock on
+    Then the services manager is displayed
+    When the user presses Escape
+    Then the services manager is closed
+    When the user quits the dashboard with Caps Lock on
+    Then the dashboard exits successfully
