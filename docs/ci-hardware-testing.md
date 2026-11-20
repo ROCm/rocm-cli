@@ -65,9 +65,13 @@ failed; a lane that ran and failed still fails the check; and when neither lane
 produced a passing report the check fails. A skipped lane, or one that exported
 no report, is never a pass. The report does not wait on `e2e-gpu` directly: a job
 queued for a runner cannot be timed out, so `e2e-gpu-settled` gives up on it after
-30 minutes in the queue and the run's leftover job is then cancelled. This applies
-to a pull request from this repository that the queue lane takes; a push or a
-dispatch has no queue lane, and only a lane that ran without a report fails there.
+30 minutes in the queue, and `cancel-abandoned-mi300x-lane` then ends the run (with
+a force-cancel if the queued job survives the cancel, as it can: its `if` is
+`always()`). On a push, a release push or a dispatch, which have no queue lane and
+no other MI300X signal, the queue deadline is 4 hours, not 30 minutes, and only a
+lane that ran without a report fails there. A re-run of only the failed jobs does
+not refresh the report after a self-hosted failure, as `e2e-gpu-settled` has
+already succeeded: re-run all jobs for that.
 
 vLLM is the effective engine on both; MI300X is the only silicon where it is.
 The Windows pool is the Strix Halo pool (`e2e-gpu-strix-windows` and
@@ -724,8 +728,9 @@ from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
 A lane added to `nightly.yml` must be added to the `LANES` list of
 `e2e-lanes-settled`;
 `nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
-and also fails if a job waits on a lane directly. The per-PR workflow
-does not use this mechanism.
+and also fails if a job waits on a lane directly. The per-PR workflow uses
+the same settle script for its MI300X self-hosted lane only (`e2e-gpu-settled`);
+its other lanes stay in the report's `needs`.
 
 ## The shared pre-warmed runtime
 
