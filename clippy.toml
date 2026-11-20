@@ -1,0 +1,8 @@
+# Production code must not unwrap or expect (`unwrap_used` and `expect_used` in
+# the workspace `Cargo.toml`); tests may, since a failure there should panic the
+# test. Clippy only treats an item as a test when it carries `#[cfg(test)]` or
+# `#[test]` literally, so a helper that unwraps outside a `#[test]` fn under a
+# gate such as `#[cfg(all(test, unix))]` needs that gate written as `#[cfg(test)]`
+# and `#[cfg(unix)]` on separate lines. See docs/testing.md.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

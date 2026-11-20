@@ -498,6 +498,59 @@ floor would be the Visual C++ runtime that `rocm diagnose` checks against
 [`diagnose/windows.rs`](../crates/rocm-core/src/diagnose/windows.rs); no
 Windows lane asserts it today.
 
+## GPU visibility on the hardware pool
+
+A hardware job does not necessarily get every GPU its host has. On the
+self-hosted pool, and on the shared GPU queue's Linux pods
+([nightly-on-the-queue.md](nightly-on-the-queue.md)), the PCI bus listing
+(`lspci`, `/sys/bus/pci`, and possibly `/sys/class/drm`) describes the whole
+host. What the job can use can be narrower, and shows in what it can read
+through the kernel's compute topology (`/sys/class/kfd/kfd/topology/nodes`)
+and the render nodes (`/dev/dri/renderD*`). On the MI300X lane a job has
+seen eight AMD GPUs on the bus but one kernel GPU node and one render
+device; on the MI350P and Radeon R9700 lanes, one kernel GPU node with
+several AMD GPUs on the bus (their exact bus and render-device counts were
+not recorded). What restricts a job is set outside this repository, by the
+runner's or the queue's own isolation, which this repository cannot verify
+([nightly-on-the-queue.md](nightly-on-the-queue.md#why-it-works-this-way)).
+How many a job gets is a property of the runner, not of the change under
+test, and can differ between lanes and over time.
+
+Write a GPU-count assertion against what the job can reach, never against
+the bus:
+
+- compare against the KFD GPU nodes (nodes reporting a nonzero
+  `gfx_target_version`: read from the node's `properties` file, or from a
+  standalone `gfx_target_version` file where `properties` states none, as the
+  product does), or against the AMD entries in
+  `rocm examine --json`'s `gpus[]`, which is that set whenever KFD reports at
+  least one GPU node: `examine` matches the kernel's GPU nodes to the PCI scan
+  by address;
+- do not assert that the bus count equals the reachable count, in either
+  direction: when KFD reports at least one GPU node, AMD devices on the bus
+  that the kernel does not expose appear only in a `notes` entry, not in
+  `gpus[]`, and a partitioned Instinct shows
+  several GPU nodes for one PCI address;
+- derive the expected number from the host at run time rather than
+  hard-coding it, and gate a premise of more than one GPU with
+  `@requires-multi-gpu`, which counts those same KFD GPU nodes. It falls
+  back to the amdgpu DRM cards where KFD lists no GPU node or `/dev/kfd`
+  exists but its topology cannot be read, a hedge rather than a description
+  of known hardware; on that fallback the count can describe the whole host
+  rather than this job.
+
+examine-17 (`@id:examine-lists-every-gpu-with-its-address-and-target` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature), step
+`assert_gpus_match_kfd_nodes` in
+[examine_steps.rs](../tests/e2e-cucumber/tests/e2e/examine_steps.rs)) is the
+worked example of comparing `gpus[]` with the KFD GPU nodes, though its step
+reads `gfx_target_version` from `properties` only, without the standalone-file
+fallback the first bullet describes. The product side is
+`apply_kernel_gpu_membership` in
+[linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs). A red lane
+where the bus and the kernel disagree is the environment, not a regression:
+re-express the assertion, do not tag it out or weaken it.
+
 ## Engine is not an independently selectable axis
 
 None of the tables above vary the serve engine as a matrix dimension, because
@@ -550,7 +603,10 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 are not required for merging and so are skipped in the merge queue rather
 than left queued on limited runner capacity or hung at their cap after its PR
 has merged) when the workflow's own `changes` job's
-`serve` path filter is `true`. A new push to a pull request
+`serve` path filter is `true`. That job classifies paths
+through the [classify-changes](../.github/actions/classify-changes/action.yml)
+action that `ci.yml`'s `changes` job uses too, so both workflows read one
+definition of each category. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
 `@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
@@ -605,7 +661,10 @@ that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — s
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
 filter is forced `true`, so the full matrix (minus MI300X and Strix Ubuntu
-in the merge queue) always runs there. Unlike the
+in the merge queue) always runs there. It is also forced `true` on a pull
+request that changes a file that neither a category of the action nor its
+`inert` list (files no gated job reads, such as the issue templates) names, so
+a new kind of file runs the matrix until it is classified. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
@@ -639,6 +698,65 @@ Dispatch the GPU lanes with, e.g.:
 ```bash
 gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ```
+
+## Nightly lanes that never get a runner
+
+GitHub cannot time a job out while it waits for a runner: `timeout-minutes`
+only counts once a runner has taken the job, and a job that is still queued
+after 24 hours is cancelled. A lane whose runner pool is offline or saturated
+therefore held `nightly.yml` pending for a day, and the report and readiness
+jobs, which wait on every lane, never ran.
+
+`nightly.yml` bounds that wait itself:
+
+- `e2e-lanes-settled` stands in for the lanes in the report job's `needs`. It
+  polls the run's own job list
+  ([`settle-e2e-lanes.sh`](../.github/scripts/settle-e2e-lanes.sh)) and settles
+  once every lane leg has finished or can be given up on: a leg still queued
+  after `QUEUE_DEADLINE_MINUTES` (60, or the `queue_deadline_minutes` dispatch
+  input) is abandoned unless another leg of the same lane has started or
+  finished (a pool with one runner serves a lane's `release` and `nightly` legs
+  one after the other, so the queued leg is waiting its turn, not unserved).
+  A leg that started, or that is queued behind a started sibling, is waited for
+  but abandoned at `HARD_DEADLINE_MINUTES` (240) so a hung runner cannot hold
+  the wait either.
+  A lane that starts just inside the queue deadline still has its full
+  `timeout-minutes`, so the script refuses a queue deadline that, plus
+  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
+  minutes, at most 120.
+- `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
+  whatever finished. An abandoned lane has no report artifact, so the report
+  job's missing-report check flags it by name, the consolidated grid shows the
+  gap and readiness reads it as a failed report rather than as success.
+- `cancel-abandoned-e2e-lanes` runs after every other job and cancels the run,
+  which is what stops the abandoned legs from holding the run open until the
+  24-hour limit. It runs only when something was abandoned or the settle job
+  itself failed or was cancelled (nothing else bounds the wait then; GitHub
+  reports a job killed by its own `timeout-minutes` as `cancelled`), and only
+  after the report and readiness jobs are done, because cancelling the run also
+  skips any job that is still gated on `!cancelled()`. The settle script fails
+  itself when the run's job list stays unreadable for long enough to span the
+  hard deadline, rather than polling until the job's cap.
+
+To try a change to these jobs from a branch without publishing a nightly
+release, dispatch the workflow with `skip_build` set:
+
+```bash
+gh workflow run nightly.yml --ref <branch> -f skip_build=true
+```
+
+Add `-f queue_deadline_minutes=5` to give up on lanes that have no runner after
+five minutes, which exercises the give-up and cancel path without a long wait.
+
+That skips the Linux and Windows builds and the release publish, and runs the
+lanes, the report, readiness and the settle job. The wiki publishers run only
+from `main`, so a `skip_build` dispatch from `main` still updates the wiki.
+
+A lane added to `nightly.yml` must be added to the `LANES` list of
+`e2e-lanes-settled`;
+`nightly_report_reads_lanes_through_the_queue_deadline_job` fails until it is,
+and also fails if a job waits on a lane directly. The per-PR workflow
+does not use this mechanism.
 
 ## The shared pre-warmed runtime
 

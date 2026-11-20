@@ -1271,6 +1271,51 @@ Expected result: exactly one entry, for your own account, with `(F)` and no
 `(I)` (inherited) flag — no `Administrators`, `SYSTEM`, `Users` or
 `Authenticated Users` entry, even when `<data>` is a folder those can read.
 
+#### Remote session records
+
+`rocm remote` keeps one record per session under `<data>/remote-sessions/`.
+These checks need no second machine. On Linux, after any `rocm remote serve`
+(or with a record copied in by hand), check the directory's mode:
+
+```bash
+stat -c '%a %U' <data>/remote-sessions
+```
+
+Expected result: `700` and your user name.
+
+Then make a record unusable and list the sessions. Copy a record aside first;
+these steps edit it:
+
+```bash
+cp <data>/remote-sessions/<session-id>.json /tmp/record.json
+sed -i 's/"remote_cli": *"[^"]*"/"remote_cli": "rocm; true #"/' \
+  <data>/remote-sessions/<session-id>.json
+rocm remote status
+rocm remote stop <session-id>
+```
+
+Expected result:
+
+- `status` prints `warning: ignoring a remote session record: refusing to act
+  on <path>: remote session names an unexpected remote CLI "rocm; true #"`,
+  with the remedy to set `"remote_cli"` back to `"rocm"` or
+  `"$HOME/.local/bin/rocm"`. It does not say `No remote sessions have been
+  started`; it says `1 remote session record(s) were refused` and that the
+  machine may still be serving a model. It exits 0 (scenario `remote-17`).
+- `stop` names the same record, exits non-zero and leaves the file in place
+  (scenario `remote-18`).
+- Following the remedy (set `"remote_cli"` back, or restore the copy) makes
+  `status` list the session again.
+- With a second record for the same machine on another port, `rocm remote stop
+  <short machine name>` and `rocm remote stop <full peer name>` are refused as
+  matching the refused record too, and stop nothing (scenarios `remote-21`,
+  `remote-22`).
+- Renaming the record to another session's name, or replacing it with a FIFO
+  (`mkfifo <data>/remote-sessions/x.json`), makes `status` refuse it and
+  return at once rather than hang.
+- Run as root with `sudo -E rocm remote status`, the records are refused as
+  owned by another user, with advice to run `rocm remote` as that user.
+
 ### 4a. Dashboard Doctor Report
 
 On a machine whose hardware `rocm diagnose --report` can describe (see
@@ -1995,20 +2040,37 @@ Expected result:
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
   on that folder. It adds no line about how to remove anything (scenario
   `uninstall-09`).
+- With a `rocm remote` session record that is refused (see *Remote session
+  records* in section 4), the dry run warns that it `could not be used and may
+  still name models running on remote machines`, names the file, and says
+  `rocm remote stop` cannot reach it (scenario `uninstall-18`).
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
-  is not an option and points to `--yes`; a near miss such as `--forc` is an
+  is not an option and points to `--yes`, and ends with a `Try:` line that is
+  your command with `--yes` in place of `--force` (scenario `uninstall-17`); a near miss such as `--forc` is an
   unknown-argument error (exit 2). Neither
   suggests `--force-dev-binaries` (scenario `uninstall-10`).
   `rocm uninstall --help` ends with examples that start with a dry run
   (scenario `uninstall-11`).
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
-  and exit code 1, and removes nothing. On Linux or WSL, check it with no
+  and exit code 1, and removes nothing. The refusal ends with
+  `Try: rocm uninstall --keep-binaries --yes`, the same command with `--yes`
+  added (scenario `uninstall-16`). On Linux or WSL, check it with no
   terminal attached. A regression would delete real settings, data and cache,
-  so the command points `HOME` at a scratch folder itself:
+  so the command points `HOME` at a scratch folder itself, and the `Try:` line
+  is run in that same scratch `HOME`. The folder needs something to remove: on
+  an empty one the command reports that there is nothing to remove and exits 0,
+  so it never reaches the refusal. `ROCM_CLI_CONFIG_DIR`, `ROCM_CLI_DATA_DIR`
+  and `ROCM_CLI_CACHE_DIR` take precedence over `HOME`, so each command runs
+  without them. With `RUST_BACKTRACE` set, a backtrace is printed after the
+  `Try:` line:
 
   ```bash
-  HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+  scratch=$(mktemp -d) && mkdir -p "$scratch/.rocm" && touch "$scratch/.rocm/x"   # something to remove
+  env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+    rocm uninstall --keep-binaries < /dev/null   # expect the refusal and its Try: line; exit 1
+  env -u ROCM_CLI_CONFIG_DIR -u ROCM_CLI_DATA_DIR -u ROCM_CLI_CACHE_DIR HOME="${scratch:?}" \
+    rocm uninstall --keep-binaries --yes         # the Try: line; removes what was listed
   ```
 
   At a terminal, the same command asks `[y/N]` and treats Enter as no. Type
@@ -2144,8 +2206,12 @@ Expected result:
 
 ## 13. Context-Size Estimate for a GGUF Model
 
-Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
-by design) and network access to Hugging Face. The point is to check the
+Needs a host with a Radeon GPU and network access to Hugging Face. A discrete
+card is what the figures below were calibrated on; an APU is also estimated,
+but against the shared memory pool its engine allocates from, so its report
+carries a note that the figure compared with is a ceiling the operating system
+draws on too, and only an APU whose pool could not be read answers
+`undetermined`. The point is to check the
 estimate against what a real load uses: the compute buffer and runtime reserve
 were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
 so a different GPU or build can differ. How close the estimate came on them is
@@ -2162,8 +2228,8 @@ Expected result:
   and the header read finishes in seconds.
 - The report opens `ESTIMATED: fits at 8192 tokens` or `ESTIMATED: does not fit
   at 8192 tokens`, and lists weights, KV cache, compute buffer, runtime reserve
-  and the total, with this GPU's dedicated VRAM and the largest context that
-  fits.
+  and the total, with this GPU's dedicated VRAM (on an APU, its shared pool) and
+  the largest context that fits.
 - Repeat with `--kv-cache-type q8_0` and `q4_0`: the KV cache figure shrinks to
   about 53% and 28% of the `f16` one.
 - Serve the same file with llama.cpp's `llama-server` at the same `--ctx-size`
@@ -2419,7 +2485,7 @@ Expected result:
   prints no `Plan: prepend` line.
 - Close the window afterwards; the empty `PATH` was only that window's.
 
-## 18. Settings Changed From Several Terminals At Once
+## 19. Settings Changed From Several Terminals At Once
 
 Commands that change settings take turns on `config.json`, so none of them
 undoes another's change. Scenario `config-12` checks this on the mock lane; this
@@ -2493,3 +2559,53 @@ Expected result:
 - Each loop prints `lost 0, failed 0`.
 - The scratch config folder lists `config.json` and `config.json.lock`; the
   lock file is expected and stays beside the settings.
+
+## 20. Curated Models Narrowed To This Machine
+
+Needs two hosts to be meaningful, **both with discrete GPUs**: one large (an
+MI300X) and one small (a 16 GiB Radeon or similar). The mock lane covers the
+logic with a forced memory figure; what it cannot do is read a real machine.
+
+An integrated GPU is deliberately *not* one of them yet. `rocm` classifies an
+APU's shared pool as unreadable rather than as a memory figure, so an APU takes
+the unmeasured branch below and its listing is **unchanged** by this check. That
+is the honest current behaviour, not an oversight: reading the pool is
+`rocmai-912` / #1054's `Unified { gtt_total_gib }`, and narrowing an APU on a
+figure nothing measured would be the invented claim this whole area exists to
+remove. Re-point this section at an APU once that lands.
+
+```bash
+rocm model
+```
+
+Expected result, on the large host:
+
+- The large models are still listed — the 54 GiB and 62 GiB recipes appear, not
+  only the small ones.
+- The listing ends with `Narrowed to what this machine can run`, possibly
+  followed by a count of further models that also fit.
+
+Expected result, on the small host:
+
+- The models listed are ones this machine's GPU memory can hold. On a 16 GiB
+  discrete card that means the smaller recipes, and none of the 17 GiB-and-larger
+  ones.
+- No row says `needs a larger GPU`: a recommendation and a refusal cannot both
+  be true of the same row.
+
+Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
+a GPU the CLI cannot measure, **or any APU** — see above):
+
+- The list is *not* narrowed, and ends with `This machine's GPU memory could not
+  be read, so these are not filtered to what it can run.` An unmeasured machine
+  must not be told its options are narrow.
+
+Then ask the assistant the same question, which must get the same answer:
+
+```bash
+echo '{"args":["model"]}' > args.json
+rocm mcp-call rocm_command --arguments-file args.json
+```
+
+- The recipes listed match what `rocm model` printed in the terminal, narrowing
+  and closing note included.

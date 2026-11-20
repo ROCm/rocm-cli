@@ -138,10 +138,12 @@ mod tests {
     }
 
     /// Every file `the_ci_host_floor_is_the_documented_product_floor` reads
-    /// runs it when that file alone changes: a Markdown file only by being in
-    /// `XTASK_READ_DOCS`, which also puts it in ci.yml's `rust` bucket (see
-    /// `forces_full_workspace_docs_are_in_the_rust_filter`), and a Rust file
-    /// by belonging to a crate xtask depends on.
+    /// runs it when that file alone changes: `cargo xtask affected` (and the
+    /// pre-push hook, which selects the same way) must pick xtask for it. A
+    /// Markdown file gets there through `CROSS_CRATE_READS` (cross_crate_reads.rs),
+    /// whose entries `every_cross_crate_read_is_in_the_rust_filter` also holds
+    /// to CI's `rust` path category, and a Rust file by belonging to a crate
+    /// xtask depends on.
     #[test]
     fn every_floor_file_selects_the_test_that_reads_it() {
         let graph = crate::affected::load_graph().expect("read the workspace graph");
@@ -149,23 +151,15 @@ mod tests {
             .into_iter()
             .chain(SLASH_FLOOR_RESTATEMENTS)
         {
-            if Path::new(rel).extension().is_some_and(|e| e == "rs") {
-                let selection = crate::affected::select(&[rel.to_owned()], &graph);
-                assert!(
-                    match &selection {
-                        crate::affected::Selection::Workspace => true,
-                        crate::affected::Selection::Packages(names) => names.contains("xtask"),
-                        crate::affected::Selection::Empty => false,
-                    },
-                    "an edit to {rel} alone selects {selection:?}, which does not run xtask"
-                );
-            } else {
-                assert!(
-                    crate::affected::XTASK_READ_DOCS.contains(&rel),
-                    "{rel} states the floor but is not in XTASK_READ_DOCS (affected.rs), so an \
-                     edit to it alone does not run the test that reads it"
-                );
-            }
+            let selection = crate::affected::select_with_readers(&[rel.to_owned()], &graph);
+            assert!(
+                match &selection {
+                    crate::affected::Selection::Workspace => true,
+                    crate::affected::Selection::Packages(names) => names.contains("xtask"),
+                    crate::affected::Selection::Empty => false,
+                },
+                "an edit to {rel} alone selects {selection:?}, which does not run xtask"
+            );
         }
     }
 

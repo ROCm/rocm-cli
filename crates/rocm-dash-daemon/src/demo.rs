@@ -93,7 +93,7 @@ pub fn generate_to_writer<W: Write>(opts: &DemoOptions, w: &mut W) -> anyhow::Re
         let t_s = t as f64;
         // Wallclock advances 1s per snapshot.
         let ts_us = wall_base_us + (t * 1_000_000);
-        let snap = build_snapshot(t_s, base_secs, &mut seed);
+        let snap = build_snapshot(t_s, base_secs, &mut seed)?;
 
         // Snapshot.
         let snap_entry = PersistedEntry {
@@ -114,8 +114,7 @@ pub fn generate_to_writer<W: Write>(opts: &DemoOptions, w: &mut W) -> anyhow::Re
         }
 
         // Any bench rows scheduled at this second.
-        while bench_iter.peek().is_some_and(|(t_off, _)| *t_off == t) {
-            let (_t_off, row) = bench_iter.next().unwrap();
+        while let Some((_t_off, row)) = bench_iter.next_if(|(t_off, _)| *t_off == t) {
             let ev = PersistedEntry {
                 ts_us: ts_us + 500_000, // half a tick after the snapshot
                 event: Event::BenchmarkRowsAppended { rows: vec![row] },
@@ -645,8 +644,13 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
         .collect()
 }
 
-fn build_snapshot(t_s: f64, base_secs: i64, seed: &mut u64) -> Snapshot {
-    let timestamp = Utc.timestamp_opt(base_secs + t_s as i64, 0).unwrap();
+fn build_snapshot(t_s: f64, base_secs: i64, seed: &mut u64) -> anyhow::Result<Snapshot> {
+    // `MAX_DEMO_SECONDS` keeps `secs` decades inside chrono's range.
+    let secs = base_secs + t_s as i64;
+    let timestamp = Utc
+        .timestamp_opt(secs, 0)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("demo timestamp {secs}s is out of range"))?;
     let gpus: Vec<_> = (0..NUM_GPUS).map(|i| build_gpu(i, t_s, seed)).collect();
     let mut instances = build_instances(t_s, seed);
     // Mirror the runner: derive tokens_per_watt once both throughput and GPU
@@ -660,14 +664,14 @@ fn build_snapshot(t_s: f64, base_secs: i64, seed: &mut u64) -> Snapshot {
         inst.power_w = power_w;
         inst.tokens_per_watt = rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, power_w);
     }
-    Snapshot {
+    Ok(Snapshot {
         timestamp,
         host: build_host(t_s, seed),
         gpus,
         gpu_system_info: Some(build_sysinfo()),
         instances,
         warnings: Vec::new(),
-    }
+    })
 }
 
 fn write_line<W: Write + ?Sized>(w: &mut W, entry: &PersistedEntry) -> anyhow::Result<()> {

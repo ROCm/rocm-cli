@@ -687,7 +687,8 @@ mod tests {
 /// Property tests for the in-process Lemonade extractor, judged on the
 /// filesystem by `archive_props` rather than by re-deriving the extractor's
 /// own path checks.
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod archive_properties {
     use std::io::Write as _;
 

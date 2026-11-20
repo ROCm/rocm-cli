@@ -266,6 +266,17 @@ Feature: Model serving
   # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
   # set resolves on one GPU too and it stays ungated.
+  #
+  # KNOWN GAP — lanes whose job reaches one GPU: `@requires-multi-gpu` (the
+  # gate in `resolve`, tests/e2e-cucumber/src/expectation.rs) counts with
+  # `probe_amd_gpu_count` (tests/e2e-cucumber/src/capability.rs) the GPUs the
+  # kernel exposes to the job (its KFD GPU nodes) rather than the cards on the
+  # bus, so this skips on a lane whose job reaches a single GPU even when the
+  # host has several. Where KFD lists no GPU node or cannot be read, the count
+  # falls back to the amdgpu DRM cards, which can describe the whole host.
+  # No lane is documented to run it: docs/ci-hardware-testing.md ("GPU
+  # visibility on the hardware pool") records a job seeing one KFD GPU node on
+  # the MI300X, MI350P and R9700 lanes, and no per-job count for the others.
   @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
     When the user serves a model pinned past the ROCR-reindexed visible set
@@ -1055,7 +1066,16 @@ Feature: Model serving
   # command that follows the engine's log, then it exits 0 once the endpoint
   # lists the model. The named command is run, not just read: a hint that
   # points at a command that does not work would still pass a string check.
-  @id:serve-interactive-startup-progress @requires-gpu
+  # Linux-only, like every other scenario that drives `rocm` under a PTY
+  # (dash.feature's header): portable-pty's Windows (ConPTY) path is not a
+  # validated contract of this harness. On the native-Windows GPU lane the
+  # emulated screen stayed blank for the whole 300s wait while the same serve
+  # run piped (serve-07) came up. On native Windows, whether the wait is
+  # announced (`a_wait_that_can_fail_without_a_summary_is_announced` in
+  # service_launch/start.rs) and how it decides (the `wait_for_serve_startup`
+  # tests in serve_progress.rs) run on the Windows build-and-test job; the
+  # printed wait line itself is not exercised there.
+  @id:serve-interactive-startup-progress @requires-gpu @requires-os:linux
   Scenario: serve-64 - Interactive serve shows how to follow startup and exits when the model is served
     Given a managed runtime is active
     When the user serves a model on GPU under a real terminal

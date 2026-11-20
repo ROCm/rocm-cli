@@ -1813,10 +1813,10 @@ pub(crate) mod tests {
             );
             // anyhow appends a backtrace when RUST_BACKTRACE is set, as CI does.
             let rendered = format!("{error:?}");
-            let rendered = rendered
-                .split_once("\n\nStack backtrace:")
-                .map_or(rendered.as_str(), |(message, _)| message);
-            assert_eq!(rendered, expected);
+            assert_eq!(
+                rocm_core::recovery_hint::without_backtrace(&rendered),
+                expected
+            );
         }
         assert!(!paths.service_manifest_path("nope").exists());
         let _ = fs::remove_dir_all(root);

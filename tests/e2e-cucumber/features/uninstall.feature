@@ -187,3 +187,45 @@ Feature: Uninstall
     Then the uninstall is reported as cancelled
     And the user is not told the answer was misunderstood
     And the config folder still holds the user's files
+
+  # A refusal that knows the command which completes the uninstall ends with it
+  # as a `Try:` line. The promise is the line and the state together: running
+  # the line as printed removes what the refused run listed, and keeps what it
+  # kept. Linux-only like uninstall-04, whose refusal it starts from.
+  @id:uninstall-refusal-names-the-command-that-completes-it @requires-os:linux
+  Scenario: uninstall-16 - Running the command a refused uninstall suggests removes what was listed and keeps what was kept
+    Given the config folder holds the user's files
+    And the data folder holds the user's files
+    When the user uninstalls the config without confirming
+    Then the uninstall is refused and the user is told to confirm explicitly
+    And the refusal ends by suggesting the same uninstall, confirmed
+    When the user runs the command the refusal suggests
+    Then the uninstall succeeds
+    And the config folder is gone
+    And the data folder still holds the user's files
+
+  # The other side of uninstall-10: `--force` is refused, and the line it ends
+  # with is the command the user meant, `--yes` in place of `--force`. Unlike
+  # uninstall-16 it is not Linux-only: `--force` is refused in dispatch, before
+  # any terminal check, so it behaves the same on every lane.
+  @id:uninstall-force-refusal-names-the-command-that-completes-it
+  Scenario: uninstall-17 - Running the command a refused --force suggests removes the config folder and keeps the data folder
+    Given the config folder holds the user's files
+    And the data folder holds the user's files
+    When the user uninstalls the config with --force
+    Then the uninstall is refused and told to use --yes instead
+    And the refusal ends by suggesting the same uninstall, confirmed
+    When the user runs the command the refusal suggests
+    Then the uninstall succeeds
+    And the config folder is gone
+    And the data folder still holds the user's files
+
+  # A session record `rocm remote` refuses to use may still describe a model
+  # running on another machine, and `rocm remote stop` cannot reach it, so the
+  # uninstall review names it rather than deleting its last trace unannounced.
+  @id:uninstall-dry-run-names-refused-remote-session-record
+  Scenario: uninstall-18 - A dry run names a refused remote session record that stop cannot reach
+    Given a session record on this machine that names a remote command this tool never writes
+    When the user dry-runs an uninstall
+    Then the uninstall succeeds
+    And the uninstall warns about the refused remote session record
