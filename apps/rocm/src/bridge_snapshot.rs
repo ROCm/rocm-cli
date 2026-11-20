@@ -37,10 +37,7 @@ pub(crate) fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridg
     // takes exactly the two fields this summary already carries, so the engine
     // list costs no detection the snapshot was not doing anyway.
     let examine = ExamineSummary::gather()?;
-    let gpu_support_level = rocm_core::gpu_support_level(
-        examine.detected_gfx_target.as_deref(),
-        examine.compatible_therock_family.as_deref(),
-    );
+    let gpu_support_level = rocm_core::gpu_support_level_for_examine(&examine);
     Ok(CodexBridgeSnapshot {
         protocol: "rocmd-codex-bridge-v0".to_owned(),
         generated_at_unix_ms: rocm_core::unix_time_millis(),

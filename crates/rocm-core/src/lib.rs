@@ -140,7 +140,8 @@ pub use fix::{
     list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
-    GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level, gpu_support_level_for_host_gpu,
+    GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, gpu_support_level, gpu_support_level_for_examine,
+    gpu_support_level_for_host_gpu,
 };
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,

@@ -627,6 +627,26 @@ pub fn gpu_support_level_for_host_gpu(host_gpu: &HostGpuSummary) -> GpuSupportLe
     )
 }
 
+/// [`gpu_support_level`] for an [`ExamineSummary`], the other shape a caller
+/// already holds.
+///
+/// Same reason as [`gpu_support_level_for_host_gpu`], for the other struct.
+/// That helper cannot serve these callers -- it takes a `HostGpuSummary`, and
+/// `rocm examine`'s report and the codex-bridge snapshot both hold an
+/// `ExamineSummary` instead -- so without this they read the two positional
+/// `Option<&str>` arguments themselves, which is exactly the transposition the
+/// first helper exists to rule out. The field names differ between the two
+/// structs (`detected_gfx_target`/`compatible_therock_family` here,
+/// `gfx_target`/`therock_family` there), which is what makes getting the order
+/// right at a call site a matter of attention rather than of the compiler.
+#[must_use]
+pub fn gpu_support_level_for_examine(examine: &crate::host_gpu::ExamineSummary) -> GpuSupportLevel {
+    gpu_support_level(
+        examine.detected_gfx_target.as_deref(),
+        examine.compatible_therock_family.as_deref(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

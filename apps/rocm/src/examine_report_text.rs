@@ -134,10 +134,7 @@ pub(crate) fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    let gpu_support_level = rocm_core::gpu_support_level(
-        summary.detected_gfx_target.as_deref(),
-        summary.compatible_therock_family.as_deref(),
-    );
+    let gpu_support_level = rocm_core::gpu_support_level_for_examine(&summary);
     append_examine_engine_inventory(
         &mut output,
         paths,
