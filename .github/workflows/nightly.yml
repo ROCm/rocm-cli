@@ -16,8 +16,10 @@ on:
         description: >-
           How long an E2E lane may wait for a runner before the run gives up on
           it (default 60). Lower it to try the give-up path from a branch
-          quickly. Whole minutes, at most 120: a larger value is refused, because
-          a lane that started just inside it could outlast the hard deadline.
+          quickly. Whole minutes, at most HARD_DEADLINE_MINUTES minus
+          LANE_RUN_MINUTES on e2e-lanes-settled (100 today): a larger value is
+          refused, because a lane that started just inside it could outlast the
+          hard deadline.
         type: string
         default: "60"
 
@@ -430,14 +432,17 @@ jobs:
   # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job (minus its PR-only
-  # stale-run guard) but sets E2E_INCLUDE_NIGHTLY.
+  # Mirrors e2e-selfhosted.yml's e2e-gpu job (minus its PR-only stale-run
+  # guard) but sets E2E_INCLUDE_NIGHTLY.
+  # Like every nightly lane, it sets no `continue-on-error`, so a failing leg
+  # fails this job. What that does to the run's conclusion, and why the lanes
+  # must stay unmasked, is in docs/ci-hardware-testing.md under "Blocking vs.
+  # non-blocking".
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
     # `mi300x`, not `amd-gpu` — see the same pin on e2e-selfhosted.yml's e2e-gpu.
     runs-on: [self-hosted, linux, mi300x]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -556,7 +561,6 @@ jobs:
     # the 12h run cap and the lane never ran. Pool hosts are cold,
     # so there are no host-specific HOME or cache-dir overrides.
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -646,7 +650,6 @@ jobs:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -916,7 +919,6 @@ jobs:
     # conservative starting budget, tune down after a measured run.
     timeout-minutes: 120
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -1367,8 +1369,8 @@ jobs:
           # `error` makes that a failed step here, in the lane that owns the
           # copy, where default `warn` would upload nothing without a word.
           # The consolidated report job's missing-report check flags the absent
-          # artifact too, and is the only signal on a `continue-on-error` lane:
-          # a failed step there does not turn the lane's check red. Only the
+          # artifact too, so the gap is named in the consolidated report job as
+          # well as here, where the failed step turns this lane red. Only the
           # WSL lanes need this guard: every other lane writes report.json
           # directly in-job, with no guest-to-host copy step that can fail on
           # its own. A harness preflight refusal is not one of those:
@@ -1451,9 +1453,10 @@ jobs:
     needs:
       - e2e-lanes-settled
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
-    # filter to consult on a schedule, and the lanes are `continue-on-error`, so
-    # a failed lane must still be reported. A nightly that broke is precisely
-    # when the grid is worth reading.
+    # filter to consult on a schedule. A failed lane does not fail
+    # e2e-lanes-settled, but the settle job itself can fail or be cancelled
+    # (an unreadable job list, its own timeout), and the default `success()`
+    # condition would then skip the report on the night it is worth reading.
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1666,10 +1669,11 @@ jobs:
       # step publishes it, so it shows as an EMPTY row (a post-run lane failure
       # as a FAIL row with lane_failure), not as missing. `discover()` can only
       # render the reports that arrived, so a lane that uploads nothing would
-      # drop out of the grid with no row and no FAIL. On a `continue-on-error`
-      # lane nothing else is red either. So check it here: every lane that ran
-      # (any `needs` result but `skipped`, and not self-skipped as `stale`)
-      # must have uploaded its report artifact. This reads the run's
+      # drop out of the grid with no row and no FAIL. The lane's own job is red,
+      # but nothing in the grid would say which report is absent. So check it
+      # here: every lane that ran (any `needs` result but `skipped`, and not
+      # self-skipped as `stale`) must have uploaded its report artifact. This
+      # reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1680,9 +1684,9 @@ jobs:
       # checked explicitly, comma-separated, rather than reading one leg as a
       # stand-in for the whole lane. LANE_REPORTS, and this script's behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
-      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
-      # `success` even though the lane failed, so the absent artifact is the
-      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # lane's `needs` result verbatim, but the absent artifact is the signal,
+      # not that value: a lane whose other leg failed reads `failure` whether or
+      # not this leg uploaded. `!cancelled()`, not `always()`: a run
       # superseded mid-flight cuts lanes off before upload, which is not a gap.
       - name: Check every lane that ran uploaded its report
         if: ${{ !cancelled() }}

@@ -418,7 +418,10 @@ via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
 build results, the consolidated E2E failure total, and the `e2e-report-nightly`
 job's own result (so a lane that dies before uploading a report still fails
 the gate), and buckets commits since the last release tag into
-features/fixes/breaking changes. Unlike the wiki-publish jobs above, the
+features/fixes/breaking changes. It reads `e2e-report-nightly`'s result and
+the report's failure total, not the lane jobs' own results, so it can read GO
+while a lane is red for a reason the report does not record as a failure.
+Unlike the wiki-publish jobs above, the
 `release-readiness-nightly` and `release-readiness-narrative` jobs have no
 `main`/repo guard — they run on any branch this workflow is dispatched on.
 The narrative job drafts prose from those facts via `actions/ai-inference`
@@ -676,8 +679,9 @@ jobs, which wait on every lane, never ran.
   the wait either.
   A lane that starts just inside the queue deadline still has its full
   `timeout-minutes`, so the script refuses a queue deadline that, plus
-  `LANE_RUN_MINUTES` (120), would pass the hard deadline: the input is whole
-  minutes, at most 120.
+  `LANE_RUN_MINUTES` (the longest lane's `timeout-minutes`, 140 today), would
+  pass the hard deadline: the input is whole minutes, at most
+  `HARD_DEADLINE_MINUTES` minus `LANE_RUN_MINUTES` (100 today).
 - `e2e-report-nightly`, the readiness jobs and the wiki publishers then run on
   whatever finished. An abandoned lane has no report artifact, so the report
   job's missing-report check flags it by name, the consolidated grid shows the
@@ -845,14 +849,49 @@ The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
 `e2e-gpu-strix-windows`, and `e2e-wsl` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
-it reports. They run with `continue-on-error: false`, so a real
-regression shows red instead of always green. Their results also surface in
-the self-hosted consolidated report for visibility. A lane that ran but uploaded
-no report (it died before writing its results) fails the consolidated report
-job, naming the lane, rather than silently dropping out of the grid (a lane that
-skipped itself as stale is the exception); on a
-`continue-on-error: true` lane that is the only red signal for such a failure.
-The nightly report job applies the same check to every nightly lane.
+it reports. Each sets `continue-on-error: false`, so a real regression shows
+red instead of always green. Their results also surface in the self-hosted
+consolidated report for visibility. A lane that ran but uploaded no report (it
+died before writing its results) fails the consolidated report job, naming the
+lane, rather than silently dropping out of the grid (a lane that skipped itself
+as stale is the exception). The nightly report job applies the same check to
+every nightly lane.
+
+No E2E lane in [`nightly.yml`](../.github/workflows/nightly.yml) sets
+`continue-on-error`, on the job or on any step, so a leg that fails fails its
+lane's job and that job's check run reads `failure`. (Outside the lanes it is
+still used: by the `release-readiness-narrative` job, by steps of
+`publish-release-readiness-wiki`, and by the queue-import steps of
+`e2e-report-nightly`, which must never stop the report.) The Nightly run then
+concludes `failure`, unless `cancel-abandoned-e2e-lanes` cancels it because a
+leg was abandoned or `e2e-lanes-settled` failed or was cancelled (see
+[Nightly lanes that never get a runner](#nightly-lanes-that-never-get-a-runner)):
+a cancelled run concludes `cancelled`, which outranks the failure, while the
+failed lane's own check run stays red. A lane killed by its own
+`timeout-minutes` also reads `cancelled` rather than `failure`. Job-level
+`continue-on-error: true` would instead make the failed lane read `success`,
+both in `needs.<lane>.result` and in the run's conclusion, and a step-level one
+would let the failing step pass the job. Nightly gates no merge or tag either
+way. A failed lane does not fail `e2e-lanes-settled`, which hands each lane's
+result to the report job, so on a red night the consolidated report and
+release-readiness jobs still run. `publish-e2e-wiki` runs when
+`e2e-report-nightly` succeeded or failed (it fails, for example, when a lane
+that ran uploaded no report), so a failed report does not by itself keep the
+E2E wiki page from being updated. The previous page stays in place when, among
+other things, the report job was skipped or cancelled, the run is outside
+`main` or outside this repository, the report job failed before writing its
+consolidated report (the wiki job then fails at the download), or the
+consolidated report has no platform table to publish.
+`e2e_lanes_do_not_mask_failures_with_continue_on_error` in
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs) enforces this with a
+line scan of every self-hosted lane in both workflows that is fail-closed for
+the spellings it reads: outside indented comments, any line mentioning
+`continue-on-error` that is not exactly `continue-on-error: false` (or
+`- continue-on-error: false`) fails the test, even inside a `run:` script, and
+the failure names each such line with its lane. There is no exception list: no
+self-hosted E2E lane in either workflow may carry such a line. What the scan
+cannot see, including spellings it misses, is listed in the
+`continue_on_error_lines` doc comment.
 
 A lane the harness failed after its run (no scenario executed, or no GPU
 scenario, `@requires-gpu` or `@requires-multi-gpu`, on an `E2E_EXPECT_GPU=1`

@@ -751,7 +751,8 @@ jobs:
   # CARGO_HOME override (pool hosts have room under the default paths, unlike
   # the full-partition static host this replaced), though CARGO_TARGET_DIR
   # still points at RUNNER_WORKSPACE to dodge checkout's `git clean -ffdx`
-  # mid-job. Non-blocking while this hardware is proven out.
+  # mid-job. Non-blocking: its check is not a required status check (see the
+  # header), but a failure still turns it red.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu, ${{ matrix.channel }}, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
@@ -937,7 +938,8 @@ jobs:
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
   # existing windows-debug/windows-release jobs use GitHub-hosted windows-latest,
-  # which has no GPU. Non-blocking so it never gates the PR.
+  # which has no GPU. Non-blocking: its check is not a required status check
+  # (see the header), but a failure still turns it red.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
@@ -1976,10 +1978,10 @@ jobs:
       # A lane that dies before writing report.json (preflight, build, a crash
       # before results exist) uploads nothing, and `discover()` can only render
       # the reports that arrived, so that lane would drop out of the grid with
-      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
-      # either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`, and not self-skipped as `stale`) must have uploaded its report
-      # artifact. This reads the run's
+      # no row and no FAIL. The lane's own job is red, but nothing in the grid
+      # would say which report is absent. So check it here: every lane that ran
+      # (any `needs` result but `skipped`, and not self-skipped as `stale`) must
+      # have uploaded its report artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1991,9 +1993,9 @@ jobs:
       # stand-in for the whole lane. LANE_REPORTS, and this script's
       # behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
-      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
-      # `success` even though the lane failed, so the absent artifact is the
-      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # lane's `needs` result verbatim, but the absent artifact is the signal,
+      # not that value: a lane whose other leg failed reads `failure` whether or
+      # not this leg uploaded. `!cancelled()`, not `always()`: a run
       # superseded mid-flight cuts lanes off before upload, which is not a gap.
       - name: Check every lane that ran uploaded its report
         if: ${{ !cancelled() }}

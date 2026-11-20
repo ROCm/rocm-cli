@@ -246,10 +246,14 @@ exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
 The nightly workflow runs the MI300X and the Strix Halo hardware from the
-table above as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-strix`,
+table above, in its own lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. R9700, MI350P and W7900 no longer have a self-hosted nightly lane in
+grid. They gate no merge, but a failing lane fails its job, and the Nightly run
+concludes `failure` unless the workflow cancels it, in which case it reads
+`cancelled` (see
+[ci-hardware-testing.md](../../docs/ci-hardware-testing.md#blocking-vs-non-blocking)).
+R9700, MI350P and W7900 no longer have a self-hosted nightly lane in
 `nightly.yml`: they run on the queue ([nightly-on-the-queue.md](../../docs/nightly-on-the-queue.md)),
 and the nightly report adds the queue's lanes to that grid. The shared large-model scenario follows each lane's serve engine: it
 serves `Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P),
