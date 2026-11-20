@@ -1,5 +1,5 @@
 ## hawkeye license-header enforcement configuration.
-## Run locally: hawkeye check
+## Run locally: hawkeye check --fail-on-unknown
 ## Docs: https://github.com/fast/hawkeye
 ##
 ## `skills/rocm-doctor/` is excluded. It is a published Agent Skill, not repo
@@ -50,8 +50,9 @@ style_out = "xml"
 ## hawkeye has no built-in comment syntax for PowerShell: without this rule a
 ## .ps1/.psm1/.psd1 file is reported `unsupported` and silently skipped (exit 0),
 ## so `includes` alone would not enforce anything. Only `hawkeye check
-## --fail-on-unknown` turns that into a failure, and neither the CI job nor the
-## prek hook passes the flag.
+## --fail-on-unknown` turns that into a failure, and both the CI job and the
+## prek hook pass the flag, so an included file type with no rule fails the
+## check instead of going unchecked.
 [[rules]]
 extensions = ["ps1", "psm1", "psd1"]
 style_out = "script"

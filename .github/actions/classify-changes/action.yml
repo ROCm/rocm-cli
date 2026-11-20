@@ -146,8 +146,11 @@ runs:
             - 'install*'
             - '.github/scripts/**'
             - '.github/dependabot.yml'
-            # license_headers_hook_has_no_file_type_filter (xtask) reads this
-            # file's license-headers hook config.
+            # license_headers_hook_has_no_file_type_filter and
+            # license_header_checks_fail_on_files_hawkeye_cannot_check (xtask)
+            # read this file's license-headers hook config; an edit here that
+            # reopens the file-type-filter gap or drops --fail-on-unknown must
+            # still run them on the PR.
             - '.pre-commit-config.yaml'
             - '.github/workflows/**'
             - '.github/actions/**'
