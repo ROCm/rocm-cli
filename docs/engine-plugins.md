@@ -146,21 +146,35 @@ fallback if that probe itself fails), since no rewrite can make an
 unsupported ROCm build
 resolve there.
 
+Before it downloads anything, the rewrite lists the 30 newest
+`lemonade-sdk/llama.cpp` releases on GitHub (an unauthenticated
+`api.github.com` call, subject to GitHub's public rate limit) to learn which
+builds ship the archive for the active ROCm version, so it does not download
+an archive that is not there (each such download would 404 and be retried).
+
 The rewrite tries two builds in order. The first keeps Lemonade's own pinned
 llama.cpp release and just repoints it at the active ROCm version — a
-deliberate, reproducible pin. If that attempt fails to resolve against the
+deliberate, reproducible pin. It is skipped when GitHub shows that release
+ships no archive for the active ROCm version: from the listing, or, since
+Lemonade's pin is usually older than the 30 newest releases, from one more
+`api.github.com` call for the release with that tag (no such release counts as
+no archive). It is still attempted when neither the listing nor that call can be
+fetched. If that attempt fails to resolve against the
 installed backend's shared libraries — for example because that release never
-shipped an asset for the active ROCm version — the second lists the 30 newest
-`lemonade-sdk/llama.cpp` releases on GitHub (an unauthenticated
-`api.github.com` call, subject to GitHub's public rate limit) and installs the
-most recently published one that ships the llama.cpp archive for the active
+shipped an asset for the active ROCm version — the second installs the
+most recently published listed release that ships the llama.cpp archive for the active
 ROCm version's `major.minor` on this platform
 (`llama-<tag>-bin-ubuntu-rocm-<major.minor>-x64.tar.gz` on Linux,
 `llama-<tag>-bin-win-rocm-<major.minor>-x64.zip` on Windows). The newest
 release alone is not used, because a release can be published without its
 ROCm archives. The second attempt is skipped when none of the 30 ships that
 archive, when the listing cannot be fetched, and when the build it finds is the
-one Lemonade already pins (the first attempt tried that build). That second
+one Lemonade already pins (the first attempt tried that build). When the first
+attempt is skipped and the second has no build either, because upstream has not
+published an archive for that ROCm version yet, no backend is downloaded for the
+alignment: a warning says so, `backend_versions.json` is left as it is, and the
+backend Lemonade pins installs as it would without alignment. The pin follows the
+SDK on a later install once a build ships. That second
 build is a moving target, not a pin: which llama.cpp commit actually gets
 installed depends on when the install ran, and the version installed is not
 recorded anywhere `rocm examine`/`rocm version` report. An attempt that cannot

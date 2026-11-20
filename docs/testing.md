@@ -3323,6 +3323,9 @@ cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_warning
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_field_wider
 cargo test -p rocm-engine-lemonade backend_alignment::tests::tier2
 cargo test -p rocm-engine-lemonade backend_alignment::tests::align_falls_through_to_tier2
+cargo test -p rocm-engine-lemonade backend_alignment::tests::align_downloads_nothing
+cargo test -p rocm-engine-lemonade backend_alignment::tests::align_goes_straight_to_tier2
+cargo test -p rocm-engine-lemonade backend_alignment::tests::release_ships_asset
 cargo test -p rocm-engine-lemonade backend_alignment::tests::llamacpp_asset_name
 ```
 
