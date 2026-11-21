@@ -55,6 +55,8 @@ use torch_alignment::{
 #[derive(Debug, Clone)]
 pub(crate) struct SdkInstallFinalization {
     pub(crate) runtime_key: String,
+    /// The SDK version the installed manifest records, for host-specific advisories.
+    sdk_version: String,
     install_root: PathBuf,
     family: String,
     pub(crate) previous_runtime_key: Option<String>,
@@ -1013,6 +1015,11 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
 }
 
 pub(crate) fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
+    render_sdk_install_success_on(finalized, rocm_core::is_wsl_host())
+}
+
+/// [`render_sdk_install_success`] for a host that is (`is_wsl`) or is not WSL2.
+fn render_sdk_install_success_on(finalized: &SdkInstallFinalization, is_wsl: bool) -> String {
     let mut output = format!(
         "ROCm SDK installed successfully.\n  install folder: {}\n  active runtime: {}\n  next step: run `rocm help` to see how to use rocm-cli.\n",
         finalized.install_root.display(),
@@ -1028,6 +1035,9 @@ pub(crate) fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> 
     );
     if finalized.previous_runtime_key.is_some() {
         let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
+    }
+    if let Some(advisory) = crate::runtime_advisory::advisory_for(is_wsl, &finalized.sdk_version) {
+        let _ = writeln!(output, "{advisory}");
     }
     output
 }
@@ -1067,6 +1077,7 @@ pub(crate) fn finalize_successful_sdk_install(
 
     Ok(Some(SdkInstallFinalization {
         runtime_key: activation.runtime_key,
+        sdk_version: manifest.version.clone(),
         sdk_python_version: therock::recorded_python_version(&manifest),
         install_root: manifest.install_root,
         family: manifest.family,
@@ -1597,6 +1608,7 @@ pub(crate) mod tests {
     fn sdk_install_finalization() -> SdkInstallFinalization {
         SdkInstallFinalization {
             runtime_key: "wheel-gfx942-7.13.0".to_owned(),
+            sdk_version: "7.13.0".to_owned(),
             install_root: PathBuf::from("/tmp/does-not-need-to-exist"),
             family: "gfx94X-dcgpu".to_owned(),
             previous_runtime_key: None,
@@ -1701,6 +1713,31 @@ pub(crate) mod tests {
             recon_pos < rollback_pos,
             "reconciliation section must precede the rollback hint:\n{rendered}"
         );
+    }
+
+    /// The install report says, in the install's own output, that the SDK it just
+    /// made active is the one with the known slow path on WSL2, and not otherwise.
+    /// The advisory text itself is pinned in `runtime_advisory.rs`.
+    #[test]
+    fn render_sdk_install_success_warns_for_the_slow_sdk_on_wsl_only() {
+        let slow = SdkInstallFinalization {
+            runtime_key: "release-wheel-multi-arch-10-2-0-abc".to_owned(),
+            sdk_version: "10.2.0".to_owned(),
+            ..sdk_install_finalization()
+        };
+        let on_wsl = render_sdk_install_success_on(&slow, true);
+        assert!(
+            on_wsl.contains("warning: ROCm SDK 10.2.0 on WSL2"),
+            "{on_wsl}"
+        );
+        assert!(
+            on_wsl.contains("active runtime: release-wheel-multi-arch-10-2-0-abc"),
+            "the warning rides on a report that says what became active:\n{on_wsl}"
+        );
+        for (finalized, is_wsl) in [(&slow, false), (&sdk_install_finalization(), true)] {
+            let rendered = render_sdk_install_success_on(finalized, is_wsl);
+            assert!(!rendered.contains("warning:"), "{rendered}");
+        }
     }
 
     #[test]

@@ -150,6 +150,11 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             if result.previous_runtime_key.is_some() {
                 println!("{ROLLBACK_RECOVERY_HINT}");
             }
+            if let Some(advisory) =
+                crate::runtime_advisory::advisory_for_runtime_key(&paths, &result.runtime_key)
+            {
+                println!("{advisory}");
+            }
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
             // Severity and detail come from the restart outcome, not from the

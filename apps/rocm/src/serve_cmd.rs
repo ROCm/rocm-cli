@@ -1053,6 +1053,18 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         visible_gpu_indices.as_deref(),
         gpu_vram.as_deref(),
     )?;
+    // On stderr, ahead of the launch and its wait: a runtime with a known slow
+    // path on this host is what the user will be waiting on, and stdout stays the
+    // plan or the machine-readable launch report.
+    if let Some(advisory) = resolved_selection
+        .runtime_id
+        .as_deref()
+        .and_then(|runtime_key| {
+            crate::runtime_advisory::advisory_for_runtime_key(&paths, runtime_key)
+        })
+    {
+        eprintln!("{advisory}");
+    }
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`
