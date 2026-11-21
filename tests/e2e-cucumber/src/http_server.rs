@@ -155,7 +155,16 @@ pub fn loopback_url(port: u16) -> Url {
 async fn bind(port: u16) -> TcpListener {
     TcpListener::bind(("127.0.0.1", port))
         .await
-        .unwrap_or_else(|e| panic!("failed to bind test server listener on port {port}: {e}"))
+        .unwrap_or_else(|e| {
+            // A fixed port that is taken is the interesting case; name the
+            // holder so the failure does not need a host login to diagnose.
+            let holders = if port == 0 {
+                String::new()
+            } else {
+                format!("\n{}", crate::serve_log::port_holders(port))
+            };
+            panic!("failed to bind test server listener on port {port}: {e}{holders}")
+        })
 }
 
 fn local_addr(listener: &TcpListener) -> SocketAddr {
