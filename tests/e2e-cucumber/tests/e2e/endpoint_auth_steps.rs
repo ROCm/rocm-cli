@@ -17,11 +17,10 @@ use std::time::{Duration, Instant};
 use cucumber::{then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::serve_log::service_log_tail;
 
 use crate::e2e::serving_steps::{
     MODELS_URL, SERVE_BASE_URL, SERVE_PORT, ensure_serve_port_free, host_serve_target,
-    serve_timeout_for,
+    serve_failure_evidence, serve_timeout_for,
 };
 
 /// A public bind listens on all interfaces, so the test still reaches the shared
@@ -74,37 +73,32 @@ async fn get_models_status(bearer: Option<&str>) -> reqwest::StatusCode {
 ///
 /// A managed serve returns as soon as the supervisor is up, so for the first while
 /// the engine has not bound the port yet and the connection is simply refused.
-/// That is expected here and must be retried — panicking on the first refusal is
-/// what made this scenario fail before it ever reached its assertions.
+/// That is expected here and must be retried.
 ///
-/// On timeout the panic carries the engine's own log tail and the last thing the
-/// endpoint did, because "did not answer in Ns" alone cannot distinguish the three
-/// failures that look identical from outside: the engine never started, it started
-/// but is still loading weights, or it is up and REJECTING the key we were issued
-/// (which would be a real defect in the contract under test, not a slow start).
-async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64, serve_stdout: &str) {
+/// Returns the failure headline instead of panicking, so the caller can attach
+/// the full serve evidence bundle. A bound engine rejecting the key it was issued
+/// is a contract defect rather than a slow start, so that is reported at once
+/// instead of at the deadline.
+async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64) -> Result<(), String> {
+    let endpoint = endpoint_url();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let last_seen = match try_models_status(Some(key)).await {
-            Some(status) if status.is_success() => return,
-            // A bound engine rejecting the key it was issued is a contract defect,
-            // not a slow start, so report it now instead of at the deadline.
-            Some(reqwest::StatusCode::UNAUTHORIZED) => panic!(
-                "public endpoint {} rejected the issued key with 401\n--- SERVE STDOUT ---\n{serve_stdout}\n--- SERVICE LOG (tail) ---\n{}",
-                endpoint_url(),
-                service_log_tail(serve_stdout)
-            ),
+            Some(status) if status.is_success() => return Ok(()),
+            Some(reqwest::StatusCode::UNAUTHORIZED) => {
+                return Err(format!(
+                    "public endpoint {endpoint} rejected the issued key with 401"
+                ));
+            }
             Some(status) => format!("endpoint answered {status} to the issued key"),
             None => "connection refused / timed out".to_owned(),
         };
-        let endpoint = endpoint_url();
-        assert!(
-            Instant::now() < deadline,
-            "public endpoint {endpoint} did not answer an authenticated request within \
-             {timeout_secs}s\nlast observed: {last_seen}\n--- SERVE STDOUT ---\n{serve_stdout}\
-             \n--- SERVICE LOG (tail) ---\n{}",
-            service_log_tail(serve_stdout)
-        );
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "public endpoint {endpoint} did not answer an authenticated request \
+                 within {timeout_secs}s (last observed: {last_seen})"
+            ));
+        }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -114,33 +108,64 @@ async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64, serve_std
 #[when("the user serves a model on a public interface with public binding allowed")]
 async fn serve_public_bind(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
-    ensure_serve_port_free().await;
+    let timeout_secs = serve_timeout_for(world);
+    let device_state = ensure_serve_port_free().await;
     // No `--api-key`: the CLI must GENERATE one, which is the behaviour under test.
     // `--port` is required: automatic port selection is refused on any host other
     // than 127.0.0.1 (networking-04), and the endpoint checks poll SERVE_PORT.
     let port = SERVE_PORT.to_string();
-    let stdout = crate::run_rocm_ok(
+    let args = [
+        "serve",
+        model,
+        "--engine",
+        engine,
+        "--managed",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        &port,
+        "--allow-public-bind",
+    ];
+    // Bounded, like every other managed GPU serve: a `rocm serve` that never
+    // returns must fail this scenario, not stall the lane until the job is
+    // cancelled (see `serve_and_wait_with_key`).
+    let (stdout, stderr, rc) = crate::run_rocm_bounded_with_env(
         world,
-        &[
-            "serve",
-            model,
-            "--engine",
-            engine,
-            "--managed",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            &port,
-            "--allow-public-bind",
-        ],
+        &args,
+        &[],
+        e2e_cucumber::serve_log::serve_cli_budget(timeout_secs),
     );
-    let key = issued_api_key(&stdout)
-        .unwrap_or_else(|| panic!("serve did not print an endpoint api key:\n{stdout}"));
-    wait_for_authenticated_endpoint(&key, serve_timeout_for(world), &stdout).await;
-    world.endpoint = Some(endpoint_url().to_owned());
-    world.endpoint_api_key = Some(key);
-    world.model_name = Some(model.to_owned());
-    world.cli_output = Some(stdout);
+    let invocation = format!("`rocm {}`", args.join(" "));
+    let outcome = if rc == 0 {
+        match issued_api_key(&stdout) {
+            Some(key) => wait_for_authenticated_endpoint(&key, timeout_secs)
+                .await
+                .map(|()| key),
+            None => Err(format!("{invocation} did not print an endpoint api key")),
+        }
+    } else {
+        Err(format!("{invocation} failed (rc={rc})"))
+    };
+    match outcome {
+        Ok(key) => {
+            world.endpoint = Some(endpoint_url().to_owned());
+            world.endpoint_api_key = Some(key);
+            world.model_name = Some(model.to_owned());
+            world.cli_output = Some(stdout);
+        }
+        Err(headline) => panic!(
+            "{}",
+            serve_failure_evidence(
+                world,
+                Some(engine),
+                &headline,
+                &device_state,
+                &stdout,
+                &stderr,
+            )
+            .await
+        ),
+    }
 }
 
 // ── Then ───────────────────────────────────────────────────────────

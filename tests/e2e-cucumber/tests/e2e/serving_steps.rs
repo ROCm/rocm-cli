@@ -165,7 +165,7 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
-async fn serve_failure_evidence(
+pub(crate) async fn serve_failure_evidence(
     world: &mut E2eWorld,
     engine: Option<&str>,
     headline: &str,
