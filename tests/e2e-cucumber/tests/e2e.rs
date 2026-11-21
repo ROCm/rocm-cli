@@ -275,6 +275,9 @@ pub struct E2eWorld {
     /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
     /// can show a refused install left that tree exactly as it was.
     pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
+    /// The size of this machine's `/dev/shm`, in bytes, as a Given measured it,
+    /// so a Then can show a fix that only explains itself left it as it was.
+    pub shm_allowance_before: Option<u64>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -454,6 +457,7 @@ impl Default for E2eWorld {
             dash_report_refused: None,
             automation_daemon: None,
             planted_tree_snapshot: None,
+            shm_allowance_before: None,
         }
     }
 }
