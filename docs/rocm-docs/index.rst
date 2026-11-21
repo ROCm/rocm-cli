@@ -12,7 +12,7 @@ chat.
 
 It ships as a single prebuilt binary for Linux and Windows (x86_64), needs no
 Python, Rust, or existing ROCm install, and includes inference engine
-adapters for Lemonade and vLLM.
+adapters for Lemonade, vLLM, and AIM.
 
 .. important::
 
@@ -30,6 +30,7 @@ The ROCm CLI public repository is located at
 
       * :doc:`Installing ROCm CLI <install/installation>`
       * :doc:`ROCm CLI on WSL2 <install/wsl>`
+      * :doc:`Compatibility <compatibility>`
 
    .. grid-item-card:: Getting started
 
