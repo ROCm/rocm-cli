@@ -5787,6 +5787,30 @@ itself (as `dash-37` does), so the runner's GPU does not change the outcome:
 cargo xtask e2e -- -n "dash-(5[6-9]|6[0-2])"
 ```
 
+## Dashboard Letter Shortcuts With Caps Lock
+
+With Caps Lock on, a terminal sends the uppercase letter (on Unix the same
+event as Shift), so the dashboard folds a letter shortcut's case before
+matching it, with `shortcut_key` in
+[widgets.rs](../crates/rocm-dash-tui/src/ui/widgets.rs) (ROCMAI-1288). Text
+entry never goes through it, Ctrl+C cancels only as lowercase (Ctrl+Shift+C
+is the terminal's copy), and `G` keeps its own binding, so `g` with Caps Lock
+on jumps to the last row. The dashboard and its modals
+([actions.rs](../crates/rocm-dash-tui/src/app/actions.rs)), the launcher and
+each manager under `crates/rocm-dash-tui/src/ui/` have a
+`caps_lock_letters_trigger_the_same_*` unit test; the job console's case is in
+`console_key_outcomes` ([job_console.rs](../crates/rocm-dash-tui/src/ui/job_console.rs)),
+the focused-host close guard's in `focused_close_keys_swallowed_while_job_runs`
+([focus.rs](../crates/rocm-dash-tui/src/app/focus.rs)), and
+`uppercase_g_keeps_its_own_binding` covers `G`. End to end, `dash-63` in
+[dash.feature](../tests/e2e-cucumber/features/dash.feature) opens the services
+manager with `S` and quits with `Q`, sent once, so it fails on a timeout if
+either is ignored. It carries only `@requires-os:linux`:
+
+```bash
+cargo xtask e2e -- -n "dash-63"
+```
+
 ## Diagnose Engine Provenance
 
 `rocm diagnose --engine vllm` (ROCMAI-955) says which engine a symptom came

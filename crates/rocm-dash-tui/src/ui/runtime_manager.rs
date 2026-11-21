@@ -35,7 +35,7 @@ use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browse
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
 use crate::ui::theme::{StatusTone, Theme};
-use crate::ui::widgets::apply_char_key;
+use crate::ui::widgets::{apply_char_key, shortcut_key};
 
 /// A flattened registered-runtime entry for the list.
 ///
@@ -226,7 +226,7 @@ pub fn on_key(
     }
 
     // 5) List navigation + actions.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *rm = None,
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
             r.selected = r.selected.saturating_sub(1);
@@ -535,7 +535,7 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crossterm::event::KeyCode;
 
     fn runtimes() -> Vec<RuntimeSummary> {
@@ -757,6 +757,51 @@ mod tests {
             on_key(&mut rm, &rts, &mut jobs, key(KeyCode::Up));
         }
         assert_eq!(rm.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        let rts = runtimes();
+        let mut jobs = State::default();
+        for (letter, expected) in [
+            ('A', RuntimeAction::Activate),
+            ('R', RuntimeAction::Rollback),
+            ('X', RuntimeAction::Uninstall),
+        ] {
+            let mut rm = Some(RuntimeManagerState::default());
+            on_key(&mut rm, &rts, &mut jobs, caps(letter));
+            let pending = rm.as_ref().unwrap().approval.as_ref();
+            assert!(
+                pending.is_some_and(|p| p.action == expected),
+                "Caps Lock {letter} must stage {expected:?}"
+            );
+        }
+        let mut rm = Some(RuntimeManagerState::default());
+        on_key(&mut rm, &rts, &mut jobs, caps('L'));
+        assert!(rm.as_ref().unwrap().active_job.is_some(), "L must refresh");
+        let mut rm = Some(RuntimeManagerState::default());
+        on_key(&mut rm, &rts, &mut jobs, caps('O'));
+        assert!(
+            rm.as_ref().unwrap().browser.is_some(),
+            "O must open the browser"
+        );
+        let mut rm = Some(RuntimeManagerState::default());
+        on_key(&mut rm, &rts, &mut jobs, caps('J'));
+        assert_eq!(rm.as_ref().unwrap().selected, 1, "J must move down");
+        on_key(&mut rm, &rts, &mut jobs, caps('K'));
+        assert_eq!(rm.as_ref().unwrap().selected, 0, "K must move up");
+        on_key(&mut rm, &rts, &mut jobs, caps('I'));
+        assert_eq!(
+            rm.as_ref().unwrap().import_input.as_deref(),
+            Some(""),
+            "I must open the import prompt"
+        );
+        // The prompt is text entry: what is typed keeps its case.
+        on_key(&mut rm, &rts, &mut jobs, caps('Q'));
+        assert_eq!(rm.as_ref().unwrap().import_input.as_deref(), Some("Q"));
+        let mut rm = Some(RuntimeManagerState::default());
+        on_key(&mut rm, &rts, &mut jobs, caps('Q'));
+        assert!(rm.is_none(), "Q must close the overlay");
     }
 
     #[test]

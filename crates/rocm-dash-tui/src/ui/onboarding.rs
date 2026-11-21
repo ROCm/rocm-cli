@@ -42,7 +42,7 @@ use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browse
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
-use crate::ui::widgets::apply_char_key_filtered;
+use crate::ui::widgets::{apply_char_key_filtered, shortcut_key};
 
 /// Which step of the wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -346,13 +346,14 @@ pub fn on_key(
     }
 
     // 4) Step navigation.
+    let code = shortcut_key(key.code);
     match o.step {
-        OnboardingStep::Welcome => match key.code {
+        OnboardingStep::Welcome => match code {
             KeyCode::Esc | KeyCode::Char('q') => *ob = None,
             KeyCode::Enter => o.step = OnboardingStep::Choose,
             _ => {}
         },
-        OnboardingStep::Choose => match key.code {
+        OnboardingStep::Choose => match code {
             KeyCode::Esc | KeyCode::Char('q') => *ob = None,
             KeyCode::Up | KeyCode::Char('k') => o.choice = o.choice.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -361,7 +362,7 @@ pub fn on_key(
             KeyCode::Enter => return activate_choice(o),
             _ => {}
         },
-        OnboardingStep::Done => match key.code {
+        OnboardingStep::Done => match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => *ob = None,
             _ => {}
         },
@@ -693,7 +694,7 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crossterm::event::KeyCode;
 
     #[test]
@@ -860,6 +861,31 @@ mod tests {
             on_key(&mut ob, &mut jobs, key(KeyCode::Up));
         }
         assert_eq!(ob.as_ref().unwrap().choice, 0);
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        let mut jobs = State::default();
+        for step in [
+            OnboardingStep::Welcome,
+            OnboardingStep::Choose,
+            OnboardingStep::Done,
+        ] {
+            let mut ob = Some(OnboardingState {
+                step,
+                ..Default::default()
+            });
+            on_key(&mut ob, &mut jobs, caps('Q'));
+            assert!(ob.is_none(), "Q must close the overlay at {step:?}");
+        }
+        let mut ob = Some(OnboardingState {
+            step: OnboardingStep::Choose,
+            ..Default::default()
+        });
+        on_key(&mut ob, &mut jobs, caps('J'));
+        assert_eq!(ob.as_ref().unwrap().choice, 1, "J must move down");
+        on_key(&mut ob, &mut jobs, caps('K'));
+        assert_eq!(ob.as_ref().unwrap().choice, 0, "K must move up");
     }
 
     #[test]
