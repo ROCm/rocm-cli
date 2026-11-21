@@ -6028,6 +6028,7 @@ The following component(s) are licensed under Apache License 2.0:
   - num-traits 0.2.19 <https://github.com/rust-num/num-traits>
   - num 0.4.3 <https://github.com/rust-num/num>
   - object 0.37.3 <https://github.com/gimli-rs/object>
+  - object 0.41.0 <https://github.com/gimli-rs/object>
   - once_cell 1.21.4 <https://github.com/matklad/once_cell>
   - openssl-probe 0.1.6 <https://github.com/alexcrichton/openssl-probe>
   - openssl-probe 0.2.1 <https://github.com/rustls/openssl-probe>

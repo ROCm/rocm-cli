@@ -314,6 +314,7 @@ repository.
 | objc2-io-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | objc2-open-directory | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | object | 0.37.3 | Apache-2.0 OR MIT |
+| object | 0.41.0 | Apache-2.0 OR MIT |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | once_cell_polyfill | 1.70.2 | MIT OR Apache-2.0 |
 | openssl-probe | 0.1.6 | MIT/Apache-2.0 |
