@@ -346,11 +346,8 @@ fn is_bare_family_word(name: &str) -> bool {
 /// and a family match from one that has lost its guards or matches inside a
 /// word rather than at its start.
 ///
-/// Two shapes that *do* cross-match today are excluded here and pinned
-/// separately, so they stay visible: bare family words, by
-/// [`a_bare_family_word_satisfies_readiness_for_the_whole_family`], and one
-/// recipe's alias spelling another recipe's basename, by
-/// [`an_alias_spelling_another_models_basename_reads_as_ready_for_it`].
+/// Bare family words are covered separately by
+/// [`a_bare_family_word_satisfies_readiness_for_the_whole_family`].
 ///
 /// The request count grows with the square of the catalog (every served name
 /// against every wanted model), so each served name gets one loopback server
@@ -373,11 +370,9 @@ fn listing_a_different_catalog_model_is_never_readiness() {
             );
             for wanted in recipes {
                 // Skip the served recipe itself, a name the *wanted* recipe
-                // also answers to (a genuine shared alias, not a confusion),
-                // and the pinned alias/basename collision.
+                // also answers to (a genuine shared alias).
                 if wanted.canonical_model_id == served.canonical_model_id
                     || wanted.matches_ref(served_name)
-                    || spells_the_basename_of(served_name, wanted)
                 {
                     continue;
                 }
@@ -426,25 +421,9 @@ fn spells_the_basename_of(name: &str, recipe: &ModelRecipeRecord) -> bool {
     name.trim().eq_ignore_ascii_case(basename)
 }
 
-/// Characterization test for a known false-positive surface, pinned so it is
-/// visible rather than merely absent from the suite.
-///
-/// Readiness accepts a model's basename for the model (an engine launched on
-/// `Qwen/Qwen3-32B` commonly reports `Qwen3-32B`). Some catalog aliases spell
-/// the basename of a *different* catalog model: `qwen3-32b` is an alias of
-/// `Qwen/Qwen3-32B-FP8` and also the basename of `Qwen/Qwen3-32B`. An engine
-/// launched on the FP8 recipe under that alias reports `qwen3-32b`, and that
-/// reads as ready for `Qwen/Qwen3-32B` — readiness cannot tell the two apart
-/// from the name alone.
-///
-/// The collisions are derived from the catalog and compared with the list
-/// below, so a catalog change that adds one fails here and has to be looked
-/// at rather than being silently excluded from
-/// [`listing_a_different_catalog_model_is_never_readiness`]. If readiness or
-/// the catalog aliases are changed to remove a collision, update the list
-/// along with them.
+/// A catalog alias spelling another recipe's basename still identifies its own recipe.
 #[test]
-fn an_alias_spelling_another_models_basename_reads_as_ready_for_it() {
+fn readiness_distinguishes_an_alias_from_another_recipes_basename() {
     let mut collisions = Vec::new();
     for owner in catalog() {
         for alias in &owner.aliases {
@@ -480,9 +459,8 @@ fn an_alias_spelling_another_models_basename_reads_as_ready_for_it() {
     for (alias, owner, other) in collisions {
         assert_eq!(
             endpoint_reports(models_document(&[alias]), Some(other)),
-            Ok(true),
-            "pinning the current behavior: {owner:?} served as {alias:?} reads as ready for \
-             {other:?}"
+            Ok(false),
+            "{alias:?} belongs to {owner:?}, not {other:?}"
         );
     }
 }
