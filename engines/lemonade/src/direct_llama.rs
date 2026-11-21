@@ -823,9 +823,11 @@ pub(crate) fn resolve_direct_llama_checkpoint(
     };
     // Only the single-checkpoint shape is supported directly. Extra files,
     // multimodal inputs, options and unknown fields belong to Lemonade's router.
-    // In the 11.5.1 source, size/suggested describe catalog entries and these
-    // labels classify chat models; 2026.44.1 also tags those models `chat`.
-    // Other labels can change launch flags (MTP).
+    // size/suggested describe catalog entries and labels classify them (`chat`,
+    // `reasoning`, `tool-calling`, ...). Only `mtp` and `dflash` change launch
+    // flags, so only those are refused (`DIRECT_REJECTED_LABELS`): an allow-list
+    // silently disabled this route when 2026.44.1 added a `chat` label to every
+    // llamacpp entry.
     if checkpoint.variant.is_none()
         || fields.iter().any(|(key, value)| match key.as_str() {
             "recipe" | "checkpoint" => false,
@@ -833,10 +835,9 @@ pub(crate) fn resolve_direct_llama_checkpoint(
             "suggested" => !value.is_boolean(),
             "labels" => !value.as_array().is_some_and(|labels| {
                 labels.iter().all(|label| {
-                    matches!(
-                        label.as_str(),
-                        Some("chat" | "reasoning" | "tool-calling" | "tools")
-                    )
+                    label
+                        .as_str()
+                        .is_some_and(|label| !DIRECT_REJECTED_LABELS.contains(&label))
                 })
             }),
             _ => true,
@@ -846,6 +847,10 @@ pub(crate) fn resolve_direct_llama_checkpoint(
     }
     Ok(Some(checkpoint))
 }
+
+/// Catalog labels that change how Lemonade launches llama-server, so the entry
+/// must go through the router. Every other label is classification only.
+const DIRECT_REJECTED_LABELS: [&str; 2] = ["mtp", "dflash"];
 
 fn require_checkpoint_variant(checkpoint: HfCheckpoint, model_ref: &str) -> Result<HfCheckpoint> {
     if let Some(message) = hf_checkpoint_variant_required(model_ref) {
@@ -1182,7 +1187,7 @@ mod tests {
         write_registry(
             &manifest,
             serde_json::json!({
-                "Qwen3-0.6B-GGUF": {"recipe": "llamacpp", "checkpoint": "owner/repo:Q4_0", "suggested": true, "size": 0.38, "labels": ["reasoning"]},
+                "Qwen3-0.6B-GGUF": {"recipe": "llamacpp", "checkpoint": "owner/repo:Q4_0", "suggested": true, "size": 0.38, "labels": ["chat", "reasoning"]},
                 "Complex": {"recipe": "llamacpp", "checkpoint": "owner/repo:Q4_0", "mmproj": "owner/repo:mmproj.gguf"},
                 "OtherRecipe": {"recipe": "oga", "checkpoint": "owner/repo"}
             }),
@@ -1365,9 +1370,8 @@ mod tests {
             ("source", serde_json::json!("alternate")),
             ("unknown_option", serde_json::json!(true)),
             ("recipe_options", serde_json::json!({"ctx_size": 8192})),
-            ("labels", serde_json::json!(["vision"])),
-            ("labels", serde_json::json!(["mtp"])),
-            ("labels", serde_json::json!(["unknown"])),
+            ("labels", serde_json::json!(["chat", "mtp"])),
+            ("labels", serde_json::json!(["chat", "dflash"])),
             ("labels", serde_json::json!([123])),
             ("labels", serde_json::json!("reasoning")),
             ("size", serde_json::json!("0.38")),
@@ -1387,14 +1391,22 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The chat-model labels the catalog uses do not change how a model is
-    /// launched, so an entry carrying only those still serves directly. Each label
-    /// on its own, so dropping one from the allow-list turns this red.
+    /// Classification labels do not change how a model is launched, so an entry
+    /// carrying only those still serves directly, `chat` (added to every llamacpp
+    /// entry by 2026.44.1) included. A label nobody has listed yet serves directly
+    /// too: only the launch-flag labels are refused.
     #[test]
     fn simple_registered_models_with_chat_labels_serve_directly() {
         let dir = scratch_dir("registered-labels");
         let manifest = test_manifest(dir.join("runtime"));
-        for label in ["chat", "reasoning", "tool-calling", "tools"] {
+        for label in [
+            "chat",
+            "reasoning",
+            "tool-calling",
+            "tools",
+            "vision",
+            "hot",
+        ] {
             write_registry(
                 &manifest,
                 serde_json::json!({"Labelled-GGUF": {
@@ -1415,7 +1427,7 @@ mod tests {
     }
 
     /// Admitting `chat` must not let a launch-changing label or field ride along
-    /// with it: any one disallowed entry sends the model to the router.
+    /// with it: any one launch-changing entry sends the model to the router.
     #[test]
     fn serving_regression_chat_label_with_launch_changing_entry_uses_router() {
         let dir = scratch_dir("registered-chat-mixed");
@@ -1423,11 +1435,6 @@ mod tests {
         for (name, labels, mmproj) in [
             ("mtp after chat", serde_json::json!(["chat", "mtp"]), false),
             ("mtp before chat", serde_json::json!(["mtp", "chat"]), false),
-            (
-                "unknown after chat",
-                serde_json::json!(["chat", "unknown"]),
-                false,
-            ),
             ("chat with mmproj", serde_json::json!(["chat"]), true),
         ] {
             let mut metadata = serde_json::json!({
@@ -1561,7 +1568,7 @@ mod tests {
                     "checkpoint": "owner/repo:*",
                     "recipe": "llamacpp",
                     "suggested": true,
-                    "labels": ["reasoning"],
+                    "labels": ["chat", "reasoning"],
                     "size": 1.0
                 }
             }),
@@ -2416,23 +2423,23 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Real entries from the released 11.5.1 `server_models.json`. Other released
-    /// entries carry labels such as `hot`, `coding` and `mtp`; those are outside
-    /// the labels direct serving accepts, so they intentionally route to the router.
+    /// Entries shaped like the released 2026.44.1 `server_models.json`, where every
+    /// llamacpp entry carries a `chat` label. Entries labelled `mtp` or `dflash`
+    /// route to the router; the `mmproj` and `*` entries below do so for their shape.
     fn released_catalog_entries() -> serde_json::Value {
         serde_json::json!({
             "Qwen3-4B-Instruct-2507-GGUF": {
                 "checkpoint": "unsloth/Qwen3-4B-Instruct-2507-GGUF:Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
                 "recipe": "llamacpp",
                 "suggested": true,
-                "labels": ["tool-calling"],
+                "labels": ["chat"],
                 "size": 2.5
             },
             "Qwen3-0.6B-GGUF": {
                 "checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_0",
                 "recipe": "llamacpp",
                 "suggested": true,
-                "labels": ["reasoning"],
+                "labels": ["chat", "reasoning"],
                 "size": 0.38
             },
             "Qwen3.5-0.8B-GGUF": {
@@ -2440,14 +2447,14 @@ mod tests {
                 "mmproj": "mmproj-F16.gguf",
                 "recipe": "llamacpp",
                 "suggested": true,
-                "labels": ["vision", "tool-calling"],
+                "labels": ["chat", "vision"],
                 "size": 0.764
             },
             "gpt-oss-120b-mxfp-GGUF": {
                 "checkpoint": "ggml-org/gpt-oss-120b-GGUF:*",
                 "recipe": "llamacpp",
                 "suggested": true,
-                "labels": ["reasoning", "tool-calling"],
+                "labels": ["chat", "reasoning", "tool-calling"],
                 "size": 63.0
             }
         })
