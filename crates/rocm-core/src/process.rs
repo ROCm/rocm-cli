@@ -33,9 +33,10 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessW, DETACHED_PROCESS, GetExitCodeProcess, INFINITE, OpenProcess,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CreateProcessW, DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     WaitForSingleObject,
 };
 
@@ -140,11 +141,11 @@ pub fn spawn_hidden_console_no_inherit(
 /// (`CREATE_NEW_CONSOLE`) and so pays for a `conhost` per engine, which a
 /// detached background service has no use for.
 ///
-/// Handing `CreateProcessW` std handles forces `bInheritHandles`, so the child
-/// inherits every inheritable handle this process holds, not only the two
-/// below. That is the same blanket-inheritance model
-/// [`spawn_hidden_console_with_log`] already uses; scoping it would need
-/// `STARTUPINFOEXW` with an explicit handle list.
+/// Handing `CreateProcessW` std handles forces `bInheritHandles`, which would
+/// otherwise give the child every inheritable handle this process holds. The
+/// two log handles are confined to themselves with an explicit
+/// [`InheritedHandleList`]; a detached engine that outlives `rocm serve` must
+/// not keep its caller's pipes open.
 #[cfg(windows)]
 pub fn spawn_detached_with_log_watching_startup(
     program: &Path,
@@ -1049,6 +1050,33 @@ fn spawn_windows_no_inherit(
         startup_info.hStdOutput = stdout_handle;
         startup_info.hStdError = stderr_handle;
     }
+    // `bInheritHandles` is all-or-nothing, so the two log handles cannot be
+    // passed without an explicit list naming them: the child would otherwise
+    // inherit every inheritable handle this process holds. See
+    // `InheritedHandleList`.
+    let mut inherited = match std_handles {
+        Some((stdout_handle, stderr_handle)) => Some(InheritedHandleList::for_handles(&[
+            stdout_handle,
+            stderr_handle,
+        ])?),
+        None => None,
+    };
+    let mut startup_info_ex = STARTUPINFOEXW {
+        StartupInfo: startup_info,
+        lpAttributeList: inherited
+            .as_mut()
+            .map_or_else(null_mut, InheritedHandleList::as_ptr),
+    };
+    startup_info_ex.StartupInfo.cb = if inherited.is_some() {
+        std::mem::size_of::<STARTUPINFOEXW>() as u32
+    } else {
+        std::mem::size_of::<STARTUPINFOW>() as u32
+    };
+    let creation_flags = if inherited.is_some() {
+        creation_flags | EXTENDED_STARTUPINFO_PRESENT
+    } else {
+        creation_flags
+    };
     let mut process_info = PROCESS_INFORMATION::default();
     let created = unsafe {
         CreateProcessW(
@@ -1060,10 +1088,11 @@ fn spawn_windows_no_inherit(
             creation_flags,
             environment.as_mut_ptr().cast(),
             null(),
-            &raw const startup_info,
+            (&raw const startup_info_ex).cast::<STARTUPINFOW>(),
             &raw mut process_info,
         )
     };
+    drop(inherited);
     if created == 0 {
         bail!(
             "failed to launch detached process {}: {}",
@@ -1084,6 +1113,100 @@ fn spawn_windows_no_inherit(
         pid: process_info.dwProcessId,
         early_exit_code,
     })
+}
+
+/// The `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that confines a spawn's inheritance
+/// to the handles it was actually given.
+///
+/// `CreateProcessW` takes one `bInheritHandles` flag for the whole process, so
+/// handing it std handles otherwise lets the child inherit *every* inheritable
+/// handle this process holds. For a detached child that outlives us that is not
+/// merely untidy: `rocm serve` is itself usually spawned with its stdout on a
+/// pipe, and that handle arrives here inheritable, so the engine would hold the
+/// write end open after `rocm serve` returned and whoever was reading that pipe
+/// would never see EOF. ROCMAI-541's Windows e2e lane hung for the full 45-minute
+/// job timeout on exactly that, in `serve-02`.
+///
+/// The list must outlive the `CreateProcessW` call and is freed on drop. Every
+/// handle in it must be inheritable and distinct; the two the caller passes are
+/// separate `DuplicateHandle` results, so they are.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+struct InheritedHandleList {
+    buffer: Vec<u8>,
+    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+impl InheritedHandleList {
+    fn for_handles(handles: &[windows_sys::Win32::Foundation::HANDLE]) -> Result<Self> {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+        };
+
+        let mut size: usize = 0;
+        // The sizing call is *expected* to fail with ERROR_INSUFFICIENT_BUFFER;
+        // `size` is the output that matters.
+        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &raw mut size) };
+        if size == 0 {
+            bail!(
+                "failed to size the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Held as a plain buffer until the initialize call succeeds, so the
+        // `Drop` that calls `DeleteProcThreadAttributeList` only ever exists
+        // for a list that really was initialized.
+        let mut buffer = vec![0u8; size];
+        let attributes = buffer.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &raw mut size) } == 0 {
+            bail!(
+                "failed to initialize the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut list = Self {
+            buffer,
+            handles: handles.to_vec(),
+        };
+        let handle_bytes = std::mem::size_of_val(list.handles.as_slice());
+        let handle_ptr = list.handles.as_ptr().cast();
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handle_ptr,
+                handle_bytes,
+                null_mut(),
+                null(),
+            )
+        } == 0
+        {
+            // `list`'s own drop frees what was just initialized.
+            bail!(
+                "failed to set the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(list)
+    }
+
+    fn as_ptr(&mut self) -> windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buffer.as_mut_ptr().cast()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+impl Drop for InheritedHandleList {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
+
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+    }
 }
 
 /// Wait up to `settle` for `process` to exit, reporting its exit code if it did.
