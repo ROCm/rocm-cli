@@ -1087,12 +1087,21 @@ mod tests {
     }
 
     /// A covering TheRock family is the whole answer, which is why that arm
-    /// ignores `detected_gfx_target` — and `resolve_family` depends on it:
-    /// it asks this about a target named with `--family`, where there may be
-    /// no detected target at all. Until the `None`/`Some(_)` case below, every
-    /// call in this suite passed `Some`/`Some`, `None`/`None` or `Some`/`None`,
-    /// so the arm could be narrowed to `(Some(_), Some(_))` with nothing
-    /// noticing.
+    /// ignores `detected_gfx_target`: the family is itself a statement that a
+    /// ROCm build exists for the target, and no gfx value can contradict it.
+    ///
+    /// The `None`/`Some(_)` case below is pinned as a property of the function,
+    /// **not** because production reaches it. No call site can: the two
+    /// struct-reading wrappers take both fields from one probed record, and
+    /// `target_is_vulkan_only` (`apps/rocm/src/therock/family.rs`) passes
+    /// `Some(value)` for a target the user named. So the arm could be narrowed
+    /// to `(Some(_), Some(_))` and nothing outside this test would notice.
+    ///
+    /// It is left wide deliberately — the answer genuinely does not depend on
+    /// the first argument — and this case is what stops a later narrowing being
+    /// mistaken for a no-op. An earlier version of this comment claimed
+    /// `resolve_family` depends on the wide arm; it does not, and that was
+    /// wrong.
     #[test]
     fn gpu_support_level_is_rocm_hip_when_a_family_covers_it() {
         assert_eq!(
