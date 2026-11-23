@@ -6736,6 +6736,13 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   against is a shared ceiling rather than free memory, so the weaker claim is
   visible to a user reading the estimate rather than only to the verdict.
 
+  `diagnose-87` is the human-readable twin of `diagnose-86`: it asks the same
+  question in text form and requires the report to name the shared pool, say it
+  is shared, and carry the `ESTIMATED: fits` label its figures imply, so that
+  branch of the text report runs on every Linux lane rather than only on
+  integrated-GPU hardware. The planted pool is far larger than the tiny file, so
+  only the "fits" polarity is exercised there.
+
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question
@@ -6750,10 +6757,12 @@ isolated directory and assert the shape and the sizes (weights and KV cache are
 exact), and that a host that measured its GPU gets a comparison while one that
 could not is told why. Which branch runs depends on the lane: the GPU-less
 hosted runners take the "could not compare" one (the text report must then read
-UNDETERMINED), and the MI300X self-hosted lane (`E2E tests (MI300X, ...)` in
-`e2e-selfhosted.yml`) takes the compared one, where the text report must read
-ESTIMATED. The "does not fit" half depends on the host's VRAM, so it is covered
-by the unit tests, not by a scenario. Nothing in either runs against a real GPU
+UNDETERMINED), and a lane that measures its GPU takes the compared one, where
+the text report must read ESTIMATED: the MI300X self-hosted lane
+(`E2E tests (MI300X, ...)` in `e2e-selfhosted.yml`) against dedicated VRAM, and
+the Linux Strix Halo lanes against the shared pool. The "does not fit" half
+depends on the host's VRAM, so it is covered by the unit tests, not by a
+scenario. Nothing in either runs against a real GPU
 load; see [manual-testing.md](manual-testing.md) for the check that does.
 
 Scenarios `diagnose-53` to `diagnose-56` cover the refusals, all host-independent:

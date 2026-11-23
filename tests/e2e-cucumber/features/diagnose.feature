@@ -1311,3 +1311,16 @@ Feature: Diagnosing failures and listing fixes
     And a user asking about a small GGUF file on this machine
     When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
     Then the estimate is compared against the shared pool's ceiling, and says the pool is shared
+
+  # The human-readable half of diagnose-86. The text report words the shared
+  # pool differently from a card's dedicated VRAM, and the label step of
+  # diagnose-50 used to recognise only the dedicated wording, so a correct
+  # ESTIMATED label on an integrated GPU (the Strix Halo lanes) failed it as
+  # "undetermined". Planting the APU puts that branch under every lane.
+  @id:diagnose-model-a-gguf-text-estimate-says-its-pool-is-shared @requires-os:linux
+  Scenario: diagnose-87 - The text report of a GGUF estimate on an integrated GPU is labelled and says the pool is shared
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form
+    Then the text report compares the estimate with the shared pool's ceiling and says the pool is shared
+    And the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked
