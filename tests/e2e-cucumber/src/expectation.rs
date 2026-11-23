@@ -2668,6 +2668,23 @@ flaky = true
         );
     }
 
+    /// runtime-33's row (ROCMAI-1318) is for the Linux Lemonade lanes only: the
+    /// scenario passes on both Strix Halo Windows lanes, which stay strict, and
+    /// a host whose engine is not lemonade is not covered. Deterministic, so not
+    /// `flaky`: an XPASS means the cause is gone and the row is stale.
+    #[test]
+    fn runtime_33_is_expected_to_fail_on_linux_lemonade_hosts_and_nowhere_else() {
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let id = "runtime-lemonade-backend-alignment-failure-remembered";
+        assert!(m.is_xfail(id, &cap("strix-ubuntu"), "lemonade"));
+        assert!(!m.is_xfail(id, &cap("strix-windows"), "lemonade"));
+        assert!(!m.is_xfail(id, &cap("strix-ubuntu"), "vllm"));
+        let entries = m.entries_for(id);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].bug, "ROCMAI-1318");
+        assert!(!entries[0].flaky);
+    }
+
     #[test]
     fn serve_timeout_override_prefers_the_row_and_needs_an_id() {
         let m = Expectations::parse(

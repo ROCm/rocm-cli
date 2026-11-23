@@ -235,6 +235,9 @@ pub struct E2eWorld {
     /// runtime-33's failed alignment had reverted it, so the install that follows
     /// can be held to leaving exactly that pin in place.
     pub lemonade_pin_after_failed_alignment: Option<String>,
+    /// The Lemonade runtime tree runtime-33's install reported, so a failed
+    /// check can attach what the tree holds (see `lemonade_runtime_evidence`).
+    pub lemonade_runtime_dir: Option<PathBuf>,
     /// The pasted error a diagnose-59 or diagnose-60 scenario hands to
     /// `rocm diagnose --symptom-file`. Its own field for the reason
     /// `skill_symptom` is.
@@ -455,6 +458,7 @@ impl Default for E2eWorld {
             skill_reference: None,
             skill_symptom: None,
             lemonade_pin_after_failed_alignment: None,
+            lemonade_runtime_dir: None,
             symptom_paste: None,
             symptom_file_runs: Vec::new(),
             helper_identity: None,
