@@ -6698,9 +6698,10 @@ isolated directory and assert the shape and the sizes (weights and KV cache are
 exact), and that a host that measured its GPU gets a comparison while one that
 could not is told why. Which branch runs depends on the lane: the GPU-less
 hosted runners take the "could not compare" one (the text report must then read
-UNDETERMINED), and the MI300X self-hosted lane (`E2E tests (MI300X, ...)` in
-`e2e-selfhosted.yml`) takes the compared one, where the text report must read
-ESTIMATED. The "does not fit" half depends on the host's VRAM, so it is covered
+UNDETERMINED), and a lane that measures its GPU takes the compared one, where
+the text report must read ESTIMATED: the MI300X self-hosted lane
+(`E2E tests (MI300X, ...)` in `e2e-selfhosted.yml`) against dedicated VRAM, and
+the Strix Halo lanes against the shared pool. The "does not fit" half depends on the host's VRAM, so it is covered
 by the unit tests, not by a scenario. Nothing in either runs against a real GPU
 load; see [manual-testing.md](manual-testing.md) for the check that does.
 

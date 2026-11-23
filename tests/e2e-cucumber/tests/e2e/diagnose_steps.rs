@@ -12,6 +12,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 // typed again here, so the real binary's output is held to the one string the
 // renderer prints from.
 use rocm_core::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE;
+use rocm_core::gguf_fit::{DEDICATED_VRAM_OPENING, SHARED_POOL_OPENING};
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -4457,12 +4458,16 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
     // that measures dedicated VRAM (the MI300X self-hosted lane) or a shared
     // pool (the Strix Halo lanes, and the planted APU of diagnose-87 on any
     // Linux lane, which only ever reaches the "fits" label) takes the first.
-    let offered_marker = [
-        "the GPU with the most dedicated VRAM that ROCm can see has ",
-        "the pool this host's integrated GPU allocates from has ",
-    ]
-    .into_iter()
-    .find(|marker| output.contains(marker));
+    //
+    // The line is printed whenever a figure was measured, so it stands for "the
+    // estimate was compared" only for a model the estimator can size. The
+    // fixture is a dense one; an estimate that is `CannotEstimate` despite a
+    // measured figure would be labelled UNDETERMINED and fail the label owed
+    // below, which is the right failure for this fixture. The openings are the
+    // ones `evidence_lines` is built from.
+    let offered_marker = [DEDICATED_VRAM_OPENING, SHARED_POOL_OPENING]
+        .into_iter()
+        .find(|marker| output.contains(marker));
     if let Some(offered_marker) = offered_marker {
         // The label owed follows from the two figures the report prints: the
         // total it needs ("= about N MiB") and the pool's ("has M MiB").
@@ -5860,7 +5865,7 @@ async fn assert_gguf_text_report_names_its_pool_as_shared(world: &mut E2eWorld) 
     // Non-vacuity, as for the machine-readable half: a host that fell back to
     // `cannot_estimate` prints no pool sentence at all, and the label step that
     // runs beside this would then be vacuously satisfied by UNDETERMINED.
-    let pool = "the pool this host's integrated GPU allocates from has ";
+    let pool = SHARED_POOL_OPENING;
     let at = output.find(pool).unwrap_or_else(|| {
         panic!(
             "this APU's pool is readable, so the report must name the shared pool it compared \
@@ -5879,7 +5884,7 @@ async fn assert_gguf_text_report_names_its_pool_as_shared(world: &mut E2eWorld) 
          carve-out or something else entirely:\n{output}"
     );
     assert!(
-        !output.contains("the GPU with the most dedicated VRAM that ROCm can see has "),
+        !output.contains(DEDICATED_VRAM_OPENING),
         "a shared pool was described as dedicated VRAM:\n{output}"
     );
     assert!(

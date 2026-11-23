@@ -1125,6 +1125,18 @@ const fn whole_mib_offered(gib: f64) -> f64 {
     gib.mul_add(1024.0, 1e-6).floor()
 }
 
+/// How [`evidence_lines`] opens the memory line for a shared pool.
+///
+/// The line gives the memory an estimate was compared with, for an integrated
+/// GPU that allocates from a shared pool. The figure in MiB follows it directly.
+/// Public so the end-to-end label check reads the report with the same text the
+/// report is built from.
+pub const SHARED_POOL_OPENING: &str = "the pool this host's integrated GPU allocates from has ";
+
+/// As [`SHARED_POOL_OPENING`], for a card with dedicated VRAM.
+pub const DEDICATED_VRAM_OPENING: &str =
+    "the GPU with the most dedicated VRAM that ROCm can see has ";
+
 /// The evidence lines for an estimate, in the report's own voice.
 #[must_use]
 pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
@@ -1167,15 +1179,15 @@ pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
         let offered = whole_mib_offered(available);
         lines.push(if estimate.available_is_shared_pool {
             format!(
-                "the pool this host's integrated GPU allocates from has {offered} MiB ({}) in \
-                 total; that is a ceiling it shares with the operating system, and memory other \
-                 processes already hold is not subtracted",
+                "{SHARED_POOL_OPENING}{offered} MiB ({}) in total; that is a ceiling it shares \
+                 with the operating system, and memory other processes already hold is not \
+                 subtracted",
                 format_gib(available)
             )
         } else {
             format!(
-                "the GPU with the most dedicated VRAM that ROCm can see has {offered} MiB ({}) \
-                 in total; memory other processes already hold is not subtracted",
+                "{DEDICATED_VRAM_OPENING}{offered} MiB ({}) in total; memory other processes \
+                 already hold is not subtracted",
                 format_gib(available)
             )
         });
@@ -1743,6 +1755,59 @@ mod tests {
             assert_eq!(
                 says_dedicated, !shared,
                 "shared={shared}: the evidence line names the wrong kind of memory:\n{evidence}"
+            );
+        }
+    }
+
+    /// The end-to-end label check recognises a compared estimate by the
+    /// opening of the memory line, and reads the figure that follows it. It
+    /// does so through the public opening constants, so this pins what the
+    /// check relies on: the real renderer is built from those constants (not
+    /// from a literal that could drift), the figure follows the opening
+    /// directly, and the other kind of opening is absent. The wording itself
+    /// is deliberately not pinned; it lives in one place, the constants.
+    ///
+    /// The line is printed whenever a figure was measured, including when the
+    /// estimate then reports `CannotEstimate` (the second half): a reader that
+    /// takes the line as proof of a compared estimate has to rely on the
+    /// estimate being one that can be sized, which a dense model is.
+    #[test]
+    fn the_memory_line_is_built_from_the_shared_openings_and_the_figure_follows() {
+        let (header, size) = llama(GIB_U as usize / 1024);
+        for (memory, opening, other) in [
+            (
+                AcceleratorMemory::Unified {
+                    gtt_total_gib: 24.0,
+                },
+                SHARED_POOL_OPENING,
+                DEDICATED_VRAM_OPENING,
+            ),
+            (
+                AcceleratorMemory::Dedicated(24.0),
+                DEDICATED_VRAM_OPENING,
+                SHARED_POOL_OPENING,
+            ),
+        ] {
+            let mut estimate = estimate(&header, size, 4096, KvCacheType::F16, memory);
+            assert_ne!(
+                estimate.outcome,
+                EstimateOutcome::CannotEstimate,
+                "premise: a dense model is sized, so the line means it was compared"
+            );
+            let evidence = evidence_lines(&estimate).join("\n");
+            assert!(!evidence.contains(other), "{evidence}");
+            let at = evidence
+                .find(opening)
+                .unwrap_or_else(|| panic!("no `{opening}` in:\n{evidence}"))
+                + opening.len();
+            let figure = evidence[at..].split_whitespace().next();
+            assert_eq!(figure, Some("24576"), "{evidence}");
+
+            estimate.outcome = EstimateOutcome::CannotEstimate;
+            let evidence = evidence_lines(&estimate).join("\n");
+            assert!(
+                evidence.contains(opening),
+                "the line is printed for an undetermined estimate too:\n{evidence}"
             );
         }
     }
