@@ -603,6 +603,7 @@ mod tests {
             detach_confirm,
             active_job,
             message: _,
+            focused_host: _,
         } = ServeWizardState::default();
         assert!(
             browser.is_none()
