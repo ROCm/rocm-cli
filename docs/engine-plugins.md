@@ -268,19 +268,25 @@ customization point.
 
 ## Pinned runtime versions
 
-The versions of the third-party runtimes rocm-cli downloads are pinned in
-`runtime-deps.toml` at the repository root — one `[runtime.<name>]` table per
-runtime. That file is the only place a runtime version is written down:
-archive names, download URLs, and the dashboard's offline fallback are all
-derived from it, so the tree cannot end up holding two different versions of
-the same runtime. A Lemonade bump also records the new release's archive
-digests (`EMBEDDABLE_LINUX_SHA256` and `EMBEDDABLE_WINDOWS_SHA256` in
-[install.rs](../engines/lemonade/src/install.rs)): the downloaded archive is
-checked against them, and a digest cannot be derived from the version. It also
-re-reads what the new Linux `lemond` needs from the host, the newest `GLIBC_*`
-and `OPENSSL_*` versions `objdump -T lemond` lists, into `LINUX_LEMOND_NEEDS`
-beside those digests; a unit test fails until that record names the new Linux
-archive. On Linux, `rocm engines install lemonade` refuses a host whose glibc
+Lemonade, the one third-party binary rocm-cli downloads that is pinned this
+way so far, is pinned in [`runtimes/mise.toml`](../runtimes/mise.toml) and
+locked, with a download URL and SHA-256 per platform, in
+[`runtimes/mise.lock`](../runtimes/mise.lock). Its build-time constants
+(`rocm_deps::LEMONADE_VERSION` and the per-platform URL and digest) are
+generated from `mise.lock`. The Lemonade adapter checks an install against
+the locked digest and derives archive names and download URLs from the
+version, and `rocm engines` takes the version too, so no non-test source holds
+a second Lemonade version. Other runtimes (vLLM, the ROCm SDK) are still
+pinned in their own adapters until they migrate. Bump the Lemonade pin with
+`runtimes/bin/mise run --cd runtimes update`, or edit the version and run
+`runtimes/bin/mise run --cd runtimes lock`; the weekly runtime-deps-update
+workflow does the former on its own. See [runtime-dependencies.md](runtime-dependencies.md).
+
+A Lemonade bump also re-reads what the new Linux `lemond` needs from the host,
+the newest `GLIBC_*` and `OPENSSL_*` versions `objdump -T lemond` lists, into
+`LINUX_LEMOND_NEEDS` in [install.rs](../engines/lemonade/src/install.rs); a
+unit test fails until that record names the Linux archive digest locked in
+`mise.lock`. On Linux, `rocm engines install lemonade` refuses a host whose glibc
 or OpenSSL is older than that before downloading anything, and the engine
 refuses to start that `lemond` on such a host
 ([host_libraries.rs](../engines/lemonade/src/host_libraries.rs)). For each

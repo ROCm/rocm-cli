@@ -25,7 +25,7 @@
 //! The floors live in a committed file rather than in workflow YAML because
 //! that is the pattern this repo already uses for measured-and-pinned values
 //! (`expectations.toml`, `MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`,
-//! `runtime-deps.toml`): the value is reviewable in a diff, and `--bless`
+//! `runtimes/mise.lock`): the value is reviewable in a diff, and `--bless`
 //! regenerates it so raising a floor is a one-line change rather than an edit
 //! to a workflow file.
 //!

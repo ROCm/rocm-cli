@@ -32,23 +32,16 @@ const RUNTIME_VERSION_MARKER: &str = "runtime-version.txt";
 /// only bounds the work spent looking; exceeding it is not an error.
 const MAX_EMBEDDABLE_SEARCH_DEPTH: usize = 4;
 
-/// Digests of the pinned embeddable archives. Unlike the archive names and
-/// URLs, these cannot be derived from the version in `runtime-deps.toml`: each
-/// release has its own digest, so bumping the pin means recording the new pair
-/// here as well.
-const EMBEDDABLE_WINDOWS_SHA256: &str =
-    "7ff6c5d6ab612c33690411a7e53d6d0dd62eb515a073375c35015b0778a5a344";
-const EMBEDDABLE_LINUX_SHA256: &str =
-    "16f156a7f44a32b20936e76019b24dbccc7b82e60a3acea12e8614da8bca8e90";
-
 /// What the `lemond` in the pinned Linux archive needs from the host, read with
 /// `objdump -T lemond` (the newest `GLIBC_*` and `OPENSSL_*` versions listed).
 /// A host older than either is refused before download and before `lemond`
-/// starts; see [`crate::host_libraries`]. Like the digests, these belong to one
-/// release: re-read them on every bump and record that archive's digest here,
-/// which a unit test holds equal to [`EMBEDDABLE_LINUX_SHA256`]. Lemonade
-/// 2026.45.3's `lemond`, for one, needs glibc 2.43 and OpenSSL 3.2.0, which
-/// Ubuntu 24.04 does not have; that is why the pin stays at 2026.44.1
+/// starts; see [`crate::host_libraries`]. These belong to one release and
+/// cannot be derived from `runtimes/mise.lock`: re-read them on every bump and
+/// record that archive's digest here, which a unit test holds equal to the
+/// Linux digest locked in `runtimes/mise.lock`
+/// ([`rocm_deps::LEMONADE_LINUX_X64_SHA256`]). Lemonade 2026.45.3's `lemond`,
+/// for one, needs glibc 2.43 and OpenSSL 3.2.0, which Ubuntu 24.04 does not
+/// have; that is why the pin stays at 2026.44.1
 /// (<https://github.com/lemonade-sdk/lemonade/issues/4123>).
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const LINUX_LEMOND_NEEDS: crate::host_libraries::LemondHostNeeds =
@@ -515,11 +508,13 @@ fn embeddable_url(version: &str) -> String {
     rocm_deps::lemonade_download_url(version, &embeddable_archive_name(version))
 }
 
+/// Digest of the pinned embeddable archive for this host, as locked in
+/// `runtimes/mise.lock` alongside the version, so a bump moves both together.
 const fn embeddable_archive_sha256() -> &'static str {
     if runtime_is_windows() {
-        EMBEDDABLE_WINDOWS_SHA256
+        rocm_deps::LEMONADE_WINDOWS_X64_SHA256
     } else {
-        EMBEDDABLE_LINUX_SHA256
+        rocm_deps::LEMONADE_LINUX_X64_SHA256
     }
 }
 
@@ -612,6 +607,28 @@ mod tests {
     use std::io::Write;
     #[cfg(windows)]
     use std::process::{Command as ProcessCommand, Stdio};
+
+    /// The digest the install checks must be the one `runtimes/mise.lock`
+    /// records for the archive this host downloads — not the other OS's.
+    #[test]
+    fn the_checked_digest_is_the_one_locked_for_the_downloaded_archive() {
+        let url = embeddable_url(rocm_deps::LEMONADE_VERSION);
+        let locked = [
+            (
+                rocm_deps::LEMONADE_LINUX_X64_URL,
+                rocm_deps::LEMONADE_LINUX_X64_SHA256,
+            ),
+            (
+                rocm_deps::LEMONADE_WINDOWS_X64_URL,
+                rocm_deps::LEMONADE_WINDOWS_X64_SHA256,
+            ),
+        ];
+        let (_, digest) = locked
+            .iter()
+            .find(|(locked_url, _)| *locked_url == url)
+            .unwrap_or_else(|| panic!("runtimes/mise.lock locks no asset at {url}"));
+        assert_eq!(embeddable_archive_sha256(), *digest);
+    }
 
     /// The e2e harness reads this manifest back to describe a failed serve
     /// (`tests/e2e-cucumber/src/lemonade_diagnostics.rs`), by the same path
@@ -810,10 +827,12 @@ mod tests {
 
     #[test]
     fn pinned_archive_digests_are_two_distinct_sha256_hex_strings() {
-        // A digest is pasted by hand on every bump and only a live download
-        // checks it, so a dropped character or a value pasted twice would
-        // otherwise pass every offline test.
-        for digest in [EMBEDDABLE_LINUX_SHA256, EMBEDDABLE_WINDOWS_SHA256] {
+        // Only a live download checks a digest against its archive, so a
+        // malformed value, or one platform's digest generated for both, would
+        // otherwise pass every offline test of this adapter.
+        let linux = rocm_deps::LEMONADE_LINUX_X64_SHA256;
+        let windows = rocm_deps::LEMONADE_WINDOWS_X64_SHA256;
+        for digest in [linux, windows] {
             assert_eq!(digest.len(), 64, "{digest}");
             assert!(
                 digest
@@ -822,7 +841,7 @@ mod tests {
                 "{digest}"
             );
         }
-        assert_ne!(EMBEDDABLE_LINUX_SHA256, EMBEDDABLE_WINDOWS_SHA256);
+        assert_ne!(linux, windows);
     }
 
     /// The host-library needs were read from the archive that is pinned: a bump
@@ -831,7 +850,8 @@ mod tests {
     #[test]
     fn linux_lemond_needs_belong_to_the_pinned_linux_archive() {
         assert_eq!(
-            LINUX_LEMOND_NEEDS.archive_sha256, EMBEDDABLE_LINUX_SHA256,
+            LINUX_LEMOND_NEEDS.archive_sha256,
+            rocm_deps::LEMONADE_LINUX_X64_SHA256,
             "re-read the pinned lemond's needs with `objdump -T lemond` and record \
              them for this archive"
         );
