@@ -536,8 +536,8 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
     /// fails, it says why on stderr, signals the server process directly and exits 0,
-    /// noting on stderr if that signal fails too. Inspect or stop servers later with
-    /// `rocm services`.
+    /// noting on stderr if that signal fails too. A server that dies on its own instead exits non-zero,
+    /// quotes the end of its log and is marked `failed`. Inspect or stop servers later with `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
     /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
@@ -622,9 +622,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
         /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
         /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
-        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. Fails with a
-        /// pointer to the logs if the server exits first. Cannot be
-        /// combined with --foreground or --verbose, which already stay attached.
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. If the server exits
+        /// first, a crash fails with a pointer to the logs, while a stop from elsewhere reports it was stopped before
+        /// it became ready and names no logs. Cannot be combined with --foreground or --verbose, which stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
         wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
@@ -1320,9 +1320,9 @@ pub(crate) enum ServicesCommand {
     },
     /// Restart a local model server.
     ///
-    /// Stops the server first, and starts it again only once every process it
-    /// recorded is confirmed gone. If the stop cannot confirm that, nothing is
-    /// started and the stop request stays recorded on the server.
+    /// Stops the server first, and starts it again only once every process it recorded is confirmed gone. If the
+    /// stop cannot confirm that, nothing is started and the stop request stays recorded. A server that dies during
+    /// the restart fails loudly: its exit status and a log pointer are printed, and the record is marked `failed`.
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -2907,6 +2907,69 @@ mod tests {
             }
             other => panic!("expected Bench/Load, got {other:?}"),
         }
+    }
+
+    /// ROCMAI-541: the log-remediation lines printed next to a crash told users
+    /// to run `rocm logs <service_id>`, which has never selected a service —
+    /// `rocm logs` takes `--service`, and its positional argument is a
+    /// free-text search query, so the recommended command ran and quietly
+    /// searched for the id. Nothing caught it because no test ever parsed the
+    /// commands the output recommends.
+    ///
+    /// Both surviving spellings are genuine and both are kept: `rocm services
+    /// logs <id>` is the services-cluster form and `rocm logs --service <id>`
+    /// the top-level one. What has to hold is that whichever a message names
+    /// actually parses as a way to read that service's log.
+    #[test]
+    fn the_log_commands_the_crash_messages_name_actually_parse() {
+        // Parsing is not the property under test — the buggy spelling parsed
+        // too. What has to hold is that the id reaches the field that actually
+        // selects a service, so each form is asserted on its *resolved* value.
+        for argv in [
+            ["rocm", "services", "logs", "svc-1"].as_slice(),
+            ["rocm", "services", "logs", "svc-1", "--follow"].as_slice(),
+        ] {
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            match parsed.command {
+                Some(Command::Services {
+                    command: Some(ServicesCommand::Logs { service_id, .. }),
+                }) => assert_eq!(
+                    service_id,
+                    "svc-1",
+                    "`{}` must select svc-1",
+                    argv.join(" ")
+                ),
+                other => panic!("`{}` must be services/logs, got {other:?}", argv.join(" ")),
+            }
+        }
+        for argv in [
+            ["rocm", "logs", "--service", "svc-1"].as_slice(),
+            ["rocm", "logs", "--service", "svc-1", "--follow"].as_slice(),
+        ] {
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            match parsed.command {
+                Some(Command::Logs { service, .. }) => assert_eq!(
+                    service.as_deref(),
+                    Some("svc-1"),
+                    "`{}` must select svc-1",
+                    argv.join(" ")
+                ),
+                other => panic!("`{}` must be logs, got {other:?}", argv.join(" ")),
+            }
+        }
+
+        // The form the bug used. It parses, which is precisely why the defect
+        // was silent: it selects no service, so it cannot be recommended as a
+        // way to read one's log.
+        let parsed = Cli::try_parse_from(["rocm", "logs", "svc-1"])
+            .expect("the positional form parses as a search query");
+        assert!(
+            matches!(parsed.command, Some(Command::Logs { service: None, .. })),
+            "the positional form selects no service: {:?}",
+            parsed.command
+        );
     }
 
     /// ROCMAI-543: the clap doc comments are the largest single surface of

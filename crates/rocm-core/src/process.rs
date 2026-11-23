@@ -33,9 +33,10 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessW, DETACHED_PROCESS, GetExitCodeProcess, INFINITE, OpenProcess,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CreateProcessW, DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     WaitForSingleObject,
 };
 
@@ -130,14 +131,72 @@ pub fn spawn_hidden_console_no_inherit(
     .map(|spawn| spawn.pid)
 }
 
+/// Detached background spawn whose stdout/stderr land in `log_path`.
+///
+/// The managed-engine spawn (ROCMAI-541). Identical in creation flags to
+/// [`spawn_detached_no_inherit`] — no console, own process group, outlives this
+/// process — and differs only in attaching the child's output to the service
+/// log, which is what [`spawn_detached_no_inherit`] loses. Deliberately NOT
+/// [`spawn_hidden_console_with_log`]: that one creates a console
+/// (`CREATE_NEW_CONSOLE`) and so pays for a `conhost` per engine, which a
+/// detached background service has no use for.
+///
+/// Handing `CreateProcessW` std handles forces `bInheritHandles`, which would
+/// otherwise give the child every inheritable handle this process holds. The
+/// two log handles are confined to themselves with an explicit
+/// [`InheritedHandleList`]; a detached engine that outlives `rocm serve` must
+/// not keep its caller's pipes open.
 #[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
+pub fn spawn_detached_with_log_watching_startup(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+    settle: Duration,
+) -> Result<DetachedSpawn> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        false,
+        log_path,
+        Some(settle),
+    )
+}
+
+#[cfg(windows)]
 pub fn spawn_hidden_console_with_log(
     program: &Path,
     args: &[String],
     env_overrides: &[(&str, &Path)],
     log_path: &Path,
 ) -> Result<u32> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        true,
+        log_path,
+        None,
+    )
+    .map(|spawn| spawn.pid)
+}
+
+/// Duplicate `log_path` into inheritable stdout/stderr handles and spawn with
+/// them, closing this process's copies whether or not the spawn succeeded.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn spawn_windows_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    creation_flags: u32,
+    hide_window: bool,
+    log_path: &Path,
+    settle: Option<Duration>,
+) -> Result<DetachedSpawn> {
     use std::os::windows::io::AsRawHandle;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{
@@ -193,16 +252,16 @@ pub fn spawn_hidden_console_with_log(
         program,
         args,
         env_overrides,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        true,
+        creation_flags,
+        hide_window,
         Some((stdout_handle, stderr_handle)),
-        None,
+        settle,
     );
     unsafe {
         CloseHandle(stdout_handle);
         CloseHandle(stderr_handle);
     }
-    result.map(|spawn| spawn.pid)
+    result
 }
 
 #[cfg(windows)]
@@ -991,6 +1050,29 @@ fn spawn_windows_no_inherit(
         startup_info.hStdOutput = stdout_handle;
         startup_info.hStdError = stderr_handle;
     }
+    // `bInheritHandles` is all-or-nothing, so the two log handles cannot be
+    // passed without an explicit list naming them: the child would otherwise
+    // inherit every inheritable handle this process holds. See
+    // `InheritedHandleList`.
+    let mut inherited = std_handles
+        .map(|handles| InheritedHandleList::for_handles(&<[_; 2]>::from(handles)))
+        .transpose()?;
+    let mut startup_info_ex = STARTUPINFOEXW {
+        StartupInfo: startup_info,
+        lpAttributeList: inherited
+            .as_mut()
+            .map_or_else(null_mut, InheritedHandleList::as_ptr),
+    };
+    startup_info_ex.StartupInfo.cb = if inherited.is_some() {
+        std::mem::size_of::<STARTUPINFOEXW>() as u32
+    } else {
+        std::mem::size_of::<STARTUPINFOW>() as u32
+    };
+    let creation_flags = if inherited.is_some() {
+        creation_flags | EXTENDED_STARTUPINFO_PRESENT
+    } else {
+        creation_flags
+    };
     let mut process_info = PROCESS_INFORMATION::default();
     let created = unsafe {
         CreateProcessW(
@@ -1002,10 +1084,11 @@ fn spawn_windows_no_inherit(
             creation_flags,
             environment.as_mut_ptr().cast(),
             null(),
-            &raw const startup_info,
+            (&raw const startup_info_ex).cast::<STARTUPINFOW>(),
             &raw mut process_info,
         )
     };
+    drop(inherited);
     if created == 0 {
         bail!(
             "failed to launch detached process {}: {}",
@@ -1026,6 +1109,102 @@ fn spawn_windows_no_inherit(
         pid: process_info.dwProcessId,
         early_exit_code,
     })
+}
+
+/// The `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that confines a spawn's inheritance
+/// to the handles it was actually given.
+///
+/// `CreateProcessW` takes one `bInheritHandles` flag for the whole process, so
+/// handing it std handles otherwise lets the child inherit *every* inheritable
+/// handle this process holds. For a detached child that outlives us that is not
+/// merely untidy: `rocm serve` is itself usually spawned with its stdout on a
+/// pipe, and that handle arrives here inheritable, so the engine would hold the
+/// write end open after `rocm serve` returned and whoever was reading that pipe
+/// would never see EOF. ROCMAI-541's Windows e2e lane hung for the full 45-minute
+/// job timeout on exactly that, in `serve-02`.
+///
+/// The list must outlive the `CreateProcessW` call and is freed on drop. Every
+/// handle in it must be inheritable and distinct; the two the caller passes are
+/// separate `DuplicateHandle` results, so they are.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+struct InheritedHandleList {
+    buffer: Vec<u8>,
+    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+impl InheritedHandleList {
+    fn for_handles(handles: &[windows_sys::Win32::Foundation::HANDLE]) -> Result<Self> {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+        };
+
+        let mut size: usize = 0;
+        // The sizing call is *expected* to fail with ERROR_INSUFFICIENT_BUFFER;
+        // `size` is the output that matters.
+        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &raw mut size) };
+        if size == 0 {
+            bail!(
+                "failed to size the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Held as a plain buffer until the initialize call succeeds, so the
+        // `Drop` that calls `DeleteProcThreadAttributeList` only ever exists
+        // for a list that really was initialized.
+        let mut buffer = vec![0u8; size];
+        let attributes = buffer.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &raw mut size) } == 0 {
+            bail!(
+                "failed to initialize the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut list = Self {
+            buffer,
+            handles: handles.to_vec(),
+        };
+        let handle_bytes = std::mem::size_of_val(list.handles.as_slice());
+        let handle_ptr = list.handles.as_ptr().cast();
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handle_ptr,
+                handle_bytes,
+                null_mut(),
+                null(),
+            )
+        } == 0
+        {
+            // `list`'s own drop frees what was just initialized.
+            bail!(
+                "failed to set the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(list)
+    }
+
+    const fn as_ptr(
+        &mut self,
+    ) -> windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buffer.as_mut_ptr().cast()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+impl Drop for InheritedHandleList {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
+
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+    }
 }
 
 /// Wait up to `settle` for `process` to exit, reporting its exit code if it did.
@@ -1159,6 +1338,81 @@ mod tree_properties;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROCMAI-541, and the only check that runs on the platform the bug was
+    /// reported on: a detached child's stdout AND stderr must both reach the
+    /// log file the caller named.
+    ///
+    /// `spawn_detached_no_inherit` attaches neither, which is what lost a
+    /// failing `__engine-serve-http`'s reason on Windows. Nothing else in the
+    /// suite covers that: the liveness test is Unix-only, and the
+    /// scripted-engine e2e scenarios run on the Linux no-GPU lane, where the
+    /// Unix `attach_background_stdio` branch does the attaching and this code
+    /// never executes.
+    ///
+    /// stderr matters more than stdout here — an engine's final error chain is
+    /// printed there — so both streams are asserted, not just the easy one.
+    #[cfg(windows)]
+    #[test]
+    fn a_detached_child_writes_both_streams_into_the_log() {
+        const OUT_MARKER: &str = "rocmai541-stdout-reached-the-log";
+        const ERR_MARKER: &str = "rocmai541-stderr-reached-the-log";
+
+        // Plain pid, no thread id: `ThreadId`'s Debug form is `ThreadId(2)`, and
+        // `quote_windows_arg` only quotes an argument containing whitespace or a
+        // quote — so a path carrying cmd's own metacharacters reaches it bare and
+        // `(` ends the token early. Only this test uses this name, so the pid
+        // alone keeps it unique.
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-detached-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the fixture dir");
+
+        // A .bat rather than `cmd /c "echo a & echo b 1>&2"`: `CreateProcessW`
+        // cannot run a .bat directly, but handing cmd a single path argument
+        // sidesteps cmd's quoting rules entirely, which an inline compound
+        // command would otherwise have to survive.
+        let script = dir.join("emit.bat");
+        fs::write(
+            &script,
+            format!("@echo off\r\necho {OUT_MARKER}\r\necho {ERR_MARKER} 1>&2\r\n"),
+        )
+        .expect("write the fixture script");
+        let log_path = dir.join("service.log");
+
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        // Zero settle: this test is about the log attachment, not the startup
+        // watch, and a child that is meant to exit immediately must not be
+        // reported as having died inside the window.
+        let pid = spawn_detached_with_log_watching_startup(
+            Path::new(&comspec),
+            &["/c".to_owned(), script.to_string_lossy().into_owned()],
+            &[],
+            &log_path,
+            std::time::Duration::from_millis(0),
+        )
+        .expect("spawn the detached child")
+        .pid;
+
+        let exit_code = wait_for_process_exit(pid).expect("wait for the detached child");
+        let log = fs::read(&log_path).map_or_else(
+            |error| panic!("failed to read {}: {error}", log_path.display()),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(exit_code, 0, "fixture child failed; log was:\n{log}");
+        assert!(
+            log.contains(OUT_MARKER),
+            "the child's stdout never reached the log:\n{log}"
+        );
+        assert!(
+            log.contains(ERR_MARKER),
+            "the child's stderr never reached the log, which is the half that \
+             carries an engine's error chain:\n{log}"
+        );
+    }
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
 

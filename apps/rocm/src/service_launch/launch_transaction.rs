@@ -148,6 +148,16 @@ const fn launch_cleanup_refusal(
 /// only the endpoint key, which a failed attempt has no use for, is cleared. A
 /// child ran in two shapes: its pid is on record, or `child_known_dead` says it
 /// died before its pid could be recorded (below).
+///
+/// The mark is guarded, not unconditional: `launch_still_owns` requires the
+/// record on disk to still read live, and a launch whose child *crashed* has
+/// already had `failed` recorded on it by the path that observed the death
+/// (`spawn`'s `settle_startup_death`, `readiness`'s
+/// `finalize_managed_launch_readiness`). `failed` is not live, so the mark does
+/// not apply and the crash verdict stands. Overwriting it with `stopped` is what
+/// made the manifest disagree with its own engine state file permanently:
+/// `refresh_from_engine_state` will not re-read that file behind a `stopped`
+/// manifest, so the pair never reconciled (ROCMAI-541).
 /// Every step is best-effort and idempotent; cleanup must never mask the
 /// original failure with a second one.
 ///
@@ -202,6 +212,17 @@ fn abandon_failed_managed_launch_with(
             ManagedServiceRecord::mark_launch_abandoned,
         ) {
             Ok(RecordUpdate::Written(_) | RecordUpdate::Gone) => {
+                endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+            }
+            // Still this launch's record, just no longer live: its own crash
+            // path marked it `failed` before this cleanup ran (ROCMAI-541), so
+            // the `stopped` mark correctly did not apply. The key is still this
+            // launch's to clear — the reason the guarded arm below keeps one is
+            // that the record has become somebody else's, which this is not.
+            Ok(RecordUpdate::NotOwned(current))
+                if current.supervisor_pid == record.supervisor_pid
+                    && current.supervisor_start_ticks == record.supervisor_start_ticks =>
+            {
                 endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
             }
             // A restart that took the record over stores its key under the same
