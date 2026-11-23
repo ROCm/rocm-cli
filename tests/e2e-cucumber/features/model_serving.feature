@@ -1244,3 +1244,22 @@ Feature: Model serving
   Scenario: serve-71 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
+
+  # vllm-fatal-startup (issue 1134): when the engine core dies during startup the
+  # API server stays up and silent, so the failure used to surface only after the
+  # readiness timeout and say nothing of the cause. The readiness wait now stops
+  # on the fatal line in the engine log, and the failed launch's summary names it.
+  # The timing half (the wait ends within seconds of the line, not at the timeout)
+  # is `a_fatal_engine_error_ends_the_readiness_wait_at_once` in
+  # `engines/vllm/src/process.rs`: a scenario would need a real engine and a GPU
+  # that faults. This scenario covers what the user reads afterwards.
+  #
+  # Same test-only hook as @id:serve-oom-launch-memory-guidance, in its
+  # `gpu-fault` mode, so @requires-oom-fault-injection skips this on the
+  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane.
+  @id:serve-vllm-fatal-startup-error-named @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-72 - A launch whose engine hit a GPU fault during startup names the fault instead of blaming memory
+    Given a managed vLLM launch whose engine will hit a GPU fault during startup
+    When the user opens the interactive serve summary for that launch
+    Then the deployment summary names the engine's fatal startup error
+    And the deployment summary does not blame GPU memory

@@ -3773,6 +3773,66 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
     );
 }
 
+#[given("a managed vLLM launch whose engine will hit a GPU fault during startup")]
+async fn plant_gpu_fault_launch(world: &mut E2eWorld) {
+    // The `gpu-fault` mode of the hook `@id:serve-oom-launch-memory-guidance`
+    // arms. It fabricates only what a GPU-less lane cannot produce: a launch that
+    // never became ready and the raw log a GPU fault leaves. The sentence the
+    // `Then` below asserts is composed by `fatal_startup_note` in
+    // `apps/rocm/src/serve_summary.rs` from the engine's own line.
+    //
+    // Consumed by `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch/readiness.rs`; spelled out on both sides
+    // because the shipped binary's crate must not depend on this harness.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "gpu-fault".into()));
+}
+
+#[then("the deployment summary names the engine's fatal startup error")]
+async fn assert_gpu_fault_named(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // Whitespace-insensitive: the note is long and the 80-column PTY wraps it.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains("theenginereportedafatalerrorduringstartup"),
+        "the summary must say the engine hit a fatal error:\n{screen}"
+    );
+    // The engine's own line is what names the cause. The planted log carries it
+    // twice, once as the engine wrote it and once quoted by the supervisor's
+    // bail; the note must show the engine's, which starts with the fault and not
+    // with rocm-cli's own prefix.
+    assert!(
+        flattened
+            .contains("HSA_STATUS_ERROR_EXCEPTION:AnHSAILoperationresultedinahardwareexception"),
+        "the summary must quote the engine's own fault line:\n{screen}"
+    );
+    assert!(
+        !flattened.contains(&screen_without_whitespace(
+            rocm_core::VLLM_FATAL_STARTUP_DETECTED_PREFIX
+        )),
+        "the summary must not quote the supervisor's own bail back:\n{screen}"
+    );
+}
+
+#[then("the deployment summary does not blame GPU memory")]
+async fn assert_gpu_fault_is_not_blamed_on_memory(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        !flattened.contains("ranoutofGPUmemory") && !flattened.contains("--gpu-memory-utilization"),
+        "a GPU fault is not an out-of-memory failure:\n{screen}"
+    );
+}
+
 #[given("a managed vLLM launch whose compiled extension will fail to load")]
 async fn plant_extension_load_launch(world: &mut E2eWorld) {
     // The `extension-load` mode of the same hook `@id:serve-oom-launch-memory-guidance`

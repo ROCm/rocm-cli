@@ -1977,7 +1977,10 @@ server exits first it ends non-zero rather than waiting forever, and says which
 of the two happened: a crash or a kill fails with an error pointing at the
 server's logs and leaves the record `failed`, while a deliberate `rocm services
 stop` reports that the server was stopped before it became ready and leaves it
-`stopped`. Ctrl-C ends the wait and leaves the server starting
+`stopped`. A vLLM engine that logs a fatal error while starting (the engine core
+failing to start, a GPU fault such as `HSA_STATUS_ERROR_*`, `GPU stall detected` or an illegal
+memory access) ends the wait within seconds rather than at the timeout, and the failure names that
+line. Ctrl-C ends the wait and leaves the server starting
 in the background; a generated API key (public bind) is printed when the wait
 begins, so interrupting the wait does not lose it. It cannot be combined with `--foreground` or `--verbose`, and
 when the model is already being served and still starting, it waits on that

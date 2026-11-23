@@ -478,7 +478,9 @@ fn compute_metrics(
 }
 
 /// Appends the actionable memory-knob note when a managed serve failed to become
-/// ready and its engine log carries an out-of-memory signature.
+/// ready and its engine log carries an out-of-memory signature, or, when it
+/// carries no such signature but does carry another fatal engine error (a GPU
+/// fault, an engine core that gave up), the [`fatal_startup_note`] naming it.
 ///
 /// This is the post-failure companion to the pre-launch low-VRAM warning in
 /// [`crate::collect_serve_notes`]. The reported low-VRAM environment ships no
@@ -571,10 +573,35 @@ pub(crate) fn append_oom_serve_note(
         "service log",
     )
     .join("\n");
-    if let Some(note) = oom_memory_note(status, &log_tail, already_hinted) {
+    // An out-of-memory failure also ends in the engine core giving up, and its
+    // note already says what happened, so the fatal-startup note is the
+    // alternative to it rather than a second sentence about the same death.
+    if let Some(note) = oom_memory_note(status, &log_tail, already_hinted)
+        .or_else(|| fatal_startup_note(status, &log_tail))
+    {
         notes.push(note);
     }
     notes
+}
+
+/// The note for a managed serve that never became ready because the engine
+/// reported a fatal error in its log (an engine core that gave up, a GPU fault;
+/// see [`rocm_core::vllm_fatal_startup_line`]), naming the line that says so.
+///
+/// `None` when the tail has no such line, or when `status` is not a launch that
+/// failed to become ready ([`serve_failed_to_become_ready`]). The engine stops
+/// waiting on the same line the moment it is written, so "waiting longer will
+/// not help" is true of the launch this note describes, not only advice.
+pub(crate) fn fatal_startup_note(status: &str, log_tail: &str) -> Option<String> {
+    if !serve_failed_to_become_ready(status) {
+        return None;
+    }
+    let line = rocm_core::vllm_fatal_startup_line(log_tail)?.replace('`', "'");
+    Some(format!(
+        "the engine reported a fatal error during startup: `{line}`. The server cannot recover \
+         from it, so waiting longer or raising the readiness timeout will not help. \
+         `rocm examine` reports the GPU and driver state, and the service log has the full trace."
+    ))
 }
 
 #[cfg(test)]
@@ -1152,6 +1179,85 @@ mod tests {
                 .any(|entry| entry.contains("--gpu-memory-utilization")
                     && entry.contains("--gpu <index>")),
             "the OOM note must name both memory knobs: {notes:?}"
+        );
+    }
+
+    const GPU_FAULT_LOG: &str = "INFO loading weights\n\
+        (EngineCore pid=7) ERROR HSA_STATUS_ERROR_EXCEPTION: hardware exception\n\
+        (EngineCore pid=7) ERROR EngineCore failed to start.\n";
+
+    #[test]
+    fn a_fatal_engine_error_is_named_in_the_failed_launch_note() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log_path = dir.path().join("vllm.log");
+        fs::write(&log_path, GPU_FAULT_LOG).expect("log");
+
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
+
+        let [note] = notes.as_slice() else {
+            panic!("one note expected, got {notes:?}");
+        };
+        assert!(
+            note.contains("HSA_STATUS_ERROR_EXCEPTION: hardware exception"),
+            "the first fatal line is the cause: {note}"
+        );
+        assert!(
+            !note.contains("GPU memory"),
+            "a GPU fault is not an out-of-memory failure: {note}"
+        );
+    }
+
+    #[test]
+    fn the_fatal_note_applies_only_to_a_vllm_launch_that_failed_to_become_ready() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log_path = dir.path().join("vllm.log");
+        fs::write(&log_path, GPU_FAULT_LOG).expect("log");
+
+        for (case, engine, already_running, status) in [
+            ("a ready launch", "vllm", false, "ready"),
+            ("another engine", "lemonade", false, "starting"),
+            ("a reused service", "vllm", true, "starting"),
+        ] {
+            assert!(
+                append_oom_serve_note(Vec::new(), engine, already_running, status, Some(&log_path))
+                    .is_empty(),
+                "{case}"
+            );
+        }
+        fs::write(&log_path, "INFO Application startup complete.\n").expect("log");
+        assert!(
+            append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path))
+                .is_empty(),
+            "a log with no fatal line"
+        );
+    }
+
+    #[test]
+    fn an_out_of_memory_death_gets_the_memory_note_and_not_a_second_fatal_one() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log_path = dir.path().join("vllm.log");
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n\
+             (EngineCore pid=7) ERROR EngineCore failed to start.\n",
+        )
+        .expect("log");
+
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
+
+        let [note] = notes.as_slice() else {
+            panic!("one note expected, got {notes:?}");
+        };
+        assert!(note.contains("ran out of GPU memory"), "{note}");
+    }
+
+    #[test]
+    fn the_fatal_note_never_breaks_out_of_its_backticks() {
+        let note = fatal_startup_note("starting", "ERROR HSA_STATUS_ERROR_X: `rm -rf` ran\n")
+            .expect("a fatal line");
+        assert!(
+            note.contains("`ERROR HSA_STATUS_ERROR_X: 'rm -rf' ran`"),
+            "{note}"
         );
     }
 

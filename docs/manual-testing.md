@@ -932,7 +932,10 @@ Expected result:
   server answers or its engine gives up (vLLM and AIM: 5 minutes by default, override
   with `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`). If the server is killed or stopped meanwhile, it exits non-zero
   with `the server exited before it became ready` and a `rocm logs --service`
-  pointer, and the record shows `stopped`.
+  pointer, and the record shows `stopped`. A vLLM engine that logs a fatal error
+  during startup (`EngineCore failed to start`, `HSA_STATUS_ERROR_`, `GPU stall detected`,
+  `hipErrorIllegalAddress`, `illegal memory access`) ends the wait within seconds,
+  not at the timeout, and the failure names that log line instead of advising a longer timeout.
 - The logs command shows the exact service failure or startup output.
 - The log views tell an empty log from one they could not show, and each view
   reads its own files, so check each separately. In a Linux or WSL shell,
