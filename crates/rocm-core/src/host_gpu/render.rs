@@ -110,8 +110,8 @@ impl ExamineSummary {
     /// the ones where the answer is "this build cannot tell". Printing only the
     /// `VulkanOnly` line leaves this report unable to answer the very question
     /// the other surfaces send people here to ask: `lemonade_engine_note` in
-    /// `apps/rocm/src/main.rs` tells an `Unknown` host to run `rocm examine`,
-    /// and silence there is not an answer.
+    /// `apps/rocm/src/examine_report_text.rs` tells an `Unknown` host to run
+    /// `rocm examine`, and silence there is not an answer.
     ///
     /// Without the `VulkanOnly` line specifically,
     /// `compatible_therock_family: <unknown>` reads like a probe failure when

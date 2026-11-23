@@ -663,8 +663,8 @@ pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
 ///
 /// Two surfaces render this level — `rocm examine`'s `rocm_support` line
 /// (`rocm_support_line` in `host_gpu/render.rs`) and the lemonade engine note
-/// (`lemonade_engine_note` in `apps/rocm/src/main.rs`) — and they appear in the
-/// *same* `rocm examine` report, a few lines apart. Sharing the claim is what
+/// (`lemonade_engine_note` in `apps/rocm/src/examine_report_text.rs`) — and
+/// they appear in the *same* `rocm examine` report, a few lines apart. Sharing the claim is what
 /// stops one of them denying a driver while the other says the question is
 /// open.
 ///

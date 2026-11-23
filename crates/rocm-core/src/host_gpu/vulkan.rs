@@ -539,15 +539,18 @@ const fn detect_icds() -> VulkanEvidence<String> {
 /// **What is and is not covered**, stated exactly, because an overstated claim
 /// here is what leaves a gap nobody goes looking for. This function and the
 /// argv around it ([`windows_icds_through`]) are unit-tested on every platform.
-/// The one step no test executes is starting the PowerShell process: no test in
-/// this repository runs `detect_icds` on Windows, so CI's
-/// `windows-build-and-test` job *compiles* that call and never runs it. What
-/// could still break there and nowhere else is the behaviour of PowerShell
-/// itself on a real host — the script's output encoding, a policy that blocks
-/// it, a cold start slower than `OPTIONAL_COMMAND_TIMEOUT`. Each of those
-/// arrives as a `None`, which this function routes to the hedged
+/// The one step no test *asserts on* is starting the PowerShell process. It is
+/// executed on the Windows lane — `the_summary_without_driver_facts_keeps_the_gpu_target`
+/// in [`crate::host_gpu`] calls `ExamineSummary::gather`, which reaches
+/// `detect_icds`, so the process really does start there — but that test
+/// compares two scopes' other fields and never looks at what the lookup
+/// returned. A PowerShell that answered wrongly, or not at all, would leave it
+/// green. What could break there and nowhere else is therefore the behaviour of
+/// PowerShell itself on a real host — the script's output encoding, a policy
+/// that blocks it, a cold start slower than `OPTIONAL_COMMAND_TIMEOUT`. Each of
+/// those arrives as a `None`, which this function routes to the hedged
 /// [`VulkanStatus::Inconclusive`] rather than to a claim about the machine, so
-/// the untested step cannot produce a false statement — only a less useful one.
+/// the unasserted step cannot produce a false statement — only a less useful one.
 #[must_use]
 pub fn windows_icds_from_capture(captured: Option<String>) -> VulkanEvidence<String> {
     captured.map_or_else(VulkanEvidence::unanswered, |output| {

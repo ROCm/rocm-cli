@@ -16,7 +16,9 @@
 //! `os_facts` (kernel, distro, CPU and RAM), `linux` (sysfs, KFD and DRM),
 //! `gpu_visibility` (which GPUs this process may use), `unified_memory` (the
 //! pool an APU's engine allocates a model from, which is neither its VRAM
-//! carve-out nor installed RAM), `windows_inventory` (the
+//! carve-out nor installed RAM), `vulkan` (whether a model can run through
+//! Vulkan on this host: ICD manifests, the Windows Khronos registry and
+//! `vulkaninfo`, classified into `VulkanStatus`), `windows_inventory` (the
 //! Windows display-adapter inventory), `wsl` (WSL detection and the Windows host
 //! driver as seen from the guest), `render` (the `rocm examine` text of an
 //! `ExamineSummary`), `diagnostics` (the GPU detection diagnostics text) and
