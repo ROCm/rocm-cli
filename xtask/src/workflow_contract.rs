@@ -3039,23 +3039,26 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
              name the API reports; a misspelt name reads as `absent`"
         );
         // The deadlines are ordered and the job's cap lets the script stop itself.
-        // `${{ github.event_name == 'pull_request' && '<pr>' || '<other>' }}`: a short
+        // `${{ <MI300X_REQUIRED's condition> && '<pr>' || '<other>' }}`: a short
         // queue deadline where the queue lane is the primary check, a long one
-        // where this lane is the only MI300X signal. Both pairs must be ordered.
+        // where this lane is the only MI300X signal (a fork or dependabot pull
+        // request included). Both pairs must be ordered.
+        let required_cond = env_value(&named_step(report, MI300X_GATE_STEP), "MI300X_REQUIRED")
+            .trim_start_matches("${{ ")
+            .trim_end_matches(" }}")
+            .to_string();
         let both = |key: &str| -> [u32; 2] {
             let expr = env_value(settle, key);
             assert!(
-                expr.starts_with("${{ github.event_name == 'pull_request' && '"),
-                "{key} must differ by event: {expr}"
+                expr.starts_with(&format!("${{{{ {required_cond} && '")),
+                "{key} must differ by the queue lane's condition: {expr}"
             );
-            let nums: Vec<u32> = expr
-                .split('\'')
-                .skip(1)
-                .step_by(2)
-                .skip(1)
-                .map(|n| n.parse().unwrap())
-                .collect();
-            [nums[0], nums[1]]
+            let quoted: Vec<&str> = expr.split('\'').skip(1).step_by(2).collect();
+            let n = quoted.len();
+            [
+                quoted[n - 2].parse().unwrap(),
+                quoted[n - 1].parse().unwrap(),
+            ]
         };
         let (queues, hards) = (
             both("QUEUE_DEADLINE_MINUTES"),

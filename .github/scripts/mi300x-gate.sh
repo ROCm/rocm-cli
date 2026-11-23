@@ -33,8 +33,8 @@
 # judges every other lane: a lane that ran (succeeded, failed, or was cut off by
 # its timeout, which GitHub reports as cancelled) and exported no report fails
 # the check, and so does a lane that never got a runner (`abandoned`: there is
-# no queue lane to cover it), while a skipped or missing one does not. A lane that ran, failed and did export
-# its report is the report's to show, as before.
+# no queue lane to cover it), while a skipped or missing one does not. A lane
+# that ran, failed and did export its report is the report's to show, as before.
 #
 # Inputs (environment):
 #   MI300X_REQUIRED       `true` for the either-or rule above.
