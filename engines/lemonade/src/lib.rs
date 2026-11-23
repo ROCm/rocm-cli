@@ -242,6 +242,13 @@ pub fn run_cli() -> Result<()> {
     Ok(())
 }
 
+/// The routes this engine's server answers, as its `Endpoint` answer reports
+/// them in `supported_routes`.
+#[must_use]
+pub(crate) fn supported_routes() -> Vec<String> {
+    rocm_engine_protocol::engine_supported_routes(ENGINE_NAME)
+}
+
 pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
     handle_envelope(envelope)
 }
@@ -841,12 +848,7 @@ fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
     Ok(EndpointResponse {
         endpoint_url,
         api_style: "openai".to_owned(),
-        supported_routes: vec![
-            "/v1/health".to_owned(),
-            "/v1/models".to_owned(),
-            "/v1/chat/completions".to_owned(),
-            "/v1/completions".to_owned(),
-        ],
+        supported_routes: crate::supported_routes(),
     })
 }
 

@@ -16,11 +16,13 @@ pub(crate) use crate::cli_args::{
     DevicePolicyArg, DiagnoseEngineArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider,
     SandboxToolArg, TelemetryModeArg, WatcherModeArg,
 };
-use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::{bootstrap, chat, comfyui, remote, storage};
 use clap::{Parser, Subcommand};
 use rocm_core::DEFAULT_LOCAL_HOST;
 use std::path::PathBuf;
+
+mod services;
+pub(crate) use services::ServicesCommand;
 
 /// User-selectable serving engines, in the order shown in `--help` and shell
 /// completions. Used as the clap `value_parser` for every user-facing argument
@@ -529,7 +531,8 @@ rocm model --verbose"
     /// first prints the service id and how to follow its log; while it starts, the status line
     /// follows what the engine is doing (download, load, or the latest log line) until
     /// the server is ready or that wait fails. A ready server then prints a deployment
-    /// summary (status, endpoint, model, and smoke-test metrics). A wait that fails
+    /// summary (status, engine, model, endpoint, the `rocm services docs` command
+    /// for its API docs, and smoke-test metrics). A wait that fails
     /// while the server is still running names `rocm logs` and `rocm services stop`
     /// instead of a finished "not ready" summary. Use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
@@ -1276,117 +1279,6 @@ pub(crate) enum ComfyuiCommand {
 // same commit too (AGENTS.md section 5): README.md, docs/testing.md, and
 // docs/manual-testing.md. `--help` is the one most often left behind, because
 // it is the only one of the four that is not a Markdown file.
-#[derive(Subcommand, Debug)]
-pub(crate) enum ServicesCommand {
-    /// Show currently running local model servers, and count the records that
-    /// are no longer running.
-    List {
-        /// Include failed, stopped, and old service records.
-        #[arg(short, long)]
-        all: bool,
-        /// Emit the service records as JSON instead of a table.
-        ///
-        /// This is the machine-readable form `rocm remote` reads back over its
-        /// control channel to discover which service a remote `rocm serve` just
-        /// started, rather than scraping the human table.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show logs for a local model server.
-    Logs {
-        /// Service id from `rocm services list`.
-        service_id: String,
-        /// Keep printing new output until the server stops (Ctrl-C ends the follow and
-        /// leaves the server running). Use it to watch a model download.
-        #[arg(long, short = 'f')]
-        follow: bool,
-    },
-    /// Stop a local model server.
-    ///
-    /// Reports the server stopped only once every process it recorded is
-    /// confirmed gone. Otherwise it reports on stderr that the stop was not
-    /// confirmed and exits with an error, keeping the record, which still names
-    /// the processes, and any endpoint key, which the server may still be
-    /// enforcing. It names each process that did not exit (on Windows, also one
-    /// whose child processes may still be running), and for one it could not
-    /// verify it signals nothing and names an operating-system command to check
-    /// on it. It does not suggest running the stop again.
-    Stop {
-        /// Service id from `rocm services list`.
-        service_id: String,
-        /// Required; stop refuses without it.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Restart a local model server.
-    ///
-    /// Stops the server first, and starts it again only once every process it
-    /// recorded is confirmed gone. If the stop cannot confirm that, nothing is
-    /// started and the stop request stays recorded on the server.
-    Restart {
-        /// Service id from `rocm services list --all`.
-        service_id: String,
-        /// Required; restart refuses without it.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Delete one local server record and its files.
-    ///
-    /// Only works on a record that is not running: stop the server first (on
-    /// Windows a process `rocm` cannot query counts as running). The record's
-    /// details file, log, engine state file, and endpoint key file (with any
-    /// copy of the key an interrupted save left beside it) are all deleted, so
-    /// its log can no longer be read and it can no longer be restarted.
-    Remove {
-        /// Service id from `rocm services list --all`.
-        service_id: String,
-        /// Required; remove refuses without it.
-        #[arg(long)]
-        yes: bool,
-        /// Remove a record whose recorded process `rocm` cannot query.
-        ///
-        /// Only when a stop was requested, no recorded process is confirmed
-        /// running, and at least one could not be queried (on Windows, a live
-        /// process the account may not open). Deletes the same files as a
-        /// plain `remove`, and says which process; if it is still running it
-        /// keeps running. Refused for a process confirmed running.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Delete local server records that are no longer running.
-    ///
-    /// Running servers are always left alone; a record held only by a process
-    /// `rocm` cannot query (Windows) is listed with the `remove --force` command.
-    /// Leftover files whose record is already gone are cleaned up too.
-    ///
-    /// Waits for a managed launch already under way to publish its record
-    /// before reading the directory, and waits as long as that launch takes.
-    /// There is no timeout. On an interactive terminal it says so while it
-    /// waits; piped or redirected output stays silent.
-    Prune {
-        /// Only remove records and files untouched for at least this many hours.
-        ///
-        /// Age is measured from when the record file was last written - a stop,
-        /// a restart, or a status correction all count as touching it - so a
-        /// server that has only just stopped keeps its log and stays
-        /// restartable. Pass 0 to include everything that is not running.
-        #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
-        older_than_hours: u64,
-        /// Remove every record that is not running, however recent.
-        ///
-        /// The same thing as `--older-than-hours 0`, named so it can be reached
-        /// without knowing the age rule exists -- which is how most people will
-        /// arrive here, after the summary tells them recent records were kept.
-        #[arg(long, conflicts_with = "older_than_hours")]
-        any_age: bool,
-        /// Show what would be removed, without removing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Required unless --dry-run; prune refuses without it.
-        #[arg(long)]
-        yes: bool,
-    },
-}
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AutomationsCommand {
@@ -1538,6 +1430,25 @@ mod tests {
         }
         if reference == "unknown" {
             assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    /// The API docs and each engine's `supported_routes` take an engine's
+    /// health route from one table; an engine `rocm serve` accepts but the
+    /// table lacks would get docs without a health route.
+    #[test]
+    fn every_supported_engine_has_a_health_route_and_no_other_engine_does() {
+        for engine in SUPPORTED_ENGINES {
+            assert!(
+                rocm_engine_protocol::engine_health_route(engine).is_some(),
+                "{engine} is missing from ENGINE_HEALTH_ROUTES"
+            );
+        }
+        for (engine, _) in rocm_engine_protocol::ENGINE_HEALTH_ROUTES {
+            assert!(
+                SUPPORTED_ENGINES.contains(&engine),
+                "ENGINE_HEALTH_ROUTES names {engine}, which `rocm serve` does not accept"
+            );
         }
     }
 
@@ -2806,26 +2717,6 @@ mod tests {
         let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
             .expect_err("zero timeout-secs is rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
-    /// `--any-age` and an explicit `--older-than-hours` would be two answers to
-    /// one question; clap has to reject the pair rather than silently pick one.
-    #[test]
-    fn services_prune_rejects_any_age_with_an_explicit_age() {
-        let error = Cli::try_parse_from([
-            "rocm",
-            "services",
-            "prune",
-            "--any-age",
-            "--older-than-hours",
-            "5",
-        ])
-        .expect_err("the two age arguments must conflict");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("--any-age") && rendered.contains("--older-than-hours"),
-            "the conflict must name both arguments:\n{rendered}"
-        );
     }
 
     #[test]

@@ -242,11 +242,18 @@ const fn announces_wait(wait_until_ready: bool, policy: &ServeStartupPolicy) -> 
 pub(crate) fn print_managed_launch_plain(
     report: &ManagedLaunchReport,
     endpoint_api_key: Option<&str>,
+    docs_rows: &[(&str, String)],
 ) {
+    let print_docs_rows = || {
+        for (label, value) in docs_rows {
+            println!("  {label}: {value}");
+        }
+    };
     if report.already_running {
         println!("managed service already running");
         println!("  service_id: {}", report.service_id);
         println!("  endpoint: {}", report.endpoint_url);
+        print_docs_rows();
         println!("  status: {}", report.status);
         println!("  note: existing service detected; no second process spawned");
         return;
@@ -257,6 +264,7 @@ pub(crate) fn print_managed_launch_plain(
         println!("  process_pid: {child_pid}");
     }
     println!("  endpoint: {}", report.endpoint_url);
+    print_docs_rows();
     if let Some(key) = endpoint_api_key {
         // Intentional one-time display of a freshly generated API key to the
         // terminal so the user can copy it — the designed delivery channel

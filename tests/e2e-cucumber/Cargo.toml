@@ -116,9 +116,11 @@ rocm-core = { path = "../../crates/rocm-core", features = ["test-support"] }
 # granularity varies by platform (about 15.6 ms on Windows).
 tokio = { workspace = true, features = ["test-util"] }
 
-# `fcntl(F_GETFL)` only, to read (never modify) the `O_NONBLOCK` state of the
-# suite's own stdio for the diagnostics log (see `src/harness_diagnostics.rs`).
-# Already a workspace dependency, so this adds no new crate to the tree.
+# `fcntl(F_GETFL)` to read (never modify) the `O_NONBLOCK` state of the
+# suite's own stdio for the diagnostics log (see `src/harness_diagnostics.rs`),
+# `O_NOFOLLOW` for the Lemonade diagnostics, and `kill(SIGINT)` for the step
+# that presses Ctrl+C in `rocm services docs`. Already a workspace dependency,
+# so this adds no new crate to the tree.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

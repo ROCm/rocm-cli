@@ -2112,6 +2112,7 @@ mod tests {
                 smoke_failure,
                 api_key: None,
                 notes: Vec::new(),
+                docs_rows: Vec::new(),
             });
         assert!(rendered.starts_with("Deployment summary (smoke test failed)\n"));
         assert!(rendered.contains("started, smoke test failed"));

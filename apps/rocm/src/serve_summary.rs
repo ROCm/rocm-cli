@@ -76,6 +76,10 @@ pub(crate) struct DeploymentSummary {
     pub api_key: Option<String>,
     /// GPU/device warnings folded in from the serve plan.
     pub notes: Vec<String>,
+    /// The `docs` row naming `rocm services docs`, and an `engine docs` row
+    /// for an engine that serves docs itself, from
+    /// [`crate::services_docs::launch_docs_rows`]; shown under the endpoints.
+    pub docs_rows: Vec<(&'static str, String)>,
 }
 
 /// Result of the post-launch smoke test.
@@ -223,6 +227,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         model_rows,
         vec![("endpoint", summary.chat_endpoint.clone())],
         anthropic_rows,
+        summary.docs_rows.clone(),
         vec![
             ("time to first token", format_ttft(summary.metrics.ttft)),
             ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
@@ -578,7 +583,43 @@ mod tests {
             smoke_failure: None,
             api_key: None,
             notes: Vec::new(),
+            docs_rows: Vec::new(),
         }
+    }
+
+    // Pins where the rows go. Which rows a launched server gets is
+    // `services_docs::launch_docs_rows`; that the `docs` command serves the
+    // docs is scenario service-docs-01, and that the line `rocm serve` prints
+    // does is the GPU serve canaries' last step (serve-05, serve-07).
+    #[test]
+    fn summary_lists_the_docs_rows_right_after_the_endpoint() {
+        let summary = DeploymentSummary {
+            docs_rows: vec![
+                ("docs", "rocm services docs vllm-qwen-1720000000".to_owned()),
+                ("engine docs", "http://127.0.0.1:1337/docs".to_owned()),
+            ],
+            ..base_summary()
+        };
+        let rendered = render_summary(&summary);
+        let lines: Vec<&str> = rendered.lines().map(str::trim).collect();
+        let endpoint_row = lines
+            .iter()
+            .position(|line| line.starts_with("endpoint "))
+            .expect("endpoint row");
+        assert_eq!(
+            &lines[endpoint_row + 1..endpoint_row + 3],
+            [
+                "docs                 rocm services docs vllm-qwen-1720000000",
+                "engine docs          http://127.0.0.1:1337/docs",
+            ],
+            "{rendered}"
+        );
+        assert!(
+            !render_summary(&base_summary())
+                .lines()
+                .any(|line| line.trim_start().starts_with("docs ")),
+            "no docs rows, no docs line"
+        );
     }
 
     #[test]
