@@ -526,6 +526,7 @@ jobs:
         with:
           name: mi300x-stale-run-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mi300x-stale-run
+          if-no-files-found: error
 
   # Cancels a run `e2e-gpu` found stale. A separate job, on a GitHub-hosted
   # runner with no checkout, so the `actions: write` token never shares a job
@@ -2006,10 +2007,8 @@ jobs:
   # wait for the job it ends); the queue lane and the report are done by then.
   # It also runs when the settle job itself failed or was cancelled, as the
   # nightly's does: a job killed by its own timeout reports `cancelled`, and
-  # nothing else bounds the wait then. The force-cancel ends this job's own run,
-  # so GitHub marks this job (and the abandoned leg) failed, not cancelled: a red
-  # canceller beside a red `E2E tests (MI300X, current)` is expected whenever a
-  # leg is abandoned.
+  # nothing else bounds the wait then. The force-cancel ends this job's own run, so
+  # this job shows as cancelled, like the abandoned leg.
   cancel-abandoned-mi300x-lane:
     name: Cancel the MI300X self-hosted lane that never got a runner
     runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API

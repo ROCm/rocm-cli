@@ -67,9 +67,8 @@ no report, is never a pass. The report does not wait on `e2e-gpu` directly: a jo
 queued for a runner cannot be timed out, so `e2e-gpu-settled` gives up on it after
 30 minutes in the queue, and `cancel-abandoned-mi300x-lane` then ends the run with a
 force-cancel (a plain cancel leaves the queued job alive: its `if` is `always()`).
-The force-cancel ends that job's own run, so GitHub shows the canceller and the
-abandoned `E2E tests (MI300X, current)` leg as failed, not cancelled; the red
-canceller is expected whenever a leg is abandoned. On a push, a release push, a
+The force-cancel ends that job's own run, so the canceller shows as cancelled
+too. On a push, a release push, a
 dispatch, or a fork or dependabot pull request, which have no queue lane and
 no other MI300X signal, the queue deadline is 4 hours, not 30 minutes, and a lane
 that ran without a report, one that never got a runner, or an unreadable result

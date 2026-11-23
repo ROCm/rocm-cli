@@ -3187,8 +3187,14 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         assert!(
             stale_upload.contains("name: mi300x-stale-run-${{ github.run_attempt }}")
                 && stale_upload.contains("path: ${{ runner.temp }}/mi300x-stale-run")
-                && stale_upload.contains("steps.stale.outputs.stale == 'true'"),
+                && stale_upload.contains("steps.stale.outputs.stale == 'true'")
+                && stale_upload.contains("if-no-files-found: error"),
             "{stale_upload}"
+        );
+        let stale_record = named_step(lane, "- name: Record that this run skipped itself as stale");
+        assert!(
+            stale_record.contains("echo stale > \"${RUNNER_TEMP}/mi300x-stale-run\""),
+            "the marker the upload reads must be the file the record step writes:\n{stale_record}"
         );
 
         // The settle job hands over what the report reads, runs the script and can
@@ -3442,9 +3448,14 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         for (queue, selfhosted, uploaded, want, why) in cases {
             let (code, log, summary) = run_mi300x_gate(true, queue, selfhosted, uploaded);
             assert_eq!(code, *want, "{why} (required):\n{log}");
+            let mark = if *want == 0 {
+                ":white_check_mark:"
+            } else {
+                ":x:"
+            };
             assert!(
-                summary.contains("MI300X"),
-                "{why}: the verdict is said in the summary: {summary}"
+                summary.contains(&format!("MI300X: {mark}")),
+                "{why}: the verdict mark is said in the summary: {summary}"
             );
         }
         // The cancelled lane is named absent, not failed, in the summary.
