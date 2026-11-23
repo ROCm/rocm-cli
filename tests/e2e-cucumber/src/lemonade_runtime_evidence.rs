@@ -253,7 +253,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("bin/llamacpp/rocm-nightly")).unwrap();
         let report = files(root.path());
-        assert!(report.contains("rocm-nightly/version.txt"), "{report}");
+        // Separators differ by platform, so the directory and the file are asserted apart.
+        assert!(report.contains("rocm-nightly"), "{report}");
+        assert!(report.contains("version.txt"), "{report}");
+        assert!(report.contains("<cannot read:"), "{report}");
     }
 
     #[test]
