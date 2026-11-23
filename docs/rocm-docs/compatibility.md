@@ -29,9 +29,9 @@ For the minimum Linux release and the library versions the Lemonade engine
 needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 [ROCm CLI on WSL2](install/wsl.md).
 
-## Engine support
+## Engines by platform
 
-The tables in this section use these statuses:
+The engine tables below use these statuses:
 
 - **Supported**: `rocm engines install` sets up the engine for this
   combination, and it has run on GPU hardware.
@@ -40,8 +40,6 @@ The tables in this section use these statuses:
 - **Not verified**: `rocm engines install` sets up the engine, but it hasn't
   been confirmed on GPU hardware.
 - **Not supported**: ROCm CLI doesn't offer the install, or refuses it.
-
-### Engines by platform
 
 ```{table}
 :widths: 16 28 28 28
@@ -62,7 +60,7 @@ The tables in this section use these statuses:
 - **AIM on WSL2**: ROCm CLI passes the WSL2 GPU device to the container, but
   this hasn't been confirmed on GPU hardware.
 
-### ROCm versions, Python, and vLLM
+## ROCm versions, Python, and vLLM
 
 | ROCm version | Python | vLLM |
 |---|---|---|
