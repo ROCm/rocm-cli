@@ -92,14 +92,17 @@ ran_without_report() {
 queue=$(classify "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT:?QUEUE_ARTIFACT is required}")
 selfhosted_result="${SELFHOSTED_RESULT-}"
 # A lane that skipped itself as stale did not run for this head: absent.
+self_stale=false
 if grep -qxF -- "${STALE_ARTIFACT:?STALE_ARTIFACT is required}" <<<"${artifacts}"; then
+  self_stale=true
   selfhosted_result=skipped
 fi
 # `e2e-gpu-settled` hands over the self-hosted lane's result; when it failed, was
 # cancelled or never ran, that result is unknown and an empty one must not read as
-# an absent lane.
+# an absent lane. The stale marker is the lane's own word and outranks that: it is
+# absent whatever the settle job did.
 settle_unknown=false
-if [[ "${SETTLE_RESULT:-success}" != success && "${SETTLE_RESULT}" != skipped ]]; then
+if [[ "${self_stale}" = false && "${SETTLE_RESULT:-success}" != success && "${SETTLE_RESULT}" != skipped ]]; then
   settle_unknown=true
   selfhosted_result=""
 fi
@@ -134,13 +137,24 @@ else
   fi
 fi
 
+# A lane that ran, was cut off and left no report is not "absent": say so where the
+# verdict blames it for that.
+queue_label="${queue}"
+selfhosted_label="${selfhosted}"
+if [[ "${required}" != true ]]; then
+  [[ "${queue}" = absent ]] && ran_without_report "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT}" &&
+    queue_label="cut off, no report"
+  [[ "${selfhosted}" = absent ]] && ran_without_report "${selfhosted_result}" "" "${SELFHOSTED_ARTIFACT}" &&
+    selfhosted_label="cut off, no report"
+fi
+
 mark=":white_check_mark:"
 [[ "${required}" = true ]] || mark=":information_source:"
 [[ "${verdict}" = 0 ]] || mark=":x:"
 {
   echo "### MI300X: ${mark} ${reason}"
-  echo "- queue lane (\`e2e-gpu-queue\`): ${queue} (result: ${QUEUE_RESULT:-absent})"
-  echo "- self-hosted lane (\`e2e-gpu\`): ${selfhosted} (result: ${selfhosted_result:-absent})"
+  echo "- queue lane (\`e2e-gpu-queue\`): ${queue_label} (result: ${QUEUE_RESULT:-absent})"
+  echo "- self-hosted lane (\`e2e-gpu\`): ${selfhosted_label} (result: ${selfhosted_result:-absent})"
   if [[ "${queue}" = absent && "${required}" = true ]]; then
     echo "- The queue lane did not run for this push (switched off, or refused for the nightly window), and a skipped lane is never a pass: re-run once it can, or when the self-hosted lane has a runner."
   fi

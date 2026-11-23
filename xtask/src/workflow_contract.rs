@@ -3493,6 +3493,28 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             assert_eq!(code, 1, "off a queue run, settle {settle}:\n{log}");
             assert!(summary.contains("unknown"), "{summary}");
         }
+        // The lane's own stale marker outranks a broken settle job, on every kind of run.
+        for settle in ["failure", "cancelled"] {
+            for required in [true, false] {
+                let (code, log, summary) =
+                    run_mi300x_gate_settled(required, "skipped", "", &["mi300x-stale-run"], settle);
+                // Required: nothing passed, so it fails for that reason, not for "unknown".
+                assert_eq!(
+                    code,
+                    i32::from(required),
+                    "stale lane, required {required}, settle {settle}:\n{log}"
+                );
+                assert!(!summary.contains("unknown"), "{summary}");
+            }
+        }
+        // A cut-off lane with no report is named as that, not as an absent one.
+        let (code, log, summary) =
+            run_mi300x_gate_settled(false, "skipped", "cancelled", &[], "success");
+        assert_eq!(code, 1, "{log}");
+        assert!(
+            summary.contains("(`e2e-gpu`): cut off, no report (result: cancelled)"),
+            "{summary}"
+        );
         // An empty result with a healthy settle job is a lane absent from the run.
         let (code, log, _) = run_mi300x_gate_settled(false, "skipped", "", &[], "success");
         assert_eq!(code, 0, "{log}");
