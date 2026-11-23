@@ -4,7 +4,7 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# ROCm CLI compatibility
+# ROCm CLI compatibility matrix
 
 This page shows which inference engines run on which platforms and ROCm
 versions, which Python version each ROCm version uses, and which GPUs AIM

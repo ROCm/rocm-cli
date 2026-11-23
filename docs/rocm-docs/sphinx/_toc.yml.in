@@ -9,7 +9,7 @@ subtrees:
       - file: install/wsl
         title: ROCm CLI on WSL2
       - file: compatibility
-        title: Compatibility
+        title: Compatibility matrix
       - file: getting-started
   - caption: Reference
     entries:

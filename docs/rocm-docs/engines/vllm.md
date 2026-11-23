@@ -11,7 +11,7 @@ to the compatibility page can sit at the top of the page. Everything after the
 title is included. -->
 
 For the ROCm versions and platforms vLLM supports, see
-[ROCm CLI compatibility](../compatibility.md).
+[ROCm CLI compatibility matrix](../compatibility.md).
 
 ```{include} ../../vllm.md
 :start-after: "# vLLM adapter"
