@@ -66,7 +66,9 @@ use crate::gpu_policy::{
     select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
     write_unchecked_index_warning,
 };
-use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::managed_service_status::{
+    find_live_managed_service, live_managed_services_for_model, live_service_started_with,
+};
 use crate::serve_device_probe::serve_device_after_launch;
 use crate::serve_port;
 use crate::serve_progress::{self, ServeStartupView};
@@ -642,21 +644,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         engine_recipe,
         gpu_memory_utilization,
     );
-    // After the explicit value, so a flag or a recipe value wins over the default.
-    let (engine_recipe, shared_memory_default_note) =
-        engine_recipe_with_shared_memory_default(&selected_engine, engine_recipe, || {
-            host_gpu_shares_system_memory(host_gpu_summary.as_ref())
-        });
     // Stored without a `note:` prefix so it can feed both output paths: the plan
     // path adds the prefix inline, the interactive summary adds it when rendering.
-    // At most one of the two applies: the first needs a non-vLLM engine, the second vLLM.
     let gpu_memory_utilization_note = (gpu_memory_utilization.is_some() && !engine_serves_vllm)
         .then(|| {
             format!(
                 "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
             )
-        })
-        .or(shared_memory_default_note);
+        });
     // Translate the engine-neutral CLI controls into each adapter's server-wide
     // defaults: vLLM generation config or Lemonade llama.cpp launch flags.
     let generation_defaults = ServeGenerationDefaults {
@@ -670,6 +665,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         generation_defaults,
     )?;
     let engine_recipe = engine_recipe_with_extra_env(&selected_engine, engine_recipe, &engine_env)?;
+    // Last, so the recipe it is handed is the one a live service's record is
+    // compared with, and after the explicit value, so a flag or a recipe value
+    // wins over the default.
+    let (engine_recipe, shared_memory_default_note) =
+        engine_recipe_with_shared_memory_default(&selected_engine, engine_recipe, |hint| {
+            host_gpu_shares_system_memory(host_gpu_summary.as_ref())
+                && !live_service_started_with(&paths, &selected_engine, &engine_model_ref, hint)
+        });
+    let gpu_memory_utilization_note = gpu_memory_utilization_note.or(shared_memory_default_note);
     let aim_gpu_name = aim_engine_record(&selected_engine, shared_recipe.as_ref())
         .filter(|record| !record.profile_ids.is_empty())
         .and_then(|_| {

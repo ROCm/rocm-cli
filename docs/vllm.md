@@ -422,6 +422,11 @@ the fault is not proven to depend on the size, and 0.3 is the only fraction that
 was reported to work. Pass `--gpu-memory-utilization 0.8` (or any fraction in
 `(0, 1]`) to choose your own; an explicit value is never changed.
 
+A vLLM server for the same model that is already running with the recipe you
+ask for, for example one started before this default existed, is reused as it is:
+the default is not added to the request, so it cannot make `rocm serve` refuse
+the running server over "different serve options".
+
 It applies only when `rocm serve` can attribute the APU to the server's GPU: a
 host that also has a discrete GPU (`amd-smi` lists more than one) keeps vLLM's
 default, because the one detected target cannot say which GPU the server uses.

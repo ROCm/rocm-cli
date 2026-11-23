@@ -1280,3 +1280,17 @@ Feature: Model serving
     When the user opens the interactive serve summary against that engine
     Then the launched vLLM server was left on vLLM's own memory reservation
     And the deployment summary does not mention a default memory reservation
+
+  # The APU default must not make a server that is already running unreusable.
+  # Reuse requires the running service's recorded recipe to equal the requested
+  # one, so a default added to the request alone read as "different serve options"
+  # and refused a server started by a build that predates the default, telling the
+  # user to stop a working server for a request that asked for nothing different.
+  # Same planted server as @id:serve-reuse-exempt-from-no-gpu-refusal, which
+  # fails the same way on a lane whose real GPU is an APU.
+  @id:serve-apu-reuses-a-server-started-without-the-default @requires-no-gpu @requires-os:linux
+  Scenario: serve-75 - A vLLM server started without the APU memory default is still reused
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a live managed vLLM serve is already running
+    When the user opens its interactive serve summary
+    Then the summary reflects the reused already-running service

@@ -337,9 +337,19 @@ fn sets_gpu_memory_utilization(required_flags: &[String]) -> bool {
 /// Call it after [`engine_recipe_with_gpu_memory_utilization_override`]: an
 /// explicit `--gpu-memory-utilization` and a catalog recipe's own value both
 /// arrive as a `--gpu-memory-utilization` in `required_flags`, and either one
-/// wins, so the default only fills a gap. vLLM only; `host_shares_system_memory`
-/// is not called for another engine, or once a value is already set, so the host
-/// probe it stands for runs on nothing but the path that needs it.
+/// wins, so the default only fills a gap. Call it last among the recipe
+/// transforms, because the recipe it is handed is the one a running service's
+/// record is compared with before the service is reused.
+///
+/// vLLM only. `wanted_here` is given the recipe as it stands without the default
+/// and answers whether to add one: whether the host's GPU shares system memory,
+/// and whether a live service already runs exactly that recipe. The second
+/// matters because reuse requires the recorded recipe to equal the requested one,
+/// so a server started before the default existed, or by a build without it,
+/// would otherwise be refused with "different serve options" for a request that
+/// asked for nothing different. It is not called for another engine, or once a
+/// value is already set, so the probes it stands for run on nothing but the path
+/// that needs them.
 ///
 /// Returns the hint and the note to print about what was done, `None` when the
 /// recipe was left alone. The note is built here from the same value the flag
@@ -347,13 +357,13 @@ fn sets_gpu_memory_utilization(required_flags: &[String]) -> bool {
 pub(crate) fn engine_recipe_with_shared_memory_default(
     engine: &str,
     hint: Option<EngineRecipeHint>,
-    host_shares_system_memory: impl FnOnce() -> bool,
+    wanted_here: impl FnOnce(Option<&EngineRecipeHint>) -> bool,
 ) -> (Option<EngineRecipeHint>, Option<String>) {
     if !engine.eq_ignore_ascii_case("vllm")
         || hint
             .as_ref()
             .is_some_and(|hint| sets_gpu_memory_utilization(&hint.required_flags))
-        || !host_shares_system_memory()
+        || !wanted_here(hint.as_ref())
     {
         return (hint, None);
     }
@@ -764,7 +774,7 @@ mod tests {
         let (hint, note) = engine_recipe_with_shared_memory_default(
             "vllm",
             Some(vllm_hint(&["--enable-auto-tool-choice"])),
-            || true,
+            |_| true,
         );
         assert_eq!(
             hint.expect("a hint").required_flags,
@@ -777,7 +787,7 @@ mod tests {
         let note = note.expect("the default must be announced");
         assert!(note.contains("--gpu-memory-utilization 0.3"), "{note}");
         // Synthesizes a hint when the model has no recipe.
-        let (hint, _) = engine_recipe_with_shared_memory_default("vllm", None, || true);
+        let (hint, _) = engine_recipe_with_shared_memory_default("vllm", None, |_| true);
         assert_eq!(
             hint.expect("a synthesized hint").required_flags,
             vec!["--gpu-memory-utilization".to_owned(), "0.3".to_owned()]
@@ -793,7 +803,7 @@ mod tests {
             vec!["--gpu-memory-utilization=0.8"],
         ] {
             let (hint, note) =
-                engine_recipe_with_shared_memory_default("vllm", Some(vllm_hint(&flags)), || {
+                engine_recipe_with_shared_memory_default("vllm", Some(vllm_hint(&flags)), |_| {
                     panic!("the host must not be probed once a value is set")
                 });
             assert_eq!(hint.expect("a hint").required_flags, flags);
@@ -804,7 +814,7 @@ mod tests {
             None,
             parse_gpu_memory_utilization(Some("0.9")).unwrap(),
         );
-        let (hint, note) = engine_recipe_with_shared_memory_default("vllm", explicit, || true);
+        let (hint, note) = engine_recipe_with_shared_memory_default("vllm", explicit, |_| true);
         assert_eq!(
             hint.expect("a hint").required_flags,
             vec!["--gpu-memory-utilization".to_owned(), "0.9".to_owned()]
@@ -813,15 +823,38 @@ mod tests {
     }
 
     #[test]
+    fn the_default_is_judged_on_the_recipe_without_it() {
+        // `wanted_here` is where a live service already running the request is
+        // looked for, and that comparison is only meaningful against the recipe as
+        // the user's request stands, before the default is added to it.
+        let mut seen = None;
+        let (hint, note) = engine_recipe_with_shared_memory_default(
+            "vllm",
+            Some(vllm_hint(&["--enable-auto-tool-choice"])),
+            |hint| {
+                seen = hint.map(|hint| hint.required_flags.clone());
+                false
+            },
+        );
+        assert_eq!(seen, Some(vec!["--enable-auto-tool-choice".to_owned()]));
+        assert_eq!(
+            hint.expect("a hint").required_flags,
+            vec!["--enable-auto-tool-choice".to_owned()],
+            "declining leaves the recipe exactly as it was"
+        );
+        assert!(note.is_none());
+    }
+
+    #[test]
     fn the_default_leaves_other_engines_and_other_hosts_alone() {
-        let (hint, note) = engine_recipe_with_shared_memory_default("lemonade", None, || {
+        let (hint, note) = engine_recipe_with_shared_memory_default("lemonade", None, |_| {
             panic!("only vLLM has the flag, so the host is never probed")
         });
         assert!(hint.is_none() && note.is_none());
         let (hint, note) = engine_recipe_with_shared_memory_default(
             "vllm",
             Some(vllm_hint(&["--enable-auto-tool-choice"])),
-            || false,
+            |_| false,
         );
         assert_eq!(
             hint.expect("a hint").required_flags,
@@ -829,7 +862,7 @@ mod tests {
         );
         assert!(note.is_none());
         assert!(
-            engine_recipe_with_shared_memory_default("vllm", None, || false)
+            engine_recipe_with_shared_memory_default("vllm", None, |_| false)
                 .0
                 .is_none()
         );

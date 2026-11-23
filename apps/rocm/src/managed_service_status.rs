@@ -176,6 +176,37 @@ pub(crate) fn live_managed_services_for_model(
         .then_some(records)
 }
 
+/// Whether a live managed service for `engine` and `model_ref` was started with
+/// exactly `recipe`, as `rocm serve` would record it.
+///
+/// This is the equality [`crate::service_launch::managed_service_reuse_refusal`]
+/// requires of a recipe before it lets a running service be reused, asked early
+/// enough for the caller to leave something out of the recipe it is about to
+/// request. The model is matched as [`live_managed_services_for_model`] matches
+/// it, leniently and without the engine's canonical id, so a near name can
+/// answer true for a service the spawn then refuses to reuse: the caller must
+/// treat true as "do not add anything", never as "this will be reused". Costs
+/// what that function costs, a liveness refresh of the registry.
+pub(crate) fn live_service_started_with(
+    paths: &AppPaths,
+    engine: &str,
+    model_ref: &str,
+    recipe: Option<&rocm_engine_protocol::EngineRecipeHint>,
+) -> bool {
+    let Ok(requested) = recipe.map(serde_json::to_string).transpose() else {
+        return false;
+    };
+    live_managed_services_for_model(paths, engine, model_ref).is_some_and(|records| {
+        records.iter().any(|record| {
+            record.engine == engine
+                && (service_model_names_match(&record.model_ref, model_ref)
+                    || service_model_names_match(&record.canonical_model_id, model_ref))
+                && managed_service_is_live(record)
+                && record.engine_recipe_json == requested
+        })
+    })
+}
+
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// The real process ids a record tracks.
@@ -1052,6 +1083,58 @@ mod tests {
         assert!(
             find_live_managed_service(&records, "lemonade", "not-this-model").is_none(),
             "the canonical-id term must still discriminate"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The recipe check a request makes before adding a default: a live service
+    /// started with exactly the recipe counts, one started with another, or none
+    /// for this engine and model, does not.
+    #[test]
+    fn a_live_service_counts_only_when_it_was_started_with_the_same_recipe() -> Result<()> {
+        use rocm_engine_protocol::{ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint};
+
+        let hint = |flags: &[&str]| EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
+            ..EngineRecipeHint::default()
+        };
+        let (root, paths) = test_paths("live-service-started-with");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "vllm-started-with",
+            "vllm",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11_522,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.engine_recipe_json = None;
+        record.write()?;
+
+        // Started with no recipe at all, as a server from before the default was.
+        assert!(live_service_started_with(&paths, "vllm", "qwen", None));
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--x"]))),
+            "a different recipe is not the one the service runs"
+        );
+        assert!(
+            !live_service_started_with(&paths, "lemonade", "qwen", None),
+            "another engine's service is not this one"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "another-model", None),
+            "another model's service is not this one"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
