@@ -144,7 +144,9 @@ mark=":white_check_mark:"
   if [[ "${queue}" = absent && "${required}" = true ]]; then
     echo "- The queue lane did not run for this push (switched off, or refused for the nightly window), and a skipped lane is never a pass: re-run once it can, or when the self-hosted lane has a runner."
   fi
-  if [[ "${selfhosted}" = absent && "${required}" = true ]]; then
+  if [[ "${settle_unknown}" = true && "${required}" = true ]]; then
+    echo "- The self-hosted result is unknown, counted as absent and never as a pass: the settle job (\`e2e-gpu-settled\`) ended ${SETTLE_RESULT}."
+  elif [[ "${selfhosted}" = absent && "${required}" = true ]]; then
     echo "- A self-hosted lane that was cancelled, skipped or never got a runner counts as absent, not failed."
   fi
 } >>"${summary_file}"

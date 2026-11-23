@@ -3476,8 +3476,18 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             // Where either lane suffices, the queue lane's pass still counts.
             let (code, log, _) = run_mi300x_gate_settled(true, "success", "", &[Q], settle);
             assert_eq!(code, 0, "queue passed, settle {settle}:\n{log}");
-            let (code, log, _) = run_mi300x_gate_settled(true, "skipped", "", &[], settle);
+            let (code, log, summary) = run_mi300x_gate_settled(true, "skipped", "", &[], settle);
             assert_eq!(code, 1, "nothing passed, settle {settle}:\n{log}");
+            assert!(
+                summary.contains(&format!(
+                    "the settle job (`e2e-gpu-settled`) ended {settle}"
+                )),
+                "the summary names the settle job as the reason: {summary}"
+            );
+            assert!(
+                !summary.contains("never got a runner counts as absent"),
+                "an unknown result is not explained as a lane that never ran: {summary}"
+            );
             // Where only the self-hosted lane is judged, it fails closed.
             let (code, log, summary) = run_mi300x_gate_settled(false, "skipped", "", &[S], settle);
             assert_eq!(code, 1, "off a queue run, settle {settle}:\n{log}");

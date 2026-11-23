@@ -1994,6 +1994,10 @@ jobs:
           # The lane's timeout-minutes; the script refuses a queue deadline
           # that, plus this, would pass the hard deadline.
           LANE_RUN_MINUTES: "90"
+          # The consolidated report's MI300X check reads only `e2e-gpu` (the
+          # pull-request leg): the release-branch n-1/n-2 legs are settled here so
+          # the run ends, and each shows as its own check, but they are not part of
+          # the MI300X requirement.
           LANES: |
             e2e-gpu=E2E tests (MI300X, current)
             e2e-gpu-n-1=E2E tests (MI300X, n-1)
