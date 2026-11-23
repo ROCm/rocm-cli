@@ -922,11 +922,16 @@ mod tests {
         }
     }
 
-    /// The `row N of M` position the overflow notice states, which is driven by
-    /// the scroll offset the call site passes down.
-    fn visible_row(screen: &str) -> Option<u16> {
+    /// The `row N of M` the overflow notice states: `N` is the **last** body row
+    /// on screen (`scroll + visible`, capped at the total), so it is driven by
+    /// the scroll offset the call site passes down. Returns `(N, M)`.
+    fn visible_row(screen: &str) -> Option<(u16, u16)> {
         let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-        flat.split("row ").nth(1)?.split(' ').next()?.parse().ok()
+        let tail = flat.split("row ").nth(1)?;
+        let mut parts = tail.split(' ');
+        let last_shown = parts.next()?.parse().ok()?;
+        let total = parts.nth(1)?.parse().ok()?;
+        Some((last_shown, total))
     }
 
     /// ROCMAI-1050 at the launcher's own `draw_approval_scrolled` call site.
@@ -946,19 +951,33 @@ mod tests {
     /// there is more when everything fits, which is what a notice wired to
     /// fire unconditionally would do.
     ///
-    /// The scroll is actually driven rather than left at zero, which is what
-    /// makes the transposition above detectable at all. `quit_confirm_scroll`
-    /// (passed down) and `quit_confirm_max_scroll` (written back) are both
-    /// `u16`, so swapping them still compiles, and while both hold `0` a
-    /// swapped call renders byte-identically -- rendering twice at the top
-    /// proves nothing.
+    /// The scroll is actually driven rather than left at zero, because while
+    /// both fields hold `0` any mix-up renders byte-identically -- rendering
+    /// twice at the top proves nothing.
     ///
-    /// Paging is what separates them: under the swap `max_scroll` is never
-    /// written, so `quit_confirm_scroll_key` clamps against `0`, the offset
-    /// cannot leave the top, and the position the notice reports stays put.
-    /// Asserting that position *advances* is therefore the check that fails
-    /// on a transposition. Verified by making that swap and watching this go
-    /// red.
+    /// Which mix-up is reachable here matters, and an earlier version of this
+    /// comment named one that is not. `draw` takes `&AppState`, and
+    /// `quit_confirm_scroll` is a plain field while `quit_confirm_max_scroll`
+    /// is a `Cell`, so a full transposition -- writing the result into the
+    /// plain field -- does not compile without widening the signature. The
+    /// swap that *does* compile is reading `quit_confirm_max_scroll.get()` as
+    /// the scroll input while still writing the result back into the `Cell`.
+    ///
+    /// That one is why `after > before` is not enough. `max_scroll` is by
+    /// definition the offset at which the last body row is the last row, so
+    /// the buggy render lands at the very bottom -- which also advances the
+    /// reported position, and a "did it move" check passes. The offset is
+    /// therefore pinned exactly: one PgDn must land one page down, not at the
+    /// end. For those two to be different offsets the overflow has to exceed
+    /// one page, i.e. `max_scroll > APPROVAL_PAGE`, which is asserted as a
+    /// premise below. Adding instances does not buy it -- the request body
+    /// caps at 13 rows however many are serving -- so it comes from the
+    /// terminal height: 10 rows, not the 12 the roomy arm contrasts against.
+    ///
+    /// Mutation-checked by making that swap at the call site: the render then
+    /// lands at the bottom (6 -> 13) instead of one page down (6 -> 11) and
+    /// the equality fires. A plain `after > before` passes on that mutation,
+    /// which is the whole reason this asserts the exact offset.
     #[test]
     fn launcher_quit_prompt_on_a_short_terminal_shows_its_body_and_says_there_is_more() {
         use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
@@ -986,7 +1005,7 @@ mod tests {
         )));
         s.open_quit_confirm();
 
-        let short = render(&s, 0, 100, 12);
+        let short = render(&s, 0, 100, 10);
         assert!(
             short.contains("rocm services stop vllm-0 --yes"),
             "the remediation must still reach the user on a short terminal, not be cut: {short:?}"
@@ -1000,32 +1019,44 @@ mod tests {
         // is still at the top -- so the two fields are equal-by-accident at 0.
         let max_scroll = s.quit_confirm_max_scroll.get();
         assert!(
-            max_scroll > 0,
-            "premise: the body must overflow, or there is nothing to scroll: {short:?}"
+            max_scroll > crate::ui::approval::APPROVAL_PAGE,
+            "premise: the body must be taller than one page, or landing one page \
+             down and landing at the bottom are the same offset and the swap this \
+             test exists for is invisible (max_scroll {max_scroll}): {short:?}"
         );
         assert_eq!(
             s.quit_confirm_scroll, 0,
             "premise: the body starts at the top"
         );
 
-        // Page down so the two hold DIFFERENT values; only now would swapping
-        // them at the call site change what is drawn.
+        // Page down so the two hold DIFFERENT values; only now would reading
+        // the wrong one at the call site change what is drawn.
         assert!(
             s.quit_confirm_scroll_key(crossterm::event::KeyCode::PageDown),
             "PgDn must move a body that overflows"
         );
-        assert!(
-            s.quit_confirm_scroll > 0,
-            "premise: PgDn must have moved the offset off the top"
+        assert_eq!(
+            s.quit_confirm_scroll,
+            crate::ui::approval::APPROVAL_PAGE,
+            "premise: one PgDn is one page from the top"
         );
 
-        let scrolled = render(&s, 0, 100, 12);
-        let before = visible_row(&short).expect("the notice states a row before scrolling");
-        let after = visible_row(&scrolled).expect("and after");
-        assert!(
-            after > before,
-            "paging must move the window this call site renders ({before} -> {after}):\n\
+        let scrolled = render(&s, 0, 100, 10);
+        let (before, total) =
+            visible_row(&short).expect("the notice states a row before scrolling");
+        let (after, _) = visible_row(&scrolled).expect("and after");
+        assert_eq!(
+            after,
+            before + crate::ui::approval::APPROVAL_PAGE,
+            "paging must move this call site's window exactly one page \
+             ({before} -> {after}); landing anywhere else means the offset it \
+             renders is not the one the key handler moved:\n\
              before: {short:?}\nafter: {scrolled:?}"
+        );
+        assert!(
+            after < total,
+            "and must not land at the bottom, which is where reading `max_scroll` \
+             as the scroll input would land ({after} of {total})"
         );
 
         let roomy = render(&s, 0, 100, 24);
