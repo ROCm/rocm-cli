@@ -4082,7 +4082,7 @@ async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
         //
         // Both arms are load-bearing and must stay: the catch-all below demands
         // `--engine lemonade`, which neither tier's text contains, so a host in
-        // either tier fails examine-49 the moment one of them is dropped. No CI
+        // either tier fails examine-60 the moment one of them is dropped. No CI
         // lane carries a detected, ROCm-unsupported GPU, so that regression is
         // silent here and only shows up on the first such runner.
         //
@@ -4162,6 +4162,21 @@ GPU0:
 \tdeviceType     = PHYSICAL_DEVICE_TYPE_CPU
 \tdeviceName     = llvmpipe (LLVM 15.0.7, 256 bits)
 \tdriverName     = llvmpipe
+";
+
+/// `vulkaninfo --summary` on a host whose only Vulkan device is a discrete
+/// NVIDIA GPU: real hardware, a real GPU path, and not one an AMD stack can
+/// use. Deliberately *not* a CPU device, so it takes the non-AMD arm rather
+/// than the software-only one.
+const NVIDIA_VULKANINFO_SUMMARY: &str = "\
+Devices:
+========
+GPU0:
+\tapiVersion     = 1.3.260
+\tvendorID       = 0x10de
+\tdeviceType     = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+\tdeviceName     = NVIDIA GeForce RTX 4070
+\tdriverName     = nvidia
 ";
 
 /// Plant a host whose GPU is identified but has no ROCm package family,
@@ -4329,6 +4344,82 @@ async fn unsupported_gpu_with_masked_vulkan_driver(world: &mut E2eWorld) {
         world,
         Some("radeon_icd.x86_64.json"),
         Some(LAVAPIPE_VULKANINFO_SUMMARY),
+    );
+}
+
+/// examine-66: a GPU ICD beside an enumeration of real, non-AMD hardware.
+#[given(
+    "a machine whose GPU has no official support and a Vulkan driver that enumerates only non-AMD hardware"
+)]
+async fn unsupported_gpu_with_non_amd_enumeration(world: &mut E2eWorld) {
+    plant_unsupported_gpu(
+        world,
+        Some("radeon_icd.x86_64.json"),
+        Some(NVIDIA_VULKANINFO_SUMMARY),
+    );
+}
+
+/// examine-67: a GPU ICD, and a `vulkaninfo` that runs, exits 0 and lists
+/// nothing. `plant_unsupported_gpu`'s `None` summary is exactly that stub —
+/// see its doc comment — so the answer is in hand and empty.
+#[given("a machine whose GPU has no official support and a Vulkan driver that enumerates nothing")]
+async fn unsupported_gpu_with_empty_enumeration(world: &mut E2eWorld) {
+    plant_unsupported_gpu(world, Some("radeon_icd.x86_64.json"), None);
+}
+
+/// examine-68: examine-67 with the `vulkaninfo` stub taken away, so nothing
+/// ever answered. `PATH` is narrowed to the fake directory for the same reason
+/// `unsupported_gpu_without_vulkaninfo` narrows it: otherwise a runner with a
+/// real `vulkaninfo` installed answers for the fixture.
+#[given("a machine whose GPU has no official support and a Vulkan driver but no way to enumerate")]
+async fn unsupported_gpu_with_driver_but_no_vulkaninfo(world: &mut E2eWorld) {
+    plant_unsupported_gpu(world, Some("radeon_icd.x86_64.json"), None);
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::remove_file(bin.join("vulkaninfo")).expect("failed to remove the planted vulkaninfo");
+    let path =
+        std::env::join_paths(std::iter::once(bin)).expect("fake-bin cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[then("the inspection says none of the enumerated devices is an AMD GPU")]
+async fn assert_non_amd_enumeration_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("none of the devices it enumerated is an AMD GPU"),
+        "the report must say what it actually found -- real hardware that is not AMD -- \
+         rather than a missing driver:\n{output}"
+    );
+    assert!(
+        !output.contains("install `vulkaninfo` to confirm"),
+        "`vulkaninfo` ran and answered, so the host must not be sent to install it:\n{output}"
+    );
+}
+
+#[then("the inspection says vulkaninfo ran and listed no device")]
+async fn assert_empty_enumeration_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("`vulkaninfo` ran and listed no device"),
+        "an answered-but-empty enumeration must be reported as such:\n{output}"
+    );
+    assert!(
+        !output.contains("install `vulkaninfo` to confirm"),
+        "the tool is already installed and has already answered:\n{output}"
+    );
+}
+
+#[then("the inspection asks for vulkaninfo to confirm")]
+async fn assert_unenumerated_asks_for_vulkaninfo(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("no device was enumerated (install `vulkaninfo` to confirm)"),
+        "this is the one arm where the tool really is missing, so the advice is true \
+         here and must be given:\n{output}"
     );
 }
 

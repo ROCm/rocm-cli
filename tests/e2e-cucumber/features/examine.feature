@@ -1010,3 +1010,44 @@ Feature: GPU detection and system inspection
   # literals. Covering it end to end means either driving `rocm examine`'s
   # banner (it does probe) or giving the listing a probe, which is the cost
   # decision recorded on `host_gpu_support_level`.
+
+  # The remaining three arms of the "a GPU driver is installed, but nothing
+  # confirms it reaches a GPU" split. examine-65 covers the fourth (a software
+  # renderer masking it); all four render the same `vulkan:` status and differ
+  # only in the sentence that tells the user what to do next, so the status
+  # alone cannot tell them apart and each needs its own scenario (AGENTS.md
+  # section 3).
+  #
+  # This one enumerates real hardware that is simply not AMD. It must not be
+  # reported as a missing driver, and must not be told to install `vulkaninfo`
+  # -- the tool ran and answered.
+  @id:examine-names-a-non-amd-enumeration-as-such @requires-os:linux
+  Scenario: examine-66 - A machine whose only Vulkan device is not an AMD GPU is told exactly that
+    Given a machine whose GPU has no official support and a Vulkan driver that enumerates only non-AMD hardware
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection says none of the enumerated devices is an AMD GPU
+
+  # `vulkaninfo` ran, exited 0 and listed nothing. The answer is in hand, so
+  # sending this user to install `vulkaninfo` would name a tool they already
+  # have -- the usual cause is a `render`-group permission problem.
+  @id:examine-does-not-send-an-answered-host-after-vulkaninfo @requires-os:linux
+  Scenario: examine-67 - A machine whose Vulkan driver enumerates nothing is not sent to install vulkaninfo
+    Given a machine whose GPU has no official support and a Vulkan driver that enumerates nothing
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection says vulkaninfo ran and listed no device
+
+  # examine-67 with one thing changed: no `vulkaninfo` on the host at all. This
+  # is the only one of the four where "install `vulkaninfo` to confirm" is true,
+  # and the pair is the test -- an implementation that stops distinguishing
+  # "answered empty" from "never ran" passes one and fails the other.
+  @id:examine-asks-an-unanswered-host-to-install-vulkaninfo @requires-os:linux
+  Scenario: examine-68 - A machine with a Vulkan driver but no vulkaninfo is asked to install it
+    Given a machine whose GPU has no official support and a Vulkan driver but no way to enumerate
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection asks for vulkaninfo to confirm
