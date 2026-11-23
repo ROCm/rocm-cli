@@ -4286,7 +4286,7 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_secs(3)).await;
     };
     let block = last_seen.as_str();
-    let (backend, _ordinal) = parse_device_row(&device).unwrap_or_else(|| {
+    let (backend, ordinal) = parse_device_row(&device).unwrap_or_else(|| {
         panic!(
             "`device: {device}` is not the `<backend> [gpu <n>] [(<name>)]` shape \
              every engine reports, so it cannot be the engine's own answer:\n{block}"
@@ -4313,6 +4313,38 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
         "`device: {device}` names backend `{backend}`, which the `{engine}` \
          engine cannot have selected (expected one of {allowed:?}):\n{block}"
     );
+
+    // The dynamic half of the row, which the backend check above cannot reach.
+    //
+    // `vllm` and `aim` hardcode their backend word (`reported_device` in each
+    // engine's `state.rs` passes the literal `"rocm"`, correctly - neither has a
+    // non-ROCm backend), so for those engines the allow-list above is satisfied
+    // by any implementation, including a static one. What is NOT static is the
+    // ordinal and the GPU name: both are read out of the engine's own state by
+    // `first_gpu_index_from_state` / `gpu_name`. Asserting on them is what makes
+    // this step discriminate on the vLLM canary rather than only on Lemonade.
+    //
+    // Deliberately conditional on the parts being present, and that is a
+    // limitation rather than an oversight: `Launched::gpu_indices` is an
+    // `Option` precisely so "could not tell" is distinct from "no GPU", so a
+    // correct engine may legitimately report a bare backend. Asserting their
+    // presence outright is the same false failure this function's note below
+    // records an earlier revision making. What is asserted is that when the
+    // engine does answer with them, the answer is real: a name is never the
+    // backend word echoed back, and an ordinal is one a host can actually have.
+    if let Some(ordinal) = ordinal {
+        assert!(
+            ordinal < 64,
+            "`device: {device}` reports GPU ordinal {ordinal}, which no lane has -              a plausible ordinal is what shows it came from the engine's recorded              `gpu_indices` rather than being synthesised:\n{block}"
+        );
+    }
+    if let Some((_, name)) = device.split_once(" (") {
+        let name = name.trim_end_matches(')').trim();
+        assert!(
+            !name.is_empty() && !name.eq_ignore_ascii_case(backend),
+            "`device: {device}` carries a GPU name that is empty or just the              backend word echoed back, so it cannot be the adapter the engine              actually reported:\n{block}"
+        );
+    }
 
     // The same fact, read from the other surface. `rocm serve` printed this row
     // at launch; nothing else in these scenarios inspects that summary, so

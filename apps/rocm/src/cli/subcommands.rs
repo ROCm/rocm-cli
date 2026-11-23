@@ -496,7 +496,9 @@ pub(crate) enum ServicesCommand {
     ///
     /// Stops the server first, and starts it again only once every process it
     /// recorded is confirmed gone. If the stop cannot confirm that, nothing is
-    /// started and the stop request stays recorded on the server.
+    /// started and the stop request stays recorded. A server that dies during
+    /// the restart fails loudly: its exit status and a log pointer are printed,
+    /// and the record is marked `failed`.
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,

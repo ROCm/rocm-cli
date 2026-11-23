@@ -94,7 +94,13 @@ pub(crate) fn builtin_codex_bridge_engine_inventory(
         .iter()
         .map(|(id, summary)| CodexBridgeEngine {
             id: (*id).to_owned(),
-            summary: engine_inventory_note(id, summary, gpu_support_level).to_owned(),
+            summary: engine_inventory_note(
+                id,
+                summary,
+                gpu_support_level,
+                crate::examine_report_text::InventorySurface::Standalone,
+            )
+            .to_owned(),
             default_for_platform: *id == default_engine,
             installed_binary: true,
             binary_path: binary_path.clone(),
