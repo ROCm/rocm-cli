@@ -44,6 +44,7 @@
 #   SETTLE_RESULT         `e2e-gpu-settled`'s own result. Anything but `success` (or
 #                         `skipped`) leaves the self-hosted result unknown: absent
 #                         where the either-or rule applies, a failure where it does not.
+#                         Except that the lane's own stale marker wins: absent.
 #   SELFHOSTED_RESULT     `e2e-gpu`'s result: the `needs` vocabulary plus
 #                         `abandoned` and `absent` (see settle-e2e-lanes.sh).
 #   SELFHOSTED_ARTIFACT   the self-hosted lane's report artifact name.
@@ -164,8 +165,8 @@ mark=":white_check_mark:"
     echo "- A self-hosted lane that was cancelled, skipped or never got a runner counts as absent, not failed."
   fi
 } >>"${summary_file}"
-echo "MI300X queue lane: ${queue}; self-hosted lane: ${selfhosted}; ${reason}"
+echo "MI300X queue lane: ${queue_label}; self-hosted lane: ${selfhosted_label}; ${reason}"
 if [[ "${verdict}" != 0 ]]; then
-  echo "::error::MI300X requirement not met: ${reason} (queue: ${queue}, self-hosted: ${selfhosted})"
+  echo "::error::MI300X requirement not met: ${reason} (queue: ${queue_label}, self-hosted: ${selfhosted_label})"
 fi
 exit "${verdict}"

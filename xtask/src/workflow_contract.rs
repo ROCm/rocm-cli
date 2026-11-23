@@ -3515,6 +3515,25 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             summary.contains("(`e2e-gpu`): cut off, no report (result: cancelled)"),
             "{summary}"
         );
+        // The same label for the queue lane, and only off a queue run: where either lane
+        // suffices a cancelled lane is plainly absent.
+        let (code, log, summary) = run_mi300x_gate_settled(false, "cancelled", "", &[], "success");
+        assert_eq!(code, 1, "{log}");
+        assert!(
+            summary.contains("(`e2e-gpu-queue`): cut off, no report (result: cancelled)"),
+            "{summary}"
+        );
+        assert!(
+            log.contains("queue: cut off, no report"),
+            "the annotation says it too: {log}"
+        );
+        let (_, _, summary) =
+            run_mi300x_gate_settled(true, "cancelled", "cancelled", &[], "success");
+        assert!(
+            summary.contains("(`e2e-gpu-queue`): absent (result: cancelled)")
+                && !summary.contains("cut off"),
+            "{summary}"
+        );
         // An empty result with a healthy settle job is a lane absent from the run.
         let (code, log, _) = run_mi300x_gate_settled(false, "skipped", "", &[], "success");
         assert_eq!(code, 0, "{log}");
