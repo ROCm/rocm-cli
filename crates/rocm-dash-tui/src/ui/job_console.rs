@@ -75,12 +75,25 @@ pub fn console_esc_closes(job: Option<&JobState>) -> bool {
     job.is_some_and(|j| !j.is_terminal())
 }
 
+/// Stop the job a console is showing — the single teardown for a console job.
+///
+/// Flips the reducer's shared cancel flag (which `crate::jobs::run_job` polls
+/// and answers by killing the child) and marks the job `Cancelled`. Two callers:
+/// the `Ctrl+C` arm of [`on_console_key`] below, and the serve wizard's
+/// focused-host leave, where returning from the overlay would otherwise tear the
+/// window's runtime down and kill the child implicitly through `kill_on_drop`.
+/// An overlay that must stop its job before closing calls this instead of
+/// open-coding a second `CancelJob` apply or leaning on that drop.
+pub fn cancel_job(job_id: &str, jobs: &mut State) -> Vec<SideEffect> {
+    jobs.apply(StateEvent::CancelJob(job_id.to_string()))
+}
+
 /// Interpret a key while a job console is showing `job_id`. Pure except for the
 /// `CancelJob` reducer apply (which only mutates the in-memory job model).
 pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleOutcome {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ConsoleOutcome::Cancelled(jobs.apply(StateEvent::CancelJob(job_id.to_string())))
+            ConsoleOutcome::Cancelled(cancel_job(job_id, jobs))
         }
         // `q` is always answered with `Closed`, never swallowed, so the user is
         // never trapped mid-job. The invariant is about the key reaching the
@@ -300,12 +313,21 @@ mod tests {
             cmd: "sleep".into(),
             args: vec!["1".into()],
         });
-        // Ctrl+C cancels (returns effects).
+        // Ctrl+C cancels (returns effects). Assert the job's status too, not
+        // just the outcome variant: `cancel_job` is the single teardown every
+        // console job goes through, so a version of it that stopped applying
+        // `CancelJob` would still return `Cancelled(_)` here and leave the job
+        // running underneath.
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
             on_console_key("j", &mut s, ctrl_c),
             ConsoleOutcome::Cancelled(_)
         ));
+        assert_eq!(
+            s.job("j").map(|j| &j.status),
+            Some(&rocm_dash_core::state::JobStatus::Cancelled),
+            "Ctrl+C must actually cancel the job, not only report that it did"
+        );
         // `q` yields `Closed` regardless of job state. What the owning overlay
         // then does is its own choice (see `ConsoleExit`): all but one leave at
         // once, the serve wizard's still-starting launch asks first.

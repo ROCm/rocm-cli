@@ -2559,6 +2559,66 @@ async fn open_dashboard_from_launcher(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the dashboard did not open from the launcher: {e}"));
 }
 
+/// The launcher's "Serve a model" row (`LauncherChoice::Serve`, index 1 of
+/// `ui::launcher::ROWS`, after "Set up this system"), which routes to
+/// `run_focused(Focus::Serve)` — a focused host, not the full dashboard.
+///
+/// The form's own panel title is also "Serve a model", the same words as the
+/// menu row that opens it, so the title cannot tell the two screens apart.
+/// `[ Launch ]` can: it is the form's launch button and the front door never
+/// draws it.
+#[when("the user chooses to serve a model from the launcher")]
+async fn open_serve_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the front door before sending keys, same rationale as
+    // `open_dashboard_from_launcher`.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // Serve has no single-key shortcut like `d` (`OpenDashboard`'s): it is the
+    // 2nd row, one move down from the default (Set up) selection, then `Enter`
+    // (`choice_for(sel)`).
+    tui.send("j")
+        .unwrap_or_else(|e| panic!("failed to select Serve in the launcher: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open the serve flow from the launcher: {e}"));
+    tui.wait_for_screen("[ Launch ]", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve form did not open from the launcher: {e}"));
+}
+
+/// The focused host is asserted by what only it draws: `ui::draw_focused`'s
+/// single footer hint, whose whole point is that this window returns to the
+/// launcher menu rather than to a tab shell. The full dashboard draws its tab
+/// legend there instead — so a regression that routed this row into the
+/// dashboard (or that opened the form over a tab shell) fails here rather than
+/// passing on the form alone, which both routes show.
+#[then("the serve form is shown in a window that offers the way back to the menu")]
+async fn focused_serve_window_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Esc  back to menu", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the serve form did not open as a focused window — if the form is \
+                 showing but this footer is not, the launcher's Serve row stopped \
+                 routing to `run_focused`: {e}"
+            )
+        });
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("[ Launch ]"),
+        "the focused window is not showing the serve form:\n{screen}"
+    );
+    // "Updates" is the marker `open_dashboard_from_launcher` waits for to prove
+    // the FULL dashboard opened, so its absence is what distinguishes the two
+    // routes from the same menu.
+    assert!(
+        !screen.contains("Updates"),
+        "the Serve row opened the full dashboard instead of a focused window:\n{screen}"
+    );
+}
+
 #[when("the user quits back to the launcher")]
 async fn quit_back_to_launcher(world: &mut E2eWorld) {
     let tui = session(world);

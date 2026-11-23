@@ -1156,9 +1156,15 @@ with the ROCm SDK in use, and rewrites the two pins it owns
 (`therock.version` and `llamacpp.rocm-stable` in `resources/backend_versions.json`)
 to do so. If installing an already-pinned backend fails, it restores those two
 pins from the cached Lemonade archive (it does not download), prints a warning,
-and installs once more; see
+and installs once more. When the backend cannot be aligned to the active ROCm
+version, the install keeps the backend Lemonade pins. For 24 hours after that,
+an install with the same ROCm version, pin and Lemonade version reuses that
+backend without trying the alignment again; if preparing it fails,
+the error says the alignment was skipped and why.
+`rocm engines install lemonade --reinstall` re-extracts Lemonade without that
+record, so it tries the alignment again sooner. See
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
-`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
+`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns all of this off.
 
 Before Lemonade writes a new install, whether from `rocm engines install
 lemonade` or the first `rocm serve` that needs it, it prints the folder it is
@@ -1839,6 +1845,29 @@ alone: a healthy model with no endpoint needs `attach`, not a restart. `stop`
 withdraws the endpoint and stops the model, and keeps the session listed if it
 cannot confirm both. Use `--force` to forget one whose machine is gone.
 
+Sessions are recorded under the data directory in `remote-sessions/`, which is
+created accessible to your user only on Linux; `serve` refuses to use one that
+another user owns, and says so before it prepares the machine. If
+`remote-sessions` is a link to a directory other users can access, it is
+refused rather than changed: restrict the directory it points at with
+`chmod 700`. A record is skipped with a warning rather than acted on if it
+names a remote command other than the ones `serve` writes, if its session id
+holds anything but lowercase letters, digits and `-`, if it is not named after
+its own session id, if it is not a regular file, or, on Linux, if it is owned
+by another user. That includes running `rocm remote`
+under `sudo` against your own records: run it as the user who created the
+session. `status` with no session named counts refused records instead of
+reporting no sessions, since the model a refused record describes may still be
+running. `stop` cannot reach a refused record, and a session name that matches
+a refused record's file name as well as a usable session is refused as
+ambiguous rather than resolved to the usable one. Only the record's file name,
+which holds the peer name, is compared: a name that is not part of the peer
+name, such as an ssh alias or an IP address, cannot match a refused record, so
+use the exact session id when one is refused. `serve` on the machine and
+port a refused record names refuses with that record's warning instead of
+offering `stop`.
+Removing a record forgets the session but does not stop it on the machine.
+
 Communication with the machine uses your existing `ssh` setup. Set
 `ROCM_REMOTE_SSH_CONFIG` to point at a configuration file other than the
 default.
@@ -1928,6 +1957,20 @@ standard input, it sends one prompt and prints the reply.
   change the wait; an unset, empty, non-numeric or out-of-range value keeps the
   2 minutes.
   The timeout message names the wait that applied and this variable.
+
+With `--prompt`, the reply and tool output are printed with terminal escape
+sequences and invisible characters removed, so a reply cannot hide part of a
+line, retitle the window or write the clipboard; text it tried to hide is
+shown. Every `rocm` error report is printed the same way. A change the assistant asks for with `--tools` is not made from
+`--prompt`: it is shown as an `advanced manual command:` line, quoted for a
+POSIX shell. A value the assistant chose, in that line or in a plan it asked
+for, is refused if it holds a character a Windows shell reads as syntax even
+inside those quotes, such as `'`, `&` or `%`; the message tells you to run the
+command yourself with that value. A folder the CLI takes from your own
+request, such as `install therock into <folder>`, is shown as you typed it; a
+folder that reaches the CLI through the assistant's request is held to the
+rule, even if you named it first.
+See the LLM tool-use design notes in the documentation for the exact set.
 
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
@@ -2200,18 +2243,69 @@ When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the ROCm CLI binaries in that build
 directory.
 
-Before removing anything, `uninstall` prints warnings about two situations:
+Before removing anything, `uninstall` prints warnings, among them:
 
 - Managed service records exist. `uninstall` doesn't stop their background
   processes.
 - Remote sessions exist. For each one, run `rocm remote stop <session>` first.
   Otherwise the model keeps running on the remote machine with its endpoint
   published, and the record that tracked it is gone.
+- Remote session records exist that `rocm remote` refuses to use.
+  `rocm remote stop` cannot reach them, so check each machine they name before
+  uninstalling.
 
-It also lists the shared caches it leaves in place, when they live outside the
-ROCm CLI directories: a `uv` package cache that `UV_CACHE_DIR` or the default
-`~/.cache/uv` points to, and the Hugging Face model cache. Delete them yourself
-if you no longer need them.
+It also names the shared caches: a `uv` package cache that `UV_CACHE_DIR` or
+the default `~/.cache/uv` points to, and the Hugging Face model cache. One that
+lives outside the folders being removed is left in place; delete it yourself if
+you no longer need it. If one sits inside a folder being removed (for example
+`ROCM_CLI_CACHE_DIR=~/.cache`), the review says it WILL BE DELETED before you
+confirm, and which `--keep-` flag keeps it.
+
+`rocm uninstall` removes a config, data, or cache folder inside your home
+folder as usual. It never removes:
+
+- `/`, your home folder, or a folder that contains it;
+- `/usr`, `/etc`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/sys`, `/proc`, `/dev`,
+  `/run`, `/media`, `/snap`, `/mnt/wsl`, `/mnt/wslg`, or anything inside them — on Windows, `Windows`,
+  `Program Files`, `Program Files (x86)` and `ProgramData` on the system drive,
+  and the same folders on a drive WSL mounts at `/mnt/<drive>`;
+- a folder other programs share: anything directly under `/` (`/opt`, `/srv`,
+  `/tmp`, ...), `/var/lib`, `/var/cache`, `/var/log`, `/var/tmp`, or a mounted
+  drive itself (`/mnt/c`);
+- another user's home folder (anything under `/home`, `/Users`, `C:\Users`
+  or a WSL drive's `Users`, or beside your own home, that is not inside yours).
+
+Anywhere else outside your home folder — `/opt/rocm-cli`, `/srv/rocm`,
+`/mnt/d/rocm`, another disk — it removes a folder only if it carries a
+`.rocm-cli-root` file. ROCm CLI writes that file only into a folder it creates
+itself: the config, data and cache folders when its setup, its first log line
+or its first config save creates them, the cache folder its download metadata
+or a vLLM install first writes to, and an SDK `--prefix` it creates. A folder
+that already existed, one made by hand, one made by a release before this one,
+or one some other command happened to create first is not marked, and is
+refused rather than removed until you create the file or keep the folder. The check looks at where a folder really is as well as how it is
+written, so `ROCM_CLI_DATA_DIR=.` run from your home folder, a home reached
+through a linked parent folder, or a system folder reached through a link is
+caught too. A setting that names a file or a link rather than a folder is
+judged by where its folder really is: with `~/x` a link to `/etc`,
+`~/x/config.json` is refused as `/etc/config.json`. The link itself is only
+unlinked, never followed. If a system folder that exists cannot be resolved,
+nothing can be judged against it, so the uninstall is refused as unresolvable.
+
+If a folder is refused (for example `ROCM_CLI_DATA_DIR=/`, or an SDK installed
+with `--prefix ~`), the review lists it under "Refused" with why and the
+setting it came from, the command exits with an error, and nothing is removed.
+The message says what clears it: re-run with the `--keep-config`,
+`--keep-data`, or `--keep-cache` flag to leave that folder in place; point the
+`ROCM_CLI_*_DIR` variable it came from elsewhere; or, for an unmarked folder
+that is ROCm CLI's, create the `.rocm-cli-root` file it names. For a folder
+set by `setup.therock_venv`, use `--keep-data`: moving that setting would leave
+the SDK installed there behind. The same flags work in the dashboard's
+`/uninstall` and in the assistant's preview, and their refusals name the same
+setting. Between the review and the removal, each folder is resolved again;
+if it now points somewhere else, the uninstall stops instead.
+`rocm runtimes uninstall` and `rocm storage remove-old-installs` keep their own
+rule for runtime folders.
 
 ### Shell completions
 

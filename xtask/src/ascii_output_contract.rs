@@ -101,13 +101,14 @@ mod tests {
             "crates/rocm-core/src/terminal.rs",
             "A classifier for untrusted terminal output, and the one file in the tree \
              whose job is to name non-ASCII characters rather than print them. Every \
-             literal here is a `Cf`/`Zl`/`Zp` code point in a `matches!` arm of \
-             `is_control_or_format`/`is_control_or_line_separator`, enumerated so it can \
-             be *removed* from a captured subprocess log before that log is quoted back \
-             at the user. The module emits no text of its own: both public functions \
-             return substrings of their input. Transliterating a code point here would \
-             not change any output, it would stop the stripper recognising the thing it \
-             exists to strip.",
+             non-ASCII literal outside its tests is a code point it compares a \
+             character against (a control, format, separator or other \
+             default-ignorable character), named so it can be removed from untrusted text, or refused in a \
+             value, before it is printed. The module prints nothing: the text its \
+             functions return is made of their input's characters, plus `\\n` where \
+             a line break is normalised. Transliterating a code point here would not \
+             change any output, it would stop the module recognising the thing it \
+             exists to remove.",
         ),
         (
             "apps/rocm/src/cli_progress.rs",

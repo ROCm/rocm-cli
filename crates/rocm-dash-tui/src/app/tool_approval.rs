@@ -164,6 +164,13 @@ mod tests {
     }
 
     impl crate::tool_exec::RocmToolExecutor for RecordingExecutor {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(
             &self,
             name: &str,
@@ -217,6 +224,13 @@ mod tests {
     struct CapturedFailureExecutor;
 
     impl crate::tool_exec::RocmToolExecutor for CapturedFailureExecutor {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(
             &self,
             name: &str,
