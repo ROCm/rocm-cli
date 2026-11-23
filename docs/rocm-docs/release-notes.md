@@ -170,8 +170,12 @@ installation consistent across Linux distributions.
 ### Install and uninstall
 
 - Fixed `rocm install sdk --dry-run` downloading `uv` and installing a managed
-  Python on a host without one. The preview now says that a real install would
-  prepare Python (`python_note:`) and changes nothing.
+  Python on a host without a usable Python. The preview now says that a real
+  install would prepare Python (`python_note:`) and changes nothing.
+- Fixed `rocm install sdk --dry-run` for a ROCm 10 SDK downloading `uv` to
+  choose the torch and torchvision versions, even on a host with a usable
+  Python. The preview now uses `uv` only if one is already installed. Without
+  one, it leaves those versions unresolved and says why (`resolution_note:`).
 - Fixed `rocm uninstall --dry-run` creating the folders that it then listed for
   removal.
 - Fixed `rocm uninstall` leaving behind the `PATH` change that the installer
@@ -191,8 +195,6 @@ installation consistent across Linux distributions.
   pinned to 2026.44.1, which has one.
 - Fixed a vLLM install being reported as usable before its pinned `tensorizer`
   package imports.
-- Fixed `rocm install sdk --dry-run` fetching `uv` for a ROCm 10 SDK. The
-  preview no longer downloads anything.
 - Fixed the update check preparing a managed Python.
 - Fixed the installer not configuring fish when fish isn't the login shell.
 - Fixed installer download progress drawing outside the terminal.
@@ -346,7 +348,8 @@ installation consistent across Linux distributions.
 - The AIM engine runs the same vLLM server inside its container but doesn't
   install the every-route key check. A key-protected AIM endpoint has only
   vLLM's own `VLLM_API_KEY` check, so routes such as `/invocations`,
-  `/tokenize`, and `/metrics` answer without the key.
+  `/tokenize`, and `/metrics` answer without the key. This is fixed in builds
+  made after 0.3.0, which require the endpoint key on every server route.
 - On ROCm SDK 10.2.0 with Lemonade 2026.44.1 (observed on Strix Halo in WSL2),
   copies between ordinary host memory and the GPU run at roughly 20 MiB/s, more
   than 100 times slower than on 10.1.0, so loading a large model takes many

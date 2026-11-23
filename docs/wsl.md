@@ -22,11 +22,6 @@ The AMD WSL path is:
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
 
-Ubuntu 22.04 is not supported. It ships glibc 2.35, below the minimum that every
-published Lemonade embeddable requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the
-Lemonade engine cannot start there. Ubuntu 24.04 provides glibc 2.39 and
-`GLIBCXX_3.4.33`.
-
 To run a read-only preflight check from inside the distro:
 
 ```bash

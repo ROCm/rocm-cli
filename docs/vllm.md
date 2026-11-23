@@ -260,13 +260,14 @@ with those fallback pins, the same reasons are appended to the error after the
 install's own failure, because the series match is the combination this step
 exists to avoid.
 
-The final install of vllm, flash-attn, and amd-aiter also resolves vLLM's own
+Once the pins are chosen, the install of vllm, flash-attn, and amd-aiter also
+resolves vLLM's own
 plain-PyPI transitive dependencies (for example, `lm-format-enforcer`), which
 AMD's index doesn't host. A generated `uv.toml` sets `ignore-error-codes = [403]`
 for that index so `uv` falls through to PyPI for those instead of treating the
 index's 403 as fatal.
 
-The full-dependency resolve in that final install can also pull in an unconstrained `torch`
+The full-dependency resolve in that install can also pull in an unconstrained `torch`
 from PyPI, undoing the exact ROCm pin just installed, and transitively an
 unconstrained `torchvision` and `torchaudio` with it. The install re-pins all
 three back to the exact builds discovered above immediately afterwards.
