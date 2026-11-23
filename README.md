@@ -2196,7 +2196,8 @@ Each `--keep-*` flag skips the removal of one category:
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.
 - `--keep-data` keeps app data such as logs, services, engines, downloaded
-  models, the managed ROCm SDK installs, and the managed `uv` package cache.
+  models, the managed ROCm SDK installs, the managed Python interpreters
+  (`<data-dir>/python`), and the managed `uv` package cache.
 - `--keep-cache` keeps the caches under the cache directory. It doesn't cover
   the managed `uv` package cache, which `--keep-data` controls.
 
@@ -2255,7 +2256,9 @@ Before removing anything, `uninstall` prints warnings, among them:
   uninstalling.
 
 It also names the shared caches: a `uv` package cache that `UV_CACHE_DIR` or
-the default `~/.cache/uv` points to, and the Hugging Face model cache. One that
+the default `~/.cache/uv` points to, and the Hugging Face model cache. An ambient
+`UV_PYTHON_INSTALL_DIR` is honoured; otherwise interpreters live in the data
+directory and go with it. One that
 lives outside the folders being removed is left in place; delete it yourself if
 you no longer need it. If one sits inside a folder being removed (for example
 `ROCM_CLI_CACHE_DIR=~/.cache`), the review says it WILL BE DELETED before you
