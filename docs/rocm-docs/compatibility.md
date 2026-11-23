@@ -18,6 +18,16 @@ copied. Keep this page status-only: exact package versions live in
 docs/vllm.md and the engine code, so they are not repeated here.
 -->
 
+The engine tables below use these statuses:
+
+- **Supported**: `rocm engines install` sets up the engine for this
+  combination, and it has run on GPU hardware.
+- **Partial**: `rocm engines install` sets up the engine, but GPU serving is
+  confirmed only in a limited setup. The note under the table says which.
+- **Not verified**: `rocm engines install` sets up the engine, but it hasn't
+  been confirmed on GPU hardware.
+- **Not supported**: ROCm CLI doesn't offer the install, or refuses it.
+
 ## Platforms
 
 ```{include} ../../README.md
@@ -30,16 +40,6 @@ needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 [ROCm CLI on WSL2](install/wsl.md).
 
 ## Engines by platform
-
-The engine tables below use these statuses:
-
-- **Supported**: `rocm engines install` sets up the engine for this
-  combination, and it has run on GPU hardware.
-- **Partial**: `rocm engines install` sets up the engine, but GPU serving is
-  confirmed only in a limited setup. The note under the table says which.
-- **Not verified**: `rocm engines install` sets up the engine, but it hasn't
-  been confirmed on GPU hardware.
-- **Not supported**: ROCm CLI doesn't offer the install, or refuses it.
 
 ```{table}
 :widths: 16 28 28 28
