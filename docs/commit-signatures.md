@@ -79,9 +79,11 @@ prek install -t pre-push    # pre-push
   spellings) and `user.signingkey` is set, with remediation if not.
 - **pre-push**: `cargo xtask verify-commits` — verifies every outgoing commit
   in `origin/main..HEAD` is signed (signature present and not bad) and
-  signed-off. The base is fixed at `origin/main`, so keep it fetched
-  (`git fetch origin main`); on a branch targeting a different base, run the
-  check manually with `--base <ref>` for an accurate range.
+  signed-off. The base is whichever of `origin/main` and
+  `origin/release/*` is closest to `HEAD` (fewest commits ahead), so a branch cut
+  from a release branch is not checked against that branch's own history. Keep
+  them fetched (`git fetch origin`); for any other base, run the check manually
+  with `--base <ref>`.
 
 ### CI gate
 
@@ -106,7 +108,7 @@ repository ruleset so it blocks merges.
 
 | Flag                | Meaning                                                           |
 | ------------------- | ---------------------------------------------------------------- |
-| `--base <ref>`      | Base ref; checks `<base>..HEAD`. Defaults to `GITHUB_BASE_REF` (as `origin/<branch>`) in CI, else `origin/main`. |
+| `--base <ref>`      | Base ref; checks `<base>..HEAD`. Defaults to `GITHUB_BASE_REF` (as `origin/<branch>`) in CI, else the closest of `origin/main` and `origin/release/*`. |
 | `--require-verified`| Strict mode: require GitHub's `verification.verified` (needs `gh`). |
 | `--check-config`    | Instead of checking commits, assert local signing is configured. |
 

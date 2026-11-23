@@ -14,8 +14,56 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-/// Default base ref used when none is supplied on the command line.
+/// Default base ref used when none is supplied on the command line and no
+/// candidate base can be measured.
 const DEFAULT_BASE: &str = "origin/main";
+
+/// Remote namespace whose branches are also candidate bases, so a branch cut
+/// from a `release/*` branch is not checked against that branch's own history.
+const RELEASE_REF_PREFIX: &str = "refs/remotes/origin/release/";
+
+/// Pick the candidate base with the fewest commits ahead of it. `candidates`
+/// pairs a ref with its `<ref>..HEAD` commit count; the first of equal counts
+/// wins, so listing [`DEFAULT_BASE`] first makes it the tie-break.
+fn closest_base(candidates: &[(String, usize)]) -> Option<&str> {
+    let mut best: Option<&(String, usize)> = None;
+    for candidate in candidates {
+        if best.is_none_or(|current| candidate.1 < current.1) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(name, _)| name.as_str())
+}
+
+/// The base for a push with no explicit `--base`: whichever of `origin/main`
+/// and `origin/release/*` is closest to HEAD. Falls back to [`DEFAULT_BASE`]
+/// when no candidate resolves (e.g. nothing fetched).
+fn detect_base() -> String {
+    let mut refs = vec![DEFAULT_BASE.to_string()];
+    if let Ok(listing) = git(&[
+        "for-each-ref",
+        "--format=%(refname:short)",
+        RELEASE_REF_PREFIX,
+    ]) {
+        refs.extend(
+            listing
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+        );
+    }
+    let candidates: Vec<(String, usize)> = refs
+        .into_iter()
+        .filter_map(|name| {
+            let count = git(&["rev-list", "--count", &format!("{name}..HEAD")]).ok()?;
+            Some((name, count.parse().ok()?))
+        })
+        .collect();
+    closest_base(&candidates)
+        .unwrap_or(DEFAULT_BASE)
+        .to_string()
+}
 
 /// One commit's data, as gathered from git (and optionally GitHub), in the
 /// structured form the pure decision logic consumes.
@@ -257,10 +305,7 @@ pub fn run(base: Option<String>, require_verified: bool) -> Result<()> {
         std::env::var("GITHUB_BASE_REF")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .map_or_else(
-                || DEFAULT_BASE.to_string(),
-                |branch| format!("origin/{branch}"),
-            )
+            .map_or_else(detect_base, |branch| format!("origin/{branch}"))
     });
 
     let commits = collect_commits(&base, require_verified)?;
@@ -445,6 +490,29 @@ mod tests {
     #[test]
     fn signoff_absent_is_detected() {
         assert!(!body_has_signoff("Subject\n\nNo trailer here."));
+    }
+
+    fn cands(items: &[(&str, usize)]) -> Vec<(String, usize)> {
+        items.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn closest_base_prefers_release_branch_for_branch_cut_from_it() {
+        let c = cands(&[("origin/main", 40), ("origin/release/v0.3.0", 1)]);
+        assert_eq!(closest_base(&c), Some("origin/release/v0.3.0"));
+    }
+
+    #[test]
+    fn closest_base_prefers_main_for_branch_cut_from_main() {
+        let c = cands(&[("origin/main", 2), ("origin/release/v0.3.0", 30)]);
+        assert_eq!(closest_base(&c), Some("origin/main"));
+    }
+
+    #[test]
+    fn closest_base_ties_go_to_first_candidate() {
+        let c = cands(&[("origin/main", 3), ("origin/release/v0.3.0", 3)]);
+        assert_eq!(closest_base(&c), Some("origin/main"));
+        assert_eq!(closest_base(&[]), None);
     }
 
     #[test]
