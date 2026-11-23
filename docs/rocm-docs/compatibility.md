@@ -64,15 +64,16 @@ needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 | 10.0 | 3.14 (default) | Not verified |
 | 10.1 | 3.14 (default) | Supported |
 | 10.2 | 3.14 (default) | Partial |
-| 10.3 (nightly) | 3.14 (default) | Not supported |
+| Nightly | 3.14 (default) | Not supported |
 
 - **ROCm 7.x**: ROCm CLI installs the same vLLM build, made for ROCm 7.2.3, on
   any 7.x runtime. It hasn't been confirmed on other 7.x versions. A ROCm 7
   install accepts Python 3.12 only.
 - **ROCm 10.2**: vLLM installs and imports against a ROCm 10.2 SDK. It has
   served a model on a GPU under WSL2 only, not yet with a release SDK.
-- **ROCm 10.3 (nightly)**: no vLLM build exists for this version. The install
-  stops instead of using a build made for another ROCm version.
+- **Nightly**: `rocm install sdk --channel nightly` installs the newest nightly
+  build. The current nightly builds have no vLLM build, so the install stops
+  instead of using a build made for another ROCm version.
 - **Python on ROCm 10 and newer**: vLLM needs Python 3.14. If you don't need
   vLLM, you can pick Python 3.10 through 3.14 with
   `rocm install sdk --python-version`. For
