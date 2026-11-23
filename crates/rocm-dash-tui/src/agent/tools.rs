@@ -431,7 +431,7 @@ fn truncated_tool_result(
 /// any argv the bin classifies as mutating, since a read tool has no approval
 /// channel).
 ///
-/// `execute()` is synchronous and can block for seconds or longer: the bin's
+/// `execute_model_call()` is synchronous and can block for seconds or longer: the bin's
 /// read tools run host-probe subprocesses, make HTTP readiness probes of
 /// running managed services, and can fetch a package index (the SDK install
 /// preview) or call a configured model endpoint (a provider-assisted plan). So
@@ -449,7 +449,7 @@ async fn run_rocm_read_tool(
     let Some(exec) = exec.cloned() else {
         return json!({ "error": "ROCm tools are unavailable in this mode (demo/replay/mock)." });
     };
-    match tokio::task::spawn_blocking(move || exec.execute(name, &args)).await {
+    match tokio::task::spawn_blocking(move || exec.execute_model_call(name, &args)).await {
         Ok(RocmToolOutcome::Result(v)) => model_facing_tool_result(v, TOOL_RESULT_CHAR_BUDGET),
         Ok(RocmToolOutcome::Error(s)) => json!({ "error": s }),
         Ok(RocmToolOutcome::ApprovalRequired(_)) => {
@@ -674,8 +674,9 @@ pub const ROCM_READ_TOOL_NAMES: [&str; 14] = [
 
 // ---------------------------------------------------------------------------
 // Mutating ROCm tools (group D, Phase 4). These do NOT execute inside the rig
-// tool loop. `execute()` returns `ApprovalRequired(intent)` (a descriptor that
-// the bin's validators already accepted); the tool posts the intent to the app
+// tool loop. `execute_model_call()` returns `ApprovalRequired(intent)` (a
+// descriptor that the bin's validators, the model-only ones included, already
+// accepted); the tool posts the intent to the app
 // via `approval_tx` (a `ClientMsg::ChatApprovalRequired`) and returns a
 // "surfaced for approval" note to the model. The actual action runs only after
 // the operator approves the modal, via `execute_approved` off the event loop.
@@ -711,7 +712,7 @@ macro_rules! rocm_mutating_tool {
                 record(&self.fired, $name);
                 match self.executor.as_ref() {
                     None => Ok(json!({ "error": "ROCm tools unavailable in this mode." })),
-                    Some(e) => match e.execute($name, &args) {
+                    Some(e) => match e.execute_model_call($name, &args) {
                         RocmToolOutcome::ApprovalRequired(intent) => {
                             if let Some(tx) = self.approval_tx.as_ref() {
                                 let _ = tx.send(ClientMsg::ChatApprovalRequired { intent });
@@ -1163,6 +1164,13 @@ mod tests {
     #[derive(Debug)]
     struct FakeExec(serde_json::Value);
     impl crate::tool_exec::RocmToolExecutor for FakeExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::Result(self.0.clone())
         }
@@ -1392,6 +1400,13 @@ mod tests {
         approved: Arc<Mutex<Vec<String>>>,
     }
     impl crate::tool_exec::RocmToolExecutor for RecordingMutatingExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, name: &str, args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
                 title: "T".to_string(),
@@ -1521,6 +1536,13 @@ mod tests {
     struct NeedsRuntimeProgressExec;
     const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     impl crate::tool_exec::RocmToolExecutor for NeedsRuntimeProgressExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             let (tx, rx) = std::sync::mpsc::channel();
             tokio::runtime::Handle::current().spawn(async move {
@@ -1568,12 +1590,85 @@ mod tests {
     #[derive(Debug)]
     struct PanickingExec;
     impl crate::tool_exec::RocmToolExecutor for PanickingExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             panic!("executor bug");
         }
         fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
             self.execute(name, args)
         }
+    }
+
+    /// Executor that answers differently through its two entry points, so a
+    /// test can tell which one a tool used.
+    #[derive(Debug)]
+    struct EntryPointExec;
+    impl crate::tool_exec::RocmToolExecutor for EntryPointExec {
+        fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Result(json!({ "via": "execute" }))
+        }
+        fn execute_model_call(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
+            RocmToolOutcome::Result(json!({ "via": "execute_model_call" }))
+        }
+        fn execute_approved(&self, name: &str, args: &Value) -> RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    /// The agent's tools are the model's calls, so they go through
+    /// `execute_model_call`, where the bin applies the rules only a
+    /// model-chosen value is held to; `execute` is for the operator's own
+    /// slash commands.
+    #[tokio::test]
+    async fn the_agents_tools_reach_the_executor_as_model_calls() {
+        let read = ExamineRocmTool {
+            executor: Some(Arc::new(EntryPointExec)),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(
+            read.call(json!({})).await.expect("tool call ok"),
+            json!({ "via": "execute_model_call" })
+        );
+        let mutating = InstallSdkRocmTool {
+            executor: Some(Arc::new(EntryPointExec)),
+            approval_tx: None,
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(
+            mutating
+                .call(json!({ "prefix": "/tmp/x" }))
+                .await
+                .expect("tool call ok"),
+            json!({ "via": "execute_model_call" })
+        );
+    }
+
+    /// Every tool the agent registers is a model's call, so none of them may
+    /// reach the executor through `execute`, the operator's entry point: a tool
+    /// written that way would skip the model-only rules without failing
+    /// anything else. Read from the source so a new tool is covered as well.
+    #[test]
+    fn no_agent_tool_calls_the_operators_entry_point() {
+        let source = include_str!("tools.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production part");
+        let offending: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(".execute(") && !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "agent tools must call `execute_model_call`, not `execute`: {offending:?}"
+        );
+        assert!(production.contains(".execute_model_call("));
     }
 
     /// In-memory `tracing` writer, so a test can read back what was logged.
@@ -1648,6 +1743,13 @@ mod tests {
     #[derive(Debug)]
     struct FakeErrorExec;
     impl crate::tool_exec::RocmToolExecutor for FakeErrorExec {
+        fn execute_model_call(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
         fn execute(&self, _name: &str, _args: &Value) -> RocmToolOutcome {
             RocmToolOutcome::Error("boom".to_string())
         }

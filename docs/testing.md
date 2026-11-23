@@ -151,7 +151,9 @@ The guard accepts `ScopedTestEnv` or **any** static named `*_TEST_LOCK` taken
 inside the test body. The suffix is the rule, so a new lock
 is recognised the day it is declared rather than when someone remembers to add
 it to a list. The exemption is per test function, not per file: one test taking
-a lock does not cover its neighbours.
+a lock does not cover its neighbours. "Taken" means acquired: a `*_TEST_LOCK`
+counts only with a `.lock(` in the same statement, so `let _x = &SOME_TEST_LOCK;`
+names a lock without holding it and does not satisfy the guard.
 
 Two things the shape above gets right, both of which the guard checks only
 partly:
@@ -170,14 +172,19 @@ it reads what the panicking one left behind. `rocm-core`'s `RestoredEnvVar`
 unwinding runs it; prefer it where one exists. It restores but does not
 serialize, so the lock is still yours to take.
 
-Keep the mutation and the lock in the same test body. Three known blind spots,
-all of which the scan reports nothing for:
+Keep the mutation and the lock in the same test body. The scan reports nothing
+for any of these known blind spots:
 
 - A `#[test]` that delegates its mutation to a helper — the helper's body is a
   different scope, so the scan cannot see the two together. It matches call
   text, so a wrapper hides the mutation until the wrapper itself is named in the
   scanner's `MUTATIONS` list, as `RestoredEnvVar::set(` is. Add a new restoring
   helper to that list, or it is outside the guard.
+- A guard held by the test whose `Drop` mutates the environment — the mutation
+  runs in the `Drop` impl, which the scan never enters. List the call that
+  builds the guard in `MUTATIONS`, as `UnsetKeyOnExit::arm(` and
+  `EnvVarGuard::set(` are, and build it only through that call: constructing
+  the type directly leaves no listed text to match, and nothing enforces this.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
@@ -1242,7 +1249,10 @@ skill's catalog table; CI runs that test in the `test` job's `cargo nextest` ove
 and in the `windows-debug` job's `cargo test --workspace --all-targets`, whose steps run when the
 `heavy` category matches, as every `skills/` change does, while the hook's `test`
 step never tests `e2e-cucumber`, so in the hook this entry only adds the two clippy steps), and the
-e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+e2e PowerShell fixture also selects `rocm-core` (its tests `include_str!` it), and the e2e
+Lemonade install steps and serving steps also select `rocm-engine-lemonade` (its
+`alignment_record` tests `include_str!` them to check that the record's file name and the reinstall
+command they hard-code still match the engine's). The table is `CROSS_CRATE_READS` in
 [cross_crate_reads.rs](../xtask/src/cross_crate_reads.rs), and a unit test scans the workspace for
 `include_str!`, `include_bytes!`, manifest-relative reads and `repo_root().join("...")` calls in
 code (not in comments or string literals) that leave their crate and fails unless each one is
@@ -1251,8 +1261,9 @@ the reader is not skipped), and fails on a path Windows resolves differently (a 
 in `.` or a space), so a new cross-crate read cannot be added without a decision. A second test
 holds every table entry to that `rust` category.
 The scan has limits. A path held in a const (`.github/scripts/gpu-preflight.sh`, read through
-`SHARED_PREFLIGHT`) is not seen at all; its `rust` glob is pinned only by a per-glob sample test,
-which checks the glob is there, not that a test reads the file. And a read whose path is
+`SHARED_PREFLIGHT`) is not seen at all; the per-glob sample test pins that file's glob and checks
+the glob is there, not that a test reads the file (the `.github/scripts/**` glob is also held
+by the literal reads of `settle-e2e-lanes.sh`). And a read whose path is
 written out (an `include_str!` literal, a `CARGO_MANIFEST_DIR` chain ending in literal
 `.join("...")` segments, or `repo_root().join("...")` with a literal path) is checked file by
 file, but a test that derives the repo root in one place and joins the rest elsewhere (the result
@@ -2547,6 +2558,29 @@ The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
 local run, and a lower value is ignored. They are Unix-only because they plant
 symlinks.
 
+The uninstall properties also point roots at the sandbox's own home folder
+(directly, relative to the working directory, through `..`, and through a
+symlinked parent folder) and plant shared caches inside and outside the
+removed roots. They check that a
+protected root refuses the whole uninstall and removes nothing, that no file
+ROCm CLI did not create is deleted, and that the review says a shared cache
+WILL BE DELETED exactly when the removal deletes it.
+
+The protected-location rules live in `rocm-core` and are property-tested
+there against oracles restated from each policy, over seeds that include other
+users' homes, `/mnt`, `/run`, `/srv`, `/usr/local` and deeper system
+descendants, for several homes (including `/`). Runtime folders are refused
+inside the runtime system list; `rocm uninstall`'s roots are refused inside its
+own list (checked before any home allowance), at shared top-level folders and
+mounted drives, and in other users' homes, and need the `.rocm-cli-root`
+marker anywhere else outside home:
+
+```bash
+cargo test -p rocm-core --lib runtime::tests::delete_guard_properties
+cargo test -p rocm --bin rocm uninstall_
+cargo test -p rocm --bin rocm shared_cache
+```
+
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
 including a folder that cannot be checked stopping the uninstall before
@@ -2563,7 +2597,7 @@ line naming the same uninstall with `--yes` (and without `--force`), and
 `uninstall-16` (Linux, the `--yes` refusal) and `uninstall-17` (the `--force`
 refusal) run that line as printed and check it removes the config folder and
 keeps the data folder. The assistant's uninstall preview
-ends differently, since it has no flag to offer: it says removal needs approval,
+ends differently, since it has no command line to offer: it says removal needs approval,
 which `lifecycle_read_mutate_split_is_honest` in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) backs.
 `uninstall-13` to `uninstall-15` drive the confirmation prompt under a
 pseudo-terminal, which is the only way to reach it, and pin the shared `[y/N]`
@@ -2572,6 +2606,20 @@ with Ctrl-D, and for a plain no, each together with the config folder being left
 in place. They run on the default mock lane; the helper's other callers (`rocm fix`,
 the SDK-overwrite prompt) share it and are covered by its unit tests in
 [confirm.rs](../crates/rocm-core/src/confirm.rs).
+`uninstall-19` to `uninstall-25` cover the protected-location refusal: the top
+of the filesystem as the data folder, refused in a dry run (`uninstall-19`); the
+home folder, refused with the home file and config folder left in place, saying
+ROCm CLI never removes that folder, and the advised `--keep-data` then
+succeeding (`uninstall-20`); shared caches inside the
+cache folder named as deleted, then kept by `--keep-cache` and really deleted
+without it (`uninstall-21`); a data folder of `.` run from home, refused with
+nothing removed (`uninstall-22`); an unmarked folder outside home, refused with
+it left in place and without a claim that it is never removed, then, once the
+marker the refusal names is created, planned and really removed (`uninstall-23`); the
+dashboard's approved-command path naming `setup.therock_venv`, with the home
+file and config folder left in place (`uninstall-24`); and a data setting naming
+a file through a home-folder link to `/proc`, refused as the system file it
+really is with the config folder left in place (`uninstall-25`).
 The `uninstall` command does not start the file logger, which would otherwise
 create the data folder's `logs` folder before the plan is built:
 
@@ -2746,6 +2794,80 @@ cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_ass
 cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
 cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
 cargo test -p e2e-cucumber --lib chat_script_tests
+```
+
+What the chat prints from a model, and what it offers to paste, is covered by
+three more mock-lane scenarios in the same feature file (steps in
+[chat_steps.rs](../tests/e2e-cucumber/tests/e2e/chat_steps.rs)), and the
+error report every command prints by one in
+[runtime_lifecycle.feature](../tests/e2e-cucumber/features/runtime_lifecycle.feature)
+(steps in
+[runtime_lifecycle_steps.rs](../tests/e2e-cucumber/tests/e2e/runtime_lifecycle_steps.rs)):
+
+- `chat-21` (`chat-cli-reply-escapes-stripped`): a reply that conceals part of
+  a line with SGR 8, retitles the window and writes the clipboard (OSC 52, and
+  an 8-bit OSC) reaches stdout of `rocm chat --prompt` with no control
+  character and no sequence payload, and the concealed text printed where it
+  was. A title sequence the reply leaves open removes the rest of its own line
+  only: the line after it (`Still here.`) is printed.
+- `chat-22` (`chat-assistant-value-unsafe-to-paste-refused`): the assistant
+  asks `install_sdk` for a folder whose name holds `&`, which `cmd.exe` acts
+  on even inside the single quotes the line is rendered in. The CLI exits
+  non-zero, asked the assistant once, and prints nothing to stdout; stderr
+  holds the refusal, which names the character and says to run
+  `rocm install sdk` with the value, and no `advanced manual command:` or
+  `tool_call:` line. The user's own `rocm install sdk --dry-run` into that
+  folder (therock-next-15's pip index fixture and installed `uv`) is
+  accepted and names it as
+  one argument. That nothing was installed is checked by the chat-turn unit
+  tests in [providers.rs](../apps/rocm/src/providers.rs) listed below, not by
+  the scenario.
+- `chat-23` (`chat-assistant-plan-unsafe-to-paste-refused`): the assistant
+  asks `natural_language_plan` to plan an install into the same kind of
+  folder. The plan's `tool_call:` line would carry the folder, so the CLI
+  refuses the plan the same way, with the refusal naming the plan for the
+  assistant's request, and prints nothing to stdout.
+- `runtime-lifecycle-32` (`runtime-lifecycle-error-report-carries-no-escape`):
+  the error report every `rocm` command prints goes through the same cleaning.
+  `rocm runtimes activate` with a runtime name carrying a window-title and an
+  erase-line sequence fails, its report names the runtime with the sequences
+  removed and holds no control character, and no runtime is active.
+
+```bash
+cargo xtask e2e -- -n "chat-21"
+cargo xtask e2e -- -n "chat-22"
+cargo xtask e2e -- -n "chat-23"
+cargo xtask e2e -- -n "runtime-lifecycle-32"
+```
+
+The unit tests behind them: `sanitize_terminal_text`, `hides_or_moves_text`
+and `is_display_altering` in [terminal.rs](../crates/rocm-core/src/terminal.rs)
+(exact output for every introducer, an unterminated sequence ending at its
+line, the glyph-shaper rule and the default-ignorable table's edges), the
+paste-unsafe set in [shell_quote.rs](../apps/rocm/src/shell_quote.rs), the
+model-only refusals, the serve option and character rules and the plan check
+in [tool_policy.rs](../apps/rocm/src/tool_policy.rs) (including that the same
+value passes `validate_chat_tool_call`, and that every tool that shows a
+command line is checked on it), the model-versus-user split in [turn.rs](../apps/rocm/src/chat/turn.rs)
+and [dash_seam.rs](../apps/rocm/src/dash_seam.rs), the chat turn against a
+local model in [providers.rs](../apps/rocm/src/providers.rs) (a refused
+folder, a refusal after a read-only check, a refused plan), the planner's
+check in [freeform_planner.rs](../apps/rocm/src/freeform_planner.rs), the
+status screen in [chat.rs](../apps/rocm/src/chat.rs), the error report as
+written to stderr in [main.rs](../apps/rocm/src/main.rs), and the dashboard
+agent's entry point in
+[tools.rs](../crates/rocm-dash-tui/src/agent/tools.rs):
+
+```bash
+cargo test -p rocm-core terminal::
+cargo test -p rocm --bin rocm shell_quote::
+cargo test -p rocm --bin rocm tool_policy::
+cargo test -p rocm --bin rocm chat::
+cargo test -p rocm --bin rocm dash_seam::
+cargo test -p rocm --bin rocm freeform_planner::tests::provider_planner_refuses
+cargo test -p rocm --bin rocm providers::tests::a_
+cargo test -p rocm --bin rocm tests::an_error
+cargo test -p rocm-dash-tui --lib agent::tools
 ```
 
 Log browser smoke:
@@ -3175,6 +3297,64 @@ has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
 lemonade` against the shared tree) reaches the restore only on a runner whose
 shared tree still holds a stale pin; on a healthy runner the install succeeds and
 the restore never runs, so a green lane does not show that it works.
+
+Lemonade failed-alignment record focused tests (ROCMAI-437; a failed
+alignment is not repeated by the next install for 24 hours; see
+[Lemonade backend alignment on engine install](engine-plugins.md#lemonade-backend-alignment-on-engine-install)):
+
+```bash
+cargo test -p rocm-engine-lemonade --lib -- alignment_record:: \
+  backend_alignment::tests::a_record backend_alignment::tests::an_unreadable_record \
+  backend_alignment::tests::with_no_record backend_alignment::tests::a_failed_alignment_is_not_repeated \
+  backend_alignment::tests::a_skipped_alignment backend_alignment::tests::the_opt_out_leaves_a_record \
+  backend_alignment::tests::a_verified_alignment_removes_the_record \
+  backend_alignment::tests::align_revert_restores_the_backend_dir \
+  install::tests::reinstall_removes_the_record_of_a_failed_alignment
+```
+
+The filters are module-qualified because a bare `record` also matches unrelated
+tests of Lemonade's install record and server state.
+
+The tests are in
+[alignment_record.rs](../engines/lemonade/src/alignment_record.rs) and
+[backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs), one per
+state of the record described in the section linked above, and their names say
+which: no record (`with_no_record_the_alignment_runs_as_before`), one that
+applies (the regression test,
+`a_failed_alignment_is_not_repeated_by_the_next_install_within_a_day`: the
+second install calls no alignment tier and installs without forcing, and its
+notice is asserted with the pin file), one that applies checked before the
+backend probe starts `lemond`
+(`a_record_that_applies_skips_before_the_backend_probe_runs`), one for another
+ROCm version, one for another pin
+(`a_record_for_another_pin_does_not_skip_the_alignment`), one from another
+Lemonade version
+(`a_record_from_another_lemonade_version_does_not_skip_the_alignment`), one a
+day old, one an early exit never consults (one table test,
+a row per exit, with an unreadable record on disk), an unreadable one past
+those exits (removed with a warning on every path: probe error, Vulkan and
+ROCm, in `an_unreadable_record_is_removed_with_one_warning_on_every_path`; and,
+on the ROCm-probe path only, the probe asserting from inside that the removal
+and warning came first, in
+`an_unreadable_record_is_removed_and_reported_before_the_backend_probe_runs`), one that cannot be removed either, one that cannot be written, one
+a later verified alignment removes, one that cannot be removed after that
+alignment, a revert whose install fails writing none (asserted in
+`align_revert_restores_the_backend_dir_when_the_fallback_install_fails`), the
+opt-out leaving one alone, and a skipped alignment whose install fails
+(`a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`:
+its error chain asserted in three rows, `lemond` not starting, a transient
+failure and the backend retry's own advice, each with the kept record and no
+notice). Removal by `--reinstall` is
+`reinstall_removes_the_record_of_a_failed_alignment` in
+[install.rs](../engines/lemonade/src/install.rs), and
+`the_record_file_name_matches_the_one_the_e2e_steps_hard_code` reads the e2e
+steps' copy of the record's file name, so the two cannot drift. The scenario
+`runtime-lemonade-backend-alignment-failure-remembered` (runtime-33 in
+[runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature))
+runs the two installs for real on the `@nightly @requires-gpu` Lemonade lanes
+(not under WSL2); it targets ROCm 7.99.0 through
+`ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION`, compiled only into the
+`rocm/e2e-test-hooks` build.
 
 vLLM endpoint-key coverage: `VLLM_API_KEY` on its own makes vLLM check the key
 only under a fixed set of path prefixes (`/v1` and a few others), while the
@@ -6895,8 +7075,9 @@ has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/)
 hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
 removes it afterwards. The stub replays recorded output for `rocm --version`,
 `rocm fix --json` and `rocm diagnose`, plus `rocm examine --json` for a case that
-names a `host` (below), and refuses every other command with exit code 2. It only
-prints text read from the recording, so whatever an agent asks it,
+names a `host` and `rocm fix <id>` with `--dry-run` or no flag for a case that names
+an `apply` fix (both below), and refuses every other command with exit code 2, `--yes`
+included. It only prints text read from the recording, so whatever an agent asks it,
 it cannot change a machine or send anything; that comes from answering a fixed set
 of commands, not from the refusals. It also refuses `diagnose` options the
 recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
@@ -6922,31 +7103,58 @@ cargo xtask eval-fixtures --check  # fail if any recording is missing, stale, or
 The manifest comes from the compiled catalog and each diagnosis from
 `rocm_core::run_diagnose`, run over the recorded examination in
 [`tests/remote-ssh/examination.json`](../tests/remote-ssh/examination.json), so a
-catalog change cannot leave a stale recording behind. After a change to the failure
-catalog or to what `rocm diagnose` prints, run `cargo xtask eval-fixtures` and commit
-the result; the check names what is out of date. CI runs the check, and
-`cargo test -p xtask` runs it too. Read the diff after regenerating: a recording that
-changed is output the skill is now graded against. What an older CLI printed cannot be
+catalog change cannot leave a stale generated recording behind. After a change to the
+failure catalog or to what `rocm diagnose` or `rocm fix --json` prints, including one
+that arrived with a rebase, run `cargo xtask eval-fixtures` and commit the result; the
+check names what is out of date. CI runs the check, and `cargo test -p xtask` runs it
+too. Read the diff after regenerating: it must be only the change in the catalog or the
+CLI, and a recording that changed is output the skill is now graded against. A premise
+test (`the_premise_a_judged_case_rests_on_is_what_its_replay_records`) states what each
+judged case needs its replay to hold, such as which match clears the threshold and which
+are `symptom_matched`; when it fails after regenerating, re-derive the premise from the
+new replay and do not loosen the assertion. What an older CLI printed cannot be
 generated. It was recorded once from a real older build and lives in
 [`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
 
-A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found` or
-`examine-fails`. The stub then answers `rocm examine --json`, and a case without a
-`host` still refuses it. The reply is the recorded examination with the fields the host
-implies set, whatever the recording held for them, and its `status` is recomputed by
+A case may also name a `host`: `no-amd-gpu`, `wsl-host-gpu-hidden`, `amd-found`,
+`examine-fails` or `container-small-shm` (an AMD GPU found, inside a Docker container
+with the default 64 MiB `/dev/shm`, which makes the shared-memory entry score from the
+host alone). The stub then answers `rocm examine --json`, and a case without a
+`host` still refuses it. The diagnosis a host gives is replayed too, so it is what the
+case's judged items rest on. The reply is the recorded examination with the fields the
+host implies set, whatever the recording held for them, and its `status` is recomputed by
 `Examination::compute_status`, the rule the probe uses, so a recording cannot say a
 status the other fields contradict. The real command prints those fields plus a
 `summary` object that only the `rocm` binary can build, so the replay leaves `summary`
 out; the skill reads `status` and `has_amd_gpu` and nothing in it. Some fields are
-typed, not probed: the one GPU of `amd-found`, and the WSL facts of
+typed, not probed: the one GPU of `amd-found` and `container-small-shm`, the container
+and `/dev/shm` figures of the latter, and the WSL facts of
 `wsl-host-gpu-hidden` (a distro that sees the Windows host's GPU through `/dev/dxg`,
 with no ROCm-side library). `examine-fails` is not recorded from a real failure: it
 exits 1 with a fixed message on stderr, which is what the case pins.
 
+A case may also name an `apply` fix id, for a case that reaches the apply step. The
+stub then answers `rocm fix <id> --dry-run` (the flag before or after the id) and
+`rocm fix <id>` with no flag, and never `--yes`, so an agent that applies before the
+user said OK meets the stub's refusal and the transcript shows the command. The fix
+must be `fix-4-render-group`, the only one whose layout around the plan the generator
+writes (another `auto` runner, such as fix-6, prints its own `Plan:` block, so naming
+one is refused), and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
+`linux`), and the case's symptom and host must make the replayed
+diagnosis match it, that is list it at or above `min_score_for_match`; otherwise the
+generator fails with "the replayed diagnosis carries no match for ...". The plan is the CLI's own (`rocm_core::fix_plan_text`), so it
+carries the command's wording; only the `Will run:` line the runner adds is not there,
+because it names the user and the machine. The layout around the plan (the blank line,
+then the notice) is written by hand in the generator and checked only against the
+committed replay. The bare command's refusal exit code
+and message, and the dry-run notice, are the CLI's own constants, so they cannot drift
+from the command's.
+
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
 case id, `current` or `older`, the error text the agent would pass as the symptom,
-and optionally a `host`), run the command above, and add the case to
+and optionally a `host` and an `apply` fix id, which must be `fix-4-render-group` and matched
+by the replayed diagnosis), run the command above, and add the case to
 [`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
 check also fails when a case id is not an id in `evals.json`, or when the part of the
 symptom before its first `:` does not appear in that case's prompt, because the hook
@@ -6954,13 +7162,13 @@ finds a replay by id and a recording for a different question grades nothing. A
 directory that no case owns fails the check, and the command never deletes one:
 remove it by hand.
 
-Limits worth knowing. A replay says what the catalog says for a recorded host
-with no GPU data, so it grades how the agent reads and relays an answer, not whether
+Limits worth knowing. A replay says what the catalog says for a typed host (the
+recorded examination, which has no GPU, with the fields a `host` implies changed), not
+for a real machine, so it grades how the agent reads and relays an answer, not whether
 the CLI is right about a real machine; and it answers `diagnose` with the same
 recorded output whatever `--symptom` is. The current-CLI replay's `--version` line
-is not the format the real `rocm --version` prints (the older-CLI replay prints that
-one), so only `fix --json` tells
-the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
+is a fixed marker that no real build prints (the older-CLI replay prints what an
+older build printed), so only `fix --json` tells the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
 pin matches, and `cargo test -p xtask` fails if a pin is quoted in `SKILL.md` or
 `reference.md`, where it would stop proving the replay ran.
 
@@ -6970,11 +7178,13 @@ On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionle
 include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
 directory and Python path without spaces; a path with spaces or parentheses is not
 exercised, and neither is the agent's own shell on the amd/skills Windows leg.
-The two cases about the older and the current CLI name no operating system in their
-prompts. They used to say "on Linux", and on a Windows host the agent answered that its
-own machine is Windows and declined to run the CLI at all, so the recorded replies never
-printed. The vLLM cases still say Linux on purpose: their catalog entries apply on Linux
-and WSL2 only, so they are not expected to pass on a Windows host.
+A replayed case whose answer does not depend on the platform names no operating system
+in its prompt. The older- and current-CLI prompts used to say "on Linux", and on a
+Windows host the agent answered that its own machine is Windows and declined to run the
+CLI at all, so the recorded replies never printed. A case that cannot pass on a Windows
+host, because its catalog entries apply on Linux and WSL2 only or because the command
+it expects depends on the shell, says so in its `note` in
+[`evals.json`](../skills/rocm-doctor/evals/evals.json).
 
 A real `rocm` on the machine can answer before the stub. The agent's shell does not
 always keep the stub first on `PATH`, so a machine that has a `rocm` installed (a

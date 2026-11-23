@@ -10,7 +10,7 @@
 //! Tailscale installed and peered — and "no targets" would look the same as
 //! "the feature is broken".
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cucumber::{given, then, when};
 use e2e_cucumber::fixture_binary::fixture_target_name;
@@ -701,8 +701,19 @@ fn plant_session_record(
     file_stem: &str,
     remote_cli: &str,
 ) -> PathBuf {
-    let directory = sessions_dir(world);
-    std::fs::create_dir_all(&directory).expect("create the sessions directory");
+    plant_session_record_in(&sessions_dir(world), session_id, file_stem, remote_cli)
+}
+
+/// [`plant_session_record`] into `directory`, for a scenario whose data folder
+/// is not the harness's (the uninstall scenarios keep theirs in the scenario
+/// home).
+pub(crate) fn plant_session_record_in(
+    directory: &Path,
+    session_id: &str,
+    file_stem: &str,
+    remote_cli: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(directory).expect("create the sessions directory");
     let record = serde_json::json!({
         "session_id": session_id,
         "target": "gpu-box",

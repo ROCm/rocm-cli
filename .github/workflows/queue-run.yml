@@ -37,10 +37,13 @@ jobs:
     name: Run and publish
     runs-on: [queue-report]
     # A lane waits at most 15000 s (4 h 10 min) to be started, then runs for at
-    # most 3 h counted from its start, however long it waited. Finishing and
-    # publishing the run can take 30 min more, and 20 min are margin for the
-    # runner's own delays: 480 min.
-    timeout-minutes: 480
+    # most 3 h counted from its start, however long it waited. Following the run
+    # to its end and finishing it can take 75 min more, and a start held behind
+    # another job's finish is asked again for about 70 min more, so the publish
+    # command gives up after 576 min at the latest (docs/nightly-on-the-queue.md
+    # has the sum). 20 min are margin for the runner's own delays and the upload:
+    # 596 min.
+    timeout-minutes: 596
     steps:
       - name: Run on the queue and publish
         env:

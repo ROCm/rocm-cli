@@ -549,6 +549,32 @@ ROCm backend directory under `bin/llamacpp/`, and run
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
 
+To check that a failed backend alignment is not repeated (Windows or native
+Linux with a GPU Lemonade runs its ROCm backend on, and an active managed ROCm
+SDK): build with `cargo build -p rocm --features rocm/e2e-test-hooks`, set
+`ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION=7.99.0` (a ROCm version Lemonade
+publishes no backend for), and run `rocm engines install lemonade --reinstall`,
+then `rocm engines install lemonade`. Expected result:
+
+- The first install prints `Warning: could not align Lemonade's ROCm backend to
+  7.99.0; reverting to the default pinned version.`, exits 0, and leaves
+  `.rocm-cli-alignment-failed.json` in the Lemonade runtime tree.
+- The second install prints no alignment warning and does not download or
+  reinstall the backend (`Using installed Lemonade llamacpp:rocm backend.`). It
+  prints `Lemonade's ROCm backend could not be aligned to ROCm 7.99.0 less than
+  an hour ago; ...`, naming `rocm engines install lemonade --reinstall` and
+  that an install run 24 hours from now or later tries it again, and exits 0.
+- Running the first command again attempts the alignment again (the warning
+  is back), because `--reinstall` removed the record with the runtime tree.
+- Not a manual step: when preparing the pinned backend fails on the second
+  install, its error says so, that the alignment was skipped because of the
+  earlier failure, and that `rocm engines install lemonade --reinstall`
+  re-extracts the runtime tree without that record; the record is kept and the
+  skip line above is not printed. There is no way to make that install fail on
+  demand, so this is covered by the unit test
+  `a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`
+  in [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs).
+
 To check what a Lemonade install says about its size (no download needed for
 the refusal): with a debug build, set
 `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
@@ -2059,6 +2085,16 @@ Expected result:
 - The plan still asks for review before mutating actions.
 - `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
+- A plan whose command carries a value a Windows shell reads as syntax inside
+  single quotes, such as `'`, `&` or `%` (the full set is in
+  [llm-tool-use.md](llm-tool-use.md)), is not shown:
+  the CLI falls back to its own plan and its note says to supply that value
+  yourself. The same holds for `rocm chat --tools --prompt …`, where the
+  assistant's request is refused with that message on stderr and no
+  `advanced manual command:` line is printed. A folder in a request the CLI
+  recognises itself (`install therock into D:\R&D\rocm`) is shown as typed;
+  in other wording the folder reaches the CLI through the assistant's request
+  and is refused like any value the assistant chose.
 
 To turn provider-assisted planning back off:
 
@@ -2687,3 +2723,99 @@ rocm mcp-call rocm_command --arguments-file args.json
 
 - The recipes listed match what `rocm model` printed in the terminal, narrowing
   and closing note included.
+
+## 21. Uninstall Safety
+
+Run these in a throwaway home on Linux or WSL, never against your real one, and
+only with `--dry-run` where the step says so. Each block starts a fresh sandbox:
+
+```bash
+export SANDBOX=$(mktemp -d)
+export HOME=$SANDBOX/users/home ROCM_CLI_CONFIG_DIR=$SANDBOX/users/home/.rocm/config \
+  ROCM_CLI_DATA_DIR=$SANDBOX/users/home/.rocm/data ROCM_CLI_CACHE_DIR=$SANDBOX/users/home/.rocm/cache
+mkdir -p "$HOME/Documents" "$ROCM_CLI_CONFIG_DIR"
+echo keep > "$HOME/Documents/keep.txt"
+```
+
+A protected data folder is refused (dry run only):
+
+```bash
+ROCM_CLI_DATA_DIR=/ rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the review lists `data: / is the top of the filesystem (set
+by ROCM_CLI_DATA_DIR)` under "Refused", never under the items to remove, ends
+with `This uninstall would be refused. Point ROCM_CLI_DATA_DIR at a folder of
+ROCm CLI's own, or re-run with --keep-data ...`, and the command exits
+non-zero.
+
+The home folder as the data folder is refused for real, and the advised flag
+works:
+
+```bash
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries --keep-data
+```
+
+Expected result: the first command exits non-zero with `uninstall refused,
+nothing was removed: the data folder <home> is your home folder (set by
+ROCM_CLI_DATA_DIR) ...`, and `$HOME/Documents/keep.txt` and the config folder
+are both still there. The second exits 0, removes the config folder, and leaves
+`keep.txt` alone.
+
+The same holds when the setting does not spell out the home folder:
+
+```bash
+(cd "$HOME" && ROCM_CLI_DATA_DIR=. rocm uninstall --yes --keep-binaries)
+```
+
+Expected result: exit non-zero with `the data folder . is your home folder
+(set by ROCM_CLI_DATA_DIR; resolves to <home>)`, and `keep.txt` is still there.
+
+In the dashboard, `/uninstall --keep-data` previews and `/uninstall --apply
+--keep-data` runs the uninstall with the data folder left out; with
+`ROCM_CLI_DATA_DIR=$HOME` the preview no longer reports a refusal. With
+`setup.therock_venv` pointing at the home folder instead (and
+`ROCM_CLI_DATA_DIR` unset), the dashboard's refusal names
+`setup.therock_venv`, not `ROCM_CLI_DATA_DIR`, and leads with `--keep-data`.
+
+A folder outside the home folder needs ROCm CLI's marker:
+
+```bash
+mkdir -p "$SANDBOX/srv/rocm"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+touch "$SANDBOX/srv/rocm/.rocm-cli-root"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the first preview refuses the data folder as `outside your
+home folder and not marked as ROCm CLI's own` and names the
+`.rocm-cli-root` file to create; after creating it, the second lists the data
+folder for removal. A system folder such as `/usr/local`, or a shared one such
+as `/var/lib` or `/opt`, is refused in a dry run whatever is in it, and the
+refusal does not offer the marker.
+
+A shared cache inside the cache folder is named as deleted (dry run):
+
+```bash
+mkdir -p "$HOME/.cache/uv" "$HOME/.cache/huggingface/hub"
+ROCM_CLI_CACHE_DIR=$HOME/.cache rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: under "Please review", `the uv package cache WILL BE DELETED`
+and `downloaded model files WILL BE DELETED`, each naming the cache folder and
+`--keep-cache`. With the default cache folder the same two caches are reported
+as `not removed` instead.
+
+A symlinked cache folder written with a trailing slash is unlinked, not
+emptied:
+
+```bash
+mkdir -p "$SANDBOX/real-cache" && touch "$SANDBOX/real-cache/keep"
+ln -s "$SANDBOX/real-cache" "$SANDBOX/rocm-cache"
+ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
+  rocm uninstall --yes --keep-binaries --keep-config --keep-data
+```
+
+Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
+gone, and `real-cache/keep` is still there.

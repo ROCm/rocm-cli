@@ -416,7 +416,7 @@ pub(super) fn download_text_cached(
     let cache_dir = body_path
         .parent()
         .context("metadata cache path has no parent directory")?;
-    fs::create_dir_all(cache_dir)?;
+    prepare_metadata_cache_dir(paths, cache_dir)?;
 
     let tmp_public_key = body_path.with_extension("public-key.pem");
     let mut headers = Vec::new();
@@ -468,6 +468,14 @@ pub(super) fn download_text_cached(
     let _ = fs::remove_file(&body_path);
     let _ = fs::remove_file(&signature_path);
     Ok(CachedHttpText { text: entry.body })
+}
+
+/// Creates `cache_dir`, the metadata folder inside the cache folder, marking
+/// the cache folder itself as ROCm CLI's own when this is what creates it.
+fn prepare_metadata_cache_dir(paths: &AppPaths, cache_dir: &Path) -> Result<()> {
+    rocm_core::create_marked_root(&paths.cache_dir)?;
+    fs::create_dir_all(cache_dir)?;
+    Ok(())
 }
 
 fn metadata_cache_paths(paths: &AppPaths, cache_key: &str) -> (PathBuf, PathBuf) {
@@ -801,6 +809,35 @@ mod tests {
 
         assert_eq!(preserved, previous);
         assert_eq!(leftovers, vec![OsString::from("index.json")]);
+    }
+
+    /// The metadata download marks the cache folder as ROCm CLI's own when it
+    /// creates it, so `rocm uninstall` may remove it later, and leaves a cache
+    /// folder that already existed unmarked.
+    #[test]
+    fn the_metadata_cache_marks_a_cache_folder_it_creates_and_not_an_existing_one() {
+        let (root, fresh) = test_paths("metadata-cache-marks");
+        let (body, _) = metadata_cache_paths(&fresh, "key");
+        prepare_metadata_cache_dir(&fresh, body.parent().unwrap()).unwrap();
+        let fresh_marked = fresh
+            .cache_dir
+            .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+            .is_file();
+        let metadata_dir_made = body.parent().unwrap().is_dir();
+
+        let (other_root, existing) = test_paths("metadata-cache-keeps-existing");
+        fs::create_dir_all(&existing.cache_dir).unwrap();
+        let (body, _) = metadata_cache_paths(&existing, "key");
+        prepare_metadata_cache_dir(&existing, body.parent().unwrap()).unwrap();
+        let existing_marked = existing
+            .cache_dir
+            .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+            .exists();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other_root);
+        assert!(fresh_marked, "the cache folder it created is not marked");
+        assert!(metadata_dir_made);
+        assert!(!existing_marked, "an existing cache folder was marked");
     }
 
     #[test]
