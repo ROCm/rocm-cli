@@ -4456,7 +4456,7 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
     // UNDETERMINED -- so the label is checked on whichever lane runs this, not
     // only accepted. A GPU-less hosted runner takes the second branch; a lane
     // that measures dedicated VRAM (the MI300X self-hosted lane) or a shared
-    // pool (the Strix Halo lanes, and the planted APU of diagnose-87 on any
+    // pool (the Linux Strix Halo lanes, and the planted APU of diagnose-87 on any
     // Linux lane, which only ever reaches the "fits" label) takes the first.
     //
     // The line is printed whenever a figure was measured, so it stands for "the
