@@ -4447,16 +4447,25 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
         );
     }
     // Which label is owed depends on whether this host's memory was compared,
-    // and the report says which: a compared estimate names the card it was
-    // compared with. A compared estimate must be labelled ESTIMATED with the
-    // outcome its own figures imply, and one that was not, UNDETERMINED -- so
-    // the label is checked on whichever lane runs this, not only accepted.
-    // A GPU-less hosted runner takes the second branch; a lane that measures
-    // dedicated VRAM (the MI300X self-hosted lane) takes the first.
-    let compared = output.contains("the GPU with the most dedicated VRAM that ROCm can see has");
-    if compared {
+    // and the report says which: a compared estimate names the pool it was
+    // compared with, and names it differently for a card with dedicated VRAM
+    // and for an integrated GPU that allocates from shared system memory
+    // (`evidence_lines` in `gguf_fit.rs`). A compared estimate must be labelled
+    // ESTIMATED with the outcome its own figures imply, and one that was not,
+    // UNDETERMINED -- so the label is checked on whichever lane runs this, not
+    // only accepted. A GPU-less hosted runner takes the second branch; a lane
+    // that measures dedicated VRAM (the MI300X self-hosted lane) or a shared
+    // pool (the Strix Halo lanes, and the planted APU of diagnose-87 on any
+    // Linux lane, which only ever reaches the "fits" label) takes the first.
+    let offered_marker = [
+        "the GPU with the most dedicated VRAM that ROCm can see has ",
+        "the pool this host's integrated GPU allocates from has ",
+    ]
+    .into_iter()
+    .find(|marker| output.contains(marker));
+    if let Some(offered_marker) = offered_marker {
         // The label owed follows from the two figures the report prints: the
-        // total it needs ("= about N MiB") and the card's ("has M MiB").
+        // total it needs ("= about N MiB") and the pool's ("has M MiB").
         let number_after = |marker: &str| -> u64 {
             let at = output
                 .find(marker)
@@ -4469,7 +4478,7 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
                 .unwrap_or_else(|| panic!("no figure after `{marker}` in:\n{output}"))
         };
         let needed = number_after("= about ");
-        let offered = number_after("can see has ");
+        let offered = number_after(offered_marker);
         let label = if needed <= offered {
             ": ESTIMATED: fits at 2048 tokens"
         } else {
@@ -5839,5 +5848,43 @@ async fn assert_gguf_estimate_names_its_pool_as_shared(world: &mut E2eWorld) {
         "a bare \"fits\" against a shared ceiling reads as \"this much memory is waiting for \
          it\", and nothing here measured how much of the pool is free, so the estimate has to \
          say so: {notes:#?}"
+    );
+}
+
+#[then(
+    "the text report compares the estimate with the shared pool's ceiling and says the pool is shared"
+)]
+async fn assert_gguf_text_report_names_its_pool_as_shared(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let output = world.cli_output.clone().expect("no diagnose output");
+    // Non-vacuity, as for the machine-readable half: a host that fell back to
+    // `cannot_estimate` prints no pool sentence at all, and the label step that
+    // runs beside this would then be vacuously satisfied by UNDETERMINED.
+    let pool = "the pool this host's integrated GPU allocates from has ";
+    let at = output.find(pool).unwrap_or_else(|| {
+        panic!(
+            "this APU's pool is readable, so the report must name the shared pool it compared \
+             against; the fixture never reached the shared-pool branch:\n{output}"
+        )
+    }) + pool.len();
+    let offered: f64 = output[at..]
+        .split_whitespace()
+        .next()
+        .and_then(|mib| mib.parse().ok())
+        .unwrap_or_else(|| panic!("no figure after `{pool}` in:\n{output}"));
+    let expected_mib = gib(APERTURE_BYTES) * 1024.0;
+    assert!(
+        (offered - expected_mib).abs() < 1.0,
+        "the report must compare against the {expected_mib} MiB pool; {offered} MiB is the \
+         carve-out or something else entirely:\n{output}"
+    );
+    assert!(
+        !output.contains("the GPU with the most dedicated VRAM that ROCm can see has "),
+        "a shared pool was described as dedicated VRAM:\n{output}"
+    );
+    assert!(
+        output.contains("a ceiling it shares with the operating system"),
+        "a bare \"fits\" against a shared ceiling reads as free memory, so the report has to \
+         say the pool is shared:\n{output}"
     );
 }

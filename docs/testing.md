@@ -6677,6 +6677,13 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   against is a shared ceiling rather than free memory, so the weaker claim is
   visible to a user reading the estimate rather than only to the verdict.
 
+  `diagnose-87` is the human-readable twin of `diagnose-86`: it asks the same
+  question in text form and requires the report to name the shared pool, say it
+  is shared, and carry the `ESTIMATED: fits` label its figures imply, so that
+  branch of the text report runs on every Linux lane rather than only on
+  integrated-GPU hardware. The planted pool is far larger than the tiny file, so
+  only the "fits" polarity is exercised there.
+
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question
