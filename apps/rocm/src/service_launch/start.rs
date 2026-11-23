@@ -85,6 +85,7 @@ pub(crate) fn start_managed_service(
             gpu_indices,
             runtime_id,
             env_id,
+            engine_recipe,
         );
     }
     let (mut record, child_pid, mut liveness) = match spawn_managed_engine_child(

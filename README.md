@@ -1799,6 +1799,10 @@ total video RAM, or VRAM) and `--tool-call-parser` (for example `hermes`,
 `llama3_json`, or `mistral`, which also turns on automatic tool choice) apply to
 vLLM only. Lower
 the memory fraction when a small model shouldn't reserve most of a large card.
+Without `--gpu-memory-utilization`, vLLM applies its own default, except on an
+APU whose GPU shares system memory (such as Strix Halo), where `rocm serve`
+asks for 0.3 and prints a `note:` saying so. Pass the flag to choose another
+value, for example `--gpu-memory-utilization 0.8`.
 
 `--require-api-key` makes a loopback endpoint require an API key too, which
 matters when something else republishes the port. A public bind generates a key

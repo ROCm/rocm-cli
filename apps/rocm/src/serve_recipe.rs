@@ -284,11 +284,13 @@ fn set_vllm_tool_call_parser(flags: &mut Vec<String>, parser: &str) {
 
 /// Applies an explicit `--gpu-memory-utilization` to the vLLM engine recipe.
 ///
-/// rocm-cli intentionally ships no default for this: vLLM sizes its KV cache as
-/// a fraction of the device's TOTAL VRAM, and any number rocm-cli picked would
-/// silently override upstream's and drift from it. So the flag is passed through
-/// only when the user asked for one, via `required_flags` (the same channel the
-/// `--tool-call-parser` override uses — no protocol change needed).
+/// rocm-cli ships no general default for this: vLLM sizes its KV cache as a
+/// fraction of the device's TOTAL VRAM, and any number rocm-cli picked would
+/// silently override upstream's and drift from it. So this passes the flag
+/// through only when the user asked for one, via `required_flags` (the same
+/// channel the `--tool-call-parser` override uses — no protocol change needed).
+/// The one default rocm-cli does choose, for a GPU that shares system memory,
+/// is [`engine_recipe_with_shared_memory_default`].
 ///
 /// Only vLLM is affected. An explicit value wins over any recipe-authored one,
 /// and a minimal hint is synthesized when none exists.
@@ -310,6 +312,65 @@ pub(crate) fn engine_recipe_with_gpu_memory_utilization_override(
     });
     set_vllm_gpu_memory_utilization(&mut hint.required_flags, value);
     Some(hint)
+}
+
+/// The share of device memory vLLM is asked to reserve on a GPU that draws on
+/// system memory, when the user and the recipe have both left it unset.
+///
+/// 0.3 is the one value reported to avoid the startup fault (a ~98 GiB KV cache
+/// on a Strix Halo under WSL2 crashed the engine; 0.3 served, ROCm/rocm-cli#1132).
+/// It is a workaround for that fault, not a tuned figure: the trigger is not
+/// proven to be the size, and no other fraction was measured.
+pub(crate) const SHARED_MEMORY_GPU_MEMORY_UTILIZATION: f64 = 0.3;
+
+/// Whether `required_flags` already carry vLLM's `--gpu-memory-utilization`,
+/// in either the `--flag value` or the `--flag=value` spelling.
+fn sets_gpu_memory_utilization(required_flags: &[String]) -> bool {
+    required_flags.iter().any(|flag| {
+        flag == "--gpu-memory-utilization" || flag.starts_with("--gpu-memory-utilization=")
+    })
+}
+
+/// Gives vLLM a smaller memory reservation on a GPU that shares system memory,
+/// unless one was already chosen.
+///
+/// Call it after [`engine_recipe_with_gpu_memory_utilization_override`]: an
+/// explicit `--gpu-memory-utilization` and a catalog recipe's own value both
+/// arrive as a `--gpu-memory-utilization` in `required_flags`, and either one
+/// wins, so the default only fills a gap. vLLM only; `host_shares_system_memory`
+/// is not called for another engine, or once a value is already set, so the host
+/// probe it stands for runs on nothing but the path that needs it.
+///
+/// Returns the hint and the note to print about what was done, `None` when the
+/// recipe was left alone. The note is built here from the same value the flag
+/// is, so the line cannot name a fraction the engine was not given.
+pub(crate) fn engine_recipe_with_shared_memory_default(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    host_shares_system_memory: impl FnOnce() -> bool,
+) -> (Option<EngineRecipeHint>, Option<String>) {
+    if !engine.eq_ignore_ascii_case("vllm")
+        || hint
+            .as_ref()
+            .is_some_and(|hint| sets_gpu_memory_utilization(&hint.required_flags))
+        || !host_shares_system_memory()
+    {
+        return (hint, None);
+    }
+    let value = SHARED_MEMORY_GPU_MEMORY_UTILIZATION;
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    set_vllm_gpu_memory_utilization(&mut hint.required_flags, value);
+    let note = format!(
+        "this GPU shares system memory, where vLLM's default reservation (most of the device's \
+         memory) has crashed the engine at startup; reserving {value} instead \
+         (--gpu-memory-utilization {value}). Pass `--gpu-memory-utilization <fraction greater \
+         than 0 and at most 1>` to choose another value."
+    );
+    (Some(hint), Some(note))
 }
 
 /// Rewrites `flags` so vLLM receives exactly one `--gpu-memory-utilization
@@ -686,6 +747,91 @@ mod tests {
                 "--gpu-memory-utilization".to_owned(),
                 "1".to_owned(),
             ]
+        );
+    }
+
+    fn vllm_hint(flags: &[&str]) -> EngineRecipeHint {
+        EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
+            ..EngineRecipeHint::default()
+        }
+    }
+
+    #[test]
+    fn a_gpu_sharing_system_memory_gets_the_smaller_reservation_and_a_note_naming_it() {
+        let (hint, note) = engine_recipe_with_shared_memory_default(
+            "vllm",
+            Some(vllm_hint(&["--enable-auto-tool-choice"])),
+            || true,
+        );
+        assert_eq!(
+            hint.expect("a hint").required_flags,
+            vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--gpu-memory-utilization".to_owned(),
+                "0.3".to_owned(),
+            ]
+        );
+        let note = note.expect("the default must be announced");
+        assert!(note.contains("--gpu-memory-utilization 0.3"), "{note}");
+        // Synthesizes a hint when the model has no recipe.
+        let (hint, _) = engine_recipe_with_shared_memory_default("vllm", None, || true);
+        assert_eq!(
+            hint.expect("a synthesized hint").required_flags,
+            vec!["--gpu-memory-utilization".to_owned(), "0.3".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_default_never_overrides_a_value_the_user_or_recipe_chose() {
+        // Both spellings of a recipe-authored value, and the explicit flag (which
+        // arrives through the override as a separate pair).
+        for flags in [
+            vec!["--gpu-memory-utilization", "0.8"],
+            vec!["--gpu-memory-utilization=0.8"],
+        ] {
+            let (hint, note) =
+                engine_recipe_with_shared_memory_default("vllm", Some(vllm_hint(&flags)), || {
+                    panic!("the host must not be probed once a value is set")
+                });
+            assert_eq!(hint.expect("a hint").required_flags, flags);
+            assert!(note.is_none());
+        }
+        let explicit = engine_recipe_with_gpu_memory_utilization_override(
+            "vllm",
+            None,
+            parse_gpu_memory_utilization(Some("0.9")).unwrap(),
+        );
+        let (hint, note) = engine_recipe_with_shared_memory_default("vllm", explicit, || true);
+        assert_eq!(
+            hint.expect("a hint").required_flags,
+            vec!["--gpu-memory-utilization".to_owned(), "0.9".to_owned()]
+        );
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn the_default_leaves_other_engines_and_other_hosts_alone() {
+        let (hint, note) = engine_recipe_with_shared_memory_default("lemonade", None, || {
+            panic!("only vLLM has the flag, so the host is never probed")
+        });
+        assert!(hint.is_none() && note.is_none());
+        let (hint, note) = engine_recipe_with_shared_memory_default(
+            "vllm",
+            Some(vllm_hint(&["--enable-auto-tool-choice"])),
+            || false,
+        );
+        assert_eq!(
+            hint.expect("a hint").required_flags,
+            vec!["--enable-auto-tool-choice".to_owned()]
+        );
+        assert!(note.is_none());
+        assert!(
+            engine_recipe_with_shared_memory_default("vllm", None, || false)
+                .0
+                .is_none()
         );
     }
 

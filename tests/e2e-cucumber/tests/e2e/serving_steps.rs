@@ -3943,6 +3943,128 @@ async fn open_summary_against_failing_engine(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// A managed vLLM launch that becomes ready against a mock engine that answers
+/// every request, so the summary is the healthy one and carries only the notes
+/// the launch itself produced. The `ready` mode of the hook the smoke-failure
+/// scenario arms; its consumer is `e2e_simulate_oom_launch` in
+/// `apps/rocm/src/service_launch/readiness.rs`, spelled out on both sides because
+/// the binary's crate cannot depend on this harness.
+#[given("a managed vLLM launch that becomes ready and whose engine answers")]
+async fn plant_ready_launch_with_answering_engine(world: &mut E2eWorld) {
+    world.mock = Some(MockServer::start(OOM_LAUNCH_MODEL).await);
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "ready".into()));
+}
+
+/// Opens the interactive serve summary against the planted engine, with any
+/// `extra` flags the user typed after the model. The step without extra flags is
+/// the smoke-failure scenario's (`open_summary_against_failing_engine`), which
+/// serves the same model the same way and so works against either engine.
+async fn open_summary_against_answering_engine(world: &mut E2eWorld, extra: &[&str]) {
+    let port = world
+        .mock
+        .as_ref()
+        .expect("no mock engine was started")
+        .port()
+        .to_string();
+    let mut args = vec![
+        "serve",
+        OOM_LAUNCH_MODEL,
+        "--engine",
+        "vllm",
+        "--env-id",
+        "e2e-memory-reservation",
+        "--port",
+        &port,
+    ];
+    args.extend_from_slice(extra);
+    let mut session = TuiSession::spawn(world, &args)
+        .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
+#[when(
+    "the user opens the interactive serve summary against that engine asking for a 0.8 memory reservation"
+)]
+async fn open_summary_asking_for_a_reservation(world: &mut E2eWorld) {
+    open_summary_against_answering_engine(world, &["--gpu-memory-utilization", "0.8"]).await;
+}
+
+/// The `--gpu-memory-utilization` values among the launched service's recorded
+/// engine-recipe flags, in order. What the engine is started with, read from the
+/// record the launch wrote rather than from anything printed.
+fn recorded_memory_reservations(world: &E2eWorld) -> Vec<String> {
+    let record = launched_service_record(world);
+    let Some(recipe) = record["engine_recipe_json"].as_str() else {
+        return Vec::new();
+    };
+    let recipe: serde_json::Value =
+        serde_json::from_str(recipe).expect("the recorded engine recipe is JSON");
+    let flags: Vec<&str> = recipe["required_flags"]
+        .as_array()
+        .map(|flags| flags.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    flags
+        .windows(2)
+        .filter(|pair| pair[0] == "--gpu-memory-utilization")
+        .map(|pair| pair[1].to_owned())
+        .collect()
+}
+
+#[then("the deployment summary says vLLM was given a smaller memory reservation")]
+async fn assert_summary_names_the_default_reservation(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // Whitespace-free, so a soft-wrapped row cannot split the phrase. The note is
+    // only this line, so a summary that merely contains the flag name elsewhere
+    // would not satisfy it.
+    assert!(
+        screen_without_whitespace(&screen).contains("thisGPUsharessystemmemory")
+            && screen_without_whitespace(&screen)
+                .contains("reserving0.3instead(--gpu-memory-utilization0.3)"),
+        "the summary must say the GPU shares system memory and which reservation was used:\n{screen}"
+    );
+}
+
+#[then(regex = r"^the launched vLLM server was started with a (\d\.\d) memory reservation$")]
+async fn assert_launch_was_given_reservation(world: &mut E2eWorld, fraction: String) {
+    assert_eq!(
+        recorded_memory_reservations(world),
+        vec![fraction],
+        "the engine must be started with exactly the one reservation the summary names"
+    );
+}
+
+#[then("the launched vLLM server was left on vLLM's own memory reservation")]
+async fn assert_launch_was_left_on_vllm_default(world: &mut E2eWorld) {
+    assert_eq!(
+        recorded_memory_reservations(world),
+        Vec::<String>::new(),
+        "no --gpu-memory-utilization may be passed on a host whose GPU has its own memory"
+    );
+}
+
+#[then("the deployment summary does not mention a default memory reservation")]
+async fn assert_summary_has_no_default_reservation_note(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    assert!(
+        !screen_without_whitespace(&screen).contains("sharessystemmemory"),
+        "no default-reservation note may appear when no default was applied:\n{screen}"
+    );
+}
+
 #[then("the deployment summary says the smoke test failed and does not call the service ready")]
 async fn assert_summary_reports_failed_smoke_test(world: &mut E2eWorld) {
     let screen = world

@@ -1011,6 +1011,44 @@ pub(crate) fn vram_capacity_is_meaningful(gfx_target: Option<&str>, gpu_count: u
     !gfx_target.is_some_and(rocm_core::gfx_is_apu_family)
 }
 
+/// Whether the GPU `rocm serve` will launch on draws its memory from system RAM,
+/// so that vLLM's default reservation is a share of the machine's memory rather
+/// than of a card's own.
+///
+/// True for an APU part ([`rocm_core::gfx_is_apu_family`]) on a host with no
+/// second GPU. The target names a *part* and detection yields one target for the
+/// whole machine, so when `amd-smi` counts more than one GPU the target cannot be
+/// attributed to the GPU the server will use, and the answer is false (the same
+/// condition [`vram_capacity_is_meaningful`] applies). An unreadable count is
+/// treated as one GPU, unlike there: the APU target is then the only evidence, and
+/// the count is unreadable on a WSL2 host (it has `/dev/dxg` and no `/dev/kfd`,
+/// so [`detect_gpu_count`]'s `amd-smi` probe finds nothing), the host the default
+/// was written for. A wrong "true" costs a smaller KV cache that the serve output
+/// names and `--gpu-memory-utilization` overrides.
+pub(crate) fn host_gpu_shares_system_memory(
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+) -> bool {
+    let gfx_target = match host_gpu_summary {
+        Some(summary) => summary.gfx_target.clone(),
+        None => rocm_core::detect_host_gfx_target(),
+    };
+    // Counted only for an APU target, so a discrete host never spawns `amd-smi`.
+    gfx_target
+        .as_deref()
+        .is_some_and(rocm_core::gfx_is_apu_family)
+        && gpu_count_leaves_target_attributable(detect_gpu_count())
+}
+
+/// The count half of [`host_gpu_shares_system_memory`]: one GPU, or a count that
+/// could not be read, leaves the host's single gfx target attributable to the
+/// GPU the server uses; two or more do not.
+const fn gpu_count_leaves_target_attributable(count: Option<usize>) -> bool {
+    match count {
+        Some(count) => count <= 1,
+        None => true,
+    }
+}
+
 /// The serve plan's low-VRAM warning, withheld on hosts where the VRAM figures
 /// do not describe the memory the engine uses (see
 /// [`vram_capacity_is_meaningful`]).
@@ -1115,6 +1153,15 @@ mod tests {
         record.status = "starting".to_owned();
         record.gpu_indices = gpu.to_vec();
         record.write().expect("write claiming record");
+    }
+
+    #[test]
+    fn a_second_gpu_makes_the_apu_target_unattributable() {
+        use super::gpu_count_leaves_target_attributable as attributable;
+        assert!(attributable(Some(1)));
+        // Unreadable on WSL2, the host the default was written for; see the caller.
+        assert!(attributable(None));
+        assert!(!attributable(Some(2)));
     }
 
     #[test]

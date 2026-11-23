@@ -387,9 +387,10 @@ vLLM claims a fixed fraction of each GPU's **total** video RAM (VRAM) for
 weights plus KV cache. The fraction is not based on the free VRAM, and it is not
 scaled to the model. On a large card, a small model therefore still reserves a large slice.
 
-ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
-applies unless a value comes from somewhere else: either a model's catalog
-recipe or, taking precedence over it, the flag below:
+ROCm CLI sets no `--gpu-memory-utilization` of its own on a discrete GPU, so
+vLLM's own default applies unless a value comes from somewhere else: either a
+model's catalog recipe or, taking precedence over it, the flag below. The one
+exception is an APU whose GPU shares system memory, described next:
 
 ```bash
 rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
@@ -404,6 +405,26 @@ command instead of falling back silently.
 Earlier releases pinned this to `0.80` to leave display or WSL headroom. That
 pin is gone, so an unchanged command now reserves vLLM's own (higher) default.
 Pass `--gpu-memory-utilization 0.8` to restore the previous reservation.
+
+### APUs, whose GPU shares system memory
+
+On a unified-memory APU (Strix Halo, for example) vLLM's default is a share of
+the machine's memory, not of a card's own: on a 108 GiB device it sized a ~98 GiB
+KV cache for a 0.6B model, and on a Strix Halo under WSL2 that crashed the engine
+during startup in 3 of 4 runs, with `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` (see
+[#1132](https://github.com/ROCm/rocm-cli/issues/1132)). The same host served in both
+reported runs with `--gpu-memory-utilization 0.3`.
+
+So when the host's GPU is an APU part and you pass no `--gpu-memory-utilization`
+(and the model's recipe sets none), `rocm serve` starts vLLM with 0.3 and prints
+a `note:` saying it did. This is a workaround for that fault, not a tuned value:
+the fault is not proven to depend on the size, and 0.3 is the only fraction that
+was reported to work. Pass `--gpu-memory-utilization 0.8` (or any fraction in
+`(0, 1]`) to choose your own; an explicit value is never changed.
+
+It applies only when `rocm serve` can attribute the APU to the server's GPU: a
+host that also has a discrete GPU (`amd-smi` lists more than one) keeps vLLM's
+default, because the one detected target cannot say which GPU the server uses.
 
 ### Shared or busy GPUs
 

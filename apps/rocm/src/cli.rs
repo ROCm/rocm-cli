@@ -668,8 +668,9 @@ rocm serve qwen --verbose --device gpu_required")]
         tool_call_parser: Option<String>,
         /// Fraction of each GPU's TOTAL VRAM that vLLM may claim for weights and
         /// KV cache (`0.0 < value <= 1.0`). Omitted by default, so vLLM applies
-        /// its own default. Lower it when a small model should not reserve most
-        /// of a large card. Applies to vLLM only.
+        /// its own default, except on a GPU that shares system memory (an APU),
+        /// where 0.3 is used and the serve output says so. Lower it when a small
+        /// model should not reserve most of a large card. Applies to vLLM only.
         // Taken as a string with `allow_hyphen_values` rather than a clap `f64` so a
         // negative fraction reaches `parse_gpu_memory_utilization` and gets the domain
         // error naming the valid range, instead of clap rejecting `-0.2` as an unknown

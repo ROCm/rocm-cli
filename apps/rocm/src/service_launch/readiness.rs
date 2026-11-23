@@ -634,6 +634,7 @@ pub(super) fn simulate_oom_managed_launch(
     gpu_indices: &[u32],
     runtime_id: Option<&str>,
     env_id: Option<&str>,
+    engine_recipe: Option<&rocm_engine_protocol::EngineRecipeHint>,
 ) -> Result<ManagedLaunchReport> {
     paths.ensure()?;
     std::fs::create_dir_all(paths.services_dir())?;
@@ -652,6 +653,12 @@ pub(super) fn simulate_oom_managed_launch(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
+    // Recorded as `spawn_managed_engine_child` records it, so a scenario can read
+    // the flags the engine would have been started with.
+    record.engine_recipe_json = engine_recipe
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to encode engine recipe hint")?;
     if e2e_simulate_ready_launch() {
         // The `ready` mode: a launch that came up. The record is what the local
         // provider needs to send the smoke test to `host:port`; no log is written

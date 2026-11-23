@@ -61,9 +61,10 @@ use crate::engine_runtime_select::{
 };
 use crate::engines_cmd::ensure_self_managed_engine_ready;
 use crate::gpu_policy::{
-    GpuVramUsage, active_visibility_mask, detect_gpu_count, gpu_vram_usage, parse_device_policy,
-    parse_gpu_selection, pinned_index_bound, select_gpu_indices_under_launch_lock,
-    serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
+    GpuVramUsage, active_visibility_mask, detect_gpu_count, gpu_vram_usage,
+    host_gpu_shares_system_memory, parse_device_policy, parse_gpu_selection, pinned_index_bound,
+    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
+    write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
 use crate::serve_device_probe::serve_device_after_launch;
@@ -72,8 +73,9 @@ use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
     ServeGenerationDefaults, engine_env_ignored_note, engine_recipe_enables_tool_choice,
     engine_recipe_with_extra_env, engine_recipe_with_generation_defaults,
-    engine_recipe_with_gpu_memory_utilization_override, engine_recipe_with_tool_call_override,
-    parse_gpu_memory_utilization, protocol_engine_recipe_hint, render_serve_engine_recipe_lines,
+    engine_recipe_with_gpu_memory_utilization_override, engine_recipe_with_shared_memory_default,
+    engine_recipe_with_tool_call_override, parse_gpu_memory_utilization,
+    protocol_engine_recipe_hint, render_serve_engine_recipe_lines,
 };
 use crate::serve_summary;
 use crate::service_control::run_internal_sandbox_tool;
@@ -640,14 +642,21 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         engine_recipe,
         gpu_memory_utilization,
     );
+    // After the explicit value, so a flag or a recipe value wins over the default.
+    let (engine_recipe, shared_memory_default_note) =
+        engine_recipe_with_shared_memory_default(&selected_engine, engine_recipe, || {
+            host_gpu_shares_system_memory(host_gpu_summary.as_ref())
+        });
     // Stored without a `note:` prefix so it can feed both output paths: the plan
     // path adds the prefix inline, the interactive summary adds it when rendering.
+    // At most one of the two applies: the first needs a non-vLLM engine, the second vLLM.
     let gpu_memory_utilization_note = (gpu_memory_utilization.is_some() && !engine_serves_vllm)
         .then(|| {
             format!(
                 "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
             )
-        });
+        })
+        .or(shared_memory_default_note);
     // Translate the engine-neutral CLI controls into each adapter's server-wide
     // defaults: vLLM generation config or Lemonade llama.cpp launch flags.
     let generation_defaults = ServeGenerationDefaults {
