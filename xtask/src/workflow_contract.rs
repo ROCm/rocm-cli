@@ -1914,7 +1914,7 @@ jobs:
                 .filter(|l| !l.starts_with('#') && !l.is_empty())
                 .collect::<Vec<_>>(),
             ["stale: ${{ steps.stale.outputs.stale }}"],
-            "e2e-gpu must publish exactly the guard's `stale` output for `e2e-report`"
+            "e2e-gpu must publish exactly the guard's `stale` output for `cancel-stale-run`"
         );
 
         let steps = job_steps(block).expect("e2e-gpu has steps");
@@ -1974,6 +1974,12 @@ jobs:
                 cond == format!(
                     "always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == '{leg}'"
                 )
+            } else if name == "Record that this run skipped itself as stale"
+                || name == "Upload the stale-run marker"
+            {
+                // The marker steps run only for a stale run, the opposite gate:
+                // they tell `e2e-report`, which cannot read this job's output.
+                cond == "always() && steps.stale.outputs.stale == 'true'"
             } else {
                 cond == STALE_RUN_GATE.strip_prefix("if: ").unwrap()
             };
@@ -2363,6 +2369,9 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
 
     const REPORT_CHECK_STEP: &str = "- name: Check every lane that ran uploaded its report";
 
+    /// The per-PR workflow's MI300X lanes: the queue lane and the self-hosted one.
+    const MI300X_LANES: &[&str] = &["e2e-gpu", "e2e-gpu-queue"];
+
     /// A step block, found by its exact `- name:` line, including that line.
     fn named_step(block: &str, name_line: &str) -> String {
         let lines: Vec<&str> = block.lines().collect();
@@ -2488,9 +2497,20 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
                     .filter(|job| job_block(text, job).contains("gh workflow run queue-pr-run.yml"))
                     .map(|job| (job, String::from("the queue"))),
             );
+            // The per-PR workflow's MI300X lanes are decided together by
+            // `.github/scripts/mi300x-gate.sh` (the queue lane OR the self-hosted
+            // one), so a missing report from one is not an error while the other
+            // passed: they are not in LANE_REPORTS (see
+            // `mi300x_requirement_is_met_by_the_queue_or_the_self_hosted_lane`).
+            let gated: &[&str] = if workflow == "e2e-selfhosted.yml" {
+                MI300X_LANES
+            } else {
+                &[]
+            };
             let expected: Vec<String> = job_ids(text)
                 .iter()
                 .filter(|job| lanes.iter().any(|(lane, _)| lane == *job))
+                .filter(|job| !gated.contains(&job.as_str()))
                 .map(|job| format!("{job}={}", uploaded_report_artifact(workflow, text, job)))
                 .collect();
             // Read from the step itself, so a LANE_REPORTS left elsewhere in the
@@ -2508,6 +2528,11 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             let reads_lanes_through_needs = workflow != "nightly.yml";
             if reads_lanes_through_needs {
                 for (job, _) in &lanes {
+                    // `e2e-gpu` is read through `e2e-gpu-settled` instead, so a
+                    // lane queued on a pool with no runner cannot hold the report.
+                    if job == "e2e-gpu" && workflow == "e2e-selfhosted.yml" {
+                        continue;
+                    }
                     assert!(
                         block.lines().any(|line| line.trim() == format!("- {job}")),
                         "{workflow} `{report_job}` must list `{job}` under needs, or the \
@@ -2670,24 +2695,20 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             .find(|(workflow, ..)| *workflow == "e2e-selfhosted.yml")
             .expect("the per-PR workflow has a report check");
         let results = [
-            ("e2e-gpu", "success"),
-            // The queue gate is a lane of this check too: skipped here, as for a
-            // pull request that gets no queue run.
-            ("e2e-gpu-queue", "skipped"),
             ("e2e-gpu-strix-ubuntu", "skipped"),
-            ("e2e-gpu-strix-windows", "skipped"),
+            ("e2e-gpu-strix-windows", "success"),
             ("e2e-wsl", "skipped"),
         ];
         let (code, ..) = run_report_check_with_stale(&step, &results, &[], Some(&[]));
         assert_eq!(code, 1, "a lane that ran without a report is still flagged");
         let (code, log, summary) =
-            run_report_check_with_stale(&step, &results, &["e2e-gpu"], Some(&[]));
+            run_report_check_with_stale(&step, &results, &["e2e-gpu-strix-windows"], Some(&[]));
         assert_eq!(
             code, 0,
             "a stale-skipped lane is not a missing report: {log}"
         );
         assert!(
-            summary.contains("`e2e-gpu` skipped itself as stale"),
+            summary.contains("`e2e-gpu-strix-windows` skipped itself as stale"),
             "the lane's absence from the grid is said in the summary: {summary}"
         );
     }
@@ -2717,7 +2738,14 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // `nightly` legs); flatten to the individual artifact names the real
         // upload steps would produce, matching what `gh api` would list.
         let every_artifact: Vec<&str> = lanes.iter().flat_map(|(_, a)| a.split(',')).collect();
-        let (victim, victim_artifact) = (&lanes[0].0, &lanes[0].1);
+        // A lane with one artifact: the channel-axis lanes list two, and removing
+        // one of them is a different case from the lane uploading nothing.
+        let (victim, victim_artifact) = lanes
+            .iter()
+            .find(|(_, artifact)| !artifact.contains(','))
+            .map(|(job, artifact)| (job, artifact))
+            .expect("a lane with a single report artifact");
+        let victim_at = lanes.iter().position(|(job, _)| job == victim).unwrap();
         let all = |result: &'static str| -> Vec<(&str, &str)> {
             jobs.iter().map(|job| (*job, result)).collect()
         };
@@ -2740,7 +2768,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         );
 
         let mut failed = all("success");
-        failed[0].1 = "failure";
+        failed[victim_at].1 = "failure";
         let (code, log, summary) = run_report_check(&step, &failed, Some(&without_victim));
         assert_eq!(
             code, 1,
@@ -2766,7 +2794,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // A gate that skipped itself for the nightly window ends green with no
         // report, and is not missing; the same lane without that output is.
         let mut self_skipped = all("success");
-        self_skipped[0].1 = "success+skipped";
+        self_skipped[victim_at].1 = "success+skipped";
         let (code, log, _) = run_report_check(&step, &self_skipped, Some(&without_victim));
         assert_eq!(
             code, 0,
@@ -2774,7 +2802,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         );
 
         let mut skipped = all("success");
-        skipped[0].1 = "skipped";
+        skipped[victim_at].1 = "skipped";
         let (code, log, _) = run_report_check(&step, &skipped, Some(&without_victim));
         assert_eq!(
             code, 0,
@@ -2859,7 +2887,9 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
 
         // A lane absent from `needs` has no result to say it was skipped, so
         // it is checked rather than waved through.
-        let (code, log, _) = run_report_check(&step, &all("success")[1..], Some(&without_victim));
+        let mut victim_not_in_needs = all("success");
+        victim_not_in_needs.remove(victim_at);
+        let (code, log, _) = run_report_check(&step, &victim_not_in_needs, Some(&without_victim));
         assert_eq!(
             code, 1,
             "a lane missing from `needs` must not pass unchecked:\n{log}"
@@ -2872,7 +2902,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // `cancelled` is what a lane cut off by its timeout reports: it is
         // checked like any lane that ran, and passes only if it still uploaded.
         let mut timed_out = all("success");
-        timed_out[0].1 = "cancelled";
+        timed_out[victim_at].1 = "cancelled";
         let (code, log, _) = run_report_check(&step, &timed_out, Some(&without_victim));
         assert_eq!(
             code, 1,
@@ -2964,6 +2994,670 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             .trim()
             .trim_matches('"')
             .to_owned()
+    }
+
+    const MI300X_GATE_STEP: &str = "- name: Check the MI300X requirement (queue or self-hosted)";
+
+    #[test]
+    fn mi300x_requirement_is_met_by_the_queue_or_the_self_hosted_lane() {
+        // A pull request's MI300X requirement is either lane. The self-hosted
+        // lane can sit queued for a day on a pool at zero replicas, so the report
+        // reads it through `e2e-gpu-settled` (a job that gives up on it) instead
+        // of through `needs`, and the decision is `mi300x-gate.sh`, fed both lanes.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let report = job_block(&sh, "e2e-report");
+        let needs = job_needs(report);
+        assert!(
+            !needs.contains(&"e2e-gpu".to_owned()),
+            "`e2e-report` must not wait on `e2e-gpu` directly: queued on a pool with no runner \
+             it would hold the report for 24 hours"
+        );
+        for lane in ["e2e-gpu-settled", "e2e-gpu-queue"] {
+            assert!(
+                needs.contains(&lane.to_owned()),
+                "`e2e-report` must need `{lane}`"
+            );
+        }
+
+        // The settle job knows every leg of the MI300X lane, by display name.
+        let lane = job_block(&sh, "e2e-gpu");
+        let name = job_scalar(lane, "name");
+        assert_eq!(name, "E2E tests (MI300X, ${{ matrix.sdk_version }})");
+        let settle = job_block(&sh, "e2e-gpu-settled");
+        let expected: Vec<String> = [
+            ("e2e-gpu", "current"),
+            ("e2e-gpu-n-1", "n-1"),
+            ("e2e-gpu-n-2", "n-2"),
+        ]
+        .iter()
+        .map(|(id, leg)| format!("{id}={}", name.replace("${{ matrix.sdk_version }}", leg)))
+        .collect();
+        assert_eq!(
+            block_scalar_lines(settle, "LANES"),
+            expected,
+            "`e2e-gpu-settled` LANES must list every sdk_version leg of `e2e-gpu` by the display \
+             name the API reports; a misspelt name reads as `absent`"
+        );
+        // The deadlines are ordered and the job's cap lets the script stop itself.
+        // `${{ <MI300X_REQUIRED's condition> && '<pr>' || '<other>' }}`: a short
+        // queue deadline where the queue lane is the primary check, a long one
+        // where this lane is the only MI300X signal (a fork or dependabot pull
+        // request included). Both pairs must be ordered.
+        let required_cond = env_value(&named_step(report, MI300X_GATE_STEP), "MI300X_REQUIRED")
+            .trim_start_matches("${{ ")
+            .trim_end_matches(" }}")
+            .to_string();
+        let both = |key: &str| -> [u32; 2] {
+            let expr = env_value(settle, key);
+            assert!(
+                expr.starts_with(&format!("${{{{ {required_cond} && '")),
+                "{key} must differ by the queue lane's condition: {expr}"
+            );
+            let quoted: Vec<&str> = expr.split('\'').skip(1).step_by(2).collect();
+            let n = quoted.len();
+            [
+                quoted[n - 2].parse().unwrap(),
+                quoted[n - 1].parse().unwrap(),
+            ]
+        };
+        let (queues, hards) = (
+            both("QUEUE_DEADLINE_MINUTES"),
+            both("HARD_DEADLINE_MINUTES"),
+        );
+        assert!(
+            queues[0] < queues[1],
+            "a pull request gives up sooner: {queues:?}"
+        );
+        let lane_run: u32 = env_value(settle, "LANE_RUN_MINUTES").parse().unwrap();
+        let cap: u32 = job_scalar(settle, "timeout-minutes").parse().unwrap();
+        let lane_timeout: u32 = job_scalar(lane, "timeout-minutes").parse().unwrap();
+        assert!(
+            lane_run >= lane_timeout,
+            "LANE_RUN_MINUTES ({lane_run}) must cover `e2e-gpu`'s timeout-minutes ({lane_timeout})"
+        );
+        for (queue, hard) in queues.into_iter().zip(hards) {
+            assert!(
+                queue + lane_run <= hard,
+                "a leg that starts just before the queue deadline ({queue}m) must finish \
+                 ({lane_run}m) before the hard deadline ({hard}m)"
+            );
+            assert!(
+                hard < cap,
+                "the hard deadline ({hard}m) must come before the job's timeout ({cap}m)"
+            );
+        }
+        assert_eq!(
+            job_scalar(settle, "runs-on"),
+            "ubuntu-24.04 # one LTS: only polls the GitHub API",
+            "the settle job polls on a GitHub-hosted runner, which is always there"
+        );
+
+        // The gate step reads both lanes and runs even when a lane failed.
+        let step = named_step(report, MI300X_GATE_STEP);
+        let lines: Vec<&str> = step.lines().map(str::trim).collect();
+        for required in [
+            "if: ${{ !cancelled() }}",
+            "QUEUE_RESULT: ${{ needs.e2e-gpu-queue.result }}",
+            "QUEUE_SKIPPED: ${{ needs.e2e-gpu-queue.outputs.skipped }}",
+            "SELFHOSTED_RESULT: ${{ fromJSON(needs.e2e-gpu-settled.outputs.lane_results || '{}').e2e-gpu.result }}",
+            "bash .github/scripts/mi300x-gate.sh",
+        ] {
+            assert!(
+                lines.contains(&required),
+                "the MI300X gate step must carry `{required}`:\n{step}"
+            );
+        }
+        // The artifact names are the lanes' own upload steps'.
+        assert_eq!(
+            env_value(&step, "QUEUE_ARTIFACT"),
+            uploaded_report_artifact("e2e-selfhosted.yml", &sh, "e2e-gpu-queue")
+        );
+        assert_eq!(
+            env_value(&step, "SELFHOSTED_ARTIFACT"),
+            uploaded_report_artifact("e2e-selfhosted.yml", &sh, "e2e-gpu")
+        );
+        // Required only where the queue lane takes the pull request: its own `if`.
+        let required = env_value(&step, "MI300X_REQUIRED");
+        for part in [
+            "github.event_name == 'pull_request'",
+            "needs.changes.outputs.serve == 'true'",
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            "github.actor != 'dependabot[bot]'",
+        ] {
+            assert!(
+                required.contains(part) && job_block(&sh, "e2e-gpu-queue").contains(part),
+                "MI300X_REQUIRED must mirror the queue lane's `if`; missing `{part}`"
+            );
+        }
+
+        // The canceller ends the run after everything but the lane it cancels.
+        let cancel = job_block(&sh, "cancel-abandoned-mi300x-lane");
+        let cancel_needs = job_needs(cancel);
+        assert!(
+            !cancel_needs.contains(&"e2e-gpu".to_owned())
+                && !cancel_needs.contains(&"cancel-stale-run".to_owned()),
+            "the canceller must not wait on the lane it cancels (or on a job that does)"
+        );
+        for job in ["e2e-gpu-settled", "e2e-report", "e2e-gpu-queue"] {
+            assert!(
+                cancel_needs.contains(&job.to_owned()),
+                "the canceller must wait for `{job}`, or it cancels a job still producing a report"
+            );
+        }
+        assert!(cancel.lines().any(|line| line.trim() == "actions: write"));
+        let condition = job_scalar(cancel, "if");
+        assert!(
+            condition.starts_with("${{ always()")
+                && condition.contains("abandoned_count")
+                && condition.contains("needs.e2e-gpu-settled.result == 'failure'")
+                && condition.contains("needs.e2e-gpu-settled.result == 'cancelled'"),
+            "{condition}"
+        );
+
+        // The pieces whose loss no behaviour test would see, pinned exactly.
+        assert_eq!(
+            env_value(&step, "MI300X_REQUIRED"),
+            "${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' \
+             && github.event.pull_request.head.repo.full_name == github.repository \
+             && github.actor != 'dependabot[bot]' }}",
+            "MI300X_REQUIRED must hold the queue lane's whole `if`, joined by `&&`"
+        );
+        assert_eq!(
+            env_value(&step, "STALE_ARTIFACT"),
+            "mi300x-stale-run-${{ github.run_attempt }}",
+            "the marker is per attempt: the artifact list holds every attempt's"
+        );
+        assert!(
+            lines.contains(&"SETTLE_RESULT: ${{ needs.e2e-gpu-settled.result }}"),
+            "the gate must see the settle job's own result:\n{step}"
+        );
+        for required in [
+            "export ARTIFACTS",
+            "--paginate \\",
+            "exit 1",
+            "GH_TOKEN: ${{ github.token }}",
+        ] {
+            assert!(
+                step.contains(required),
+                "the MI300X gate step must carry `{required}`:\n{step}"
+            );
+        }
+        // The stale lane leaves its marker, which the gate reads as an absent lane.
+        let stale_upload = named_step(lane, "- name: Upload the stale-run marker");
+        assert!(
+            stale_upload.contains("name: mi300x-stale-run-${{ github.run_attempt }}")
+                && stale_upload.contains("path: ${{ runner.temp }}/mi300x-stale-run")
+                && stale_upload.contains("steps.stale.outputs.stale == 'true'")
+                && stale_upload.contains("if-no-files-found: error"),
+            "{stale_upload}"
+        );
+        let stale_record = named_step(lane, "- name: Record that this run skipped itself as stale");
+        assert!(
+            stale_record.contains("echo stale > \"${RUNNER_TEMP}/mi300x-stale-run\""),
+            "the marker the upload reads must be the file the record step writes:\n{stale_record}"
+        );
+
+        // The settle job hands over what the report reads, runs the script and can
+        // list the run's jobs.
+        for required in [
+            "lane_results: ${{ steps.settle.outputs.lane_results }}",
+            "abandoned_count: ${{ steps.settle.outputs.abandoned_count }}",
+            "run: bash .github/scripts/settle-e2e-lanes.sh",
+            "id: settle",
+            "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "GH_TOKEN: ${{ github.token }}",
+            "actions: read",
+            "needs: [changes]",
+        ] {
+            assert!(
+                settle.lines().any(|line| line.trim() == required),
+                "`e2e-gpu-settled` must carry `{required}`"
+            );
+        }
+
+        // The canceller runs the cancel, with a token, after every job it must not
+        // cut off.
+        assert!(
+            cancel.contains(
+                "-X POST \"repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/force-cancel\""
+            ) && !cancel.contains("gh run cancel")
+                && cancel.contains("GH_TOKEN: ${{ github.token }}")
+                && cancel.contains("::warning::"),
+            "the canceller must cancel this run with a token, tolerating a refusal:\n{cancel}"
+        );
+        let mut cancel_needs = cancel_needs;
+        cancel_needs.sort();
+        assert_eq!(
+            cancel_needs,
+            [
+                "e2e-gpu-queue",
+                "e2e-gpu-settled",
+                "e2e-gpu-strix-ubuntu",
+                "e2e-gpu-strix-windows",
+                "e2e-report",
+                "e2e-wsl"
+            ],
+            "the canceller must wait for every job but the lane it cancels"
+        );
+    }
+
+    /// Run `mi300x-gate.sh` and return its exit code, log and step summary.
+    /// `queue` and `selfhosted` are `result`, or `success+skipped` for a lane that
+    /// skipped itself on purpose; `uploaded` names the artifacts the run holds.
+    #[cfg(unix)]
+    fn run_mi300x_gate(
+        required: bool,
+        queue: &str,
+        selfhosted: &str,
+        uploaded: &[&str],
+    ) -> (i32, String, String) {
+        run_mi300x_gate_settled(required, queue, selfhosted, uploaded, "success")
+    }
+
+    /// As `run_mi300x_gate`, with the settle job's own result chosen.
+    #[cfg(unix)]
+    fn run_mi300x_gate_settled(
+        required: bool,
+        queue: &str,
+        selfhosted: &str,
+        uploaded: &[&str],
+        settle: &str,
+    ) -> (i32, String, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let summary = dir.path().join("summary.md");
+        std::fs::write(&summary, "").expect("write summary");
+        let (queue, queue_skipped) = queue.split_once('+').unwrap_or((queue, ""));
+        let out = std::process::Command::new("bash")
+            .arg(repo_root().join(".github/scripts/mi300x-gate.sh"))
+            .env("MI300X_REQUIRED", required.to_string())
+            .env("QUEUE_RESULT", queue)
+            .env(
+                "QUEUE_SKIPPED",
+                if queue_skipped.is_empty() { "" } else { "true" },
+            )
+            .env("QUEUE_ARTIFACT", "e2e-gpu-report")
+            .env("SELFHOSTED_RESULT", selfhosted)
+            .env("SELFHOSTED_ARTIFACT", "e2e-gpu-selfhosted-report")
+            .env("STALE_ARTIFACT", "mi300x-stale-run")
+            .env("SETTLE_RESULT", settle)
+            .env("ARTIFACTS", uploaded.join("\n") + "\n")
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .expect("running the MI300X gate");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status
+                .code()
+                .expect("the gate exited with a status code"),
+            log,
+            std::fs::read_to_string(&summary).expect("read summary"),
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mi300x_gate_passes_on_either_lane_with_a_report_and_never_on_absence() {
+        const Q: &str = "e2e-gpu-report";
+        const S: &str = "e2e-gpu-selfhosted-report";
+        // (queue, self-hosted, artifacts, expected exit, why)
+        let cases: &[(&str, &str, &[&str], i32, &str)] = &[
+            // The reported problem: the queue lane passed, the self-hosted lane
+            // never got a runner or was cancelled.
+            (
+                "success",
+                "abandoned",
+                &[Q],
+                0,
+                "queue passed, self-hosted never got a runner",
+            ),
+            (
+                "success",
+                "cancelled",
+                &[Q],
+                0,
+                "queue passed, self-hosted cancelled",
+            ),
+            (
+                "success",
+                "skipped",
+                &[Q],
+                0,
+                "queue passed, self-hosted skipped",
+            ),
+            (
+                "success",
+                "absent",
+                &[Q],
+                0,
+                "queue passed, self-hosted not in the run",
+            ),
+            // The bonus lane is enough on its own.
+            (
+                "skipped",
+                "success",
+                &[S],
+                0,
+                "self-hosted passed, queue skipped",
+            ),
+            (
+                "success+skipped",
+                "success",
+                &[S],
+                0,
+                "self-hosted passed, queue skipped itself",
+            ),
+            (
+                "cancelled",
+                "success",
+                &[S],
+                0,
+                "self-hosted passed, queue cancelled",
+            ),
+            ("success", "success", &[Q, S], 0, "both passed"),
+            // A skipped lane, or one with no exported report, is never a pass.
+            ("skipped", "skipped", &[], 1, "both skipped"),
+            (
+                "success+skipped",
+                "abandoned",
+                &[],
+                1,
+                "queue skipped itself, self-hosted never ran",
+            ),
+            (
+                "success",
+                "abandoned",
+                &[],
+                1,
+                "queue succeeded but exported no report",
+            ),
+            ("success", "success", &[], 1, "neither exported a report"),
+            (
+                "success",
+                "cancelled",
+                &[S],
+                1,
+                "queue exported no report; the cancelled lane's stray artifact is no pass",
+            ),
+            ("cancelled", "cancelled", &[], 1, "both cancelled"),
+            // A lane that ran and failed still fails, whatever the other did.
+            (
+                "success",
+                "failure",
+                &[Q, S],
+                1,
+                "self-hosted ran and failed, queue passed",
+            ),
+            (
+                "failure",
+                "success",
+                &[Q, S],
+                1,
+                "queue ran and failed, self-hosted passed",
+            ),
+            (
+                "failure",
+                "abandoned",
+                &[],
+                1,
+                "queue failed, self-hosted absent",
+            ),
+            (
+                "success",
+                "timed_out",
+                &[Q],
+                1,
+                "self-hosted timed out while running",
+            ),
+            (
+                "success",
+                "something-new",
+                &[Q],
+                1,
+                "an unknown result is not read as absent",
+            ),
+            (
+                "success+skipped",
+                "abandoned",
+                &[Q],
+                1,
+                "queue skipped itself, stray report is no pass",
+            ),
+            (
+                "success",
+                "abandoned",
+                &["x-e2e-gpu-report"],
+                1,
+                "a substring is not the artifact",
+            ),
+            (
+                "success",
+                "success",
+                &[Q, "mi300x-stale-run"],
+                0,
+                "stale self-hosted lane, queue passed",
+            ),
+            (
+                "skipped",
+                "success",
+                &["mi300x-stale-run"],
+                1,
+                "a stale self-hosted lane is no pass",
+            ),
+        ];
+        for (queue, selfhosted, uploaded, want, why) in cases {
+            let (code, log, summary) = run_mi300x_gate(true, queue, selfhosted, uploaded);
+            assert_eq!(code, *want, "{why} (required):\n{log}");
+            let mark = if *want == 0 {
+                ":white_check_mark:"
+            } else {
+                ":x:"
+            };
+            assert!(
+                summary.contains(&format!("MI300X: {mark}")),
+                "{why}: the verdict mark is said in the summary: {summary}"
+            );
+        }
+        // The cancelled lane is named absent, not failed, in the summary.
+        let (_, _, summary) = run_mi300x_gate(true, "success", "abandoned", &[Q]);
+        assert!(
+            summary.contains("counts as absent, not failed"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mi300x_gate_does_not_read_an_unknown_self_hosted_result_as_an_absent_lane() {
+        const Q: &str = "e2e-gpu-report";
+        const S: &str = "e2e-gpu-selfhosted-report";
+        // The settle job failed, was cancelled or never ran: `lane_results` is empty.
+        for settle in ["failure", "cancelled"] {
+            // Where either lane suffices, the queue lane's pass still counts.
+            let (code, log, _) = run_mi300x_gate_settled(true, "success", "", &[Q], settle);
+            assert_eq!(code, 0, "queue passed, settle {settle}:\n{log}");
+            let (code, log, summary) = run_mi300x_gate_settled(true, "skipped", "", &[], settle);
+            assert_eq!(code, 1, "nothing passed, settle {settle}:\n{log}");
+            assert!(
+                summary.contains(&format!(
+                    "the settle job (`e2e-gpu-settled`) ended {settle}"
+                )),
+                "the summary names the settle job as the reason: {summary}"
+            );
+            assert!(
+                !summary.contains("never got a runner counts as absent"),
+                "an unknown result is not explained as a lane that never ran: {summary}"
+            );
+            // Where only the self-hosted lane is judged, it fails closed.
+            let (code, log, summary) = run_mi300x_gate_settled(false, "skipped", "", &[S], settle);
+            assert_eq!(code, 1, "off a queue run, settle {settle}:\n{log}");
+            assert!(summary.contains("unknown"), "{summary}");
+        }
+        // The lane's own stale marker outranks a broken settle job, on every kind of run.
+        for settle in ["failure", "cancelled"] {
+            for required in [true, false] {
+                let (code, log, summary) =
+                    run_mi300x_gate_settled(required, "skipped", "", &["mi300x-stale-run"], settle);
+                // Required: nothing passed, so it fails for that reason, not for "unknown".
+                assert_eq!(
+                    code,
+                    i32::from(required),
+                    "stale lane, required {required}, settle {settle}:\n{log}"
+                );
+                assert!(!summary.contains("unknown"), "{summary}");
+            }
+        }
+        // A cut-off lane with no report is named as that, not as an absent one.
+        let (code, log, summary) =
+            run_mi300x_gate_settled(false, "skipped", "cancelled", &[], "success");
+        assert_eq!(code, 1, "{log}");
+        assert!(
+            summary.contains("(`e2e-gpu`): cut off, no report (result: cancelled)"),
+            "{summary}"
+        );
+        // The same label for the queue lane, and only off a queue run: where either lane
+        // suffices a cancelled lane is plainly absent.
+        let (code, log, summary) = run_mi300x_gate_settled(false, "cancelled", "", &[], "success");
+        assert_eq!(code, 1, "{log}");
+        assert!(
+            summary.contains("(`e2e-gpu-queue`): cut off, no report (result: cancelled)"),
+            "{summary}"
+        );
+        assert!(
+            log.contains("queue: cut off, no report"),
+            "the annotation says it too: {log}"
+        );
+        let (_, _, summary) =
+            run_mi300x_gate_settled(true, "cancelled", "cancelled", &[], "success");
+        assert!(
+            summary.contains("(`e2e-gpu-queue`): absent (result: cancelled)")
+                && !summary.contains("cut off"),
+            "{summary}"
+        );
+        // An empty result with a healthy settle job is a lane absent from the run.
+        let (code, log, _) = run_mi300x_gate_settled(false, "skipped", "", &[], "success");
+        assert_eq!(code, 0, "{log}");
+        // A stale marker from another attempt is a different artifact name.
+        let (code, log, _) =
+            run_mi300x_gate(true, "failure", "success", &[Q, S, "mi300x-stale-run-1"]);
+        assert_eq!(code, 1, "a failed queue lane still fails:\n{log}");
+        let (code, log, _) =
+            run_mi300x_gate(true, "skipped", "success", &[S, "x-mi300x-stale-run"]);
+        assert_eq!(
+            code, 0,
+            "a near-miss marker name does not mark the lane stale:\n{log}"
+        );
+        // `::error::` is emitted when the requirement is not met.
+        let (code, log, _) = run_mi300x_gate(true, "skipped", "skipped", &[]);
+        assert_eq!(code, 1);
+        assert!(log.contains("::error::MI300X requirement not met"), "{log}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mi300x_gate_off_a_queue_run_judges_each_lane_as_the_missing_report_check_does() {
+        // A push, a dispatch or a fork's pull request has no queue lane: there is
+        // no either-or. A lane that ran fails if it exported no report, whatever
+        // its result (a lane cut off by its timeout reports `cancelled`), and an
+        // absent lane is not an error.
+        const Q: &str = "e2e-gpu-report";
+        const S: &str = "e2e-gpu-selfhosted-report";
+        const STALE: &str = "mi300x-stale-run";
+        // (queue, self-hosted, artifacts, expected exit, why)
+        let cases: &[(&str, &str, &[&str], i32, &str)] = &[
+            ("skipped", "skipped", &[], 0, "nothing ran"),
+            (
+                "skipped",
+                "abandoned",
+                &[],
+                1,
+                "self-hosted never got a runner and no queue lane covers it",
+            ),
+            ("skipped", "absent", &[], 0, "self-hosted not in the run"),
+            ("skipped", "success", &[S], 0, "self-hosted passed"),
+            (
+                "skipped",
+                "failure",
+                &[S],
+                0,
+                "a failing suite is the report's to show",
+            ),
+            (
+                "skipped",
+                "success",
+                &[],
+                1,
+                "self-hosted ran and exported nothing",
+            ),
+            (
+                "skipped",
+                "failure",
+                &[],
+                1,
+                "self-hosted failed and exported nothing",
+            ),
+            (
+                "skipped",
+                "cancelled",
+                &[],
+                1,
+                "self-hosted cut off by its timeout, no report",
+            ),
+            (
+                "skipped",
+                "cancelled",
+                &[S],
+                0,
+                "self-hosted cut off but still uploaded",
+            ),
+            (
+                "skipped",
+                "success",
+                &[STALE],
+                0,
+                "self-hosted skipped itself as stale",
+            ),
+            (
+                "skipped",
+                "success",
+                &[S, STALE],
+                0,
+                "stale marker beats a leftover report",
+            ),
+            (
+                "success",
+                "skipped",
+                &[],
+                1,
+                "queue ran and exported nothing",
+            ),
+            (
+                "failure",
+                "skipped",
+                &[],
+                1,
+                "queue failed and exported nothing",
+            ),
+            ("success", "skipped", &[Q], 0, "queue passed"),
+            (
+                "success+skipped",
+                "skipped",
+                &[],
+                0,
+                "queue skipped itself on purpose",
+            ),
+            (
+                "success",
+                "skipped",
+                &["x-e2e-gpu-report"],
+                1,
+                "a substring is not the artifact",
+            ),
+        ];
+        for (queue, selfhosted, uploaded, want, why) in cases {
+            let (code, log, _) = run_mi300x_gate(false, queue, selfhosted, uploaded);
+            assert_eq!(code, *want, "{why} (not required):\n{log}");
+        }
     }
 
     #[test]
@@ -10605,6 +11299,26 @@ jobs:
                 condition: "always() && github.event_name == 'pull_request' \
                             && github.event.pull_request.head.repo.full_name == github.repository \
                             && needs.e2e-gpu.outputs.stale == 'true'"
+                    .to_owned(),
+                matrix_lane: false,
+            },
+            // The report's own condition: skips because the `serve` output of a
+            // skipped `changes` is empty.
+            PinnedIf {
+                job: "e2e-gpu-settled",
+                condition: "always() && (needs.changes.outputs.serve == 'true' \
+                            || github.event_name == 'workflow_dispatch')"
+                    .to_owned(),
+                matrix_lane: false,
+            },
+            // Skips on `closed`: every job it needs is skipped, so the count of
+            // abandoned legs is empty and its condition is false.
+            PinnedIf {
+                job: "cancel-abandoned-mi300x-lane",
+                condition: "${{ always() && (needs.e2e-gpu-settled.result == 'failure' \
+                            || needs.e2e-gpu-settled.result == 'cancelled' \
+                            || (needs.e2e-gpu-settled.outputs.abandoned_count != '' \
+                            && needs.e2e-gpu-settled.outputs.abandoned_count != '0')) }}"
                     .to_owned(),
                 matrix_lane: false,
             },

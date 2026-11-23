@@ -1162,6 +1162,7 @@ Feature: Interactive dashboard
     When the user quits the launcher
     Then the launcher exits successfully
 
+
   # ROCMAI-1050: at a short window height the prompt painted the
   # "<model> — stop it first:" bullet and cut the command on the line directly
   # beneath it, with nothing on screen saying anything had been dropped — the
@@ -1207,4 +1208,18 @@ Feature: Interactive dashboard
     And the quit prompt says there is more to read and names the keys that scroll it
     When the user declines the quit prompt
     And the user quits the dashboard
+
+  # ROCMAI-1288: with Caps Lock on, the terminal sends the uppercase letter, and
+  # the letter shortcuts matched only the lowercase one, so `S` did not open the
+  # services manager and `Q` did not quit. A PTY cannot toggle Caps Lock; the
+  # steps send the uppercase byte, which is what the terminal delivers with it on.
+  @id:dash-caps-lock-letter-shortcuts @requires-os:linux
+  Scenario: dash-66 - Letter shortcuts still work with Caps Lock on
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the services manager with Caps Lock on
+    Then the services manager is displayed
+    When the user presses Escape
+    Then the services manager is closed
+    When the user quits the dashboard with Caps Lock on
     Then the dashboard exits successfully

@@ -1302,6 +1302,15 @@ async fn open_services_manager(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
 }
 
+#[when("the user opens the services manager with Caps Lock on")]
+async fn open_services_manager_caps_lock(world: &mut E2eWorld) {
+    // A PTY cannot toggle Caps Lock; `S` is the byte the terminal sends for
+    // `s` with it on.
+    session(world)
+        .send("S")
+        .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
+}
+
 #[when("the user presses Escape")]
 async fn press_escape(world: &mut E2eWorld) {
     session(world)
@@ -1797,6 +1806,18 @@ async fn quit_tui(world: &mut E2eWorld, surface: &str) {
 #[when("the user quits the dashboard")]
 async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
+}
+
+#[when("the user quits the dashboard with Caps Lock on")]
+async fn quit_dashboard_caps_lock(world: &mut E2eWorld) {
+    // Sent once, not resent like `quit_and_wait` does: the previous step waited
+    // for the idle Observe frame, so nothing transient can swallow the key.
+    // Demo data never serves a model (`AppState::has_live_instance`), so no
+    // quit-confirm prompt opens.
+    session(world)
+        .send_once_and_wait("Q", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard did not quit on Q: {e}"));
 }
 
 // ── Two dashboards at once (dash-56) ───────────────────────────────

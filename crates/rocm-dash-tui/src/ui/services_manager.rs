@@ -36,6 +36,7 @@ use crate::ui::format;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// A lifecycle operation on a managed service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +185,7 @@ pub fn on_key<S: ::std::hash::BuildHasher>(
     }
 
     // 3) List navigation + lifecycle requests.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *services = None,
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
             sm.selected = sm.selected.saturating_sub(1);
@@ -471,7 +472,7 @@ fn trunc(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::test_support::press as key;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
     fn inst(id: &str, model: &str, tps: Option<f64>) -> Instance {
@@ -580,6 +581,32 @@ mod tests {
                 assert!(jobs.jobs.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        // Caps Lock delivers `Char('S')` with SHIFT on Unix, exactly as
+        // Shift+s would; the shortcut must still fire.
+        let caps = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let insts = instances();
+        let mut jobs = State::default();
+        for (letter, expected) in [
+            ('S', LifecycleAction::Stop),
+            ('R', LifecycleAction::Restart),
+        ] {
+            let mut services = Some(ServicesManagerState::default());
+            on_key(&mut services, &mut jobs, &insts, caps(letter));
+            let pending = services.as_ref().unwrap().approval.as_ref();
+            assert!(
+                pending.is_some_and(|p| p.action == expected),
+                "Caps Lock {letter} must stage {expected:?}"
+            );
+        }
+        let mut services = Some(ServicesManagerState::default());
+        on_key(&mut services, &mut jobs, &insts, caps('J'));
+        assert_eq!(services.as_ref().unwrap().selected, 1, "J must move down");
+        on_key(&mut services, &mut jobs, &insts, caps('Q'));
+        assert!(services.is_none(), "Q must close the overlay");
     }
 
     #[test]
