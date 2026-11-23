@@ -1135,6 +1135,72 @@ Feature: Model serving
     Then the startup failure names the vLLM compiled extension that did not load
     And the startup failure points at a diagnose command that reports a cause
 
+  # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
+  # log in this terminal (`run_attached_service`), and a managed engine that dies
+  # well after its early-startup window must fail that attach loudly — never the
+  # pre-fix "server process exited" / exit 0, which left a crash indistinguishable
+  # from a clean stop. Needs a real spawned `__engine-serve-http` child that
+  # survives both platforms' early-startup liveness checks before dying, which the
+  # scripted-engine E2E hook (`ROCM_E2E_SCRIPTED_ENGINE`, gated by the
+  # `e2e-test-hooks` feature — see `run_scripted_e2e_engine_serve_http` in
+  # `apps/rocm/src/engine_ipc.rs`) provides without any GPU: it stands in for the
+  # real Lemonade/vLLM dispatch entirely, and `serve_cmd.rs`'s
+  # `scripted_engine_death` bypasses the no-GPU pre-flight and the
+  # self-managed-engine install that would otherwise refuse this on the no-GPU
+  # lane. Piped (non-TTY) stdio, so this exercises `stream_attached_logs_no_tty`
+  # specifically — the only possible outcome of a scripted/CI `--verbose`
+  # session, per that function's own doc comment.
+  @id:serve-scripted-death-after-startup @requires-no-gpu
+  Scenario: serve-67 - A managed engine that dies after startup fails loudly
+    Given the scripted engine is armed to die shortly after startup
+    When the user serves a model expecting the engine to crash after startup
+    Then serving fails with a non-zero exit and names the crash
+    And the service record and its engine state both read failed
+
+  # The companion regression, proving the other half of the same fix: an
+  # externally triggered stop in the same post-startup window must NOT be
+  # treated as the crash above. `rocm services stop` run from a second
+  # invocation kills the pid the attached `--verbose` session is watching,
+  # landing in the identical `AttachOutcome::ServerExited` arm serve-67
+  # exercises — never `AttachOutcome::Stop`, which only ever fires from this
+  # attached session's own keystroke reader (and piped stdio has none at all).
+  # Before ROCMAI-541 this made a clean, intentional, externally-triggered
+  # stop fail exactly like serve-67's crash.
+  @id:serve-scripted-external-stop-while-attached @requires-no-gpu
+  Scenario: serve-68 - An externally stopped attached serve exits cleanly, not as a crash
+    Given the scripted engine is armed to run until stopped
+    When the user attaches to the scripted serve in the background
+    And another shell stops that service while it is attached
+    Then the attached serve exits zero and reports a stop, not a crash
+    And the service record does not read failed
+
+  # A managed engine is spawned detached, so if it dies on the way up there is no
+  # terminal for it to report to: the child's own service log is the only account
+  # of why. The launch fails naming that log, and leaves its record `stopped`
+  # (not `failed`, which `rocmd`'s recovery would respawn) without naming the
+  # dead child: its pid is free, and a later stop or cleanup must not signal
+  # whatever process reuses it (on Windows no start-time token was captured for
+  # the dead engine that could tell the two apart). Serving the same model
+  # again then reaches the engine launch again. The engine is scripted to
+  # die at startup in test builds (`rocm/e2e-test-hooks`), which also waives the
+  # no-GPU pre-flight and engine preparation so this reaches a real spawn without
+  # GPU hardware or a runtime download — the death itself is real, only its
+  # trigger is scripted.
+  #
+  # Carries no host tag on purpose, so it runs on every lane built with the
+  # hooks, the self-hosted Windows lane among them: `@requires-no-gpu` would skip
+  # it on any host that HAS a GPU, and the premise is a dead engine, not an
+  # absent GPU. The required `windows-build-and-test` lane does not build the
+  # hooks, so it cannot run this; the Windows watch itself is covered there by
+  # `rocm-core`'s `watched_detached_spawn_*` unit tests.
+  @id:serve-managed-engine-dies-at-startup
+  Scenario: serve-69 - An engine that dies at startup fails the serve and names its log
+    Given the managed engine dies during startup
+    When the user serves a model with Lemonade
+    Then serving fails and names the engine's own log
+    When the user serves the same model again
+    Then that serve reaches the engine launch again and fails the same way
+
   # ROCMAI-550, and the evidence that the Vulkan remediation is not a dead end.
   # `rocm install sdk` on a gfx90c APU refuses and tells the user to run `rocm
   # serve <model> --engine lemonade`; AGENTS.md section 3 only allows that if
@@ -1154,7 +1220,7 @@ Feature: Model serving
   # ROCM_CLI_TEST_HOST_ROOT (an `e2e-test-hooks` build), so the GPU-less mock
   # lane is where this runs.
   @id:serve-accepts-an-apu-the-kernel-gives-no-compute-node @requires-os:linux
-  Scenario: serve-67 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
+  Scenario: serve-70 - Serving is not refused on a Vulkan-only APU the kernel gives no compute node
     Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
     When the user is told to serve on Lemonade because this GPU has no ROCm build
     Then serving got past the no-GPU pre-flight and reported this host's usable GPU

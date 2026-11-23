@@ -266,7 +266,8 @@ fn render_engine_inventory_text_for_host(
     }
     for (name, note) in engine_inventory() {
         let marker = (*name == default_engine).then_some(DEFAULT_ENGINE_MARKER);
-        let note = engine_inventory_note(name, note, gpu_support_level);
+        let note =
+            engine_inventory_note(name, note, gpu_support_level, InventorySurface::Standalone);
         write_marked_row(&mut output, "", marker, format_args!("{name:10} {note}"));
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -544,7 +545,12 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
-        let note = engine_inventory_note(engine, note, gpu_support_level);
+        let note = engine_inventory_note(
+            engine,
+            note,
+            gpu_support_level,
+            InventorySurface::ExamineReport,
+        );
         write_marked_row(
             output,
             "  ",
@@ -727,12 +733,30 @@ pub(crate) fn engine_inventory_note(
     engine: &str,
     catalog_note: &'static str,
     gpu_support_level: rocm_core::GpuSupportLevel,
+    surface: InventorySurface,
 ) -> &'static str {
     if engine == "lemonade" {
-        lemonade_engine_note(gpu_support_level)
+        lemonade_engine_note(gpu_support_level, surface)
     } else {
         catalog_note
     }
+}
+
+/// Which surface is rendering an engine-inventory note.
+///
+/// Exists for exactly one clause. The `Unknown` note sends the reader to
+/// `rocm examine` for this host's support level, which is right from
+/// `rocm engines` and from the bridge's `engines` tool — and circular inside
+/// `rocm examine`'s own report, where it lands a few lines under the
+/// `rocm_support:` line that already answers it. Every other arm is identical
+/// across surfaces, so the three still cannot disagree about what a host *is*;
+/// they differ only in where they send the reader next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InventorySurface {
+    /// `rocm engines`, and the codex bridge's `engines` MCP tool.
+    Standalone,
+    /// The engine inventory printed inside `rocm examine`'s own report.
+    ExamineReport,
 }
 
 /// The lemonade engine note shown in `rocm examine`, `rocm engines` and the
@@ -767,7 +791,10 @@ pub(crate) fn engine_inventory_note(
 /// now answers for every level, and this says what that answer is: the support
 /// level, not the backend. The backend is settled by launching one, which that
 /// line in turn points at.
-const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
+const fn lemonade_engine_note(
+    level: rocm_core::GpuSupportLevel,
+    surface: InventorySurface,
+) -> &'static str {
     match level {
         rocm_core::GpuSupportLevel::VulkanOnly => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support, so it runs on the Vulkan llama.cpp backend"
@@ -788,11 +815,13 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         // always passes `VulkanStatus::Unknown`, so it can never land on these
         // two arms.
         //
-        // So the advice cannot be "run `rocm examine`": this very note is
+        // So the advice here cannot be "run `rocm examine`": this very note is
         // rendered *inside* that command's own output, through
-        // `examine_human_report` -> `append_examine_engine_inventory`, and told
-        // its reader to run the command they were already reading. It names the
-        // thing that would actually settle the question instead.
+        // `examine_human_report` -> `append_examine_engine_inventory`, and
+        // would tell its reader to run the command they were already reading.
+        // This arm names the thing that would actually settle the question
+        // instead, which is why it needs no [`InventorySurface`] split the way
+        // the `Unknown` arm below does.
         //
         // The claim and the next step are `rocm_core`'s
         // `VULKAN_UNCONFIRMED_CLAIM` and `VULKAN_UNCONFIRMED_NEXT_STEP`,
@@ -818,9 +847,18 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
         rocm_core::GpuSupportLevel::NoGpuBackend => {
             "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
         }
-        rocm_core::GpuSupportLevel::Unknown => {
-            "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
-        }
+        // The only remaining arm that names a next step, and so the only one
+        // that can be circular. The arms above answer it by naming `vulkaninfo`
+        // instead; this one has no such substitute, so it varies by surface.
+        // See [`InventorySurface`].
+        rocm_core::GpuSupportLevel::Unknown => match surface {
+            InventorySurface::Standalone => {
+                "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
+            }
+            InventorySurface::ExamineReport => {
+                "default embedded Lemonade server; the `rocm_support` line above gives this host's GPU support level and how to find the backend"
+            }
+        },
     }
 }
 
@@ -865,7 +903,22 @@ mod tests {
     /// Khronos registry key the probe reads is legacy there.
     #[test]
     fn the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim() {
-        let note = lemonade_engine_note(rocm_core::GpuSupportLevel::VulkanUnconfirmed);
+        let note = lemonade_engine_note(
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+            InventorySurface::ExamineReport,
+        );
+
+        // This arm settles the question by naming `vulkaninfo`, so unlike the
+        // `Unknown` arm it needs no per-surface wording. Pinned, so a future
+        // split here has to be deliberate.
+        assert_eq!(
+            note,
+            lemonade_engine_note(
+                rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+                InventorySurface::Standalone,
+            ),
+            "the unconfirmed arm must read the same on every surface"
+        );
 
         assert!(
             note.contains(rocm_core::VULKAN_UNCONFIRMED_CLAIM),
@@ -1481,6 +1534,57 @@ mod tests {
         assert!(output.contains("runtime_pref=therock-release:gfx120X-all"));
         assert!(output.contains("plugin_dirs:"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// `rocm examine`'s own report must not answer a question by telling the
+    /// reader to run `rocm examine`.
+    ///
+    /// The `Unknown` lemonade note is the only arm that names a next step, and
+    /// the `rocm engines` / bridge wording for it is "run `rocm examine` for
+    /// this host's GPU support level". Printed inside the examine report that
+    /// advice is circular, and it lands a few lines under the `rocm_support:`
+    /// line that already answers it with something actionable.
+    ///
+    /// The pair is the test: the same level rendered for the standalone
+    /// surface must still send the reader to `rocm examine`, or this would pass
+    /// just as well if the clause were deleted everywhere.
+    #[test]
+    fn the_examine_report_does_not_tell_the_reader_to_run_examine() {
+        let (root, paths) = test_paths("examine-inventory-not-circular");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            output.contains("lemonade"),
+            "premise: the lemonade row must be rendered at all:\n{output}"
+        );
+        assert!(
+            !output.contains("run `rocm examine`"),
+            "the examine report must not send the reader back to examine:\n{output}"
+        );
+        assert!(
+            output.contains("the `rocm_support` line above"),
+            "it must point at the answer already in this same report:\n{output}"
+        );
+
+        // The standalone surface keeps the original advice, where it is correct.
+        assert!(
+            lemonade_engine_note(
+                rocm_core::GpuSupportLevel::Unknown,
+                InventorySurface::Standalone,
+            )
+            .contains("run `rocm examine`"),
+            "`rocm engines` and the bridge still point at examine"
+        );
     }
 
     #[test]

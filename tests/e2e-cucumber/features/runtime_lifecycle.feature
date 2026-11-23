@@ -455,3 +455,16 @@ Feature: Runtime lifecycle state machine
     And the JSON gives no value for each fact the older runtime did not record instead of guessing
     And the JSON gives no package source for the adopted runtime
     And the text listing names the same provenance as the JSON for every runtime
+
+  # Every `rocm` error report goes through the same cleaning as a chat reply,
+  # because an error can quote text a user, a model or a remote service
+  # supplied. Here the runtime the user names carries a window-title sequence
+  # and an erase-line sequence: the report still names that runtime, with the
+  # sequences removed, and nothing is activated. Mock lane: no SDK or GPU.
+  @id:runtime-lifecycle-error-report-carries-no-escape
+  Scenario: runtime-lifecycle-32 - An error naming a runtime prints the name without its terminal escape sequences
+    Given two registered runtimes and none active
+    When the user tries to activate a runtime whose name carries terminal escape sequences
+    Then the activation fails naming that runtime without its escape sequences
+    And the error report carries no terminal control character
+    And no runtime is active

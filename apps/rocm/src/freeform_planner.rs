@@ -101,15 +101,25 @@ pub(crate) fn freeform_plan_next_action(
 /// answer short-circuits rendering), so it builds once via
 /// [`build_freeform_plan_with_context`] directly and passes that same `plan`
 /// through to `execute_freeform_next_action`.
+///
+/// The third value is the argv of every action the text lists as a
+/// `tool_call:` line, from the same build, so the `natural_language_plan` tool
+/// can report them and a caller can hold a model's request to the model-only
+/// rules (`tool_policy::validate_model_chosen_plan`) without planning again.
 pub(crate) fn plan_freeform_request_with_context(
     request: &str,
     paths: &AppPaths,
     config: &RocmCliConfig,
-) -> (String, Option<FreeformPlanAction>) {
+) -> (String, Option<FreeformPlanAction>, Vec<Vec<String>>) {
     let plan = build_freeform_plan_with_context(request, paths, config);
     let text = render_structured_request_plan(&plan, paths);
+    let planned_args = plan
+        .actions
+        .iter()
+        .map(|action| action.args.clone())
+        .collect();
     let action = plan_next_action(plan);
-    (text, action)
+    (text, action, planned_args)
 }
 
 pub(crate) fn plan_next_action(plan: StructuredRequestPlan) -> Option<FreeformPlanAction> {
@@ -370,7 +380,7 @@ fn build_freeform_plan_on(
             .as_ref()
             .map(|recipe| recipe.canonical_model_id.as_str())
             .or(requested_model)
-            .unwrap_or("<model>");
+            .unwrap_or(tool_policy::PLAN_MODEL_PLACEHOLDER);
         let engine = prompt_text::infer_engine_from_request(&lower)
             .or_else(|| resolved_recipe.as_ref().and_then(planner_recipe_engine))
             .unwrap_or(default_engine);
@@ -699,7 +709,7 @@ fn serve_plan_parsed_fields_and_confidence(
         ("device_policy".to_owned(), device_policy_value.to_owned()),
         ("mode".to_owned(), "managed".to_owned()),
     ];
-    if model == "<model>" {
+    if model == tool_policy::PLAN_MODEL_PLACEHOLDER {
         parsed.push(("missing".to_owned(), "model".to_owned()));
     }
     if let Some(requested_model) = requested_model
@@ -711,7 +721,11 @@ fn serve_plan_parsed_fields_and_confidence(
         parsed.push(("recipe_source".to_owned(), recipe.source.clone()));
         parsed.push(("recipe_dtype".to_owned(), recipe.dtype.clone()));
     }
-    let confidence = if model == "<model>" { "medium" } else { "high" };
+    let confidence = if model == tool_policy::PLAN_MODEL_PLACEHOLDER {
+        "medium"
+    } else {
+        "high"
+    };
     (parsed, confidence)
 }
 
@@ -1022,6 +1036,10 @@ pub(crate) fn validate_provider_planner_tool_call(
             format_structured_tool_call("rocm", &call.args)
         ),
     }
+    // The planner is a model, and its argv becomes the plan's `tool_call:` and
+    // `next_tool_call:` lines, which are offered to be run. Checked last, so
+    // the rules above keep their own refusals.
+    tool_policy::validate_model_chosen_argv(&call.args, "provider planner")?;
     Ok(call.args.clone())
 }
 
@@ -1786,6 +1804,29 @@ mod tests {
         assert!(rendered.contains("approval: required"));
     }
 
+    /// The argvs reported beside the text are the plan's `tool_call:` lines,
+    /// every one and in order, so checking them checks what is printed.
+    #[test]
+    fn the_planned_args_are_the_tool_call_lines_of_the_text() {
+        let (_root, paths) = test_paths("planned-args");
+        let (text, _, planned_args) = plan_freeform_request_with_context(
+            "serve qwen3.5 with vllm",
+            &paths,
+            &RocmCliConfig::default(),
+        );
+        let lines = text
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("tool_call: "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let from_args = planned_args
+            .iter()
+            .map(|args| format_structured_tool_call("rocm", args))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(from_args, lines);
+    }
+
     #[test]
     fn provider_planner_response_reduces_to_validated_rocm_tool_call() -> Result<()> {
         let content = r#"{
@@ -1883,6 +1924,40 @@ mod tests {
 
             assert!(error.contains("--managed"), "unexpected error: {error}");
         }
+    }
+
+    /// The planner's argv becomes the plan's `tool_call:` line, which is offered
+    /// to be run, so a value a Windows shell reads as syntax is refused there
+    /// as it is from the chat assistant, and a serve reference is held to the
+    /// same character set.
+    #[test]
+    fn provider_planner_refuses_values_unsafe_to_paste() {
+        for args in [
+            vec!["install", "sdk", "--prefix", "/mnt/R&D"],
+            vec!["install", "sdk", "--prefix", "/mnt/o'brien"],
+            vec!["serve", "qwen%PATH%", "--managed"],
+            vec!["serve", "qwen;id", "--managed"],
+        ] {
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            };
+            let error = validate_provider_planner_tool_call(&call)
+                .expect_err(&format!("{args:?}"))
+                .to_string();
+            assert!(
+                error.starts_with("provider planner ")
+                    && (error.contains("supply it yourself") || error.contains("only letters")),
+                "{args:?}: {error}"
+            );
+        }
+        let ordinary = ProviderPlannerToolCall {
+            tool: "rocm".to_owned(),
+            args: ["install", "sdk", "--prefix", "/mnt/my rocm"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        validate_provider_planner_tool_call(&ordinary).expect("a space is quoted, not refused");
     }
 
     #[test]

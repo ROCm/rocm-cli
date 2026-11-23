@@ -239,6 +239,10 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The `therock.version` Lemonade's `backend_versions.json` held after
+    /// runtime-33's failed alignment had reverted it, so the install that follows
+    /// can be held to leaving exactly that pin in place.
+    pub lemonade_pin_after_failed_alignment: Option<String>,
     /// The pasted error a diagnose-59 or diagnose-60 scenario hands to
     /// `rocm diagnose --symptom-file`. Its own field for the reason
     /// `skill_symptom` is.
@@ -263,6 +267,12 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// The scripted-engine `service_id` a serve step captured from the CLI's
+    /// own printed output (ROCMAI-541) — not by scanning the services dir
+    /// for "the newest record" after the fact, which a concurrent recovery
+    /// mechanism could make ambiguous. Set as soon as the id is known; read
+    /// by the later `Then` steps instead of re-deriving it.
+    pub scripted_service_id: Option<String>,
     /// The identity of a process the recorded one started (`service-stop-07`'s
     /// `ping`). Teardown ends it on its own account, because a stop that fails
     /// to take it down leaves it running with a dead parent, where nothing else
@@ -450,10 +460,12 @@ impl Default for E2eWorld {
             side_by_side: None,
             skill_reference: None,
             skill_symptom: None,
+            lemonade_pin_after_failed_alignment: None,
             symptom_paste: None,
             symptom_file_runs: Vec::new(),
             helper_identity: None,
             recorded_process: None,
+            scripted_service_id: None,
             recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,

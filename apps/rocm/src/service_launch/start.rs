@@ -7,15 +7,17 @@
 
 use super::endpoint_auth::drop_orphaned_endpoint_key_on_already_running;
 use super::readiness::{
-    died_during_wait, record_wait_outcome, service_pid_is_alive, settle_ended_launch,
-    wait_for_launch_startup, wait_for_record_ready, wait_on_existing_service,
+    StopWatch, died_during_wait, finalize_managed_launch_readiness, record_wait_outcome,
+    service_pid_is_alive, settle_ended_launch, wait_for_launch_startup, wait_for_record_ready,
+    wait_on_existing_service,
 };
 #[cfg(feature = "e2e-oom-fault-injection")]
 use super::readiness::{e2e_simulate_oom_launch, simulate_oom_managed_launch};
 use super::spawn::{ManagedLaunchReport, ManagedSpawn, spawn_managed_engine_child};
+use crate::record_cli_audit_event;
 use crate::serve_port;
 use crate::serve_progress::{self, ServeStartupPhase, ServeStartupPolicy, ServeStartupView};
-use crate::{record_cli_audit_event, status_for_readiness};
+use crate::status_for_readiness;
 use anyhow::Result;
 use rocm_core::format_http_base_url;
 use rocm_core::{AppPaths, EndpointReadiness};
@@ -85,7 +87,7 @@ pub(crate) fn start_managed_service(
             env_id,
         );
     }
-    let (mut record, child_pid) = match spawn_managed_engine_child(
+    let (mut record, child_pid, mut liveness) = match spawn_managed_engine_child(
         paths,
         engine,
         service_id,
@@ -118,7 +120,11 @@ pub(crate) fn start_managed_service(
                 },
             );
         }
-        ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
+        ManagedSpawn::Spawned {
+            record,
+            child_pid,
+            liveness,
+        } => (*record, child_pid, liveness),
     };
     // The transaction resolved the request to one concrete port; everything
     // below — readiness, the endpoint URL, the audit line — uses that.
@@ -135,24 +141,40 @@ pub(crate) fn start_managed_service(
     if announces_wait(wait_until_ready, policy) {
         on_wait_begin(service_id, port);
     }
+    // Sample the stop marker on every tick of whichever wait runs below, not
+    // just once at the end: a `rocm services stop` that lands inside this
+    // window clears its own marker as soon as it confirms, so a single read
+    // afterwards can miss it and report the stop as a crash. See `StopWatch`.
+    // Both waits call back per poll, so both sample.
+    let mut stop_watch = StopWatch::default();
+    let service_id_for_watch = record.service_id.clone();
     let (readiness, startup_stop) = if wait_until_ready {
         let readiness = wait_for_record_ready(paths, &record, endpoint_api_key, &mut |_elapsed| {
+            stop_watch.sample(paths, &service_id_for_watch);
             on_view(&steady);
         });
         (readiness, None)
     } else {
+        let mut sampling_view = |view: &ServeStartupView| {
+            stop_watch.sample(paths, &service_id_for_watch);
+            on_view(view);
+        };
         match wait_for_launch_startup(
             paths,
             &record,
             requested_model,
             endpoint_api_key,
             policy,
-            on_view,
+            &mut sampling_view,
         ) {
             Ok(readiness) => (readiness, None),
             Err(stop) => (stop.readiness, Some(stop)),
         }
     };
+    // `--wait` keeps its own death report: it waits far past the readiness
+    // budget, so a child that dies in that window is the `--wait` contract's
+    // case, with its own message and its own settling. Checked first so the
+    // ROCMAI-541 check below never preempts it.
     if let Some(error) = died_during_wait(
         paths,
         service_id,
@@ -167,7 +189,10 @@ pub(crate) fn start_managed_service(
         .filter(|stop| !stop.leaves_server_running())
     {
         // The engine failed or the process ended: settled the way a `--wait`
-        // that saw the server exit is, with the same memory guidance.
+        // that saw the server exit is, with the same memory guidance. Ahead of
+        // the crash check below, which would otherwise report this same death
+        // in its own, barer words — `settle_ended_launch` already tells a stop
+        // from a crash through `settle_exited_service`.
         let message = stop.user_message(requested_model, engine, service_id);
         let why = format!("{:?}", stop.reason);
         return Err(serve_progress::ServeStartupFailed {
@@ -176,36 +201,57 @@ pub(crate) fn start_managed_service(
         }
         .into());
     }
+    // A readiness wait that never reaches `Serving` is ambiguous (still loading
+    // vs. already dead) without checking whether the child is still alive — see
+    // `finalize_managed_launch_readiness`'s doc comment (ROCMAI-541). This bails
+    // with a non-zero exit and the service log's tail when it is not — unless a
+    // stop was requested concurrently, in which case it returns `false` and
+    // has already refreshed `record` from disk, so the bookkeeping below is
+    // skipped entirely rather than writing this stale snapshot back over
+    // whatever the stop just recorded. Backed by `liveness` (the retained
+    // `Child`/pid from the spawn above), not a bare `process_is_running(child_pid)`
+    // probe — see `ManagedChildLiveness`'s doc comment for why a probe alone is
+    // inert against a zombie on Unix.
+    let proceed_with_launch_bookkeeping = finalize_managed_launch_readiness(
+        paths,
+        &mut record,
+        readiness,
+        || liveness.is_running(),
+        stop_watch.stop_was_requested(),
+    )?;
     // A stall or the deadline left the server up. Its status follows how far
     // the endpoint got, as for any other launch: `running` only when the model
     // is listed, `starting` when it never opened, so `rocm services`, dash and
     // chat do not show a server that has not listed its model as up.
     // `rocmd` leaves a live `starting` record alone until the startup deadline
     // (`live_startup_still_in_progress` in apps/rocmd/src/watchers/server_recover.rs).
+    // The same value `finalize_managed_launch_readiness` just put on `record`.
     let launch_status = status_for_readiness(readiness);
-    let recorded = record_wait_outcome(
-        paths,
-        &mut record,
-        launch_status,
-        readiness == EndpointReadiness::Serving,
-    );
-    // After a stop, the stop is what the user needs to read; a record that
-    // could not be rewritten is best-effort there, as `settle_ended_launch` is.
-    if startup_stop.is_none() {
-        recorded?;
-    }
     let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
-    record_cli_audit_event(
-        paths,
-        "service",
-        "managed_service_launch",
-        "info",
-        format!(
-            "launched managed service engine={} model={} endpoint={} readiness={}",
-            engine, resolve.canonical_model_id, endpoint_url, launch_status
-        ),
-        Some(service_id),
-    );
+    if proceed_with_launch_bookkeeping {
+        let recorded = record_wait_outcome(
+            paths,
+            &mut record,
+            launch_status,
+            readiness == EndpointReadiness::Serving,
+        );
+        // After a stop, the stop is what the user needs to read; a record that
+        // could not be rewritten is best-effort there, as `settle_ended_launch` is.
+        if startup_stop.is_none() {
+            recorded?;
+        }
+        record_cli_audit_event(
+            paths,
+            "service",
+            "managed_service_launch",
+            "info",
+            format!(
+                "launched managed service engine={} model={} endpoint={} readiness={}",
+                engine, resolve.canonical_model_id, endpoint_url, launch_status
+            ),
+            Some(service_id),
+        );
+    }
     if let Some(stop) = startup_stop {
         return Err(serve_progress::ServeStartupFailed {
             message: stop.user_message(requested_model, engine, service_id),

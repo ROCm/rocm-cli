@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Test-only helpers shared across `app`'s submodule test suites, and
-//! (`press`, `st`, `with_registry_probe`) `crate::ui`'s test modules too — the
+//! (`press`, `caps`, `st`, `with_registry_probe`) `crate::ui`'s test modules too — the
 //! module itself and those fns are `pub(crate)` rather than `pub(super)` for
 //! exactly that cross-module reach.
 
@@ -16,6 +16,12 @@ use super::{ActiveTab, AppState, ResolvedArgs};
 /// its own byte-identical copy.
 pub(crate) fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// A letter typed with Caps Lock on: the uppercase char with SHIFT, which is
+/// how a Unix terminal reports it (the same event as Shift+letter).
+pub(crate) fn caps(letter: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(letter), KeyModifiers::SHIFT)
 }
 
 pub(crate) fn st() -> AppState {

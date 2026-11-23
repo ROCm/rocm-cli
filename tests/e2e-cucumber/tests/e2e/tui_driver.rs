@@ -1279,9 +1279,25 @@ impl TuiSession {
         Ok(())
     }
 
+    /// Send `bytes` once and wait for the TUI to exit, stashing the observed
+    /// code for the scenario's `Then` steps. Unlike
+    /// [`quit_and_wait`](Self::quit_and_wait) it never resends, so a key the TUI
+    /// ignores fails on the timeout instead of being covered by a later `q`.
+    pub async fn send_once_and_wait(
+        &mut self,
+        bytes: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.send(bytes)?;
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
     /// The exit code recorded by the most recent
     /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait),
-    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait) or
+    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait),
+    /// [`send_once_and_wait`](Self::send_once_and_wait) or
     /// [`quit_and_wait`](Self::quit_and_wait), read back by the scenario's
     /// `Then` step (the expected `128 + signo` value, or 0 after a quit).
     #[must_use]

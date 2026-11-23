@@ -150,6 +150,33 @@ impl AppState {
         self.close_overlays();
         self.modal = Modal::None;
         self.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
+        // A prompt always opens on its first line. Keeping a previous prompt's
+        // offset would open this one already scrolled past the bullet naming
+        // what is still serving.
+        self.quit_confirm_scroll = 0;
+        self.quit_confirm_max_scroll.set(0);
+    }
+
+    /// Move the open prompt's body if `code` is one of the scroll keys the
+    /// dialog's own "More to read" row advertises, reporting whether it did.
+    ///
+    /// Deliberately separate from [`on_quit_confirm_key`](Self::on_quit_confirm_key):
+    /// scrolling decides nothing, so a caller must apply this BEFORE the
+    /// verdict keys and stop when it returns `true`. `examine_manager`'s send
+    /// approval has the same split for the same reason.
+    pub(crate) fn quit_confirm_scroll_key(&mut self, code: crossterm::event::KeyCode) -> bool {
+        if !self.quit_confirm_pending() {
+            return false;
+        }
+        let Some(scroll) = crate::ui::approval::scrolled(
+            self.quit_confirm_scroll,
+            self.quit_confirm_max_scroll.get(),
+            code,
+        ) else {
+            return false;
+        };
+        self.quit_confirm_scroll = scroll;
+        true
     }
 
     /// Route a key to the open quit-confirm prompt: move the cursor and
@@ -181,6 +208,12 @@ impl AppState {
         code: crossterm::event::KeyCode,
     ) -> Option<bool> {
         use crate::ui::approval::ApprovalVerdict;
+        // Scrolling decides nothing, so it never reaches the verdict keys.
+        // Handled here rather than in each caller so the dashboard event loop
+        // and the launcher cannot drift on whether PgDn answers the prompt.
+        if self.quit_confirm_scroll_key(code) {
+            return None;
+        }
         match self.on_quit_confirm_key(code)? {
             ApprovalVerdict::Approve => Some(true),
             ApprovalVerdict::Deny | ApprovalVerdict::Cancel => {
@@ -221,7 +254,9 @@ impl AppState {
         &mut self,
         code: crossterm::event::KeyCode,
     ) -> bool {
-        if !self.quit_confirm_pending() || code != crossterm::event::KeyCode::Char('s') {
+        if !self.quit_confirm_pending()
+            || crate::ui::widgets::shortcut_key(code) != crossterm::event::KeyCode::Char('s')
+        {
             return false;
         }
         // One read for both questions below: a registry write landing between
@@ -472,6 +507,26 @@ mod tests {
             );
             assert!(s.services.is_none());
         }
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_accepts_caps_lock_s() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = st();
+        s.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                managed: true,
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut s, true, &["svc-managed"]);
+        s.open_quit_confirm();
+        assert!(s.quit_confirm_open_services_key(KeyCode::Char('S')));
+        assert!(s.services.is_some(), "Caps Lock `S` must open Services");
     }
 
     #[test]

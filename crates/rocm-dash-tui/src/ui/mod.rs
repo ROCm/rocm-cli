@@ -193,7 +193,21 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         panel::grey_overlay(f);
         // `true`: the dashboard's own `s` key (`quit_confirm_open_services_key`
         // in `event_loop`) can act on the hint this renders.
-        approval::draw_approval(f, body, &quit_confirm_request(state, true), choice, &theme);
+        // Scrolled, not plain: on a short screen the body outgrows even the
+        // rows `draw_approval_scrolled` now claims for it, and the line it
+        // would otherwise cut is the command that stops the model
+        // (ROCMAI-1050). The offset is written back so a stale one cannot
+        // blank the body on the next frame.
+        state
+            .quit_confirm_max_scroll
+            .set(approval::draw_approval_scrolled(
+                f,
+                body,
+                &quit_confirm_request(state, true),
+                choice,
+                state.quit_confirm_scroll,
+                &theme,
+            ));
     }
 }
 
@@ -271,7 +285,16 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
 
     if let Some(choice) = state.quit_confirm {
         panel::grey_overlay(f);
-        approval::draw_approval(f, body, &quit_confirm_request(state, false), choice, &theme);
+        state
+            .quit_confirm_max_scroll
+            .set(approval::draw_approval_scrolled(
+                f,
+                body,
+                &quit_confirm_request(state, false),
+                choice,
+                state.quit_confirm_scroll,
+                &theme,
+            ));
     }
 }
 

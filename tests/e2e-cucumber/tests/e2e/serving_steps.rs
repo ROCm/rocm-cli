@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -4285,7 +4286,7 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_secs(3)).await;
     };
     let block = last_seen.as_str();
-    let (backend, _ordinal) = parse_device_row(&device).unwrap_or_else(|| {
+    let (backend, ordinal) = parse_device_row(&device).unwrap_or_else(|| {
         panic!(
             "`device: {device}` is not the `<backend> [gpu <n>] [(<name>)]` shape \
              every engine reports, so it cannot be the engine's own answer:\n{block}"
@@ -4312,6 +4313,38 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
         "`device: {device}` names backend `{backend}`, which the `{engine}` \
          engine cannot have selected (expected one of {allowed:?}):\n{block}"
     );
+
+    // The dynamic half of the row, which the backend check above cannot reach.
+    //
+    // `vllm` and `aim` hardcode their backend word (`reported_device` in each
+    // engine's `state.rs` passes the literal `"rocm"`, correctly - neither has a
+    // non-ROCm backend), so for those engines the allow-list above is satisfied
+    // by any implementation, including a static one. What is NOT static is the
+    // ordinal and the GPU name: both are read out of the engine's own state by
+    // `first_gpu_index_from_state` / `gpu_name`. Asserting on them is what makes
+    // this step discriminate on the vLLM canary rather than only on Lemonade.
+    //
+    // Deliberately conditional on the parts being present, and that is a
+    // limitation rather than an oversight: `Launched::gpu_indices` is an
+    // `Option` precisely so "could not tell" is distinct from "no GPU", so a
+    // correct engine may legitimately report a bare backend. Asserting their
+    // presence outright is the same false failure this function's note below
+    // records an earlier revision making. What is asserted is that when the
+    // engine does answer with them, the answer is real: a name is never the
+    // backend word echoed back, and an ordinal is one a host can actually have.
+    if let Some(ordinal) = ordinal {
+        assert!(
+            ordinal < 64,
+            "`device: {device}` reports GPU ordinal {ordinal}, which no lane has -              a plausible ordinal is what shows it came from the engine's recorded              `gpu_indices` rather than being synthesised:\n{block}"
+        );
+    }
+    if let Some((_, name)) = device.split_once(" (") {
+        let name = name.trim_end_matches(')').trim();
+        assert!(
+            !name.is_empty() && !name.eq_ignore_ascii_case(backend),
+            "`device: {device}` carries a GPU name that is empty or just the              backend word echoed back, so it cannot be the adapter the engine              actually reported:\n{block}"
+        );
+    }
 
     // The same fact, read from the other surface. `rocm serve` printed this row
     // at launch; nothing else in these scenarios inspects that summary, so
@@ -4912,6 +4945,160 @@ async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
     );
 }
 
+/// Arms the scripted startup death. Also waives serve's no-GPU pre-flight and
+/// engine preparation, so the black-box test reaches a real spawn on a host with
+/// neither GPU hardware nor an installed runtime.
+#[given("the managed engine dies during startup")]
+async fn managed_engine_dies_during_startup(world: &mut E2eWorld) {
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
+}
+
+#[then("serving fails and names the engine's own log")]
+async fn assert_startup_death_names_log(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // A binary built without `rocm/e2e-test-hooks` never arms the scripted death:
+    // on a GPU lane it launches a real engine, which this exit-code check is the
+    // first to notice — so it names the feature as the likely cause.
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "an engine that died at startup must fail the serve (if it did not die at \
+         all, check the binary under test was built with `rocm/e2e-test-hooks`):\n{output}"
+    );
+    // See the note in assert_lemonade_preparation_retry_is_bounded: the seam that
+    // scripts the death also waives the no-GPU pre-flight, so this refusal can
+    // only appear when the binary under test was built without the feature. That
+    // diagnosis is specific to a host with no usable GPU, where the pre-flight is
+    // what stops such a binary.
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached the \
+         engine launch:\n{output}"
+    );
+    assert!(
+        output.contains("managed engine exited immediately"),
+        "expected the launch to report the engine's immediate exit:\n{output}"
+    );
+    // The child is detached, so its own log is the only account of why it died —
+    // the user has to be told where it is. The path is read off the record the
+    // launch left behind, not matched as a `.log` suffix that any incidental
+    // mention of a log would satisfy; and it is the path `rocm` itself recorded,
+    // so a Windows 8.3 short form cannot make the comparison disagree with itself.
+    //
+    // The two platforms reach this through different branches of the message.
+    // On Unix the parent redirects the child's stdio into the log, so the dead
+    // child's output is there and the message carries a tail. On Windows the
+    // detached spawn does not redirect, and the scripted child never receives
+    // `--log`, so the log stays empty and only the no-tail branch runs. Naming
+    // the path is the claim both branches share, and it is the one pinned here.
+    let records = lemonade_service_records(world);
+    let log_paths: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["log_path"].as_str())
+        .collect();
+    assert!(
+        !log_paths.is_empty(),
+        "the failed launch left no lemonade service record"
+    );
+    assert!(
+        log_paths.iter().any(|path| output.contains(path)),
+        "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
+    );
+    assert_failed_launches_left_their_claims(&records, 1);
+}
+
+/// Every lemonade service record in the scenario's isolated data folder, read
+/// raw from disk.
+fn lemonade_service_records(world: &E2eWorld) -> Vec<serde_json::Value> {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    std::fs::read_dir(&services)
+        .unwrap_or_else(|e| panic!("no services dir at {}: {e}", services.display()))
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(|record| record["engine"] == "lemonade")
+        .collect()
+}
+
+/// `launches` failed launches of an engine that died at startup each left one
+/// record: `stopped`, and still the claim as it was written.
+fn assert_failed_launches_left_their_claims(records: &[serde_json::Value], launches: usize) {
+    // Read raw from disk, not through `rocm services`, whose liveness refresh
+    // would rewrite the very fields pinned here. `stopped`, not `failed`:
+    // `rocmd`'s recovery restarts a managed `failed` record that carries no stop
+    // marker, which would respawn the launch this serve just reported as failed.
+    let statuses: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["stopped"; launches],
+        "each failed launch must leave its record `stopped`, not claiming the engine \
+         and model"
+    );
+    // The startup check saw the child die, so the record never names it: the
+    // pid is free, and a later stop or cleanup must not signal whatever process
+    // reuses it. On Windows no start-time token was captured for the dead
+    // engine, so nothing else would tell that process from it. Both platforms
+    // leave the claim as it was written, before any child was put on record.
+    let pids: Vec<(serde_json::Value, serde_json::Value)> = records
+        .iter()
+        .map(|record| {
+            (
+                record["supervisor_pid"].clone(),
+                record["engine_pid"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pids,
+        vec![(serde_json::json!(0), serde_json::Value::Null); launches],
+        "a child the startup check saw die must not be named by the record"
+    );
+}
+
+#[when("the user serves the same model again")]
+async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
+    // Re-arm the scripted death: the runner consumes the scenario env on each
+    // invocation, and the retry has to die the same way to be recognisable.
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
+    user_serves_with_failing_lemonade_preparation(world).await;
+}
+
+#[then("that serve reaches the engine launch again and fails the same way")]
+async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
+    // The retry reaches the engine launch again and dies there the same way,
+    // rather than being answered by the first launch's record as an engine already
+    // starting. The `stopped` status asserted by the previous step is what frees
+    // the engine and model for it.
+    let output = serve_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the retry should fail the same way, not succeed:\n{output}"
+    );
+    assert!(
+        output.contains("managed engine exited immediately"),
+        "the retry must reach the engine launch again rather than being turned \
+         away by the previous failed launch:\n{output}"
+    );
+    // The retry's own cleanup left its record the same way, beside the first.
+    assert_failed_launches_left_their_claims(&lemonade_service_records(world), 2);
+}
+
 /// Serve this host's small model on loopback with `--require-api-key`, so the
 /// CLI generates a key and stores it before the engine starts. The serve still
 /// waits a fixed 45 seconds for the engine (`READINESS_WAIT` in
@@ -4943,6 +5130,160 @@ async fn user_serves_model_requiring_api_key(world: &mut E2eWorld) {
         "`rocm serve {model} --engine {engine} --managed --require-api-key` failed:\n\
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+// ── ROCMAI-541: scripted-engine post-startup death / external stop ─────────
+//
+// Both scenarios below spawn a REAL managed child — the `rocm` binary itself,
+// re-invoked as `__engine-serve-http` — rather than a planted record, but swap
+// out the real Lemonade/vLLM dispatch for a scripted stand-in
+// (`run_scripted_e2e_engine_serve_http` in `apps/rocm/src/engine_ipc.rs`, armed by
+// `ROCM_E2E_SCRIPTED_ENGINE`) so the child can survive past both platforms'
+// early-startup liveness checks and then either die or run until stopped,
+// without any GPU. Both attach with `--verbose` under piped (non-TTY) stdio,
+// so both exercise `stream_attached_logs_no_tty` and
+// `run_attached_service`'s `AttachOutcome::ServerExited` arm specifically —
+// the ROCMAI-541 code path, not the background-launch readiness wait
+// (covered by unit tests instead: a real HTTP readiness wait never completes
+// early against an engine that never binds a port, so driving that path here
+// would cost the full 45s timeout for no extra coverage).
+
+/// Engine the scripted-engine scenarios launch under. Lemonade because it
+/// manages its own runtime, so `serve_cmd.rs`'s "no active ROCm runtime
+/// configured" guard is skipped for it and reaching the scripted dispatch
+/// needs only the no-GPU pre-flight and the self-managed-install call
+/// bypassed — not a fake ROCm runtime too. Not the *only* engine that would
+/// do: `engine_manages_own_runtime` (`engine_install_env.rs`) answers true
+/// for `aim` as well. See `scripted_engine_death` in `serve_cmd.rs`.
+const SCRIPTED_ENGINE: &str = "lemonade";
+/// A short recipe name `resolve_lemonade_model_ref` resolves purely locally
+/// (no network, no GPU) — the same model `serve-18` already relies on this
+/// resolving on the no-GPU lane.
+const SCRIPTED_ENGINE_MODEL: &str = "Qwen3-0.6B-GGUF";
+
+/// A port nothing holds right now, asked of the OS rather than hardcoded.
+///
+/// These two scenarios used fixed 11483/11484, which a busy self-hosted lane
+/// can collide on — and a collision fails the serve for a reason that has
+/// nothing to do with what the scenario tests. The listener closes before this
+/// returns, so it is the same inherently racy bind-then-release every other
+/// port helper in this suite uses; the scenario's own serve claims the port
+/// immediately afterwards.
+fn scripted_engine_free_port() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind a loopback port for the scripted serve")
+        .local_addr()
+        .expect("failed to read the bound loopback address")
+        .port()
+        .to_string()
+}
+
+fn scripted_engine_services_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services")
+}
+
+fn read_json_file(path: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
+
+/// The scripted engine's service record and its paired engine-state file
+/// (named by the record's own `engine_state_path` field).
+///
+/// Reads the manifest by its known `service_id` (`<service_id>.json` — see
+/// `AppPaths::service_manifest_path`) rather than scanning the services dir
+/// for "the newest record" (ROCMAI-541): a concurrent recovery mechanism
+/// could otherwise make that ambiguous.
+fn scripted_engine_record_and_state_for(
+    world: &E2eWorld,
+    service_id: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let manifest_path = world.app_paths().service_manifest_path(service_id);
+    let record = read_json_file(&manifest_path);
+    record_and_state_from(record)
+}
+
+fn record_and_state_from(record: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    let engine_state_path = record
+        .get("engine_state_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("record has no engine_state_path: {record}"));
+    let engine_state = read_json_file(std::path::Path::new(engine_state_path));
+    (record, engine_state)
+}
+
+/// Extract the `service_id` the CLI printed for an attached managed launch
+/// (`println!("  service_id: {service_id}");` in `run_attached_service`) from
+/// its captured stdout (ROCMAI-541). Deterministic and tied to this exact
+/// invocation, unlike scanning the services dir afterward for "the newest
+/// record".
+fn parse_service_id_from_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("service_id: ")
+            .map(str::to_owned)
+    })
+}
+
+/// Guard against a binary built without `rocm/e2e-test-hooks`: without that
+/// feature `ROCM_E2E_SCRIPTED_ENGINE` does not exist, so serving falls through
+/// to the ordinary no-GPU pre-flight refusal instead of reaching the scripted
+/// engine — the same failure mode (and the same guard shape)
+/// `assert_lemonade_preparation_retry_is_bounded` already checks for.
+fn assert_scripted_hook_was_reached(output: &str) {
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached the \
+         scripted engine. E2E lanes that pre-build `rocm` and export \
+         ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
+         what `cargo xtask e2e` builds for itself:\n{output}"
+    );
+}
+
+#[given("the scripted engine is armed to die shortly after startup")]
+async fn scripted_engine_armed_to_die(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_SCRIPTED_ENGINE", "1".into()));
+    // Long enough to clear both platforms' early-startup liveness checks
+    // (~200ms) with margin; short enough that the scenario stays fast.
+    world
+        .command_env
+        .push(("ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS", "1500".into()));
+}
+
+#[when("the user serves a model expecting the engine to crash after startup")]
+async fn user_serves_expecting_scripted_crash(world: &mut E2eWorld) {
+    let port = scripted_engine_free_port();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            SCRIPTED_ENGINE_MODEL,
+            "--engine",
+            SCRIPTED_ENGINE,
+            "--port",
+            &port,
+            "--verbose",
+        ],
+    );
+    // Captured from the CLI's own printed output (ROCMAI-541) — right here,
+    // before any `Then` step would otherwise need to re-derive it by scanning
+    // the services dir for "the newest record", which a concurrent recovery
+    // mechanism could make ambiguous.
+    world.scripted_service_id = parse_service_id_from_output(&stdout);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -4996,4 +5337,257 @@ async fn endpoint_key_is_owner_only(world: &mut E2eWorld) {
     }
     #[cfg(not(unix))]
     panic!("this step checks a Unix file mode; its scenario is tagged @requires-os:linux");
+}
+
+#[then("serving fails with a non-zero exit and names the crash")]
+async fn assert_scripted_crash_fails(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert_scripted_hook_was_reached(&output);
+    assert_ne!(rc, 0, "expected a non-zero exit, got 0:\n{output}");
+    assert!(
+        output.contains("exited unexpectedly"),
+        "expected the crash to be reported as an unexpected exit: {output}"
+    );
+    // That wrapper is not enough on its own. `managed_engine_exit_failure_detail`
+    // prints "exited unexpectedly" even when the log tail is EMPTY, so asserting
+    // only it would stay green in exactly the failure ROCMAI-541 is about: the
+    // engine's reason reaching neither the log nor the user. Pin the engine's
+    // OWN message in both places instead.
+    //
+    // What this does NOT pin, despite an earlier comment here claiming it: the
+    // Windows stdio attach. The in-child backstop
+    // (`record_engine_serve_http_failure`) appends the reason to this same log
+    // file directly, independent of stdout/stderr, so the assertion below stays
+    // green with the attach reverted — and on Linux the attach is not exercised
+    // at all. What it pins is that the reason reaches the log by *some* route,
+    // which is the user-visible guarantee; the attach itself is covered at the
+    // unit level by `a_detached_child_writes_both_streams_into_the_log`.
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured from the serve's own output");
+    let log = scripted_service_log(world, &service_id);
+    assert!(
+        log.contains(SCRIPTED_ENGINE_DEATH_REASON),
+        "the engine's own failure reason never reached the service log — the bug \
+         this scenario exists for. Log was:\n{log}"
+    );
+    assert!(
+        output.contains(SCRIPTED_ENGINE_DEATH_REASON),
+        "the engine's own failure reason never reached the user:\n{output}"
+    );
+}
+
+/// The scripted engine's own death message, which must survive from the
+/// detached child all the way to the service log and the user. Must match the
+/// `bail!` in `run_scripted_e2e_engine_serve_http`.
+const SCRIPTED_ENGINE_DEATH_REASON: &str = "scripted e2e engine death after startup";
+
+/// Read the service log the way `rocm logs` would: off the `log_path` the
+/// manifest records, rather than re-deriving it.
+fn scripted_service_log(world: &E2eWorld, service_id: &str) -> String {
+    let manifest_path = world.app_paths().service_manifest_path(service_id);
+    let record = read_json_file(&manifest_path);
+    let log_path = record
+        .get("log_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("record has no log_path: {record}"));
+    match std::fs::read(log_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => panic!("failed to read service log {log_path}: {error}"),
+    }
+}
+
+#[then("the service record and its engine state both read failed")]
+async fn assert_scripted_crash_marks_failed(world: &mut E2eWorld) {
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured from the serve's own output");
+    let (record, engine_state) = scripted_engine_record_and_state_for(world, &service_id);
+    // These two halves pin DIFFERENT writers, and only the first is parent-side.
+    // The manifest is never touched by the engine child, so `failed` there can
+    // only have come from `run_attached_service`'s `ServerExited` branch and its
+    // `still_watching_this_supervisor` guard.
+    assert_eq!(record["status"], "failed", "manifest: {record}");
+    // The engine state file, by contrast, is stamped by
+    // `record_engine_serve_http_failure` inside the child itself, so this half
+    // would stay green even if the parent-side write were deleted. It is kept
+    // deliberately: that in-child backstop is part of the same fix (it covers
+    // engines that error without updating their own state file), and is worth
+    // pinning — just not as evidence for the parent-side path.
+    assert_eq!(
+        engine_state["status"], "failed",
+        "engine state: {engine_state}"
+    );
+}
+
+#[given("the scripted engine is armed to run until stopped")]
+async fn scripted_engine_armed_to_run(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_SCRIPTED_ENGINE", "1".into()));
+}
+
+/// Kill `child` and collect its combined stdout+stderr, best-effort. Used to
+/// diagnose a hung wait before it falls through to a generic timeout panic
+/// (ROCMAI-541).
+fn kill_and_collect_combined_output(mut child: std::process::Child) -> String {
+    let _ = child.kill();
+    match child.wait_with_output() {
+        Ok(output) => format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("(failed to collect output after kill: {error})"),
+    }
+}
+
+#[when("the user attaches to the scripted serve in the background")]
+async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
+    let port = scripted_engine_free_port();
+    let mut cmd = Command::new(crate::rocm_binary());
+    cmd.args([
+        "serve",
+        SCRIPTED_ENGINE_MODEL,
+        "--engine",
+        SCRIPTED_ENGINE,
+        "--port",
+        &port,
+        "--verbose",
+    ]);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in std::mem::take(&mut world.command_env) {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .expect("failed to spawn the attached scripted serve");
+    world.recorded_process = Some(child);
+
+    // Wait for the service record to name a real, running engine pid — not
+    // merely for the file to exist. `spawn_managed_engine_child` writes the
+    // record twice: once before the child spawns (a placeholder with pid 0,
+    // which `terminate_recorded_service_pids` would silently skip), and again
+    // after, with the real pid and `status: "running"`. Stopping on the first
+    // write's strength would stop nothing and let the scripted engine run to
+    // its own safety ceiling instead.
+    let dir = scripted_engine_services_dir(world);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // Captured here, the moment the record is first seen `running` (ROCMAI-541
+    // N5/N3) — not re-derived later by scanning the services dir for "the
+    // newest record", which a concurrent recovery mechanism could make
+    // ambiguous by the time `another shell stops that service` or the final
+    // `Then` step runs.
+    let found_service_id = loop {
+        let running_service_id = std::fs::read_dir(&dir).ok().and_then(|entries| {
+            entries.flatten().find_map(|entry| {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    return None;
+                }
+                let value = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())?;
+                if value["status"] != "running" {
+                    return None;
+                }
+                value["service_id"].as_str().map(str::to_owned)
+            })
+        });
+        if let Some(service_id) = running_service_id {
+            break service_id;
+        }
+        if Instant::now() >= deadline {
+            // Diagnose before the generic timeout panic (ROCMAI-541): a
+            // binary under test built without the `rocm/e2e-test-hooks`
+            // feature never reaches the scripted engine at all, so this loop
+            // would otherwise just spin for the full 30s and panic with a
+            // message that gives no hint why. Kill the attached process and
+            // check its own output for that specific cause first.
+            let child = world
+                .recorded_process
+                .take()
+                .expect("scenario recorded no attached serve process");
+            let output = kill_and_collect_combined_output(child);
+            assert_scripted_hook_was_reached(&output);
+            panic!(
+                "the scripted engine's service record never reached `running` under {}:\n{output}",
+                dir.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    world.scripted_service_id = Some(found_service_id);
+}
+
+#[when("another shell stops that service while it is attached")]
+async fn another_shell_stops_scripted_service(world: &mut E2eWorld) {
+    // The id captured when `user_attaches_scripted_serve_in_background` first
+    // saw this exact record `running` (ROCMAI-541) — not re-derived here by
+    // scanning the services dir for "the newest record", which a concurrent
+    // recovery mechanism could make ambiguous.
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured while waiting for the attach to come up");
+    let stdout = crate::run_rocm_ok(world, &["services", "stop", &service_id, "--yes"]);
+    assert!(
+        stdout.contains("stopped"),
+        "the stop must report success:\n{stdout}"
+    );
+}
+
+#[then("the attached serve exits zero and reports a stop, not a crash")]
+async fn assert_attached_serve_reports_stop(world: &mut E2eWorld) {
+    let child = world
+        .recorded_process
+        .take()
+        .expect("scenario recorded no attached serve process");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for the attached serve process");
+    let rc = output.status.code().unwrap_or(-1);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_scripted_hook_was_reached(&combined);
+    assert_eq!(
+        rc, 0,
+        "an externally stopped attach must exit 0, got {rc}:\n{combined}"
+    );
+    assert!(
+        combined.contains("server process exited"),
+        "expected the benign-stop message: {combined}"
+    );
+    assert!(
+        !combined.contains("exited unexpectedly"),
+        "an intentional external stop must not be reported as a crash: {combined}"
+    );
+}
+
+#[then("the service record does not read failed")]
+async fn assert_scripted_stop_not_marked_failed(world: &mut E2eWorld) {
+    // Read by the id captured at attach time (ROCMAI-541), not by scanning
+    // for "the newest record" — see `another_shell_stops_scripted_service`.
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured while waiting for the attach to come up");
+    let (record, engine_state) = scripted_engine_record_and_state_for(world, &service_id);
+    assert_ne!(
+        record["status"], "failed",
+        "manifest wrongly marked failed: {record}"
+    );
+    assert_ne!(
+        engine_state["status"], "failed",
+        "engine state wrongly marked failed: {engine_state}"
+    );
 }

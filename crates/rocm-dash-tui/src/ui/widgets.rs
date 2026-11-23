@@ -35,6 +35,21 @@ pub fn trunc(s: &str, n: usize) -> String {
     }
 }
 
+/// Fold a letter key to lowercase so a letter shortcut fires whatever its case.
+///
+/// With Caps Lock on, the terminal delivers the uppercase letter, and on Unix
+/// crossterm reports it exactly like Shift+letter (`Char('S')` with `SHIFT`),
+/// so the two cannot be told apart. A shortcut match on `Char('s')` alone
+/// therefore ignores the key. Match shortcuts on `shortcut_key(key.code)`
+/// instead. Never pass text-entry keys through it (chat input, form fields,
+/// filters, [`apply_char_key`]): that would lose the case the user typed.
+pub const fn shortcut_key(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+        other => other,
+    }
+}
+
 /// Apply an append-only text-edit key to `buf`.
 ///
 /// `Char` appends and `Backspace` pops one char. Returns `true` when `key` is
@@ -365,6 +380,22 @@ mod tests {
             |_| false
         ));
         assert_eq!(buf, "a");
+    }
+
+    #[test]
+    fn shortcut_key_folds_letters_and_leaves_every_other_key_alone() {
+        assert_eq!(shortcut_key(KeyCode::Char('S')), KeyCode::Char('s'));
+        assert_eq!(shortcut_key(KeyCode::Char('s')), KeyCode::Char('s'));
+        for key in [
+            KeyCode::Char('1'),
+            KeyCode::Char('?'),
+            KeyCode::Char('{'),
+            KeyCode::Char('é'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            assert_eq!(shortcut_key(key), key, "{key:?} must pass through");
+        }
     }
 
     #[test]

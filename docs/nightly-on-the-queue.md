@@ -78,11 +78,14 @@ minutes to be started and runs at most 75, and a limited number of such runs
 at once (the queue side sets the limit). The
 queue side does not take one while the nightly goes, or when it has no healthy
 MI300X worker: the gate job then fails with the reason the queue gave, which is
-capacity, not a failing test (the consolidated report's missing-report check
-then flags the lane too). The nightly window is the exception, being by design:
+capacity, not a failing test (the consolidated report's MI300X check,
+[`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh), still counts a run the
+queue refused as a lane that ran and failed). The nightly window is the exception, being by design:
 the gate ends green with a note in its summary to re-run once the window has
 passed (the queue side defines the window), and
-the consolidated report reads the lane as skipped, not missing. A superseded push cancels the gate job, which cancels
+the consolidated report reads the lane as skipped, not missing; the MI300X check
+still needs a passing report from the self-hosted lane, since a skipped lane is
+never a pass. A superseded push cancels the gate job, which cancels
 the run it started, freeing the runner; the queue side's lanes are left to their
 own budgets. The queue run tests the branch as it is when the run starts, not
 the pull request's merge with its base, which the self-hosted lane checks out.
@@ -337,6 +340,35 @@ queue has (MI325X, MI350X, MI355X) is on them.
 What is public follows from the queue's own rules: the artifact is public and
 already scanned, only three of its files are used, and the log is the public job
 log.
+
+## The jobs' time limits
+
+A job that waits for a run on the queue side must not reach its GitHub time
+limit before the publish command gives up: a job cut off by GitHub reads as
+cancelled, not as a result, and publishes nothing. The publish command is kept
+with the queue side, so its bounds are written here and held to the workflows
+by `the_queue_job_timeouts_cover_the_publish_commands_bound` in
+[workflow_contract.rs](../xtask/src/workflow_contract.rs). It follows a started
+run, and asks to start one, for at most:
+
+- the start, asked again for as long as the queue side is busy finishing another
+  job's run: 3600 s of retries, a pause of 30 s and one last start call of 600 s
+  (4230 s)
+- the wait for the run, where its lanes wait at most `W` to be started and run
+  at most `R`: `W` + `R` + 120 s for a cancelled lane to stop + 600 s for a
+  passed lane's files + one poll (60 s) + one finish (1800 s)
+- one more poll (60 s), one status call (60 s) and a last finish (1800 s)
+
+For `queue-run.yml`, with `W` 15000 s and `R` 10800 s, the wait is 28380 s and
+the whole is 34530 s, 576 min. Its `timeout-minutes` is 596: that, and 20 min
+for the runner's own delays and the upload of the lanes' files, which the same
+limit covers.
+
+For `queue-pr-run.yml`, with `W` 2700 s and `R` 4500 s (a pull request's lanes,
+as in "Pull requests" above), the wait is 9780 s and the whole is 15930 s, 266 min. Its
+`timeout-minutes` is 286, by the same 20 min. The gate job `e2e-gpu-queue` waits
+for it on a GitHub-hosted runner, which ends a job after 360 min, so its limit
+is the run's plus 10 min for the dispatch and the download: 296.
 
 ## What the workflow requires
 

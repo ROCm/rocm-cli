@@ -401,15 +401,17 @@ pub(crate) enum Command {
     },
     /// [preview] Chat with a configured assistant provider.
     ///
-    /// In a terminal with no --prompt, opens the interactive chat (switch
-    /// providers there with /provider; --provider, --model, and --tools don't
-    /// apply). With --prompt, or a prompt piped on standard input, sends that one
-    /// prompt and prints the reply. Use `rocm config enable-provider` and
-    /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server. On Linux/WSL the interactive
-    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
-    /// and, like it, prints why that daemon was failing after it closes,
-    /// including when it is ended with Ctrl-C, SIGINT or SIGTERM.
+    /// In a terminal with no --prompt, opens the interactive chat (switch providers
+    /// there with /provider; --provider, --model, and --tools don't apply). With
+    /// --prompt, or a prompt piped on standard input, sends that one prompt and prints
+    /// the reply without terminal escape sequences. With --tools, an assistant-chosen
+    /// value a Windows shell reads as syntax (', &, %) is refused, not offered to
+    /// paste, unless it came from your own request (`install therock into <folder>`).
+    /// Use `rocm config enable-provider` and `rocm config set-provider-key` first to
+    /// configure a remote provider; the `local` provider talks to a running server. On
+    /// Linux/WSL the interactive chat shares the dashboard's telemetry daemon the way
+    /// `rocm dash` does, and, like it, prints why that daemon was failing after it
+    /// closes, including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -542,8 +544,8 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
     /// the server exited, it says so on stderr and exits with an error; if the stop itself
     /// fails, it says why on stderr, signals the server process directly and exits 0,
-    /// noting on stderr if that signal fails too. Inspect or stop servers later with
-    /// `rocm services`.
+    /// noting on stderr if that signal fails too. A server that dies on its own instead exits non-zero,
+    /// quotes the end of its log and is marked `failed`. Inspect or stop servers later with `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
     /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
@@ -628,9 +630,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS`),
         /// with no CLI-side stall limit or deadline. Without it, a terminal gives up when
         /// startup progress stalls or after 30 minutes, and piped output (or a redirected stderr) returns
-        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. Fails with a
-        /// pointer to the logs if the server exits first. Cannot be
-        /// combined with --foreground or --verbose, which already stay attached.
+        /// `starting` after 45 seconds. Also waits on a matching server that is already starting. If the server exits
+        /// first, a crash fails with a pointer to the logs, while a stop from elsewhere reports it was stopped before
+        /// it became ready and names no logs. Cannot be combined with --foreground or --verbose, which stay attached.
         #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
         wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
@@ -821,10 +823,7 @@ rocm logs --search error timeout")]
     /// warning). It also undoes the PATH change the installer made (its marked
     /// shell-profile block, or the user PATH entry it recorded adding on
     /// Windows), unless other programs share the install folder.
-    #[command(after_help = "EXAMPLES:\n  \
-rocm uninstall --dry-run\n  \
-rocm uninstall\n  \
-rocm uninstall --keep-data --yes")]
+    #[command(after_help = crate::uninstall::UNINSTALL_AFTER_HELP)]
     Uninstall {
         /// Do not ask for interactive confirmation. Without it, the command
         /// asks `[y/N]` (default: no) in an interactive terminal; outside one,
@@ -2130,6 +2129,56 @@ mod tests {
         assert!(rows.contains(&"rocm uninstall"), "{examples}");
     }
 
+    /// Every system folder `rocm uninstall --help` names is one the uninstall
+    /// really refuses as a system location. The list is abbreviated (`...`),
+    /// so README carries the whole of it; `uninstall_plan.rs`'s
+    /// `readme_names_every_uninstall_system_root` holds README to the code.
+    /// Each platform's names are checked on that platform's lane.
+    #[test]
+    fn uninstall_help_names_only_folders_it_refuses() {
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .expect("uninstall subcommand")
+            .render_long_help()
+            .to_string()
+            .replace('\n', " ");
+        let list = help
+            .split_once("system location (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map_or_else(
+                || panic!("no system-location list in:\n{help}"),
+                |(list, _)| list,
+            );
+        let names: Vec<&str> = list
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "...")
+            .collect();
+        assert!(
+            names.contains(&"/usr") && names.contains(&"Windows"),
+            "{list}"
+        );
+        for name in names {
+            let path = if name.starts_with('/') {
+                if !cfg!(unix) {
+                    continue;
+                }
+                std::path::PathBuf::from(name)
+            } else {
+                if !cfg!(windows) {
+                    continue;
+                }
+                std::path::PathBuf::from(format!("{}/{name}", rocm_core::windows_system_drive()))
+            };
+            assert_eq!(
+                rocm_core::uninstall_root_verdict(&path, None, &[]),
+                rocm_core::UninstallRootVerdict::Refused(rocm_core::ProtectedLocation::System),
+                "--help names {name} as a system location"
+            );
+        }
+    }
+
     #[test]
     fn update_rejects_zero_timeout_secs() {
         let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
@@ -2236,6 +2285,69 @@ mod tests {
             }
             other => panic!("expected Bench/Load, got {other:?}"),
         }
+    }
+
+    /// ROCMAI-541: the log-remediation lines printed next to a crash told users
+    /// to run `rocm logs <service_id>`, which has never selected a service —
+    /// `rocm logs` takes `--service`, and its positional argument is a
+    /// free-text search query, so the recommended command ran and quietly
+    /// searched for the id. Nothing caught it because no test ever parsed the
+    /// commands the output recommends.
+    ///
+    /// Both surviving spellings are genuine and both are kept: `rocm services
+    /// logs <id>` is the services-cluster form and `rocm logs --service <id>`
+    /// the top-level one. What has to hold is that whichever a message names
+    /// actually parses as a way to read that service's log.
+    #[test]
+    fn the_log_commands_the_crash_messages_name_actually_parse() {
+        // Parsing is not the property under test — the buggy spelling parsed
+        // too. What has to hold is that the id reaches the field that actually
+        // selects a service, so each form is asserted on its *resolved* value.
+        for argv in [
+            ["rocm", "services", "logs", "svc-1"].as_slice(),
+            ["rocm", "services", "logs", "svc-1", "--follow"].as_slice(),
+        ] {
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            match parsed.command {
+                Some(Command::Services {
+                    command: Some(ServicesCommand::Logs { service_id, .. }),
+                }) => assert_eq!(
+                    service_id,
+                    "svc-1",
+                    "`{}` must select svc-1",
+                    argv.join(" ")
+                ),
+                other => panic!("`{}` must be services/logs, got {other:?}", argv.join(" ")),
+            }
+        }
+        for argv in [
+            ["rocm", "logs", "--service", "svc-1"].as_slice(),
+            ["rocm", "logs", "--service", "svc-1", "--follow"].as_slice(),
+        ] {
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            match parsed.command {
+                Some(Command::Logs { service, .. }) => assert_eq!(
+                    service.as_deref(),
+                    Some("svc-1"),
+                    "`{}` must select svc-1",
+                    argv.join(" ")
+                ),
+                other => panic!("`{}` must be logs, got {other:?}", argv.join(" ")),
+            }
+        }
+
+        // The form the bug used. It parses, which is precisely why the defect
+        // was silent: it selects no service, so it cannot be recommended as a
+        // way to read one's log.
+        let parsed = Cli::try_parse_from(["rocm", "logs", "svc-1"])
+            .expect("the positional form parses as a search query");
+        assert!(
+            matches!(parsed.command, Some(Command::Logs { service: None, .. })),
+            "the positional form selects no service: {:?}",
+            parsed.command
+        );
     }
 
     /// ROCMAI-543: the clap doc comments are the largest single surface of

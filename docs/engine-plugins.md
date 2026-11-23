@@ -140,11 +140,11 @@ actually resolves its ROCm libraries, left alone when the active SDK reports
 a nightly version rather than a plain `X.Y.Z` the alignment can match against
 (or no active SDK version can be determined at all, or Lemonade's packaged
 pin can't be read), skipped when the pin already matches the active version,
-and skipped on a host where Lemonade would select `llamacpp:vulkan` instead of
-`llamacpp:rocm` regardless (WSL2 being the documented case, and also the
-fallback if that probe itself fails), since no rewrite can make an
-unsupported ROCm build
-resolve there.
+skipped while an earlier attempt for the same versions is recorded as failed
+(see the paragraph on remembered failures below), and skipped on a host where
+Lemonade would select `llamacpp:vulkan` instead of `llamacpp:rocm` regardless
+(WSL2 being the documented case, and also the fallback if that probe itself
+fails), since no rewrite can make an unsupported ROCm build resolve there.
 
 The rewrite tries two builds in order. The first keeps Lemonade's own pinned
 llama.cpp release and just repoints it at the active ROCm version — a
@@ -168,6 +168,43 @@ be verified against the installed backend's shared libraries reverts to whicheve
 was pinned before the attempt — the packaged pin on a fresh install or after
 `--reinstall`, but whatever alignment last wrote otherwise — rather than
 being kept.
+
+A failed alignment is remembered so that it is not repeated on every install.
+The revert puts back a pin that still differs from the active ROCm version, so
+without that every later `rocm engines install lemonade`, and every `rocm serve`
+that installs Lemonade, would download both builds and force-reinstall the
+pinned backend again. When the revert's install succeeds, the attempt (the
+active ROCm version, the pins it started from, the llama.cpp builds tried and
+the Lemonade version) is recorded in
+`.rocm-cli-alignment-failed.json` in the Lemonade runtime tree. For the next 24
+hours an install for the same active ROCm version, pin and Lemonade version
+does not attempt the alignment: it installs the backend already
+pinned without forcing a reinstall, so a backend already installed is reused,
+and prints a line saying the alignment could not be done, when it failed, and
+how many hours from now an install tries it again (nothing retries on its own).
+If preparing that pinned backend fails (which can happen before anything is
+installed, for example when `lemond` does not start), the error says so and that
+the alignment was skipped because of the earlier failure, and says that `rocm
+engines install lemonade --reinstall` re-extracts the runtime tree without the
+record, so it tries the alignment again (downloading the backend again); the
+line it adds says only what that command does, not that it fixes the error
+beneath. Run at any time, the same command tries the alignment again at once.
+A different active ROCm version, a new
+Lemonade version (which also re-extracts the tree), or a record 24 hours old or
+older (or dated in the future) runs the alignment as before, and an
+alignment that succeeds removes the record. The record is consulted only when an
+install could align: not with the opt-out set, on an unsupported platform, with
+no active ROCm version or an unreadable pin, or when the pin already equals the
+active ROCm version, all of which leave it untouched and say nothing about it.
+Past those checks, and before the backend probe starts `lemond`, a record that
+applies skips the alignment, and one that cannot be read is removed with a
+warning; if it cannot be removed either, the warning says so and names `rocm
+engines install lemonade --reinstall`, which removes it. A record that cannot be
+written leaves the next install to try again, also with a warning. Setting
+`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` neither reads nor changes the
+record. The record does not note the rocm-cli version, so upgrading rocm-cli
+does not clear it: it still expires after 24 hours, and `--reinstall` clears it
+sooner.
 
 A pin an earlier alignment kept can go stale: the llama.cpp or TheRock build it
 names may later be withdrawn upstream. When the pin already equals the active
