@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 # Installing ROCm CLI
 
-ROCm CLI ships as a single prebuilt binary. Platform support:
+ROCm CLI ships as prebuilt binaries (`rocm` and `rocmd`). Platform support:
 
 ```{include} ../../../README.md
 :start-after: "<!-- platform-support-table-start -->"
