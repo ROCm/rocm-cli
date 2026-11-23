@@ -78,10 +78,13 @@ pub(crate) use readiness::{
     managed_service_stop_was_requested,
 };
 pub(crate) use spawn::scripted_managed_engine_startup_failure;
+// Platform-independent, and named on every target by `serve_device_probe.rs`'s
+// `serve_device_after_launch` — so it must NOT ride along with the
+// `cfg(not(windows))` block below, where a Linux build cannot see it go missing.
+pub(crate) use spawn::ManagedLaunchReport;
 #[cfg(not(windows))]
 pub(crate) use spawn::{
-    ManagedLaunchReport, attach_background_stdio, detach_background_command,
-    managed_service_process_command,
+    attach_background_stdio, detach_background_command, managed_service_process_command,
 };
 // Platform-independent, and now called on both: `service_control.rs`'s Windows
 // restart branch renders it for a child the liveness probe found already gone,
