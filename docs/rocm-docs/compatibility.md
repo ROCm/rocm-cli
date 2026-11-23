@@ -8,8 +8,8 @@ SPDX-License-Identifier: MIT
 
 This page shows which inference engines run on which platforms and ROCm
 versions, which Python version each ROCm version uses, and which GPUs AIM
-images support. It lists support status only. Exact package versions and the details behind each status are on the
-linked pages.
+images support. It lists support status only. Exact package versions and the details behind
+each status are on the linked pages.
 
 <!--
 Site-only page: no source file holds these tables. The platform table is
@@ -17,16 +17,6 @@ included from README.md (between the platform-support-table markers), not
 copied. Keep this page status-only: exact package versions live in
 docs/vllm.md and the engine code, so they are not repeated here.
 -->
-
-The engine tables use these statuses:
-
-- **Supported**: `rocm engines install` sets up the engine for this
-  combination, and it has run on GPU hardware.
-- **Partial**: `rocm engines install` sets up the engine, but GPU serving is
-  confirmed only in a limited setup. The note under the table says which.
-- **Not verified**: `rocm engines install` sets up the engine, but it hasn't
-  been confirmed on GPU hardware.
-- **Not supported**: ROCm CLI doesn't offer the install, or refuses it.
 
 ## Platforms
 
@@ -39,7 +29,19 @@ For the minimum Linux release and the library versions the Lemonade engine
 needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 [ROCm CLI on WSL2](install/wsl.md).
 
-## Engines by platform
+## Engine support
+
+The tables in this section use these statuses:
+
+- **Supported**: `rocm engines install` sets up the engine for this
+  combination, and it has run on GPU hardware.
+- **Partial**: `rocm engines install` sets up the engine, but GPU serving is
+  confirmed only in a limited setup. The note under the table says which.
+- **Not verified**: `rocm engines install` sets up the engine, but it hasn't
+  been confirmed on GPU hardware.
+- **Not supported**: ROCm CLI doesn't offer the install, or refuses it.
+
+### Engines by platform
 
 | Engine | Linux | Windows | WSL2 |
 |---|---|---|---|
@@ -56,7 +58,7 @@ needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 - **AIM on WSL2**: ROCm CLI passes the WSL2 GPU device to the container, but
   this hasn't been confirmed on GPU hardware.
 
-## ROCm versions, Python, and vLLM
+### ROCm versions, Python, and vLLM
 
 | ROCm version | Python | vLLM |
 |---|---|---|
