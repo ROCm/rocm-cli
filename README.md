@@ -38,7 +38,7 @@ For the full documentation, see the
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and the Lemonade, vLLM, and AIM engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM or AIM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; AIM not yet verified |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; includes the live dashboard; GPU serving is confirmed only for vLLM on a pre-release ROCm 10.2 SDK, and AIM is not yet verified |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 

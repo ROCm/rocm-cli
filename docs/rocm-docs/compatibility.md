@@ -20,12 +20,12 @@ docs/vllm.md and the engine code, so they are not repeated here.
 
 The engine tables use these statuses:
 
-- **Supported**: ROCm CLI installs the engine for this combination, and it has
-  run on GPU hardware.
-- **Partial**: ROCm CLI installs the engine, but GPU serving is confirmed only in
-  a limited setup. The note under the table says which.
-- **Not verified**: ROCm CLI has an install path, but it hasn't been confirmed on
-  GPU hardware.
+- **Supported**: `rocm engines install` sets up the engine for this
+  combination, and it has run on GPU hardware.
+- **Partial**: `rocm engines install` sets up the engine, but GPU serving is
+  confirmed only in a limited setup. The note under the table says which.
+- **Not verified**: `rocm engines install` sets up the engine, but it hasn't
+  been confirmed on GPU hardware.
 - **Not supported**: ROCm CLI doesn't offer the install, or refuses it.
 
 ## Platforms
@@ -43,10 +43,14 @@ needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 
 | Engine | Linux | Windows | WSL2 |
 |---|---|---|---|
-| Lemonade | Supported | Supported | Supported |
-| vLLM | Supported | Not supported | Supported |
+| Lemonade | Supported | Supported | Not verified |
+| vLLM | Supported | Not supported | Partial |
 | AIM | Supported (needs Docker) | Not supported | Not verified |
 
+- **Lemonade on WSL2**: ROCm CLI installs Lemonade on WSL2, but GPU serving
+  there hasn't been confirmed on GPU hardware.
+- **vLLM on WSL2**: GPU serving has been confirmed only with a pre-release
+  ROCm 10.2 SDK.
 - **AIM on Windows**: ROCm CLI has no GPU passthrough for AIM containers on
   native Windows.
 - **AIM on WSL2**: ROCm CLI passes the WSL2 GPU device to the container, but
