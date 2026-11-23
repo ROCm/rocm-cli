@@ -7,7 +7,7 @@
 
 use super::engine::{
     check_16_vllm_oom, check_17_torch_dlpack_cuda_variant, check_18_comgr_conflict,
-    check_19_shm_too_small, check_23_vllm_extension_load,
+    check_19_shm_too_small, check_23_vllm_extension_load, check_24_vllm_gpu_memory_fault,
 };
 use super::host::{
     check_1_arch_not_in_wheel, check_2_hsa_override_unneeded, check_6_path_missing,
@@ -178,6 +178,12 @@ const CHECKERS: &[Checker] = &[
     // Linux and WSL2, like the other vLLM entries: the engine runs on both and
     // its startup-failure hint points here on both.
     (Check::Text(check_23_vllm_extension_load), &["linux", "wsl"]),
+    // Linux and WSL2, like the other vLLM entries. The fault was reported on
+    // WSL2, and a unified-memory APU on bare Linux sizes the same reservation.
+    (
+        Check::Text(check_24_vllm_gpu_memory_fault),
+        &["linux", "wsl"],
+    ),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -773,7 +779,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20, fix-22 and fix-23 live in two places: the `rocm fix`
+        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20, fix-22, fix-23 and fix-24 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -854,6 +860,13 @@ mod tests {
             },
             crate::diagnose::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
         );
+        let gpu_memory_fault = check_24_vllm_gpu_memory_fault(
+            &Examination {
+                os_family: "linux".to_owned(),
+                ..Examination::default()
+            },
+            "vllm: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION",
+        );
         for diag in [
             vllm_oom,
             msvc,
@@ -863,6 +876,7 @@ mod tests {
             adrenalin_old,
             display_driver_old,
             extension_load,
+            gpu_memory_fault,
         ] {
             if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
                 assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);

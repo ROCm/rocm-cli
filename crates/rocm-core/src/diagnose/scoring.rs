@@ -412,6 +412,45 @@ pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
     ),
 ];
 
+/// A GPU memory fault while vLLM initialises its KV cache, as reported for
+/// the ~98 GiB cache fill on a unified-memory APU under WSL2 (ROCm/rocm-cli
+/// issue 1132).
+///
+/// The signature is a cluster, not one line: the HSA runtime reports
+/// `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`, the stall watchdog says
+/// `possible device memory fault`, and torch surfaces `illegal memory access`
+/// from `create_kv_cache_views`. The aperture violation clears
+/// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) on its own; the other
+/// three are sub-threshold alone (any CUDA/HIP program can print
+/// `illegal memory access`) and count together, because [`keyword_score`] sums
+/// the top two.
+///
+/// Apart from `create_kv_cache_views`, none of these tokens names vLLM, so
+/// `check_24_vllm_gpu_memory_fault` scores nothing unless the paste identifies
+/// vLLM (`VLLM_GPU_MEMORY_FAULT_ANCHOR_PATTERN`, which includes that function).
+pub(super) const KEYWORDS_VLLM_GPU_MEMORY_FAULT: KeywordTable = &[
+    (
+        "memory_aperture_violation",
+        50,
+        "the HSA runtime reported MEMORY_APERTURE_VIOLATION",
+    ),
+    (
+        "possible device memory fault",
+        40,
+        "the GPU stall watchdog reported a possible device memory fault",
+    ),
+    (
+        "illegal memory access",
+        30,
+        "error mentions an illegal memory access",
+    ),
+    (
+        "create_kv_cache_views",
+        30,
+        "error comes from vLLM's KV-cache initialisation (create_kv_cache_views)",
+    ),
+];
+
 /// The part of [`KEYWORDS_VLLM_EXTENSION_LOAD`] that may be scored against
 /// `symptom` text which carries no vLLM-identifying token (`anchored == false`).
 ///

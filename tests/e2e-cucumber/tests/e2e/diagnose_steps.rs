@@ -45,6 +45,21 @@ const EXTENSION_LOAD_SYMPTOM: &str = "(EngineCore pid=629513) ERROR 11-16 11:48:
 /// The catalog entry [`EXTENSION_LOAD_SYMPTOM`] must reach.
 const EXTENSION_LOAD_FIX_ID: &str = "fix-23-vllm-extension-load";
 
+/// The lines a vLLM engine writes when it faults on the GPU while filling its KV
+/// cache, from the report behind ROCm/rocm-cli issue 1132 with the timestamps
+/// dropped: vLLM's identity is on the neighbouring lines, as in a pasted log.
+const GPU_MEMORY_FAULT_SYMPTOM: &str = "(EngineCore pid=4242) INFO GPU KV cache size: 916,000 \
+     tokens\n(EngineCore pid=4242) WARNING GPU stall detected after 30 s, possible device \
+     memory fault\n:0:rocdevice.cpp:3000: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in \
+     at::native::FillFunctor<signed char>";
+
+/// The same fault from a program that is not vLLM.
+const OTHER_PROGRAM_GPU_FAULT_SYMPTOM: &str = ":0:rocdevice.cpp:3000: \
+     HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in at::native::FillFunctor<signed char>";
+
+/// The catalog entry [`GPU_MEMORY_FAULT_SYMPTOM`] must reach.
+const GPU_MEMORY_FAULT_FIX_ID: &str = "fix-24-vllm-gpu-memory-fault";
+
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
 /// recipes gate on host state (e.g. `$USER`) and return non-zero even for a
@@ -153,6 +168,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     // nothing. Leaving it out here would let the two published forms drift.
     "info-20-gpu-no-rocm-support",
     "fix-23-vllm-extension-load",
+    "fix-24-vllm-gpu-memory-fault",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -479,6 +495,16 @@ async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
 #[given("a user who hit a vLLM compiled-extension load failure")]
 async fn user_hit_extension_load_failure(world: &mut E2eWorld) {
     world.model_name = Some(EXTENSION_LOAD_SYMPTOM.to_string());
+}
+
+#[given("a user who hit a vLLM GPU memory fault while the KV cache was filled")]
+async fn user_hit_gpu_memory_fault(world: &mut E2eWorld) {
+    world.model_name = Some(GPU_MEMORY_FAULT_SYMPTOM.to_string());
+}
+
+#[given("a user who hit a GPU memory fault in a program that is not vLLM")]
+async fn user_hit_other_programs_gpu_fault(world: &mut E2eWorld) {
+    world.model_name = Some(OTHER_PROGRAM_GPU_FAULT_SYMPTOM.to_string());
 }
 
 #[given("a user who has chosen the fix for the engine-startup import failure")]
@@ -1521,6 +1547,52 @@ async fn assert_extension_load_failure_established(world: &mut E2eWorld) {
         world,
         EXTENSION_LOAD_FIX_ID,
         "vLLM compiled-extension load failure",
+    );
+}
+
+#[then("the CLI reports the vLLM GPU memory fault as an established cause")]
+async fn assert_gpu_memory_fault_established(world: &mut E2eWorld) {
+    assert_established_cause(world, GPU_MEMORY_FAULT_FIX_ID, "vLLM GPU memory fault");
+}
+
+#[then("the CLI can act on the fix named for the vLLM GPU memory fault")]
+async fn assert_gpu_memory_fault_fix_is_printable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix = find_matched(&report, GPU_MEMORY_FAULT_FIX_ID, &output)
+        .get("fix")
+        .unwrap_or_else(|| panic!("the matched cause must carry a fix:\n{output}"));
+    let fix_id = fix
+        .get("fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    // The diagnosis says the remedy is a smaller reservation, so the plan it
+    // hands over has to be the `rocm serve` flag that does that.
+    assert!(
+        fix.to_string()
+            .contains("rocm serve <model> --engine vllm --gpu-memory-utilization"),
+        "the plan must name the reservation flag:\n{output}"
+    );
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+#[then("no vLLM GPU memory fault is reported")]
+async fn assert_no_gpu_memory_fault_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    let matched = report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("report must carry a `matched` array:\n{output}"));
+    assert!(
+        !matched.iter().any(|diagnosis| {
+            diagnosis.get("id").and_then(serde_json::Value::as_str) == Some(GPU_MEMORY_FAULT_FIX_ID)
+        }),
+        "another program's GPU fault must not be attributed to vLLM:\n{output}"
     );
 }
 

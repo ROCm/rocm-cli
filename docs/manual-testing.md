@@ -1841,6 +1841,25 @@ Expected result:
   the loader's own `ImportError` for the extension that failed.
 - A serve that fails for any other reason does not print the paragraph.
 
+### 6c-bis. A GPU memory fault during the KV-cache fill
+
+Needs no GPU: the symptom text alone drives the match. The behaviour is described
+in [GPU memory faults while the KV cache is filled](vllm.md#gpu-memory-faults-while-the-kv-cache-is-filled).
+
+```bash
+rocm diagnose --symptom 'vllm: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in at::native::FillFunctor<signed char>'
+rocm diagnose --symptom 'HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in at::native::FillFunctor<signed char>'
+rocm fix fix-24-vllm-gpu-memory-fault
+```
+
+Expected result (Linux or WSL2):
+
+- The first command reports `fix-24-vllm-gpu-memory-fault` as a cause that
+  cleared the match threshold.
+- The second, which never names vLLM, does not report it.
+- The third prints the plan, which is one `rocm serve ... --gpu-memory-utilization 0.3`
+  line, and exits 0 without changing anything or starting a server.
+
 ### 6d. The tensorizer upgrade on Python 3.14
 
 Needs a Linux or WSL host with a ROCm 10.1.0 runtime on Python 3.14 (the only

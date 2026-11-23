@@ -12,8 +12,8 @@
 
 use super::scoring::{
     KEYWORDS_COMGR_CONFLICT, KEYWORDS_SHM_TOO_SMALL, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT,
-    KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, symptom_matches,
-    vllm_extension_load_keywords, zero,
+    KEYWORDS_VLLM_GPU_MEMORY_FAULT, KEYWORDS_VLLM_OOM, finalize, keyword_score,
+    keyword_score_collapsing_overlaps, symptom_matches, vllm_extension_load_keywords, zero,
 };
 // Only `check_23_vllm_extension_load`'s tests reach for the whole table; the
 // check itself goes through `vllm_extension_load_keywords`, which is what
@@ -695,6 +695,76 @@ pub(super) fn check_23_vllm_extension_load(_e: &Examination, symptom: &str) -> D
         notes: vec![
             "vLLM logs the cause near the top of the startup log, as a warning that starts with `Failed to import from vllm.`, and carries on. The AttributeError comes later, from the first call to an op that extension registers.".to_owned(),
             "Reinstalling the engine fetches the same wheel, built against the same glibc, so it does not fix a glibc version error.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
+/// A required anchor before [`KEYWORDS_VLLM_GPU_MEMORY_FAULT`] is scored at
+/// all.
+///
+/// `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` and `illegal memory access`
+/// are what any ROCm program prints when it faults on the GPU, and the remedy
+/// this entry offers (a smaller vLLM reservation) means nothing for those. So
+/// the paste has to identify vLLM somewhere: the word `vllm`, `EngineCore` (the
+/// process name the real log lines carry as a prefix), or `create_kv_cache_views`,
+/// which is vLLM's own function.
+///
+/// Gated over the whole symptom, not line by line as [`check_16_vllm_oom`] is.
+/// That is the looser choice, made knowingly: the keywords here are generic
+/// text, which is the case [`VLLM_EXTENSION_ANCHOR_PATTERN`] says calls for a
+/// per-line anchor. It is made because the line that carries the deciding
+/// keyword, `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`, is written by the HSA
+/// runtime and need not carry a vLLM prefix (the e2e `GPU_MEMORY_FAULT_SYMPTOM`
+/// has none), so a per-line rule would zero a real report.
+///
+/// The cost is real, not bounded to a rare paste: the aperture keyword scores
+/// 50, which is [`MIN_SCORE_FOR_MATCH`] on its own, so any paste that mentions
+/// `vllm` anywhere (a `pip install vllm` line is enough) and also holds another
+/// program's aperture fault gets this verdict. It is accepted because the plan
+/// is print-only (`fix-24-vllm-gpu-memory-fault` in `fix/catalog.rs` has no
+/// runner, and the diagnosis is never `auto_applicable`), says in terms that it
+/// is a workaround, and its notes tell the reader the match came from keywords.
+/// `a_gpu_fault_that_never_mentions_vllm_is_not_a_vllm_cause` pins the case with
+/// no vLLM text at all, and `a_fault_line_that_names_no_engine_is_reported_when_a_neighbour_does`
+/// pins the one this gate exists for.
+const VLLM_GPU_MEMORY_FAULT_ANCHOR_PATTERN: &str = r"vllm|enginecore|create_kv_cache_views";
+
+/// A GPU memory fault while vLLM initialises its KV cache, reported for the
+/// large default reservation on a unified-memory APU under WSL2.
+///
+/// Keyword-only, for the reason [`check_17_torch_dlpack_cuda_variant`] gives:
+/// the deciding facts live in the engine's log, not in the `Examination`.
+///
+/// The root cause is not established. It is reported as a fault in the runtime's
+/// memory mapping or the torch/HIP build, not in rocm-cli, and a smaller
+/// reservation changed the outcome in the report that prompted this entry
+/// (3 of 3 failed at the default, 2 of 2 passed at 0.3). The plan therefore
+/// offers lowering the reservation as a way to work around the fault, and says
+/// in terms that it does not fix it.
+pub(super) fn check_24_vllm_gpu_memory_fault(_e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-24-vllm-gpu-memory-fault";
+    const TITLE: &str = "vLLM hit a GPU memory fault while initialising its KV cache";
+
+    if !symptom_matches(symptom, VLLM_GPU_MEMORY_FAULT_ANCHOR_PATTERN) {
+        return zero(ID, TITLE);
+    }
+    let (score, evidence) = keyword_score(symptom, KEYWORDS_VLLM_GPU_MEMORY_FAULT);
+    if score <= 0 {
+        return zero(ID, TITLE);
+    }
+    let fix = Fix {
+        summary: "vLLM faulted on the GPU while filling its KV cache. A smaller reservation can avoid it: re-run with --gpu-memory-utilization set well below vLLM's default, which is a workaround, not a fix for the underlying fault.".to_owned(),
+        commands: vec![
+            "# Reserve a smaller share of GPU memory for the KV cache:".to_owned(),
+            "rocm serve <model> --engine vllm --gpu-memory-utilization 0.3".to_owned(),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "rocm serve <model> --engine vllm --gpu-memory-utilization 0.3   # re-run and watch for a clean startup".to_owned(),
+        notes: vec![
+            "This lowers how much memory vLLM asks for; it does not repair the fault. If it still fails at a small value, or you need the larger cache, the fault is in the GPU runtime or driver stack underneath vLLM (on WSL2, ROCDXG and the host driver), so report it with the runtime version and the full log.".to_owned(),
+            "This entry is keyword-matched from the error text alone; it does not look at this machine's GPU or memory, so pass the failure with --symptom and include the lines around it that name vLLM.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -2370,5 +2440,124 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with('#') && c.contains("YOUR OWN shell"))
         );
+    }
+
+    /// The lines the reported failure (ROCm/rocm-cli issue 1132) wrote while
+    /// filling the KV cache, one per signal, with the timestamps dropped.
+    const FAULT_APERTURE: &str = "(EngineCore pid=4242) :0:rocdevice.cpp:3000: \
+         HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond \
+         the largest legal address. code: 0x29 in at::native::FillFunctor<signed char>";
+    const FAULT_STALL: &str = "(EngineCore pid=4242) WARNING GPU stall detected after 30 s, \
+         possible device memory fault";
+    const FAULT_TORCH: &str = "(EngineCore pid=4242) torch.AcceleratorError: illegal memory \
+         access was encountered in create_kv_cache_views";
+
+    #[test]
+    fn a_vllm_gpu_memory_fault_is_reported_on_every_engine_host() {
+        for line in [FAULT_APERTURE, FAULT_TORCH] {
+            for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+                let report = diagnose(&host, line);
+                let top = &report.matched[0];
+                assert_eq!(
+                    top.id, "fix-24-vllm-gpu-memory-fault",
+                    "{family}: {line}\n{:?}",
+                    report.matched
+                );
+                assert!(
+                    top.score >= MIN_SCORE_FOR_MATCH,
+                    "{family}: score was {} for {line}",
+                    top.score
+                );
+                assert!(!top.fix.as_ref().expect("a plan").auto_applicable);
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_pasted_fault_cluster_scores_above_its_strongest_single_line() {
+        let all = format!("{FAULT_STALL}\n{FAULT_APERTURE}\n{FAULT_TORCH}");
+        let score_of = |text: &str| {
+            diagnose(&linux_base(), text)
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-24-vllm-gpu-memory-fault")
+                .map_or(0, |d| d.score)
+        };
+        // The aperture line alone is the strongest keyword (50); only a scorer
+        // that adds the next signal in (the scorer sums the top two weights)
+        // gets past it.
+        assert!(
+            score_of(&all) > score_of(FAULT_APERTURE),
+            "{} vs {}",
+            score_of(&all),
+            score_of(FAULT_APERTURE)
+        );
+    }
+
+    #[test]
+    fn a_fault_line_that_names_no_engine_is_reported_when_a_neighbour_does() {
+        // The shape of the report behind the entry: the HSA line carries no vLLM
+        // prefix, and vLLM is named only on the line beside it. A per-line gate
+        // would score nothing here.
+        let paste = format!(
+            "(EngineCore pid=4242) INFO GPU KV cache size: 916,000 tokens\n{}",
+            ":0:rocdevice.cpp:3000: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in \
+             at::native::FillFunctor<signed char>"
+        );
+        let report = diagnose(&linux_base(), &paste);
+        let top = &report.matched[0];
+        assert_eq!(
+            top.id, "fix-24-vllm-gpu-memory-fault",
+            "{:?}",
+            report.matched
+        );
+        assert!(top.score >= MIN_SCORE_FOR_MATCH, "score was {}", top.score);
+    }
+
+    #[test]
+    fn a_gpu_fault_that_never_mentions_vllm_is_not_a_vllm_cause() {
+        // The same HSA error from a llama.cpp or training run: the remedy is a
+        // vLLM flag, so no vLLM text means no vLLM verdict.
+        for line in [
+            "HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in at::native::FillFunctor<signed char>",
+            "torch.AcceleratorError: illegal memory access was encountered",
+            "GPU stall detected after 30 s, possible device memory fault",
+        ] {
+            assert!(
+                diagnose(&linux_base(), line)
+                    .matched
+                    .iter()
+                    .all(|d| d.id != "fix-24-vllm-gpu-memory-fault"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_illegal_memory_access_alone_stays_below_the_match_threshold() {
+        // Any CUDA/HIP program can print it; it needs a corroborating line.
+        let report = diagnose(
+            &linux_base(),
+            "vllm: RuntimeError: HIP error: illegal memory access",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-24-vllm-gpu-memory-fault")
+            .expect("the keyword registers as a weak signal");
+        assert!(hit.score < MIN_SCORE_FOR_MATCH, "score was {}", hit.score);
+    }
+
+    #[test]
+    fn the_gpu_memory_fault_plan_matches_the_catalog_copy() {
+        let report = diagnose(&linux_base(), FAULT_APERTURE);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-24-vllm-gpu-memory-fault")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
     }
 }

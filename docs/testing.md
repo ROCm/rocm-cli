@@ -5846,6 +5846,20 @@ either is ignored. It carries only `@requires-os:linux`:
 cargo xtask e2e -- -n "dash-66"
 ```
 
+## Diagnose: vLLM GPU Memory Fault
+
+`fix-24-vllm-gpu-memory-fault` recognises the fault reported for the KV-cache
+fill on a unified-memory GPU under WSL2 (ROCm/rocm-cli issue 1132). It is
+keyword-only, so the scenarios drive `rocm diagnose --symptom` directly and need
+no GPU. `@id:diagnose-recognises-a-vllm-gpu-memory-fault` (diagnose-89) pastes
+the fault with vLLM's identity on neighbouring lines and asserts the entry clears
+the report's own threshold and that `rocm fix` prints its plan.
+`@id:diagnose-does-not-blame-vllm-for-another-programs-gpu-fault` (diagnose-90)
+pastes the same HSA error with no sign of vLLM and asserts it is not attributed
+to vLLM. Run them with
+`cargo xtask e2e -- -n 'diagnose-(89|90)'`. The by-hand check is
+[manual-testing.md](manual-testing.md#6c-bis-a-gpu-memory-fault-during-the-kv-cache-fill).
+
 ## Diagnose Engine Provenance
 
 `rocm diagnose --engine vllm` (ROCMAI-955) says which engine a symptom came
