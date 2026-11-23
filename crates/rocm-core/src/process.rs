@@ -1054,13 +1054,9 @@ fn spawn_windows_no_inherit(
     // passed without an explicit list naming them: the child would otherwise
     // inherit every inheritable handle this process holds. See
     // `InheritedHandleList`.
-    let mut inherited = match std_handles {
-        Some((stdout_handle, stderr_handle)) => Some(InheritedHandleList::for_handles(&[
-            stdout_handle,
-            stderr_handle,
-        ])?),
-        None => None,
-    };
+    let mut inherited = std_handles
+        .map(|handles| InheritedHandleList::for_handles(&<[_; 2]>::from(handles)))
+        .transpose()?;
     let mut startup_info_ex = STARTUPINFOEXW {
         StartupInfo: startup_info,
         lpAttributeList: inherited
@@ -1194,7 +1190,9 @@ impl InheritedHandleList {
         Ok(list)
     }
 
-    fn as_ptr(&mut self) -> windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
+    const fn as_ptr(
+        &mut self,
+    ) -> windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
         self.buffer.as_mut_ptr().cast()
     }
 }
