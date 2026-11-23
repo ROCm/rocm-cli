@@ -1162,12 +1162,59 @@ Feature: Interactive dashboard
     When the user quits the launcher
     Then the launcher exits successfully
 
+
+  # ROCMAI-1050: at a short window height the prompt painted the
+  # "<model> — stop it first:" bullet and cut the command on the line directly
+  # beneath it, with nothing on screen saying anything had been dropped — the
+  # dashboard named a remedy it did not show. `dash-26` pins the same
+  # assertion at the default geometry; this is the short-window case, which is
+  # where the line was actually lost.
+  @id:dash-quit-confirm-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-64 - The quit prompt still shows the stop command on a short terminal
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
+
+  # ROCMAI-1050's other half, and the one dash-64 cannot reach. Growing the
+  # popup only fixes the bodies that now fit; a body that still does not fit
+  # must SAY so and name the keys that move it, or a silent cut is
+  # indistinguishable from the original bug — the dashboard naming a remedy it
+  # does not show. Two served models at twelve rows is past what even the grown
+  # popup holds, so this is the overflow case on real geometry rather than a
+  # fabricated one. The unit test
+  # `a_body_that_still_overflows_says_so_and_names_the_keys`
+  # pins the same rule against a synthetic body; this proves a user can actually
+  # reach it.
+  @id:dash-quit-confirm-overflow-names-its-keys @requires-os:linux
+  Scenario: dash-65 - A quit prompt too tall for the window says so and names the keys that scroll it
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When another managed model is served
+    Then the other managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt says there is more to read and names the keys that scroll it
+    When the user declines the quit prompt
+    And the user quits the dashboard
+
   # ROCMAI-1288: with Caps Lock on, the terminal sends the uppercase letter, and
   # the letter shortcuts matched only the lowercase one, so `S` did not open the
   # services manager and `Q` did not quit. A PTY cannot toggle Caps Lock; the
   # steps send the uppercase byte, which is what the terminal delivers with it on.
   @id:dash-caps-lock-letter-shortcuts @requires-os:linux
-  Scenario: dash-64 - Letter shortcuts still work with Caps Lock on
+  Scenario: dash-66 - Letter shortcuts still work with Caps Lock on
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the services manager with Caps Lock on

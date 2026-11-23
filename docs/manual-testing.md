@@ -1299,6 +1299,15 @@ Expected result:
   still starting, it opens that wizard's own "leave the running serve?"
   confirmation instead, and only answering `y` there leaves — so reaching this
   quit prompt from it takes one extra keystroke.
+- In a short window (shrink the terminal to roughly twelve rows before
+  pressing `q`) the prompt still names the model and still shows the
+  `rocm services stop <service-id> --yes` line under it. It used to paint the
+  `— stop it first:` bullet and cut the command on the row directly beneath,
+  with nothing on screen saying anything had been dropped. Where the body is
+  longer than even a full-height prompt can hold — several models serving at
+  once — the row under the buttons reads `More to read: PgUp/PgDn scroll ·
+  Home/End jump · row N of M`, and those keys move the text without answering
+  the prompt: only `y`/`n`/Enter/Esc decide it.
 - Confirming (`y`/Enter) exits immediately, and `rocm services list --all`
   afterward still shows the model as `ready`/`running` — quitting never
   stops it.

@@ -430,11 +430,11 @@ const MIN_POPUP_HEIGHT: u16 = 5;
 /// The [`MIN_POPUP_HEIGHT`] floor is clamped to `area.height` for the reason
 /// spelled out on [`centered_width`]. An unclamped floor asks for 5 rows on an
 /// area shorter than 5, which the `Layout::split` below then truncates, so the
-/// requested geometry and the rendered geometry disagree. Nothing measures
-/// against the height *today* — the callers measure their content and pass the
-/// answer in as `max_h` — so this is a latent form of the defect that had gone
-/// live on the width. Keeping the two sides identical is what stops it going
-/// live here the first time a caller needs the height before the popup exists.
+/// requested geometry and the rendered geometry disagree. `draw_approval_inner`
+/// is the first caller that needs the height before the popup exists: it
+/// measures its wrapped body and passes that count in as `max_h`. Keeping the
+/// requested and rendered sides identical is what stops the defect that had
+/// gone live on the width reappearing here.
 fn centered_height(pct_y: u16, max_h: u16, area: Rect) -> u16 {
     let floor = MIN_POPUP_HEIGHT.min(area.height);
     scale_pct(area.height, pct_y).min(max_h).max(floor)

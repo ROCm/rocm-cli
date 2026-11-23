@@ -330,6 +330,18 @@ pub struct AppState {
     /// `Some` ⇒ the confirm-before-quit prompt is open and owns keyboard
     /// focus, the same way `approval` does.
     pub(crate) quit_confirm: Option<crate::ui::approval::ApprovalChoice>,
+    /// Rows the quit-confirm body is scrolled down. A short terminal can leave
+    /// the prompt taller than the screen even after it claims every row it can
+    /// (`ui::approval`), and the remediation it hides is the command that stops
+    /// the model — so the body scrolls rather than being silently cut.
+    pub(crate) quit_confirm_scroll: u16,
+    /// Last-measured upper bound for `quit_confirm_scroll`, written back by the
+    /// renderer each frame — only the draw knows how many rows the body
+    /// actually needed. A [`Cell`] rather than a plain `u16` because the
+    /// launcher renders this same prompt from a `&AppState`
+    /// (`ui::launcher::draw`), the way `examine_manager` holds its own
+    /// approval's bound.
+    pub(crate) quit_confirm_max_scroll: std::cell::Cell<u16>,
     /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
     pub(crate) active_provider: ChatProvider,
     /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
@@ -448,6 +460,8 @@ impl AppState {
             plan_request: None,
             approval: None,
             quit_confirm: None,
+            quit_confirm_scroll: 0,
+            quit_confirm_max_scroll: std::cell::Cell::new(0),
             active_provider: ChatProvider::default(),
             provider_switch: None,
             update_status: UpdateStatus::Unknown,

@@ -1222,6 +1222,18 @@ async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
     // actually gates on the post-resize render.
 }
 
+#[when("the user shrinks the terminal to a short window")]
+async fn shrink_to_a_short_window(world: &mut E2eWorld) {
+    // ROCMAI-1050: the same geometry `shrink_below_menu_logo_layout` uses, under
+    // a name that does not speak of the Esc menu — this is also the height at
+    // which the quit prompt cut the stop command off its own remediation
+    // bullet. Only resizes; the `Then` steps after it gate on a post-resize
+    // frame.
+    session(world)
+        .use_short_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+}
+
 #[when("the user shrinks the terminal below the Esc menu's logo layout")]
 async fn shrink_below_menu_logo_layout(world: &mut E2eWorld) {
     // ROCMAI-1042: at this height the Esc menu's modal is too short for the
@@ -2292,6 +2304,32 @@ async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
                     .collect::<Vec<_>>()
                     .join(" ")
                     .contains(expected)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// ROCMAI-1050's overflow half: growing the popup cannot save every body, so a
+/// body that still does not fit has to advertise itself instead of being cut
+/// silently — which is the original defect, not a lesser version of it.
+///
+/// The notice and the key names are asserted together on purpose. A notice
+/// that named no keys would leave the user exactly as stuck as the silent cut,
+/// and the keys alone would not say there was anything below. Matched on the
+/// whitespace-collapsed screen because the row is padded out to the popup's
+/// width. It cannot wrap: the footer is an unwrapped `Paragraph` in a one-row
+/// constraint, so a row too long for the popup is clipped instead. At this
+/// geometry the tail is clipped, but "PgUp/PgDn" sits inside that boundary.
+#[then("the quit prompt says there is more to read and names the keys that scroll it")]
+async fn quit_confirm_announces_more_to_read(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the quit prompt says \"More to read\" and names PgUp/PgDn",
+            |screen| {
+                let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+                flat.contains("More to read") && flat.contains("PgUp/PgDn")
             },
             default_timeout(),
         )

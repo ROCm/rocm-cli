@@ -5802,13 +5802,13 @@ each manager under `crates/rocm-dash-tui/src/ui/` have a
 `console_key_outcomes` ([job_console.rs](../crates/rocm-dash-tui/src/ui/job_console.rs)),
 the focused-host close guard's in `focused_close_keys_swallowed_while_job_runs`
 ([focus.rs](../crates/rocm-dash-tui/src/app/focus.rs)), and
-`uppercase_g_keeps_its_own_binding` covers `G`. End to end, `dash-64` in
+`uppercase_g_keeps_its_own_binding` covers `G`. End to end, `dash-66` in
 [dash.feature](../tests/e2e-cucumber/features/dash.feature) opens the services
 manager with `S` and quits with `Q`, sent once, so it fails on a timeout if
 either is ignored. It carries only `@requires-os:linux`:
 
 ```bash
-cargo xtask e2e -- -n "dash-64"
+cargo xtask e2e -- -n "dash-66"
 ```
 
 ## Diagnose Engine Provenance
