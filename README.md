@@ -27,9 +27,10 @@ It ships as prebuilt binaries (`rocm` and `rocmd`) for Linux and Windows
 (x86_64), needs no Python, Rust, or existing ROCm install, and includes
 inference engine adapters for Lemonade, vLLM, and AIM.
 
-<!-- GitHub-only: no docs/rocm-docs/ wrapper includes README text above the
-platform-support-table-start marker (docs/rocm-docs/install/installation.md is
-the first to start there), so the site never links to itself. Keep it above. -->
+<!-- GitHub-only: every docs/rocm-docs/ wrapper that includes README text
+starts at or below the platform-support-table-start marker (install/installation.md
+and compatibility.md start exactly at it), so the site never links to itself.
+Keep this link above the marker. -->
 For the full documentation, see the
 [ROCm CLI documentation](https://rocm.docs.amd.com/projects/rocm-cli/en/latest/).
 
