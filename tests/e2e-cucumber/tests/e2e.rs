@@ -231,6 +231,10 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The `therock.version` Lemonade's `backend_versions.json` held after
+    /// runtime-33's failed alignment had reverted it, so the install that follows
+    /// can be held to leaving exactly that pin in place.
+    pub lemonade_pin_after_failed_alignment: Option<String>,
     /// The pasted error a diagnose-59 or diagnose-60 scenario hands to
     /// `rocm diagnose --symptom-file`. Its own field for the reason
     /// `skill_symptom` is.
@@ -447,6 +451,7 @@ impl Default for E2eWorld {
             side_by_side: None,
             skill_reference: None,
             skill_symptom: None,
+            lemonade_pin_after_failed_alignment: None,
             symptom_paste: None,
             symptom_file_runs: Vec::new(),
             helper_identity: None,
