@@ -65,6 +65,6 @@ Each `rocm` command, its options, and what it does.
 :link: engines/vllm
 :link-type: doc
 
-Serve with an existing vLLM installation on Linux and WSL.
+Install vLLM and serve models with it on Linux and WSL.
 ```
 ````
