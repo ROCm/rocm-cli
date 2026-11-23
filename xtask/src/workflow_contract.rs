@@ -10777,6 +10777,102 @@ fi
         );
     }
 
+    /// The `feature-naming` hook runs the e2e suite's naming guard at commit time,
+    /// so a mis-numbered scenario or a missing `@id:` fails the commit that stages
+    /// it instead of a CI run. Its entry names a test target by file name, so the
+    /// target must still exist. Its `files:` filter is checked against fixed
+    /// sample paths: it must match a `.feature` file directly under
+    /// `tests/e2e-cucumber/features/` and the guard itself, and must not match a
+    /// `.feature` file under a directory that only contains that path further
+    /// down (which the `^` anchor rules out), a name that continues past
+    /// `.feature` (which the `$` anchor rules out), or a `.feature` file or
+    /// README elsewhere in the crate. It stays at pre-commit and in `local-tools`,
+    /// and sets none of `types:`, `types_or:`, `exclude:` or `always_run:`, so
+    /// `files:` alone decides when it fires.
+    #[test]
+    fn feature_naming_hook_runs_the_naming_guard_when_a_feature_file_is_staged() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "feature-naming");
+        assert!(
+            hook_block_sets(
+                block,
+                "entry: cargo test -p e2e-cucumber --test feature_naming"
+            ),
+            "feature-naming hook must run exactly the `feature_naming` test target:\n{block}"
+        );
+        assert!(
+            repo_root()
+                .join("tests/e2e-cucumber/tests/feature_naming.rs")
+                .is_file(),
+            "the feature-naming hook's entry names tests/e2e-cucumber/tests/feature_naming.rs, \
+             which no longer exists"
+        );
+        for (flag, why) in [
+            (
+                "stages: [pre-commit]",
+                "it is the commit-time mirror of a CI test",
+            ),
+            (
+                "pass_filenames: false",
+                "cargo would read one appended filename as a test-name filter that \
+                 matches no test, so the hook would pass having run nothing",
+            ),
+            ("language: system", "it runs the local cargo"),
+            (
+                "groups: [local-tools]",
+                "it compiles e2e-cucumber, and `local-tools` is the group for hooks \
+                 that need a full Rust compile",
+            ),
+        ] {
+            assert!(
+                hook_block_sets(block, flag),
+                "feature-naming hook must set `{flag}`: {why}:\n{block}"
+            );
+        }
+        for filter_key in ["types:", "types_or:", "exclude:", "always_run:"] {
+            assert!(
+                !hook_block_mentions(block, filter_key),
+                "feature-naming hook must not set `{filter_key}`: `files:` alone decides \
+                 when it fires, and the samples below check only `files:`:\n{block}"
+            );
+        }
+
+        let files = strip_quotes(
+            block
+                .lines()
+                .find_map(|line| strip_comment(line).trim().strip_prefix("files: "))
+                .unwrap_or_else(|| {
+                    panic!("feature-naming hook must set a `files:` filter:\n{block}")
+                }),
+        );
+        let filter = regex::Regex::new(&files)
+            .unwrap_or_else(|e| panic!("feature-naming `files:` is not a valid regex: {e}"));
+        for path in [
+            "tests/e2e-cucumber/features/chat.feature",
+            "tests/e2e-cucumber/features/new_area.feature",
+            "tests/e2e-cucumber/tests/feature_naming.rs",
+        ] {
+            assert!(
+                filter.is_match(path),
+                "feature-naming `files:` filter {files:?} must match {path}"
+            );
+        }
+        for path in [
+            "vendor/tests/e2e-cucumber/features/x.feature",
+            "tests/e2e-cucumber/features/x.feature.orig",
+            "tests/e2e-cucumber/src/x.feature",
+            "tests/e2e-cucumber/README.md",
+        ] {
+            assert!(
+                !filter.is_match(path),
+                "feature-naming `files:` filter {files:?} must not match {path}, or the \
+                 hook compiles e2e-cucumber on commits it has nothing to say about"
+            );
+        }
+    }
+
     // Extractor guards: prove the helpers above actually parse the shapes they
     // claim to — multiline hook blocks, comment-stripping, and single-line pin
     // tokens alike — so the contract tests above can't silently false-pass on a
