@@ -1288,7 +1288,7 @@ mod tests {
         assert_eq!(state["status"], "stopped");
     }
 
-    /// The pinned 2026.44.1 catalog labels its small chat models `chat`. A serve
+    /// The pinned 2026.47.1 catalog labels its small chat models `chat`. A serve
     /// of such a name must take the direct route, not start the router; the
     /// recorded load method says which one served.
     #[cfg(target_os = "linux")]

@@ -3423,6 +3423,7 @@ line inside the table, even one with a state word in it):
 
 ```bash
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::parse
+cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_container
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::another_recipes_backend
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::update_states
 cargo test -p rocm-engine-lemonade llamacpp_backend::tests::a_warning
@@ -3432,10 +3433,11 @@ cargo test -p rocm-engine-lemonade backend_alignment::tests::align_falls_through
 cargo test -p rocm-engine-lemonade backend_alignment::tests::llamacpp_asset_name
 ```
 
-They run on fixtures: the `lemonade backends` table Lemonade 2026.44.1 prints,
-and a release listing shaped like the real one. The live paths (a real
-`lemond`, the GitHub listing, a real backend install) run only on the gated
-Lemonade GPU lanes.
+They run on fixtures: the `lemonade backends` tables Lemonade 2026.44.1 and
+2026.47.1 print (2026.47.1 also lists container backends as `llamacpp` rows,
+which are never selected), and a release listing shaped like the real one. The live paths
+(a real `lemond`, the GitHub listing, a real backend install) run only on the
+gated Lemonade GPU lanes.
 
 AIM endpoint-key coverage: an AIM container bundles vLLM, so the same gap
 applies to it. A keyed AIM launch

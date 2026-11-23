@@ -654,7 +654,7 @@ async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
 /// - the active SDK differs from Lemonade's packaged `therock.version`, and the
 ///   install aligns the pin to it and says so ("Aligned Lemonade's ROCm llama.cpp
 ///   backend ..."), as on an SDK older than the pin (ROCm 7.14 against
-///   Lemonade 2026.44.1's 10.1.0, whose pinned llama.cpp build also ships a 7.14
+///   Lemonade 2026.47.1's 10.1.0, whose pinned llama.cpp build also ships a 7.14
 ///   archive);
 /// - the active SDK already is the packaged pin (a ROCm 10.1 SDK), so there is
 ///   nothing to align: no alignment line, no alignment attempt, and the ROCm
@@ -702,7 +702,7 @@ async fn assert_lemonade_backend_paired_with_active_sdk(world: &mut E2eWorld) {
         .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK");
     if pinned_version == packaged_version {
         // The active SDK is the packaged pin (ROCm 10.1 against Lemonade
-        // 2026.44.1), so the comparison above holds whatever the CLI did. The
+        // 2026.47.1), so the comparison above holds whatever the CLI did. The
         // llama.cpp tag paired with that pin is a second signal: an alignment
         // that rewrote the pin would also have moved it.
         assert_eq!(
@@ -964,7 +964,7 @@ async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
     let pinned_version = installed_therock_pin(output);
     let packaged_version = packaged_therock_pin(output);
     // Where the active SDK already is the packaged pin (a ROCm 10.1 SDK against
-    // Lemonade 2026.44.1) the ROCm version alone cannot tell an untouched pin
+    // Lemonade 2026.47.1) the ROCm version alone cannot tell an untouched pin
     // from one rewritten to the same value, so the llama.cpp tag paired with it
     // is checked too.
     assert_eq!(
