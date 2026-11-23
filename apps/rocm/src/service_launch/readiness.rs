@@ -237,6 +237,22 @@ fn settle_exited_service(
         }
         return deliberate;
     }
+    // Reaching here means the refresh changed the status, and the only way it
+    // changes it to `failed` is the engine writing that itself. For a stop this
+    // function has already proved was asked for, that verdict is the adapters'
+    // known misreading of SIGTERM as an unsuccessful exit — and persisting it
+    // unchanged would return `deliberate` to the caller, which prints "was
+    // stopped", while leaving `rocm services list` and `rocmd`'s recovery scan
+    // reading `failed` off the same record. The live-child branch above already
+    // resolves exactly this tie in favour of the stop; this one did not.
+    //
+    // The recorded stop is the stronger evidence: it is a fact about what was
+    // asked for, written by `stop_internal_managed_service_confirmed_with`
+    // before anything was signalled, whereas `failed` here is an inference from
+    // an exit code. A crash carries no such marker, so this cannot mask one.
+    if deliberate && latest.status == "failed" {
+        latest.status = "stopped".to_owned();
+    }
     // A whole-record write, not the `merge_json_state_file` the branch above
     // uses, and deliberately so: reaching here means `refresh_from_engine_state`
     // adopted fields from the engine state file (`engine_pid`,
@@ -2061,6 +2077,68 @@ mod tests {
             "the correction must be a merge of the `status` key, not a write-back of the \
              stale snapshot: fixing the status by clobbering the concurrent writer trades \
              one defect for the one the early return exists to prevent"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A stop this function proves was asked for must not be persisted as
+    /// `failed` by the engine's own verdict, on the one path where the two can
+    /// both be true at once.
+    ///
+    /// The adapters read a SIGTERM'd server as an unsuccessful exit and write
+    /// `failed` to their own state file. When that lands beside a real stop
+    /// marker, `refresh_from_engine_state` adopts it, the record is no longer
+    /// live, and the status now differs from what was on disk — so neither the
+    /// live-child branch nor the `status == on_disk` early return applies and
+    /// execution reaches the final write. Before the reconciliation there, that
+    /// write persisted `failed` while the function returned `deliberate`,
+    /// i.e. the caller printed "was stopped" over a record saying `failed`.
+    ///
+    /// `died_during_wait_reports_a_stop_during_the_wait_as_a_stop` asserts the
+    /// same invariant but deletes the engine state file first, specifically to
+    /// avoid this interleaving — so it cannot catch this. This one plants both
+    /// halves on purpose.
+    #[test]
+    fn a_stop_is_not_rewritten_as_failed_by_the_engines_own_verdict() {
+        let (root, paths) = test_paths("wait-settle-stop-vs-engine-failed");
+        paths.ensure().expect("paths");
+        // Not live (pid 0), status still `starting` on disk, and a genuine stop
+        // marker: `stop_internal_managed_service_confirmed_with` writes this
+        // before it signals anything.
+        let mut record = record_tracking_pid(&paths, 0, "starting");
+        record.stop_requested_unix_ms = Some(4_242);
+        record.settled_stop_unix_ms = None;
+        record.write().expect("write");
+        // The adapter's own misreading of the SIGTERM, in the place it writes
+        // it. This is what the refresh adopts.
+        let _ = rocm_core::merge_json_state_file(
+            &record.engine_state_path,
+            &serde_json::json!({ "status": "failed" }),
+        );
+
+        let deliberate = settle_exited_service(
+            &paths,
+            &record.service_id,
+            &|_| false,
+            UnexplainedDeath::IsACrash,
+        );
+
+        assert!(
+            deliberate,
+            "a recorded stop is a fact about what was asked for; an exit code is an \
+             inference, and must not overturn it"
+        );
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_ne!(
+            after.status, "failed",
+            "the verdict said this death was asked for, so the record must not be left \
+             reading `failed` for `rocm services list` and rocmd's recovery scan"
+        );
+        assert_eq!(after.status, "stopped");
+        assert_eq!(
+            after.stop_requested_unix_ms,
+            Some(4_242),
+            "the evidence the verdict rests on survives the write"
         );
         let _ = fs::remove_dir_all(root);
     }

@@ -2392,6 +2392,61 @@ mod tests {
         assert_eq!(on_disk.stop_requested_unix_ms, Some(4_321));
     }
 
+    /// The `stop_seen_while_waiting` half of the same guard. The test above
+    /// exercises only the *on-disk* fallback (`managed_service_stop_was_requested`),
+    /// because it plants the marker that fallback reads.
+    ///
+    /// `StopWatch` exists because a stop can both land and be cleared inside a
+    /// single readiness wait, leaving nothing on disk by the time this runs —
+    /// the tick sampling is then the only witness. Here the manifest carries no
+    /// stop evidence at all, which makes the on-disk term `false` and leaves
+    /// the latched `true` as the only thing that can produce the early return.
+    /// Deleting or inverting the `stop_seen_while_waiting ||` disjunct turns
+    /// this red; the four sibling tests all pass a literal `false` and would
+    /// stay green.
+    #[test]
+    fn restart_readiness_treats_a_stop_seen_only_while_waiting_as_clean() {
+        let (root, paths) = test_paths("restart-readiness-stop-watched");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-readiness-stop-watched";
+        let stopped = stopped_restart_record(&paths, service_id);
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+
+        // The stop landed and was cleared again inside the wait: nothing is
+        // left on disk for the fallback to find.
+        let mut cleared = raw_manifest(&paths, service_id);
+        cleared.stop_requested_unix_ms = None;
+        cleared.settled_stop_unix_ms = None;
+        cleared.write().unwrap();
+        assert!(
+            !crate::service_launch::managed_service_stop_was_requested(&paths, service_id),
+            "premise: the on-disk fallback must be false, or this test would pass without \
+             the latch"
+        );
+
+        let result = record_restart_readiness(
+            &paths,
+            &started,
+            EndpointReadiness::Unreachable,
+            || false,
+            true,
+        );
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let engine_state = fs::read_to_string(&started.engine_state_path).unwrap_or_default();
+        let _ = fs::remove_dir_all(root);
+
+        result.expect("a stop the watch saw must not fail the restart");
+        assert_ne!(
+            on_disk.status, "failed",
+            "a stop the readiness wait watched land must not be stamped a crash"
+        );
+        assert!(
+            !engine_state.contains("\"failed\""),
+            "nor may its engine state file say failed: {engine_state}"
+        );
+    }
+
     /// Spawn a child that is certainly gone by the time the restart's 200ms
     /// early-exit window elapses, so `try_wait()` yields a real exit status.
     #[cfg(not(windows))]

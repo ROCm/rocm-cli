@@ -452,11 +452,12 @@ fn record_engine_serve_http_failure(
 ) {
     let detail = format!("{error:?}");
     tracing::error!(service_id, %detail, "managed engine serve-http failed");
-    // Decided before anything is written: `lemonade` and `vllm` return `Err`
-    // for a SIGTERM from `rocm services stop` too, and a line reading
-    // "failed:" in `rocm services logs` is wrong for a stop the operator
-    // asked for — the state file was already being spared, but the log was
-    // not.
+    // Decided before anything is written: `lemonade` returns `Err` for a
+    // SIGTERM from `rocm services stop` too (and `vllm` does on its
+    // pre-readiness path — see `engine_stop_was_deliberate`), and a line
+    // reading "failed:" in `rocm services logs` is wrong for a stop the
+    // operator asked for — the state file was already being spared, but the
+    // log was not.
     let deliberate = engine_stop_was_deliberate(service_id, state_path);
     if let Some(log_path) = log_path
         && let Ok(mut file) = fs::OpenOptions::new()
@@ -490,9 +491,19 @@ fn record_engine_serve_http_failure(
 ///
 /// Needed because the adapters disagree. `aim` makes the distinction itself
 /// (`finish_after_exit` reads `stopping`/`stopped` off its own state file,
-/// writes `stopped` and returns `Ok`), so it never reaches the stamp. `lemonade`
-/// and `vllm` have no such carve-out: a SIGTERM from `rocm services stop` makes
-/// `status.success()` false, so they write `failed` themselves and return `Err`.
+/// writes `stopped` and returns `Ok`), so it never reaches the stamp.
+/// `lemonade` has no such carve-out: a SIGTERM from `rocm services stop` makes
+/// `status.success()` false, so it writes `failed` itself and returns `Err`,
+/// landing here.
+///
+/// `vllm` reaches this only on its *pre-readiness* failure path. Its
+/// `serve_http` (`engines/vllm/src/process.rs`) writes its own terminal state
+/// and then ends an unsuccessful run with `std::process::exit(...)` instead of
+/// returning `Err`, so a post-readiness stop or crash never unwinds this far —
+/// that one is settled supervisor-side by `settle_exited_service`. The check
+/// still has to cover `vllm`, because a stop can land in the pre-readiness
+/// window, but this is not what spares a stopped vLLM server after readiness.
+///
 /// They were already mislabelling a deliberate stop before this change — the
 /// stamp would merely agree with them — but agreeing with a wrong answer is
 /// still wrong, so check both places an intent is recorded:

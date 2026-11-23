@@ -2922,14 +2922,42 @@ mod tests {
     /// actually parses as a way to read that service's log.
     #[test]
     fn the_log_commands_the_crash_messages_name_actually_parse() {
+        // Parsing is not the property under test — the buggy spelling parsed
+        // too. What has to hold is that the id reaches the field that actually
+        // selects a service, so each form is asserted on its *resolved* value.
         for argv in [
             ["rocm", "services", "logs", "svc-1"].as_slice(),
             ["rocm", "services", "logs", "svc-1", "--follow"].as_slice(),
+        ] {
+            let parsed = Cli::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            match parsed.command {
+                Some(Command::Services {
+                    command: Some(ServicesCommand::Logs { service_id, .. }),
+                }) => assert_eq!(
+                    service_id,
+                    "svc-1",
+                    "`{}` must select svc-1",
+                    argv.join(" ")
+                ),
+                other => panic!("`{}` must be services/logs, got {other:?}", argv.join(" ")),
+            }
+        }
+        for argv in [
             ["rocm", "logs", "--service", "svc-1"].as_slice(),
             ["rocm", "logs", "--service", "svc-1", "--follow"].as_slice(),
         ] {
-            Cli::try_parse_from(argv)
+            let parsed = Cli::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            match parsed.command {
+                Some(Command::Logs { service, .. }) => assert_eq!(
+                    service.as_deref(),
+                    Some("svc-1"),
+                    "`{}` must select svc-1",
+                    argv.join(" ")
+                ),
+                other => panic!("`{}` must be logs, got {other:?}", argv.join(" ")),
+            }
         }
 
         // The form the bug used. It parses, which is precisely why the defect
