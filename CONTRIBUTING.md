@@ -86,7 +86,7 @@ cargo xtask pre-push-check test --dry-run --base origin/main
 
 The manifest hooks only run when you change the dependency graph. They *rewrite* the generated file instead of only reporting that it is stale. When that happens, the commit stops so you can re-stage the refreshed file.
 
-The `THIRD_PARTY_NOTICES.txt` hook needs `cargo-about` at the pinned version. Without it the hook skips, and CI's `third-party-notices` job is the gate. To install it:
+The `THIRD_PARTY_NOTICES.txt` hook needs `cargo-about` at the pinned version. Without it, or at another version, the hook skips; the hook is not `verbose`, so under `prek` the skip is silent, and `cargo xtask tpn --check` run directly fails instead. CI's `third-party-notices` job is the gate. To install it:
 
 ```bash
 cargo install cargo-about@0.9.1 --locked --features cli   # pinned to match the CI third-party-notices job
