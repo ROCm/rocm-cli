@@ -24,6 +24,7 @@ use rocm_dash_core::metrics::InstanceStatus;
 use crate::app::AppState;
 use crate::ui::format;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// Where a selected launcher row leads. The runtime maps these to the existing
 /// dash entry points.
@@ -441,7 +442,7 @@ fn handle_launcher_key(state: &mut AppState, sel: &mut usize, code: KeyCode) -> 
             Some(false) | None => LauncherKeyOutcome::Continue,
         };
     }
-    match code {
+    match shortcut_key(code) {
         KeyCode::Char('q') | KeyCode::Esc => {
             if crate::app::request_quit(state) {
                 LauncherKeyOutcome::Exit(None)
@@ -1206,5 +1207,21 @@ mod tests {
             s.quit_confirm.is_some(),
             "`d` is not a verdict key — the prompt must still be open"
         );
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_launcher_shortcuts() {
+        let mut s = launcher_state("default-dark", vec![]);
+        let mut sel = 0usize;
+        handle_launcher_key(&mut s, &mut sel, KeyCode::Char('J'));
+        assert_eq!(sel, 1, "J must move down");
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('D')),
+            LauncherKeyOutcome::Exit(Some(LauncherChoice::OpenDashboard))
+        ));
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('Q')),
+            LauncherKeyOutcome::Exit(None)
+        ));
     }
 }

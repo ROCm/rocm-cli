@@ -76,9 +76,14 @@ pub(super) fn focused_close_key_blocked(
     let running = state
         .active_job_id()
         .is_some_and(|id| ui::job_console::console_esc_closes(state.jobs.job(id)));
+    // Folded like the console's own `q` (`ui::job_console::on_console_key`):
+    // a Caps Lock `Q` that got past this gate would close the console there.
     running
         && state.console_exit() == ui::job_console::ConsoleExit::Immediate
-        && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+        && matches!(
+            ui::widgets::shortcut_key(code),
+            KeyCode::Char('q') | KeyCode::Esc
+        )
 }
 
 /// Open the single overlay a focused host should host, returning any initial
@@ -304,6 +309,12 @@ mod tests {
             &s,
             Some(Focus::Examine),
             KeyCode::Esc
+        ));
+        // Caps Lock `Q` closes the console like `q` does, so it is blocked too.
+        assert!(focused_close_key_blocked(
+            &s,
+            Some(Focus::Examine),
+            KeyCode::Char('Q')
         ));
         assert!(!focused_close_key_blocked(
             &s,

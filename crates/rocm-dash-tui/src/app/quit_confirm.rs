@@ -254,7 +254,9 @@ impl AppState {
         &mut self,
         code: crossterm::event::KeyCode,
     ) -> bool {
-        if !self.quit_confirm_pending() || code != crossterm::event::KeyCode::Char('s') {
+        if !self.quit_confirm_pending()
+            || crate::ui::widgets::shortcut_key(code) != crossterm::event::KeyCode::Char('s')
+        {
             return false;
         }
         // One read for both questions below: a registry write landing between
@@ -505,6 +507,26 @@ mod tests {
             );
             assert!(s.services.is_none());
         }
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_accepts_caps_lock_s() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = st();
+        s.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                managed: true,
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut s, true, &["svc-managed"]);
+        s.open_quit_confirm();
+        assert!(s.quit_confirm_open_services_key(KeyCode::Char('S')));
+        assert!(s.services.is_some(), "Caps Lock `S` must open Services");
     }
 
     #[test]

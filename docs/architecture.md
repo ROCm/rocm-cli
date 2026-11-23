@@ -572,7 +572,7 @@ The dashboard client: the event loop and reducer (`app/`), the chat agent (`agen
 | [`ui/theme_picker.rs`](../crates/rocm-dash-tui/src/ui/theme_picker.rs) | The theme picker modal: the registered themes beside a live preview of the highlighted one. | flat |
 | [`ui/update_manager.rs`](../crates/rocm-dash-tui/src/ui/update_manager.rs) | The Update overlay: the `rocm update` check and dry-run preview start directly; applying goes through an approval. | flat |
 | [`ui/warnings_modal.rs`](../crates/rocm-dash-tui/src/ui/warnings_modal.rs) | The Warnings modal: the text behind the header's warning badge, content-sized like the Help modals. | flat |
-| [`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs) | Small helpers shared across tabs, including `apply_char_key` and `apply_char_key_filtered`, the append-only text-field edit the form key handlers use. | flat |
+| [`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs) | Small helpers shared across tabs, including `apply_char_key` and `apply_char_key_filtered`, the append-only text-field edit the form key handlers use, and `shortcut_key`, which folds a letter's case so shortcuts fire with Caps Lock on. | flat |
 
 #### `ui/tabs/`
 

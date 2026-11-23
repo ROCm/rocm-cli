@@ -32,6 +32,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// Assistant providers (mirrors the bin's `Provider` value-enum). Fixed set, so
 /// no plumbing is needed — these are not runtime-discovered data.
@@ -125,7 +126,7 @@ pub fn on_key(
     }
 
     // 3) Menu navigation + actions.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *cm = None,
         KeyCode::Up | KeyCode::Char('k') => c.action_sel = c.action_sel.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
@@ -306,7 +307,7 @@ pub fn draw_config_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crossterm::event::KeyCode;
 
     #[test]
@@ -410,6 +411,22 @@ mod tests {
             on_key(&mut cm, &mut jobs, key(KeyCode::Right));
         }
         assert_eq!(cm.as_ref().unwrap().provider_sel, PROVIDERS.len() - 1);
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        let mut cm = Some(ConfigManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut cm, &mut jobs, caps('J'));
+        assert_eq!(cm.as_ref().unwrap().action_sel, 1, "J must move down");
+        on_key(&mut cm, &mut jobs, caps('K'));
+        assert_eq!(cm.as_ref().unwrap().action_sel, 0, "K must move up");
+        on_key(&mut cm, &mut jobs, caps('L'));
+        assert_eq!(cm.as_ref().unwrap().provider_sel, 1, "L must move right");
+        on_key(&mut cm, &mut jobs, caps('H'));
+        assert_eq!(cm.as_ref().unwrap().provider_sel, 0, "H must move left");
+        on_key(&mut cm, &mut jobs, caps('Q'));
+        assert!(cm.is_none(), "Q must close the overlay");
     }
 
     #[test]

@@ -44,6 +44,7 @@ use crate::ui::exec::resolve_exe;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// The `rocm examine` job.
 const EXAMINE_JOB: &str = "examine";
@@ -160,7 +161,7 @@ pub fn on_key(
             }
             ConsoleOutcome::Unhandled => {
                 let terminal = jobs.job(&job_id).is_none_or(JobState::is_terminal);
-                match key.code {
+                match shortcut_key(key.code) {
                     // `r` re-runs the examine after its own terminal result.
                     KeyCode::Char('r') if terminal && job_id == EXAMINE_JOB => {
                         d.active_job = None;
@@ -179,7 +180,7 @@ pub fn on_key(
     }
 
     // 3) The intro card.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *examine = None,
         KeyCode::Enter | KeyCode::Char('r') => return run_examine(d, jobs),
         KeyCode::Char('p') => return run_report_preview(d, jobs),
@@ -457,7 +458,7 @@ pub fn draw_examine_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crate::ui::approval::APPROVAL_PAGE;
     use crossterm::event::KeyCode;
 
@@ -511,6 +512,39 @@ mod tests {
         let fx = on_key(&mut d, &mut jobs, key(KeyCode::Char('r')));
         assert_eq!(fx.len(), 1);
         assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("examine"));
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        // The intro card.
+        let mut jobs = State::default();
+        let mut d = Some(ExamineManagerState::default());
+        on_key(&mut d, &mut jobs, caps('R'));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some(EXAMINE_JOB));
+        let mut d = Some(ExamineManagerState::default());
+        on_key(&mut d, &mut jobs, caps('P'));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some(REPORT_JOB));
+        let mut d = Some(ExamineManagerState::default());
+        on_key(&mut d, &mut jobs, caps('Q'));
+        assert!(d.is_none(), "Q must close the overlay");
+        let (mut d, mut jobs) = previewed(PREPARED, 0);
+        on_key(&mut d, &mut jobs, caps('S'));
+        assert!(
+            d.as_ref().unwrap().approval.is_some(),
+            "S must stage the send"
+        );
+
+        // The console after a terminal examine result: `R` re-runs it and `P`
+        // prepares a report.
+        for (letter, expected) in [('R', EXAMINE_JOB), ('P', REPORT_JOB)] {
+            let mut d = Some(ExamineManagerState::default());
+            let mut jobs = State::default();
+            on_key(&mut d, &mut jobs, key(KeyCode::Enter));
+            finish(&mut jobs, EXAMINE_JOB, &[], 0);
+            let fx = on_key(&mut d, &mut jobs, caps(letter));
+            assert_eq!(fx.len(), 1, "{letter} must start a job from the console");
+            assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some(expected));
+        }
     }
 
     #[test]

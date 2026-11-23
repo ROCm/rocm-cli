@@ -25,6 +25,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// The update menu actions, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +146,7 @@ pub fn on_key(
     }
 
     // 3) Menu navigation + action.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *update = None,
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
             u.selected = u.selected.saturating_sub(1);
@@ -292,7 +293,7 @@ pub fn draw_update_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crossterm::event::KeyCode;
 
     #[test]
@@ -391,6 +392,18 @@ mod tests {
             on_key(&mut u, &mut jobs, key(KeyCode::Up));
         }
         assert_eq!(u.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        let mut u = Some(UpdateManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut u, &mut jobs, caps('J'));
+        assert_eq!(u.as_ref().unwrap().selected, 1, "J must move down");
+        on_key(&mut u, &mut jobs, caps('K'));
+        assert_eq!(u.as_ref().unwrap().selected, 0, "K must move up");
+        on_key(&mut u, &mut jobs, caps('Q'));
+        assert!(u.is_none(), "Q must close the overlay");
     }
 
     #[test]
