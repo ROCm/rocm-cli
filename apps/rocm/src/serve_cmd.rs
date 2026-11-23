@@ -55,7 +55,7 @@ use rocm_engine_protocol::{
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
 use crate::engine_install_env::engine_manages_own_runtime;
-use crate::engine_ipc::{engine_request, fetch_service_device_briefly};
+use crate::engine_ipc::engine_request;
 use crate::engine_runtime_select::{
     EngineSelection, resolve_engine_selection, validate_engine_selection_runtime,
 };
@@ -66,7 +66,7 @@ use crate::gpu_policy::{
     serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
-use crate::serve_device_probe::serve_device_probe_opens;
+use crate::serve_device_probe::serve_device_after_launch;
 use crate::serve_port;
 use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
@@ -892,9 +892,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // the same reason: it asserts what happens *after* a spawn, so it must reach
     // one without real GPU hardware.
     //
+    // ROCMAI-541's scripted-engine scenario needs the same waiver for the
+    // opposite case: a real managed child that spawns and *survives* its early
+    // startup window on a no-GPU host. See `run_scripted_e2e_engine_serve_http`
+    // for what runs once the spawned child reaches it.
+    //
     // Every test hook that waives this bail is named here once, so the bail and
     // `gpu_refusal_waived_for_reuse` below cannot disagree about which ones do.
+    let scripted_engine_death =
+        cfg!(feature = "e2e-test-hooks") && std::env::var_os("ROCM_E2E_SCRIPTED_ENGINE").is_some();
     let gpu_bail_waived_by_test_hook = scripted_backend_failure
+        || scripted_engine_death
         || e2e_simulate_oom_launch()
         || crate::service_launch::e2e_simulate_startup_exit()
         || scripted_managed_engine_startup_failure();
@@ -1018,8 +1026,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
         && resolved_model.is_none()
+        && !scripted_engine_death
         && !scripted_managed_engine_startup_failure()
     {
+        // See `scripted_engine_death`'s own doc comment above: the scripted-engine
+        // scenario needs the spawn below to reach `run_builtin_engine_serve_http`
+        // without a real (and, for Lemonade, GPU-dependent) runtime install.
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
     // Reuse the `ResolveModel` answer the reuse pre-gate already paid for, so a
@@ -1296,20 +1308,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 };
             spinner.clear();
 
-            // Read what the engine actually selected rather than guessing from
-            // the pre-launch GPU plan: `gpu_indices` above can be empty for a
-            // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
-            // the server is running fine on it. Only for a launch this command
-            // performed — [`serve_device_probe_opens`] says why skipping the
-            // reuse path is the point rather than tidiness. Asked more than
-            // once, briefly: `engines/lemonade` answers `"unknown"` until its
-            // own inference probe returns, a real window right after a launch
-            // reports ready. The wait is bounded
-            // (`engine_ipc::SERVE_DEVICE_PROBE_BUDGET`) and `None` is supported —
-            // no `device:` row, and `rocm services list` shows it once it can.
-            let device = serve_device_probe_opens(report.already_running, &report.status, || {
-                fetch_service_device_briefly(&paths, &selected_engine, &report.service_id)
-            });
+            let device = serve_device_after_launch(&paths, &selected_engine, &report);
 
             let mut notes = collect_serve_notes(
                 cpu_only,

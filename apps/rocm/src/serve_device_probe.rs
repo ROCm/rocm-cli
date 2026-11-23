@@ -35,6 +35,31 @@ pub(crate) fn serve_device_probe_opens<T>(
         .flatten()
 }
 
+/// The `device:` row for a launch this command just performed.
+///
+/// Pairs [`serve_device_probe_opens`]'s gate with the probe it gates, so
+/// `serve_cmd.rs` carries the call rather than the reasoning — the same
+/// module-size pressure this file was split out for.
+///
+/// Reads what the engine actually selected rather than guessing from the
+/// pre-launch GPU plan: that plan's `gpu_indices` can be empty for a
+/// Vulkan-only GPU ROCm/amd-smi never enumerates, even though the server is
+/// running fine on it. Asked more than once, briefly, because
+/// `engines/lemonade` answers `"unknown"` until its own inference probe
+/// returns — a real window right after a launch reports ready. The wait is
+/// bounded by `engine_ipc::SERVE_DEVICE_PROBE_BUDGET`, and `None` is a
+/// supported answer: no `device:` row, and `rocm services list` shows it once
+/// it can.
+pub(crate) fn serve_device_after_launch(
+    paths: &rocm_core::AppPaths,
+    engine: &str,
+    report: &crate::service_launch::ManagedLaunchReport,
+) -> Option<String> {
+    serve_device_probe_opens(report.already_running, &report.status, || {
+        crate::engine_ipc::fetch_service_device_briefly(paths, engine, &report.service_id)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

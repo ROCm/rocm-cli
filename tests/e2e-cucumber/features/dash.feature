@@ -1116,3 +1116,95 @@ Feature: Interactive dashboard
     Then the dashboard exits from the signal with code 130
     And the dashboard reports that its telemetry daemon could not use that file
     And that file is left in place
+
+  # The launcher's "Serve a model" row opens a FOCUSED HOST — the serve form as
+  # the only thing in a window with no tab shell and no background
+  # (`run_focused`, `app/focus.rs`), which is a different route from every
+  # dash-45..dash-49 scenario above: those all open the full dashboard with
+  # demo data and reach the same form through the Observe tab's `w`. Nothing
+  # covered the launcher route, so the focused host's own close policy — the
+  # `q`/Esc gate in `focused_close_key_blocked` and the
+  # `focused_should_exit` ejection that hands control back to the menu — was
+  # only ever asserted by unit tests against the helpers.
+  #
+  # KNOWN GAP, and it is a real one rather than a covered case: this scenario
+  # does NOT reach the half of that policy that only shows up while a launch
+  # job is actually RUNNING in the console (Esc raising the leave
+  # confirmation, and approving it stopping the launch). It opens the form and
+  # backs straight out, so it passes whether or not that behaviour works.
+  # Reaching a running console means really spawning `rocm serve`, which on
+  # the no-GPU lane this scenario runs on is refused in well under a second
+  # (`serve-13`), so the console would already be terminal by the time a
+  # keystroke landed — and no step in this harness drives a launch through
+  # the wizard's console even on the GPU lane (dash-52 serves its model from
+  # a fixture, not from the form). So no lane, gated or not, can currently
+  # drive it. AGENTS.md's e2e rule lists three ways out — an existing
+  # scenario, a gated lane, or a purely internal change — and none of them is
+  # this one, so the rule is left UNDISCHARGED rather than satisfied. The
+  # behaviour is covered a level down, in `ui/serve_wizard.rs`'s
+  # `focused_host_leave_says_it_stops_the_launch_and_actually_stops_it`, which
+  # asserts the rendered wording and the job's fate in one test — which that
+  # same rule says is not a substitute. Closing this needs harness work to
+  # drive a launch through the form on a GPU lane.
+  #
+  # What is asserted here is the route and the window it opens in: the form
+  # arrives with the focused host's own "Esc  back to menu" footer (drawn by
+  # `ui::draw_focused`, which the full dashboard never draws), and Esc at the
+  # form's root really does return to the front door rather than quitting the
+  # process.
+  @id:dash-launcher-serve-row-opens-a-focused-window @requires-os:linux
+  Scenario: dash-63 - Serving a model from the launcher opens the form in its own window and Escape returns to the menu
+    When the user opens the launcher
+    And the user chooses to serve a model from the launcher
+    Then the serve form is shown in a window that offers the way back to the menu
+    When the user presses Escape
+    Then the launcher front door is displayed
+    When the user quits the launcher
+    Then the launcher exits successfully
+
+  # ROCMAI-1050: at a short window height the prompt painted the
+  # "<model> — stop it first:" bullet and cut the command on the line directly
+  # beneath it, with nothing on screen saying anything had been dropped — the
+  # dashboard named a remedy it did not show. `dash-26` pins the same
+  # assertion at the default geometry; this is the short-window case, which is
+  # where the line was actually lost.
+  @id:dash-quit-confirm-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-64 - The quit prompt still shows the stop command on a short terminal
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
+
+  # ROCMAI-1050's other half, and the one dash-64 cannot reach. Growing the
+  # popup only fixes the bodies that now fit; a body that still does not fit
+  # must SAY so and name the keys that move it, or a silent cut is
+  # indistinguishable from the original bug — the dashboard naming a remedy it
+  # does not show. Two served models at twelve rows is past what even the grown
+  # popup holds, so this is the overflow case on real geometry rather than a
+  # fabricated one. The unit test
+  # `a_body_that_still_overflows_says_so_and_names_the_keys`
+  # pins the same rule against a synthetic body; this proves a user can actually
+  # reach it.
+  @id:dash-quit-confirm-overflow-names-its-keys @requires-os:linux
+  Scenario: dash-65 - A quit prompt too tall for the window says so and names the keys that scroll it
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When another managed model is served
+    Then the other managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt says there is more to read and names the keys that scroll it
+    When the user declines the quit prompt
+    And the user quits the dashboard
+    Then the dashboard exits successfully

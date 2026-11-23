@@ -3006,7 +3006,7 @@ cleanup terminating the engine it then names, run on the required Windows lane t
 The `watched_detached_spawn_*` tests, and the one that drives the watch's failed wait
 and failed exit-code read (`observe_early_exit_*`), run on the required Windows lane.
 
-`serve-68` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
+`serve-69` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an
 `e2e-test-hooks` build scripts the managed engine's death (the spawned `rocm`
 gets an argument it rejects), and the scenario checks that the serve fails naming
 the engine's own log, that the record left on disk reads `stopped` and names no
@@ -3016,7 +3016,7 @@ self-hosted Windows lane; the required `windows-build-and-test` lane builds
 without the hooks and does not. Run it locally with:
 
 ```bash
-cargo xtask e2e -- -n "serve-68 "
+cargo xtask e2e -- -n "serve-69 "
 ```
 
 Serve resolver focused tests:
@@ -5629,6 +5629,41 @@ others assert on the outcome the smoke test returns.
 cargo xtask e2e -- -n "serve-60"
 ```
 
+### Managed-engine crash vs. stop (ROCMAI-541)
+
+A managed engine that dies *after* its early-startup window used to be
+indistinguishable from one that is merely slow: `rocm serve --verbose` printed
+"server process exited" and exited 0, and on Windows the child's stdout/stderr
+were attached to nothing, so the reason never reached the service log at all.
+These two scenarios pin both halves of the fix, and they are companions — each
+is the other's control, since both land in the same
+`AttachOutcome::ServerExited` arm and only the stop marker tells them apart:
+
+- serve-67, `@id:serve-scripted-death-after-startup` — a managed child that dies
+  after startup must fail the attach loudly: non-zero exit, the crash named, and
+  `failed` on both the service record and the engine state file.
+- serve-68, `@id:serve-scripted-external-stop-while-attached` — a `rocm services
+  stop` issued from another shell during the same window must stay a clean stop:
+  exit 0 and no `failed` stamp. `AttachOutcome::Stop` fires only from the
+  attached session's *own* keystroke reader, and piped stdio has none, so an
+  external stop lands in the crash arm and would otherwise be reported as one.
+
+Both carry `@requires-no-gpu`, so the GitHub-hosted mock lane is where they get
+their live coverage. Neither needs a GPU or a real engine: the scripted-engine
+hook (`ROCM_E2E_SCRIPTED_ENGINE`, with `ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS`,
+compiled only under the `e2e-test-hooks` feature — see
+`run_scripted_e2e_engine_serve_http` in
+[engine_ipc.rs](../apps/rocm/src/engine_ipc.rs)) stands in for the whole
+Lemonade/vLLM dispatch, so a real `__engine-serve-http` child still spawns and
+still clears both platforms' early-startup liveness checks before it dies.
+[serve_cmd.rs](../apps/rocm/src/serve_cmd.rs)'s `scripted_engine_death` bypasses
+the no-GPU pre-flight and the self-managed-engine install that would otherwise
+refuse these on that lane.
+
+To run them on a host that *does* have a GPU, mask it so the harness resolves to
+its no-GPU premise — `HIP_VISIBLE_DEVICES="" cargo xtask e2e -- -n "serve-(67|68)"`
+— otherwise `@requires-no-gpu` skips them.
+
 ## The Reported Backend Device And Support Level
 
 ROCMAI-550 made two surfaces report what this host can actually do instead of a
@@ -5679,7 +5714,6 @@ Vulkan-only here is inferred from the gfx table, not probed: there are three
 support levels and this section describes three. Probing the host for a Vulkan
 driver, and the further levels that evidence would make knowable, is separate
 work.
-
 
 ## Two Dashboards Share One Telemetry Daemon
 
