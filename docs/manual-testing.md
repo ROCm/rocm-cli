@@ -523,6 +523,32 @@ ROCm backend directory under `bin/llamacpp/`, and run
 - `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
   packaged values again, and the unrelated key is still there.
 
+To check that a failed backend alignment is not repeated (Windows or native
+Linux with a GPU Lemonade runs its ROCm backend on, and an active managed ROCm
+SDK): build with `cargo build -p rocm --features rocm/e2e-test-hooks`, set
+`ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION=7.99.0` (a ROCm version Lemonade
+publishes no backend for), and run `rocm engines install lemonade --reinstall`,
+then `rocm engines install lemonade`. Expected result:
+
+- The first install prints `Warning: could not align Lemonade's ROCm backend to
+  7.99.0; reverting to the default pinned version.`, exits 0, and leaves
+  `.rocm-cli-alignment-failed.json` in the Lemonade runtime tree.
+- The second install prints no alignment warning and does not download or
+  reinstall the backend (`Using installed Lemonade llamacpp:rocm backend.`). It
+  prints `Lemonade's ROCm backend could not be aligned to ROCm 7.99.0 less than
+  an hour ago; ...`, naming `rocm engines install lemonade --reinstall` and
+  that an install run 24 hours from now or later tries it again, and exits 0.
+- Running the first command again attempts the alignment again (the warning
+  is back), because `--reinstall` removed the record with the runtime tree.
+- Not a manual step: when preparing the pinned backend fails on the second
+  install, its error says so, that the alignment was skipped because of the
+  earlier failure, and that `rocm engines install lemonade --reinstall`
+  re-extracts the runtime tree without that record; the record is kept and the
+  skip line above is not printed. There is no way to make that install fail on
+  demand, so this is covered by the unit test
+  `a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`
+  in [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs).
+
 To check what a Lemonade install says about its size (no download needed for
 the refusal): with a debug build, set
 `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
@@ -925,6 +951,58 @@ outcome for the stopping process itself; the JSON answer of the sandbox
 `stop_server` tool does, in `pid_outcomes`, as `self` (never signalled, counted
 as stopped).
 
+**An engine that dies at startup.** On Windows and Linux alike, a managed
+engine that exits within its first 200 ms fails `rocm serve --managed`
+instead of reporting a server that is still starting.
+To see it without a broken engine, build the CLI with its test hooks and arm
+the scripted death, which makes the spawned engine reject its arguments:
+
+```powershell
+cargo build -p rocm --features e2e-test-hooks
+$env:ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE = "1"
+./target/debug/rocm serve qwen --engine lemonade --managed
+./target/debug/rocm services list --all
+```
+
+Expected result:
+
+- The serve exits non-zero with `managed engine exited immediately with status
+  ...; inspect <log path>`, where `<log path>` is the service's own log, plus a
+  tail of that log when the engine wrote anything to it. On Windows the status
+  is the engine's exit code too.
+- `rocm services list --all` shows the attempt as `stopped`. Running the same
+  `rocm serve` again fails again with the same `managed engine exited
+  immediately ...` error, rather than reporting the earlier attempt as already
+  running, and `rocm services list --all` then shows two `stopped` records.
+- An engine that dies later than that — while loading its runtime or model —
+  is not caught by this check; the serve then waits for readiness and reports
+  the service as still starting, as before.
+
+Unset the variable afterwards; a build without `--features e2e-test-hooks`
+ignores it.
+
+To see the stop-during-start case, run `rocm serve <model> --managed` in one
+terminal and, while it is still waiting for the server, `rocm services stop
+<service-id> --yes` from another. The serve exits non-zero with an error that
+begins "a stop was requested for managed service `<service-id>` while it was
+starting". Which advice follows depends on how far the stop has got:
+
+- If the stop has finished, the record reads `stopped`, `rocm services list
+  --all` shows the service as `stopped`, and the error ends "start it again with
+  `rocm serve`".
+- If the stop is still running (it can take tens of seconds), the record still
+  reads as live (`starting`, `running` or `ready`), and a new `rocm serve` for
+  the same model would reuse the service being stopped. The error then names
+  `rocm services stop <service-id> --yes` to run first. It waits for the
+  processes; once it reports the service stopped, `rocm services list --all`
+  shows `stopped` and `rocm serve` launches anew. A stop that cannot confirm the
+  processes gone says so and leaves the service live.
+
+This is the usual result, not a certain one: the launch reads the record and
+writes its readiness verdict as two separate steps, and a stop takes no lock on
+the record, so a stop that lands between the two is overwritten by the verdict
+and the serve reports the server as it found it.
+
 #### Windows host check
 
 The Windows build-and-test job runs the workspace unit tests, which include two
@@ -1270,6 +1348,51 @@ icacls <data>\remote-sessions\<session-id>.endpoint-key
 Expected result: exactly one entry, for your own account, with `(F)` and no
 `(I)` (inherited) flag — no `Administrators`, `SYSTEM`, `Users` or
 `Authenticated Users` entry, even when `<data>` is a folder those can read.
+
+#### Remote session records
+
+`rocm remote` keeps one record per session under `<data>/remote-sessions/`.
+These checks need no second machine. On Linux, after any `rocm remote serve`
+(or with a record copied in by hand), check the directory's mode:
+
+```bash
+stat -c '%a %U' <data>/remote-sessions
+```
+
+Expected result: `700` and your user name.
+
+Then make a record unusable and list the sessions. Copy a record aside first;
+these steps edit it:
+
+```bash
+cp <data>/remote-sessions/<session-id>.json /tmp/record.json
+sed -i 's/"remote_cli": *"[^"]*"/"remote_cli": "rocm; true #"/' \
+  <data>/remote-sessions/<session-id>.json
+rocm remote status
+rocm remote stop <session-id>
+```
+
+Expected result:
+
+- `status` prints `warning: ignoring a remote session record: refusing to act
+  on <path>: remote session names an unexpected remote CLI "rocm; true #"`,
+  with the remedy to set `"remote_cli"` back to `"rocm"` or
+  `"$HOME/.local/bin/rocm"`. It does not say `No remote sessions have been
+  started`; it says `1 remote session record(s) were refused` and that the
+  machine may still be serving a model. It exits 0 (scenario `remote-17`).
+- `stop` names the same record, exits non-zero and leaves the file in place
+  (scenario `remote-18`).
+- Following the remedy (set `"remote_cli"` back, or restore the copy) makes
+  `status` list the session again.
+- With a second record for the same machine on another port, `rocm remote stop
+  <short machine name>` and `rocm remote stop <full peer name>` are refused as
+  matching the refused record too, and stop nothing (scenarios `remote-21`,
+  `remote-22`).
+- Renaming the record to another session's name, or replacing it with a FIFO
+  (`mkfifo <data>/remote-sessions/x.json`), makes `status` refuse it and
+  return at once rather than hang.
+- Run as root with `sudo -E rocm remote status`, the records are refused as
+  owned by another user, with advice to run `rocm remote` as that user.
 
 ### 4a. Dashboard Doctor Report
 
@@ -1936,6 +2059,16 @@ Expected result:
 - The plan still asks for review before mutating actions.
 - `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
+- A plan whose command carries a value a Windows shell reads as syntax inside
+  single quotes, such as `'`, `&` or `%` (the full set is in
+  [llm-tool-use.md](llm-tool-use.md)), is not shown:
+  the CLI falls back to its own plan and its note says to supply that value
+  yourself. The same holds for `rocm chat --tools --prompt …`, where the
+  assistant's request is refused with that message on stderr and no
+  `advanced manual command:` line is printed. A folder in a request the CLI
+  recognises itself (`install therock into D:\R&D\rocm`) is shown as typed;
+  in other wording the folder reaches the CLI through the assistant's request
+  and is refused like any value the assistant chose.
 
 To turn provider-assisted planning back off:
 
@@ -1995,6 +2128,10 @@ Expected result:
   `HOME=$(mktemp -d) rocm uninstall --keep-binaries --dry-run`, then `ls -A`
   on that folder. It adds no line about how to remove anything (scenario
   `uninstall-09`).
+- With a `rocm remote` session record that is refused (see *Remote session
+  records* in section 4), the dry run warns that it `could not be used and may
+  still name models running on remote machines`, names the file, and says
+  `rocm remote stop` cannot reach it (scenario `uninstall-18`).
 - Passing `--force` to `rocm uninstall` is refused with a message that says it
   is not an option and points to `--yes`, and ends with a `Try:` line that is
   your command with `--yes` in place of `--force` (scenario `uninstall-17`); a near miss such as `--forc` is an
@@ -2560,3 +2697,99 @@ rocm mcp-call rocm_command --arguments-file args.json
 
 - The recipes listed match what `rocm model` printed in the terminal, narrowing
   and closing note included.
+
+## 21. Uninstall Safety
+
+Run these in a throwaway home on Linux or WSL, never against your real one, and
+only with `--dry-run` where the step says so. Each block starts a fresh sandbox:
+
+```bash
+export SANDBOX=$(mktemp -d)
+export HOME=$SANDBOX/users/home ROCM_CLI_CONFIG_DIR=$SANDBOX/users/home/.rocm/config \
+  ROCM_CLI_DATA_DIR=$SANDBOX/users/home/.rocm/data ROCM_CLI_CACHE_DIR=$SANDBOX/users/home/.rocm/cache
+mkdir -p "$HOME/Documents" "$ROCM_CLI_CONFIG_DIR"
+echo keep > "$HOME/Documents/keep.txt"
+```
+
+A protected data folder is refused (dry run only):
+
+```bash
+ROCM_CLI_DATA_DIR=/ rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the review lists `data: / is the top of the filesystem (set
+by ROCM_CLI_DATA_DIR)` under "Refused", never under the items to remove, ends
+with `This uninstall would be refused. Point ROCM_CLI_DATA_DIR at a folder of
+ROCm CLI's own, or re-run with --keep-data ...`, and the command exits
+non-zero.
+
+The home folder as the data folder is refused for real, and the advised flag
+works:
+
+```bash
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries --keep-data
+```
+
+Expected result: the first command exits non-zero with `uninstall refused,
+nothing was removed: the data folder <home> is your home folder (set by
+ROCM_CLI_DATA_DIR) ...`, and `$HOME/Documents/keep.txt` and the config folder
+are both still there. The second exits 0, removes the config folder, and leaves
+`keep.txt` alone.
+
+The same holds when the setting does not spell out the home folder:
+
+```bash
+(cd "$HOME" && ROCM_CLI_DATA_DIR=. rocm uninstall --yes --keep-binaries)
+```
+
+Expected result: exit non-zero with `the data folder . is your home folder
+(set by ROCM_CLI_DATA_DIR; resolves to <home>)`, and `keep.txt` is still there.
+
+In the dashboard, `/uninstall --keep-data` previews and `/uninstall --apply
+--keep-data` runs the uninstall with the data folder left out; with
+`ROCM_CLI_DATA_DIR=$HOME` the preview no longer reports a refusal. With
+`setup.therock_venv` pointing at the home folder instead (and
+`ROCM_CLI_DATA_DIR` unset), the dashboard's refusal names
+`setup.therock_venv`, not `ROCM_CLI_DATA_DIR`, and leads with `--keep-data`.
+
+A folder outside the home folder needs ROCm CLI's marker:
+
+```bash
+mkdir -p "$SANDBOX/srv/rocm"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+touch "$SANDBOX/srv/rocm/.rocm-cli-root"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the first preview refuses the data folder as `outside your
+home folder and not marked as ROCm CLI's own` and names the
+`.rocm-cli-root` file to create; after creating it, the second lists the data
+folder for removal. A system folder such as `/usr/local`, or a shared one such
+as `/var/lib` or `/opt`, is refused in a dry run whatever is in it, and the
+refusal does not offer the marker.
+
+A shared cache inside the cache folder is named as deleted (dry run):
+
+```bash
+mkdir -p "$HOME/.cache/uv" "$HOME/.cache/huggingface/hub"
+ROCM_CLI_CACHE_DIR=$HOME/.cache rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: under "Please review", `the uv package cache WILL BE DELETED`
+and `downloaded model files WILL BE DELETED`, each naming the cache folder and
+`--keep-cache`. With the default cache folder the same two caches are reported
+as `not removed` instead.
+
+A symlinked cache folder written with a trailing slash is unlinked, not
+emptied:
+
+```bash
+mkdir -p "$SANDBOX/real-cache" && touch "$SANDBOX/real-cache/keep"
+ln -s "$SANDBOX/real-cache" "$SANDBOX/rocm-cache"
+ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
+  rocm uninstall --yes --keep-binaries --keep-config --keep-data
+```
+
+Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
+gone, and `real-cache/keep` is still there.

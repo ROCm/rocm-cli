@@ -729,6 +729,20 @@ async fn try_activate_second(world: &mut E2eWorld) {
     activate_second(world).await;
 }
 
+/// A runtime name that is not registered, with a window-title sequence and an
+/// erase-line sequence inside it. The report quotes it, so it is printed with
+/// the sequences removed: [`ESCAPED_RUNTIME_NAME_SHOWN`].
+const ESCAPED_RUNTIME_NAME: &str = "release-tarball\u{1b}]0;rocm\u{7}-gfx9\u{1b}[2K42-copy";
+/// [`ESCAPED_RUNTIME_NAME`] with its sequences, and only them, removed.
+const ESCAPED_RUNTIME_NAME_SHOWN: &str = "release-tarball-gfx942-copy";
+
+#[when("the user tries to activate a runtime whose name carries terminal escape sequences")]
+async fn activate_escaped_name(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "activate", ESCAPED_RUNTIME_NAME]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user tries to activate the first runtime restarting services without confirming")]
 async fn activate_restart_services_without_yes(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(
@@ -897,6 +911,37 @@ async fn import_replace(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the activation fails naming that runtime without its escape sequences")]
+async fn activation_fails_naming_escaped_runtime(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "activating an unknown runtime must fail:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "installed runtime not found: {ESCAPED_RUNTIME_NAME_SHOWN}"
+        )),
+        "the report must name the runtime, its sequences removed:\n{stderr:?}"
+    );
+}
+
+#[then("the error report carries no terminal control character")]
+async fn error_report_has_no_control(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    let controls = stderr
+        .chars()
+        .filter(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        .collect::<Vec<_>>();
+    assert!(
+        controls.is_empty(),
+        "control characters {controls:?} in:\n{stderr:?}"
+    );
+    // The title the sequence carried goes with it rather than being printed.
+    assert!(!stderr.contains("0;rocm"), "{stderr:?}");
+}
 
 #[then("that runtime becomes active having changed from nothing")]
 async fn active_changed_from_nothing(world: &mut E2eWorld) {

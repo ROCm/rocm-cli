@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! The one place every `rocm services <action> <id> --yes` hint is built.
+//! The one place every `rocm services <action> <id> --yes` hint is built, and
+//! the `rocm logs --service <id>` hints beside them.
 //!
 //! `main.rs`, `remote/mod.rs`, and `serve_summary.rs` each used to format this
 //! string by hand, and it drifted: `serve_summary.rs`'s stop row printed the
@@ -48,18 +49,24 @@ pub(crate) fn service_forced_remove_hint(service_id: &str) -> String {
     )
 }
 
+/// The directly-runnable `rocm logs --service <id>` hint, which prints a local
+/// managed service's own log, for a message that sends the user there to see
+/// why the server exited.
+pub(crate) fn service_logs_hint(service_id: &str) -> String {
+    format!("rocm logs --service {}", shell_quote(service_id))
+}
+
+/// The directly-runnable `rocm logs --service <id> --follow` hint, which keeps
+/// printing a local managed service's log as it grows.
+pub(crate) fn service_logs_follow_hint(service_id: &str) -> String {
+    // Spelled out rather than built on `service_logs_hint`, so the advised-command
+    // contract test reads `--follow` too.
+    format!("rocm logs --service {} --follow", shell_quote(service_id))
+}
+
 /// The directly-runnable `rocm services stop <id> --yes` hint.
 pub(crate) fn service_stop_hint(service_id: &str) -> String {
     service_action_hint("stop", service_id)
-}
-
-/// The directly-runnable `rocm logs --service <id>` hint.
-///
-/// `rocm logs --service` prints `services_text::render_service_logs_text` for
-/// that service. Shared so a startup failure and the deployment summary cannot
-/// name two different log commands.
-pub(crate) fn service_logs_hint(service_id: &str) -> String {
-    format!("rocm logs --service {}", shell_quote(service_id))
 }
 
 /// The directly-runnable `<remote_cli> services stop <id> --yes` hint for a
@@ -157,19 +164,28 @@ mod tests {
                     hint
                 );
             }
-            // Mutation: printing `service_id` bare in the logs hint fails this.
-            let logs = service_logs_hint(&service_id);
-            prop_assert_eq!(
-                shlex::split(&logs),
-                Some(vec![
+        }
+
+        // Mutation: printing `service_id` bare in either logs builder fails this
+        // for any id carrying whitespace or a quote.
+        #[test]
+        fn the_logs_hint_denotes_the_argv_it_names(service_id in hostile_arg()) {
+            let argv = |follow: bool| {
+                let mut argv = vec![
                     "rocm".to_owned(),
                     "logs".to_owned(),
                     "--service".to_owned(),
-                    service_id,
-                ]),
-                "{}",
-                logs
-            );
+                    service_id.clone(),
+                ];
+                if follow {
+                    argv.push("--follow".to_owned());
+                }
+                Some(argv)
+            };
+            let hint = service_logs_hint(&service_id);
+            prop_assert_eq!(shlex::split(&hint), argv(false), "{}", hint);
+            let hint = service_logs_follow_hint(&service_id);
+            prop_assert_eq!(shlex::split(&hint), argv(true), "{}", hint);
         }
     }
 }

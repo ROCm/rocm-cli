@@ -39,6 +39,21 @@ pub(crate) struct RemotePlatform {
 /// Where a provisioned CLI lands, matching the documented manual install path.
 pub(crate) const REMOTE_CLI_PATH: &str = "$HOME/.local/bin/rocm";
 
+/// The only two ways this tool ever invokes the CLI on a remote machine.
+///
+/// Defined once and read by [`probe`] below, so the set a recorded session is
+/// checked against (`RemoteSessionRecord::validate_remote_cli`) cannot drift
+/// from the set actually produced here.
+const REMOTE_CLI_CANDIDATES: [&str; 2] = ["rocm", REMOTE_CLI_PATH];
+
+/// Whether `value` is one of the invocations [`probe`] can return.
+///
+/// Used to vet a `remote_cli` read back off disk: that field goes into the
+/// remote command line unquoted, so it must be a value this code chose.
+pub(crate) fn is_known_remote_cli(value: &str) -> bool {
+    REMOTE_CLI_CANDIDATES.contains(&value)
+}
+
 /// Inspect the remote. Nothing here is an error: absence is a finding, and
 /// [`ensure_ready`] is where it becomes a refusal.
 pub(crate) fn probe(transport: &dyn Transport) -> Result<RemoteReadiness> {
@@ -47,7 +62,7 @@ pub(crate) fn probe(transport: &dyn Transport) -> Result<RemoteReadiness> {
     // and missing it would mean provisioning over a perfectly good install.
     let mut cli = None;
     let mut cli_version = None;
-    for candidate in ["rocm", REMOTE_CLI_PATH] {
+    for candidate in REMOTE_CLI_CANDIDATES {
         let outcome = transport.exec(&format!("{candidate} --version"))?;
         if outcome.success {
             cli = Some(candidate.to_owned());

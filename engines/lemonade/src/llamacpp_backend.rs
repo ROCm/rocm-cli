@@ -87,6 +87,14 @@ pub(crate) fn best_llamacpp_backend_for_host(
     result
 }
 
+/// The context [`install_llamacpp_backend_with_retry`] puts on the second
+/// failure: the recovery the user is pointed at.
+pub(crate) const BACKEND_INSTALL_RETRY_FAILED: &str = concat!(
+    "Lemonade backend installation failed again; run `",
+    reinstall_lemonade_command!(),
+    "` and then retry `rocm serve`"
+);
+
 /// Ask Lemonade which llama.cpp backends it supports on this GPU, choose the best
 /// one (`LLAMACPP_BACKEND_PRIORITY`), install it if necessary, and return its name.
 /// Retry the backend install itself once, rather than the whole Lemonade runtime
@@ -102,10 +110,7 @@ pub(crate) fn install_llamacpp_backend_with_retry(
         Ok(()) => Ok(()),
         Err(first_error) => {
             eprintln!("Lemonade backend installation failed; retrying once: {first_error:#}");
-            install().with_context(|| {
-                "Lemonade backend installation failed again; run `rocm engines install \
-                 lemonade --reinstall` and then retry `rocm serve`"
-            })
+            install().context(BACKEND_INSTALL_RETRY_FAILED)
         }
     }
 }
@@ -457,9 +462,16 @@ mod tests {
             !rendered.contains("first backend connection was interrupted"),
             "the terminal error must be the retry's failure: {rendered}"
         );
+        // Through the shared constants, so the test fails if the context stops
+        // naming the one command every Lemonade remediation message names.
         assert!(
-            rendered.contains("rocm engines install lemonade --reinstall"),
+            rendered.contains(BACKEND_INSTALL_RETRY_FAILED),
             "{rendered}"
+        );
+        assert!(
+            BACKEND_INSTALL_RETRY_FAILED
+                .contains(&format!("`{}`", crate::REINSTALL_LEMONADE_COMMAND)),
+            "{BACKEND_INSTALL_RETRY_FAILED}"
         );
         assert!(rendered.contains("retry `rocm serve`"), "{rendered}");
     }

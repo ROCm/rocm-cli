@@ -5,7 +5,10 @@
 //! Focused-host policy: what a dashboard launched with an explicit `Focus`
 //! (Setup, Serve or Examine) does differently from the full dashboard — skip
 //! the daemon client and chat backend, open its one overlay at startup, and
-//! swallow the console keys that would tear down a running job.
+//! swallow the console keys that would tear down a running job. The one
+//! exemption is the serve launch console, which advertises a confirmation and
+//! owns it: those keys reach it, and approving stops the launch on the way out
+//! (`ui::serve_wizard`'s `focused_host`).
 //!
 //! A leaf module, split out of `app/event_loop.rs`, whose `run` and event loop
 //! call these helpers.
@@ -37,6 +40,31 @@ pub(super) const fn should_skip_daemon(focus: Option<Focus>) -> bool {
 /// while the job is non-terminal we swallow those keys; the user stops a job
 /// explicitly with `Ctrl+C` (never blocked here), and once it is terminal `q` /
 /// `Esc` exit normally. Always `false` for the dashboard (`focus == None`).
+///
+/// Never blocked for a [`ui::job_console::ConsoleExit::Confirmed`] console (the
+/// serve wizard's still-running launch): its console footer advertises
+/// "Esc leave (asks first)", and `ui::serve_wizard::on_key` answers `q` / `Esc`
+/// with a confirmation modal rather than leaving, so the overlay is only nulled
+/// after the user approves. Swallowing the key there made the advertised Esc a
+/// silent no-op. That exemption is safe only because the wizard is built with
+/// [`crate::ui::serve_wizard::ServeWizardState::focused_host`] here: its modal
+/// says plainly that leaving STOPS the launch rather than backgrounding it, and
+/// approving routes the stop through the same teardown `Ctrl+C` uses
+/// ([`ui::job_console::cancel_job`]) instead of letting the dropped runtime be
+/// the only thing that ends the child.
+///
+/// What that does and does not buy, since the distinction is easy to overstate:
+/// the job is marked `Cancelled` and its cancel flag is raised synchronously,
+/// before the loop breaks, so the model and any later reader agree the launch
+/// was stopped deliberately. The child itself still dies by `SIGKILL` either
+/// way — `tokio::process::Child::start_kill` sends the same signal
+/// `kill_on_drop` does, and this window tears its runtime down immediately
+/// after, well inside the job runtime's cancel poll. So this does NOT rescue a
+/// managed launch's registry record: `service_launch::spawn` publishes it
+/// `"running"` before the readiness wait and `record_wait_outcome` is what
+/// would flip it, so a record caught mid-wait stays `"running"` whichever path
+/// kills the child. Unfreezing that is `apps/rocm`'s to fix, not this crate's;
+/// the modal is honest about it instead of implying otherwise.
 pub(super) fn focused_close_key_blocked(
     state: &AppState,
     focus: Option<Focus>,
@@ -51,6 +79,7 @@ pub(super) fn focused_close_key_blocked(
     // Folded like the console's own `q` (`ui::job_console::on_console_key`):
     // a Caps Lock `Q` that got past this gate would close the console there.
     running
+        && state.console_exit() == ui::job_console::ConsoleExit::Immediate
         && matches!(
             ui::widgets::shortcut_key(code),
             KeyCode::Char('q') | KeyCode::Esc
@@ -73,7 +102,7 @@ pub(super) fn open_overlay_for_focus(
             Vec::new()
         }
         Focus::Serve => {
-            state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
+            state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::focused_host());
             Vec::new()
         }
         Focus::Examine => {
@@ -147,6 +176,11 @@ mod tests {
         let mut s = st();
         assert!(open_overlay_for_focus(&mut s, Focus::Serve).is_empty());
         assert!(s.serve_wizard.is_some());
+        assert!(
+            s.serve_wizard.as_ref().unwrap().focused_host,
+            "the serve wizard must know it has no background here: its leave \
+             confirmation wording and its leave teardown both depend on it"
+        );
         assert!(s.onboarding.is_none() && s.examine_manager.is_none());
 
         let mut s = st();
@@ -303,6 +337,71 @@ mod tests {
         assert!(
             !focused_close_key_blocked(&s, Some(Focus::Examine), KeyCode::Char('q')),
             "a terminal job no longer blocks exit (the child already exited)"
+        );
+    }
+
+    #[test]
+    fn focused_serve_running_console_esc_reaches_the_confirmation() {
+        // The serve console advertises "Esc leave (asks first)". In a focused
+        // host Esc/q must therefore reach `serve_wizard::on_key` (which raises
+        // the confirmation) instead of being swallowed as a silent no-op.
+        let recipes: Vec<crate::ui::model_picker::ModelRecipeSummary> = Vec::new();
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Serve);
+        {
+            let w = s.serve_wizard.as_mut().unwrap();
+            w.model = "org/model".to_string();
+            w.field = crate::ui::serve_wizard::FIELDS.len() - 1; // Launch
+        }
+        for code in [KeyCode::Enter, KeyCode::Char('y')] {
+            let _ = crate::ui::serve_wizard::on_key(
+                &mut s.serve_wizard,
+                &mut s.jobs,
+                &recipes,
+                press(code),
+            );
+        }
+        assert!(s.has_active_console(), "launch console is showing");
+        assert_eq!(s.console_exit(), ui::job_console::ConsoleExit::Confirmed);
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(
+                !focused_close_key_blocked(&s, Some(Focus::Serve), code),
+                "{code:?} must reach the serve wizard's confirmation"
+            );
+        }
+
+        // Routed to the wizard, Esc raises the confirmation; the overlay stays
+        // open (gate shut) until the user approves.
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Esc),
+        );
+        assert!(s.serve_wizard.as_ref().unwrap().detach_confirm.is_some());
+        assert!(!s.focused_should_exit(Some(Focus::Serve)));
+        let job_id = s
+            .serve_wizard
+            .as_ref()
+            .unwrap()
+            .active_job
+            .clone()
+            .expect("the launch job is live");
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut s.serve_wizard,
+            &mut s.jobs,
+            &recipes,
+            press(KeyCode::Char('y')),
+        );
+        assert!(s.focused_should_exit(Some(Focus::Serve)));
+        // Approving ejects the focused host, which drops the window's runtime
+        // and would kill the child by `kill_on_drop`. The leave must therefore
+        // stop the job explicitly on the way out, through the same teardown
+        // Ctrl+C uses — not leave it to the drop.
+        assert_eq!(
+            s.jobs.job(&job_id).map(|j| &j.status),
+            Some(&rocm_dash_core::state::JobStatus::Cancelled),
+            "leaving a focused host must stop its launch job"
         );
     }
 

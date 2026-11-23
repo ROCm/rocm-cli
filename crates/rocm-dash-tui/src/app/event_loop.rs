@@ -503,7 +503,9 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // swallow the console close keys (`q`, running-`Esc`) so the
                     // overlay is never nulled mid-job — which would trip the
                     // focused exit gate and tear the runtime down, killing the
-                    // child via kill_on_drop. `Ctrl+C` (cancel) and the scroll
+                    // child via kill_on_drop (except the serve launch console,
+                    // whose own confirmation modal gates leaving; see
+                    // `focused_close_key_blocked`). `Ctrl+C` (cancel) and the scroll
                     // keys above still flow, so the user can always stop a job;
                     // once it is terminal, `q`/`Esc` exit normally. Routed BEFORE
                     // the per-manager arms so the manager can't close first.

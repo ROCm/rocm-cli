@@ -107,13 +107,33 @@ mod tests {
     /// an offense. Both directions have fixtures.
     /// `RestoredEnvVar::set(` is here because the guard matches TEXT, and a
     /// mutation spelled as a method on a restoring wrapper contains neither
-    /// direct call. The two tests that use it are the sanctioned exception this
-    /// change documents, and before this entry existed they sat outside the
-    /// guard entirely — deleting their lock acquisition left the scan green,
-    /// which is the opposite of what their comments told the next contributor.
+    /// direct call. The tests that use it are the sanctioned exception, and
+    /// before this entry existed they sat outside the guard entirely —
+    /// deleting their lock acquisition left the scan green, which is the
+    /// opposite of what their comments told the next contributor.
     /// Listing the helper keeps the escape hatch narrow: it is still the lock
     /// that is required, the wrapper just stops hiding the requirement.
-    const MUTATIONS: [&str; 3] = ["set_var(", "remove_var(", "RestoredEnvVar::set("];
+    ///
+    /// `UnsetKeyOnExit::arm(` (`crates/rocm-core/src/test_env.rs`) is here
+    /// for the same reason, from the other side: `UnsetKeyOnExit` is a guard
+    /// whose `Drop` removes a variable, so the mutation happens in an impl the
+    /// scan never enters. What the test body does contain is the call that
+    /// builds the guard, and that call is what is listed. A guard constructed
+    /// directly from its type, rather than through that call, would leave
+    /// nothing for this list's text to match; build such a guard only through
+    /// the listed call.
+    ///
+    /// `EnvVarGuard::set(` (`crates/rocm-core/src/examine/framework.rs`) is the
+    /// same shape: its constructor sets the variable and its `Drop` restores
+    /// it, both in impls the scan never enters, so the test that builds one
+    /// shows neither call.
+    const MUTATIONS: [&str; 5] = [
+        "set_var(",
+        "remove_var(",
+        "RestoredEnvVar::set(",
+        "UnsetKeyOnExit::arm(",
+        "EnvVarGuard::set(",
+    ];
 
     /// Named helpers that serialize env mutation for their whole scope.
     ///
@@ -489,6 +509,41 @@ mod tests {
         );
     }
 
+    /// Every entry in [`MUTATIONS`] still names a call made somewhere in the
+    /// tree.
+    ///
+    /// The entries are text, so renaming a wrapper or guard leaves its entry
+    /// matching nothing: the scan stays green while the renamed call is
+    /// outside it, which is the silent failure this module is written
+    /// against. Matched on code with literals and comments stripped, so a
+    /// mention in a doc comment or a string does not keep a dead entry alive.
+    /// That stripping is also what lets this file be scanned with the rest:
+    /// `MUTATIONS` and the fixtures below spell the calls only inside string
+    /// literals, so nothing here can keep an entry alive either.
+    #[test]
+    fn every_listed_mutation_is_still_called_in_the_tree() {
+        let code: Vec<String> = workspace_rust_sources()
+            .iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+                strip_literals_and_comments(&text)
+            })
+            .collect();
+
+        let stale: Vec<&str> = MUTATIONS
+            .iter()
+            .copied()
+            .filter(|call| !code.iter().any(|text| text.contains(call)))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "MUTATIONS lists calls nothing in the tree makes any more, so the \
+             scan no longer covers whatever replaced them -- rename the entry \
+             with the symbol, or drop it: {stale:?}"
+        );
+    }
+
     /// A mutating call, assembled at runtime.
     ///
     /// Spelling `env::set_var` literally in a fixture would make this file's own
@@ -516,6 +571,15 @@ mod tests {
     /// file match its own scan.
     fn delegated_mutation_call(path: &str) -> String {
         format!("let _restore = crate::test_env::{path}(\"KEY\", &value);")
+    }
+
+    /// A guard whose `Drop` mutates, armed by a test that never calls a
+    /// mutation itself.
+    ///
+    /// Assembled rather than written out for the same reason as
+    /// [`mutation_call`].
+    fn held_mutating_guard(constructor: &str) -> String {
+        format!("let _held = {constructor}(&lock);")
     }
 
     fn unguarded_test(body: &str) -> String {
@@ -546,14 +610,15 @@ mod tests {
     /// `remove_var` inside a `#[test]` was flagged at all.
     ///
     /// The length assertion is what stops the next entry arriving untested: a
-    /// third call added to the const fails here until it gains a case.
+    /// new call added to the const fails here until it gains a case.
     #[test]
     fn every_mutating_call_is_flagged_inside_an_unguarded_test() {
         let kinds = ["set_var", "remove_var"];
         let delegated = ["RestoredEnvVar::set"];
+        let held = ["UnsetKeyOnExit::arm", "EnvVarGuard::set"];
         assert_eq!(
             MUTATIONS.len(),
-            kinds.len() + delegated.len(),
+            kinds.len() + delegated.len() + held.len(),
             "a call was added to MUTATIONS without a case here"
         );
         for kind in kinds {
@@ -570,6 +635,14 @@ mod tests {
                 env_mutations_in_unserialized_tests(&source).len(),
                 1,
                 "an unguarded {path} inside a #[test] must be flagged"
+            );
+        }
+        for name in held {
+            let source = unguarded_test(&held_mutating_guard(name));
+            assert_eq!(
+                env_mutations_in_unserialized_tests(&source).len(),
+                1,
+                "a test holding an unguarded {name} must be flagged"
             );
         }
     }
@@ -594,6 +667,33 @@ mod tests {
 
         let guarded = unguarded_test(&format!(
             "let _guard = SOME_TEST_LOCK.lock().unwrap();\n        {call}"
+        ));
+        assert!(
+            env_mutations_in_unserialized_tests(&guarded).is_empty(),
+            "the lock above is what makes this shape acceptable"
+        );
+    }
+
+    /// A guard whose `Drop` mutates does not exempt the test that holds it.
+    ///
+    /// The mirror of
+    /// [`a_mutation_delegated_to_a_restoring_wrapper_still_needs_the_lock`]
+    /// for a guard: the test body only calls the guard's constructor, so the
+    /// scan enforces the lock only while that call is in [`MUTATIONS`].
+    /// Unguarded is an offense, guarded is not.
+    #[test]
+    fn holding_a_mutating_guard_still_needs_the_lock() {
+        let held = held_mutating_guard("UnsetKeyOnExit::arm");
+
+        let hits = env_mutations_in_unserialized_tests(&unguarded_test(&held));
+        assert_eq!(hits.len(), 1, "holding the guard mutates on drop: {hits:?}");
+        assert_eq!(
+            hits[0].call, "UnsetKeyOnExit::arm",
+            "the offender is named by the constructor call"
+        );
+
+        let guarded = unguarded_test(&format!(
+            "let lock = SOME_TEST_LOCK.lock().unwrap();\n        {held}"
         ));
         assert!(
             env_mutations_in_unserialized_tests(&guarded).is_empty(),

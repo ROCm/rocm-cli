@@ -25,7 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, runtime_install_root_is_protected};
+use rocm_core::{AppPaths, RocmCliConfig};
 use rocm_engine_lemonade::RecordCleanup;
 
 use crate::cli_report;
@@ -469,6 +469,17 @@ fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) 
 }
 
 fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
+    ensure_runtime_install_root_is_safe_to_remove_for_home(
+        path,
+        rocm_core::runtime_home_dir().as_deref(),
+    )
+}
+
+/// [`ensure_runtime_install_root_is_safe_to_remove`] judged against `home`.
+fn ensure_runtime_install_root_is_safe_to_remove_for_home(
+    path: &Path,
+    home: Option<&Path>,
+) -> Result<()> {
     if path.as_os_str().is_empty() || path.parent().is_none() || path.file_name().is_none() {
         bail!(
             "refusing to remove unsafe runtime folder {}",
@@ -480,12 +491,13 @@ fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
     // matching in-tree `.rocm-cli-runtime.json`, slipping past
     // `local_runtime_manifest_matches`. `prune` already refuses these before
     // ever calling this function (see storage.rs); check it here too so the
-    // single source of truth for "may ROCm CLI delete this folder?" refuses
+    // runtime-folder rule (`rocm uninstall`'s own roots have their own) refuses
     // it for every caller, including a direct `runtimes uninstall <key>`.
-    if runtime_install_root_is_protected(path) {
+    if let Some(why) = rocm_core::runtime_protected_location_for_home(path, home) {
         bail!(
-            "refusing to remove runtime folder {} in a protected system location",
-            path.display()
+            "refusing to remove runtime folder {} because it is {}",
+            path.display(),
+            why.describe()
         );
     }
     Ok(())
@@ -924,7 +936,7 @@ mod tests {
         // registry entry could point a direct `runtimes uninstall <key>`
         // manifest's `install_root` at the same kind of path while still
         // carrying a matching in-tree `.rocm-cli-runtime.json`, slipping past
-        // `local_runtime_manifest_matches`. The single source of truth for
+        // `local_runtime_manifest_matches`. The runtime-folder rule for
         // "may ROCm CLI delete this folder?" must refuse it too, regardless
         // of caller.
         let protected = if cfg!(windows) {
@@ -936,6 +948,77 @@ mod tests {
         let err = ensure_runtime_install_root_is_safe_to_remove(&protected)
             .expect_err("protected system path must be refused");
         assert!(err.to_string().contains("protected system location"));
+    }
+
+    /// `rocm runtimes uninstall` and `rocm storage remove-old-installs` judge a
+    /// runtime folder by the runtime-folder rule (`runtime_protected_location`),
+    /// which refuses the home folder as `rocm uninstall`'s own rule does, so a
+    /// runtime whose `install_root` is the home folder itself (`--prefix ~`) is
+    /// refused — and the refusal says it is the home folder, not a system
+    /// location.
+    #[test]
+    fn ensure_runtime_install_root_refuses_the_home_folder_by_name() {
+        // A fixed home, so the check cannot fall back to some other refusal
+        // on a host whose home is `/`.
+        let home = Path::new("/home/alice");
+        let err = ensure_runtime_install_root_is_safe_to_remove_for_home(home, Some(home))
+            .expect_err("the home folder must be refused");
+        assert_eq!(
+            err.to_string(),
+            "refusing to remove runtime folder /home/alice because it is your home folder"
+        );
+        // The real gate consults the real home.
+        let real_home = rocm_core::runtime_home_dir().expect("a home directory");
+        if real_home.parent().is_some() {
+            let err = ensure_runtime_install_root_is_safe_to_remove(&real_home)
+                .expect_err("the real home folder must be refused");
+            assert!(err.to_string().ends_with("is your home folder"), "{err}");
+        }
+    }
+
+    /// The refusal above stops a real `rocm runtimes uninstall` before it
+    /// touches anything: a runtime whose matching in-tree manifest says its
+    /// folder is the home folder is refused, and the folder, its files and its
+    /// registry entry are all still there afterwards. Home is pointed at the
+    /// runtime's own sandbox folder, under the process-wide env locks.
+    #[test]
+    fn runtime_uninstall_of_a_runtime_in_the_home_folder_is_refused_and_removes_nothing()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-home-folder");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let home = manifest.install_root.clone();
+        let registry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let mut config = RocmCliConfig::default();
+        let result = {
+            let _process_env = crate::test_support::PROCESS_ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut env = crate::tests::ScopedTestEnv::new();
+            env.set("HOME", &home.display().to_string());
+            env.set("USERPROFILE", &home.display().to_string());
+            uninstall_runtime(&paths, &mut config, &manifest.runtime_key)
+        };
+        let folder_kept = home.join(".rocm-cli-runtime.json").is_file()
+            && manifest
+                .python_executable
+                .as_deref()
+                .is_some_and(|python| Path::new(python).is_file());
+        let registry_kept = registry.is_file();
+        let _ = fs::remove_dir_all(&root);
+        let err = result.expect_err("a runtime in the home folder must be refused");
+        assert!(
+            err.to_string().ends_with("because it is your home folder"),
+            "{err}"
+        );
+        assert!(folder_kept, "the home folder's contents were removed");
+        assert!(registry_kept, "the registry entry was removed");
+        Ok(())
     }
 
     /// The gate above is the last thing between a registry entry and
