@@ -43,11 +43,15 @@ The tables in this section use these statuses:
 
 ### Engines by platform
 
+```{table}
+:widths: 16 28 28 28
+
 | Engine | Linux | Windows | WSL2 |
 |---|---|---|---|
 | Lemonade | Supported | Supported | Not verified |
 | vLLM | Supported | Not supported | Partial |
 | AIM | Supported (needs Docker) | Not supported | Not verified |
+```
 
 - **Lemonade on WSL2**: ROCm CLI installs Lemonade on WSL2, but GPU serving
   there hasn't been confirmed on GPU hardware.
