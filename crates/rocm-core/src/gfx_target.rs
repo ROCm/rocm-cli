@@ -566,48 +566,216 @@ pub(crate) fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) 
 pub enum GpuSupportLevel {
     /// A TheRock package family covers this GPU: full ROCm/HIP support.
     RocmHip,
-    /// Recognized, confirmed to have no ROCm/HIP build, but Vulkan-based
-    /// engines (the default Lemonade backend) still work on it.
+    /// Recognized, confirmed to have no ROCm/HIP build, and a Vulkan GPU driver
+    /// was **found on this host**, so Vulkan-based engines (the default Lemonade
+    /// backend) run on it.
+    ///
+    /// One exception, and it is deliberate: [`VulkanStatus::Unknown`] — a
+    /// platform the probe cannot read at all, or a summary from before the probe
+    /// existed — also lands here, keeping the benefit of the doubt it had before
+    /// any probe existed rather than withholding the only path such a host has.
+    /// So this level means "a driver was found, **or** nobody could look"; it is
+    /// `render.rs` that tells the two apart in what the user reads, and it only
+    /// names a driver when one was actually found.
+    ///
+    /// The second half of that sentence must be evidence, never inference.
+    /// Deriving it from the gfx table alone — reading "no ROCm build" as
+    /// "Vulkan then", on a machine nobody has looked at — sends a host with no
+    /// Vulkan driver, or with only a software rasteriser, to a backend that
+    /// cannot start: every surface that renders this level tells the user to go
+    /// and serve a model on it.
     VulkanOnly,
+    /// Recognized, confirmed to have no ROCm/HIP build, and the Vulkan probe
+    /// could not reach an answer — nothing was found, and at least one of its
+    /// two sources never answered. Either one can be the source that went
+    /// unread: `vulkaninfo` missing or failing, or (on Windows, where the
+    /// registry read is its own PowerShell call) the driver listing.
+    ///
+    /// Deliberately NOT folded into [`Self::NoGpuBackend`]. That level renders
+    /// as a confirmed fact and is serialized for JSON consumers, and this state
+    /// has not earned it: on Windows the Khronos `Drivers` key is legacy and
+    /// `vulkaninfo` is rarely on PATH, so a working Adrenalin laptop — the
+    /// machine shape ROCMAI-550 was reported from — lands here routinely.
+    /// Telling it there is no GPU backend is a worse answer than the
+    /// unconditional Vulkan claim this level exists to replace.
+    ///
+    /// Nor is it [`Self::VulkanOnly`], which promises a backend that may not be
+    /// there. It is its own answer: say what was looked for, that nothing was
+    /// found, and how to settle it.
+    VulkanUnconfirmed,
+    /// Recognized, confirmed to have no ROCm/HIP build, **and** no Vulkan GPU
+    /// driver was found: this host has no GPU path at all.
+    ///
+    /// Deliberately not folded into [`Self::Unknown`]. Both halves here are
+    /// confirmed — the catalog establishes the missing ROCm build, and the
+    /// Vulkan probe looked and found nothing — whereas `Unknown` means the CLI
+    /// could not establish either. Collapsing them would commit, in the other
+    /// direction, the exact conflation this enum's `Unknown` exists to prevent:
+    /// a fact about the machine would be reported as a gap in what this build
+    /// knows, and the user would be sent to probe a question already answered.
+    NoGpuBackend,
     /// No GPU detected yet, or a gfx target this catalog doesn't recognize.
     Unknown,
 }
 
-/// The one claim every [`GpuSupportLevel::VulkanOnly`] surface makes, written
-/// once.
+/// The claim every *unprobed* [`GpuSupportLevel::VulkanOnly`] surface makes,
+/// written once.
 ///
-/// `rocm examine`'s `rocm_support` line and `rocm install sdk`'s two refusals
-/// (`unsupported_host_gpu_message` / `unsupported_requested_target_message` in
-/// `apps/rocm/src/therock/family.rs`) all tell the user the same two things
-/// about a Vulkan-only GPU: ROCm will not run on it, and Vulkan will. They are
-/// three different sentences around it — each adds its own subject and its own
-/// next step, because what they may promise differs — but the claim itself is
-/// shared, so it lives here next to the classifier that decides when it is
-/// true rather than being retyped at each site.
+/// `rocm install sdk`'s two refusals (`unsupported_host_gpu_message` /
+/// `unsupported_requested_target_message` in `apps/rocm/src/therock/family.rs`)
+/// tell the user the same two things about a Vulkan-only GPU: ROCm will not run
+/// on it, and Vulkan will. They are two different sentences around it — each
+/// adds its own subject and its own next step, because what they may promise
+/// differs — but the claim itself is shared, so it lives here next to the
+/// classifier that decides when it is true rather than being retyped at each
+/// site.
+///
+/// **This constant is the claim, not the decision to make it.** Who may say it
+/// is settled by whether the speaker has a host to grade it against, and the
+/// three surfaces differ:
+///
+/// - `unsupported_requested_target_message` says it unconditionally, and that
+///   is correct: it is about a target the *user named*, which may not be the
+///   GPU in this machine, so no probe of this host bears on it. It classifies
+///   with [`VulkanStatus::Unknown`] for the same reason.
+/// - `unsupported_host_gpu_message` is about the GPU that was *detected here*,
+///   so it classifies with this host's real [`VulkanStatus`] and interpolates
+///   this constant only at [`GpuSupportLevel::VulkanOnly`]. At
+///   `VulkanUnconfirmed` it says [`VULKAN_UNCONFIRMED_CLAIM`] instead, and at
+///   `NoGpuBackend` it says neither. Saying it unconditionally there put `rocm
+///   install sdk` and `rocm examine` in flat contradiction about the same
+///   machine in the same session.
+/// - `rocm examine`'s `rocm_support` line does not interpolate it at all. It
+///   grades the second half of the claim finer than three tiers — an
+///   enumerated device is *named*, so the reader can check it rather than take
+///   it — and the unconditional "can still be used" is exactly the promise this
+///   work exists to stop making. See `rocm_support_line` in
+///   `host_gpu/render.rs`.
 ///
 /// Deliberately just the claim, with no leading subject and no trailing
-/// punctuation: a caller supplies both. Changing the wording here changes all
-/// three surfaces together, which is the point.
+/// punctuation: a caller supplies both. Changing the wording here changes every
+/// site that makes it, which is the point.
 pub const VULKAN_ONLY_SUPPORT_CLAIM: &str =
     "not supported by ROCm; the Vulkan backend can still be used";
 
-/// Classify the host's GPU support level from the same two facts
-/// `ExamineSummary` and `resolve_family` already compute: the detected gfx
-/// target and whichever TheRock family (if any) covers it.
+/// What every [`GpuSupportLevel::VulkanUnconfirmed`] surface says about the
+/// host, written once.
+///
+/// Two surfaces render this level — `rocm examine`'s `rocm_support` line
+/// (`rocm_support_line` in `host_gpu/render.rs`) and the lemonade engine note
+/// (`lemonade_engine_note` in `apps/rocm/src/examine_report_text.rs`) — and
+/// they appear in the *same* `rocm examine` report, a few lines apart. Sharing the claim is what
+/// stops one of them denying a driver while the other says the question is
+/// open.
+///
+/// It states a gap in the probe, never a fact about the machine. On Windows the
+/// ICD lookup reads only the legacy Khronos `Drivers` key and `vulkaninfo` is
+/// rarely on PATH, so a working Adrenalin laptop lands in this level routinely;
+/// anything stronger than "could not be determined" is false on that host.
+pub const VULKAN_UNCONFIRMED_CLAIM: &str =
+    "whether a Vulkan driver is present could not be determined here";
+
+/// The next step for a host at [`GpuSupportLevel::VulkanUnconfirmed`] when
+/// nothing is known about its display driver.
+///
+/// `vulkaninfo` comes first and the install is conditional on what it reports,
+/// because this level means the probe did not settle the question — not that a
+/// driver is missing. `vulkan_unconfirmed_next_step` in `host_gpu/render.rs`
+/// routes the hosts whose driver *was* found to
+/// [`VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER`], so what reaches this
+/// constant is the unsettled remainder, where a driver may or may not be
+/// installed. Leading with an unconditional "install a Vulkan driver" would
+/// assert an absence nothing established. AGENTS.md §3 asks that a named
+/// command be able to clear the condition it is printed for, and `vulkaninfo`
+/// can — it is what turns an unconfirmed host into a known one, whichever way
+/// the answer falls.
+///
+/// Deliberately not "install `vulkaninfo`": on a driverless Linux host the tool
+/// is typically already installed, prints "Found no drivers!" and exits 1,
+/// which is one of the shapes that lands in this level.
+pub const VULKAN_UNCONFIRMED_NEXT_STEP: &str = "run `vulkaninfo` yourself to see what it reports, and install a Vulkan driver (Mesa RADV on \
+     Linux, the AMD display driver on Windows) if it finds none";
+
+/// The next step for a Windows host at [`GpuSupportLevel::VulkanUnconfirmed`]
+/// whose AMD display driver the summary already found.
+///
+/// The Windows AMD display driver *is* the Vulkan driver on that platform —
+/// Adrenalin installs the ICD — so `driver_status: amd_display_driver_detected`
+/// contradicts the install advice in [`VULKAN_UNCONFIRMED_NEXT_STEP`]. Only
+/// `vulkaninfo` is left to settle whether that driver exposes a device here.
+///
+/// The cross-check is Windows-only on purpose. Linux's `driver_status` reports
+/// the `amdgpu` kernel module, which says nothing about whether a userspace
+/// Vulkan ICD such as Mesa RADV is installed, so suppressing the install advice
+/// there would withhold the one step that can help.
+pub const VULKAN_UNCONFIRMED_NEXT_STEP_WITH_DISPLAY_DRIVER: &str = "the AMD display driver is installed (see `driver_status`), so there is nothing to install \
+     here - run `vulkaninfo` yourself to see whether it reports a device";
+
+/// Classify a GPU target's support level.
+///
+/// Reads the two facts `ExamineSummary` and `resolve_family` already compute —
+/// the detected gfx target and whichever TheRock family (if any) covers it —
+/// plus what the Vulkan probe found.
 ///
 /// Not only for a *host*: `resolve_family` also asks this of a target the user
 /// named with `--family` or `ROCM_CLI_THEROCK_FAMILY`, to decide whether to
-/// refuse it. The two arguments are facts about a GPU target, not about this
-/// machine, so that is the same question. What differs is what the caller may
-/// then say — a requested target establishes nothing about the hardware here,
-/// which is why the two install refusals end differently.
+/// refuse it. The first two arguments are facts about a GPU target, not about
+/// this machine, so that is the same question. What differs is what the caller
+/// may then say — a requested target establishes nothing about the hardware
+/// here, which is why the two install refusals end differently, and why they
+/// pass [`VulkanStatus::Unknown`] rather than probing this host for a verdict
+/// about another one.
+///
+/// `vulkan` only ever decides between [`GpuSupportLevel::VulkanOnly`],
+/// [`GpuSupportLevel::VulkanUnconfirmed`] and [`GpuSupportLevel::NoGpuBackend`],
+/// and is consulted only once the catalog has
+/// confirmed there is no ROCm build. A host with a covering family is `RocmHip`
+/// whatever Vulkan reports, and an unrecognized target stays `Unknown`: finding
+/// a Vulkan driver says nothing about whether ROCm would also work there, so it
+/// must not be allowed to turn a detection gap into a support claim.
+///
+/// [`VulkanStatus::Unknown`] — the platform could not be probed at all — keeps
+/// `VulkanOnly`: withholding the one path such a host has, on the strength of a
+/// probe that never ran, is a worse answer than the unconditional assumption it
+/// replaces.
 pub fn gpu_support_level(
     detected_gfx_target: Option<&str>,
     compatible_therock_family: Option<&str>,
+    vulkan: crate::host_gpu::VulkanStatus,
 ) -> GpuSupportLevel {
     match (detected_gfx_target, compatible_therock_family) {
         (_, Some(_)) => GpuSupportLevel::RocmHip,
-        (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => GpuSupportLevel::VulkanOnly,
+        (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => {
+            // `Unknown` only — a platform the probe cannot look at, which keeps
+            // the benefit of the doubt. `Inconclusive` is a host that WAS
+            // looked at and showed nothing, and must not be promised Vulkan: it
+            // is the common no-driver shape, since most such hosts have no
+            // `vulkaninfo` either. The wording it gets is hedged rather than a
+            // confirmed absence — see `render.rs`.
+            //
+            // Every variant is spelled out, with no `_` and no guard. A guard
+            // reads well but does not count toward exhaustiveness, so the arms
+            // would have to end in a wildcard — and a wildcard here silently
+            // routes any future `VulkanStatus` to `NoGpuBackend`, which renders
+            // as a confirmed fact. Listing every variant makes a new one a
+            // compile error instead, the same discipline `render.rs` uses.
+            match vulkan {
+                // A device answered, or a driver is installed and nothing
+                // contradicted it.
+                crate::host_gpu::VulkanStatus::Available
+                | crate::host_gpu::VulkanStatus::DriverPresentDevicesUnverified => {
+                    GpuSupportLevel::VulkanOnly
+                }
+                // A platform the probe cannot look at keeps the benefit of the
+                // doubt, as it did before any probe existed.
+                crate::host_gpu::VulkanStatus::Unknown => GpuSupportLevel::VulkanOnly,
+                // Looked at, and nothing either way. Not a confirmed absence —
+                // see `VulkanUnconfirmed`.
+                crate::host_gpu::VulkanStatus::Inconclusive => GpuSupportLevel::VulkanUnconfirmed,
+                // The only status that has earned a confirmed absence.
+                crate::host_gpu::VulkanStatus::Absent => GpuSupportLevel::NoGpuBackend,
+            }
+        }
         _ => GpuSupportLevel::Unknown,
     }
 }
@@ -619,11 +787,20 @@ pub fn gpu_support_level(
 /// site that transposed them would classify a Vulkan-only host as `RocmHip`
 /// and still compile. `rocm engines` and the codex-bridge `engines` tool both
 /// derive the level from this struct, so both go through this.
+///
+/// `vulkan` is passed in rather than probed here so this stays a pure function
+/// of what the caller already holds: the probe runs a subprocess and reads the
+/// filesystem, and burying that in a helper this cheap would make every caller
+/// pay for it without saying so.
 #[must_use]
-pub fn gpu_support_level_for_host_gpu(host_gpu: &HostGpuSummary) -> GpuSupportLevel {
+pub fn gpu_support_level_for_host_gpu(
+    host_gpu: &HostGpuSummary,
+    vulkan: crate::host_gpu::VulkanStatus,
+) -> GpuSupportLevel {
     gpu_support_level(
         host_gpu.gfx_target.as_deref(),
         host_gpu.therock_family.as_deref(),
+        vulkan,
     )
 }
 
@@ -644,12 +821,14 @@ pub fn gpu_support_level_for_examine(examine: &crate::host_gpu::ExamineSummary) 
     gpu_support_level(
         examine.detected_gfx_target.as_deref(),
         examine.compatible_therock_family.as_deref(),
+        examine.vulkan_status(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_gpu::VulkanStatus;
 
     #[test]
     fn normalize_therock_family_maps_gfx1101_to_gfx110x_all() {
@@ -725,14 +904,14 @@ mod tests {
         );
     }
 
-    /// The shared claim is user-visible text on three surfaces, so its wording
-    /// is pinned here rather than only asserted as "whatever the constant
-    /// says".
+    /// The shared claim is user-visible text on both `rocm install sdk`
+    /// refusals, so its wording is pinned here rather than only asserted as
+    /// "whatever the constant says".
     ///
-    /// `rocm examine`'s `rocm_support` line and both `rocm install sdk`
-    /// refusals now interpolate [`VULKAN_ONLY_SUPPORT_CLAIM`], which is what
-    /// stops them drifting — but it also means a careless edit to the constant
-    /// silently rewords all three at once, and their own tests would still
+    /// Both refusals interpolate [`VULKAN_ONLY_SUPPORT_CLAIM`] — one
+    /// unconditionally, one only at [`GpuSupportLevel::VulkanOnly`] — which is
+    /// what stops them drifting. But it also means a careless edit to the
+    /// constant silently rewords both at once, and their own tests would still
     /// pass because they assert containment of the same constant. This test is
     /// the one place that has to be changed deliberately.
     #[test]
@@ -1060,7 +1239,7 @@ mod tests {
             therock_family: Some("gfx94X-dcgpu".to_owned()),
         };
         assert_eq!(
-            gpu_support_level_for_host_gpu(&host_gpu),
+            gpu_support_level_for_host_gpu(&host_gpu, VulkanStatus::Available),
             GpuSupportLevel::RocmHip
         );
     }
@@ -1073,7 +1252,7 @@ mod tests {
             therock_family: None,
         };
         assert_eq!(
-            gpu_support_level_for_host_gpu(&host_gpu),
+            gpu_support_level_for_host_gpu(&host_gpu, VulkanStatus::Available),
             GpuSupportLevel::VulkanOnly
         );
     }
@@ -1081,7 +1260,7 @@ mod tests {
     #[test]
     fn gpu_support_level_for_host_gpu_reads_an_undetected_summary_as_unknown() {
         assert_eq!(
-            gpu_support_level_for_host_gpu(&HostGpuSummary::default()),
+            gpu_support_level_for_host_gpu(&HostGpuSummary::default(), VulkanStatus::Available),
             GpuSupportLevel::Unknown
         );
     }
@@ -1105,35 +1284,111 @@ mod tests {
     #[test]
     fn gpu_support_level_is_rocm_hip_when_a_family_covers_it() {
         assert_eq!(
-            gpu_support_level(Some("gfx90a"), Some("gfx90a")),
+            gpu_support_level(Some("gfx90a"), Some("gfx90a"), VulkanStatus::Available),
+            GpuSupportLevel::RocmHip
+        );
+        // A covering family wins outright: a host whose Vulkan probe found
+        // nothing still has ROCm, and must not be downgraded for it.
+        assert_eq!(
+            gpu_support_level(Some("gfx90a"), Some("gfx90a"), VulkanStatus::Absent),
             GpuSupportLevel::RocmHip
         );
         assert_eq!(
-            gpu_support_level(None, Some("gfx90a")),
+            gpu_support_level(None, Some("gfx90a"), VulkanStatus::Absent),
             GpuSupportLevel::RocmHip
         );
         // Even for a target this file's own table says has no ROCm build: the
         // family the caller resolved is a statement about ROCm support, and a
         // detected target cannot outvote it.
         assert_eq!(
-            gpu_support_level(Some("gfx90c"), Some("gfx90a")),
+            gpu_support_level(Some("gfx90c"), Some("gfx90a"), VulkanStatus::Absent),
             GpuSupportLevel::RocmHip
         );
     }
 
     #[test]
     fn gpu_support_level_is_unknown_without_detection_or_for_an_unrecognized_target() {
-        assert_eq!(gpu_support_level(None, None), GpuSupportLevel::Unknown);
         assert_eq!(
-            gpu_support_level(Some("gfx_totally_unrecognized"), None),
+            gpu_support_level(None, None, VulkanStatus::Available),
+            GpuSupportLevel::Unknown
+        );
+        // Finding a Vulkan driver says nothing about whether ROCm would work on
+        // an unrecognized target, so it must not promote a detection gap into a
+        // support claim.
+        assert_eq!(
+            gpu_support_level(
+                Some("gfx_totally_unrecognized"),
+                None,
+                VulkanStatus::Available
+            ),
             GpuSupportLevel::Unknown
         );
     }
 
     #[test]
-    fn gpu_support_level_is_vulkan_only_for_gfx90c() {
+    fn gpu_support_level_is_vulkan_only_for_gfx90c_with_a_vulkan_driver() {
         assert_eq!(
-            gpu_support_level(Some("gfx90c"), None),
+            gpu_support_level(Some("gfx90c"), None, VulkanStatus::Available),
+            GpuSupportLevel::VulkanOnly
+        );
+        // An installed driver that enumerated no device is still worth routing
+        // to; the level says "Vulkan", and `examine`'s own line carries how sure
+        // the probe was.
+        assert_eq!(
+            gpu_support_level(
+                Some("gfx90c"),
+                None,
+                VulkanStatus::DriverPresentDevicesUnverified
+            ),
+            GpuSupportLevel::VulkanOnly
+        );
+    }
+
+    /// The common no-driver host: no ICD, no device, and no `vulkaninfo` to
+    /// ask. It must not be promised a Vulkan path — that is the symptom this
+    /// change exists to remove, and it is the usual shape, since a host with no
+    /// driver generally has no `vulkaninfo` either.
+    ///
+    /// `Unknown` (a platform the probe cannot look at) keeps the benefit of the
+    /// doubt; `Inconclusive` has been looked at and showed nothing.
+    #[test]
+    fn a_probed_host_with_no_evidence_is_not_promised_vulkan() {
+        assert_eq!(
+            gpu_support_level(
+                Some("gfx90c"),
+                None,
+                crate::host_gpu::VulkanStatus::Inconclusive
+            ),
+            GpuSupportLevel::VulkanUnconfirmed,
+            "a host probed with no answer must be told neither that Vulkan runs nor \
+             that it is absent — a Windows box with a working Adrenalin driver lands \
+             here, since the legacy Khronos key and a missing `vulkaninfo` leave no \
+             evidence to find"
+        );
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None, crate::host_gpu::VulkanStatus::Unknown),
+            GpuSupportLevel::VulkanOnly,
+            "a platform that cannot be probed keeps the benefit of the doubt"
+        );
+    }
+
+    #[test]
+    fn gpu_support_level_reports_no_gpu_backend_when_the_vulkan_probe_found_none() {
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None, VulkanStatus::Absent),
+            GpuSupportLevel::NoGpuBackend,
+            "a confirmed-absent Vulkan driver must not read as a usable Vulkan path"
+        );
+    }
+
+    /// A platform the probe cannot read is not a platform without Vulkan.
+    /// Withholding the only path such a host has, on the strength of a probe
+    /// that never ran, would be a worse answer than the assumption this change
+    /// replaces.
+    #[test]
+    fn gpu_support_level_keeps_vulkan_when_the_probe_could_not_run() {
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None, VulkanStatus::Unknown),
             GpuSupportLevel::VulkanOnly
         );
     }
