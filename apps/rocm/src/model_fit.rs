@@ -34,8 +34,11 @@
 //! `ListingGpuMemory` from here as the renderers' host argument.
 //! `host_model_listing_facts` and its `ModelListingHostFacts` are reached from
 //! `main.rs` and `chat/mcp_bridge.rs`, so `rocm model` and the tool-use path
-//! measure one host the same way. Every other item has no caller outside this
-//! module and stays private.
+//! measure one host the same way; `assess_model_for_host` is reached from
+//! `diagnose_model.rs`. `ListingGpuMemory`'s `dedicated` and `shared_pool`
+//! constructors are `#[cfg(test)]`, so production reaches that type only
+//! through `from_accelerator` and cannot label a figure by hand. Every other
+//! item has no caller outside this module and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`.
 //! `engine_ruled_out_by_platform_gates_aim_on_docker_reachability` re-runs the
@@ -220,12 +223,20 @@ fn host_accelerator_memory(
 /// the same rule, including its "largest mask-visible card, never the sum"
 /// decision and its refusal to read an APU's carve-out as the pool.
 ///
-/// The *rule* is shared; the inputs are not identical. This passes `None` for
-/// `AppPaths` where `assess_model_with_host_paths` threads a discovered one
-/// through, which is inert only because `detect_host_gpu_summary` ignores that
-/// argument on every platform branch today. If a branch ever reads it, these
-/// two stop agreeing silently -- so the equivalence above is a property of the
-/// classifier, not of the two call sites.
+/// The *rule* is shared; the inputs are not identical, in two places. This
+/// passes `None` for `AppPaths` where `assess_model_with_host_paths` threads a
+/// discovered one through, which is inert only because `detect_host_gpu_summary`
+/// ignores that argument on every platform branch today. If a branch ever reads
+/// it, these two stop agreeing silently -- so the equivalence above is a
+/// property of the classifier, not of the two call sites.
+///
+/// The second is the evidence-of-a-GPU argument, below: this reads it off the
+/// two cheap probes rather than off an `Examination`. They agree on every host
+/// where VRAM telemetry exists, because the argument is then not consulted at
+/// all, and on every host where neither says there is a GPU. They can differ on
+/// one shape -- a part WSL's `rocm_sees_gpu` positively denies while a gfx
+/// target still names it -- where this would narrow and the diagnosis would not.
+/// No fixture plants that host, so it is argued rather than tested.
 ///
 /// An APU answers with its measured pool, flagged as shared. That pool is a
 /// ceiling the operating system draws on too, so the listing says as much rather

@@ -390,8 +390,10 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
                 .quantization
                 .clone()
                 .unwrap_or_else(|| model_recipe_memory_label(recipe));
-            let fit_label = aggregate_gpu_vram_gib
-                .and_then(|available| model_recipe_gpu_fit_label(recipe, available))
+            let fit_label = gpu_memory
+                .and_then(|gpu| {
+                    model_recipe_gpu_fit_label(recipe, gpu.total_gib, gpu.is_shared_pool)
+                })
                 .map_or_else(String::new, |label| format!("  {label}"));
             let _ = writeln!(
                 output,
@@ -469,16 +471,29 @@ fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
 /// `None` where the recipe declares no minimum: the comparison has no subject,
 /// and saying "fits" on the strength of a figure nobody wrote down is the same
 /// unknown-read-as-a-fact that [`recipe_fits_gpu`] exists to refuse.
+///
+/// On a shared pool both labels change, for the two different reasons the rest
+/// of this file already gives. "fits this GPU" would claim of an integrated part
+/// exactly what `assess_model_readiness` refuses to claim about it — clearing an
+/// aperture the operating system also draws on is `Degraded`, never `Ready` —
+/// and "needs a larger GPU" would tell its owner to fit a card the machine has
+/// no slot for. The closing note qualifies the list as a whole, but a row is
+/// read on its own, and the signed-index path prints rows with no closing note
+/// at all.
 fn model_recipe_gpu_fit_label(
     recipe: &ModelRecipeRecord,
     available_gib: f64,
+    is_shared_pool: bool,
 ) -> Option<&'static str> {
     let required = recipe.min_gpu_mem_gb?;
-    Some(if available_gib >= f64::from(required) {
-        "fits this GPU"
-    } else {
-        "needs a larger GPU"
-    })
+    Some(
+        match (available_gib >= f64::from(required), is_shared_pool) {
+            (true, false) => "fits this GPU",
+            (true, true) => "fits this shared pool",
+            (false, false) => "needs a larger GPU",
+            (false, true) => "larger than this shared pool",
+        },
+    )
 }
 
 pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
@@ -1495,6 +1510,45 @@ mod tests {
         );
     }
 
+    /// Each row says which kind of memory it was weighed against.
+    ///
+    /// The closing note qualifies the list as a whole, but a row is read on its
+    /// own — and the signed-index path prints rows with no closing note at all,
+    /// so on that path the label is the only thing that can carry it. Both
+    /// polarities move: "fits this GPU" would claim of an integrated part what
+    /// `assess_model_readiness` refuses to claim (clearing a shared aperture is
+    /// `Degraded`, never `Ready`), and "needs a larger GPU" would tell its owner
+    /// to fit a card the machine has no slot for.
+    #[test]
+    fn a_row_says_whether_it_was_weighed_against_a_card_or_a_shared_pool() {
+        let recipes = builtin_model_recipes();
+        let declared = recipes
+            .iter()
+            .find(|recipe| recipe.min_gpu_mem_gb.is_some())
+            .expect("the catalog ships recipes with declared GPU minimums");
+        let required = f64::from(declared.min_gpu_mem_gb.expect("a minimum"));
+
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required, false),
+            Some("fits this GPU")
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required, true),
+            Some("fits this shared pool"),
+            "a shared ceiling is not the card-of-its-own this phrasing implies"
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required / 2.0, false),
+            Some("needs a larger GPU")
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required / 2.0, true),
+            Some("larger than this shared pool"),
+            "there is no larger card to fit on a machine whose graphics have no memory of \
+             their own"
+        );
+    }
+
     /// `--verbose` names an integrated GPU's figure for what it is.
     ///
     /// Every per-recipe row weighs the same number, so before this the verdict
@@ -1634,9 +1688,14 @@ mod tests {
             .expect("the catalog ships recipes with no declared GPU minimum");
 
         assert_eq!(
-            model_recipe_gpu_fit_label(undeclared, 0.25),
+            model_recipe_gpu_fit_label(undeclared, 0.25, false),
             None,
             "a model with no declared minimum must not be labelled against a host's memory"
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(undeclared, 0.25, true),
+            None,
+            "nor against a shared pool, which is a figure in exactly the same way"
         );
     }
 

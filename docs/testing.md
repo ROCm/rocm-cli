@@ -6803,9 +6803,12 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   — `plant_single_gpu_with_memory`, with `GFX1151_TARGET_VERSION` and
   `CARVE_OUT_BYTES` widened to `pub(crate)` for them — because `rocm model` has
   to reach the same verdict about a machine that `rocm diagnose --model` does.
-  `-12` is the `diagnose-88` host, and its presence is what stops the listing's
-  evidence-of-a-GPU test drifting from the one the diagnosis uses: the two read
-  the same machine and must not disagree about whether its memory was readable.
+  `-12` plants the same host *shape* as `diagnose-88` — an APU with a readable
+  aperture and no VRAM counters at all — at this cluster's own pool size rather
+  than that scenario's. Its presence is what stops the listing's
+  evidence-of-a-GPU test drifting from the one the diagnosis uses: the two
+  commands read that shape of machine and must not disagree about whether its
+  memory was readable.
 
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes

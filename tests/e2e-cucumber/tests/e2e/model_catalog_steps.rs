@@ -397,6 +397,18 @@ async fn assert_verbose_names_the_shared_pool(world: &mut E2eWorld) {
         !output.contains("aggregate GPU VRAM"),
         "an integrated GPU has no VRAM, so no row may call its pool that:\n{output}"
     );
+    // The remedy offered alongside the verdict. A row that does not fit used to
+    // say "use a GPU with at least N", which this machine's owner cannot do --
+    // the pool is what the system allows the graphics, not a card with a slot.
+    assert!(
+        output.contains("not a card that can be changed"),
+        "a row that does not fit must offer a remedy this machine can act on:\n{output}"
+    );
+    assert!(
+        !output.contains("or use a GPU with at least"),
+        "there is no larger card to fit on a machine whose graphics have no memory of \
+         their own:\n{output}"
+    );
 }
 
 /// The same question through the assistant's tool, on the same machine.
@@ -470,12 +482,16 @@ async fn user_asks_for_recommendations(world: &mut E2eWorld) {
 #[then("every model offered is one this machine can run")]
 async fn assert_every_offer_fits(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
+    // Either label, because the row names the kind of memory it was weighed
+    // against: a discrete card's own VRAM, or an integrated part's shared pool.
+    // Accepting both is what lets this step describe the behaviour rather than
+    // the hardware, so the shared-pool scenarios reuse it as written.
     assert!(
-        output.contains("fits this GPU"),
+        output.contains("fits this GPU") || output.contains("fits this shared pool"),
         "a narrowed listing must offer something and say it fits:\n{output}"
     );
     assert!(
-        !output.contains("needs a larger GPU"),
+        !output.contains("needs a larger GPU") && !output.contains("larger than this shared pool"),
         "a model this machine cannot run must not be recommended to it:\n{output}"
     );
 }
