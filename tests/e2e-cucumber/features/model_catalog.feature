@@ -66,7 +66,7 @@ Feature: Model catalog listing
   # These run on the ungated lane: the host's GPU capacity is planted, so they
   # describe the same machine whatever the runner has -- which is also the only
   # way the narrowed listing is reachable at all, since the no-GPU lane measures
-  # no capacity and the GPU box measures none either.
+  # no capacity and a GPU lane cannot be made small.
   @id:model-catalog-recommends-only-what-this-machine-can-run @requires-os:linux
   Scenario: model-catalog-06 - A small machine is recommended models it can run
     Given a machine whose GPU has room for only the smaller models

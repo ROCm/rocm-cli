@@ -3910,6 +3910,11 @@ the endpoint key file, and that the standalone `rocmd` got an answer to its
 engine `Stop` request (it reaches the engine through the `rocm` beside it). Run it with
 `ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
 cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
+`model-catalog-06` to `-08` state the host's GPU memory through the `e2e-test-hooks`
+seam `ROCM_E2E_FORCE_GPU_TOTAL_GIB`: a whole number of GiB for a machine of that
+size, or `unreadable` for one whose memory could not be read, so the listing's
+selection does not depend on what the lane's GPU reports. A value it cannot parse is
+ignored and the host is measured as usual.
 `service-stop-03`, `-04` and `-05` (Linux, mock lane) cover `rocm services
 stop`'s unconfirmed half through the `e2e-test-hooks` seam
 `ROCM_E2E_STOP_OUTCOME` (`timed_out` or `unverified`), which makes the verified
