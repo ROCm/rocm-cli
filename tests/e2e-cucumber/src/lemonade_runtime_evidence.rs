@@ -29,8 +29,9 @@ use crate::serve_log::slugify;
 
 /// Most bytes of one file or one output stream kept in the evidence.
 const MAX_BYTES: u64 = 64 * 1024;
-/// Time allowed for the `lemonade backends` listing. It queries the local
-/// server's catalog and can reach for the network to check for updates.
+/// Time allowed for the `lemonade backends` listing. A bound so a hung listing
+/// cannot stall the failure report; whether the listing touches the network is
+/// not established here.
 const BACKENDS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Where the evidence is archived, under the suite's results directory.
 const ARCHIVE_SUBDIR: &str = "lemonade-runtime-evidence";

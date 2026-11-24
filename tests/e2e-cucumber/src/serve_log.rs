@@ -142,8 +142,10 @@ pub fn service_log_tail(serve_stdout: &str) -> String {
 }
 
 /// A filename-safe form of a scenario name: lowercase, non-alphanumerics folded
-/// to single dashes. Only ever used to LABEL a file whose uniqueness comes from
-/// the service id already in its name, so collisions here cost nothing.
+/// to single dashes. Different names can fold to the same slug. Where the
+/// filename also carries the service id (the serve archive) that id keeps the
+/// files apart; where the slug is the whole name (the Lemonade runtime
+/// evidence), a repeated or colliding scenario name overwrites the earlier file.
 pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     for ch in name.chars() {
