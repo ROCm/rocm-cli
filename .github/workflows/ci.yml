@@ -1433,9 +1433,14 @@ jobs:
           # against the image's glibc.
           key: ${{ runner.os }}-ubuntu-24.04-cargo-about-0.9.1
 
+      # `--force`: this step runs when the `Cache cargo-about` key misses, but
+      # the setup-rust-toolchain step's rust-cache (`cache-bin` defaults on) can
+      # leave a cargo-about in ~/.cargo/bin, and without `--force` the install
+      # can then fail with "binary `cargo-about` already exists in
+      # destination". `--force` makes the install idempotent.
       - name: Install cargo-about
         if: needs.changes.outputs.tpn == 'true' && steps.cache-cargo-about.outputs.cache-hit != 'true'
-        run: cargo install cargo-about@0.9.1 --locked --features cli
+        run: cargo install cargo-about@0.9.1 --locked --features cli --force
 
       - name: THIRD_PARTY_NOTICES.txt is current
         if: needs.changes.outputs.tpn == 'true'

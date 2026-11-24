@@ -11041,6 +11041,44 @@ fi
         }
     }
 
+    /// The CI installs of cargo-about (`ci.yml`'s `third-party-notices` job,
+    /// `dependabot-manifests.yml`'s `generate` job) run after a
+    /// setup-rust-toolchain step whose rust-cache restores `~/.cargo/bin`
+    /// (its `cache-bin` input defaults on), and are gated on a miss of their
+    /// own `Cache cargo-about` key. When that key misses but the rust-cache
+    /// restore (`cache-bin`) or an earlier step left a cargo-about in
+    /// `~/.cargo/bin`, a plain `cargo install` can fail the job with "binary
+    /// `cargo-about` already exists in destination", so each install line
+    /// carries `--force`. Every workflow and local action is read, so a new
+    /// install site is covered when it is spelled on one line as
+    /// `cargo install cargo-about@...`. Flags before the crate name, a command
+    /// wrapped over several lines, `cargo +toolchain install` and
+    /// `cargo binstall` are not seen. At least one install must be found, or
+    /// the check would pass with nothing left to check.
+    #[test]
+    fn every_ci_cargo_about_install_overwrites_a_restored_binary() {
+        let mut installs = 0;
+        for (path, text) in all_workflows_and_actions() {
+            for line in text.lines() {
+                let code = strip_comment(line);
+                if !code.contains("cargo install cargo-about@") {
+                    continue;
+                }
+                installs += 1;
+                assert!(
+                    code.split_whitespace().any(|word| word == "--force"),
+                    "{path} installs cargo-about without `--force`; a cargo-about that \
+                     rust-cache left in ~/.cargo/bin can fail the install:\n{line}"
+                );
+            }
+        }
+        assert!(
+            installs > 0,
+            "no workflow or local action runs `cargo install cargo-about@`; \
+             update this test if the install moved"
+        );
+    }
+
     /// Extract one prek hook's complete YAML block by its `- id:` value, up
     /// to the next line at or above this hook's own `- id:` indent — the
     /// same indent-based termination `job_block` and `nested_block` already
