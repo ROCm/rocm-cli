@@ -78,7 +78,7 @@ prek install -t pre-push    # pre-push
   that commit signing is enabled (`commit.gpgsign`, in any of git's truthy
   spellings) and `user.signingkey` is set, with remediation if not.
 - **pre-push**: `cargo xtask verify-commits` — verifies every outgoing commit
-  in `origin/main..HEAD` is signed (signature present and not bad) and
+  in `<base>..HEAD` is signed (signature present and not bad) and
   signed-off. The base is whichever of `origin/main` and
   `origin/release/*` is closest to `HEAD` (fewest commits ahead), so a branch cut
   from a release branch is not checked against that branch's own history. Keep

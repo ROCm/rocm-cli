@@ -323,7 +323,10 @@ pub fn run(base: Option<String>, require_verified: bool) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("verify-commits: {} check(s) failed:\n", failures.len());
+    eprintln!(
+        "verify-commits: {} check(s) failed in {base}..HEAD:\n",
+        failures.len()
+    );
     for failure in &failures {
         eprintln!(
             "  {} {}\n    -> {}",
