@@ -4320,29 +4320,34 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
     // engine's `state.rs` passes the literal `"rocm"`, correctly - neither has a
     // non-ROCm backend), so for those engines the allow-list above is satisfied
     // by any implementation, including a static one. What is NOT static is the
-    // ordinal and the GPU name: both are read out of the engine's own state by
-    // `first_gpu_index_from_state` / `gpu_name`. Asserting on them is what makes
-    // this step discriminate on the vLLM canary rather than only on Lemonade.
+    // GPU name: it comes from the engine's own recorded `gpu_name`, so a stub
+    // that reports nothing, or echoes the backend word back as the name, fails
+    // here. That is what lets this step discriminate on the vLLM canary at all,
+    // rather than only on Lemonade.
     //
-    // Deliberately conditional on the parts being present, and that is a
-    // limitation rather than an oversight: `Launched::gpu_indices` is an
-    // `Option` precisely so "could not tell" is distinct from "no GPU", so a
-    // correct engine may legitimately report a bare backend. Asserting their
-    // presence outright is the same false failure this function's note below
-    // records an earlier revision making. What is asserted is that when the
-    // engine does answer with them, the answer is real: a name is never the
-    // backend word echoed back, and an ordinal is one a host can actually have.
-    if let Some(ordinal) = ordinal {
-        assert!(
-            ordinal < 64,
-            "`device: {device}` reports GPU ordinal {ordinal}, which no lane has -              a plausible ordinal is what shows it came from the engine's recorded              `gpu_indices` rather than being synthesised:\n{block}"
-        );
-    }
+    // Conditional on the name being present, and that is a limitation rather
+    // than an oversight: `Launched::gpu_indices` is an `Option` precisely so
+    // "could not tell" is distinct from "no GPU", so a correct engine may
+    // legitimately report a bare backend. Asserting presence outright is the
+    // same false failure this function's note below records an earlier revision
+    // making.
+    //
+    // The ORDINAL is deliberately not asserted — a finding answered, not a gap
+    // overlooked. `parse_device_row` already rejects anything that is not a
+    // `u32`, and every current lane is single-GPU, so the only value a correct
+    // implementation can report is `0` — exactly what a stubbed or reverted one
+    // would report too. A bound like `ordinal < 64` reads as a check and
+    // discriminates nothing. Making it mean something needs a second source for
+    // the expected ordinal: a scenario that pins `--gpu`, or a multi-GPU lane.
+    // Neither exists today, so the honest thing is to not imply otherwise.
+    let _ = ordinal;
     if let Some((_, name)) = device.split_once(" (") {
         let name = name.trim_end_matches(')').trim();
         assert!(
             !name.is_empty() && !name.eq_ignore_ascii_case(backend),
-            "`device: {device}` carries a GPU name that is empty or just the              backend word echoed back, so it cannot be the adapter the engine              actually reported:\n{block}"
+            "`device: {device}` carries a GPU name that is empty or just the \
+             backend word echoed back, so it cannot be the adapter the engine \
+             actually reported:\n{block}"
         );
     }
 
