@@ -239,6 +239,9 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The eval replay of `rocm fix` that skill-08 holds the real command to, and
+    /// what the command printed. See `e2e::skill_steps`.
+    pub skill_apply: Option<e2e::skill_steps::ApplyReplay>,
     /// The `therock.version` Lemonade's `backend_versions.json` held after
     /// runtime-33's failed alignment had reverted it, so the install that follows
     /// can be held to leaving exactly that pin in place.
@@ -468,6 +471,7 @@ impl Default for E2eWorld {
             side_by_side: None,
             skill_reference: None,
             skill_symptom: None,
+            skill_apply: None,
             lemonade_pin_after_failed_alignment: None,
             lemonade_runtime_dir: None,
             symptom_paste: None,

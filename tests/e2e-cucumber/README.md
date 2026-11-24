@@ -333,24 +333,26 @@ that ships inside the binary — so what it does own is a **contract**: which
 fix-ids exist, which ones the CLI applies
 itself, which machines each is for, which fields a diagnosis carries, which
 confidence thresholds an agent reasons about, which verdicts `examine` can
-return, and where a report goes when nothing matched.
+return, where a report goes when nothing matched, and what `rocm fix` prints
+for the fix its evals replay an agent applying.
 
 `diagnose.feature` covers the same commands, so the division matters:
 
 |  | expected value lives in | catches |
 |---|---|---|
 | `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
-| `rocm_doctor_skill.feature` | [reference.md](../../skills/rocm-doctor/reference.md) (and, for `skill-07`, [SKILL.md](../../skills/rocm-doctor/SKILL.md)) | the **document** drifting |
+| `rocm_doctor_skill.feature` | [reference.md](../../skills/rocm-doctor/reference.md) (and, for `skill-07`, [SKILL.md](../../skills/rocm-doctor/SKILL.md); for `skill-08`, the skill's [eval replay](../../skills/rocm-doctor/evals/fixtures/rocm-apply-auto-fix-needs-consent/replies.json)) | the **document** drifting |
 
 Only the second can notice that a published document has gone stale, and that is
 the whole reason the feature exists. So anything already proven by
 `diagnose.feature` — that a fix for another OS is declined without writing
 anything, that the listing is complete, that a report says plainly whether a
 cause was established — stays there and is **not** restated here. If a scenario
-in this feature does not read `reference.md`, it is in the wrong file. The one
-exception is `skill-07`, which reads
+in this feature does not read `reference.md`, it is in the wrong file. The two
+exceptions are `skill-07`, which reads
 [SKILL.md](../../skills/rocm-doctor/SKILL.md) for the catalog contract number
-that Phase 0 requires.
+that Phase 0 requires, and `skill-08`, which reads the replay of `rocm fix` the
+skill's evals grade an agent against and compares it with the real command.
 
 Reading that document as test data is a deliberate, narrow exception to
 **Black-box only** above: the scenario steps import nothing from the rocm-cli

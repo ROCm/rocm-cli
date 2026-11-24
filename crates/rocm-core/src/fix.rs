@@ -53,6 +53,7 @@ pub use manifest::{
 pub use options::{FixClass, FixOptions, exit};
 pub(crate) use render::format_flags;
 pub use render::{fix_plan_text, list_recipes};
+pub use runners::{FixPreview, fix_preview_text};
 // The catalog's test-only oracles, which the `diagnose` module holds its own copies of
 // a recipe to.
 #[cfg(test)]
@@ -143,8 +144,8 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
 /// branch before that, and still covers any class the catalog later empties.
 #[must_use]
 fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
+    // The plan and the blank line after it (`plan_preamble`).
     print_recipe(recipe);
-    println!();
 
     // Exhaustive on purpose. An arm removed here is a compile error rather than
     // a silent fall-through to the next branch, which is how a disabled guard

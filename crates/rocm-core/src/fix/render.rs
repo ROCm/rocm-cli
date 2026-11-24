@@ -106,10 +106,20 @@ pub(crate) fn format_flags(
     flags
 }
 
+/// Print [`plan_preamble`] for `r` on the running platform: what `rocm fix <id>`
+/// prints before it acts.
 pub(super) fn print_recipe(r: &FixRecipe) {
-    for line in recipe_plan_lines(r, current_os()) {
-        println!("{line}");
-    }
+    print!("{}", plan_preamble(r, current_os()));
+}
+
+/// What `rocm fix <id>` prints for `r` on the platform `os` before it acts: the
+/// plan, then a blank line. [`print_recipe`] prints it, and `fix_preview_text` in
+/// `fix/runners.rs` starts its replay with it, so the blank line the two show
+/// cannot differ.
+pub(super) fn plan_preamble(r: &FixRecipe, os: &str) -> String {
+    let mut text = recipe_plan_lines(r, os).join("\n");
+    text.push_str("\n\n");
+    text
 }
 
 /// Every line of the plan `rocm fix <id>` prints for `r` on the platform `os`, in
@@ -146,9 +156,10 @@ fn recipe_plan_lines(r: &FixRecipe, os: &str) -> Vec<String> {
 /// after (such as the command it is about to run), which name the user and the
 /// machine.
 ///
-/// `pub` only so the eval-fixture generator in `xtask` replays the plan without a
-/// second copy of its wording; hidden from the docs because it is not an API to
-/// build on.
+/// `pub` only so the eval-fixture generator in `xtask` can tell a fix id from none
+/// without a second copy of the catalog, and so its tests hold the plan the
+/// replay prints (through `fix_preview_text`) to this wording; hidden from the
+/// docs because it is not an API to build on.
 #[doc(hidden)]
 #[must_use]
 pub fn fix_plan_text(fix_id: &str, os: &str) -> Option<String> {
@@ -215,7 +226,47 @@ pub(super) fn diagnosis_position_refusal(fix_id: &str) -> [String; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fix::catalog::{find_recipe, needs_on};
+    use crate::fix::catalog::{find_recipe, needs_on, on};
+
+    /// The plan block `rocm fix <id>` prints before it acts is the plan lines, then
+    /// exactly one blank line, and that blank line is the only one in it. Asserted
+    /// against a literal for a recipe of its own, so the expectation does not
+    /// move with the catalog's wording and is not built by `plan_preamble`, as the
+    /// other tests that read it do. `with_will_run_line` in
+    /// `tests/e2e-cucumber/tests/e2e/skill_steps.rs` splits the replay at its first
+    /// blank line, which is right only while this holds.
+    #[test]
+    fn the_plan_preamble_is_the_plan_and_one_blank_line() {
+        const RECIPE: FixRecipe = FixRecipe {
+            fix_id: "fix-0-sample",
+            title: "A sample",
+            rationale: "Why.",
+            commands: &["do-it"],
+            needs_sudo: true,
+            needs_reboot: false,
+            needs_relogin: false,
+            verify: "check-it",
+            verify_linux: None,
+            notes: &["Careful."],
+            doc_url: None,
+            applies_on: &[on("linux", FixClass::Auto)],
+            runner: None,
+        };
+        assert_eq!(
+            plan_preamble(&RECIPE, "linux"),
+            concat!(
+                "Fix:        fix-0-sample  -- A sample\n",
+                "OS scope:   linux\n",
+                "Rationale:  Why.\n",
+                "Commands:\n",
+                "  $ do-it\n",
+                "Flags:      requires sudo, rocm fix can run it\n",
+                "Note:       Careful.\n",
+                "Verify:     check-it\n",
+                "\n",
+            )
+        );
+    }
 
     /// fix-6's plan carries one verify line that runs on Windows and one for
     /// Linux and WSL that shows the GPU. The plain line is what Windows runs, so
