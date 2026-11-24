@@ -24,6 +24,10 @@
   "user_groups": [],
   "in_render_group": null,
   "in_video_group": null,
+  "groups_on_host": [
+    "render",
+    "video"
+  ],
   "rocm_version": "",
   "rocm_install_method": "",
   "rocm_path": "",

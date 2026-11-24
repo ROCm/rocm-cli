@@ -41,7 +41,9 @@ use host_env::{
 pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
-use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};
+use linux_driver::{
+    probe_device_groups, probe_devices, probe_modules, probe_secure_boot, probe_user,
+};
 use linux_gpus::{
     GpuProbeSources, probe_gpus_after_lspci, probe_gpus_lspci, summarise_gpu_categories,
 };
@@ -307,6 +309,17 @@ pub struct Examination {
     pub user_groups: Vec<String>,
     pub in_render_group: Option<bool>,
     pub in_video_group: Option<bool>,
+    /// Which of the groups the render-group fix can name exist in the host's
+    /// group database, as `getent group` answered for the group that owns
+    /// `/dev/kfd`, `render` and `video` (`fix::render_group`'s
+    /// `lookup_candidates`). `rocm diagnose` names only these in the `usermod`
+    /// line it prints, through the resolver `rocm fix` uses too.
+    ///
+    /// `None` when the database was not read: off Linux, when `getent` did not
+    /// answer, and in an examination from a CLI that predates the field, which
+    /// `#[serde(default)]` keeps readable for `rocm remote doctor`.
+    #[serde(default)]
+    pub groups_on_host: Option<Vec<String>>,
 
     // ROCm install (Linux)
     pub rocm_version: String,
@@ -477,6 +490,7 @@ impl Default for Examination {
             user_groups: Vec::new(),
             in_render_group: None,
             in_video_group: None,
+            groups_on_host: None,
             rocm_version: String::new(),
             rocm_install_method: String::new(),
             rocm_path: String::new(),
@@ -630,6 +644,7 @@ impl Examination {
             probe_modules(&mut e);
             probe_user(&mut e);
             probe_devices(&mut e);
+            probe_device_groups(&mut e);
             probe_secure_boot(&mut e);
             probe_rocm_install(&mut e);
             probe_env(&mut e);
@@ -786,6 +801,10 @@ mod tests {
             "user_groups",
             "in_render_group",
             "in_video_group",
+            // CLI addition beyond examine.py, added deliberately: which of the
+            // groups the render-group fix can name exist, so the `usermod` line
+            // `diagnose` prints never names a group the host does not have.
+            "groups_on_host",
             "rocm_version",
             "rocm_install_method",
             "rocm_path",
