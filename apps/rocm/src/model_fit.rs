@@ -228,8 +228,12 @@ fn host_accelerator_memory(
 /// readable here yet.
 pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
     #[cfg(feature = "e2e-test-hooks")]
-    if let Some(forced_gib) = simulated_listing_gpu_gib() {
-        return (Some(forced_gib), rocm_core::detect_system_ram_gib());
+    if let Some(forced) = simulated_listing_gpu() {
+        let gpu_gib = match forced {
+            SimulatedListingGpu::Gib(gib) => Some(gib),
+            SimulatedListingGpu::Unreadable => None,
+        };
+        return (gpu_gib, rocm_core::detect_system_ram_gib());
     }
     let vram = gpu_vram_usage();
     let host_gpu_summary = detect_host_gpu_summary(None);
@@ -254,28 +258,48 @@ pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
 }
 
 /// E2E hook: `ROCM_E2E_FORCE_GPU_TOTAL_GIB` states outright how much GPU memory
-/// the listing is selected against, overriding every measurement above.
+/// the listing is selected against, overriding every measurement above. The
+/// value `unreadable` states the opposite verdict: a host whose GPU memory could
+/// not be read, so the listing has no figure to narrow on.
 ///
 /// Without it the narrowed listing has no live coverage anywhere. The mock lane
 /// has no GPU, so `usable_amd_gpu_indices` reports none and
 /// [`classify_accelerator_memory`] correctly discards any planted row as a card
-/// no mask makes visible; the GPU lanes cannot be made small, and the MI300X box
-/// has no `amd-smi` and an unreadable `mem_info_vram_total`, so it measures
-/// nothing either. Planting raw telemetry therefore reaches no verdict on any
-/// available lane -- only stating the verdict does.
+/// no mask makes visible; the GPU lanes cannot be made small, and a lane whose
+/// GPU `gpu_vram_usage` can read (through `amd-smi` or the DRM sysfs fallback)
+/// measures its real memory, as the MI300X lane did when model-catalog-08 ran
+/// there unplanted, so an unreadable host is no more reachable there than a
+/// small one. Planting raw telemetry therefore reaches no verdict on any
+/// available lane -- only stating the verdict does, the unmeasured one
+/// included.
 ///
 /// What that costs: the scenarios behind this hook exercise the selection and
 /// the notices, not the measurement. `classify_accelerator_memory` keeps its own
 /// unit tests for the measurement, which this deliberately bypasses rather than
 /// re-stages. Compiled only into the `e2e-test-hooks` binary.
 #[cfg(feature = "e2e-test-hooks")]
-fn simulated_listing_gpu_gib() -> Option<f64> {
-    let total_gib: u32 = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(f64::from(total_gib))
+fn simulated_listing_gpu() -> Option<SimulatedListingGpu> {
+    parse_simulated_listing_gpu(&std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB").ok()?)
+}
+
+/// What `ROCM_E2E_FORCE_GPU_TOTAL_GIB` states about the host: its GPU memory
+/// outright, or that it could not be read.
+#[cfg(feature = "e2e-test-hooks")]
+#[derive(Debug, PartialEq)]
+enum SimulatedListingGpu {
+    Gib(f64),
+    Unreadable,
+}
+
+/// `None` means the value states nothing, so the host is measured as usual.
+#[cfg(feature = "e2e-test-hooks")]
+fn parse_simulated_listing_gpu(value: &str) -> Option<SimulatedListingGpu> {
+    let value = value.trim();
+    if value == "unreadable" {
+        return Some(SimulatedListingGpu::Unreadable);
+    }
+    let total_gib: u32 = value.parse().ok()?;
+    Some(SimulatedListingGpu::Gib(f64::from(total_gib)))
 }
 
 /// The pure classification behind [`host_accelerator_memory`], split out so it
@@ -456,6 +480,16 @@ fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn the_listing_hook_can_state_a_figure_or_an_unreadable_host() {
+        use SimulatedListingGpu::{Gib, Unreadable};
+        assert_eq!(parse_simulated_listing_gpu("8"), Some(Gib(8.0)));
+        assert_eq!(parse_simulated_listing_gpu(" 1 "), Some(Gib(1.0)));
+        assert_eq!(parse_simulated_listing_gpu("unreadable"), Some(Unreadable));
+        assert_eq!(parse_simulated_listing_gpu("garbage"), None);
+    }
 
     /// Hosts whose engine choice differs, so the assertion below is exercised on
     /// more than one branch of `select_serve_engine`.
