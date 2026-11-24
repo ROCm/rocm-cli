@@ -105,6 +105,9 @@ different goal.
    `rocm fix` match known failures against a catalog with a stable id for
    each. Where a fix is safe to automate, `rocm fix` applies it after asking.
    Otherwise it prints the steps to take, or says plainly that no fix exists.
+   You do not have to wait for it to break: `rocm diagnose` checks the machine
+   as it is and installs nothing, and no fix is applied until you run
+   `rocm fix`.
 7. **Built for people, scripts, and agents alike.** A launcher and a live
    dashboard for people, `--json` output from `examine`, `diagnose`, `fix`
    and other inspection commands for scripts, and the
@@ -599,7 +602,10 @@ Checks this computer's GPU, ROCm install, engines, and managed setup
 folders. Run this command first to see whether a system is ready and what
 `rocm install sdk` and `rocm serve` will see. `--json` emits a
 machine-readable report for diagnosis tooling instead of the human-readable
-summary. `--framework` controls which ML framework the `--json` report probes
+summary. To check the same machine against the catalog of known failure modes,
+before anything has failed or after, run `rocm diagnose` (see
+[Diagnose and fix](#diagnose-and-fix)). `--framework` controls which ML
+framework the `--json` report probes
 for its ROCm build and compiled GPU architectures:
 
 - `auto` (the default) tries PyTorch, then falls back to llama.cpp.
@@ -641,6 +647,16 @@ ROCm, PyTorch, and llama.cpp misconfigurations and ranks what it finds. It can
 only recognize failure modes that are in the catalog: no match means "not
 recognized", not "nothing is wrong". In that case it points you at where to
 report the symptom.
+
+Nothing has to have failed first. With no `--symptom`, `diagnose` examines the
+machine as it is and reports any catalogued misconfiguration it finds, so you
+can run it before you install or serve anything. A diagnosis applies no fix and
+installs nothing; `rocm fix` is the step that changes the machine. Run that way
+on a machine where nothing matched, the report says no known misconfiguration
+matched and still lists the issue tracker to use; that pointer matters only if
+you have a failure to report. A few failure modes show only
+in the error a failing run prints (a vLLM out-of-memory error, for one), so
+pass that text with `--symptom` once you have it.
 
 Each result prints an `id:` and an `apply with:` command. The leading `#1`, `#2`
 are ranking positions for reading order only. `rocm fix` takes the id, not the

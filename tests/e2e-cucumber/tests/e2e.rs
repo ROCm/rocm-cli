@@ -289,8 +289,10 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
-    /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
-    /// can show a refused install left that tree exactly as it was.
+    /// Every file of a tree, with its bytes, recorded before a command runs so
+    /// a Then can show the command left that tree exactly as it was: a planted
+    /// Lemonade tree a refused install must not touch, or the CLI's settings
+    /// and data folders a diagnosis must not change (diagnose-89).
     pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
     /// The size of this machine's `/dev/shm`, in bytes, as a Given measured it,
     /// so a Then can show a fix that only explains itself left it as it was.
