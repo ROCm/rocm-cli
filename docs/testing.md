@@ -2296,7 +2296,7 @@ and the install report by
 `render_sdk_install_success_warns_for_the_slow_sdk_on_wsl_only`:
 
 ```bash
-cargo xtask e2e -- -n 'runtime-lifecycle-3[23] '
+cargo xtask e2e -- -n 'runtime-lifecycle-3[34] '
 cargo test -p rocm --bin rocm -- runtime_advisory render_sdk_install_success
 ```
 
