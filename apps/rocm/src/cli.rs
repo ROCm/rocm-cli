@@ -105,7 +105,8 @@ pub(crate) enum Command {
     ///
     /// Each cause is printed with an `id:` and an `apply with:` command. The
     /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
-    /// takes the id, not the position.
+    /// takes the id, not the position. An established cause that leaves the GPU
+    /// unreachable is listed first, and the closing line names the first cause.
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring. A few failure
         /// modes show only in such text (a vLLM out-of-memory error, for one).

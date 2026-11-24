@@ -210,6 +210,12 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
+Every entry above except `fix-wsl-5-distro-too-old` means nothing in the distro
+can reach the GPU, so when one of them clears the match threshold it is listed
+before any other finding, including one that scores higher, such as
+`fix-19-shm-too-small` in a container started without `/dev/dxg`, and the
+closing line names the first one listed.
+
 Nine entries that are not WSL-specific also run on WSL: `fix-1-arch`,
 `fix-2-unset-override`, `fix-6-path`, `fix-8-wheel-rocm`, `fix-16-vllm-oom`,
 `fix-17-torch-dlpack`, `fix-18-comgr-conflict`, `fix-19-shm-too-small`, and
