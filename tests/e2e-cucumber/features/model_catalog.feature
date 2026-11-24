@@ -114,6 +114,7 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     Then every model offered is one this machine can run
     And the offer includes a model too large for the carve-out the adapter reports
+    And each offered row says the memory it was weighed against is shared
     And the user is told the offer was narrowed to this machine
     And the user is told that memory is shared with everything else running
 
@@ -137,6 +138,7 @@ Feature: Model catalog listing
     Given a machine whose graphics share memory with the rest of the system and report no memory of their own
     When the user asks which models are recommended
     Then every model offered is one this machine can run
+    And each offered row says the memory it was weighed against is shared
     And the user is told that memory is shared with everything else running
 
   # The per-recipe detail reaches the same host, and has to describe the figure
@@ -147,3 +149,4 @@ Feature: Model catalog listing
     Given a machine whose graphics share memory with the rest of the system, with room for only the smaller models
     When the user asks for the model catalog in verbose detail
     Then each recipe's memory verdict names the shared pool rather than VRAM
+    And the remedy it offers is one this machine can act on

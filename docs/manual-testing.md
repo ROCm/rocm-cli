@@ -2754,7 +2754,9 @@ Expected result, on the APU host:
 - The closing note names the narrowing *and* says the memory is shared:
   `This GPU has no dedicated VRAM, so that is a ceiling on memory it shares with
   the operating system: how much is free depends on what else is running.`
-- Cross-check the figure it narrowed on against `rocm diagnose --model <model>`
+- Cross-check the figure it narrowed on -- `rocm model --verbose` prints it, as
+  `reason: shared GPU memory pool N GiB` on each row; the curated listing carries
+  no number -- against `rocm diagnose --model <model>`
   on the same host — both read the pool through the same classifier, so a
   disagreement between them is a bug in one of the two call sites.
 

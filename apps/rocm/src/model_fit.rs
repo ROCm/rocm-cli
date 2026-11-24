@@ -35,10 +35,12 @@
 //! `host_model_listing_facts` and its `ModelListingHostFacts` are reached from
 //! `main.rs` and `chat/mcp_bridge.rs`, so `rocm model` and the tool-use path
 //! measure one host the same way; `assess_model_for_host` is reached from
-//! `diagnose_model.rs`. `ListingGpuMemory`'s `dedicated` and `shared_pool`
-//! constructors are `#[cfg(test)]`, so production reaches that type only
-//! through `from_accelerator` and cannot label a figure by hand. Every other
-//! item has no caller outside this module and stays private.
+//! `diagnose_model.rs`'s test module. `ListingGpuMemory`'s `dedicated` and
+//! `shared_pool` constructors are `#[cfg(test)]`, so the only production route
+//! to that type is `from_accelerator` -- except in the `e2e-test-hooks` build,
+//! where the hook below names the fields directly and `model-catalog-06` is
+//! what guards that one literal. Every other item has no caller outside this
+//! module and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`.
 //! `engine_ruled_out_by_platform_gates_aim_on_docker_reachability` re-runs the
@@ -349,13 +351,19 @@ impl ListingGpuMemory {
 /// E2E hook: `ROCM_E2E_FORCE_GPU_TOTAL_GIB` states outright how much GPU memory
 /// the listing is selected against, overriding every measurement above.
 ///
-/// Without it the narrowed listing has no live coverage anywhere. The mock lane
-/// has no GPU, so `usable_amd_gpu_indices` reports none and
-/// [`classify_accelerator_memory`] correctly discards any planted row as a card
-/// no mask makes visible; the GPU lanes cannot be made small, and the MI300X box
-/// has no `amd-smi` and an unreadable `mem_info_vram_total`, so it measures
-/// nothing either. Planting raw telemetry therefore reaches no verdict on any
-/// available lane -- only stating the verdict does.
+/// It was written when the narrowed listing had no other live coverage. The
+/// mock lane has no GPU, so `usable_amd_gpu_indices` reports none and
+/// [`classify_accelerator_memory`] correctly discards any planted *amd-smi* row
+/// as a card no mask makes visible; the GPU lanes cannot be made small, and the
+/// MI300X box has no `amd-smi` and an unreadable `mem_info_vram_total`, so it
+/// measures nothing either.
+///
+/// That is no longer the whole picture: a host planted under
+/// `ROCM_CLI_TEST_HOST_ROOT` is measured end to end, which is how the
+/// shared-pool scenarios reach a verdict without stating one. What survives is
+/// the reason to keep *this* seam for the discrete-magnitude scenarios, whose
+/// subject is the selection and the notices at an exact figure rather than the
+/// classification.
 ///
 /// What that costs: the scenarios behind this hook exercise the selection and
 /// the notices, not the measurement. `classify_accelerator_memory` keeps its own
@@ -363,12 +371,10 @@ impl ListingGpuMemory {
 /// re-stages. Compiled only into the `e2e-test-hooks` binary.
 ///
 /// **It states a verdict, so nothing reached through it exercises the
-/// measurement.** That is the trade this hook was always making, and it bounds
-/// what a scenario built on it can prove: a host whose memory is an integrated
-/// GPU's shared pool is *classified* rather than stated, so forcing a figure
-/// here would assert the classification instead of running it. Those scenarios
-/// plant a real sysfs host under `ROCM_CLI_TEST_HOST_ROOT` and go through
-/// `classify_accelerator_memory` like any other machine.
+/// measurement.** That bounds what a scenario built on it can prove, which is
+/// why the shared-pool ones are not: whether a host's memory is an integrated
+/// GPU's pool is *classified*, so forcing it here would assert the answer
+/// instead of running it.
 #[cfg(feature = "e2e-test-hooks")]
 fn simulated_listing_gpu_gib() -> Option<f64> {
     let total_gib: u32 = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")

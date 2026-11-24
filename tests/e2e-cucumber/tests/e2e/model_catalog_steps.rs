@@ -397,9 +397,14 @@ async fn assert_verbose_names_the_shared_pool(world: &mut E2eWorld) {
         !output.contains("aggregate GPU VRAM"),
         "an integrated GPU has no VRAM, so no row may call its pool that:\n{output}"
     );
-    // The remedy offered alongside the verdict. A row that does not fit used to
-    // say "use a GPU with at least N", which this machine's owner cannot do --
-    // the pool is what the system allows the graphics, not a card with a slot.
+}
+
+/// The remedy printed beside a verdict that did not fit. It used to read "use a
+/// GPU with at least N", which this machine's owner cannot act on: the pool is
+/// what the system allows the graphics, not a card with a slot behind it.
+#[then("the remedy it offers is one this machine can act on")]
+async fn assert_remedy_is_actionable(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
     assert!(
         output.contains("not a card that can be changed"),
         "a row that does not fit must offer a remedy this machine can act on:\n{output}"
@@ -484,8 +489,9 @@ async fn assert_every_offer_fits(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     // Either label, because the row names the kind of memory it was weighed
     // against: a discrete card's own VRAM, or an integrated part's shared pool.
-    // Accepting both is what lets this step describe the behaviour rather than
-    // the hardware, so the shared-pool scenarios reuse it as written.
+    // Which of the two is right for a given host is not this step's business --
+    // `the rows say the memory is shared` is where that is pinned, because a
+    // permissive check here would let the card wording pass on an APU.
     assert!(
         output.contains("fits this GPU") || output.contains("fits this shared pool"),
         "a narrowed listing must offer something and say it fits:\n{output}"
@@ -493,6 +499,32 @@ async fn assert_every_offer_fits(world: &mut E2eWorld) {
     assert!(
         !output.contains("needs a larger GPU") && !output.contains("larger than this shared pool"),
         "a model this machine cannot run must not be recommended to it:\n{output}"
+    );
+}
+
+/// The row label, which is the only qualifier a row carries on its own.
+///
+/// The closing note describes the list; a reader scanning rows sees neither it
+/// nor `--verbose`. And the signed-index path prints rows with no closing note
+/// at all, so there the label is the whole of it.
+#[then("each offered row says the memory it was weighed against is shared")]
+async fn assert_rows_say_the_memory_is_shared(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("fits this shared pool"),
+        "an offered row must name the pool it cleared, not a card:\n{output}"
+    );
+    assert!(
+        !output.contains("fits this GPU"),
+        "\"fits this GPU\" claims of an integrated part what the readiness check refuses to \
+         claim about it -- clearing a shared ceiling is Degraded, never Ready:\n{output}"
+    );
+    // ROCMAI-543: the same guard the renderer's own tests carry. These strings
+    // are only reachable on a shared-pool host, so the existing `is_ascii`
+    // assertions -- which render with no host memory at all -- never see them.
+    assert!(
+        output.is_ascii(),
+        "non-ASCII in the listing mojibakes on a Windows console:\n{output}"
     );
 }
 
@@ -531,8 +563,11 @@ async fn assert_nothing_fits_is_stated(world: &mut E2eWorld) {
 #[then("no model is offered")]
 async fn assert_no_model_offered(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
+    // Both labels, so this stays true if a shared-pool host is ever given a
+    // nothing-fits scenario; checking only the card wording would pass there
+    // while a row was being offered.
     assert!(
-        !output.contains("fits this GPU"),
+        !output.contains("fits this GPU") && !output.contains("fits this shared pool"),
         "nothing fits, so nothing may be offered as fitting:\n{output}"
     );
 }

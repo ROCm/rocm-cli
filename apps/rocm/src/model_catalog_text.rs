@@ -317,9 +317,11 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     gpu_memory: Option<ListingGpuMemory>,
     _host_ram_gib: Option<f64>,
 ) -> String {
-    // Selection and every per-row verdict weigh the figure alone; only the
-    // closing note cares what kind of figure it is.
-    let aggregate_gpu_vram_gib = gpu_memory.map(|gpu| gpu.total_gib);
+    // Selection weighs the figure alone. The row label and the closing note
+    // both read the kind as well, which is why the whole value travels rather
+    // than only the number -- and why this local is not named for VRAM, which
+    // is exactly what it is not on half the hosts that reach here.
+    let measured_gib = gpu_memory.map(|gpu| gpu.total_gib);
     let mut output = String::new();
     let registry = match load_model_recipe_registry() {
         Ok(registry) => registry,
@@ -335,11 +337,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     let show_all = !matches!(registry.source, ModelRecipeRegistrySource::BuiltIn);
     // Only the built-in catalog is narrowed to what runs here; `None` also means
     // "do not filter", which is what an unmeasured host gets.
-    let fit = if show_all {
-        None
-    } else {
-        aggregate_gpu_vram_gib
-    };
+    let fit = if show_all { None } else { measured_gib };
     let visible = registry.recipes.iter().collect::<Vec<_>>();
     let platforms = model_catalog_platforms(&registry);
     let host_gfx_family = detect_host_gfx_target()
