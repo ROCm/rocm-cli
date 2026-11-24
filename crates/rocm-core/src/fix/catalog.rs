@@ -1004,6 +1004,30 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
     },
+    // Print-only: `rocm serve` already takes the flag, and whether to trade a
+    // smaller KV cache for a launch that survives is the user's call.
+    FixRecipe {
+        fix_id: "fix-24-vllm-gpu-memory-fault",
+        title: "Work around a GPU memory fault while vLLM initialises its KV cache",
+        rationale: "vLLM faulted on the GPU (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`, `possible device memory fault` or `illegal memory access`) while filling its KV cache. On a unified-memory GPU the default reservation is a large share of the machine's memory, and a smaller one has avoided the fault. That is a workaround: the fault itself is below vLLM, in the GPU runtime, driver stack or torch build.",
+        commands: &[
+            "# Reserve a smaller share of GPU memory for the KV cache:",
+            "rocm serve <model> --engine vllm --gpu-memory-utilization 0.3",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> --engine vllm --gpu-memory-utilization 0.3   # re-run and watch for a clean startup",
+        verify_linux: None,
+        notes: &[
+            "This lowers how much memory vLLM asks for; it does not repair the fault. If it still fails at a small value, or you need the larger cache, the fault is in the GPU runtime or driver stack underneath vLLM (on WSL2, ROCDXG and the host driver), so report it with the runtime version and the full log.",
+            "This entry is keyword-matched from the error text alone; it does not look at this machine's GPU or memory, so pass the failure with --symptom and include the lines around it that name vLLM.",
+        ],
+        doc_url: None,
+        // Matches `check_24_vllm_gpu_memory_fault`'s `["linux", "wsl"]`.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
+        runner: None,
+    },
 ];
 
 /// Assert that a recipe whose steps span more than one shell says which shell
@@ -1660,12 +1684,13 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 23 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 24 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
         // fix-21-msvc-redist-outdated, fix-22-display-driver-old,
-        // fix-23-vllm-extension-load and the informational
-        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
-        assert_eq!(count, 30, "expected 30 catalog entries");
+        // fix-23-vllm-extension-load, fix-24-vllm-gpu-memory-fault and the
+        // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL
+        // ones.
+        assert_eq!(count, 31, "expected 31 catalog entries");
     }
 
     #[test]
@@ -1682,6 +1707,23 @@ mod tests {
                 recipe.platform(os).map(|p| p.class),
                 Some(FixClass::PrintOnly),
                 "{os}: fix-23 must stay print-only"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gpu_memory_fault_recipe_is_print_only_on_the_engine_hosts() {
+        // Lowering the reservation is a flag on a command the user runs; the CLI
+        // has no business relaunching their server for them.
+        let recipe = find_recipe("fix-24-vllm-gpu-memory-fault")
+            .expect("fix-24-vllm-gpu-memory-fault must be in the catalog");
+        assert!(recipe.runner.is_none());
+        assert_eq!(recipe.os_scope(), vec!["linux", "wsl"]);
+        for os in recipe.os_scope() {
+            assert_eq!(
+                recipe.platform(os).map(|p| p.class),
+                Some(FixClass::PrintOnly),
+                "{os}: fix-24 must stay print-only"
             );
         }
     }

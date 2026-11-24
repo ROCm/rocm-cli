@@ -461,6 +461,23 @@
       "needs_sudo": false,
       "needs_reboot": false,
       "needs_relogin": false
+    },
+    {
+      "id": "fix-24-vllm-gpu-memory-fault",
+      "title": "Work around a GPU memory fault while vLLM initialises its KV cache",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
     }
   ],
   "exit_codes": {

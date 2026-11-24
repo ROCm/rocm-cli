@@ -320,7 +320,7 @@ this check prevents.
      changes nothing.
 
    [reference.md](reference.md)'s table marks the entries that are not print-only.
-   The other 25 are **print-only** on every host (bootloader, kernel, reinstall,
+   The other 26 are **print-only** on every host (bootloader, kernel, reinstall,
    Windows driver, …): the CLI never performs those.
 
    To apply an `auto` fix, or a `needs-argument` fix with its argument, go in this
@@ -399,7 +399,7 @@ Step 2 says when to route.
 
 ## vLLM startup failures
 
-Three vLLM engine failures are in the catalog. All are **print-only**: `rocm fix`
+Four vLLM engine failures are in the catalog. All are **print-only**: `rocm fix`
 prints the plan and the user runs it. Say so first, in one short sentence at the
 start of the reply, before relaying a multi-step plan.
 
@@ -452,6 +452,18 @@ the error line no vLLM entry can match; step 2 judges what comes back.
   rather than concluding there is nothing to find. Relay the plan, which finds the
   failing extension inside `rocm engines shell vllm`. Do not suggest an engine
   reinstall, which fetches the same wheel, or group edits.
+- **A GPU memory fault while vLLM fills its KV cache**
+  (`fix-24-vllm-gpu-memory-fault`, Linux and WSL2): `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`,
+  `possible device memory fault` or `illegal memory access` right after vLLM
+  reports its KV-cache size. Those lines are what any ROCm program prints when it
+  faults, so the entry matches only when the text also identifies vLLM (the word
+  `vllm`, the `(EngineCore pid=...)` prefix, or `create_kv_cache_views`); pass the
+  surrounding log lines with the fault. If a bare fault line gets no match, ask
+  for them rather than concluding there is nothing to find. Relay the plan and
+  say what it is: a smaller `--gpu-memory-utilization` is a workaround that
+  avoided the fault in the report this entry came from, not a repair, and a
+  failure that persists at a small value belongs to the GPU runtime or driver
+  stack, so ask for the runtime version and the full log before routing it.
 
 Native Windows gets no match from any of them, because the vLLM engine does not
 run there. Do not route that user to an issue tracker, whatever else matched; step

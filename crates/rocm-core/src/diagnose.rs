@@ -367,8 +367,8 @@ pub fn diagnose_with_engine(
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
     //
-    // `fix-16-vllm-oom`, `fix-17-torch-dlpack` and `fix-23-vllm-extension-load`
-    // opt into `wsl` in CHECKERS for that reason: they are keyword-only checks
+    // `fix-16-vllm-oom`, `fix-17-torch-dlpack`, `fix-23-vllm-extension-load` and
+    // `fix-24-vllm-gpu-memory-fault` opt into `wsl` in CHECKERS for that reason: they are keyword-only checks
     // whose failure modes are just as real under WSL2, so they still answer
     // there alongside the WSL entries.
     //

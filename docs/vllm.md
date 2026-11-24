@@ -590,6 +590,33 @@ print-only: `rocm fix` prints a plan that imports each extension inside
 `rocm engines shell vllm` to name the one that fails and why, and does not
 change anything.
 
+## GPU memory faults while the KV cache is filled
+
+On a unified-memory GPU such as Strix Halo, vLLM's default reservation is a large
+share of the machine's memory: about 98 GiB of KV cache on a 108 GiB device, for a
+0.6B model. On one WSL2/ROCDXG host with a ROCm 10.2 nightly runtime, that fill
+intermittently crashed the engine right after `GPU KV cache size: ...`, with
+`GPU stall detected ... possible device memory fault`,
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in the KV-cache zero fill and
+`torch.AcceleratorError: illegal memory access` in `create_kv_cache_views`.
+Three of three later runs failed at the default and two of two passed with
+`--gpu-memory-utilization 0.3`. The cause is not established; it is thought to be
+in the runtime's memory mapping or the torch/HIP build, not in rocm-cli.
+
+`rocm diagnose --symptom '<those lines>'` matches `fix-24-vllm-gpu-memory-fault`
+on Linux and WSL. The text must also identify vLLM (the word `vllm`, the
+`EngineCore` process prefix, or `create_kv_cache_views`), because the HSA and
+torch lines on their own are what any ROCm program prints when it faults. Naming
+the engine with `--engine vllm` does not stand in for that text on this entry (nor
+on `fix-23-vllm-extension-load`). The word is looked for anywhere in the paste, not
+on the fault line itself, so a paste that mentions vLLM and also holds another
+program's fault gets the same verdict. The fix
+is print-only: `rocm fix fix-24-vllm-gpu-memory-fault` prints
+`rocm serve <model> --engine vllm --gpu-memory-utilization 0.3` and changes
+nothing. That is a workaround that asks for less memory. If the engine still
+faults at a small value, the fault is below vLLM, so report it with the runtime
+version and the full log.
+
 ## Tool calling
 
 The chat tab in the terminal user interface (TUI) attaches tool definitions to

@@ -139,7 +139,7 @@ every machine the id applies to:
 `fix.auto_applicable` flag in a diagnosis. An entry whose class is `print-only`
 prints its plan for the user to run.
 
-## Closed catalog (30 failure modes)
+## Closed catalog (31 failure modes)
 
 The OS column is the platform family the CLI scopes an entry to, and WSL2 is a
 family of its own — not a flavour of `linux`. An entry reaches a WSL host only
@@ -183,6 +183,7 @@ when it fires: the CLI's score and the entry's `evidence` decide, so read
 | `fix-21-msvc-redist-outdated` | windows | MSVC runtime present but older than 14.40, so programs built with a recent toolset (such as the llama.cpp server that Lemonade installs) crash | `msvc_redist_version` below 14.40 in `rocm examine --json`; an access violation (`0xC0000005`, `-1073741819`) in `msvcp140.dll` | print-only |
 | `fix-22-display-driver-old` | windows | The AMD display driver is dated before the first HIP SDK for Windows (27 July 2023). Advice only: AMD publishes no minimum driver version for the HIP SDK or the Lemonade Vulkan backend, so the minimum is not established and the entry never claims the driver is broken. The date is only a floor and cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers | `rocm examine` shows `driver_age: older than the first HIP SDK for Windows` | print-only |
 | `fix-23-vllm-extension-load` | linux/wsl | One of vLLM's compiled extensions (`vllm/_*.abi3.so`) failed to load, for example because it was built against a newer glibc than the host has, so an op it registers is missing and the engine fails at startup | `AttributeError: '_OpNamespace' '_C' object has no attribute '...'` — enough on its own, but only when the pasted text also identifies vLLM (the word `vllm`, the `EngineCore` process prefix, or a vLLM extension name such as `_rocm_C`/`_moe_C`/`_C_cache_ops`/`_C_stable_libtorch`), since every PyTorch-ecosystem library with a `_C` extension raises the identical line; `Failed to import from vllm._...`; `GLIBC_2.NN' not found` naming a vllm `.abi3.so` | print-only |
+| `fix-24-vllm-gpu-memory-fault` | linux/wsl | vLLM faulted on the GPU while filling its KV cache, as reported for the large default reservation on a unified-memory APU under WSL2. A smaller `--gpu-memory-utilization` is offered as a workaround; the fault itself lies below vLLM, in the GPU runtime, driver stack or torch build | `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` — enough on its own, but only when the pasted text also identifies vLLM (the word `vllm`, the `EngineCore` process prefix, or `create_kv_cache_views`), since any ROCm program prints it when it faults; `possible device memory fault` and `illegal memory access` are weaker and count together | print-only |
 | `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | print-only |
 | `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | print-only |
 | `fix-wsl-3-rocdxg-missing` | wsl | ROCDXG, the ROCm-to-DXCore shim the WSL path runs on, is not installed | `librocdxg.so` not found under any ROCm install | print-only |
@@ -194,7 +195,7 @@ when it fires: the CLI's score and the entry's `evidence` decide, so read
 One thing the numbering does not tell you: the `fix-wsl-N` entries are a parallel
 series, not a continuation of the numeric one, because they answer for a
 different platform family. The numeric series itself runs `fix-1` through
-`fix-19`, then `fix-21` through `fix-23`. The ids are stable handles rather than positions, so
+`fix-19`, then `fix-21` through `fix-24`. The ids are stable handles rather than positions, so
 the number `fix-20` is simply not used here: slot 20 belongs to
 `info-20-gpu-no-rocm-support`, which is in the table above but under an `info-`
 prefix because it has no fix to offer. A gap is not an error, and a retired

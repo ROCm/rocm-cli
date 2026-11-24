@@ -1355,3 +1355,25 @@ Feature: Diagnosing failures and listing fixes
     And nothing on the machine is changed
     And this machine's shared memory allowance is what it was
     And the reason the fix gives says WSL2 normally gives half the VM's memory
+
+  # A GPU memory fault while vLLM fills its KV cache (ROCm/rocm-cli issue 1132).
+  # Before fix-24 the catalog had nothing for these lines and the report said no
+  # known misconfiguration matched. The symptom is the real shape of the log: the
+  # HSA error on one line and vLLM's identity on its neighbours, as in a pasted
+  # log. Like diagnose-80, @requires-os:linux and not @requires-bare-metal: the
+  # checker is registered for linux and wsl and reads only the symptom text.
+  @id:diagnose-recognises-a-vllm-gpu-memory-fault @requires-os:linux
+  Scenario: diagnose-89 - A GPU memory fault during the vLLM KV-cache fill is recognised from its log text
+    Given a user who hit a vLLM GPU memory fault while the KV cache was filled
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the CLI reports the vLLM GPU memory fault as an established cause
+    And the CLI can act on the fix named for the vLLM GPU memory fault
+
+  # The other half. The HSA error is what any ROCm program prints when it
+  # faults, and the remedy here is a vLLM flag, so the same fault with no sign of
+  # vLLM in the text must not be blamed on it.
+  @id:diagnose-does-not-blame-vllm-for-another-programs-gpu-fault @requires-os:linux
+  Scenario: diagnose-90 - A GPU memory fault with nothing identifying vLLM is not attributed to it
+    Given a user who hit a GPU memory fault in a program that is not vLLM
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then no vLLM GPU memory fault is reported
