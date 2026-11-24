@@ -216,8 +216,8 @@ pub(crate) enum Command {
         /// neither case against
         /// what other processes have left free. Applies to a GGUF outside the
         /// catalog (a curated model's memory minimum is fixed, and says so);
-        /// `rocm serve` has no context-size option yet, so this answers the
-        /// question without changing what serve does.
+        /// `rocm serve` has no context-size option, but on an integrated GPU
+        /// it sizes the window itself, which may differ from this.
         #[arg(
             long,
             value_name = "TOKENS",
@@ -2049,10 +2049,18 @@ mod tests {
         }
     }
 
-    /// `rocm diagnose --model` tells the user that `rocm serve` takes no context
-    /// size, KV cache type or GPU layer count and passes none to the engine
+    /// `rocm diagnose --model` tells the user that `rocm serve` has no
+    /// context-size, KV cache type or GPU layer count option
     /// (`SERVE_OPTIONS_NOTE` and `SERVE_CONTEXT_NOTE` in `gguf_fit.rs`). This
     /// fails when `rocm serve` gains one of them, so the notes are updated with it.
+    ///
+    /// It can only see the option. Parsing an argv says nothing about what
+    /// `rocm serve` hands the engine, which is how the notes came to claim it
+    /// passed no context size at all long after the Lemonade route began
+    /// computing one for an integrated GPU. That half is guarded where the
+    /// window is computed, by
+    /// `the_serve_notes_do_not_deny_the_window_this_module_passes` in
+    /// `engines/lemonade/src/context_size.rs`.
     #[test]
     fn serve_takes_no_estimate_options_yet() {
         let serve = |extra: &[&str]| {

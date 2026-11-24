@@ -754,13 +754,22 @@ On such an integrated GPU, `rocm serve` on Lemonade chooses the llama.cpp
 context window itself. Lemonade sizes it from the memory it can see and, when
 it can see none (it logs `memory undetectable, returning 4096`), uses 4096
 tokens whatever the model, which is less than the assistant's own prompt. `rocm`
-reads the model's GGUF header (from the cached file, or by a header-only range
-request to Hugging Face before the model is downloaded), estimates the largest
-context that fits in 75% of the pool the GPU shares with the operating system,
-and loads with that, at most 32768 tokens. The chosen size is written to the
-service log as `Context window: N tokens, ...`. A recipe that carries its own
-`--ctx-size` keeps it, a model whose header cannot be read or sized is loaded
-as before, and a discrete GPU is not affected.
+reads the model's GGUF header (from the cached file — the first shard, for a
+split model whose shards are all present — or by a header-only range request to
+Hugging Face before the model is downloaded), estimates the largest context that
+fits in 75% of the pool the GPU shares with the operating system, and serves with
+that, at most 32768 tokens. This happens on both serving paths: the window
+reaches `lemonade load` as `--ctx-size`, or a directly launched `llama-server` as
+the same argument. The chosen size is written to the service log as
+`Context window: N tokens, ...`.
+
+A recipe that carries its own `--ctx-size` keeps it, and a discrete GPU is not
+affected. Where the window cannot be chosen — the header cannot be read, or the
+model so nearly fills the pool that nothing larger than Lemonade's own 4096-token
+fallback fits — the model is served exactly as it would have been, and the
+service log says why on a `Context window: left to the engine to choose,
+because ...` line. The 4096-token floor is deliberate: a smaller computed window
+would replace Lemonade's number with a worse one.
 
 #### Compiler toolchain (--devel)
 

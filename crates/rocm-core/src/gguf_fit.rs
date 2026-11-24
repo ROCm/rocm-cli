@@ -1221,19 +1221,33 @@ pub const ESTIMATE_CAVEAT: &str = "these are estimates from the file's metadata,
 
 /// The standing note about `rocm serve` when there are suggestions.
 ///
-/// The options they name are the engine's, and `rocm serve` does not pass them
-/// through today. `serve_takes_no_estimate_options_yet` in `apps/rocm/src/cli.rs` fails
-/// when `rocm serve` gains one of them, so this text cannot go stale unnoticed.
-pub const SERVE_OPTIONS_NOTE: &str = "`rocm serve` does not take a context size, KV cache type or \
-     GPU layer count yet, and passes none to the engine, so a model it serves gets the engine's \
-     own default context; the options named above are llama.cpp's own llama-server flags";
+/// The options they name are the engine's, and `rocm serve` has no flag for any
+/// of them today — which is a statement about its command line, not about what
+/// reaches the engine. On a host whose integrated GPU shares its memory with the
+/// operating system, `rocm serve` computes a llama.cpp context window itself and
+/// passes it on both serving routes (`context_size` in `engines/lemonade`), so
+/// these notes say the *option* is missing and name that sizing, rather than
+/// claiming nothing is passed.
+///
+/// Two tests keep them from going stale, because neither can see both halves:
+/// `serve_takes_no_estimate_options_yet` in `apps/rocm/src/cli.rs` fails when
+/// `rocm serve` gains one of the options, and
+/// `the_serve_notes_do_not_deny_the_window_this_module_passes` in
+/// `engines/lemonade/src/context_size.rs` fails when this text goes back to
+/// denying that a computed window reaches the engine.
+pub const SERVE_OPTIONS_NOTE: &str = "`rocm serve` has no context-size, KV cache type or GPU \
+     layer count option yet, so a model it serves gets the engine's own default context -- \
+     except on an integrated GPU, where the load is sized automatically from the memory the GPU \
+     shares with the operating system; the options named above are llama.cpp's own llama-server \
+     flags";
 
 /// The same fact for an estimate with no suggestions: the context size it was
-/// sized for is not one `rocm serve` would use. Pinned by the same test as
+/// sized for is not one `rocm serve` would use. Pinned by the same tests as
 /// [`SERVE_OPTIONS_NOTE`].
-pub const SERVE_CONTEXT_NOTE: &str = "`rocm serve` does not take a context size yet and passes \
-     none to the engine, so a model it serves gets the engine's own default context, which can \
-     differ from the size estimated here";
+pub const SERVE_CONTEXT_NOTE: &str = "`rocm serve` has no context-size option yet, so a model it \
+     serves gets the engine's own default context -- or, on an integrated GPU, a window sized \
+     automatically from the memory the GPU shares with the operating system; either can differ \
+     from the size estimated here";
 
 #[cfg(test)]
 mod tests {

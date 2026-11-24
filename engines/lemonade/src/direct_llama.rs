@@ -406,7 +406,12 @@ fn serve_direct_llama_server_within(
         push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
     }
 
-    let mut command = direct_llama_server_command(request, server, model_path);
+    // Nothing on this route reaches the router, so its sizing never runs here;
+    // llama-server would otherwise pick its own default on a host whose shared
+    // pool is exactly what this is meant to size against. Read after the log
+    // file exists, so the line it writes lands where a managed serve can show it.
+    let context_size = crate::context_size::direct_context_size(request, model_path);
+    let mut command = direct_llama_server_command(request, server, model_path, context_size);
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
     // CLI-managed owner-only key file via `--api-key-file` (a path, not the value, so the
@@ -572,10 +577,15 @@ fn supervise_direct_server<S: DirectServerSteps>(
     }
 }
 
+/// `context_size` is the window [`crate::context_size::direct_context_size`]
+/// chose for this host, or `None` to leave it to llama-server. It is never set
+/// when the recipe names one itself, so the flags that follow cannot contradict
+/// it; they are still passed last, so an authored recipe wins either way.
 pub(crate) fn direct_llama_server_command(
     request: &ServeHttpRequest,
     server: &Path,
     model_path: &Path,
+    context_size: Option<u64>,
 ) -> ProcessCommand {
     let mut command = ProcessCommand::new(server);
     command
@@ -590,6 +600,9 @@ pub(crate) fn direct_llama_server_command(
         .arg("--alias")
         .arg(&request.model_ref)
         .stdin(Stdio::null());
+    if let Some(context_size) = context_size {
+        command.arg("--ctx-size").arg(context_size.to_string());
+    }
     if let Some(recipe) = request.engine_recipe.as_ref() {
         command.args(&recipe.required_flags);
     }
@@ -935,8 +948,14 @@ fn collect_hf_checkpoint_ggufs(cache_root: &Path, checkpoint: &HfCheckpoint) -> 
 }
 
 /// Every cached GGUF matching a checkpoint's variant, across all hub cache roots,
-/// deduplicated by file name. Used to detect an ambiguous variant (more than one match)
-/// so the caller can refuse to pick arbitrarily.
+/// deduplicated by file name, in cache-root then path order with a complete shard
+/// set ahead of partial copies of the same files.
+///
+/// More than one match means the variant names more than one file, which may be
+/// the shards of a single split model ([`first_shard_of_complete_set`] says which)
+/// or genuinely different quantizations. What to do about that is each caller's:
+/// serving refuses to pick arbitrarily, sizing falls back to reading the header
+/// from the hub.
 pub(crate) fn hf_checkpoint_gguf_matches(
     paths: &AppPaths,
     checkpoint: &HfCheckpoint,
@@ -1008,7 +1027,7 @@ fn parse_gguf_shard(path: &Path) -> Option<(String, u32, u32)> {
 /// The first shard when `matches` is exactly one complete split model (every shard
 /// of one stem present once), `None` otherwise. Several unrelated files, or an
 /// incomplete set, are still ambiguous or missing and are handled by the caller.
-fn first_shard_of_complete_set(matches: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn first_shard_of_complete_set(matches: &[PathBuf]) -> Option<PathBuf> {
     let shards = matches
         .iter()
         .map(|path| parse_gguf_shard(path).map(|shard| (path, shard)))
@@ -3084,7 +3103,9 @@ mod tests {
         };
         let server = Path::new("runtime/bin/llamacpp/vulkan/llama-build/llama-server");
         let model = Path::new("cache/model-Q4_0.gguf");
-        let command = direct_llama_server_command(&request, server, model);
+        // The recipe names the window, so the host sizing passes `None` here;
+        // see `context_size::direct_context_size_from`.
+        let command = direct_llama_server_command(&request, server, model, None);
         assert_eq!(command.get_program(), server.as_os_str());
         let args = command
             .get_args()
