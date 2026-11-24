@@ -48,6 +48,8 @@ prek install -t pre-push    # heavier checks on push (clippy + tests of the crat
 
 `prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), the module map (`cargo xtask check-architecture-doc`), the e2e scenario naming guard (the `feature-naming` hook, which runs the `feature_naming.rs` test; its comment in `.pre-commit-config.yaml` says when it fires), and the generated files (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`, and the published Doctor catalog, `doctor-catalog.json`).
 
+`prek` shows a passing hook without its output unless the hook is `verbose`, so a hook that skipped reads as passed; the hooks below that can skip say so. `prek run --all-files` runs every commit-stage hook over the whole tree, not the pre-push hooks, and some of them rewrite files, so start from a clean working tree and read the diff it leaves.
+
 The pre-push hooks (`cargo clippy`, the e2e harness clippy, and `cargo test`) check only the crates your push affects: the crates whose files changed plus every crate that depends on them, selected the way CI's `cargo xtask affected` does. Each step prints the scope it chose and why.
 
 The hooks check the whole workspace when:
@@ -84,10 +86,10 @@ cargo xtask pre-push-check test --dry-run --base origin/main
 
 The manifest hooks only run when you change the dependency graph. They *rewrite* the generated file instead of only reporting that it is stale. When that happens, the commit stops so you can re-stage the refreshed file.
 
-The `THIRD_PARTY_NOTICES.txt` hook also needs the pinned generator. Without it, the hook skips and CI remains the gate for that hook, but the AGENTS.md section 8 gate needs it:
+The `THIRD_PARTY_NOTICES.txt` hook needs `cargo-about` at the pinned version. Without it, or at another version, the hook skips; the hook is not `verbose`, so under `prek` the skip is silent, and `cargo xtask tpn --check` run directly fails instead. CI's `third-party-notices` job is the gate. To install it:
 
 ```bash
-cargo install cargo-about@0.9.1 --locked --features cli   # for THIRD_PARTY_NOTICES.txt and `cargo xtask tpn --check`
+cargo install cargo-about@0.9.1 --locked --features cli   # pinned to match the CI third-party-notices job
 ```
 
 The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged. It has no file-type filter, because `hawkeye` always scans the whole working tree per `licenserc.toml`, including untracked files that aren't gitignored. An unrelated unheadered file, even one not yet committed, can therefore block an otherwise unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is.
@@ -105,6 +107,8 @@ The Markdown-links hook (`lychee`) runs on every commit, over the whole reposito
 ```bash
 cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
 ```
+
+The PowerShell hook (`powershell-script-analyzer`) lints `.ps1` files with PSScriptAnalyzer through `cargo xtask powershell-lint`. It skips on a non-Windows host, and on Windows when no PowerShell is found or the one it picks (`pwsh`, else `powershell`) lacks the PSScriptAnalyzer module. The hook is not `verbose`, so under `prek` the skip is silent; `cargo xtask powershell-lint` run directly prints why it skipped. The `powershell-lint` CI job is the gate. To lint locally on Windows, install the module with `Install-Module PSScriptAnalyzer -Scope CurrentUser`; `cargo xtask powershell-lint --shell pwsh` forces a run on another host, where PowerShell Core can report edition-specific differences that do not match CI.
 
 ### Workspace layout
 
@@ -152,7 +156,7 @@ Run the tests with these commands:
 | Rust (all crates) | `cargo test` |
 | Lint and format check | `prek run --all-files` |
 
-See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps. [AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md) has the minimum quality gate; this table lists only some of its commands.
+See the [test guide](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md) for the full set of tests and the [manual testing guide](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md) for manual QA steps. [AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md) says how hooks and CI gate a change, including the end-to-end scenarios that `cargo test` skips.
 
 ## Making changes
 
@@ -161,7 +165,7 @@ To contribute a change:
 1. **Fork** the repository and create a branch from `main`.
 2. **Make your changes.** Keep commits focused, with one logical change per commit.
 3. **Add or update tests** for any new behavior.
-4. **Run at least the minimum quality gate** ([AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md), "Verification Matrix For This Repo"), plus the suites relevant to your change, before opening a PR.
+4. **Install the hooks and run the tests relevant to your change** before opening a PR. CI gates the pull request ([AGENTS.md section 8](https://github.com/ROCm/rocm-cli/blob/main/AGENTS.md)).
 5. **Open a pull request** against `main` with a clear title and description following the Conventional Commits format.
 
 ### Commit signing and sign-off

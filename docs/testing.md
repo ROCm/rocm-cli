@@ -10,7 +10,7 @@ This page collects developer verification commands. The README stays focused on 
 
 ## Local Verification
 
-The minimum quality gate is in [AGENTS.md](../AGENTS.md) section 8.
+How hooks and CI gate a change is in [AGENTS.md](../AGENTS.md) section 8.
 
 `cargo test` runs every test as a thread in **one process**, which is
 also what the `windows-debug` job of the required `windows-build-and-test` lane
@@ -1219,8 +1219,7 @@ no category names, and that is not in the action's `inert` list (files no gated
 job reads, such as `CODE_OF_CONDUCT.md` or the issue templates), turns every
 category on and prints a notice naming the file, so a new kind of file runs the
 full suite until someone adds it to the categories whose jobs read it. Off pull
-requests every category is on. The minimum quality gate in
-[AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
+requests every category is on. `affected` is a CI optimization
 that also narrows the local pre-push hooks (next section).
 
 ### Pre-push hook scope

@@ -92,6 +92,8 @@ Run only the matching lifecycle set for the current host through the harness:
 E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 ```
 
+A green run does not show that every scenario ran: a scenario that resolves to skip, such as an opt-in set whose variable is not set or a capability the host lacks, leaves the run green. The run writes `results/platform.json` (`PlatformManifest` in [`src/expectation.rs`](src/expectation.rs)) with the probed host capability and every scenario's resolution, so a skipped scenario and its reason can be read there. A `-n`/`--tags` filter bypasses that resolution, as described under "Lane verdict" below, and a run with `ROCM_CLI_BINARY` set tests that prebuilt binary instead of building the change.
+
 ## Environment variables
 
 | Variable | Default | Description |
