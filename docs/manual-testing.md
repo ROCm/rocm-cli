@@ -2754,11 +2754,14 @@ Expected result, on the APU host:
 - The closing note names the narrowing *and* says the memory is shared:
   `This GPU has no dedicated VRAM, so that is a ceiling on memory it shares with
   the operating system: how much is free depends on what else is running.`
-- Cross-check the figure it narrowed on -- `rocm model --verbose` prints it, as
-  `reason: shared GPU memory pool N GiB` on each row; the curated listing carries
-  no number -- against `rocm diagnose --model <model>`
-  on the same host — both read the pool through the same classifier, so a
-  disagreement between them is a bug in one of the two call sites.
+- Cross-check the figure it narrowed on -- `rocm model --verbose` prints it as
+  `reason: shared GPU memory pool N GiB`, on each row that declares a minimum;
+  the recipes declaring none say so instead, and the curated listing carries no
+  number at all -- against `rocm diagnose --model <model>` on the same host. Off
+  WSL the two read the pool through the same classifier, so a disagreement is a
+  bug in one of the two call sites. On WSL they are allowed to differ, for the
+  reason `host_model_listing_facts` documents: the listing takes a gfx target as
+  evidence of a GPU, where the diagnosis asks the examination's `rocm_sees_gpu`.
 
 Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
 a GPU the CLI cannot measure, or an APU whose aperture is unreadable — an older

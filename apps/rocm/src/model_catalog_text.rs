@@ -976,6 +976,22 @@ fn append_model_fit_lines(
                     format_gib(available),
                     format_gib(f64::from(required))
                 );
+                // The row a user acts on, and the last place this qualification
+                // was missing. `assess_model_readiness` answers `Degraded` for
+                // this exact host and recipe and never `Ready`, because clearing
+                // a ceiling the operating system also draws on says nothing
+                // about what is free. Without this, `--verbose` reports a bare
+                // `supported` while `rocm diagnose --model` hedges about the
+                // same pair -- and the closing note that carries this everywhere
+                // else in the curated listing has no counterpart in this
+                // renderer.
+                if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+                    let _ = writeln!(
+                        output,
+                        "      note: that pool is shared with the operating system, so how much of it is free depends on what else is running; `rocm diagnose --model {}` weighs the same figure and will not promise more than DEGRADED",
+                        recipe_display_ref(recipe)
+                    );
+                }
                 let _ = writeln!(
                     output,
                     "      action: use /plan serve {} with {}",

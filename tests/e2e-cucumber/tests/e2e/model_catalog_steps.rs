@@ -397,6 +397,18 @@ async fn assert_verbose_names_the_shared_pool(world: &mut E2eWorld) {
         !output.contains("aggregate GPU VRAM"),
         "an integrated GPU has no VRAM, so no row may call its pool that:\n{output}"
     );
+    // The fitting rows are the ones a user acts on, and this renderer has no
+    // closing note to carry the qualification the curated listing ends with.
+    // Without it `--verbose` says a bare "supported" about a pair the diagnosis
+    // will only ever call DEGRADED.
+    assert!(
+        output.contains("gpu_fit: supported"),
+        "the planted host must fit something, or this asserts nothing:\n{output}"
+    );
+    assert!(
+        output.contains("that pool is shared with the operating system"),
+        "a row reported as fitting must say the pool it cleared is shared:\n{output}"
+    );
 }
 
 /// The remedy printed beside a verdict that did not fit. It used to read "use a
