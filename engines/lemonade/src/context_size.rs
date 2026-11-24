@@ -33,7 +33,7 @@
 //! exactly as it would have been and the reason goes to the serve log.
 
 use rocm_core::gguf::parse_gguf_header;
-use rocm_core::gguf_fit::{FitRequest, KvCacheType, estimate_fit};
+use rocm_core::gguf_fit::{CannotEstimateReason, FitRequest, KvCacheType, estimate_fit};
 use rocm_core::gguf_source::{GgufRef, GgufSource, LiveGgufSource, parse_gguf_ref};
 use rocm_core::model_readiness::AcceleratorMemory;
 use rocm_core::{AppPaths, format_http_base_url, http_get_text_with_auth};
@@ -213,16 +213,28 @@ fn window_within_bounds(max_context: Option<u64>) -> Option<u64> {
 }
 
 /// Choose a context for the model at `reference` against a shared pool of
-/// `pool_gib`, or `None` when the header cannot be read or sized, or nothing
-/// larger than [`MIN_COMPUTED_CONTEXT`] fits.
+/// `pool_gib`, or say why none was chosen as the `because ...` clause of
+/// [`announce_unsized`].
+///
+/// The three causes are kept apart because they are not the same news to a user:
+/// a header that could not be read may be a download or a network to retry, a
+/// layout the estimate declines to size is permanent for that model and no
+/// reflection on the host's memory, and a pool too small for
+/// [`MIN_COMPUTED_CONTEXT`] is about this host. Reporting them as one disjunction
+/// tells a reader whose MoE model sized fine on disk that its header is
+/// unreadable or that it does not fit, neither of which happened.
 fn computed_context(
     pool_gib: f64,
     system_ram_gib: Option<f64>,
     source: &dyn GgufSource,
     reference: &GgufRef,
-) -> Option<ComputedContext> {
-    let mut opened = source.open(reference).ok()?;
-    let header = parse_gguf_header(&mut opened.reader).ok()?;
+    described: &str,
+) -> Result<ComputedContext, String> {
+    let mut opened = source
+        .open(reference)
+        .map_err(|_| format!("the GGUF for `{described}` could not be read"))?;
+    let header = parse_gguf_header(&mut opened.reader)
+        .map_err(|_| format!("the GGUF header for `{described}` could not be read"))?;
     let estimate = estimate_fit(
         &header,
         opened.size,
@@ -237,14 +249,66 @@ fn computed_context(
         },
         system_ram_gib,
     );
-    let tokens = window_within_bounds(estimate.max_context)?;
-    Some(ComputedContext {
+    if let Some(reason) = estimate.cannot_estimate_reason {
+        return Err(format!(
+            "the memory `{described}` needs could not be estimated: {}",
+            unmeasurable(reason)
+        ));
+    }
+    let Some(tokens) = window_within_bounds(estimate.max_context) else {
+        let floor = MIN_COMPUTED_CONTEXT;
+        return Err(format!(
+            "no window of at least {floor} tokens fits in the {pool_gib:.1} GiB this integrated \
+             GPU shares with the operating system"
+        ));
+    };
+    Ok(ComputedContext {
         tokens,
         notice: format!(
             "Context window: {tokens} tokens, chosen from the model file and the {pool_gib:.1} GiB \
              of memory this integrated GPU shares with the operating system."
         ),
     })
+}
+
+/// Why [`estimate_fit`] gave no figure to size a window from, in the words the
+/// serve log uses.
+///
+/// Matched exhaustively on purpose: a new [`CannotEstimateReason`] must be given
+/// its own wording here rather than falling into a catch-all that would report
+/// the wrong cause, which is the whole point of the distinction.
+const fn unmeasurable(reason: CannotEstimateReason) -> &'static str {
+    match reason {
+        CannotEstimateReason::HeaderUnreadable => "its GGUF header could not be read",
+        CannotEstimateReason::NotAModel => {
+            "the file named is a multimodal projector, not a language model"
+        }
+        CannotEstimateReason::SplitFile => {
+            "it is one shard of a split model, whose metadata and weights are spread over \
+             several files"
+        }
+        CannotEstimateReason::LatentAttention => {
+            "its KV cache is not heads times head width, which the estimate does not measure"
+        }
+        CannotEstimateReason::NoAttentionLayers => {
+            "no layer in it keeps a KV cache, so a context window sizes nothing"
+        }
+        CannotEstimateReason::UnmeasuredLayout => {
+            "part of its memory is not counted or not measured (state-space or \
+             mixture-of-experts layers), so any window chosen from the total could be too large"
+        }
+        CannotEstimateReason::MissingMetadata => {
+            "its header does not carry a figure the estimate needs"
+        }
+        // The caller states the host's memory itself, so these three cannot be
+        // reached from here; they are the discrete-GPU and unreadable-pool cases
+        // that never get as far as choosing a window.
+        CannotEstimateReason::NoGpu => "no GPU is visible to ROCm",
+        CannotEstimateReason::AcceleratorMemoryUnknown => "this GPU's memory could not be measured",
+        CannotEstimateReason::UnifiedMemoryUnreadable => {
+            "the memory this GPU shares with the operating system could not be read"
+        }
+    }
 }
 
 /// Print the notice and append it to the serve log, where a managed serve (whose
@@ -299,18 +363,18 @@ fn sized_against(
     described: &str,
     log_path: Option<&Path>,
 ) -> Option<ComputedContext> {
-    let Some(computed) = computed_context(pool_gib, host.system_ram_gib, host.source, reference)
-    else {
-        let floor = MIN_COMPUTED_CONTEXT;
-        announce_unsized(
-            &format!(
-                "the GGUF header for `{described}` could not be read, or no window of at least \
-                 {floor} tokens fits in the {pool_gib:.1} GiB this integrated GPU shares with the \
-                 operating system"
-            ),
-            log_path,
-        );
-        return None;
+    let computed = match computed_context(
+        pool_gib,
+        host.system_ram_gib,
+        host.source,
+        reference,
+        described,
+    ) {
+        Ok(computed) => computed,
+        Err(reason) => {
+            announce_unsized(&reason, log_path);
+            return None;
+        }
     };
     announce(&computed.notice, log_path);
     Some(computed)
@@ -445,10 +509,20 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    /// What the serve log calls the model under test, so a reason that names it
+    /// can be told from one that does not.
+    const DESCRIBED: &str = "fake.gguf";
+
     /// A Qwen3-4B-shaped header: 36 layers of 8 KV heads with key and value
     /// width 128, so 147,456 bytes of f16 KV cache per token, and a 262,144
     /// token training context.
     fn qwen_shaped_header() -> Vec<u8> {
+        qwen_shaped_header_with_experts(None)
+    }
+
+    /// The same header, optionally carrying `qwen3.expert_count`, which is what
+    /// makes the parser call the model mixture-of-experts.
+    fn qwen_shaped_header_with_experts(experts: Option<u32>) -> Vec<u8> {
         fn string(out: &mut Vec<u8>, value: &str) {
             out.extend_from_slice(&(value.len() as u64).to_le_bytes());
             out.extend_from_slice(value.as_bytes());
@@ -474,10 +548,14 @@ mod tests {
         ] {
             uint(&mut metadata, key, value);
         }
+        if let Some(experts) = experts {
+            uint(&mut metadata, "qwen3.expert_count", experts);
+        }
+        let entries = 9 + u64::from(u8::from(experts.is_some()));
         let mut bytes = b"GGUF".to_vec();
         bytes.extend_from_slice(&3_u32.to_le_bytes());
         bytes.extend_from_slice(&1_u64.to_le_bytes()); // tensors
-        bytes.extend_from_slice(&9_u64.to_le_bytes()); // metadata entries
+        bytes.extend_from_slice(&entries.to_le_bytes()); // metadata entries
         bytes.extend(metadata);
         string(&mut bytes, "blk.0.attn_q.weight");
         bytes.extend_from_slice(&2_u32.to_le_bytes());
@@ -532,7 +610,7 @@ mod tests {
     #[test]
     fn a_4b_model_on_the_4700u_pool_gets_a_window_the_chat_prompt_fits_in() {
         // The pool `unified_memory.rs` records for the Ryzen 7 4700U.
-        let computed = computed_context(7.7, Some(15.0), &four_b_source(), &reference())
+        let computed = computed_context(7.7, Some(15.0), &four_b_source(), &reference(), DESCRIBED)
             .expect("a 4B model fits in a 7.7 GiB pool");
         assert!(
             computed.tokens > CHAT_PROMPT_TOKENS && computed.tokens < MAX_COMPUTED_CONTEXT,
@@ -545,7 +623,8 @@ mod tests {
     #[test]
     fn the_window_leaves_the_rest_of_the_pool_to_the_operating_system() {
         let pool_gib = 7.7;
-        let computed = computed_context(pool_gib, None, &four_b_source(), &reference()).unwrap();
+        let computed =
+            computed_context(pool_gib, None, &four_b_source(), &reference(), DESCRIBED).unwrap();
         // The weights and the KV cache alone, with none of the allowances the
         // estimate adds on top, stay within three quarters of the pool. The
         // fraction is written out here, not read from `SHARED_POOL_BUDGET`, so a
@@ -557,31 +636,59 @@ mod tests {
 
     #[test]
     fn a_large_pool_is_capped_at_a_chat_sized_window() {
-        let computed = computed_context(96.0, Some(128.0), &four_b_source(), &reference()).unwrap();
+        let computed =
+            computed_context(96.0, Some(128.0), &four_b_source(), &reference(), DESCRIBED).unwrap();
         assert_eq!(computed.tokens, MAX_COMPUTED_CONTEXT);
     }
 
+    /// The three ways no window is chosen must not be reported as each other.
+    /// One disjunction ("could not be read, or does not fit") told a user whose
+    /// mixture-of-experts model sized fine on disk that its header was
+    /// unreadable or that it did not fit, and neither had happened.
     #[test]
-    fn a_pool_the_model_does_not_fit_in_leaves_the_load_to_lemonade() {
-        assert_eq!(
-            computed_context(2.0, Some(4.0), &four_b_source(), &reference()),
-            None
-        );
-    }
+    fn each_reason_for_choosing_no_window_is_reported_as_itself() {
+        let unsized_because = |pool_gib: f64, ram: Option<f64>, source: &dyn GgufSource| {
+            computed_context(pool_gib, ram, source, &reference(), DESCRIBED).expect_err("no window")
+        };
 
-    #[test]
-    fn an_unreadable_header_leaves_the_load_to_lemonade() {
-        assert_eq!(
-            computed_context(7.7, Some(15.0), &UnreadableSource, &reference()),
-            None
+        // Too small a pool: about this host, and only this host.
+        let small = unsized_because(2.0, Some(4.0), &four_b_source());
+        assert!(
+            small.contains("no window of at least") && small.contains("2.0 GiB"),
+            "{small}"
         );
+
+        // Nothing to read: a download or a network to retry.
         let not_gguf = FakeSource {
             header: b"not a gguf file".to_vec(),
             size: GIB,
         };
-        assert_eq!(
-            computed_context(7.7, Some(15.0), &not_gguf, &reference()),
-            None
+        for source in [&UnreadableSource as &dyn GgufSource, &not_gguf] {
+            let unreadable = unsized_because(7.7, Some(15.0), source);
+            assert!(
+                unreadable.contains(DESCRIBED) && unreadable.contains("could not be"),
+                "{unreadable}"
+            );
+            assert!(
+                !unreadable.contains("no window of at least"),
+                "a header that was never read says nothing about what fits: {unreadable}"
+            );
+        }
+
+        // A layout the estimate declines to measure: permanent for that model,
+        // and no reflection on the pool.
+        let moe = unsized_because(
+            7.7,
+            Some(15.0),
+            &FakeSource {
+                header: qwen_shaped_header_with_experts(Some(8)),
+                size: 5 * GIB / 2,
+            },
+        );
+        assert!(moe.contains("mixture-of-experts"), "{moe}");
+        assert!(
+            !moe.contains("could not be read") && !moe.contains("no window of at least"),
+            "the header read fine and no fit verdict was reached: {moe}"
         );
     }
 
@@ -788,7 +895,9 @@ mod tests {
                     size: hundredths_of_a_gib * GIB / 100,
                 },
                 &reference(),
+                DESCRIBED,
             )
+            .ok()
             .map(|computed| computed.tokens)
         };
         assert_eq!(sized(388), Some(MIN_COMPUTED_CONTEXT));

@@ -2388,8 +2388,10 @@ Expected result:
   hundred MiB at best. That is one model on one card, not a bound; a different
   model, GPU or build can land elsewhere. At a size well above what loads, the
   report should say `does not fit` and list what would make it fit.
-- `rocm serve` is unchanged: it takes no context-size option, and the report
-  names llama.cpp's options only as llama.cpp's.
+- `rocm serve` still takes no context-size option, and the report names
+  llama.cpp's options only as llama.cpp's. On an integrated GPU the serve itself
+  does choose a window — see the `Context window:` check below — so the size the
+  report estimated and the size the model is served with need not agree.
 
 Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
 `--context-size`, says a quantization is needed; a repository that does not

@@ -909,11 +909,13 @@ the same argument. The chosen size is written to the service log as
 `Context window: N tokens, ...`.
 
 A recipe that carries its own `--ctx-size` keeps it, and a discrete GPU is not
-affected. Where the window cannot be chosen — the header cannot be read, or the
-model so nearly fills the pool that nothing larger than Lemonade's own 4096-token
+affected. Where the window cannot be chosen — the header cannot be read, the
+model's memory is not something the estimate measures (a mixture-of-experts or
+state-space model, or a header missing a figure the estimate needs), or the model
+so nearly fills the pool that nothing larger than Lemonade's own 4096-token
 fallback fits — the model is served exactly as it would have been, and the
-service log says why on a `Context window: left to the engine to choose,
-because ...` line. The 4096-token floor is deliberate: a smaller computed window
+service log says which of those it was, on a `Context window: left to the engine
+to choose, because ...` line. The 4096-token floor is deliberate: a smaller computed window
 would replace Lemonade's number with a worse one.
 
 #### Compiler toolchain (--devel)
@@ -1487,6 +1489,10 @@ it fit:
 Those are llama.cpp options (`--ctx-size`, `--cache-type-k`/`-v`,
 `--n-gpu-layers`): **`rocm serve` does not take a context size, KV cache type
 or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
+On an integrated GPU `rocm serve` does size the context window itself, from the
+memory the GPU shares with the operating system (see
+[GPUs with no ROCm build](#gpus-with-no-rocm-build)); that window is chosen for
+the host, not for the context size estimated here, so the two can differ.
 
 The estimate is built from these parts:
 

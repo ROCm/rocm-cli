@@ -757,10 +757,13 @@ pub(crate) fn lemonade_model_load_args(
 ///
 /// A `--ctx-size` with no value is left in place for llama-server to reject
 /// rather than guessed at, in all three ways it can lack one: last in the list,
-/// spelled `--ctx-size=` with nothing after the `=`, and followed by another
-/// `--` flag rather than a number. The last is why the next token is inspected
-/// and not merely counted — swallowing it would send Lemonade `--ctx-size
-/// --temperature` and hand llama-server the orphaned `0.5`. All three also leave
+/// spelled `--ctx-size=` with nothing after the `=`, and followed by something
+/// that is not a number. The last is why the next token is inspected and not
+/// merely counted — swallowing it would send Lemonade `--ctx-size --temperature`
+/// and hand llama-server the orphaned `0.5`. The test is that the token parses
+/// as a count, not that it lacks a leading `--`: llama-server's short flags
+/// (`-ngl`, `-fa`, `-b`, `-np`) carry a single dash and would otherwise be
+/// swallowed by the same mistake in a different spelling. All three also leave
 /// [`crate::context_size::recipe_pins_context`] false, so the host sizing still
 /// runs for a recipe that named no usable window.
 pub(crate) fn split_context_size_flag(flags: &[String]) -> (Option<String>, Vec<&str>) {
@@ -774,7 +777,9 @@ pub(crate) fn split_context_size_flag(flags: &[String]) -> (Option<String>, Vec<
             } else {
                 context_size = Some(value.to_owned());
             }
-        } else if flag == "--ctx-size" && iter.peek().is_some_and(|next| !next.starts_with("--")) {
+        } else if flag == "--ctx-size"
+            && iter.peek().is_some_and(|next| next.parse::<u64>().is_ok())
+        {
             context_size = iter.next().map(str::to_owned);
         } else {
             rest.push(flag);
@@ -1499,6 +1504,21 @@ helper line
         assert_eq!(context_size, None);
         assert_eq!(rest, ["--ctx-size", "--temperature", "0.5"]);
 
+        // Followed by a *single*-dash llama-server flag. Excluding only `--`
+        // would consume `-ngl` as the window and orphan its `999`, which is the
+        // `--temperature` bug above wearing llama-server's short spelling.
+        let flags = owned(&["--ctx-size", "-ngl", "999"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size", "-ngl", "999"]);
+
+        // A negative number is not a count either, and llama-server owns the
+        // refusal.
+        let flags = owned(&["--ctx-size", "-1"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size", "-1"]);
+
         // `--ctx-size=` names no value, and must not become `--ctx-size ""`.
         let flags = owned(&["--ctx-size="]);
         let (context_size, rest) = split_context_size_flag(&flags);
@@ -1520,8 +1540,38 @@ helper line
 
     /// The valueless spellings must not reach `lemonade load` as a `--ctx-size`
     /// with a flag or an empty string after it.
+    ///
+    /// The last case carries a *usable* window alongside other flags, so the
+    /// whole test turns on the split actually happening: pass everything through
+    /// untouched — which is what this function did before the split existed, and
+    /// what satisfies the three valueless cases on its own — and that case fails.
     #[test]
     fn a_valueless_context_size_is_passed_through_to_llama_server_untouched() {
+        // A real value is extracted instead of passed through, so "do nothing"
+        // is not an answer that satisfies this test.
+        let pinned = EngineRecipeHint {
+            required_flags: vec![
+                "--temperature".to_owned(),
+                "0.5".to_owned(),
+                "--ctx-size".to_owned(),
+                "8192".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let args =
+            lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", Some(&pinned));
+        assert_eq!(
+            args[args.len() - 5..],
+            [
+                "--save-options".to_owned(),
+                "--ctx-size".to_owned(),
+                "8192".to_owned(),
+                "--llamacpp-args".to_owned(),
+                "--temperature 0.5".to_owned()
+            ],
+            "{args:?}"
+        );
+
         for flags in [
             vec!["--ctx-size".to_owned()],
             vec![
