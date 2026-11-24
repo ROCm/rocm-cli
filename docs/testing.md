@@ -897,8 +897,8 @@ place fails it), so a change of route is caught even when the endpoint still ans
 inference and stops the scenario-owned service. It needs a usable AMD GPU on a
 Lemonade Linux lane (`@requires-gpu`, `@requires-os:linux`,
 `@requires-engine:lemonade`). It has no flaky expectations row, so a route
-regression fails the lane. Of the other direct-route serves, `serve-07` keeps its
-flaky Linux row; `serve-08` has none, so it fails the lane too.
+regression fails the lane. The other direct-route serves, `serve-07` and
+`serve-08`, have no row either, so they fail the lane too.
 
 The daemon's Lemonade contracts in
 [telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
@@ -931,17 +931,15 @@ The dashboard scenarios in
   claims. One remaining model shows its throughput, an empty or unreachable
   server shows no models, and a reload restores both.
 - `dash-lemonade-managed-inference-journey`: a GPU-gated real Lemonade serve and
-  inference followed by dashboard observation. On Linux Lemonade hosts it is
-  expected to be flaky and its serve is bounded by `serve_timeout_secs` (readiness polling; the CLI process is killed only 300 s after that) in
-  [expectations.toml](../tests/e2e-cucumber/expectations.toml). The model must
-  appear as a full row in Observe, and its instance detail must show it READY
-  on the port it was served on. This is real engine acceptance;
-  the protocol fixtures do not prove GPU inference or engine installation.
-  The flaky row matches every lane that can run this scenario, so the whole
-  journey is advisory: its dashboard, instance detail, and post-quit inference
-  checks cannot block a merge. Only the serve step is intermittent, but
-  expectations apply per scenario. It also does not gate the
-  "Lemonade — managed runtime installed" wording.
+  inference followed by dashboard observation. It has no row in
+  [expectations.toml](../tests/e2e-cucumber/expectations.toml), so it is an
+  expected pass on every Linux Lemonade lane that runs it, and a failure of its
+  serve, dashboard, instance detail, or post-quit inference checks fails that
+  lane. The model must appear as a full row in Observe, and its instance detail
+  must show it READY on the port it was served on. This is real engine
+  acceptance; the protocol fixtures do not prove GPU inference or engine
+  installation. It does not gate the "Lemonade — managed runtime installed"
+  wording.
   Unit tests gate that wording instead:
   `managed_installed_verdict_follows_detect_result` in
   [dash.rs](../apps/rocm/src/dash.rs), and the engine pane glyph and verdict
@@ -2105,8 +2103,17 @@ is the `kill/reap failed` branch, which needs an operating system that refuses t
 kill a child it just started.
 
 Use the evidence to distinguish backend startup, download, and router readiness
-failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
-as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+failures. The evidence was added for the Strix Halo Ubuntu investigation of
+ROCMAI-898, first tracked as
+[issue #897](https://github.com/ROCm/rocm-cli/issues/897). Both are closed. #963
+fixed one signature (resolving a registered Lemonade model name when it is
+served directly on Linux), and #1150 serves simple `chat`-labelled registered
+GGUFs directly instead of through Lemonade's router. Before #1150 a serve could
+find port 11435 already taken or come up on another port; #1150's own account
+names a router serve as the likely occupant, but that has not been observed.
+The rows were deleted because of the lane evidence since #1150 (see the
+ROCMAI-898 comment in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml)). A
 backend's ready line does not establish that the router serves the requested
 model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
 managed-launch contract or imply a backend fix.
@@ -4413,12 +4420,12 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper; on a Linux host
-that runs it with lemonade it is an expected failure in
-[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
-not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
-the row also matches other Linux lemonade hosts, where a pass is tolerated).
+(GPU lanes: serving with no watcher enabled starts no helper. It pins lemonade, so
+the Strix Halo Windows and Ubuntu lanes and the MI300X lane, whose default
+engine is vLLM, all serve it with lemonade, and it has no row in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml): the Linux row it
+carried while lemonade serving there was broken (ROCMAI-898) was deleted once the
+fix reached those lanes).
 
 Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
 its HTTP front are tested in
@@ -4481,9 +4488,8 @@ the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
 on the queue nightly), and none of their check names is a required status
 check, so the two unit tests above are the blocking per-PR coverage. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
-unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
-their known serve failure there has not been observed, and a row claiming a
-known bug before one is seen would say something untrue.
+like the managed-Lemonade serves whose ROCMAI-898 rows were deleted (see the
+ROCMAI-898 comment in that file for the evidence and what it does not cover).
 
 An installed vLLM whose compiled extensions (`vllm._C`, `vllm._rocm_C`,
 `vllm._C_stable_libtorch`) do not import against the runtime's torch is listed as

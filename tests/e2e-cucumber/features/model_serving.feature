@@ -933,9 +933,15 @@ Feature: Model serving
   # Linux only: registered names take the router on Windows both with and
   # without the direct llama-server route, so a Windows run cannot tell the
   # two behaviours apart.
-  # No expectations row is added for this scenario. The flaky Linux rows cover
-  # the direct llama-server route, and this scenario takes the router route, so
-  # those rows' failure mode does not describe it. It is nightly-only.
+  # No expectations row is added for this scenario. Its 11.5.1 catalog entry
+  # carries an mmproj file (as `COMPLEX_REGISTERED_MODEL` in serving_steps.rs
+  # records; not checked against the pinned catalog), and #1150, which sent
+  # simple `chat`-labelled registered GGUFs down the direct route, still sends
+  # such an entry to the router. So the lane evidence for deleting the
+  # ROCMAI-898 rows (see expectations.toml) does not cover it. It has failed in
+  # Strix Halo Ubuntu jobs of the Nightly workflow both before and after #1150;
+  # those failures were not diagnosed when the ROCMAI-898 rows were deleted, so
+  # whether it needs a row is not settled. It is nightly-only.
   @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-os:linux @requires-engine:lemonade @nightly
   Scenario: serve-57 - A registered vision GGUF retains the Lemonade router and managed lifecycle
     Given a managed runtime is active
