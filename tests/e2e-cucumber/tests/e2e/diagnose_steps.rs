@@ -5335,7 +5335,7 @@ async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
 
 /// `gfx_target_version` for gfx1151 (Strix Halo), in the kernel's decimal
 /// encoding: major 11, minor 5, step 1.
-const GFX1151_TARGET_VERSION: u32 = 110_501;
+pub(crate) const GFX1151_TARGET_VERSION: u32 = 110_501;
 
 /// `gfx_target_version` for gfx1100 (Radeon RX 7900 / PRO W7900), a discrete
 /// part that `gfx_is_apu_family` does not match.
@@ -5351,7 +5351,7 @@ const GFX1100_TARGET_VERSION: u32 = 110_000;
 /// too. An assertion that the carve-out is absent could then not tell the two
 /// apart. `"4.5 GiB"` can only have come from this fixture. See
 /// [`carve_out_as_rendered`].
-const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+pub(crate) const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
 
 /// A 60 GiB aperture, in bytes: a Strix-Halo-shaped `mem_info_gtt_total`. Far
 /// enough from the carve-out that a verdict reached against the wrong one is
@@ -5379,7 +5379,7 @@ const SECOND_CARD_APERTURE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// `vram_total_bytes` is `None` for the host that reports no VRAM telemetry at
 /// all -- the Linux spelling of a Windows APU with no ROCm build, where
 /// `amd-smi` is not installed and nothing else says how much memory the GPU has.
-fn plant_single_gpu_with_memory(
+pub(crate) fn plant_single_gpu_with_memory(
     world: &mut E2eWorld,
     gfx_target_version: u32,
     vram_total_bytes: Option<u64>,

@@ -276,34 +276,49 @@ async fn an_unmeasured_machine(world: &mut E2eWorld) {
     let _ = world;
 }
 
-/// State that the figure is an integrated GPU's shared ceiling rather than a
-/// discrete card's own memory.
+/// An integrated GPU's shared pool, sized to the same host the small-GPU
+/// scenarios describe, in bytes.
 ///
-/// Separate from the capacity for the same reason the hook is: the two
-/// interesting hosts are "shared, and measured" and "shared, and unreadable",
-/// which one variable cannot express.
-fn plant_shared_pool(world: &mut E2eWorld) {
-    world
-        .command_env
-        .push(("ROCM_E2E_FORCE_GPU_SHARED_POOL", "1".into()));
+/// Matches [`SMALL_GPU_TOTAL_GIB`] so the narrowing asserted here is the one
+/// `model-catalog-06` already asserts, and the only thing differing between the
+/// two scenarios is what kind of memory produced it.
+const SMALL_SHARED_POOL_BYTES: u64 = SMALL_GPU_TOTAL_GIB as u64 * 1024 * 1024 * 1024;
+
+/// Plant a real integrated-GPU machine rather than stating the verdict for one.
+///
+/// `plant_gpu_capacity_gib` cannot describe this host. That hook supplies a
+/// figure and says nothing about where the figure came from, so a scenario built
+/// on it asserts the classification instead of running it: production could map
+/// a shared pool to "dedicated" and such a scenario would stay green. This
+/// plants the sysfs a Strix Halo actually presents -- an APU `gfx_target_version`
+/// on the KFD node, the BIOS carve-out as the VRAM counter, the aperture as
+/// `mem_info_gtt_total` -- under `ROCM_CLI_TEST_HOST_ROOT`, so
+/// `classify_accelerator_memory` runs and the scenario fails when it is wrong.
+///
+/// `aperture_bytes` is `None` for the host whose pool could not be read. That is
+/// a different machine from one nobody measured: the GPU is present and known to
+/// share memory, and only the amount is missing.
+fn plant_integrated_gpu(world: &mut E2eWorld, aperture_bytes: Option<u64>) {
+    crate::e2e::diagnose_steps::plant_single_gpu_with_memory(
+        world,
+        crate::e2e::diagnose_steps::GFX1151_TARGET_VERSION,
+        Some(crate::e2e::diagnose_steps::CARVE_OUT_BYTES),
+        aperture_bytes,
+    );
 }
 
 #[given(
     "a machine whose graphics share memory with the rest of the system, with room for only the smaller models"
 )]
 async fn a_small_shared_pool_machine(world: &mut E2eWorld) {
-    plant_gpu_capacity_gib(world, SMALL_GPU_TOTAL_GIB);
-    plant_shared_pool(world);
+    plant_integrated_gpu(world, Some(SMALL_SHARED_POOL_BYTES));
 }
 
-/// An APU whose aperture could not be read: shared, but with no figure. The
-/// capacity is deliberately not planted, so this is the unmeasured host rather
-/// than a small one.
 #[given(
     "a machine whose graphics share memory with the rest of the system, and that amount cannot be read"
 )]
 async fn an_unreadable_shared_pool_machine(world: &mut E2eWorld) {
-    plant_shared_pool(world);
+    plant_integrated_gpu(world, None);
 }
 
 /// The same question through the assistant's tool, on the same machine.

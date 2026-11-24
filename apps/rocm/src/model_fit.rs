@@ -229,11 +229,16 @@ fn host_accelerator_memory(
 /// not be read still reports `None` and stays unfiltered.
 pub(crate) fn host_model_listing_facts() -> ModelListingHostFacts {
     #[cfg(feature = "e2e-test-hooks")]
-    if let Some((forced_gib, is_shared_pool)) = simulated_listing_gpu_facts() {
+    if let Some(forced_gib) = simulated_listing_gpu_gib() {
         return ModelListingHostFacts {
-            gpu: forced_gib.map(|total_gib| ListingGpuMemory {
-                total_gib,
-                is_shared_pool,
+            // Always a dedicated card: this hook states a figure and nothing
+            // about where it comes from. An APU is not reachable this way and
+            // must not be faked here -- the scenarios that need one plant a real
+            // sysfs host instead, so they run the measurement rather than
+            // bypassing it.
+            gpu: Some(ListingGpuMemory {
+                total_gib: forced_gib,
+                is_shared_pool: false,
             }),
             host_ram_gib: rocm_core::detect_system_ram_gib(),
         };
@@ -332,25 +337,21 @@ impl ListingGpuMemory {
 /// unit tests for the measurement, which this deliberately bypasses rather than
 /// re-stages. Compiled only into the `e2e-test-hooks` binary.
 ///
-/// `ROCM_E2E_FORCE_GPU_SHARED_POOL` states that the figure is an integrated
-/// GPU's shared ceiling rather than dedicated VRAM. It is a separate switch from
-/// the figure because the two combinations that matter are not "one variable
-/// with three values": a shared pool with a figure narrows and is captioned as
-/// shared, and a shared pool *without* one is the APU whose aperture could not be
-/// read, which must stay unfiltered. Set alone, it produces exactly that second
-/// host -- which is why this returns `Some` for it rather than falling through to
-/// a live measurement the mock lane cannot make.
+/// **It states a verdict, so nothing reached through it exercises the
+/// measurement.** That is the trade this hook was always making, and it bounds
+/// what a scenario built on it can prove: a host whose memory is an integrated
+/// GPU's shared pool is *classified* rather than stated, so forcing a figure
+/// here would assert the classification instead of running it. Those scenarios
+/// plant a real sysfs host under `ROCM_CLI_TEST_HOST_ROOT` and go through
+/// `classify_accelerator_memory` like any other machine.
 #[cfg(feature = "e2e-test-hooks")]
-fn simulated_listing_gpu_facts() -> Option<(Option<f64>, bool)> {
-    let forced_total = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .map(f64::from);
-    let forced_shared = std::env::var("ROCM_E2E_FORCE_GPU_SHARED_POOL").is_ok();
-    if forced_total.is_none() && !forced_shared {
-        return None;
-    }
-    Some((forced_total, forced_shared))
+fn simulated_listing_gpu_gib() -> Option<f64> {
+    let total_gib: u32 = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(f64::from(total_gib))
 }
 
 /// The pure classification behind [`host_accelerator_memory`], split out so it
@@ -901,9 +902,9 @@ mod tests {
             "the aperture is the pool and the carve-out is only a label: {result:?}"
         );
         // And it is the aperture, not the 4 GiB carve-out, that a recipe
-        // minimum is compared against -- asserted on the verdict rather than on
-        // `measured_gib`, which is private to `rocm-core`. The carve-out would
-        // refuse this model; the aperture does not.
+        // minimum is compared against -- asserted on the verdict, which is what
+        // a user actually sees, rather than on `measured_gib`. The carve-out
+        // would refuse this model; the aperture does not.
         let registry = rocm_core::builtin_model_recipe_registry();
         let recipe = registry
             .recipes

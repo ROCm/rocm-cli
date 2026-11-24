@@ -487,8 +487,9 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     host_ram_gib: Option<f64>,
 ) -> String {
     // `--verbose` lists every recipe whatever the host is, so the shared-pool
-    // distinction changes nothing it prints: only the figure is used.
-    let aggregate_gpu_vram_gib = gpu_memory.map(|gpu| gpu.total_gib);
+    // distinction never changes *which* rows appear here -- but it does change
+    // what each row's `reason` line calls the figure, so the whole value is
+    // handed down rather than just the number.
     let mut output = String::new();
     let _ = writeln!(output, "{MODEL_CATALOG_VERBOSE_HEADER}");
     let registry = match load_model_recipe_registry() {
@@ -550,13 +551,7 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         }
         append_model_recipe_metadata_lines(&mut output, recipe, paths);
         append_model_host_ram_fit_lines(&mut output, recipe, host_ram_gib);
-        append_model_fit_lines(
-            &mut output,
-            recipe,
-            aggregate_gpu_vram_gib,
-            &host_gpu,
-            paths,
-        );
+        append_model_fit_lines(&mut output, recipe, gpu_memory, &host_gpu, paths);
         append_model_engine_support_lines(&mut output, recipe, paths, &docker_reachable);
         if recipe.trust_remote_code {
             let _ = writeln!(output, "      trust_remote_code: true");
@@ -927,10 +922,22 @@ fn append_model_host_ram_fit_lines(
 fn append_model_fit_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory: Option<ListingGpuMemory>,
     host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
     paths: Option<&AppPaths>,
 ) {
+    let aggregate_gpu_vram_gib = gpu_memory.map(|gpu| gpu.total_gib);
+    // Name what the figure *is*, not only how large it is. An integrated GPU
+    // has no VRAM, so calling its pool that asserts memory private to the card
+    // -- the claim `assess_model_readiness` refuses for this very host, forcing
+    // `Degraded` rather than `Ready`. Before this change an APU reached here
+    // with no figure and took the `unknown` arm; saying the wrong thing is
+    // worse than saying nothing, so the figure arrives labelled.
+    let memory_label = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+        "shared GPU memory pool"
+    } else {
+        "aggregate GPU VRAM"
+    };
     let engine_target = preferred_engine_action_target(recipe, host_gpu, paths);
     match recipe.min_gpu_mem_gb {
         None => {
@@ -952,7 +959,7 @@ fn append_model_fit_lines(
                 let _ = writeln!(output, "      gpu_fit: supported");
                 let _ = writeln!(
                     output,
-                    "      reason: aggregate GPU VRAM {} meets recipe minimum {}",
+                    "      reason: {memory_label} {} meets recipe minimum {}",
                     format_gib(available),
                     format_gib(f64::from(required))
                 );
@@ -967,7 +974,7 @@ fn append_model_fit_lines(
                 let _ = writeln!(output, "      gpu_fit: unsupported");
                 let _ = writeln!(
                     output,
-                    "      reason: aggregate GPU VRAM {} is below recipe minimum {}",
+                    "      reason: {memory_label} {} is below recipe minimum {}",
                     format_gib(available),
                     format_gib(f64::from(required))
                 );
@@ -1472,6 +1479,110 @@ mod tests {
             !dedicated.contains(SHARED_CAVEAT),
             "a discrete card's VRAM is not shared with the OS, so saying it is would be \
              false: {dedicated}"
+        );
+    }
+
+    /// `--verbose` names an integrated GPU's figure for what it is.
+    ///
+    /// Every per-recipe row weighs the same number, so before this the verdict
+    /// lines on an APU and on a discrete card of the same size were byte-for-byte
+    /// identical — both claiming "aggregate GPU VRAM", which is the one phrase
+    /// that asserts memory private to the card. An APU reached these rows with no
+    /// figure at all until the listing started measuring one, so this is a claim
+    /// the change introduced rather than one it inherited.
+    ///
+    /// Both the fits and the does-not-fit verdicts are checked, because they
+    /// build their reason lines separately and only one was wrong at a time while
+    /// this was being fixed.
+    #[test]
+    fn verbose_calls_a_shared_pool_a_pool_and_a_discrete_card_vram() {
+        let minimums = builtin_model_recipes()
+            .iter()
+            .filter_map(|recipe| recipe.min_gpu_mem_gb)
+            .collect::<Vec<_>>();
+        let smallest = f64::from(*minimums.iter().min().expect("a declared minimum"));
+        let largest = f64::from(*minimums.iter().max().expect("a declared minimum"));
+
+        // Above the smallest and below the largest, so one row reaches the
+        // "meets" verdict and another the "is below" verdict in the same render.
+        let figure = (smallest + largest) / 2.0;
+
+        let shared = render_model_registry_verbose_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(figure)),
+            None,
+        );
+        assert!(
+            shared.contains("shared GPU memory pool") && !shared.contains("aggregate GPU VRAM"),
+            "an integrated GPU has no VRAM, so no row may call its pool that: {shared}"
+        );
+
+        let dedicated = render_model_registry_verbose_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(figure)),
+            None,
+        );
+        assert!(
+            dedicated.contains("aggregate GPU VRAM") && !dedicated.contains("shared GPU memory"),
+            "a discrete card's VRAM is its own, and calling it shared would be the same \
+             misstatement in reverse: {dedicated}"
+        );
+    }
+
+    /// The shared-memory caveat reaches the *other* two closing messages too.
+    ///
+    /// Three branches can report a verdict — nothing fits, narrowed with more
+    /// also fitting, and narrowed with no remainder — and only the middle one
+    /// was covered, because both earlier tests happened to pick figures landing
+    /// there. Deleting the caveat from either of the others left every test
+    /// green. The figures are derived from the catalog rather than written down,
+    /// so a recipe added tomorrow cannot silently move a case into an arm it was
+    /// not written for.
+    #[test]
+    fn the_shared_memory_caveat_reaches_the_nothing_fits_and_bare_narrowed_messages() {
+        const SHARED_CAVEAT: &str = "This GPU has no dedicated VRAM";
+
+        let minimums = builtin_model_recipes()
+            .iter()
+            .filter_map(|recipe| recipe.min_gpu_mem_gb)
+            .collect::<Vec<_>>();
+        let smallest = f64::from(
+            *minimums
+                .iter()
+                .min()
+                .expect("the catalog ships recipes with declared GPU minimums"),
+        );
+
+        // Below every declared minimum, so the listing offers nothing.
+        let nothing_fits = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(smallest / 2.0)),
+            None,
+        );
+        assert!(
+            nothing_fits.contains("None of the curated models fit"),
+            "{nothing_fits}"
+        );
+        assert!(
+            nothing_fits.contains(SHARED_CAVEAT),
+            "a host told nothing fits is being told so about a shared ceiling, and the figure \
+             it was judged against has to say so: {nothing_fits}"
+        );
+
+        // Exactly the smallest minimum: the fewest recipes that can still be
+        // offered, which is what empties the "and N more also fit" remainder and
+        // reaches the bare narrowed message.
+        let bare = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(smallest)),
+            None,
+        );
+        assert!(
+            bare.contains(&format!(
+                "Narrowed to what this machine can run. {SHARED_CAVEAT}"
+            )),
+            "the bare narrowed message must carry the caveat immediately, with no remainder \
+             clause between them: {bare}"
         );
     }
 
