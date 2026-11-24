@@ -4802,6 +4802,27 @@ if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_FAILS:-0}" = 1 ]; then
 fi
 "#;
 
+    /// Stands in for `.github/scripts/host-baseline.sh`, which the shared
+    /// preflight runs before either GPU gate. These cases are about the GPU
+    /// gates, so it passes unless `HOST_BASELINE_RC` says otherwise; what the
+    /// real script decides is `host_baseline_contract.rs`'s to drive.
+    ///
+    /// `BASELINE_COUNTER` names a file it appends one line to per call, so a
+    /// case can count how often the preflight ran it. `HOST_BASELINE_HANGS`
+    /// makes it never return, for the `timeout` bound on that call; `exec`
+    /// for the reason `RECLAIM_STUB` gives.
+    #[cfg(unix)]
+    const HOST_BASELINE_STUB: &str = r#"#!/bin/sh
+echo "host-baseline.sh stub called"
+if [ -n "${BASELINE_COUNTER:-}" ]; then echo call >> "$BASELINE_COUNTER"; fi
+if [ "${HOST_BASELINE_HANGS:-0}" = 1 ]; then exec sleep 60; fi
+rc="${HOST_BASELINE_RC:-0}"
+if [ "$rc" != 0 ]; then
+  echo "::error::host baseline not met: stubbed shortfall"
+fi
+exit "$rc"
+"#;
+
     /// What a lane logs when it reached the step that names what holds the GPU.
     #[cfg(unix)]
     const REPORTED_HOLDERS: &str = "reclaim-gpu.sh stub called: --report-holders";
@@ -4852,6 +4873,36 @@ fi
         env: &[(&str, &str)],
         reclaim: &str,
     ) -> (i32, String) {
+        run_preflight_with_scripts(
+            script,
+            shell,
+            fixture,
+            env,
+            reclaim,
+            Some(HOST_BASELINE_STUB),
+        )
+    }
+
+    /// As `run_preflight_with_reclaim`, but with the
+    /// `.github/scripts/host-baseline.sh` the preflight finds supplied by the
+    /// caller too, or left out entirely with `None`.
+    ///
+    /// Three cases call it directly:
+    /// `preflight_fails_when_the_host_baseline_could_not_be_run` leaves the
+    /// script out, so the "missing script" exit is the real one, and
+    /// `preflight_runs_the_real_host_baseline` and
+    /// `preflight_stops_on_the_real_host_baseline_below_the_floor` plant the
+    /// real script, so the two are shown to agree about how it is invoked and
+    /// what it exits, on a host that meets the floor and one below it.
+    #[cfg(unix)]
+    fn run_preflight_with_scripts(
+        script: &str,
+        shell: PreflightShell,
+        fixture: &str,
+        env: &[(&str, &str)],
+        reclaim: &str,
+        baseline: Option<&str>,
+    ) -> (i32, String) {
         use rocm_core::fake_executable::write_fake_executable;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4867,6 +4918,16 @@ fi
         std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
         std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), reclaim)
             .expect("write reclaim-gpu.sh");
+        // …and the host baseline the shared script runs first, named the same
+        // way.
+        if let Some(baseline) = baseline {
+            std::fs::create_dir_all(dir.path().join(".github/scripts")).expect("baseline dir");
+            std::fs::write(
+                dir.path().join(".github/scripts/host-baseline.sh"),
+                baseline,
+            )
+            .expect("write host-baseline.sh");
+        }
 
         let path = format!(
             "{}:{}",
@@ -5615,6 +5676,399 @@ fi
                  Logged:\n{log}"
             );
         }
+    }
+
+    /// A runner below the product's glibc/libstdc++ floor fails the shared
+    /// preflight at once, before `rocm-smi` is asked anything.
+    ///
+    /// The GPU here is healthy and empty, so nothing but the baseline can fail
+    /// this run. The passing half shows the baseline runs FIRST, ahead of the
+    /// first GPU reading, rather than merely somewhere. That it is not retried
+    /// is `preflight_runs_the_host_baseline_once_however_many_polls_it_takes`.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_fails_a_host_below_the_baseline_without_querying_the_gpu() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let counter = dir.path().join("smi-calls");
+        let counter_arg = counter.to_str().expect("utf-8 temp path").to_owned();
+
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[("HOST_BASELINE_RC", "1"), ("COUNTER", counter_arg.as_str())],
+        );
+        assert_eq!(code, 1, "a host below the baseline passed; logged:\n{log}");
+        assert!(
+            log.contains("::error::host baseline not met: stubbed shortfall"),
+            "the baseline's own verdict is missing from the log:\n{log}"
+        );
+        assert!(
+            !counter.exists(),
+            "the preflight queried rocm-smi {} time(s) after the host baseline failed; \
+             it must stop at once. Logged:\n{log}",
+            std::fs::read_to_string(&counter).unwrap_or_default().trim()
+        );
+        assert!(
+            !log.contains("could not be run"),
+            "a baseline that ran and said no was reported as one that never ran:\n{log}"
+        );
+
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[],
+        );
+        assert_eq!(
+            code, 0,
+            "a host meeting the baseline failed; logged:\n{log}"
+        );
+        let baseline = log.find("host-baseline.sh stub called");
+        let pools = log.find("rocm-smi pools (used/total bytes)");
+        assert!(
+            matches!((baseline, pools), (Some(b), Some(p)) if b < p),
+            "the host baseline must run before the first GPU reading; logged:\n{log}"
+        );
+    }
+
+    /// The baseline runs once per preflight, however long the GPU wait goes
+    /// on: the floor describes the host, not the moment, so re-asking it each
+    /// poll would only spend the ceiling.
+    ///
+    /// The GPU stays busy (1 GiB of GTT free against the 8 GiB floor) for the
+    /// whole 7s ceiling, so the loop polls at least twice — the ceiling
+    /// arithmetic is that of
+    /// `apu_preflight_verdict_reflects_the_last_completed_reading` — and a
+    /// baseline moved inside the loop would be counted once per poll. The
+    /// poll count is asserted too, so a ceiling that stopped buying a second
+    /// poll fails here instead of passing vacuously.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_runs_the_host_baseline_once_however_many_polls_it_takes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let baseline_counter = dir.path().join("baseline-calls");
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[
+                (
+                    "BASELINE_COUNTER",
+                    baseline_counter.to_str().expect("utf-8 temp path"),
+                ),
+                ("GPU_PREFLIGHT_CEILING_SECS", "7"),
+            ],
+        );
+        assert_eq!(code, 1, "a GPU that never freed up passed; logged:\n{log}");
+        let polls = log.matches("waiting: 1 GiB GTT free (< 8 GiB)").count();
+        assert!(
+            polls >= 2,
+            "the wait polled {polls} time(s); this case needs two or more to show anything. \
+             Logged:\n{log}"
+        );
+        let baseline_calls = std::fs::read_to_string(&baseline_counter)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            baseline_calls, 1,
+            "the host baseline ran {baseline_calls} time(s) across {polls} polls; it must run \
+             exactly once. Logged:\n{log}"
+        );
+    }
+
+    /// A baseline check that never returns is cut off at its 15s bound and
+    /// fails the preflight, naming the bound.
+    ///
+    /// The bound is pinned in the source first, as the reclaim gate's is in
+    /// `the_shared_preflight_asserts_no_leaked_engine_process_survives`, so a raised
+    /// bound goes red without a run. The run then shows it takes effect: the
+    /// stub sleeps 60s, and an elapsed time under 25s separates "the 15s bound
+    /// cut it short" from "it happened to return" or from a bound twice as
+    /// long. The message names the bound from the same variable the call
+    /// uses, so the two cannot disagree.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_bounds_a_host_baseline_that_never_returns() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        let script = shared_preflight_script();
+        let code_lines: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .collect();
+        assert!(
+            code_lines.contains(&"BASELINE_TIMEOUT_SECS=15"),
+            "{SHARED_PREFLIGHT} no longer bounds the host baseline at 15s \
+             (`BASELINE_TIMEOUT_SECS=15`); a longer bound holds every GPU lane that long \
+             on a host where the check hangs"
+        );
+        let calls: Vec<&str> = code_lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(r#"bash "${BASELINE_SCRIPT}""#))
+            .collect();
+        assert!(
+            !calls.is_empty()
+                && calls
+                    .iter()
+                    .all(|l| l.starts_with(r#"timeout "${BASELINE_TIMEOUT_SECS}" bash"#)),
+            "{SHARED_PREFLIGHT} does not invoke the host baseline as a plain command bounded \
+             by `timeout \"${{BASELINE_TIMEOUT_SECS}}\"`. Found: {calls:?}"
+        );
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let counter = dir.path().join("smi-calls");
+        let started = std::time::Instant::now();
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[
+                ("HOST_BASELINE_HANGS", "1"),
+                ("COUNTER", counter.to_str().expect("utf-8 temp path")),
+            ],
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            code, 1,
+            "a baseline that never returned passed; logged:\n{log}"
+        );
+        assert!(
+            log.contains(
+                "the host baseline check (.github/scripts/host-baseline.sh) could not be run \
+                 — it exited 124 (124 is the 15s bound"
+            ),
+            "the preflight did not report the baseline as cut off at its bound:\n{log}"
+        );
+        assert!(
+            !counter.exists(),
+            "rocm-smi was queried after the baseline timed out; logged:\n{log}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(25),
+            "the preflight took {elapsed:?} against a 15s bound and a stub that sleeps 60s: \
+             the bound did not cut the baseline short"
+        );
+    }
+
+    /// A baseline check that could not be run has shown nothing about the
+    /// host, so it fails the preflight with a message of its own rather than
+    /// passing or borrowing the baseline's "not met" verdict — and, like a
+    /// baseline that said no, before `rocm-smi` is asked anything.
+    ///
+    /// The missing script is really missing: nothing is planted at its path,
+    /// so the 127 is the one `bash` gives for a script it cannot open.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_fails_when_the_host_baseline_could_not_be_run() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        for (rc, baseline) in [
+            ("2", Some(HOST_BASELINE_STUB)),
+            ("127", Some(HOST_BASELINE_STUB)),
+            ("127", None),
+        ] {
+            let what = if baseline.is_some() {
+                format!("a baseline that exited {rc}")
+            } else {
+                "a missing baseline script".to_owned()
+            };
+            let dir = tempfile::tempdir().expect("counter dir");
+            let counter = dir.path().join("smi-calls");
+            let counter_arg = counter.to_str().expect("utf-8 temp path").to_owned();
+            let mut env = vec![("COUNTER", counter_arg.as_str())];
+            if baseline.is_some() {
+                env.push(("HOST_BASELINE_RC", rc));
+            }
+            let (code, log) = run_preflight_with_scripts(
+                &shared_preflight_script(),
+                PreflightShell::DefaultRunStep,
+                &fixture,
+                &env,
+                RECLAIM_STUB,
+                baseline,
+            );
+            assert_eq!(code, 1, "{what} let the preflight pass:\n{log}");
+            assert!(
+                log.contains(&format!(
+                    "the host baseline check (.github/scripts/host-baseline.sh) could not be \
+                     run — it exited {rc}"
+                )),
+                "{what}: the preflight did not say the baseline never ran:\n{log}"
+            );
+            assert!(
+                !counter.exists(),
+                "{what}: the preflight queried rocm-smi {} time(s) afterwards; it must stop \
+                 at once. Logged:\n{log}",
+                std::fs::read_to_string(&counter).unwrap_or_default().trim()
+            );
+        }
+    }
+
+    /// A real-host smoke test: the real `host-baseline.sh` under the real
+    /// preflight, reading this host's own glibc and libstdc++, so the two are
+    /// seen to agree about where the script is, how it is run and what its
+    /// exit means. A stub cannot show that.
+    ///
+    /// The verdict is this host's, so either one is accepted, and each is held
+    /// to its own consequence: a host that meets the floor goes on to the GPU
+    /// gates and passes, and one that does not stops before `rocm-smi` with
+    /// the script's own reason. What neither may be is "could not be run". On
+    /// CI's hosts it is the met path that runs;
+    /// `preflight_stops_on_the_real_host_baseline_below_the_floor` drives the
+    /// other one deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_runs_the_real_host_baseline() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let baseline_path = repo_root().join(".github/scripts/host-baseline.sh");
+        let baseline = std::fs::read_to_string(&baseline_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", baseline_path.display()));
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let dir = tempfile::tempdir().expect("counter dir");
+        let counter = dir.path().join("smi-calls");
+        let counter_arg = counter.to_str().expect("utf-8 temp path").to_owned();
+        let (code, log) = run_preflight_with_scripts(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[("COUNTER", counter_arg.as_str())],
+            RECLAIM_STUB,
+            Some(&baseline),
+        );
+        assert!(
+            !log.contains("could not be run"),
+            "the preflight could not run the real host baseline; logged:\n{log}"
+        );
+        if log.contains("::error::host baseline not met on ") {
+            assert_eq!(code, 1, "a host below the floor passed; logged:\n{log}");
+            assert!(
+                !counter.exists(),
+                "rocm-smi was queried after the real baseline failed; logged:\n{log}"
+            );
+        } else {
+            assert_eq!(
+                code, 0,
+                "this host met the floor and still failed; logged:\n{log}"
+            );
+            let baseline = log.find("host baseline: ");
+            let pools = log.find("rocm-smi pools (used/total bytes)");
+            assert!(
+                matches!((baseline, pools), (Some(b), Some(p)) if b < p),
+                "the real baseline's verdict must come before the first GPU reading; \
+                 logged:\n{log}"
+            );
+        }
+    }
+
+    /// The real `host-baseline.sh` under the real preflight on a host below
+    /// the floor: a planted `getconf` reports glibc 2.37, and a planted
+    /// `ldconfig` points at a libstdc++ that meets its own floor, so glibc is
+    /// the one shortfall. The preflight fails with the script's own verdict
+    /// line and never asks `rocm-smi` anything.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_stops_on_the_real_host_baseline_below_the_floor() {
+        use rocm_core::fake_executable::write_fake_executable;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let baseline_path = repo_root().join(".github/scripts/host-baseline.sh");
+        let baseline = std::fs::read_to_string(&baseline_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", baseline_path.display()));
+        let dir = tempfile::tempdir().expect("stub dir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin dir");
+        let lib = dir.path().join("libstdc++.so.6");
+        std::fs::write(&lib, b"\x7fELF\0GLIBCXX_3.4\0GLIBCXX_3.4.32\0").expect("write libstdc++");
+        write_fake_executable(&bin.join("getconf"), "#!/bin/sh\necho 'glibc 2.37'\n")
+            .expect("plant getconf");
+        write_fake_executable(
+            &bin.join("ldconfig"),
+            format!(
+                "#!/bin/sh\nprintf '\\tlibstdc++.so.6 (libc6,x86-64) => %s\\n' '{}'\n",
+                lib.display()
+            ),
+        )
+        .expect("plant ldconfig");
+        // The counting rocm-smi, on the PATH this case replaces.
+        write_fake_executable(&bin.join("rocm-smi"), SMI_STUB).expect("plant rocm-smi");
+        let os_release = dir.path().join("os-release");
+        std::fs::write(&os_release, "PRETTY_NAME=\"Ubuntu 22.04.5 LTS\"\n").expect("os-release");
+        let counter = dir.path().join("smi-calls");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let (code, log) = run_preflight_with_scripts(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[
+                ("PATH", path.as_str()),
+                ("COUNTER", counter.to_str().expect("utf-8 temp path")),
+                (
+                    "HOST_BASELINE_OS_RELEASE",
+                    os_release.to_str().expect("utf-8 temp path"),
+                ),
+            ],
+            RECLAIM_STUB,
+            Some(&baseline),
+        );
+        assert_eq!(code, 1, "a host on glibc 2.37 passed; logged:\n{log}");
+        assert!(
+            log.lines().any(|l| l
+                == "::error::host baseline not met on Ubuntu 22.04.5 LTS: glibc 2.37 is \
+                    below 2.38 (floor glibc 2.38, GLIBCXX_3.4.32; see README.md)"),
+            "the real baseline's verdict is missing; logged:\n{log}"
+        );
+        assert!(
+            !counter.exists(),
+            "rocm-smi was queried after the real baseline failed; logged:\n{log}"
+        );
     }
 
     /// One path into a holder report, and the reason the preflight still owes
@@ -8205,6 +8659,63 @@ fi
                     "hook `{id}`'s `files: {files}` must match `{path}`"
                 );
             }
+        }
+    }
+
+    /// Every script under `scripts/` or `.github/scripts/` that an xtask
+    /// source names, in a test or a const such as `SHARED_PREFLIGHT`, and that
+    /// exists, sits in the `rust` category of the classify-changes action and not in
+    /// `inert`, and sends `cargo xtask affected` to the whole workspace. No
+    /// crate owns those scripts; without the category the rust-gated jobs skip
+    /// on a pull request that edits only the script, and the tests that read or
+    /// drive it never run there. `every_cross_crate_read_selects_its_reader`
+    /// cannot see these reads, because the path is held in a const or a string
+    /// rather than written out at a `repo_root().join(...)` call.
+    #[test]
+    fn scripts_xtask_tests_read_are_in_the_rust_filter() {
+        use std::collections::BTreeSet;
+
+        let filters = paths_filters(&read_classify_action());
+        let rust = paths_filter(&filters, "rust");
+        let inert = paths_filter(&filters, "inert");
+        let named_pattern =
+            regex::Regex::new(r#""((?:\.github/)?scripts/[A-Za-z0-9_./-]+\.[a-z0-9]+)""#)
+                .expect("script path pattern compiles");
+        let mut named = BTreeSet::new();
+        for entry in std::fs::read_dir(repo_root().join("xtask/src")).expect("xtask/src") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read xtask source");
+            for c in named_pattern.captures_iter(&text) {
+                named.insert(c[1].to_owned());
+            }
+        }
+        assert!(
+            named.contains(".github/scripts/gpu-preflight.sh")
+                && named.contains(".github/scripts/host-baseline.sh"),
+            "the scan must find the scripts the preflight contract tests read; found {named:?}"
+        );
+        let graph = crate::affected::load_graph().expect("read the workspace graph");
+        // A name with no file behind it is a sample path a classification
+        // test feeds the filters (`scripts/README.txt`), not a read.
+        for script in named.iter().filter(|s| repo_root().join(s).is_file()) {
+            assert!(
+                filter_matches(rust, script),
+                "xtask names `{script}`, but the `rust` category in {CLASSIFY_ACTION} does \
+                 not match it, so an edit to it alone skips the tests that read it"
+            );
+            assert!(
+                !filter_matches(inert, script),
+                "xtask names `{script}`, so it cannot be `inert`"
+            );
+            assert_eq!(
+                crate::affected::select_with_readers(std::slice::from_ref(script), &graph),
+                crate::affected::Selection::Workspace,
+                "`{script}` gates the rust jobs on, but `cargo xtask affected` would not run \
+                 the whole workspace for it"
+            );
         }
     }
 
