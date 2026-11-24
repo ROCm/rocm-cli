@@ -22,6 +22,7 @@ pub mod lane_verdict;
 pub mod lemonade_backend;
 pub mod lemonade_diagnostics;
 pub mod lemonade_protocol;
+pub mod lemonade_runtime_evidence;
 pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;
