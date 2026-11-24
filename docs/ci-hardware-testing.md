@@ -46,19 +46,22 @@ been removed from `nightly.yml`: they never got a runner. The queue (below) is
 the scheduled run of R9700 (`r9700s`), MI350P (`mi350p`) and W7900
 (`w7900-dual`). The decommissioning of the runners themselves is separate.
 
-A pull request now runs on one Linux GPU silicon and one Windows GPU pool.
-The Linux silicon is MI300X, checked twice:
+A pull request now runs on one Linux GPU target (gfx942) and one Windows GPU pool.
+The Linux target is checked twice, on two different parts:
 
 - `e2e-gpu-queue`, the primary, dispatches `queue-pr-run.yml` on the shared GPU
-  queue and publishes the queue run's release report as the `e2e-gpu-report`
-  cell.
+  queue, where the run is on an MI325X (the same gfx942 target as the MI300X),
+  and publishes the queue run's release report as the
+  `e2e-gpu-report` cell. The report labels that cell MI300X: an MI325X lane
+  probes as `mi300x`, and the nightly's self-hosted MI300X lane shares the name.
 - `e2e-gpu`, the second, runs on the self-hosted MI300X runner and reports as
   `e2e-gpu-selfhosted-report`.
 
-Either lane satisfies the MI300X requirement of a pull request, and the queue is
+Either lane satisfies the gfx942 requirement of a pull request, and the queue is
 the one to count on: the self-hosted runners can sit at zero replicas. The
 `E2E consolidated report (self-hosted)` job decides it
-([`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh)): MI300X counts as passed
+([`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh), named from when the queue
+lane was an MI300X too): gfx942 counts as passed
 only when at least one lane passed **with an exported report**; a self-hosted
 lane that was cancelled, skipped or never got a runner counts as absent, not
 failed; a lane that ran and failed still fails the check; and when neither lane
@@ -70,13 +73,14 @@ force-cancel (a plain cancel leaves the queued job alive: its `if` is `always()`
 The force-cancel ends that job's own run, so the canceller shows as cancelled
 too. On a push, a release push, a
 dispatch, or a fork or dependabot pull request, which have no queue lane and
-no other MI300X signal, the queue deadline is 4 hours, not 30 minutes, and a lane
+no other gfx942 signal, the queue deadline is 4 hours, not 30 minutes, and a lane
 that ran without a report, one that never got a runner, or an unreadable result
 (the settle job failed) fails there. A re-run of only the failed jobs does
 not refresh the report after a self-hosted failure, as `e2e-gpu-settled` has
 already succeeded: re-run all jobs for that.
 
-vLLM is the effective engine on both; MI300X is the only silicon where it is.
+vLLM is the effective engine on both; gfx942 (MI300X and MI325X) is the only target
+of a pull request that runs it.
 The Windows pool is the Strix Halo pool (`e2e-gpu-strix-windows` and
 `e2e-wsl`). The Strix Halo
 Ubuntu lane (`e2e-gpu-strix-ubuntu`) no longer starts on `pull_request` or in
@@ -198,7 +202,7 @@ On `pull_request` and `merge_group`, `e2e-gpu-strix-ubuntu` is skipped; it still
 runs on `push` and dispatch. Over 7 days 35% of its merge-queue jobs (98 of 281)
 were cancelled at the 45 min cap; the check is not required and the queue does
 not wait for it. On a
-PR the other lanes above run: MI300X (`e2e-gpu`, beside the queue gate
+PR the other lanes above run: MI300X (`e2e-gpu`, beside the MI325X queue gate
 `e2e-gpu-queue` described earlier) and the Windows Strix Halo pool.
 
 The last column is the lane's declaration of whether it has a GPU. On a lane
@@ -277,7 +281,7 @@ cancel, while a fork PR (an external contributor, whose hardware lanes are held
 for approval where the repository setting requires it, with a read-only token) just has `e2e-gpu`
 skip its steps and the rest of its run continue. A failed cancel is tolerated.
 The consolidated report does not count a lane that skipped itself as a missing
-report: the lane uploads an `mi300x-stale-run` marker, which the MI300X check reads
+report: the lane uploads an `mi300x-stale-run` marker, which the gfx942 check reads
 as an absent lane. `e2e-report` is gated on `always()`, so it
 still runs after the cancel, but its missing-report check is gated on
 `!cancelled()` and is skipped in a cancelled run. The exemption is therefore for
@@ -378,7 +382,7 @@ or a `build-and-test` that reached no verdict) `E2E tests` runs no scenario and
 concludes `success`, so this check reports
 success and gates nothing beyond what `E2E tests` does;
 `e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
-pull request runs only the MI300X (queue and self-hosted) and Windows Strix Halo pool lanes among them);
+pull request runs only the gfx942 (MI325X queue and MI300X self-hosted) and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
 platforms (it adds MI300X's `e2e-gpu-nightly` and the Strix Halo Ubuntu,
 Windows and WSL2 nightly lanes) with the `@nightly` scenarios included. The
@@ -572,9 +576,9 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 - Strix Halo is `gfx1151` on every OS, so all three Strix lanes
   (Ubuntu, Windows, WSL2) and their nightly counterparts are lemonade-only —
   no matrix value turns a Strix lane into a vLLM lane.
-- MI300X is the only silicon where vLLM is the effective engine, so the
-  per-PR vLLM lanes are the two MI300X checks: `e2e-gpu-queue` (on the queue)
-  and `e2e-gpu` (self-hosted).
+- gfx942 is the only per-PR target where vLLM is the effective engine, so the
+  per-PR vLLM lanes are the two gfx942 checks: `e2e-gpu-queue` (an MI325X on the
+  queue) and `e2e-gpu` (a self-hosted MI300X).
 - Adding a vLLM lane to the default-engine lanes above means adding hardware
   from a vLLM-eligible family, not adding an `engine:` value to a workflow
   matrix. A scenario that needs a specific engine regardless of host pins it
@@ -595,8 +599,8 @@ action that `ci.yml`'s `changes` job uses too, so both workflows read one
 definition of each category. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
-`@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
-silicon (`e2e-gpu-queue` and `e2e-gpu`): they run only on the Windows Strix Halo and WSL2 lanes (both set
+`@merge-queue` serves therefore no longer run on gfx942, the only per-PR vLLM
+target (`e2e-gpu-queue` and `e2e-gpu`): they run only on the Windows Strix Halo and WSL2 lanes (both set
 `E2E_MERGE_QUEUE` for `merge_group`), and the only vLLM serve
 before a change lands is the per-PR canary (`serve-05`), which runs when the
 `serve` filter matches. **The merge queue has no native Linux GPU lane**: MI300X
@@ -883,7 +887,7 @@ regression shows red instead of always green. Their results also surface in
 the self-hosted consolidated report for visibility. A lane that ran but uploaded
 no report (it died before writing its results) fails the consolidated report
 job, naming the lane, rather than silently dropping out of the grid (a lane that
-skipped itself as stale is the exception, and the two MI300X lanes of a pull
+skipped itself as stale is the exception, and the two gfx942 lanes of a pull
 request are decided together by `mi300x-gate.sh`, see above); on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
