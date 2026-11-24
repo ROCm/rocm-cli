@@ -377,6 +377,12 @@ struct ServerState {
     /// `Some` only when started via [`MockServer::start_with_tool_call`]; makes
     /// the chat route answer one user turn with a tool call instead of text.
     tool_call: Option<Arc<ScriptedToolCall>>,
+    /// `Some` only when started via
+    /// [`MockServer::start_refusing_as_context_overflow`]; every chat completion
+    /// is answered with HTTP 400 and this body instead of a reply. Consulted
+    /// after the request has been recorded, so the history still holds what the
+    /// client sent.
+    chat_refusal: Option<Arc<Value>>,
 }
 
 /// A tool call the mock model makes in reply to a user turn containing
@@ -540,6 +546,7 @@ impl MockServer {
             completion_requests: Arc::clone(&completion_requests),
             chat_script: None,
             tool_call: None,
+            chat_refusal: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -585,6 +592,7 @@ impl MockServer {
             completion_requests: Arc::clone(&completion_requests),
             chat_script: None,
             tool_call: None,
+            chat_refusal: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -672,6 +680,7 @@ impl MockServer {
             completion_requests: Arc::clone(&completion_requests),
             chat_script: None,
             tool_call,
+            chat_refusal: None,
         };
 
         let mut app = Router::new()
@@ -720,6 +729,7 @@ impl MockServer {
             completion_requests: Arc::clone(&completion_requests),
             chat_script: Some(Arc::new(script)),
             tool_call: None,
+            chat_refusal: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -761,6 +771,68 @@ impl MockServer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// A server that serves a model but refuses every chat completion the way
+    /// a llama.cpp-backed endpoint refuses a request larger than the context
+    /// window it was loaded with: HTTP 400 carrying its own
+    /// `exceed_context_size_error` body, with the two token counts in it.
+    ///
+    /// `/v1/models` still answers normally, so the CLI discovers and offers the
+    /// endpoint exactly as it would a healthy one and the refusal lands on the
+    /// user's own turn rather than on discovery. Plant the service record with
+    /// `ServiceRecordOptions { inference_verified: true, .. }` for the same
+    /// reason a scripted mock does: without the latch the CLI's readiness check
+    /// sends its own `Say ok.` completion, which this server would also refuse,
+    /// and the model would be demoted before the scenario starts.
+    ///
+    /// The body shape is a real one, not an invention -- it is the body behind
+    /// `CONTEXT_OVERFLOW_ERROR` in
+    /// `crates/rocm-dash-tui/src/app/chat_runtime.rs`, whose unit tests
+    /// fabricate it instead of receiving it. Change the two together.
+    pub async fn start_refusing_as_context_overflow(
+        model_name: &str,
+        prompt_tokens: u64,
+        context_tokens: u64,
+    ) -> Self {
+        let last_chat_request = Arc::new(Mutex::new(None));
+        let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let completion_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = ServerState {
+            model_name: model_name.to_string(),
+            metrics: None,
+            scripted_metrics: None,
+            last_chat_request: Arc::clone(&last_chat_request),
+            chat_paths: Arc::clone(&chat_paths),
+            completion_requests: Arc::clone(&completion_requests),
+            chat_script: None,
+            tool_call: None,
+            chat_refusal: Some(Arc::new(json!({
+                "error": {
+                    "code": 400,
+                    "message": format!(
+                        "request ({prompt_tokens} tokens) exceeds the available context size \
+                         ({context_tokens} tokens), try increasing it"
+                    ),
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": prompt_tokens,
+                    "n_ctx": context_tokens,
+                }
+            }))),
+        };
+        let app = Router::new()
+            .route("/v1/models", get(handle_models))
+            .route("/models", get(handle_models))
+            .route("/v1/chat/completions", post(handle_chat))
+            .route("/chat/completions", post(handle_chat))
+            .with_state(state);
+        Self {
+            server: http_server::spawn(app).await,
+            last_chat_request,
+            chat_paths,
+            completion_requests,
+            scripted: None,
+        }
     }
 
     /// A server that is reachable but rejects every request with `503`.
@@ -1143,6 +1215,12 @@ async fn handle_chat(
         history.push(body);
         history.len() - 1
     };
+
+    // After the recording above, so a refused completion still leaves behind
+    // what the client sent.
+    if let Some(refusal) = &state.chat_refusal {
+        return (StatusCode::BAD_REQUEST, Json((**refusal).clone()));
+    }
 
     if let Some(script) = &state.chat_script {
         return script.get(index).map_or_else(

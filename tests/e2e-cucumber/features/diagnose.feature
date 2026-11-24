@@ -1310,3 +1310,29 @@ Feature: Diagnosing failures and listing fixes
     And a user asking about a small GGUF file on this machine
     When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
     Then the estimate is compared against the shared pool's ceiling, and says the pool is shared
+
+  # The host the pool read exists for, and the one none of diagnose-81 to
+  # diagnose-86 describes: a machine where nothing reports the GPU's memory at
+  # all. That is a Windows laptop whose integrated GPU has no ROCm build --
+  # `amd-smi` ships inside the SDK, so an unsupported part has no telemetry to
+  # read a carve-out from. Such a host used to be told "the GPU memory on this
+  # host could not be read", with a plan whose one step was to run the telemetry
+  # it does not have; every one of those machines got the same dead end.
+  #
+  # The pool the GPU shares is a different counter and is readable without any
+  # of that, and the kernel topology still names the part, which is what says
+  # the pool belongs to a GPU that allocates from it rather than to a discrete
+  # card beside it. So the answer is a verdict against the pool, as on any other
+  # integrated GPU.
+  #
+  # Simulated as the same APU and the same 60 GiB pool diagnose-81 plants, with
+  # every VRAM counter taken away: that is the Linux spelling of the shape, so
+  # it runs on lanes that have no Windows APU. Linux-gated for the reason
+  # diagnose-81 is -- the simulation seam re-roots Linux paths only.
+  @id:diagnose-model-an-apu-with-no-memory-telemetry-is-still-measured @requires-os:linux
+  Scenario: diagnose-87 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
+    Given a machine whose only GPU shares system memory and reports no memory telemetry
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the pool the GPU shares
+    And the model is reported as degraded, because the pool is shared rather than set aside
