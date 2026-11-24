@@ -90,7 +90,7 @@ repos:
     hooks:
       - id: license-headers
         name: license header check (hawkeye)
-        entry: hawkeye check --config licenserc.toml
+        entry: hawkeye check --config licenserc.toml --fail-on-unknown
         language: system
         always_run: true # hawkeye always scans licenserc.toml's full file list regardless
                           # of what changed (pass_filenames: false below); a file-type
