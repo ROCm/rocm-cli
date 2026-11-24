@@ -1325,6 +1325,37 @@ Feature: Diagnosing failures and listing fixes
     Then the text report compares the estimate with the shared pool's ceiling and says the pool is shared
     And the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked
 
+  # WSL2 mounts /dev/shm with no size limit of its own, so it gets the kernel's
+  # default of half the VM's memory -- not the 64 MB a container starts with.
+  # The CLI and the docs used to say WSL2 ships that container default, which
+  # sent a WSL user who read the fix looking for a shortage their machine did
+  # not have. The check itself always read the measured size. What this checks
+  # is that the diagnosis agrees with the machine in front of it, and that the
+  # reason the fix prints says only one thing about WSL2, the pinned sentence
+  # that it gives /dev/shm half the VM's memory -- a wording pin; the first
+  # step's measurement is what shows that sentence true of this machine. The
+  # fix is still offered on WSL2, because a container in the distro, a small
+  # VM or a remount can shrink the allowance; the unit test
+  # `on_wsl2_the_shm_finding_follows_the_measured_allowance_not_a_container_default`
+  # holds that a shrunk allowance there is still reported.
+  #
+  # @requires-wsl, not @requires-os:linux: the premise is WSL2's own default, and
+  # a bare-metal lane would be asserting something about a different platform.
+  # The first step measures the allowance and the VM's memory itself, and fails
+  # with both figures when the allowance is not about half the memory (a
+  # remount) or is under 1 GiB (a VM given about 2 GB or less), so such a lane
+  # says why.
+  @id:diagnose-wsl-usual-shared-memory-is-not-reported-short @requires-wsl
+  Scenario: diagnose-88 - A WSL machine with its usual shared memory is not told it is short, and the fix explains what WSL2 gives it
+    Given a WSL machine whose shared memory is the usual half of its memory
+    When the user asks for a diagnosis without pasting an error, in machine-readable form
+    Then the shared memory allowance is not reported as too small
+    When the user asks the CLI to apply the fix for a shared memory allowance that is too small
+    Then the CLI explains that it will not make the change itself
+    And nothing on the machine is changed
+    And this machine's shared memory allowance is what it was
+    And the reason the fix gives says WSL2 normally gives half the VM's memory
+
   # The host the pool read exists for, and the one none of diagnose-81 to
   # diagnose-87 describes: a machine where nothing reports the GPU's memory at
   # all. That is a Windows laptop whose integrated GPU has no ROCm build --
@@ -1344,7 +1375,7 @@ Feature: Diagnosing failures and listing fixes
   # it runs on lanes that have no Windows APU. Linux-gated for the reason
   # diagnose-81 is -- the simulation seam re-roots Linux paths only.
   @id:diagnose-model-an-apu-with-no-memory-telemetry-is-still-measured @requires-os:linux
-  Scenario: diagnose-88 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
+  Scenario: diagnose-89 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
     Given a machine whose only GPU shares system memory and reports no memory telemetry
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form

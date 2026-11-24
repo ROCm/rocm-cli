@@ -843,7 +843,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-19-shm-too-small",
         title: "Raise the shared memory allowance",
-        rationale: "A serving workload needs gigabytes of /dev/shm; a container gives it 64 MB by default, and WSL2 ships the same default. When the allowance runs out the workload crashes without the message ever naming shared memory -- a data-loader worker killed by a bus error, or a failed write to a temporary file -- so there is no route from what the user sees back to the cause.",
+        rationale: "A serving workload needs gigabytes of /dev/shm; a container gives it 64 MB by default. WSL2 normally gives /dev/shm half the VM's memory, but it can still be short there inside a container, in a VM given little memory, or after a remount. When the allowance runs out the workload crashes without the message ever naming shared memory -- a data-loader worker killed by a bus error, or a failed write to a temporary file -- so there is no route from what the user sees back to the cause.",
         // Two situations, one cause. A running container cannot be resized, so
         // the container case is a restart rather than a command that changes
         // this machine; the host case is a remount plus the fstab line that
@@ -869,7 +869,8 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         ],
         doc_url: None,
         // Not `PRINT_ON_LINUX`: the size of a tmpfs has nothing to do with the
-        // amdgpu module, and WSL2 ships the same 64 MB default a container does.
+        // amdgpu module, and a WSL2 distro can be short of it too: inside a
+        // container, in a VM given little memory, or after a remount.
         // Print-only on both because every remedy above needs sudo.
         applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
@@ -1174,6 +1175,13 @@ pub(crate) fn recipe_verify_notes_and_run_commands(
 #[cfg(test)]
 pub(crate) fn recipe_linux_verify(fix_id: &str) -> Option<&'static str> {
     find_recipe(fix_id).and_then(|recipe| recipe.verify_linux)
+}
+
+/// Test-only: the rationale `rocm fix <fix_id>` prints, when the recipe exists.
+/// Lets a checker's tests hold the printed reason to the behaviour they pin.
+#[cfg(test)]
+pub(crate) fn recipe_rationale(fix_id: &str) -> Option<&'static str> {
+    find_recipe(fix_id).map(|recipe| recipe.rationale)
 }
 
 /// What one Windows shell did with a line typed into it.

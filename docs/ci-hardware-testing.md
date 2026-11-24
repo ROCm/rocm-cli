@@ -366,7 +366,17 @@ without the passthrough runs the non-GPU suite and reports the GPU scenarios as
 not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
-covers the mock platform;
+covers the mock platform and is a required check, so it also carries a verdict:
+its last step fails unless the `E2E tests` job concluded `success`. That is the
+24.04 leg of the `e2e` matrix and the one required check; the step reads it from
+the run's job list, not from `needs.e2e.result`, which aggregates both legs and
+would make the non-required 26.04 leg block merges through this check. The step
+fails closed when the job list cannot be read or no single job has that name,
+and the job is produced whenever `e2e` is: when the lane's gate decides not to
+run (a pull request matching no heavy path, a `clippy` that did not succeed,
+or a `build-and-test` that reached no verdict) `E2E tests` runs no scenario and
+concludes `success`, so this check reports
+success and gates nothing beyond what `E2E tests` does;
 `e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
 pull request runs only the MI300X (queue and self-hosted) and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
@@ -913,8 +923,9 @@ check names these jobs always had, and three of those are required
 `remote control channel (containerised)` is not required on either image. The
 26.04 legs report with an `(ubuntu-26.04)` suffix, and none of those names is a
 required check yet (confirmed 2026-11-02), so a failure that occurs only on
-26.04 shows red but does not block a merge. Making 26.04 blocking takes an
-admin adding `build-and-test (ubuntu-26.04)`,
+26.04 shows red but does not block a merge. `E2E consolidated report` follows
+the 24.04 `E2E tests` job only, so a failure on 26.04 alone leaves it green.
+Making 26.04 blocking takes an admin adding `build-and-test (ubuntu-26.04)`,
 `Test (affected crates) (ubuntu-26.04)` and `E2E tests (ubuntu-26.04)` to the
 required list.
 

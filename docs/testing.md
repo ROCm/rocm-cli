@@ -6514,6 +6514,37 @@ Windows:
 cargo xtask e2e -- -n '(diagnose-48)'
 ```
 
+### Shared memory on WSL2
+
+`fix-19-shm-too-small` reports a `/dev/shm` below 1 GiB on Linux and WSL2.
+WSL2 mounts `/dev/shm` with no size limit of its own, so it gets the kernel's
+default of half the VM's memory, not the 64 MB a container starts with; the
+entry fires there only inside a container, in a small VM, or after a remount.
+The unit test
+`on_wsl2_the_shm_finding_follows_the_measured_allowance_not_a_container_default`
+in [engine.rs](../crates/rocm-core/src/diagnose/engine.rs) holds both halves on
+a simulated WSL2 host: a usual allowance is not reported, a shrunk one is, and
+the rationale's only mention of WSL is one pinned sentence, that WSL2 gives
+`/dev/shm` half the VM's memory. That last part is a wording pin, so rewording
+the rationale means updating it there and in the e2e step below.
+
+`diagnose-88` (`@requires-wsl`) runs the same on a real distro. It measures
+`/dev/shm` and `MemTotal` itself, with `df` and `/proc/meminfo`, and fails with
+both figures when the allowance is not about half the memory (a remount) or is
+under 1 GiB (a VM given about 2 GB or less), so such a lane says why rather
+than failing on a finding that is correct for it. It then requires
+`rocm diagnose --json` not to report the entry, `rocm fix fix-19-shm-too-small`
+to print the plan, exit 0 and leave `/dev/shm` as it was, and the printed
+reason to mention WSL only in the same pinned sentence as the unit test.
+That last step pins wording only; the opening
+measurement is what shows the sentence true of the machine.
+Run it only inside a WSL2 distro, selected by its `@id` so the harness's own
+gates still apply (a `-n` name filter would bypass them):
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-wsl-usual-shared-memory-is-not-reported-short cargo xtask e2e
+```
+
 ## Symptom From A File Or Standard Input
 
 `rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
@@ -6758,7 +6789,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   integrated-GPU hardware. The planted pool is far larger than the tiny file, so
   only the "fits" polarity is exercised there.
 
-  `diagnose-88` covers the host none of the others describe: one where nothing
+  `diagnose-89` covers the host none of the others describe: one where nothing
   reports the GPU's memory at all. That is a Windows laptop whose integrated GPU
   has no ROCm build, since `amd-smi` ships inside the SDK and an unsupported
   part has no telemetry to read a carve-out from. Such a host used to be told

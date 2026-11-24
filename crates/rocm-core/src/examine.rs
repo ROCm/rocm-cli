@@ -610,8 +610,9 @@ impl Examination {
             probe_env(&mut e);
             probe_container(&mut e);
             probe_framework(&mut e, framework, interpreter);
-            // WSL2 ships the same 64 MB default a container does, so this is one
-            // of the platforms where the shortage is most likely to be real.
+            // WSL2 normally gives /dev/shm half the VM's memory, but a container
+            // inside the distro, a small VM or a remount can still leave it
+            // short, and the checker reads the measured size.
             probe_shared_memory(&mut e);
             // A wheel copy and a system copy collide on WSL2 exactly as they do
             // on bare metal, so skipping the search here would leave a WSL user
