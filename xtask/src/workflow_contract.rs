@@ -13711,7 +13711,9 @@ permissions:
     const QUEUE_NIGHTLY_REFUSAL: &str = "nightly:";
     const QUEUE_REPORT_PATH: &str = "mi325x/release/results/report.json";
     /// The lane the queue side ran pull requests on before it moved to mi325x: the
-    /// gate still reads it, so either order of the two deployments works.
+    /// gate still reads it, so either order of the two deployments works. Only the
+    /// mock runs, which are Unix-only, use it.
+    #[cfg(unix)]
     const QUEUE_REPORT_PATH_BEFORE_MI325X: &str = "mi300x/release/results/report.json";
 
     /// One run of the gate's script against a mock `gh`: what to answer and what
