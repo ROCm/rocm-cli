@@ -46,7 +46,7 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests of the crates the push affects)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), the module map (`cargo xtask check-architecture-doc`), and the generated files (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`, and the published Doctor catalog, `doctor-catalog.json`).
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), the module map (`cargo xtask check-architecture-doc`), the e2e scenario naming guard (the `feature-naming` hook, which runs the `feature_naming.rs` test; its comment in `.pre-commit-config.yaml` says when it fires), and the generated files (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`, and the published Doctor catalog, `doctor-catalog.json`).
 
 The pre-push hooks (`cargo clippy`, the e2e harness clippy, and `cargo test`) check only the crates your push affects: the crates whose files changed plus every crate that depends on them, selected the way CI's `cargo xtask affected` does. Each step prints the scope it chose and why.
 
@@ -59,7 +59,7 @@ The hooks also add the crates whose tests read files from outside their own crat
 
 - Any Rust file adds `xtask`, whose contract tests scan every source file.
 - `README.md`, `docs/`, and `skills/` add `rocm` and `xtask`.
-- `skills/rocm-doctor/` adds `e2e-cucumber`, which the hooks only lint. The hook's `cargo test` never includes `e2e-cucumber`, so the hook never runs its `skill_reference` test. CI runs it in the Linux test job and in the Windows debug job, whose build and test steps run for any change under `skills/`.
+- `skills/rocm-doctor/` adds `e2e-cucumber`, which the pre-push hooks only lint. The pre-push `cargo test` step never includes `e2e-cucumber`, so it never runs its `skill_reference` test. CI runs it in the Linux test job and in the Windows debug job, whose build and test steps run for any change under `skills/`.
 
 A push that changes no Rust file runs none of the cargo steps, whatever else it changes (a lockfile-only push included), except that a change to `clippy.toml` runs the two clippy steps.
 

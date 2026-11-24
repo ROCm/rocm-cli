@@ -181,7 +181,9 @@ the same `<key>-01` index twice, which is exactly what the key exists to prevent
 
 `tests/feature_naming.rs` enforces all of this (sequential, unique suite-wide,
 feature-qualified ids) in the ordinary `cargo test` run. Adding a feature file
-means adding its key to `FEATURE_KEYS` there.
+means adding its key to `FEATURE_KEYS` there. The `feature-naming` hook in
+[.pre-commit-config.yaml](../../.pre-commit-config.yaml) runs `feature_naming.rs`
+at commit time; its comment there says which staged paths fire it.
 
 Scenarios carry stable-id and capability tags:
 

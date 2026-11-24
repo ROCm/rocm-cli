@@ -1162,8 +1162,8 @@ jobs:
     # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
     # `--no-group local-tools` skips the hooks that need a full Rust compile,
     # hawkeye, lychee, PowerShell, or commit-history/signing access — those have
-    # their own jobs (clippy, build-and-test, license-headers, docs-links,
-    # powershell-lint, commit-signatures).
+    # their own jobs (clippy, test, windows-debug, license-headers, docs-links,
+    # powershell-lint, third-party-notices, commit-signatures).
     name: prek (lint / hygiene)
     runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 20
