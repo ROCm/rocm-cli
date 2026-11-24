@@ -368,9 +368,12 @@ spots â€” such as the paragraph on the unused `fix-20` number under the table â€
 is not parsed, so it can drift without failing anything here.
 [skill_reference.rs](tests/skill_reference.rs) checks outside this feature the
 catalog table's vocabulary, the failure-mode count in the catalog heading,
-SKILL.md's "The other N ... print-only" count, and the exit-code and `fix` field
-names SKILL.md lists. Some sentences in SKILL.md are therefore fixtures:
-skill_reference.rs's module doc lists every one and says which test reads it.
+SKILL.md's "The other N ... print-only" count, and the exit-code, `fix` field
+and `fix.class` names SKILL.md lists. Some sentences in SKILL.md are therefore
+fixtures, found by the phrases in `e2e_cucumber::skill_anchors`
+([src/lib.rs](src/lib.rs)); skill_reference.rs's module doc says which test reads
+each, and a self-test there fails when a phrase listed in `skill_anchors::ALL` is
+missing from that doc or from SKILL.md.
 
 Two rules follow:
 

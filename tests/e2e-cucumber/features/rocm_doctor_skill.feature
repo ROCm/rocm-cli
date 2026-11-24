@@ -20,8 +20,8 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # the table itself stays correct. The "(N failure modes)" count in the catalog
   # heading, SKILL.md's "The other M ... print-only" count and the names SKILL.md
   # lists are checked by the unit-level `tests/skill_reference.rs` instead, whose
-  # module doc lists the SKILL.md sentences that are fixtures (skill-07 reads one
-  # of them).
+  # module doc says which test reads each SKILL.md sentence that is a fixture
+  # (skill-07 reads one of them).
   #
   # The catalog is authoritative in `crates/rocm-core`. When one of these fails,
   # the CLI is right and the document is what changes: `reference.md`, or

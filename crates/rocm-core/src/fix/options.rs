@@ -240,6 +240,25 @@ pub enum FixClass {
 }
 
 impl FixClass {
+    /// Every class, in declaration order.
+    ///
+    /// `pub` only so the rocm-doctor skill's drift guard
+    /// (`tests/e2e-cucumber/tests/skill_reference.rs`) can compare the classes
+    /// `SKILL.md` lists with the ones the CLI serializes; hidden from the docs
+    /// because it is not an API to build on.
+    ///
+    /// Nothing checks that this list is complete: the exhaustive `match` in
+    /// `every_class_serializes_to_its_kebab_case_name_and_back` makes a new
+    /// variant name its spelling there, but a variant left out of this list is
+    /// left out of every check that iterates it.
+    #[doc(hidden)]
+    pub const ALL: [Self; 4] = [
+        Self::Auto,
+        Self::NeedsArgument,
+        Self::PrintOnly,
+        Self::DiagnoseOnly,
+    ];
+
     /// Whether `rocm fix <id>`, invoked with no extra arguments, will change
     /// the machine. This is the claim the old `auto_applicable` bool was making.
     #[must_use]
@@ -255,6 +274,47 @@ impl FixClass {
             Self::NeedsArgument => "NEEDS-ARG",
             Self::PrintOnly => "PRINT-ONLY",
             Self::DiagnoseOnly => "DIAGNOSE-ONLY",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FixClass;
+
+    /// The class names `rocm diagnose --json` writes as `fix.class` and `rocm fix
+    /// --json` publishes per platform, which the rocm-doctor skill lists for an
+    /// agent to act on. `skill_reference.rs` holds the skill's list to
+    /// [`FixClass::ALL`] run through serde; this holds serde to these names, so a
+    /// changed `rename_all` or a renamed variant fails here and not only in the
+    /// skill's guard.
+    #[test]
+    fn every_class_serializes_to_its_kebab_case_name_and_back() {
+        for class in FixClass::ALL {
+            // Exhaustive on purpose: a new variant does not compile until it
+            // names its spelling here (and, by the comment on `ALL`, joins it).
+            let name = match class {
+                FixClass::Auto => "auto",
+                FixClass::NeedsArgument => "needs-argument",
+                FixClass::PrintOnly => "print-only",
+                FixClass::DiagnoseOnly => "diagnose-only",
+            };
+            assert_eq!(
+                serde_json::to_value(class).expect("a class serializes"),
+                serde_json::json!(name),
+                "{class:?}"
+            );
+            assert_eq!(
+                serde_json::from_value::<FixClass>(serde_json::json!(name))
+                    .expect("the name deserializes"),
+                class
+            );
+        }
+        for (at, class) in FixClass::ALL.iter().enumerate() {
+            assert!(
+                !FixClass::ALL[at + 1..].contains(class),
+                "ALL lists {class:?} twice"
+            );
         }
     }
 }

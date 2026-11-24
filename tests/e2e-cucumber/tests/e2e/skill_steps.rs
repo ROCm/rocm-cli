@@ -14,8 +14,9 @@
 //! narrow exception to the suite's black-box rule: nothing is imported from the
 //! rocm-cli codebase — a documentation artifact is read as test data, and that
 //! artifact is the thing under test. `SKILL.md` is read too, for a few fixture
-//! sentences: `skill-07` reads the catalog contract version Phase 0 requires,
-//! and `tests/skill_reference.rs` lists all of them.
+//! sentences: `skill-07` reads the catalog contract version Phase 0 requires.
+//! The phrases those sentences are read at are in `e2e_cucumber::skill_anchors`,
+//! and the module doc of `tests/skill_reference.rs` names the test that reads each.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -155,7 +156,7 @@ fn skill_md_path() -> PathBuf {
 
 /// The phrase `SKILL.md` uses to declare the contract it requires, followed by
 /// the version number: "requires `contract_version` 1 or higher".
-const REQUIRED_CONTRACT_PHRASE: &str = "requires `contract_version` ";
+const REQUIRED_CONTRACT_PHRASE: &str = e2e_cucumber::skill_anchors::REQUIRED_CONTRACT;
 
 /// The catalog contract version `SKILL.md` says it requires, if it says so.
 ///
