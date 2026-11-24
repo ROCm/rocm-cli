@@ -6799,6 +6799,14 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   scenario plants the same APU with every VRAM counter taken away and requires a
   verdict against the shared pool rather than that dead end.
 
+  `model-catalog-10` through `-13` plant the same hosts through the same fixture
+  — `plant_single_gpu_with_memory`, with `GFX1151_TARGET_VERSION` and
+  `CARVE_OUT_BYTES` widened to `pub(crate)` for them — because `rocm model` has
+  to reach the same verdict about a machine that `rocm diagnose --model` does.
+  `-12` is the `diagnose-88` host, and its presence is what stops the listing's
+  evidence-of-a-GPU test drifting from the one the diagnosis uses: the two read
+  the same machine and must not disagree about whether its memory was readable.
+
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question

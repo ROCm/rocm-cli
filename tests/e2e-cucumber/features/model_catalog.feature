@@ -73,6 +73,7 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     Then every model offered is one this machine can run
     And the user is told the offer was narrowed to this machine
+    And the user is not told anything about shared memory
 
   @id:model-catalog-says-when-nothing-fits @requires-os:linux
   Scenario: model-catalog-07 - A machine too small for any curated model is told so
@@ -112,6 +113,7 @@ Feature: Model catalog listing
     Given a machine whose graphics share memory with the rest of the system, with room for only the smaller models
     When the user asks which models are recommended
     Then every model offered is one this machine can run
+    And the offer includes a model too large for the carve-out the adapter reports
     And the user is told the offer was narrowed to this machine
     And the user is told that memory is shared with everything else running
 
@@ -124,3 +126,24 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     Then the recommendations are not narrowed to this machine
     And the user is told the list is not specific to it
+
+  # The same machine with no ROCm build for its graphics, which is how an
+  # integrated GPU usually arrives: nothing reports a VRAM figure, because there
+  # is no VRAM. The pool is still readable, so the answer is still narrowed --
+  # and it has to match what `rocm diagnose --model` says about the same host,
+  # which judges it on that pool.
+  @id:model-catalog-narrows-shared-memory-with-no-vram-reading @requires-os:linux
+  Scenario: model-catalog-12 - A machine whose graphics report no memory of their own is narrowed on the shared pool
+    Given a machine whose graphics share memory with the rest of the system and report no memory of their own
+    When the user asks which models are recommended
+    Then every model offered is one this machine can run
+    And the user is told that memory is shared with everything else running
+
+  # The per-recipe detail reaches the same host, and has to describe the figure
+  # the same way: a row that calls a shared pool "VRAM" asserts memory the part
+  # does not have.
+  @id:model-catalog-detail-names-shared-memory @requires-os:linux
+  Scenario: model-catalog-13 - The per-recipe detail calls shared memory what it is
+    Given a machine whose graphics share memory with the rest of the system, with room for only the smaller models
+    When the user asks for the model catalog in verbose detail
+    Then each recipe's memory verdict names the shared pool rather than VRAM

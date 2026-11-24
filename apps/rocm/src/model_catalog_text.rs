@@ -978,12 +978,25 @@ fn append_model_fit_lines(
                     format_gib(available),
                     format_gib(f64::from(required))
                 );
-                let _ = writeln!(
-                    output,
-                    "      action: choose a recipe with min_gpu_mem <= {} or use a GPU with at least {} before serving",
-                    format_gib(available),
-                    format_gib(f64::from(required))
-                );
+                // An integrated GPU's pool is BIOS and driver policy, not a
+                // card, so "use a GPU with at least N" is advice its owner
+                // cannot act on -- there is no card to swap. Both halves of the
+                // sentence move together, because the smaller-recipe half is
+                // the only one left that is actually actionable there.
+                let _ = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+                    writeln!(
+                        output,
+                        "      action: choose a recipe with min_gpu_mem <= {} -- this machine's graphics have no memory of their own, so the pool above is what the system allows them, not a card that can be changed",
+                        format_gib(available)
+                    )
+                } else {
+                    writeln!(
+                        output,
+                        "      action: choose a recipe with min_gpu_mem <= {} or use a GPU with at least {} before serving",
+                        format_gib(available),
+                        format_gib(f64::from(required))
+                    )
+                };
                 append_manual_alternative_lines(output, recipe, aggregate_gpu_vram_gib);
             }
             None => {
@@ -1505,7 +1518,7 @@ mod tests {
 
         // Above the smallest and below the largest, so one row reaches the
         // "meets" verdict and another the "is below" verdict in the same render.
-        let figure = (smallest + largest) / 2.0;
+        let figure = f64::midpoint(smallest, largest);
 
         let shared = render_model_registry_verbose_text_with_context_and_host(
             None,

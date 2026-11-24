@@ -30,8 +30,12 @@
 //! `engine_ruled_out_by_platform` are `pub(crate)`; `main.rs` re-imports the
 //! last two so `examine_report_text.rs` keeps reaching them as
 //! `crate::<name>`; `model_catalog_text.rs` reaches `PlatformRuleOut` and
-//! `engine_ruled_out_by_platform_with` the same way. Every other item has no
-//! caller outside this module and stays private.
+//! `engine_ruled_out_by_platform_with` the same way, and takes
+//! `ListingGpuMemory` from here as the renderers' host argument.
+//! `host_model_listing_facts` and its `ModelListingHostFacts` are reached from
+//! `main.rs` and `chat/mcp_bridge.rs`, so `rocm model` and the tool-use path
+//! measure one host the same way. Every other item has no caller outside this
+//! module and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`.
 //! `engine_ruled_out_by_platform_gates_aim_on_docker_reachability` re-runs the
@@ -248,10 +252,20 @@ pub(crate) fn host_model_listing_facts() -> ModelListingHostFacts {
     let accelerator = classify_accelerator_memory(
         vram.as_deref(),
         host_gpu_summary.gfx_target.as_deref(),
-        // The examination is not probed for a listing; `amd-smi` having
-        // answered at all is the evidence of a GPU here, and a host where it
-        // did not is one this listing leaves unfiltered either way.
-        vram.is_some(),
+        // Evidence that there is a GPU at all, which is what the classifier's
+        // no-telemetry branch turns on. The examination is not probed for a
+        // listing -- it is a whole host snapshot, and this command renders a
+        // catalog -- so the two cheap reads already in hand stand in for it: a
+        // VRAM row, or a gfx target naming the part.
+        //
+        // The gfx target is load-bearing rather than belt-and-braces. An
+        // integrated GPU with no ROCm build ships no `amd-smi` and no VRAM
+        // counters, so VRAM alone reads it as "no GPU" and leaves the listing
+        // unfiltered -- while `rocm diagnose --model`, which asks the
+        // examination, judges the very same host against its pool. That split
+        // told the user their memory could not be read and pointed them at the
+        // command that had just read it.
+        vram.is_some() || host_gpu_summary.gfx_target.is_some(),
         rocm_core::usable_amd_gpu_indices().as_deref(),
         // The same read `host_accelerator_memory` makes, for the same reason:
         // the classifier is a pure function of its arguments, so the aperture

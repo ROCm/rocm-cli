@@ -321,6 +321,84 @@ async fn an_unreadable_shared_pool_machine(world: &mut E2eWorld) {
     plant_integrated_gpu(world, None);
 }
 
+/// The ordinary shape of an integrated GPU: no VRAM counters at all, because
+/// there is no VRAM. `plant_integrated_gpu` plants the carve-out as a counter,
+/// which is the shape a host *with* a ROCm build reports; this is the other one,
+/// and it is the one that decides whether the listing's evidence-of-a-GPU test
+/// is the same one `rocm diagnose --model` uses.
+#[given(
+    "a machine whose graphics share memory with the rest of the system and report no memory of their own"
+)]
+async fn a_shared_pool_machine_with_no_vram_counters(world: &mut E2eWorld) {
+    crate::e2e::diagnose_steps::plant_single_gpu_with_memory(
+        world,
+        crate::e2e::diagnose_steps::GFX1151_TARGET_VERSION,
+        None,
+        Some(SMALL_SHARED_POOL_BYTES),
+    );
+}
+
+/// Pin the *figure* the narrowing used, not merely that it happened.
+///
+/// Every adapter query on an APU reports the BIOS carve-out, and reaching a fit
+/// verdict against that instead of the aperture is the headline defect this
+/// whole area exists to prevent — but it is invisible from the assertions above,
+/// because a listing narrowed against either figure still offers something and
+/// still says it fits. So name a model that fits the pool and does not fit the
+/// carve-out: it can only be on offer if the aperture was what was weighed.
+#[then("the offer includes a model too large for the carve-out the adapter reports")]
+async fn assert_offer_reaches_past_the_carve_out(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let carve_out_gib = crate::e2e::diagnose_steps::CARVE_OUT_BYTES as f64 / 1024.0_f64.powi(3);
+    let pool_gib = SMALL_SHARED_POOL_BYTES as f64 / 1024.0_f64.powi(3);
+    let discriminating = rocm_core::builtin_model_recipe_registry()
+        .recipes
+        .iter()
+        .filter(|recipe| {
+            recipe
+                .min_gpu_mem_gb
+                .is_some_and(|min| f64::from(min) > carve_out_gib && f64::from(min) <= pool_gib)
+        })
+        .map(|recipe| recipe.canonical_model_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !discriminating.is_empty(),
+        "the catalog ships no recipe between the {carve_out_gib} GiB carve-out and the \
+         {pool_gib} GiB pool, so this scenario can no longer tell the two figures apart"
+    );
+    assert!(
+        discriminating.iter().any(|id| output.contains(id.as_str())),
+        "none of {discriminating:?} is offered, so the listing was narrowed against the \
+         carve-out rather than the shared pool:\n{output}"
+    );
+}
+
+/// The caveat is false of a discrete card, and the e2e hook builds its host by
+/// hand rather than through the classifier — so without this, flipping that
+/// literal would print "this GPU has no dedicated VRAM" for every forced host
+/// with nothing to catch it.
+#[then("the user is not told anything about shared memory")]
+async fn assert_no_shared_pool_caveat(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        !output.contains("This GPU has no dedicated VRAM"),
+        "this machine's memory is its own, so saying it is shared would be false:\n{output}"
+    );
+}
+
+#[then("each recipe's memory verdict names the shared pool rather than VRAM")]
+async fn assert_verbose_names_the_shared_pool(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("reason: shared GPU memory pool"),
+        "the per-recipe verdicts must name the pool they were weighed against:\n{output}"
+    );
+    assert!(
+        !output.contains("aggregate GPU VRAM"),
+        "an integrated GPU has no VRAM, so no row may call its pool that:\n{output}"
+    );
+}
+
 /// The same question through the assistant's tool, on the same machine.
 ///
 /// The capacity is planted again because `command_env` is for the *next* `rocm`

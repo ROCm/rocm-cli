@@ -2713,10 +2713,12 @@ Expected result:
 
 Needs three hosts to be meaningful: a large discrete GPU (an MI300X), a small
 discrete GPU (a 16 GiB Radeon or similar), and **an APU** (a Ryzen 7 4700U, a
-Strix Halo, or any integrated part). The mock lane covers the logic with a
-forced memory figure; what it cannot do is read a real machine, and no lane
-anywhere has an APU — so the APU host below is the only place that half of this
-is checked at all.
+Strix Halo, or any integrated part). The mock lane covers the logic against a
+planted host — a simulated APU's sysfs under `ROCM_CLI_TEST_HOST_ROOT` — and the
+`e2e-gpu-strix-ubuntu` lane runs those same scenarios on real gfx1151 hardware.
+What neither does is let the CLI measure that hardware for itself: the planted
+root answers every probe, on the Strix lane too. So this section is the only
+check of the listing against an APU's *own* readings.
 
 The APU case is the one this section was waiting on. `rocm` now reads an
 integrated part's shared pool through `Unified { gtt_total_gib }` (`rocmai-912`
