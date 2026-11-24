@@ -276,6 +276,36 @@ async fn an_unmeasured_machine(world: &mut E2eWorld) {
     let _ = world;
 }
 
+/// State that the figure is an integrated GPU's shared ceiling rather than a
+/// discrete card's own memory.
+///
+/// Separate from the capacity for the same reason the hook is: the two
+/// interesting hosts are "shared, and measured" and "shared, and unreadable",
+/// which one variable cannot express.
+fn plant_shared_pool(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_FORCE_GPU_SHARED_POOL", "1".into()));
+}
+
+#[given(
+    "a machine whose graphics share memory with the rest of the system, with room for only the smaller models"
+)]
+async fn a_small_shared_pool_machine(world: &mut E2eWorld) {
+    plant_gpu_capacity_gib(world, SMALL_GPU_TOTAL_GIB);
+    plant_shared_pool(world);
+}
+
+/// An APU whose aperture could not be read: shared, but with no figure. The
+/// capacity is deliberately not planted, so this is the unmeasured host rather
+/// than a small one.
+#[given(
+    "a machine whose graphics share memory with the rest of the system, and that amount cannot be read"
+)]
+async fn an_unreadable_shared_pool_machine(world: &mut E2eWorld) {
+    plant_shared_pool(world);
+}
+
 /// The same question through the assistant's tool, on the same machine.
 ///
 /// The capacity is planted again because `command_env` is for the *next* `rocm`
@@ -363,6 +393,20 @@ async fn assert_narrowing_stated(world: &mut E2eWorld) {
     assert!(
         output.contains("Narrowed to what this machine can run"),
         "a short list with nothing said about it reads as a small catalog:\n{output}"
+    );
+}
+
+/// The narrowing on its own would read as a promise that what is left fits
+/// whatever else the machine is doing. On an APU it is a ceiling the desktop
+/// draws on too, and the listing has to say so.
+#[then("the user is told that memory is shared with everything else running")]
+async fn assert_shared_pool_stated(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("This GPU has no dedicated VRAM")
+            && output.contains("shares with the operating system"),
+        "a narrowed shared pool must be named as shared, or the list reads as memory set \
+         aside for the model:\n{output}"
     );
 }
 

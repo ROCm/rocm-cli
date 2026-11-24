@@ -223,13 +223,20 @@ fn host_accelerator_memory(
 /// two stop agreeing silently -- so the equivalence above is a property of the
 /// classifier, not of the two call sites.
 ///
-/// An APU therefore reports `None` and the listing stays unfiltered, which is
-/// honest on this branch: the pool an integrated part allocates from is not
-/// readable here yet.
-pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
+/// An APU answers with its measured pool, flagged as shared. That pool is a
+/// ceiling the operating system draws on too, so the listing says as much rather
+/// than presenting it as memory set aside for the model; an APU whose pool could
+/// not be read still reports `None` and stays unfiltered.
+pub(crate) fn host_model_listing_facts() -> ModelListingHostFacts {
     #[cfg(feature = "e2e-test-hooks")]
-    if let Some(forced_gib) = simulated_listing_gpu_gib() {
-        return (Some(forced_gib), rocm_core::detect_system_ram_gib());
+    if let Some((forced_gib, is_shared_pool)) = simulated_listing_gpu_facts() {
+        return ModelListingHostFacts {
+            gpu: forced_gib.map(|total_gib| ListingGpuMemory {
+                total_gib,
+                is_shared_pool,
+            }),
+            host_ram_gib: rocm_core::detect_system_ram_gib(),
+        };
     }
     let vram = gpu_vram_usage();
     let host_gpu_summary = detect_host_gpu_summary(None);
@@ -246,11 +253,67 @@ pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
         // has to be supplied here rather than looked up inside it.
         rocm_core::detect_host_unified_memory_gib(),
     );
-    let gpu_gib = match accelerator {
-        AcceleratorMemory::Dedicated(gib) => Some(gib),
-        _ => None,
-    };
-    (gpu_gib, rocm_core::detect_system_ram_gib())
+    ModelListingHostFacts {
+        gpu: ListingGpuMemory::from_accelerator(accelerator),
+        host_ram_gib: rocm_core::detect_system_ram_gib(),
+    }
+}
+
+/// What the listing knows about the machine it is recommending for.
+pub(crate) struct ModelListingHostFacts {
+    /// The GPU memory a recipe's declared minimum is weighed against, when the
+    /// machine could be measured at all. `None` leaves the listing unfiltered.
+    pub(crate) gpu: Option<ListingGpuMemory>,
+    /// Installed system RAM, which softens a verdict but never decides one.
+    pub(crate) host_ram_gib: Option<f64>,
+}
+
+/// A measured GPU memory figure and what kind of figure it is.
+///
+/// The two travel together rather than as separate arguments because they are
+/// one answer. Passed apart, a caller can hand the renderer a shared ceiling
+/// while leaving the flag at its default, and the listing then presents an
+/// APU's pool as though it were memory private to the card -- which is the
+/// claim this type exists to stop anyone making by accident.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ListingGpuMemory {
+    pub(crate) total_gib: f64,
+    /// A ceiling on memory shared with the operating system, not an allocation.
+    pub(crate) is_shared_pool: bool,
+}
+
+impl ListingGpuMemory {
+    /// `None` for every host the classifier could not put a figure on --
+    /// no GPU, an unmeasured one, and an APU whose pool could not be read.
+    /// Each of those leaves the listing unfiltered rather than narrowing it
+    /// against a number nobody measured.
+    fn from_accelerator(accelerator: AcceleratorMemory) -> Option<Self> {
+        accelerator.measured_gib().map(|total_gib| Self {
+            total_gib,
+            is_shared_pool: accelerator.is_shared_pool(),
+        })
+    }
+
+    /// Memory private to a discrete card. Test construction only -- production
+    /// reaches this type through [`Self::from_accelerator`], so that the kind of
+    /// figure is always decided by what was measured.
+    #[cfg(test)]
+    pub(crate) const fn dedicated(total_gib: f64) -> Self {
+        Self {
+            total_gib,
+            is_shared_pool: false,
+        }
+    }
+
+    /// An integrated GPU's ceiling on memory shared with the operating system.
+    /// Test construction only, as above.
+    #[cfg(test)]
+    pub(crate) const fn shared_pool(total_gib: f64) -> Self {
+        Self {
+            total_gib,
+            is_shared_pool: true,
+        }
+    }
 }
 
 /// E2E hook: `ROCM_E2E_FORCE_GPU_TOTAL_GIB` states outright how much GPU memory
@@ -268,14 +331,26 @@ pub(crate) fn host_model_listing_facts() -> (Option<f64>, Option<f64>) {
 /// the notices, not the measurement. `classify_accelerator_memory` keeps its own
 /// unit tests for the measurement, which this deliberately bypasses rather than
 /// re-stages. Compiled only into the `e2e-test-hooks` binary.
+///
+/// `ROCM_E2E_FORCE_GPU_SHARED_POOL` states that the figure is an integrated
+/// GPU's shared ceiling rather than dedicated VRAM. It is a separate switch from
+/// the figure because the two combinations that matter are not "one variable
+/// with three values": a shared pool with a figure narrows and is captioned as
+/// shared, and a shared pool *without* one is the APU whose aperture could not be
+/// read, which must stay unfiltered. Set alone, it produces exactly that second
+/// host -- which is why this returns `Some` for it rather than falling through to
+/// a live measurement the mock lane cannot make.
 #[cfg(feature = "e2e-test-hooks")]
-fn simulated_listing_gpu_gib() -> Option<f64> {
-    let total_gib: u32 = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(f64::from(total_gib))
+fn simulated_listing_gpu_facts() -> Option<(Option<f64>, bool)> {
+    let forced_total = std::env::var("ROCM_E2E_FORCE_GPU_TOTAL_GIB")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .map(f64::from);
+    let forced_shared = std::env::var("ROCM_E2E_FORCE_GPU_SHARED_POOL").is_ok();
+    if forced_total.is_none() && !forced_shared {
+        return None;
+    }
+    Some((forced_total, forced_shared))
 }
 
 /// The pure classification behind [`host_accelerator_memory`], split out so it
@@ -1078,6 +1153,60 @@ mod tests {
             .verdict,
             rocm_core::model_readiness::ModelVerdict::Blocked
         );
+    }
+
+    /// The listing takes an APU's measured pool, and carries that it is a
+    /// shared one.
+    ///
+    /// Before this, the conversion matched `Dedicated` alone and dropped
+    /// everything else to `None`, so a measured APU was indistinguishable from
+    /// a machine nothing could read and its listing stayed unfiltered -- a
+    /// 7.7 GiB host offered 17-to-62 GiB models. Both halves are asserted
+    /// because either one alone is wrong: the figure without the flag renders a
+    /// shared ceiling as though it were dedicated VRAM.
+    #[test]
+    fn the_listing_weighs_an_apu_against_its_pool_and_says_the_pool_is_shared() {
+        assert_eq!(
+            ListingGpuMemory::from_accelerator(AcceleratorMemory::Unified { gtt_total_gib: 7.7 }),
+            Some(ListingGpuMemory {
+                total_gib: 7.7,
+                is_shared_pool: true,
+            })
+        );
+    }
+
+    /// A discrete card's VRAM is carried unflagged, so the shared-memory
+    /// caveat cannot appear on a machine it is false of.
+    #[test]
+    fn the_listing_does_not_call_a_discrete_card_shared() {
+        assert_eq!(
+            ListingGpuMemory::from_accelerator(AcceleratorMemory::Dedicated(16.0)),
+            Some(ListingGpuMemory {
+                total_gib: 16.0,
+                is_shared_pool: false,
+            })
+        );
+    }
+
+    /// Every host the classifier could not put a figure on leaves the listing
+    /// unfiltered, and `UnifiedMemoryUnreadable` is the one that matters here:
+    /// it is an APU, so a conversion keyed on "is this an APU" rather than on
+    /// "was it measured" would narrow it against a number nobody read. The
+    /// other two are the pre-existing contract, asserted alongside so a change
+    /// that narrows them cannot pass.
+    #[test]
+    fn the_listing_narrows_nothing_on_a_host_that_was_never_measured() {
+        for accelerator in [
+            AcceleratorMemory::UnifiedMemoryUnreadable,
+            AcceleratorMemory::Unknown,
+            AcceleratorMemory::None,
+        ] {
+            assert_eq!(
+                ListingGpuMemory::from_accelerator(accelerator),
+                None,
+                "{accelerator:?} was never measured, so it cannot narrow a listing"
+            );
+        }
     }
 
     /// An APU paired with a discrete card (more than one GPU reported) keeps

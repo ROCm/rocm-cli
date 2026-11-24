@@ -101,3 +101,26 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     And an assistant on the same machine asks the same question through its tools
     Then the assistant is given the same recommendations the user saw
+
+  # The machine the whole listing exists for: an integrated GPU with no memory
+  # of its own, which was offered the unfiltered catalog because the only figure
+  # it has is a pool it shares with the rest of the system. It is narrowed on
+  # that pool now -- and told what the pool is, because a ceiling the desktop
+  # also draws on is not memory set aside for the model.
+  @id:model-catalog-narrows-a-machine-whose-graphics-share-memory @requires-os:linux
+  Scenario: model-catalog-10 - A machine whose graphics share system memory is recommended models that fit it
+    Given a machine whose graphics share memory with the rest of the system, with room for only the smaller models
+    When the user asks which models are recommended
+    Then every model offered is one this machine can run
+    And the user is told the offer was narrowed to this machine
+    And the user is told that memory is shared with everything else running
+
+  # Sharing memory is not the same as having a readable amount of it. An
+  # integrated GPU whose pool could not be read is still a machine nobody
+  # measured, and gets the unmeasured answer rather than a narrowing.
+  @id:model-catalog-does-not-narrow-unreadable-shared-memory @requires-os:linux
+  Scenario: model-catalog-11 - A machine whose shared memory cannot be read is not narrowed
+    Given a machine whose graphics share memory with the rest of the system, and that amount cannot be read
+    When the user asks which models are recommended
+    Then the recommendations are not narrowed to this machine
+    And the user is told the list is not specific to it

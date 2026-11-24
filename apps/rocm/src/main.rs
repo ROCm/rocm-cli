@@ -831,18 +831,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             // "unknown" and the recommendations unable to narrow to what this
             // machine can run -- a 2 TB-RAM host was told its RAM telemetry was
             // unavailable.
-            let (gpu_gib, host_ram_gib) = model_fit::host_model_listing_facts();
+            let facts = model_fit::host_model_listing_facts();
             let rendered = if verbose {
                 render_model_registry_verbose_text_with_context_and_host(
                     Some(&paths),
-                    gpu_gib,
-                    host_ram_gib,
+                    facts.gpu,
+                    facts.host_ram_gib,
                 )
             } else {
                 render_model_registry_text_with_context_and_host(
                     Some(&paths),
-                    gpu_gib,
-                    host_ram_gib,
+                    facts.gpu,
+                    facts.host_ram_gib,
                 )
             };
             print!("{rendered}");

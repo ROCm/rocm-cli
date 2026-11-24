@@ -574,11 +574,11 @@ pub(crate) fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
         {
-            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
+            let facts = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_text_with_context_and_host(
                 Some(paths),
-                gpu_gib,
-                host_ram_gib,
+                facts.gpu,
+                facts.host_ram_gib,
             ))
         }
         [command, flag]
@@ -586,11 +586,11 @@ pub(crate) fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -
                 || command.eq_ignore_ascii_case("models"))
                 && flag.eq_ignore_ascii_case("--verbose") =>
         {
-            let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
+            let facts = crate::model_fit::host_model_listing_facts();
             Ok(render_model_registry_verbose_text_with_context_and_host(
                 Some(paths),
-                gpu_gib,
-                host_ram_gib,
+                facts.gpu,
+                facts.host_ram_gib,
             ))
         }
         [command] if command.eq_ignore_ascii_case("daemon") => {
@@ -1414,9 +1414,12 @@ mod tests {
         // no GPU for, both sides are the unnarrowed listing and this still
         // passes. `model-catalog-09` is the guard for the narrowing itself, on
         // a lane that can plant a capacity.
-        let (gpu_gib, host_ram_gib) = crate::model_fit::host_model_listing_facts();
-        let curated =
-            render_model_registry_text_with_context_and_host(Some(&paths), gpu_gib, host_ram_gib);
+        let facts = crate::model_fit::host_model_listing_facts();
+        let curated = render_model_registry_text_with_context_and_host(
+            Some(&paths),
+            facts.gpu,
+            facts.host_ram_gib,
+        );
         assert!(
             text.contains(curated.trim()),
             "the tool must return what `rocm model` prints:\n{text}"

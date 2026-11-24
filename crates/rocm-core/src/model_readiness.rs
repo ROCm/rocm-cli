@@ -166,7 +166,7 @@ impl AcceleratorMemory {
     /// cannot fit however free the machine is -- but clearing it does not make
     /// the model `Ready`, because the pool is shared. The verdict side of that
     /// is in `assess_model_readiness`, not here.
-    pub(crate) const fn measured_gib(self) -> Option<f64> {
+    pub const fn measured_gib(self) -> Option<f64> {
         match self {
             Self::Dedicated(gib)
             | Self::Unified {
@@ -178,7 +178,7 @@ impl AcceleratorMemory {
 
     /// Whether the figure above is a ceiling on memory shared with the
     /// operating system rather than a dedicated pool.
-    pub(crate) const fn is_shared_pool(self) -> bool {
+    pub const fn is_shared_pool(self) -> bool {
         matches!(self, Self::Unified { .. })
     }
 }

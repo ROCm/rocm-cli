@@ -43,6 +43,7 @@ use rocm_core::{
 use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
 
 use crate::engine_ipc::{builtin_engine_available, resolve_engine_binary_path_with_paths};
+use crate::model_fit::ListingGpuMemory;
 use crate::{PlatformRuleOut, engine_ruled_out_by_platform_with};
 
 /// The first words of every curated `rocm model` heading, whichever recipe
@@ -313,9 +314,12 @@ fn recipe_engine_gfx_unsupported(
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
     _paths: Option<&AppPaths>,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory: Option<ListingGpuMemory>,
     _host_ram_gib: Option<f64>,
 ) -> String {
+    // Selection and every per-row verdict weigh the figure alone; only the
+    // closing note cares what kind of figure it is.
+    let aggregate_gpu_vram_gib = gpu_memory.map(|gpu| gpu.total_gib);
     let mut output = String::new();
     let registry = match load_model_recipe_registry() {
         Ok(registry) => registry,
@@ -399,6 +403,20 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     // Say why the list is the length it is. Without this a narrowed list reads
     // as a small catalog, and an empty one reads as a broken command.
     if !show_all {
+        // An integrated GPU was weighed against a ceiling on memory it shares
+        // with the operating system, not against memory set aside for the model.
+        // Every branch that reached a verdict carries that, because a narrowed
+        // list otherwise reads as a promise that the models left in it will fit
+        // whatever else the machine is doing -- the same
+        // unknown-presented-as-a-fact this listing exists to stop. The
+        // unmeasured branch below says nothing about it: no figure was weighed
+        // there, so there is no figure to qualify.
+        let shared_pool_note = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+            " This GPU has no dedicated VRAM, so that is a ceiling on memory it shares with the \
+             operating system: how much is free depends on what else is running."
+        } else {
+            ""
+        };
         if fit.is_none() {
             let _ = writeln!(
                 output,
@@ -410,16 +428,19 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
                 output,
                 "\nNone of the curated models fit this machine's GPU memory. You can still serve \
                  a smaller model of your own, and `rocm model --verbose` lists every curated \
-                 recipe with what it needs."
+                 recipe with what it needs.{shared_pool_note}"
             );
         } else if also_fit_total > 0 {
             let _ = writeln!(
                 output,
                 "\nNarrowed to what this machine can run; {also_fit_total} more curated model(s) \
-                 also fit. `rocm model --verbose` lists them all."
+                 also fit. `rocm model --verbose` lists them all.{shared_pool_note}"
             );
         } else {
-            let _ = writeln!(output, "\nNarrowed to what this machine can run.");
+            let _ = writeln!(
+                output,
+                "\nNarrowed to what this machine can run.{shared_pool_note}"
+            );
         }
     }
     if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
@@ -462,9 +483,12 @@ fn model_recipe_gpu_fit_label(
 
 pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     paths: Option<&AppPaths>,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory: Option<ListingGpuMemory>,
     host_ram_gib: Option<f64>,
 ) -> String {
+    // `--verbose` lists every recipe whatever the host is, so the shared-pool
+    // distinction changes nothing it prints: only the figure is used.
+    let aggregate_gpu_vram_gib = gpu_memory.map(|gpu| gpu.total_gib);
     let mut output = String::new();
     let _ = writeln!(output, "{MODEL_CATALOG_VERBOSE_HEADER}");
     let registry = match load_model_recipe_registry() {
@@ -1394,7 +1418,11 @@ mod tests {
         // (~54) but not Gemma-4-31B (~62), and the one that does not fit is no
         // longer offered rather than offered with a refusal beside it --
         // "recommended" and "needs a larger GPU" cannot both be true of a row.
-        let rendered = render_model_registry_text_with_context_and_host(None, Some(60.0), None);
+        let rendered = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(60.0)),
+            None,
+        );
 
         assert!(rendered.contains("fits this GPU"));
         assert!(
@@ -1405,6 +1433,67 @@ mod tests {
         assert!(
             rendered.contains("Narrowed to what this machine can run"),
             "the narrowing must be stated, or a short list reads as a small catalog: {rendered}"
+        );
+    }
+
+    /// An integrated GPU is narrowed on the pool it shares with the operating
+    /// system, and the listing says that is what the figure was.
+    ///
+    /// The same figure is rendered twice, once as a shared ceiling and once as a
+    /// discrete card's VRAM, because the selection is identical between them --
+    /// only the caveat differs. Asserting its presence alone would pass on a
+    /// build that printed it for every host, which would be a false claim on the
+    /// discrete majority.
+    #[test]
+    fn an_integrated_gpu_is_narrowed_on_its_shared_pool_and_told_the_pool_is_shared() {
+        const SHARED_CAVEAT: &str = "This GPU has no dedicated VRAM";
+
+        let shared = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(60.0)),
+            None,
+        );
+        assert!(
+            shared.contains("Narrowed to what this machine can run"),
+            "a measured pool must narrow the listing the way measured VRAM does: {shared}"
+        );
+        assert!(
+            shared.contains(SHARED_CAVEAT),
+            "a narrowed shared pool reads as a promise of free memory unless it is \
+             qualified: {shared}"
+        );
+
+        let dedicated = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(60.0)),
+            None,
+        );
+        assert!(
+            !dedicated.contains(SHARED_CAVEAT),
+            "a discrete card's VRAM is not shared with the OS, so saying it is would be \
+             false: {dedicated}"
+        );
+    }
+
+    /// An APU whose aperture could not be read reaches the renderer as "no
+    /// figure", so it takes the unmeasured branch and is not narrowed. The
+    /// caveat has nothing to qualify there and must not appear: the listing
+    /// would otherwise explain a narrowing it did not perform.
+    #[test]
+    fn an_unreadable_pool_is_not_narrowed_and_carries_no_shared_caveat() {
+        let rendered = render_model_registry_text_with_context_and_host(None, None, None);
+
+        assert!(
+            rendered.contains("could not be read"),
+            "an unmeasured host must be told its list is not specific to it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("This GPU has no dedicated VRAM"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Narrowed to what this machine can run"),
+            "{rendered}"
         );
     }
 
@@ -1835,8 +1924,11 @@ mod tests {
 
     #[test]
     fn render_model_registry_text_reports_supported_and_unsupported_gpu_fit() {
-        let rendered =
-            render_model_registry_verbose_text_with_context_and_host(None, Some(16.0), None);
+        let rendered = render_model_registry_verbose_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(16.0)),
+            None,
+        );
 
         assert!(rendered.contains("gpu_fit: supported"));
         assert!(rendered.contains("aggregate GPU VRAM 16 GiB meets recipe minimum 12 GiB"));
