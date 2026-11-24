@@ -343,9 +343,45 @@ checks, which cannot be made anywhere else:
 
 - `rocm examine` shows `detected_gfx_target: gfx90c` with an empty
   `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
-  detected but not supported by ROCm and that the Vulkan backend can still be
-  used. A `<unknown>` target, or a missing `rocm_support` line, means detection
-  regressed.
+  detected but not supported by ROCm. A `<unknown>` target, or a missing
+  `rocm_support` line, means detection regressed. That line is printed on
+  **every** host, at one of five levels — ROCm/HIP-supported, Vulkan-only,
+  Vulkan-unconfirmed, no-GPU-backend, or unknown — so on a supported card or a
+  machine with no GPU it must still be there, saying the level that host's
+  hardware implies rather than being absent.
+
+  Which of the three middle levels this machine gets is **not** decided by the
+  gfx table: `rocm examine` probes for a Vulkan driver, so the answer depends on
+  what is installed. This is the check that cannot be made in CI, because no
+  lane has this silicon. Walk it in both directions:
+
+  - With the AMD display driver (Windows) or Mesa RADV (Linux) installed, the
+    line says models can still run through Vulkan and **names the driver**, and
+    `rocm examine --json` shows `summary.vulkan.status` as `available` with the
+    device under `summary.vulkan.devices`. Then actually run
+    `rocm serve <model> --engine lemonade` — the point of the claim is that it
+    is true, and this is the only place it can be confirmed against real
+    hardware.
+  - With the driver removed but `vulkaninfo` still installed, expect the
+    *could-not-confirm* wording on Linux rather than a confirmed absence, and it
+    must **not** still name a driver. This is the known gap recorded on
+    examine-62, measured rather than assumed: a real `vulkaninfo` with no
+    reachable driver prints "Found no drivers!" and exits **1**, and the probe
+    counts only an exit-0 run as having answered, so the host is classed
+    inconclusive. Telling "no drivers" apart from "the tool is broken" needs the
+    loader's own message, which the shared capture discards. Seeing "could not
+    confirm" here is correct, not a regression.
+  - With neither installed, the line says the check could not be made — the same
+    level as the bullet above — and tells you to install a Vulkan driver, while
+    pointing at running `vulkaninfo` yourself to see what it reports. It must
+    **not** say the driver is absent, and it must **not** tell you to *install*
+    `vulkaninfo`: on the host above, that tool is already there, so that advice
+    could never clear the state. The absence claim is the Windows-laptop case
+    ROCMAI-550 came from, and declaring absence there is the regression
+    `VulkanUnconfirmed` exists to prevent.
+
+  A software rasteriser (`lavapipe`, `swiftshader`) must never be reported as a
+  GPU path in any of the three.
 - A plain `rocm install sdk`, with no `--family`, gives the same refusal with
   the wording for a *detected* GPU rather than a requested one.
 - `rocm diagnose` reports `info-20-gpu-no-rocm-support`, naming `gfx90c` and
@@ -448,12 +484,28 @@ Lemonade is the default local assistant/server engine. Serve a small assistant
 model with the managed runtime:
 
 ```powershell
-rocm serve qwen --engine lemonade --device gpu_required --foreground --port 11435
+rocm serve qwen --engine lemonade --device gpu_required --port 11435
 ```
 
 Expected result:
 
-- The engine uses its selected supported GPU backend, ROCm or Vulkan.
+- The engine uses its selected supported GPU backend, ROCm or Vulkan. The
+  deployment summary's `device:` row is the engine's own account of the backend
+  it was launched on (Lemonade reads back the `backend_requested` it recorded),
+  so check it by reading that row rather than inferring it from the absence of a
+  fallback warning. Every engine reports it in the same
+  `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect something like
+  `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted when the launch
+  pinned none (no `--gpu`, nothing recorded in the engine's `gpu_indices`) and
+  the name omitted when the host probe could not read one or the machine has
+  more than one AMD GPU (where naming one could name the wrong one). `rocm
+  services` shows the same `device` while it runs. The first word is the half
+  that decides this check.
+- The whole `device:` row may be missing from the deployment summary, and that
+  is not a failure of this check: the engine reports no device until it has
+  verified it can serve, which a model still loading its weights has not. Run
+  `rocm services list` and read the row there instead — the check is on what the
+  row says, not on which surface said it first.
 - The run does not fall back to CPU, and does not select a stale ROCm binary
   when the installed runtime selects Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
@@ -476,9 +528,16 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
 
-With that foreground server stopped, check that a catalogued recipe reaches
-Lemonade with a build it can load, from a short name alone — no `--engine`, no
-quantization variant typed by hand:
+That server is in the background — `rocm serve` returns to the shell once it is
+ready — so stop it before continuing, or it keeps the GPU and port 11435:
+
+```powershell
+rocm services stop <service-id> --yes
+```
+
+With it stopped, check that a catalogued recipe reaches Lemonade with a build
+it can load, from a short name alone — no `--engine`, no quantization variant
+typed by hand:
 
 ```powershell
 rocm serve qwen-small --managed

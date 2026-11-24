@@ -132,7 +132,17 @@ pub(crate) fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
+    // `summary` already carries the Vulkan probe result, so the support level
+    // here is the verified one: this is the surface other messages send people
+    // to when they want a real answer.
+    let gpu_support_level = rocm_core::gpu_support_level_for_examine(&summary);
+    append_examine_engine_inventory(
+        &mut output,
+        paths,
+        config,
+        &summary.default_engine,
+        gpu_support_level,
+    );
     Ok((output, summary))
 }
 
@@ -190,7 +200,30 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    render_engine_inventory_text_for_host(
+        paths,
+        rocm_core::default_engine_for_host(&host_gpu),
+        // No Vulkan probe on this listing path, for the reason given on
+        // `host_gpu_support_level`: `rocm engines` is cheap by design, and
+        // `rocm examine` is where the verified answer lives.
+        rocm_core::gpu_support_level_for_host_gpu(&host_gpu, rocm_core::VulkanStatus::Unknown),
+    )
+}
+
+/// `rocm engines` for a host whose preferred engine and GPU support level the
+/// caller has already probed.
+///
+/// Split from [`render_engine_inventory_text_with_paths`] for the same reason
+/// [`append_examine_engine_inventory`] takes both as parameters: the host probe
+/// reads real sysfs, so a test cannot otherwise reach the Vulkan-only branch -
+/// no CI runner has a GPU that is detected *and* confirmed to have no ROCm
+/// build. Both values come from one `detect_host_gpu_summary` call above, so
+/// the marker and the note still cannot disagree about the same host.
+fn render_engine_inventory_text_for_host(
+    paths: Option<&AppPaths>,
+    host_default_engine: &str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> String {
     // A configured `default_engine` still wins over the host preference, mirroring
     // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
     // the legend could mark an engine `serve` will not actually default to.
@@ -218,7 +251,7 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
         output,
         "  Built-in engines are included with rocm-cli. External plugins are optional."
     );
-    let _ = writeln!(output, "  ROCm GPU execution is required.");
+    let _ = writeln!(output, "{}", gpu_execution_line(gpu_support_level));
     if let Some(paths) = paths {
         let _ = writeln!(output, "  Plugin folders:");
         for (index, path) in engine_plugin_dirs(paths).iter().enumerate() {
@@ -233,6 +266,8 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
     }
     for (name, note) in engine_inventory() {
         let marker = (*name == default_engine).then_some(DEFAULT_ENGINE_MARKER);
+        let note =
+            engine_inventory_note(name, note, gpu_support_level, InventorySurface::Standalone);
         write_marked_row(&mut output, "", marker, format_args!("{name:10} {note}"));
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -242,6 +277,70 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
         rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
     );
     output
+}
+
+/// The `rocm engines` banner stating what these engines will and will not run
+/// on, for a host at `level`.
+///
+/// This line used to be the constant `"  ROCm GPU execution is required."`,
+/// printed a few rows above the per-engine notes. That was consistent while
+/// lemonade's note was the same static ROCm-only sentence, and stopped being
+/// consistent the moment [`crate::engine_inventory_note`] made that note
+/// host-aware: on a `VulkanOnly` host the banner asserted ROCm was required
+/// directly above a row saying this GPU has no ROCm support — reinstating, on
+/// the same screen, the stale claim ROCMAI-550 exists to remove.
+///
+/// What is actually invariant across every level is the *refusal*, not the
+/// backend: rocm-cli serves on a GPU and never silently falls back to CPU, and
+/// Vulkan is one of the GPU paths it serves on rather than a fallback from
+/// one. So "GPU execution is required" is said at every level and the ROCm
+/// half is said only where the classifier establishes it. `Unknown` drops it
+/// too, and that is the point of preferring this over a `VulkanOnly`-only
+/// special case: "ROCm is required" on a host whose support level is unknown
+/// is the same unfounded claim, just on the hosts the CLI knows least about.
+/// `Unknown` does not re-name `rocm examine` either — lemonade's own row
+/// already does, two lines below.
+///
+/// Matched exhaustively, like the notes it has to agree with, so a sixth
+/// support level is a compile error here instead of silently inheriting a
+/// claim about ROCm. That is not hypothetical: this function arrived with
+/// three variants and the Vulkan probe added two more, and the compile error
+/// is what forced the decision below rather than letting either new level
+/// fall through to a sentence about a backend nothing had established.
+const fn gpu_execution_line(level: rocm_core::GpuSupportLevel) -> &'static str {
+    match level {
+        rocm_core::GpuSupportLevel::RocmHip => "  ROCm GPU execution is required.",
+        rocm_core::GpuSupportLevel::VulkanOnly => {
+            "  GPU execution is required; on this GPU that is the Vulkan backend, not ROCm."
+        }
+        // The three levels that establish no usable backend share one
+        // sentence, because the banner's job is to state the refusal and all
+        // three refuse identically. What differs between them is *why*, and
+        // that is the per-engine row's job two lines below — lemonade's note
+        // already distinguishes "could not be determined" from "no Vulkan
+        // driver was found", and repeating a weaker version of it up here
+        // would only risk the two drifting apart.
+        //
+        // Neither new level may borrow the `RocmHip` arm. `NoGpuBackend` is a
+        // host the catalog confirmed has no ROCm build and the probe
+        // confirmed has no Vulkan driver; `VulkanUnconfirmed` has the same
+        // confirmed absence of a ROCm build with the Vulkan half still open.
+        // On both, "ROCm GPU execution is required" is precisely the stale
+        // claim this stack exists to delete — stated directly above a row
+        // saying this GPU has no ROCm/HIP support.
+        //
+        // The other half is kept rather than softened: on `NoGpuBackend` it is
+        // tempting to read "no backend can run here" as licence to mention the
+        // CPU, but rocm-cli refuses CPU execution at every level and Vulkan
+        // counts as a GPU path rather than a fallback from one. The sentence
+        // that is true on all three is that a GPU is required and the CPU is
+        // not an alternative, which is what it says.
+        rocm_core::GpuSupportLevel::VulkanUnconfirmed
+        | rocm_core::GpuSupportLevel::NoGpuBackend
+        | rocm_core::GpuSupportLevel::Unknown => {
+            "  GPU execution is required; CPU execution is not supported."
+        }
+    }
 }
 
 pub(crate) fn append_examine_runtime_state(
@@ -363,6 +462,7 @@ fn append_examine_engine_inventory(
     paths: &AppPaths,
     config: &RocmCliConfig,
     host_default_engine: &str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
 ) {
     // Mirrors `select_serve_engine`'s guard: a blank configured value must not
     // out-rank the host preference, or `effective_default` below would become
@@ -445,6 +545,12 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
+        let note = engine_inventory_note(
+            engine,
+            note,
+            gpu_support_level,
+            InventorySurface::ExamineReport,
+        );
         write_marked_row(
             output,
             "  ",
@@ -612,11 +718,221 @@ fn runtime_status_label_for(installed: bool, ruled_out: PlatformRuleOut) -> &'st
     }
 }
 
+/// The inventory note to print for `engine`, given the row `catalog_note` the
+/// static catalogue carries for it and what this host actually supports.
+///
+/// The one place the lemonade substitution lives. All three host-aware
+/// inventory renderers — [`render_engine_inventory_text_for_host`]
+/// (`rocm engines`), [`append_examine_engine_inventory`] (`rocm examine`) and
+/// [`builtin_codex_bridge_engine_inventory`] (the codex bridge and its
+/// `engines` MCP tool) — route their note through this, so the three cannot
+/// drift into disagreeing about the same host. Tests exercise the renderers
+/// rather than this function: asserting on it directly would only restate the
+/// condition below instead of proving a surface prints it.
+pub(crate) fn engine_inventory_note(
+    engine: &str,
+    catalog_note: &'static str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
+    surface: InventorySurface,
+) -> &'static str {
+    if engine == "lemonade" {
+        lemonade_engine_note(gpu_support_level, surface)
+    } else {
+        catalog_note
+    }
+}
+
+/// Which surface is rendering an engine-inventory note.
+///
+/// Exists for exactly one clause. The `Unknown` note sends the reader to
+/// `rocm examine` for this host's support level, which is right from
+/// `rocm engines` and from the bridge's `engines` tool — and circular inside
+/// `rocm examine`'s own report, where it lands a few lines under the
+/// `rocm_support:` line that already answers it. Every other arm is identical
+/// across surfaces, so the three still cannot disagree about what a host *is*;
+/// they differ only in where they send the reader next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InventorySurface {
+    /// `rocm engines`, and the codex bridge's `engines` MCP tool.
+    Standalone,
+    /// The engine inventory printed inside `rocm examine`'s own report.
+    ExamineReport,
+}
+
+/// The lemonade engine note shown in `rocm examine`, `rocm engines` and the
+/// codex-bridge engine inventory, adjusted for whether this host's detected GPU
+/// can actually use the ROCm llama.cpp backend.
+///
+/// All three of those have a live `GpuSupportLevel` in scope. The two places
+/// that still print the note statically — the dashboard TUI's engine-manager
+/// pane and `rocmd`'s own `rocmd_engine_inventory` in
+/// `apps/rocmd/src/host_snapshot.rs` — keep the
+/// unconditional ROCm wording, and that is deliberate rather than an oversight:
+/// the TUI pane renders a hard-coded descriptive list with no probe behind it,
+/// and `rocmd` is the daemon answering for whichever host a client asks about,
+/// not necessarily the one it runs on. Both are their own change if they ever
+/// need to be host-aware.
+///
+/// The match is exhaustive rather than a catch-all on purpose. `Unknown` is
+/// "no GPU detected yet, or a gfx target this catalog does not recognize", and
+/// folding it into the ROCm arm reproduced the exact bug ROCMAI-550 exists to
+/// fix - asserting ROCm support on a host where nothing establishes it, just
+/// on the hosts where the CLI knows least. It does not get the Vulkan wording
+/// either: that is a confirmed absence, and a detection gap is not one. So it
+/// claims no backend and names the command that can answer. A new
+/// `GpuSupportLevel` variant now has to be classified here rather than
+/// silently inheriting the ROCm claim.
+///
+/// What the `Unknown` arm promises is bounded by what the named command
+/// delivers. It used to say `rocm examine` would show "which llama.cpp backend
+/// this GPU uses", and examine showed no such thing — it printed a
+/// `rocm_support` line only for `VulkanOnly`, so on exactly the hosts that got
+/// this note it printed nothing at all. `ExamineSummary::rocm_support_line`
+/// now answers for every level, and this says what that answer is: the support
+/// level, not the backend. The backend is settled by launching one, which that
+/// line in turn points at.
+const fn lemonade_engine_note(
+    level: rocm_core::GpuSupportLevel,
+    surface: InventorySurface,
+) -> &'static str {
+    match level {
+        rocm_core::GpuSupportLevel::VulkanOnly => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, so it runs on the Vulkan llama.cpp backend"
+        }
+        rocm_core::GpuSupportLevel::RocmHip => {
+            "default embedded Lemonade server with ROCm llama.cpp backend"
+        }
+        // Looked at and inconclusive. Says the same "no ROCm/HIP" fact as the
+        // arm below, but stops short of its claim about Vulkan, because
+        // nothing here established it either way.
+        //
+        // Reached by every caller that passes a real `VulkanStatus`, which is
+        // `rocm examine` *and* `build_codex_bridge_snapshot` (the
+        // `InternalBridgeSnapshot` command and the MCP `bridge_snapshot` tool),
+        // which builds the level from `examine.vulkan_status()` rather than the
+        // cheap `host_gpu_support_level`. The MCP `engines` tool is deliberately
+        // NOT in that list: it goes through `host_gpu_support_level`, which
+        // always passes `VulkanStatus::Unknown`, so it can never land on these
+        // two arms.
+        //
+        // So the advice here cannot be "run `rocm examine`": this very note is
+        // rendered *inside* that command's own output, through
+        // `examine_human_report` -> `append_examine_engine_inventory`, and
+        // would tell its reader to run the command they were already reading.
+        // This arm names the thing that would actually settle the question
+        // instead, which is why it needs no [`InventorySurface`] split the way
+        // the `Unknown` arm below does.
+        //
+        // The claim and the next step are `rocm_core`'s
+        // `VULKAN_UNCONFIRMED_CLAIM` and `VULKAN_UNCONFIRMED_NEXT_STEP`,
+        // spelled out here only because this is a `const fn` returning a
+        // `&'static str` and a constant cannot be interpolated into one.
+        // `the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim`
+        // holds the two in step; both strings appear in the *same* `rocm
+        // examine` report, a few lines apart, so a divergence is visible to the
+        // user immediately.
+        //
+        // In particular this must not say "install a Vulkan driver"
+        // unconditionally: a working Windows Adrenalin machine lands in this
+        // level, since the Khronos key it reads is legacy there. Nor "install
+        // `vulkaninfo`": on a driverless Linux host that tool is already
+        // installed, prints "Found no drivers!" and exits 1, which is another
+        // of the shapes that lands here.
+        rocm_core::GpuSupportLevel::VulkanUnconfirmed => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, and whether a \
+             Vulkan driver is present could not be determined here - run `vulkaninfo` yourself \
+             to see what it reports, and install a Vulkan driver (Mesa RADV on Linux, the AMD \
+             display driver on Windows) if it finds none"
+        }
+        rocm_core::GpuSupportLevel::NoGpuBackend => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support and no Vulkan driver was found, so no GPU backend can run here"
+        }
+        // The only remaining arm that names a next step, and so the only one
+        // that can be circular. The arms above answer it by naming `vulkaninfo`
+        // instead; this one has no such substitute, so it varies by surface.
+        // See [`InventorySurface`].
+        rocm_core::GpuSupportLevel::Unknown => match surface {
+            InventorySurface::Standalone => {
+                "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
+            }
+            InventorySurface::ExamineReport => {
+                "default embedded Lemonade server; the `rocm_support` line above gives this host's GPU support level and how to find the backend"
+            }
+        },
+    }
+}
+
+/// This host's GPU support level from the cheap host probe, for the call sites
+/// that need it without gathering a whole [`ExamineSummary`].
+///
+/// The same two inputs `rocm examine` derives it from, read through
+/// `detect_host_gpu_summary` rather than the full examine gather — exactly what
+/// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
+///
+/// **The Vulkan probe is deliberately not run here**, so this stays the cheap
+/// probe its callers chose it for: the probe spawns `vulkaninfo` on Linux and
+/// PowerShell on Windows, and `rocm engines` is a listing command that would
+/// pay that on every invocation. Passing [`VulkanStatus::Unknown`] keeps these
+/// surfaces answering exactly as they did before this probe existed — a
+/// Vulkan-capable-by-the-table host still reads `VulkanOnly` — while `rocm
+/// examine`, which already gathers the probe, is the surface that can tell a
+/// host with a Vulkan driver from one without. That split is why
+/// `lemonade_engine_note` sends the user to `rocm examine` for a real answer.
+pub(crate) fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
+    rocm_core::gpu_support_level_for_host_gpu(
+        &rocm_core::detect_host_gpu_summary(paths),
+        rocm_core::VulkanStatus::Unknown,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
+
+    /// The lemonade note and `rocm examine`'s `rocm_support` line both render
+    /// `VulkanUnconfirmed`, and both appear in the same `rocm examine` report a
+    /// few lines apart. They must make the same claim about the host and offer
+    /// the same next step, so both are held against the constants `rocm-core`
+    /// defines; this note spells them out only because a `const fn` returning
+    /// `&'static str` cannot interpolate a constant.
+    ///
+    /// Neither may tell a host to install a Vulkan driver unconditionally: a
+    /// working Windows Adrenalin machine reaches this level, because the
+    /// Khronos registry key the probe reads is legacy there.
+    #[test]
+    fn the_lemonade_note_and_the_support_line_make_the_same_unconfirmed_claim() {
+        let note = lemonade_engine_note(
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+            InventorySurface::ExamineReport,
+        );
+
+        // This arm settles the question by naming `vulkaninfo`, so unlike the
+        // `Unknown` arm it needs no per-surface wording. Pinned, so a future
+        // split here has to be deliberate.
+        assert_eq!(
+            note,
+            lemonade_engine_note(
+                rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+                InventorySurface::Standalone,
+            ),
+            "the unconfirmed arm must read the same on every surface"
+        );
+
+        assert!(
+            note.contains(rocm_core::VULKAN_UNCONFIRMED_CLAIM),
+            "the note must make the shared claim verbatim: {note}"
+        );
+        assert!(
+            note.contains(rocm_core::VULKAN_UNCONFIRMED_NEXT_STEP),
+            "and offer the shared next step verbatim: {note}"
+        );
+        assert!(
+            !note.contains("no Vulkan driver was found"),
+            "a level a working Adrenalin laptop reaches must not deny its driver: {note}"
+        );
+    }
     use crate::runtimes_cmd::runtime_manifest_path;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::test_paths;
@@ -640,6 +956,7 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
+            vulkan: None,
             driver: rocm_core::DriverSummary {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
@@ -738,7 +1055,13 @@ mod tests {
 
         assert!(rendered.contains("Local model engines"));
         assert!(rendered.contains("Built-in engines are included with rocm-cli"));
-        assert!(rendered.contains("ROCm GPU execution is required"));
+        // Not `"ROCm GPU execution is required"`: this renderer probes the real
+        // host, so the ROCm half of that sentence is now whatever this runner's
+        // `GpuSupportLevel` is (see `gpu_execution_line`). The part that holds
+        // on every runner — and the part this test is about — is that engines
+        // need a GPU at all. Which backend is claimed for which level is pinned
+        // by `engines_banner_and_engine_note_cannot_contradict_each_other`.
+        assert!(rendered.contains("GPU execution is required"));
         assert!(rendered.contains("Plugin folders:"));
         assert!(rendered.contains(&paths.primary_engine_plugin_dir().display().to_string()));
     }
@@ -856,7 +1179,13 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             output.contains("configured_default_engine: <platform default>"),
@@ -1190,7 +1519,13 @@ mod tests {
 
         // Host default deliberately disagrees with the configured value: an
         // engine the user chose must outrank whatever the GPU would prefer.
-        append_examine_engine_inventory(&mut output, &paths, &config, "lemonade");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(output.contains("engine_inventory:"));
         assert!(output.contains("configured_default_engine: vllm"));
@@ -1201,13 +1536,70 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// `rocm examine`'s own report must not answer a question by telling the
+    /// reader to run `rocm examine`.
+    ///
+    /// The `Unknown` lemonade note is the only arm that names a next step, and
+    /// the `rocm engines` / bridge wording for it is "run `rocm examine` for
+    /// this host's GPU support level". Printed inside the examine report that
+    /// advice is circular, and it lands a few lines under the `rocm_support:`
+    /// line that already answers it with something actionable.
+    ///
+    /// The pair is the test: the same level rendered for the standalone
+    /// surface must still send the reader to `rocm examine`, or this would pass
+    /// just as well if the clause were deleted everywhere.
+    #[test]
+    fn the_examine_report_does_not_tell_the_reader_to_run_examine() {
+        let (root, paths) = test_paths("examine-inventory-not-circular");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            output.contains("lemonade"),
+            "premise: the lemonade row must be rendered at all:\n{output}"
+        );
+        assert!(
+            !output.contains("run `rocm examine`"),
+            "the examine report must not send the reader back to examine:\n{output}"
+        );
+        assert!(
+            output.contains("the `rocm_support` line above"),
+            "it must point at the answer already in this same report:\n{output}"
+        );
+
+        // The standalone surface keeps the original advice, where it is correct.
+        assert!(
+            lemonade_engine_note(
+                rocm_core::GpuSupportLevel::Unknown,
+                InventorySurface::Standalone,
+            )
+            .contains("run `rocm examine`"),
+            "`rocm engines` and the bridge still point at examine"
+        );
+    }
+
     #[test]
     fn examine_engine_inventory_includes_marker_legend() {
         let (root, paths) = test_paths("examine-engine-inventory-marker-legend");
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
         let _ = fs::remove_dir_all(root);
 
         let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
@@ -1227,7 +1619,13 @@ mod tests {
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
         let _ = fs::remove_dir_all(root);
 
         for (engine, _) in engine_inventory() {
@@ -1255,7 +1653,13 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
         let _ = fs::remove_dir_all(root);
 
         assert!(
@@ -1275,7 +1679,13 @@ mod tests {
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         // The configured line still reads as unset — the host default must not be
         // mistaken for something the user chose.
@@ -1307,7 +1717,13 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             output.contains("effective_default_engine: lemonade"),
@@ -1341,12 +1757,381 @@ mod tests {
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             !output.contains("configured_default_note"),
             "there is no override to report when the two agree:\n{output}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        // A gfx90c host (or any confirmed-no-ROCm-build GPU) actually runs
+        // Lemonade's Vulkan backend, not the ROCm one the static catalog text
+        // always claimed.
+        let (root, paths) = test_paths("examine-engine-inventory-vulkan-only");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanOnly,
+        );
+
+        assert!(
+            output.contains("no ROCm/HIP support") && output.contains("Vulkan llama.cpp backend"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("note=default embedded Lemonade server with ROCm"),
+            "{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_engine_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let (root, paths) = test_paths("examine-engine-inventory-rocm-capable");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
+
+        assert!(
+            output.contains("note=default embedded Lemonade server with ROCm llama.cpp backend"),
+            "{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The two support levels this change added carry new user-facing wording
+    /// on both renderers, and nothing exercised either of them. They are each
+    /// other's nearest neighbour -- both say "no ROCm/HIP" -- so each case
+    /// asserts what the *other* one would have said is absent; otherwise a
+    /// single arm doing duty for both would still pass.
+    #[test]
+    fn examine_engine_inventory_separates_an_unconfirmed_vulkan_from_no_backend_at_all() {
+        let (root, paths) = test_paths("examine-engine-inventory-vulkan-tiers");
+        let config = RocmCliConfig::default();
+
+        let mut unconfirmed = String::new();
+        append_examine_engine_inventory(
+            &mut unconfirmed,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+        );
+        assert!(
+            unconfirmed.contains("could not be determined"),
+            "an unprobed Vulkan path must read as unknown, not as a verdict:\n{unconfirmed}"
+        );
+        assert!(
+            !unconfirmed.contains("no Vulkan driver was found"),
+            "`VulkanUnconfirmed` must not borrow `NoGpuBackend`'s confirmed absence:\n{unconfirmed}"
+        );
+        assert!(
+            !unconfirmed.contains("so it runs on the Vulkan llama.cpp backend"),
+            "nor may it promise the backend `VulkanOnly` promises:\n{unconfirmed}"
+        );
+
+        let mut none = String::new();
+        append_examine_engine_inventory(
+            &mut none,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+        );
+        assert!(
+            none.contains("no Vulkan driver was found")
+                && none.contains("no GPU backend can run here"),
+            "a confirmed absence must say so plainly:\n{none}"
+        );
+        assert!(
+            !none.contains("could not be determined"),
+            "`NoGpuBackend` is the probed answer, not the missing one:\n{none}"
+        );
+
+        assert_ne!(
+            unconfirmed, none,
+            "'we could not tell' and 'we looked and there is none' are different facts"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `rocm engines` renders the same two notes through a different renderer,
+    /// so it needs the same pair -- this is the counterpart to
+    /// `examine_engine_inventory_separates_an_unconfirmed_vulkan_from_no_backend_at_all`.
+    #[test]
+    fn engines_inventory_separates_an_unconfirmed_vulkan_from_no_backend_at_all() {
+        let (root, paths) = test_paths("engines-inventory-vulkan-tiers");
+
+        let unconfirmed = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+        );
+        assert!(
+            unconfirmed.contains("could not be determined")
+                && unconfirmed.contains("no ROCm/HIP support"),
+            "`rocm engines` must report the same unprobed Vulkan state examine does:\n{unconfirmed}"
+        );
+        assert!(
+            !unconfirmed.contains("Lemonade server with ROCm llama.cpp backend"),
+            "a host with no ROCm build must not be told it has one:\n{unconfirmed}"
+        );
+
+        let none = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+        );
+        assert!(
+            none.contains("no GPU backend can run here"),
+            "`rocm engines` must not keep promising a backend that was ruled out:\n{none}"
+        );
+        assert!(
+            !none.contains("could not be determined"),
+            "the probed answer must not be softened into the unprobed one:\n{none}"
+        );
+
+        assert_ne!(
+            unconfirmed, none,
+            "the two levels exist precisely because they are not the same claim"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `rocm engines` makes the same claim `rocm examine` does, through a
+    /// different renderer, so it needs the same pair of tests:
+    /// `examine_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support`
+    /// is this test's counterpart on the examine surface.
+    #[test]
+    fn engines_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        let (root, paths) = test_paths("engines-inventory-vulkan-only");
+
+        let output = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanOnly,
+        );
+
+        assert!(
+            output.contains("no ROCm/HIP support") && output.contains("Vulkan llama.cpp backend"),
+            "`rocm engines` must name the backend this GPU really runs on:\n{output}"
+        );
+        assert!(
+            !output.contains("Lemonade server with ROCm llama.cpp backend"),
+            "`rocm engines` must not keep asserting ROCm support on a host without it:\n{output}"
+        );
+        // The substitution is lemonade's alone; vLLM's row is not host-aware.
+        assert!(
+            output.contains("Linux/WSL ROCm GPU serving engine through external vLLM"),
+            "only lemonade's note is support-level aware:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn engines_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let (root, paths) = test_paths("engines-inventory-rocm-capable");
+
+        let output = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "vllm",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
+
+        assert!(
+            output.contains("default embedded Lemonade server with ROCm llama.cpp backend"),
+            "a ROCm-capable host must keep the ROCm wording:\n{output}"
+        );
+        assert!(
+            !output.contains("Vulkan llama.cpp backend"),
+            "a ROCm-capable host must not be told it is on Vulkan:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An unrecognized or undetected GPU is a gap in what the catalog knows,
+    /// not a confirmed absence of ROCm - printing the Vulkan wording for it
+    /// would turn that gap into a false claim about the hardware, which is the
+    /// distinction `GpuSupportLevel::Unknown` exists to preserve. It must not
+    /// get the *ROCm* wording either: that was the original bug, reappearing
+    /// on precisely the hosts where support is least known.
+    #[test]
+    fn engines_inventory_does_not_claim_vulkan_for_an_unrecognized_gpu() {
+        let (root, paths) = test_paths("engines-inventory-unknown");
+
+        let output = render_engine_inventory_text_for_host(
+            Some(&paths),
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
+
+        assert!(
+            !output.contains("no ROCm/HIP support"),
+            "an unrecognized GPU must not be reported as confirmed ROCm-less:\n{output}"
+        );
+        assert!(
+            !output.contains("Lemonade server with ROCm llama.cpp backend"),
+            "an unrecognized GPU must not be told it has ROCm support either:\n{output}"
+        );
+        assert!(
+            output.contains("rocm examine"),
+            "claiming no backend still has to leave a way to find out:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `rocm engines` must not assert and deny ROCm support on one screen.
+    ///
+    /// The three tests above each check one half of the page — the per-engine
+    /// note — and would all pass with the banner above it flatly contradicting
+    /// them, which is exactly the state this test was added for: the banner was
+    /// the constant `"ROCm GPU execution is required."` printed a few lines
+    /// over "this GPU has no ROCm/HIP support".
+    ///
+    /// Stated as a relation between the two lines rather than as expected text
+    /// per level, so it keeps holding if either sentence is reworded: the claim
+    /// under test is that the banner requires ROCm on exactly the hosts whose
+    /// row says they have it. That covers every level and not just the
+    /// `VulkanOnly` one — `Unknown` must not be told ROCm is required either,
+    /// when its own row says the support level is not yet known.
+    #[test]
+    fn engines_banner_and_engine_note_cannot_contradict_each_other() {
+        let (root, paths) = test_paths("engines-banner-vs-note");
+
+        // All five levels, not the three this test was written against: the
+        // Vulkan probe added `VulkanUnconfirmed` and `NoGpuBackend`, and both
+        // are hosts whose own lemonade row states there is no ROCm/HIP
+        // support — exactly the shape of the contradiction this test exists
+        // to catch, so leaving them out would leave the new levels free to
+        // reintroduce it.
+        for level in [
+            rocm_core::GpuSupportLevel::RocmHip,
+            rocm_core::GpuSupportLevel::VulkanOnly,
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+            rocm_core::GpuSupportLevel::Unknown,
+        ] {
+            let output = render_engine_inventory_text_for_host(Some(&paths), "lemonade", level);
+
+            // The invariant that survives every level: these engines serve on a
+            // GPU, never on the CPU. Dropping the banner entirely would make the
+            // contradiction assertions below vacuously true.
+            assert!(
+                output.contains("GPU execution is required"),
+                "{level:?}: the GPU requirement must still be stated:\n{output}"
+            );
+
+            let banner_requires_rocm = output.contains("ROCm GPU execution is required");
+            let note_claims_rocm =
+                output.contains("default embedded Lemonade server with ROCm llama.cpp backend");
+            assert_eq!(
+                banner_requires_rocm,
+                matches!(level, rocm_core::GpuSupportLevel::RocmHip),
+                "{level:?}: the banner may require ROCm only where the classifier \
+                 establishes it:\n{output}"
+            );
+            assert_eq!(
+                banner_requires_rocm, note_claims_rocm,
+                "{level:?}: the banner and lemonade's row must make the same ROCm claim \
+                 about the same host:\n{output}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other half of the banner, and the half nothing asserted:
+    /// `gpu_execution_line` tells a `VulkanOnly` host which backend it has,
+    /// and tells the other three that the CPU is not an alternative. Neither
+    /// sentence appeared anywhere outside that function, so merging the
+    /// `VulkanOnly` arm into the shared one below it left every test green —
+    /// including the ROCm-parity sweep above, which only reads the word "ROCm
+    /// GPU execution is required" and is satisfied by either sentence.
+    ///
+    /// The discrimination is the finding, not either sentence on its own:
+    /// `VulkanOnly` is the single level where the classifier established a GPU
+    /// backend, and "CPU execution is not supported" there is true but silent
+    /// about the backend this host actually has. So each level asserts its own
+    /// banner present *and* the other's absent, and the three no-usable-backend
+    /// levels are swept rather than sampled, so a future arm cannot quietly
+    /// pick up the Vulkan claim.
+    #[test]
+    fn engines_banner_claims_a_vulkan_backend_only_where_one_was_established() {
+        let (root, paths) = test_paths("engines-banner-vulkan-only");
+        let banner = |level| {
+            render_engine_inventory_text_for_host(Some(&paths), "lemonade", level)
+                .lines()
+                .find(|line| line.contains("GPU execution is required"))
+                .expect("every level prints the GPU-execution banner")
+                .to_owned()
+        };
+
+        let vulkan_only = banner(rocm_core::GpuSupportLevel::VulkanOnly);
+        assert!(
+            vulkan_only.contains("that is the Vulkan backend, not ROCm"),
+            "the one level with an established GPU backend must name it:\n{vulkan_only}"
+        );
+        assert!(
+            !vulkan_only.contains("CPU execution is not supported"),
+            "and must not borrow the sentence of the levels that have none:\n{vulkan_only}"
+        );
+
+        for level in [
+            rocm_core::GpuSupportLevel::VulkanUnconfirmed,
+            rocm_core::GpuSupportLevel::NoGpuBackend,
+            rocm_core::GpuSupportLevel::Unknown,
+        ] {
+            let line = banner(level);
+            assert!(
+                !line.contains("that is the Vulkan backend, not ROCm"),
+                "{level:?} established no Vulkan backend and must not claim one:\n{line}"
+            );
+            assert!(
+                line.contains("CPU execution is not supported"),
+                "but the refusal is what is invariant across them, so it is still \
+                 said:\n{line}"
+            );
+            assert_ne!(
+                line, vulkan_only,
+                "{level:?} must not render the `VulkanOnly` banner"
+            );
+        }
+
+        // `RocmHip` is the fourth answer, and the only one that may still
+        // require ROCm. Without it the sweep above would pass on a banner that
+        // had lost that arm too.
+        let rocm_hip = banner(rocm_core::GpuSupportLevel::RocmHip);
+        assert!(
+            rocm_hip.contains("ROCm GPU execution is required"),
+            "a ROCm-capable host keeps the original claim:\n{rocm_hip}"
+        );
+        assert_ne!(
+            rocm_hip, vulkan_only,
+            "and it is not the Vulkan sentence either"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 }
