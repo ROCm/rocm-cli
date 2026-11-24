@@ -2256,13 +2256,15 @@ Before removing anything, `uninstall` prints warnings, among them:
   uninstalling.
 
 It also names the shared caches: a `uv` package cache that `UV_CACHE_DIR` or
-the default `~/.cache/uv` points to, and the Hugging Face model cache. An ambient
-`UV_PYTHON_INSTALL_DIR` is honoured; otherwise interpreters live in the data
-directory and go with it. One that
+the default `~/.cache/uv` points to, and the Hugging Face model cache. One that
 lives outside the folders being removed is left in place; delete it yourself if
 you no longer need it. If one sits inside a folder being removed (for example
 `ROCM_CLI_CACHE_DIR=~/.cache`), the review says it WILL BE DELETED before you
 confirm, and which `--keep-` flag keeps it.
+
+The Python interpreters rocm-cli provisions live in `<data-dir>/python` and go
+with the data folder. An ambient `UV_PYTHON_INSTALL_DIR` is honoured instead, and
+that directory is left alone.
 
 `rocm uninstall` removes a config, data, or cache folder inside your home
 folder as usual. It never removes:

@@ -495,7 +495,9 @@ fn ensure_managed_python(
         }
     };
     let install_output = Command::new(&uv)
-        .args(["python", "install", &version])
+        // `--no-bin`/`--no-registry`: uv would otherwise write a launcher under
+        // `~/.local/bin` (or a Windows registry entry) that outlives the data dir.
+        .args(["python", "install", "--no-bin", "--no-registry", &version])
         .envs(uv_command_env(paths))
         .stdin(Stdio::null())
         .stdout(install_stdio())

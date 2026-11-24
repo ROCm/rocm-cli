@@ -61,6 +61,12 @@ filesystem: a bind mount is enough to trigger the fallback even when both paths
 resolve to one underlying filesystem. Making `--prefix` do this automatically is
 tracked separately.
 
+The Python interpreters `uv python install` fetches live at `<data-dir>\python`, so
+an isolated data dir is self-contained and deleting it removes them. An ambient
+`UV_PYTHON_INSTALL_DIR` is honoured instead and that directory is left alone.
+Interpreters installed before this change stay where they were and keep serving
+the installs that use them; they are not migrated or cleaned up.
+
 ## 1. First-Time Setup
 
 Start rocm-cli:
