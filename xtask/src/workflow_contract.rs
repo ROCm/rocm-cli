@@ -2369,7 +2369,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
 
     const REPORT_CHECK_STEP: &str = "- name: Check every lane that ran uploaded its report";
 
-    /// The per-PR workflow's MI300X lanes: the queue lane and the self-hosted one.
+    /// The per-PR workflow's gfx942 lanes: the queue lane and the self-hosted one.
     const MI300X_LANES: &[&str] = &["e2e-gpu", "e2e-gpu-queue"];
 
     /// A step block, found by its exact `- name:` line, including that line.
@@ -3492,11 +3492,11 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             .to_owned()
     }
 
-    const MI300X_GATE_STEP: &str = "- name: Check the MI300X requirement (queue or self-hosted)";
+    const MI300X_GATE_STEP: &str = "- name: Check the gfx942 requirement (queue or self-hosted)";
 
     #[test]
     fn mi300x_requirement_is_met_by_the_queue_or_the_self_hosted_lane() {
-        // A pull request's MI300X requirement is either lane. The self-hosted
+        // A pull request's gfx942 requirement is either lane. The self-hosted
         // lane can sit queued for a day on a pool at zero replicas, so the report
         // reads it through `e2e-gpu-settled` (a job that gives up on it) instead
         // of through `needs`, and the decision is `mi300x-gate.sh`, fed both lanes.
@@ -3537,7 +3537,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // The deadlines are ordered and the job's cap lets the script stop itself.
         // `${{ <MI300X_REQUIRED's condition> && '<pr>' || '<other>' }}`: a short
         // queue deadline where the queue lane is the primary check, a long one
-        // where this lane is the only MI300X signal (a fork or dependabot pull
+        // where this lane is the only gfx942 signal (a fork or dependabot pull
         // request included). Both pairs must be ordered.
         let required_cond = env_value(&named_step(report, MI300X_GATE_STEP), "MI300X_REQUIRED")
             .trim_start_matches("${{ ")
@@ -3950,7 +3950,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
                 ":x:"
             };
             assert!(
-                summary.contains(&format!("MI300X: {mark}")),
+                summary.contains(&format!("gfx942: {mark}")),
                 "{why}: the verdict mark is said in the summary: {summary}"
             );
         }
@@ -4046,7 +4046,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // `::error::` is emitted when the requirement is not met.
         let (code, log, _) = run_mi300x_gate(true, "skipped", "skipped", &[]);
         assert_eq!(code, 1);
-        assert!(log.contains("::error::MI300X requirement not met"), "{log}");
+        assert!(log.contains("::error::gfx942 requirement not met"), "{log}");
     }
 
     #[test]
@@ -13638,7 +13638,7 @@ permissions:
 
     /// What the pull request's gate job may and may not do: it holds no queue
     /// credential, dispatches the workflow as it is on main, and publishes only
-    /// the queue run's release report as the MI300X one.
+    /// the queue run's release report as the gfx942 one.
     #[test]
     fn the_pull_request_gate_dispatches_the_workflow_on_main_and_nothing_else() {
         let text = read_workflow("e2e-selfhosted.yml");
@@ -13729,7 +13729,7 @@ permissions:
             gate.contains("=~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$"),
             "the branch name must be checked before it is passed on"
         );
-        // Its one report, the MI300X cell the queue's run stands for.
+        // Its one report, the gfx942 cell the queue's run stands for.
         assert_eq!(
             uploaded_report_artifact("e2e-selfhosted.yml", &text, "e2e-gpu-queue"),
             "e2e-gpu-report"
@@ -13752,12 +13752,17 @@ permissions:
 
     /// The queue side's half of the gate's contract, as the gate reads it: the
     /// first line of `refused.txt` starts with this when the queue refused for
-    /// the nightly's window, and the MI300X lane's release report sits at this
+    /// the nightly's window, and the MI325X lane's release report sits at this
     /// path of the `queue-pr-run-results` artifact. The queue side is not in this
     /// repository: these are the gate's half, shared by the script check, the
     /// mock runs and the doc check below so none can drift alone.
     const QUEUE_NIGHTLY_REFUSAL: &str = "nightly:";
-    const QUEUE_REPORT_PATH: &str = "mi300x/release/results/report.json";
+    const QUEUE_REPORT_PATH: &str = "mi325x/release/results/report.json";
+    /// The lane the queue side ran pull requests on before it moved to mi325x: the
+    /// gate still reads it, so either order of the two deployments works. Only the
+    /// mock runs, which are Unix-only, use it.
+    #[cfg(unix)]
+    const QUEUE_REPORT_PATH_BEFORE_MI325X: &str = "mi300x/release/results/report.json";
 
     /// One run of the gate's script against a mock `gh`: what to answer and what
     /// the queue run published.
@@ -14016,10 +14021,10 @@ esac
         let run = run_gate_script(&Gate {
             results: Some(vec![
                 (QUEUE_REPORT_PATH, "{}"),
-                ("mi300x/release/results/platform.json", "{}"),
+                ("mi325x/release/results/platform.json", "{}"),
                 // Another lane's and another channel's files are not this job's.
                 ("w7900/release/results/report.json", "{}"),
-                ("mi300x/nightly/results/report.json", "{}"),
+                ("mi325x/nightly/results/report.json", "{}"),
             ]),
             ..Gate::default()
         });
@@ -14053,6 +14058,46 @@ esac
         );
     }
 
+    /// The queue side and this workflow are deployed apart: while the queue still
+    /// runs pull requests on mi300x, the gate takes that lane's report, and it
+    /// prefers mi325x's when both are there.
+    #[test]
+    #[cfg(unix)]
+    fn queue_gate_script_reads_the_mi300x_lane_until_the_queue_side_moves() {
+        if !jq_available() {
+            return;
+        }
+        let before = run_gate_script(&Gate {
+            results: Some(vec![
+                (QUEUE_REPORT_PATH_BEFORE_MI325X, "{}"),
+                ("mi300x/release/results/platform.json", "{}"),
+            ]),
+            ..Gate::default()
+        });
+        assert_eq!(before.code, 0, "{}", before.log);
+        assert_eq!(
+            before.report,
+            ["platform.json", "report.json"],
+            "{}",
+            before.log
+        );
+        let both = run_gate_script(&Gate {
+            results: Some(vec![
+                (QUEUE_REPORT_PATH_BEFORE_MI325X, "{}"),
+                (QUEUE_REPORT_PATH, "{}"),
+                ("mi325x/release/results/platform.json", "{}"),
+            ]),
+            ..Gate::default()
+        });
+        assert_eq!(both.code, 0, "{}", both.log);
+        assert_eq!(
+            both.report,
+            ["platform.json", "report.json"],
+            "{}",
+            both.log
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn queue_gate_script_follows_the_runs_verdict_but_still_publishes_its_report() {
@@ -14066,7 +14111,7 @@ esac
         });
         assert_eq!(failed.code, 1, "{}", failed.log);
         assert_eq!(failed.report, ["report.json"], "{}", failed.log);
-        // A run with no MI300X release report is red, whatever else it published.
+        // A run with no MI325X release report is red, whatever else it published.
         let none = run_gate_script(&Gate {
             results: Some(vec![("w7900/release/results/report.json", "{}")]),
             ..Gate::default()
@@ -14074,7 +14119,8 @@ esac
         assert_eq!(none.code, 1, "{}", none.log);
         assert!(none.report.is_empty());
         assert!(
-            none.log.contains("left no MI300X release report"),
+            none.log
+                .contains("left no MI325X (or, until the queue side moves, MI300X) release report"),
             "{}",
             none.log
         );
@@ -14384,7 +14430,7 @@ esac
                     "results=queue-results/{}",
                     QUEUE_REPORT_PATH.trim_end_matches("/report.json")
                 )),
-            "the gate must read refused.txt and the MI300X release results directory"
+            "the gate must read refused.txt and the MI325X release results directory"
         );
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
