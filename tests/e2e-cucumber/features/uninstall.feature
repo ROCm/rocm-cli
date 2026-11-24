@@ -7,8 +7,10 @@ Feature: Uninstall
   # the mock lane every PR.
   #
   # Every scenario passes --keep-binaries (the binary under test must survive)
-  # and points HOME, the uv cache and the Hugging Face cache at the scenario's
-  # own folder, so an uninstall can never reach the runner's shared caches.
+  # and points HOME, the cache folder, the uv cache and the Hugging Face cache
+  # at the scenario's own folder, so an uninstall can never reach the runner's
+  # shared caches. The one setting that names a folder outside it, a data
+  # folder of `/`, is only ever previewed with --dry-run.
   #
   # The link scenarios are Linux-only, and the behaviour they pin is only
   # claimed for Linux: on Windows a directory symlink or junction needs
@@ -143,11 +145,11 @@ Feature: Uninstall
 
   # The assistant's uninstall preview (the `rocm_command` tool of the chat
   # assistant and the dashboard, called here without a model through the hidden
-  # `rocm mcp-call`) renders the same plan as a dry run, but it has no flag to
-  # offer, so it says that removal needs approval. It is the one run here that
-  # cannot pass --keep-binaries: the preview takes no flags and removes nothing,
-  # and it is made without --allow-mutation, so a call that would remove
-  # something is refused.
+  # `rocm mcp-call`) renders the same plan as a dry run, but it has no command
+  # line to offer, so it says that removal needs approval. It is the one run here
+  # made without --keep-binaries: the preview reads the --keep-* flags but
+  # removes nothing, and it is made without --allow-mutation, so a call that
+  # would remove something is refused.
   @id:uninstall-assistant-preview-says-removal-needs-approval
   Scenario: uninstall-12 - The assistant's uninstall preview lists what it would remove, says removal needs approval, and removes nothing
     Given the config folder holds the user's files
@@ -225,7 +227,106 @@ Feature: Uninstall
   # uninstall review names it rather than deleting its last trace unannounced.
   @id:uninstall-dry-run-names-refused-remote-session-record
   Scenario: uninstall-18 - A dry run names a refused remote session record that stop cannot reach
-    Given a session record on this machine that names a remote command this tool never writes
+    Given the data folder holds a session record that names a remote command this tool never writes
     When the user dry-runs an uninstall
     Then the uninstall succeeds
     And the uninstall warns about the refused remote session record
+
+  # Linux-only: on Windows `/` names the current drive's root and renders as
+  # `\`, so this line would read differently. The Windows drive-root refusal is
+  # covered only by rocm-core's `windows_roots_follow_the_system_drive`
+  # unit test, not end to end.
+  @id:uninstall-filesystem-root-refused @requires-os:linux
+  Scenario: uninstall-19 - A data folder set to the top of the filesystem is refused
+    Given the data folder is set to the top of the filesystem
+    When the user previews an uninstall
+    Then the uninstall is refused because the data folder "/" is "the top of the filesystem"
+    And the refusal names ROCM_CLI_DATA_DIR as where the data folder came from
+    And the refusal advises re-running with --keep-data
+
+  @id:uninstall-home-refused-nothing-removed
+  Scenario: uninstall-20 - A data folder set to the home folder is refused, nothing is removed, and the advised flag works
+    Given the data folder is set to the user's home folder, which holds the user's files
+    When the user uninstalls
+    Then the uninstall is refused because the data folder "<home>" is "your home folder"
+    And the refusal says nothing was removed
+    And the refusal says ROCm CLI never removes that folder itself
+    And the refusal advises re-running with --keep-data
+    And the user's files in the home folder are still there
+    And the config folder is still there
+    When the user uninstalls again with the flag the refusal advised
+    Then the uninstall succeeds
+    And the user's files in the home folder are still there
+    And the config folder is gone
+
+  @id:uninstall-shared-cache-inside-root-warned
+  Scenario: uninstall-21 - Shared caches inside the cache folder are named as deleted before anything is removed
+    Given the cache folder is set to the user's own cache folder, which holds the uv and model caches
+    When the user previews an uninstall
+    Then the review warns that the uv and model caches will be deleted with the cache folder
+    And the uv cache is still there after the preview
+    When the user uninstalls keeping the cache
+    Then the uninstall succeeds
+    And the uv cache is still there
+    When the user uninstalls
+    Then the uninstall succeeds
+    And the uv cache is gone
+
+  # The text of `.` is not the home folder, but the folder it names is. Linux-
+  # only like uninstall-01/-02 in what it claims: the resolution goes through
+  # the same symlink-following call, which nothing verifies on Windows.
+  @id:uninstall-dot-from-home-refused @requires-os:linux
+  Scenario: uninstall-22 - A data folder of `.` run from the home folder is refused and nothing is removed
+    Given the data folder is set to `.`, and the user is in their home folder, which holds their files
+    When the user uninstalls from their home folder
+    Then the refusal says the data folder "." resolves to the home folder
+    And the refusal says nothing was removed
+    And the user's files in the home folder are still there
+    And the config folder is still there
+
+  # A real folder outside the home folder is only removed when ROCm CLI marked
+  # it as its own. The refusal says how to mark it, and does not claim ROCm CLI
+  # never removes it; marking it clears the refusal and a real run removes it.
+  # Linux-only: on Windows the scenario root sits inside the runner's own user
+  # folder, where a folder outside the scenario home is another user's home.
+  @id:uninstall-unmarked-folder-refused-until-marked @requires-os:linux
+  Scenario: uninstall-23 - A data folder outside home without ROCm CLI's marker is refused until the advised marker exists
+    Given the data folder is a folder outside the home folder without ROCm CLI's marker
+    When the user uninstalls
+    Then the refusal says nothing was removed
+    And the refusal does not say ROCm CLI never removes that folder
+    And the data folder outside the home folder is still there
+    When the user previews an uninstall
+    Then the refusal advises creating the marker if the folder is ROCm CLI's
+    When the user creates the marker the refusal named
+    And the user previews an uninstall
+    Then the preview plans to remove the data folder
+    When the user uninstalls
+    Then the uninstall succeeds
+    And the data folder outside the home folder is gone
+
+  # The dashboard and the assistant run an approved `rocm uninstall` as a
+  # child process with the folders pinned. The refusal must still name the
+  # setting the folder really came from.
+  @id:uninstall-dashboard-names-the-real-setting
+  Scenario: uninstall-24 - From the dashboard, a refusal names setup.therock_venv rather than a pinned variable
+    Given setup.therock_venv points at the user's home folder, which holds their files
+    When the dashboard runs an approved uninstall
+    Then the refusal names setup.therock_venv and advises --keep-data, not a variable the user never set
+    And the user's files in the home folder are still there
+    And the config folder is still there
+
+  # A setting that names a file rather than a folder is judged by where its
+  # folder really is: a file spelled inside home but reached through a link to
+  # a system location is refused, and nothing is removed. The link points at
+  # `/proc`, where nothing can be unlinked even by root, so a regression could
+  # not damage the runner.
+  # Linux-only: it needs `/proc`.
+  @id:uninstall-file-through-linked-folder-refused @requires-os:linux
+  Scenario: uninstall-25 - A data setting naming a file reached through a link to a system folder is refused
+    Given the data folder setting names a file through a link in the home folder to /proc
+    When the user uninstalls
+    Then the refusal says that file really is in a protected system location
+    And the refusal says nothing was removed
+    And the config folder is still there
+    And the link in the home folder is still there

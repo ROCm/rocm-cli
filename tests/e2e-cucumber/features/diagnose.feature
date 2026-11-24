@@ -290,10 +290,11 @@ Feature: Diagnosing failures and listing fixes
   #
   # Unlike diagnose-14, this one IS OS-gated. `print_recipe` still runs before
   # the fix's own platform gate (see `apply` in fix.rs), but the Flags: line it
-  # prints comes from `class_here()`, which looks up the catalog entry for the
-  # *running* host's OS. "AUTO" only renders where `fix-4-render-group` is
+  # prints comes from the recipe's class on the *running* host's OS
+  # (`print_recipe` hands `current_os()` to the plan builder, which asks
+  # `FixRecipe::class_on_os`). "AUTO" only renders where `fix-4-render-group` is
   # actually `Auto` -- bare-metal Linux. Everywhere else (`applies_on` has no
-  # other member) `class_here()` falls back to PRINT-ONLY, the generic "this
+  # other member) that lookup falls back to PRINT-ONLY, the generic "this
   # fix does not apply here" answer diagnose-11 already covers -- not a second,
   # platform-specific behaviour worth asserting under this scenario's name.
   #
@@ -1311,8 +1312,21 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
     Then the estimate is compared against the shared pool's ceiling, and says the pool is shared
 
+  # The human-readable half of diagnose-86. The text report words the shared
+  # pool differently from a card's dedicated VRAM, and the label step of
+  # diagnose-50 used to recognise only the dedicated wording, so a correct
+  # ESTIMATED label on an integrated GPU (the Strix Halo lanes) failed it as
+  # "undetermined". Planting the APU puts that branch under every lane.
+  @id:diagnose-model-a-gguf-text-estimate-says-its-pool-is-shared @requires-os:linux
+  Scenario: diagnose-87 - The text report of a GGUF estimate on an integrated GPU is labelled and says the pool is shared
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form
+    Then the text report compares the estimate with the shared pool's ceiling and says the pool is shared
+    And the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked
+
   # The host the pool read exists for, and the one none of diagnose-81 to
-  # diagnose-86 describes: a machine where nothing reports the GPU's memory at
+  # diagnose-87 describes: a machine where nothing reports the GPU's memory at
   # all. That is a Windows laptop whose integrated GPU has no ROCm build --
   # `amd-smi` ships inside the SDK, so an unsupported part has no telemetry to
   # read a carve-out from. Such a host used to be told "the GPU memory on this
@@ -1330,7 +1344,7 @@ Feature: Diagnosing failures and listing fixes
   # it runs on lanes that have no Windows APU. Linux-gated for the reason
   # diagnose-81 is -- the simulation seam re-roots Linux paths only.
   @id:diagnose-model-an-apu-with-no-memory-telemetry-is-still-measured @requires-os:linux
-  Scenario: diagnose-87 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
+  Scenario: diagnose-88 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
     Given a machine whose only GPU shares system memory and reports no memory telemetry
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form

@@ -195,11 +195,14 @@ jobs:
     # On a pull request this lane is the second MI300X check: the first is the
     # queue run of `e2e-gpu-queue` below, which does not wait for one of these
     # runners. This lane is kept for the runners' own coverage (their runtime and
-    # cache), and its failure is as non-blocking as it always was.
+    # cache). Where the queue lane takes the pull request, a lane that ran and
+    # failed still fails `E2E consolidated report (self-hosted)` through
+    # `mi300x-gate.sh`; one that never got a runner is absent, not failed.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
-    # Read by `e2e-report`: a run that skipped itself as stale uploads nothing,
-    # which is not a missing report.
+    # Read by `cancel-stale-run`. `e2e-report` cannot read it (it reaches this
+    # lane through `e2e-gpu-settled`), so a stale run also uploads an
+    # `mi300x-stale-run` marker, which the MI300X check reads as an absent lane.
     outputs:
       stale: ${{ steps.stale.outputs.stale }}
     strategy:
@@ -264,10 +267,10 @@ jobs:
       #
       # This has to be a step: a job-level `if` is evaluated before the job is
       # queued, when the PR may still be open and current, and cannot be
-      # re-evaluated later. Every later step is gated on `steps.stale.outputs`
-      # so the job ends without running them, and without failing; `e2e-report`
-      # reads the `stale` job output so that is not reported as a lane that ran
-      # without uploading its report.
+      # re-evaluated later. Every later step but the marker's is gated on
+      # `steps.stale.outputs` so the job ends without running them, and without
+      # failing; the marker steps run only when stale, and tell the MI300X check
+      # in `e2e-report` that this is not a lane that ran without a report.
       #
       # Fails open: if the PR cannot be read (or `gh` is missing), the job runs
       # as before. One assumption: any API head that differs from the event's
@@ -506,6 +509,25 @@ jobs:
           name: e2e-gpu-n-2-report
           path: tests/e2e-cucumber/results/
 
+      # `e2e-report` no longer reads this job's `stale` output (it reads the lane
+      # through `e2e-gpu-settled`, which carries only a result), so a run that
+      # skipped itself as stale says so in an artifact, one per attempt: the MI300X
+      # check reads it as an absent lane rather than one that ran and exported
+      # nothing. (Unlike the lanes' reports, these steps run only when stale.)
+      # The name has no matrix leg: the guard runs on a pull request only, where
+      # the matrix is the single leg `current`, so two legs cannot collide.
+      - name: Record that this run skipped itself as stale
+        if: always() && steps.stale.outputs.stale == 'true'
+        run: echo stale > "${RUNNER_TEMP}/mi300x-stale-run"
+
+      - name: Upload the stale-run marker
+        if: always() && steps.stale.outputs.stale == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mi300x-stale-run-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mi300x-stale-run
+          if-no-files-found: error
+
   # Cancels a run `e2e-gpu` found stale. A separate job, on a GitHub-hosted
   # runner with no checkout, so the `actions: write` token never shares a job
   # with PR code (`e2e-gpu` runs it on a persistent runner). It is the internal
@@ -517,8 +539,8 @@ jobs:
   # already freed when `e2e-gpu` skipped itself. A failed cancel (e.g. a token
   # without `actions: write`) is tolerated. `e2e-report` is gated on `always()`,
   # so it still runs after the cancel, but its missing-report check is gated on
-  # `!cancelled()` and is skipped in a cancelled run. The check's `stale`
-  # exemption is therefore for runs that are not cancelled: a fork PR (no
+  # `!cancelled()` and is skipped in a cancelled run. The `mi300x-stale-run`
+  # marker's exemption is therefore for runs that are not cancelled: a fork PR (no
   # cancel is sent), or a cancel that fails or loses a race with the check.
   cancel-stale-run:
     name: Cancel a stale run
@@ -561,7 +583,9 @@ jobs:
     needs: [changes]
     permissions:
       actions: write
-    # Set when the queue refused for the nightly window: a skip, not a failure.
+    # Set when the queue refused for the nightly window: a skip of this job, not a
+    # failure. The MI300X check in `e2e-report` still needs a self-hosted pass then:
+    # a skipped lane is never a pass.
     outputs:
       skipped: ${{ steps.queue.outputs.skipped }}
     # No `always()`: a job that keeps its condition true through a cancellation
@@ -587,7 +611,8 @@ jobs:
           # repository variable QUEUE_PR_GATE is `true`, which is set once the queue
           # side (the runner's allow-list and the pull request run kind) is
           # deployed. Without it, a merge of queue-pr-run.yml ahead of the queue
-          # side would turn every pull request red.
+          # side would turn every pull request's MI300X check red unless the
+          # self-hosted lane passes: a switched-off lane is a skipped one.
           if [ "${QUEUE_PR_GATE:-}" != true ]; then
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             echo "::notice::the queue lane is switched off: the repository variable QUEUE_PR_GATE is not true"
@@ -1911,6 +1936,113 @@ jobs:
           path: tests/e2e-cucumber/results/
           if-no-files-found: error
 
+  # GitHub has no queue timeout: `timeout-minutes` counts from the moment a
+  # runner takes the job, so an `e2e-gpu` queued on a runner pool at 0 replicas
+  # sits there for up to 24 hours and holds back every job that `needs` it,
+  # `e2e-report` included. The pull request's MI300X requirement is met by the
+  # queue lane OR this one (see `e2e-report`), so the report must not wait on a
+  # lane that never gets a runner. This job stands in for `e2e-gpu` in the
+  # report's `needs`: it polls this run's job list and settles once every
+  # `e2e-gpu` leg has finished or can be given up on (still queued after
+  # QUEUE_DEADLINE_MINUTES, or unfinished after HARD_DEADLINE_MINUTES). A leg that
+  # started is waited for, so a lane that runs still lands in the report. A leg
+  # given up on is `abandoned`, which the MI300X decision reads as absent.
+  # .github/scripts/settle-e2e-lanes.sh holds the logic, as for the nightly; the
+  # legs are listed by display name and a contract test checks the list against
+  # the lane. Only the MI300X lane is read through here: the other self-hosted
+  # lanes stay directly in the report's `needs`, as before.
+  e2e-gpu-settled:
+    name: E2E MI300X self-hosted lane settled (queue deadline)
+    runs-on: ubuntu-24.04 # one LTS: only polls the GitHub API
+    # HARD_DEADLINE_MINUTES + slack; the script stops itself at the hard
+    # deadline, before this cap.
+    timeout-minutes: 390
+    needs: [changes]
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      lane_results: ${{ steps.settle.outputs.lane_results }}
+      abandoned_count: ${{ steps.settle.outputs.abandoned_count }}
+    # The report's own condition: it settles the lane the report reads.
+    if: >-
+      always()
+      && (needs.changes.outputs.serve == 'true'
+        || github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Wait for the MI300X self-hosted lane to finish or time out in the queue
+        id: settle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A leg still queued this long after it was created is given up on:
+          # long enough for a runner pool to scale up from zero, short enough
+          # that the report does not sit on a lane with no runner.
+          # On a pull request the queue lane takes (the condition of
+          # `MI300X_REQUIRED` in the report) it is the primary MI300X check, so a
+          # leg with no runner for 30 minutes is given up on. Any other run (a push,
+          # release or dispatch, or a fork or dependabot pull request, which the
+          # queue lane skips) has this lane as its only MI300X signal, so a pool
+          # that is merely busy gets hours (it waited a day before this job).
+          QUEUE_DEADLINE_MINUTES: ${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && '30' || '240' }}
+          # A leg that started is waited for, but not past this: the queue
+          # deadline plus the lane's timeout-minutes (90) plus slack.
+          HARD_DEADLINE_MINUTES: ${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && '125' || '360' }}
+          # The lane's timeout-minutes; the script refuses a queue deadline
+          # that, plus this, would pass the hard deadline.
+          LANE_RUN_MINUTES: "90"
+          # The consolidated report's MI300X check reads only `e2e-gpu` (the
+          # pull-request leg): the release-branch n-1/n-2 legs are settled here so
+          # the run ends, and each shows as its own check, but they are not part of
+          # the MI300X requirement.
+          LANES: |
+            e2e-gpu=E2E tests (MI300X, current)
+            e2e-gpu-n-1=E2E tests (MI300X, n-1)
+            e2e-gpu-n-2=E2E tests (MI300X, n-2)
+        run: bash .github/scripts/settle-e2e-lanes.sh
+
+  # Ends the run when `e2e-gpu-settled` gave up on a leg, on any event: a job queued on a
+  # runner pool with no runner cannot be cancelled on its own and would keep the
+  # run, and its check, pending for a day. It runs after the report and every
+  # other lane, which is why it needs them all but `e2e-gpu` itself (it cannot
+  # wait for the job it ends); the queue lane and the report are done by then.
+  # It also runs when the settle job itself failed or was cancelled, as the
+  # nightly's does: a job killed by its own timeout reports `cancelled`, and
+  # nothing else bounds the wait then. The force-cancel ends this job's own run, so
+  # this job shows as cancelled, like the abandoned leg.
+  cancel-abandoned-mi300x-lane:
+    name: Cancel the MI300X self-hosted lane that never got a runner
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    needs:
+      - e2e-gpu-settled
+      - e2e-gpu-queue
+      - e2e-gpu-strix-ubuntu
+      - e2e-gpu-strix-windows
+      - e2e-wsl
+      - e2e-report
+    if: ${{ always() && (needs.e2e-gpu-settled.result == 'failure' || needs.e2e-gpu-settled.result == 'cancelled' || (needs.e2e-gpu-settled.outputs.abandoned_count != '' && needs.e2e-gpu-settled.outputs.abandoned_count != '0')) }}
+    steps:
+      - name: Cancel the run's unfinished lanes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Tolerated, as `cancel-stale-run` does: a pull request that cannot cancel
+        # (a read-only token on a dependabot or fork run) is left as it was before
+        # this job, with a warning, not turned red.
+        run: |
+          # A force-cancel, not a plain cancel: a leg whose `if` is `always()` (the
+          # lane's) survives a plain cancel, and a plain cancel from here would end
+          # THIS step too (a step with no `if` does not run on after a cancel), so
+          # nothing after it would run. A force-cancel ignores `if`, and every other
+          # job has finished (this job needs them).
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/force-cancel" ||
+            echo "::warning::could not cancel run ${GITHUB_RUN_ID}; the MI300X self-hosted leg stays queued"
+
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
   # required `E2E consolidated report` so it does NOT collide with that required
@@ -1925,9 +2057,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # `e2e-gpu` is read through `e2e-gpu-settled`, not listed here: a lane queued
+    # on a pool with no runner would hold this report for up to 24 hours.
     needs:
       - changes
-      - e2e-gpu
+      - e2e-gpu-settled
       - e2e-gpu-queue
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
@@ -1979,7 +2113,8 @@ jobs:
       # no row and no FAIL. On a `continue-on-error` lane nothing else is red
       # either. So check it here: every lane that ran (any `needs` result but
       # `skipped`, and not self-skipped as `stale`) must have uploaded its report
-      # artifact. This reads the run's
+      # artifact. The two MI300X lanes are not in this list: the step after this
+      # one decides them together. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -2001,8 +2136,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu=e2e-gpu-selfhosted-report
-            e2e-gpu-queue=e2e-gpu-report
             e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
             e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
             e2e-wsl=e2e-gpu-strix-wsl-report
@@ -2040,6 +2173,43 @@ jobs:
             done
           done <<<"$LANE_REPORTS"
           exit "$missing"
+
+      # The MI300X lanes are not in LANE_REPORTS above: on a pull request MI300X
+      # is met by the queue lane (`e2e-gpu-queue`, the primary) OR the self-hosted
+      # one (`e2e-gpu`, a bonus), so a missing report from one is not an error
+      # while the other passed. .github/scripts/mi300x-gate.sh holds the rule:
+      # MI300X counts as passed only when a lane passed WITH an exported report;
+      # a lane that was cancelled, skipped or never got a runner is absent, not
+      # failed; a lane that ran and failed still fails; and with no passing report
+      # from either lane the check fails. It reads `e2e-gpu` through
+      # `e2e-gpu-settled`, which gives up on a lane that never gets a runner.
+      # Required only where the queue lane takes the pull request (same
+      # repository, not dependabot, `serve` true), the conditions of
+      # `e2e-gpu-queue`'s own `if`; anywhere else (a push, a dispatch, a fork) there
+      # is no either-or, and a lane that ran without a report is the only failure.
+      - name: Check the MI300X requirement (queue or self-hosted)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MI300X_REQUIRED: ${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
+          QUEUE_RESULT: ${{ needs.e2e-gpu-queue.result }}
+          QUEUE_SKIPPED: ${{ needs.e2e-gpu-queue.outputs.skipped }}
+          QUEUE_ARTIFACT: e2e-gpu-report
+          SELFHOSTED_RESULT: ${{ fromJSON(needs.e2e-gpu-settled.outputs.lane_results || '{}').e2e-gpu.result }}
+          SELFHOSTED_ARTIFACT: e2e-gpu-selfhosted-report
+          # Per attempt: the artifact list holds every attempt's, and a re-run
+          # must not read an earlier attempt's stale marker.
+          STALE_ARTIFACT: mi300x-stale-run-${{ github.run_attempt }}
+          SETTLE_RESULT: ${{ needs.e2e-gpu-settled.result }}
+        run: |
+          ARTIFACTS=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name') || {
+            echo "::error::could not list this run's artifacts, so the MI300X lanes were not checked"
+            exit 1
+          }
+          export ARTIFACTS
+          bash .github/scripts/mi300x-gate.sh
 
       - name: Upload consolidated report
         if: always()

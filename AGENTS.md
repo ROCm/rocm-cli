@@ -318,7 +318,7 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
 - **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
 - **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `StatusTone` and `Theme::tone_color` — the shared status→color mapping. A status enum gets one exhaustive `fn …_tone(status) -> StatusTone` beside them (`job_status_tone`, `instance_status_tone`) and a `Theme::…_color` wrapper (`job_status_color`, `instance_status_color`); screens call the wrapper (or `tone_color(…)` on a tone) instead of an inline `match … => theme.ok/warn/err`. To color a new status enum, add its tone function there rather than a bespoke match per screen
-- **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them. `cargo test -p xtask dash_text_edit_contract` ([`dash_text_edit_contract.rs`](xtask/src/dash_text_edit_contract.rs)) fails on a hand-rolled `push`/`pop` text edit under `crates/rocm-dash-tui/src/` outside `widgets.rs`; a new exception is a reviewed entry in that test's `ALLOWED` list.
+- **[`widgets.rs`](crates/rocm-dash-tui/src/ui/widgets.rs)**'s `apply_char_key`/`apply_char_key_filtered` — the append-only text-field edit (`Char` appends, `Backspace` pops one char); call it from a form's key handler instead of writing another `push`/`pop` match arm. The `_filtered` form takes a predicate to refuse some chars (a digits-only port); there is no cursor or mid-string editing. The Chat tab's input is the one exception: its keys are first mapped to a `KeyAction` by the pure, separately tested table in [`actions.rs`](crates/rocm-dash-tui/src/app/actions.rs), which also applies them. `cargo test -p xtask dash_text_edit_contract` ([`dash_text_edit_contract.rs`](xtask/src/dash_text_edit_contract.rs)) fails on a hand-rolled `push`/`pop` text edit under `crates/rocm-dash-tui/src/` outside `widgets.rs`; a new exception is a reviewed entry in that test's `ALLOWED` list. The same file's `shortcut_key` folds a letter to lowercase: match letter shortcuts on `shortcut_key(key.code)` so they still fire with Caps Lock on (which Unix terminals report exactly like Shift), and never pass text-entry keys through it.
 - **[`scroll.rs`](crates/rocm-dash-tui/src/app/scroll.rs)**'s `ScrollState` (in `app/`, not `ui/`, beside the `AppState` scroll methods) — an offset plus its upper bound, whose `scroll_by(delta)` is the one "add a signed delta, clamp into `[0, max]`, saturate to `u16`" implementation. The job console (both axes), the LOGS dock and the instance Detail modal clamp through it; a new scrollable surface that keeps a `u16` offset with a known bound builds a `ScrollState` from them and stores `pos` back instead of repeating the `i32` clamp arithmetic. The chat transcript and the GPU list clamp with a `min()` against a measured bound (chat also follows the tail) and stay out of it
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
@@ -396,14 +396,13 @@ on two counts, and both change how you edit it:
   the modules it declares, such as [catalog.rs](crates/rocm-core/src/diagnose/catalog.rs)
   (each mode's checker and OS scoping) — adding, renaming, or re-scoping a
   failure mode means changing the CLI **first**, then the two docs. That feature is what
-  catches you if you forget. Two sentences in
-  [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
-  sentence "requires `contract_version` N or higher": scenario skill-07 parses
-  it and holds that number (the contract number) equal to what
-  `rocm fix --json` publishes. The other is the "The other N ... print-only"
-  sentence, whose number (the print-only count) is checked by
-  [skill_reference.rs](tests/e2e-cucumber/tests/skill_reference.rs) against the
-  catalog table. Keep both wordings when editing the skill.
+  catches you if you forget. Some sentences in
+  [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too: the module doc of
+  [skill_reference.rs](tests/e2e-cucumber/tests/skill_reference.rs) lists them all
+  and says which test reads each. Reword them only together with the test that reads
+  them. One is the Phase 0 sentence "requires `contract_version` N or higher": scenario
+  skill-07 parses it and holds that number (the contract number) equal to what
+  `rocm fix --json` publishes.
   Raise the contract number only after a release publishes that contract. The
   skill is federated from `main`, and the installer that Phase 0 offers installs
   the release channel, so an earlier raise would make the published skill stop

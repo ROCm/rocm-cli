@@ -891,9 +891,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // the same reason: it asserts what happens *after* a spawn, so it must reach
     // one without real GPU hardware.
     //
+    // ROCMAI-541's scripted-engine scenario needs the same waiver for the
+    // opposite case: a real managed child that spawns and *survives* its early
+    // startup window on a no-GPU host. See `run_scripted_e2e_engine_serve_http`
+    // for what runs once the spawned child reaches it.
+    //
     // Every test hook that waives this bail is named here once, so the bail and
     // `gpu_refusal_waived_for_reuse` below cannot disagree about which ones do.
+    let scripted_engine_death =
+        cfg!(feature = "e2e-test-hooks") && std::env::var_os("ROCM_E2E_SCRIPTED_ENGINE").is_some();
     let gpu_bail_waived_by_test_hook = scripted_backend_failure
+        || scripted_engine_death
         || e2e_simulate_oom_launch()
         || crate::service_launch::e2e_simulate_startup_exit()
         || scripted_managed_engine_startup_failure();
@@ -1017,8 +1025,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
         && resolved_model.is_none()
+        && !scripted_engine_death
         && !scripted_managed_engine_startup_failure()
     {
+        // See `scripted_engine_death`'s own doc comment above: the scripted-engine
+        // scenario needs the spawn below to reach `run_builtin_engine_serve_http`
+        // without a real (and, for Lemonade, GPU-dependent) runtime install.
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
     // Reuse the `ResolveModel` answer the reuse pre-gate already paid for, so a

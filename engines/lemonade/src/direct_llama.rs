@@ -79,10 +79,11 @@ pub(crate) fn serving_route(
         // reinstall re-extracts the runtime and reinstalls the best backend, which
         // restores the file whatever state Lemonade recorded for it.
         bail!(
-            "no selected GPU llama-server backend `{}` is installed under {} for direct serving of `{}`; run `rocm engines install lemonade --reinstall` to restore it",
+            "no selected GPU llama-server backend `{}` is installed under {} for direct serving of `{}`; run `{}` to restore it",
             manifest.backend_name,
             manifest.runtime_dir.display(),
-            request.model_ref
+            request.model_ref,
+            crate::REINSTALL_LEMONADE_COMMAND
         );
     }
     Ok(ServeRoute::Router {
@@ -1276,7 +1277,10 @@ mod tests {
             // `a_version_change_forces_re_extraction_over_the_existing_runtime`
             // (install.rs).
             assert!(
-                error.contains("rocm engines install lemonade --reinstall"),
+                error.contains(&format!(
+                    "run `{}` to restore it",
+                    crate::REINSTALL_LEMONADE_COMMAND
+                )),
                 "{error}"
             );
         }

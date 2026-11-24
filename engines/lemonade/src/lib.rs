@@ -18,6 +18,21 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The command that re-extracts the Lemonade runtime tree and reinstalls the best
+/// llama.cpp backend, as every message advising it prints it. A macro so that a
+/// constant message can be built with `concat!`; elsewhere use
+/// [`REINSTALL_LEMONADE_COMMAND`]. Defined before the modules so they can use it.
+macro_rules! reinstall_lemonade_command {
+    () => {
+        "rocm engines install lemonade --reinstall"
+    };
+}
+
+/// `reinstall_lemonade_command!` as a `&str`: the one place the recovery
+/// command is spelled, so the messages that name it cannot drift apart.
+pub(crate) const REINSTALL_LEMONADE_COMMAND: &str = reinstall_lemonade_command!();
+
+mod alignment_record;
 mod archive_cache;
 mod archive_extract;
 /// Shared archive generator and filesystem oracle for the extraction property

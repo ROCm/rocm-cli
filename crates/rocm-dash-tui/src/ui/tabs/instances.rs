@@ -452,6 +452,8 @@ pub(in crate::ui) mod tests {
 
     pub(in crate::ui) fn mk_state(instances: HashMap<String, Instance>, sel: usize) -> AppState {
         AppState {
+            quit_confirm_scroll: 0,
+            quit_confirm_max_scroll: std::cell::Cell::new(0),
             services_past_attempts: 0,
             managed_registry_probe: None,
             launcher_hosted: false,

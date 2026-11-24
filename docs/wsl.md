@@ -15,9 +15,10 @@ The AMD WSL path is:
 
 1. Windows 11 with the AMD Adrenalin WSL-capable driver.
 2. WSL2 with Ubuntu 24.04 or newer. Ubuntu 22.04 is not supported: it ships
-   glibc 2.35, below what the Lemonade embeddable ROCm CLI pins requires
-   (glibc 2.38 and `GLIBCXX_3.4.32`; newer Lemonade releases need more), so
-   the Lemonade engine cannot start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
+   glibc 2.35, below what the Lemonade embeddable build that ROCm CLI pins
+   requires (glibc 2.38 and `GLIBCXX_3.4.32`; newer Lemonade releases need
+   more), so the Lemonade engine cannot start there. Ubuntu 24.04 provides
+   glibc 2.39 and `GLIBCXX_3.4.33`.
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
 
@@ -40,16 +41,17 @@ rocm install driver            # print the plan
 rocm install driver --yes      # run it
 ```
 
-On WSL2 this installs ROCDXG rather than Linux DKMS. There is no in-tree
+On WSL2 this installs ROCDXG instead of Linux DKMS. There is no in-tree
 amdgpu driver to build, because the GPU comes from the Windows host driver
-through `/dev/dxg`. The plan is printed for review first and only runs with
+through `/dev/dxg`.
+
+The plan is printed for review first and only runs with
 `--yes`, the same as on bare metal. It checks `/dev/dxg` and dxcore before
 touching anything, installs the release package, runs `ldconfig`, and then
 verifies that `/opt/rocm/lib/librocdxg.so` exists and is visible to the linker.
 No reboot is needed: ROCDXG is userspace.
 
-Confirm afterwards with
-`rocm examine`, which should report
+Confirm afterwards with `rocm examine`, which should report
 `driver_status: wsl_rocdxg_ready`.
 
 The download is verified before it is installed. `rocm install driver` carries a
@@ -84,7 +86,7 @@ ROCM_CLI_ROCDXG_VERSION=<version> \
 ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
 ```
 
-Without one of those, an unpinned version is refused rather than installed
+Without one of those, an unpinned version is refused instead of being installed
 unverified.
 
 ### Doing it by hand
@@ -125,8 +127,8 @@ ROCDXG_STAGED="/var/cache/rocm-cli/rocdxg/${ROCDXG_DEB}"
 )
 ```
 
-Source-build alternative. Set `win_sdk` to the Windows SDK version installed on
-your host; the version in this example may differ from yours:
+To build from source instead, set `win_sdk` to the Windows SDK version installed
+on your host. The version in this example can differ from yours:
 
 ```bash
 git clone https://github.com/ROCm/librocdxg.git
@@ -294,7 +296,7 @@ collects a fixed set of data. This leaves four limits:
   `rocm diagnose` inside the distro finds healthy. A library beside its runtime,
   the layout of a TheRock tarball, is a file check, so `--distro` does see that
   one. The finding's evidence says
-  the variable could not be checked from outside the distribution, rather than
+  the variable could not be checked from outside the distribution, instead of
   claiming it was.
 - **No library or shared-memory checks.** The script does not collect the data
   that `fix-18-comgr-conflict` and `fix-19-shm-too-small` need, so those two do
@@ -326,7 +328,7 @@ below.
 - WSL major version, 1 or 2 (`--json` only)
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
-- `librocdxg.so` presence, resolved across every ROCm install rather than
+- `librocdxg.so` presence, resolved across every ROCm install instead of
   assuming `/opt/rocm`, and counted as present when it is in a directory on
   `LD_LIBRARY_PATH` even if no ROCm install holds it (the `wsl_librocdxg` line
   stays `false` for such a library; `driver_status` and the `missing` detail
@@ -346,35 +348,9 @@ below.
   `wsl_rocdxg_missing` only when none does
 - a managed wheel runtime whose own `librocdxg.so.1` its runtime does not load
   (`wsl_runtime_librocdxg` in the text form, `summary.unlinked_runtime_librocdxg`
-  in `--json`; printed only when there is one). The wheel ships
-  `librocdxg.so.1` beside `libhsa-runtime64`, but the runtime opens
-  `librocdxg.so`, which the wheel does not ship (or which is a link to a file
-  that is missing: the loader's `open` fails on a broken link as on an absent
-  file), so it loads the host's copy.
-  A host `rocdxg-roct` older than the runtime expects then fails at first GPU
-  use, for example ROCm 10.2 and 10.3 nightly runtimes against `rocdxg-roct`
-  1.2.2 (`undefined symbol: hsaKmtSetPersistingCacheSize`, then a segmentation
-  fault), while `driver_status` still reads `wsl_rocdxg_ready`, which describes
-  the host's plumbing. Wheel runtime installs and updates (`rocm install sdk`, `rocm update --apply`)
-  link `librocdxg.so` to the runtime's own copy on WSL (tarballs ship both
-  names, and an adopted runtime is never linked); for a runtime installed earlier the line names the
-  `ln -sfn librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same
-  (`-fn` so that it also replaces a dangling `librocdxg.so`; the install replaces
-  one atomically, and leaves alone a `librocdxg.so` that resolves when it is
-  checked; the install refuses at its final check if the name resolves by then,
-  and a name that becomes a working link between that check and the rename is
-  replaced). The
-  versioned name is the fixed `librocdxg.so.1`: a wheel whose soname changes is
-  not detected or linked, and a dangling `librocdxg.so` beside a runtime with no
-  `librocdxg.so.1` is not detected. A `librocdxg.so.1` that is itself dangling or
-  a link loop is not listed or linked either, and is deliberately not reported
-  (nothing valid to link to).
-  The mechanism (the unversioned open skipping the runtime's directory and
-  landing on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2
-  nightly; which component requests `hsaKmtSetPersistingCacheSize` is not
-  identified. The line is a pointer, not a verdict: it appears for every such runtime,
-  including ones that work with the host's copy, because the files alone do not
-  say which symbols the runtime needs
+  in `--json`; printed only when there is one). See
+  [Wheel runtimes and the host librocdxg](#wheel-runtimes-and-the-host-librocdxg)
+  later in this section
 - the Windows host AMD driver version, when WSL interop can reach the host
   (`--json` only)
 - whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
@@ -390,11 +366,70 @@ and `has_discrete_amd` stay `false`: the Windows side reports a gfx target, not
 a listing that says whether the part is an APU or a discrete card, so
 `has_amd_gpu: true` beside both `false` is the expected WSL shape.
 
-## How `rocm serve` Finds The GPU On WSL
+### Wheel runtimes and the host librocdxg
 
-On WSL `rocm serve` does not look for `/dev/kfd`, which does not exist there. Under the default `gpu_required` policy it asks the same question `rocm examine` answers, whether the WSL GPU path is ready (`driver_status: wsl_rocdxg_ready`): one usable device when it is, none when it is not, with `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` still applied on top. `--gpu auto` therefore selects GPU 0 on a ready host.
+A wheel runtime ships `librocdxg.so.1` beside `libhsa-runtime64`, but the
+runtime opens `librocdxg.so`. The wheel does not ship that name, and a
+`librocdxg.so` that is a link to a missing file counts as absent: the loader's
+`open` fails on a broken link as on an absent file. Either way, the runtime
+loads the host's copy.
 
-When the path is not ready, `serve` refuses with `no usable AMD GPU detected` before any engine is prepared, and on WSL its advice is to run `rocm examine`, check that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what is missing. A `librocdxg.so` the loader finds through `LD_LIBRARY_PATH`, or beside the runtime that opens it, counts as ready, wherever it lives: a library in a non-ROCm directory such as a source build in your home directory is counted once its directory is on `LD_LIBRARY_PATH`. A TheRock tarball is laid out the second way and needs nothing exported; for a library that sits alone, export its `lib` directory in the shell that runs `rocm` (see [What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
+A host `rocdxg-roct` older than the runtime expects then fails at first GPU use.
+For example, ROCm 10.2 and 10.3 nightly runtimes fail against `rocdxg-roct`
+1.2.2 with `undefined symbol: hsaKmtSetPersistingCacheSize`, then a segmentation
+fault. Meanwhile `driver_status` still reads `wsl_rocdxg_ready`, which describes
+the host's plumbing.
+
+On WSL, wheel runtime installs and updates (`rocm install sdk`,
+`rocm update --apply`) link `librocdxg.so` to the runtime's own copy. Tarballs
+ship both names, and an adopted runtime is never linked. For a runtime installed
+earlier, the `wsl_runtime_librocdxg` line names the
+`ln -sfn librocdxg.so.1 <runtime lib>/librocdxg.so` command that does the same.
+The `-fn` makes it also replace a dangling `librocdxg.so`.
+
+The install replaces a dangling `librocdxg.so` atomically, and leaves alone a
+`librocdxg.so` that resolves when it is checked. It checks the name again before
+the replacement and refuses if the name resolves by then. A name that becomes a
+working link between that final check and the rename is still replaced.
+
+Detection and linking have these limits:
+
+- The versioned name is the fixed `librocdxg.so.1`. A wheel whose soname
+  changes is not detected or linked.
+- A dangling `librocdxg.so` beside a runtime with no `librocdxg.so.1` is not
+  detected.
+- A `librocdxg.so.1` that is itself dangling or a link loop is not listed or
+  linked either, and is deliberately not reported (nothing valid to link to).
+
+The mechanism (the unversioned open skipping the runtime's directory and landing
+on `/opt/rocm/lib`) was observed with `LD_DEBUG=libs` on the 10.2 nightly. Which
+component requests `hsaKmtSetPersistingCacheSize` is not identified.
+
+The line is a pointer, not a verdict: it appears for every such runtime,
+including ones that work with the host's copy, because the files alone do not
+say which symbols the runtime needs.
+
+## How `rocm serve` finds the GPU on WSL
+
+On WSL `rocm serve` does not look for `/dev/kfd`, which does not exist there.
+Under the default `gpu_required` policy it asks the same question
+`rocm examine` answers, whether the WSL GPU path is ready
+(`driver_status: wsl_rocdxg_ready`): one usable device when it is, none when it
+is not, with `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` still applied on
+top. `--gpu auto` therefore selects GPU 0 on a ready host.
+
+When the path is not ready, `serve` refuses with `no usable AMD GPU detected`
+before any engine is prepared. On WSL its advice is to run `rocm examine`, check
+that `driver_status` is `wsl_rocdxg_ready`, and run `rocm diagnose` to see what
+is missing.
+
+A `librocdxg.so` that the loader finds through `LD_LIBRARY_PATH`, or beside the
+runtime that opens it, counts as ready wherever it lives. A library in a
+non-ROCm directory, such as a source build in your home directory, is counted
+once its directory is on `LD_LIBRARY_PATH`. A TheRock tarball places the library
+beside the runtime and needs nothing exported. For a library that sits alone,
+export its `lib` directory in the shell that runs `rocm` (see
+[What `rocm examine` Reports On WSL](#what-rocm-examine-reports-on-wsl)).
 
 ## Install UX Recommendations
 

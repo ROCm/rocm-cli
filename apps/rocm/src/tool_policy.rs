@@ -8,7 +8,7 @@
 //!
 //! `validate_chat_tool_call` and the `validate_chat_*_tool_call` family
 //! reject malformed or unsafe requests (a CPU or public-bind `serve`, a
-//! system install folder, a service id or watcher mode that does not parse);
+//! protected install folder, a service id or watcher mode that does not parse);
 //! `chat_rocm_command_action` and `chat_rocm_command_action_from_args` sort a
 //! `rocm` argv into a read-only command or one that needs approval
 //! (`ChatRocmCommandAction`); `chat_tool_approval_request` builds the approval
@@ -32,7 +32,7 @@ use crate::services_text::validate_service_id;
 use crate::shell_quote::{has_terminal_control_character, paste_unsafe_character};
 use crate::{providers, therock};
 use anyhow::{Context, Result, bail};
-use rocm_core::{DEFAULT_LOCAL_HOST, builtin_watcher, runtime_install_root_is_protected};
+use rocm_core::{DEFAULT_LOCAL_HOST, builtin_watcher};
 use std::path::Path;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -691,9 +691,9 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
         );
     };
     let prefix_path = Path::new(&prefix);
-    if chat_install_prefix_is_system(prefix_path) {
+    if let Some(why) = chat_install_prefix_protection(prefix_path) {
         bail!(
-            "local assistant cannot request system install folder `{}`",
+            "local assistant cannot request install folder `{}`: it is {why}",
             prefix_path.display()
         );
     }
@@ -1282,9 +1282,9 @@ pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
             );
         };
         let prefix_path = Path::new(prefix);
-        if chat_install_prefix_is_system(prefix_path) {
+        if let Some(why) = chat_install_prefix_protection(prefix_path) {
             bail!(
-                "local assistant cannot request system install folder `{}`",
+                "local assistant cannot request install folder `{}`: it is {why}",
                 prefix_path.display()
             );
         }
@@ -1292,8 +1292,20 @@ pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn chat_install_prefix_is_system(prefix: &Path) -> bool {
-    prefix.as_os_str().is_empty() || runtime_install_root_is_protected(prefix)
+// Only the unix-only respelling test calls this.
+#[cfg(all(test, unix))]
+fn chat_install_prefix_is_system(prefix: &Path) -> bool {
+    chat_install_prefix_protection(prefix).is_some()
+}
+
+/// Why the local assistant may not install into `prefix`, if it may not: the
+/// runtime-folder rule `rocm runtimes uninstall` applies to the same folder,
+/// since an install folder is one a later uninstall or venv rebuild may remove.
+pub(crate) fn chat_install_prefix_protection(prefix: &Path) -> Option<&'static str> {
+    if prefix.as_os_str().is_empty() {
+        return Some("an empty path");
+    }
+    rocm_core::runtime_protected_location(prefix).map(rocm_core::ProtectedLocation::describe)
 }
 
 pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> bool {
@@ -2905,7 +2917,7 @@ mod tests {
                 serde_json::json!({
                     "prefix": if cfg!(windows) { "C:\\Windows\\rocm" } else { "/opt/rocm" }
                 }),
-                "system install folder",
+                "cannot request install folder",
             ),
             (
                 serde_json::json!({
@@ -3026,6 +3038,34 @@ mod tests {
             accepted.is_empty(),
             "accepted as a user install folder: {accepted:?}"
         );
+    }
+
+    /// The assistant may not install the SDK into the home folder itself, which
+    /// a later uninstall or venv rebuild would remove, and the refusal says
+    /// why; a folder inside home is still accepted. Through the shared check
+    /// and through the `rocm install sdk` command a model's call goes by.
+    #[test]
+    fn the_assistant_cannot_install_into_the_home_folder_itself() {
+        use crate::test_support::owned_argv;
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        assert_eq!(
+            chat_install_prefix_protection(&home),
+            Some("your home folder")
+        );
+        assert_eq!(chat_install_prefix_protection(&home.join("rocm")), None);
+
+        let home_text = home.display().to_string();
+        let error = validate_chat_rocm_command_safety(&owned_argv(&[
+            "install", "sdk", "--format", "wheel", "--prefix", &home_text,
+        ]))
+        .expect_err("the home folder as install folder must be refused")
+        .to_string();
+        assert!(error.contains("it is your home folder"), "{error}");
+        let inside = home.join("rocm").display().to_string();
+        validate_chat_rocm_command_safety(&owned_argv(&[
+            "install", "sdk", "--format", "wheel", "--prefix", &inside,
+        ]))
+        .expect("a folder inside home is a valid install folder");
     }
 
     /// The serve safety rules as the chat assistant meets them: every refusal in

@@ -22,6 +22,7 @@ use crate::app::{ScrollTarget, ScrollbarHandle};
 use crate::ui::exec::display_args;
 use crate::ui::panel::{centered_rect, draw_popup_frame};
 use crate::ui::theme::{Theme, readable_text_on};
+use crate::ui::widgets::shortcut_key;
 
 /// What a console keypress means to the owning screen.
 ///
@@ -75,13 +76,30 @@ pub fn console_esc_closes(job: Option<&JobState>) -> bool {
     job.is_some_and(|j| !j.is_terminal())
 }
 
+/// Stop the job a console is showing — the single teardown for a console job.
+///
+/// Flips the reducer's shared cancel flag (which `crate::jobs::run_job` polls
+/// and answers by killing the child) and marks the job `Cancelled`. Two callers:
+/// the `Ctrl+C` arm of [`on_console_key`] below, and the serve wizard's
+/// focused-host leave, where returning from the overlay would otherwise tear the
+/// window's runtime down and kill the child implicitly through `kill_on_drop`.
+/// An overlay that must stop its job before closing calls this instead of
+/// open-coding a second `CancelJob` apply or leaning on that drop.
+pub fn cancel_job(job_id: &str, jobs: &mut State) -> Vec<SideEffect> {
+    jobs.apply(StateEvent::CancelJob(job_id.to_string()))
+}
+
 /// Interpret a key while a job console is showing `job_id`. Pure except for the
 /// `CancelJob` reducer apply (which only mutates the in-memory job model).
 pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleOutcome {
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ConsoleOutcome::Cancelled(jobs.apply(StateEvent::CancelJob(job_id.to_string())))
-        }
+    // Ctrl+C is matched on the raw key, lowercase only: terminals commonly
+    // bind Ctrl+Shift+C to copy (see `app::terminal::is_ctrl_c`). Lifted out of
+    // the match below because that one folds case, which would make a
+    // Ctrl+Shift+C meant for the clipboard cancel the job instead.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return ConsoleOutcome::Cancelled(cancel_job(job_id, jobs));
+    }
+    match shortcut_key(key.code) {
         // `q` is always answered with `Closed`, never swallowed, so the user is
         // never trapped mid-job. The invariant is about the key reaching the
         // owner, not about what the owner then does: a `ConsoleExit::Immediate`
@@ -300,18 +318,45 @@ mod tests {
             cmd: "sleep".into(),
             args: vec!["1".into()],
         });
-        // Ctrl+C cancels (returns effects).
+        // Ctrl+C cancels (returns effects). Assert the job's status too, not
+        // just the outcome variant: `cancel_job` is the single teardown every
+        // console job goes through, so a version of it that stopped applying
+        // `CancelJob` would still return `Cancelled(_)` here and leave the job
+        // running underneath.
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
             on_console_key("j", &mut s, ctrl_c),
             ConsoleOutcome::Cancelled(_)
         ));
+        assert_eq!(
+            s.job("j").map(|j| &j.status),
+            Some(&rocm_dash_core::state::JobStatus::Cancelled),
+            "Ctrl+C must actually cancel the job, not only report that it did"
+        );
         // `q` yields `Closed` regardless of job state. What the owning overlay
         // then does is its own choice (see `ConsoleExit`): all but one leave at
         // once, the serve wizard's still-starting launch asks first.
         assert!(matches!(
             on_console_key("j", &mut s, k(KeyCode::Char('q'))),
             ConsoleOutcome::Closed
+        ));
+        // Caps Lock `Q` closes the same way.
+        assert!(matches!(
+            on_console_key(
+                "j",
+                &mut s,
+                KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT)
+            ),
+            ConsoleOutcome::Closed
+        ));
+        // Ctrl+Shift+C is the terminal's copy, never a cancel.
+        let ctrl_shift_c = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(matches!(
+            on_console_key("j", &mut s, ctrl_shift_c),
+            ConsoleOutcome::Unhandled
         ));
         // Esc on a RUNNING job yields `Closed` too — same handoff as `q`.
         let mut s2 = State::default();

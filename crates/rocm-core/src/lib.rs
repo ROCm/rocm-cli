@@ -34,6 +34,7 @@ pub mod hardware_root;
 pub mod host_gpu;
 mod jsonl_store;
 pub mod log_tail;
+pub mod managed_child;
 pub mod managed_runtime;
 pub mod model_catalog;
 pub mod model_readiness;
@@ -100,7 +101,9 @@ pub use config::{
     RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig,
     WatcherMode, WatcherUserConfig, builtin_watcher, builtin_watchers,
 };
-pub use confirm::{interactive_terminal, require_yes_or_interactive};
+pub use confirm::{
+    interactive_terminal, require_yes_or_interactive, require_yes_or_interactive_with,
+};
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
@@ -135,9 +138,9 @@ pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
 pub use fix::{
-    CATALOG_CONTRACT_VERSION, CatalogManifest, FixOptions, ManifestEntry, ManifestPlatform,
-    apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
-    list_recipes as list_fix_recipes,
+    CATALOG_CONTRACT_VERSION, CatalogManifest, DRY_RUN_NOTICE, FixOptions, ManifestEntry,
+    ManifestPlatform, NON_INTERACTIVE_REFUSAL, apply as apply_fix, catalog_manifest,
+    catalog_manifest_json, exit as fix_exit, fix_plan_text, list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
     extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
@@ -165,6 +168,7 @@ pub use log_tail::{
     service_log_tool_summary, strip_ansi_sequences, tail_lines, tail_lines_decoded,
     tail_log_decoded,
 };
+pub use managed_child::ManagedChildLiveness;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, RUNTIME_COMPAT_DIR_NAME,
     active_managed_framework_interpreter, active_managed_therock_channel,
@@ -193,7 +197,9 @@ pub use net::{
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{
-    AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV, DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, engine_plugin_dirs,
+    APP_PATH_SOURCES_ENV, AppPathSource, AppPathSources, AppPaths, CACHE_DIR_ENV, CONFIG_DIR_ENV,
+    DATA_DIR_ENV, ENGINE_ENVS_ROOT_ENV, ForwardedAppPathSources, PinnedAppPathSource,
+    engine_plugin_dirs,
 };
 pub use proc_lifecycle::{
     IdentityState, KillScope, MANAGED_STOP_GRACE, ProcessIdentity, RecordedPidOutcome,
@@ -204,7 +210,8 @@ pub use proc_lifecycle::{
 #[cfg(windows)]
 pub use process::{
     DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
-    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+    spawn_detached_with_log_watching_startup, spawn_hidden_console_no_inherit,
+    spawn_hidden_console_with_log, wait_for_process_exit,
 };
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, ProcessProbe, detach_command_session,
@@ -227,23 +234,27 @@ pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;
 pub use runtime::{
-    RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform, current_executable_path,
-    default_cache_dir, default_config_dir, default_data_dir, default_interactive_shell_program,
-    install_root_has_payload, managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir,
-    managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
-    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
-    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
-    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
-    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
-    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
-    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
-    runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
+    ProtectedLocation, ROCM_CLI_ROOT_MARKER, RUNTIME_LIBRARY_PATH_ENV, RuntimeHost,
+    RuntimePlatform, UninstallRootVerdict, canonicalize_for_compare, create_marked_root,
+    current_executable_path, default_cache_dir, default_config_dir, default_data_dir,
+    default_interactive_shell_program, install_root_has_payload, managed_logs_dir,
+    managed_pip_cache_dir, managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir,
+    managed_uv_cache_dir, mark_root, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
+    platform_binary_name, prepend_runtime_path, resolve_path_through_symlinks,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    runtime_path_for_child, runtime_path_for_windows_child, runtime_path_is_same_or_inside,
+    runtime_path_list_join, runtime_path_list_split, runtime_path_sort_key,
+    runtime_path_text_is_absolute_for_host, runtime_path_text_is_absolute_for_platform,
+    runtime_paths_equivalent, runtime_protected_location, runtime_protected_location_for_home,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_env_root_for_executable,
     runtime_python_executable_in_env, runtime_python_executable_name,
-    runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
+    runtime_rocm_library_filename, shell_command_for_host, uninstall_root_verdict,
+    uninstall_root_verdict_on, uninstall_system_roots, uninstall_system_roots_on, user_runtime_dir,
+    windows_system_drive,
 };
 pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::{

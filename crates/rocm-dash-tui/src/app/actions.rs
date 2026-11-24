@@ -557,7 +557,7 @@ pub(crate) fn handle_key(
                 }
                 // Not focused: `i`/`Enter` enter insert mode; other keys fall
                 // through to the global hotkeys below.
-                if let KeyCode::Char('i') | KeyCode::Enter = k.code {
+                if let KeyCode::Char('i') | KeyCode::Enter = ui::widgets::shortcut_key(k.code) {
                     return KeyAction::ChatFocus;
                 }
             }
@@ -586,9 +586,18 @@ pub(crate) fn handle_key(
             }
         }
     }
+    // Letter shortcuts ignore case, so Caps Lock does not disable them. `G` is
+    // the exception: it has its own binding (select last, beside `g` select
+    // first), so it is kept as typed. With Caps Lock on, `g` therefore arrives
+    // as `G`; on Unix the terminal cannot tell the two apart.
+    let code = if k.code == KeyCode::Char('G') {
+        k.code
+    } else {
+        ui::widgets::shortcut_key(k.code)
+    };
     // ThemePicker is a navigable modal — j/k/g/G move the cursor, Enter applies.
     if *modal == Modal::ThemePicker {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Char('t') => KeyAction::CloseModal,
             KeyCode::Enter => KeyAction::ApplyThemePick,
@@ -601,7 +610,7 @@ pub(crate) fn handle_key(
     }
     // Detail modal: vertical scroll keys, plus quit/close.
     if *modal == Modal::Detail {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
             KeyCode::Char('j') | KeyCode::Down => KeyAction::ScrollModal(1),
@@ -616,7 +625,7 @@ pub(crate) fn handle_key(
     // Help absorbs everything except quit / close / ? toggle — the popup is
     // always sized to fit its content, so there's nothing to scroll.
     if *modal == Modal::Help {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
             _ => KeyAction::Nothing,
@@ -624,7 +633,7 @@ pub(crate) fn handle_key(
     }
     // Warnings popup: absorbs everything except quit / close, like Help.
     if *modal == Modal::Warnings {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('!') => KeyAction::CloseModal,
             _ => KeyAction::Nothing,
@@ -633,7 +642,7 @@ pub(crate) fn handle_key(
     // Global help overlay (opened from the Esc menu): close, same as the
     // contextual Help above.
     if *modal == Modal::GlobalHelp {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
             _ => KeyAction::Nothing,
@@ -641,7 +650,7 @@ pub(crate) fn handle_key(
     }
     // Esc main menu: ↑↓ cycle Options/Help/Quit, Enter activates, Esc closes.
     if *modal == Modal::Menu {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc => KeyAction::CloseModal,
             KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
@@ -652,7 +661,7 @@ pub(crate) fn handle_key(
     }
     // Command palette: ↑↓ choose destination, Enter goes, Esc closes.
     if *modal == Modal::Palette {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc => KeyAction::CloseModal,
             KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
@@ -663,7 +672,7 @@ pub(crate) fn handle_key(
     }
     // Options panel: ←→ switch settings tab, Esc closes.
     if *modal == Modal::Options {
-        return match k.code {
+        return match code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc => KeyAction::CloseModal,
             KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => KeyAction::OptionsTab(-1),
@@ -671,7 +680,7 @@ pub(crate) fn handle_key(
             _ => KeyAction::Nothing,
         };
     }
-    match k.code {
+    match code {
         KeyCode::Char('q') => KeyAction::Quit,
         // Esc opens the main menu when idle — managers/approval are routed
         // upstream, and Chat-focused Esc is handled by the short-circuit above.
@@ -1818,6 +1827,86 @@ mod tests {
     }
 
     #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        // Caps Lock delivers the uppercase letter (with SHIFT on Unix, where
+        // it is indistinguishable from Shift+letter).
+        let caps = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let on = |c, tab, modal: &Modal| handle_key(caps(c), tab, modal, ChatKeyCtx::default());
+        let none = &Modal::None;
+        assert_eq!(on('Q', ActiveTab::Home, none), KeyAction::Quit);
+        assert_eq!(on('T', ActiveTab::Home, none), KeyAction::OpenThemePicker);
+        assert_eq!(on('J', ActiveTab::Home, none), KeyAction::Move(1));
+        assert_eq!(on('K', ActiveTab::Home, none), KeyAction::Move(-1));
+        for (letter, expected) in [
+            ('S', KeyAction::OpenServices),
+            ('W', KeyAction::OpenServeWizard),
+            ('E', KeyAction::OpenEngineManager),
+            ('D', KeyAction::OpenExamine),
+            ('U', KeyAction::OpenUpdate),
+            ('I', KeyAction::OpenInstall),
+            ('L', KeyAction::OpenLogs),
+            ('B', KeyAction::OpenBenchRun),
+            ('R', KeyAction::OpenRuntimes),
+            ('N', KeyAction::OpenOnboarding),
+            ('A', KeyAction::OpenAutomations),
+            ('C', KeyAction::OpenCommand),
+            ('P', KeyAction::OpenConfig),
+        ] {
+            assert_eq!(on(letter, ActiveTab::Observe, none), expected, "{letter}");
+        }
+        assert_eq!(on('Q', ActiveTab::Home, &Modal::Menu), KeyAction::Quit);
+        for modal in [Modal::Help, Modal::Warnings, Modal::GlobalHelp] {
+            assert_eq!(
+                on('Q', ActiveTab::Home, &modal),
+                KeyAction::Quit,
+                "{modal:?}"
+            );
+        }
+        assert_eq!(
+            on('J', ActiveTab::Home, &Modal::Palette),
+            KeyAction::MenuMove(1)
+        );
+        assert_eq!(
+            on('L', ActiveTab::Home, &Modal::Options),
+            KeyAction::OptionsTab(1)
+        );
+        assert_eq!(
+            on('K', ActiveTab::Home, &Modal::Detail),
+            KeyAction::ScrollModal(-1)
+        );
+        assert_eq!(
+            on('T', ActiveTab::Home, &Modal::ThemePicker),
+            KeyAction::CloseModal
+        );
+        // `I` enters chat insert mode like `i`.
+        let accepted = ChatKeyCtx {
+            focused: false,
+            consent: ChatConsent::Accepted,
+            offer_pending: false,
+        };
+        assert_eq!(
+            handle_key(caps('I'), ActiveTab::Chat, none, accepted),
+            KeyAction::ChatFocus
+        );
+    }
+
+    #[test]
+    fn uppercase_g_keeps_its_own_binding() {
+        // `G` is the one letter bound separately from its lowercase form, so
+        // folding must not turn it into `g`.
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let with =
+            |modal: &Modal| handle_key(shift_g, ActiveTab::Home, modal, ChatKeyCtx::default());
+        assert_eq!(with(&Modal::None), KeyAction::SelectLast);
+        assert_eq!(with(&Modal::ThemePicker), KeyAction::SelectLast);
+        assert_eq!(with(&Modal::Detail), KeyAction::ScrollModal(i16::MAX));
+        assert_eq!(
+            hk(KeyCode::Char('g'), ActiveTab::Home),
+            KeyAction::SelectFirst
+        );
+    }
+
+    #[test]
     fn chat_insert_mode_captures_text_and_shortcircuits_hotkeys() {
         let accepted_focused = ChatKeyCtx {
             focused: true,
@@ -1829,6 +1918,8 @@ mod tests {
         assert_eq!(focused(KeyCode::Char('h')), KeyAction::ChatInput('h'));
         assert_eq!(focused(KeyCode::Char('q')), KeyAction::ChatInput('q'));
         assert_eq!(focused(KeyCode::Char('5')), KeyAction::ChatInput('5'));
+        // Text entry keeps the case the user typed; only shortcuts fold it.
+        assert_eq!(focused(KeyCode::Char('Q')), KeyAction::ChatInput('Q'));
         assert_eq!(focused(KeyCode::Backspace), KeyAction::ChatBackspace);
         assert_eq!(focused(KeyCode::Enter), KeyAction::ChatSubmit);
         assert_eq!(focused(KeyCode::Esc), KeyAction::ChatBlur);

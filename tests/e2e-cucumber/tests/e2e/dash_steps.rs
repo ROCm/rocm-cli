@@ -1253,6 +1253,18 @@ async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
     // actually gates on the post-resize render.
 }
 
+#[when("the user shrinks the terminal to a short window")]
+async fn shrink_to_a_short_window(world: &mut E2eWorld) {
+    // ROCMAI-1050: the same geometry `shrink_below_menu_logo_layout` uses, under
+    // a name that does not speak of the Esc menu — this is also the height at
+    // which the quit prompt cut the stop command off its own remediation
+    // bullet. Only resizes; the `Then` steps after it gate on a post-resize
+    // frame.
+    session(world)
+        .use_short_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+}
+
 #[when("the user shrinks the terminal below the Esc menu's logo layout")]
 async fn shrink_below_menu_logo_layout(world: &mut E2eWorld) {
     // ROCMAI-1042: at this height the Esc menu's modal is too short for the
@@ -1318,6 +1330,15 @@ async fn open_services_manager(world: &mut E2eWorld) {
     // `should_pane_back_out`'s doc comment calls out as needing Esc to close it.
     session(world)
         .send("s")
+        .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
+}
+
+#[when("the user opens the services manager with Caps Lock on")]
+async fn open_services_manager_caps_lock(world: &mut E2eWorld) {
+    // A PTY cannot toggle Caps Lock; `S` is the byte the terminal sends for
+    // `s` with it on.
+    session(world)
+        .send("S")
         .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
 }
 
@@ -1818,6 +1839,18 @@ async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
 }
 
+#[when("the user quits the dashboard with Caps Lock on")]
+async fn quit_dashboard_caps_lock(world: &mut E2eWorld) {
+    // Sent once, not resent like `quit_and_wait` does: the previous step waited
+    // for the idle Observe frame, so nothing transient can swallow the key.
+    // Demo data never serves a model (`AppState::has_live_instance`), so no
+    // quit-confirm prompt opens.
+    session(world)
+        .send_once_and_wait("Q", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard did not quit on Q: {e}"));
+}
+
 // ── Two dashboards at once (dash-56) ───────────────────────────────
 
 /// Wait until `tui`'s header says it is connected to a telemetry daemon.
@@ -2315,6 +2348,32 @@ async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// ROCMAI-1050's overflow half: growing the popup cannot save every body, so a
+/// body that still does not fit has to advertise itself instead of being cut
+/// silently — which is the original defect, not a lesser version of it.
+///
+/// The notice and the key names are asserted together on purpose. A notice
+/// that named no keys would leave the user exactly as stuck as the silent cut,
+/// and the keys alone would not say there was anything below. Matched on the
+/// whitespace-collapsed screen because the row is padded out to the popup's
+/// width. It cannot wrap: the footer is an unwrapped `Paragraph` in a one-row
+/// constraint, so a row too long for the popup is clipped instead. At this
+/// geometry the tail is clipped, but "PgUp/PgDn" sits inside that boundary.
+#[then("the quit prompt says there is more to read and names the keys that scroll it")]
+async fn quit_confirm_announces_more_to_read(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the quit prompt says \"More to read\" and names PgUp/PgDn",
+            |screen| {
+                let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+                flat.contains("More to read") && flat.contains("PgUp/PgDn")
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// Issue #145's actual stop action, not just the warning: `s` on the
 /// dashboard's quit-confirm prompt is meant to close it and open the Services
 /// overlay instead of resolving an Approve/Deny/Cancel verdict
@@ -2556,6 +2615,66 @@ async fn open_dashboard_from_launcher(world: &mut E2eWorld) {
     tui.wait_for_screen("Updates", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the dashboard did not open from the launcher: {e}"));
+}
+
+/// The launcher's "Serve a model" row (`LauncherChoice::Serve`, index 1 of
+/// `ui::launcher::ROWS`, after "Set up this system"), which routes to
+/// `run_focused(Focus::Serve)` — a focused host, not the full dashboard.
+///
+/// The form's own panel title is also "Serve a model", the same words as the
+/// menu row that opens it, so the title cannot tell the two screens apart.
+/// `[ Launch ]` can: it is the form's launch button and the front door never
+/// draws it.
+#[when("the user chooses to serve a model from the launcher")]
+async fn open_serve_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the front door before sending keys, same rationale as
+    // `open_dashboard_from_launcher`.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // Serve has no single-key shortcut like `d` (`OpenDashboard`'s): it is the
+    // 2nd row, one move down from the default (Set up) selection, then `Enter`
+    // (`choice_for(sel)`).
+    tui.send("j")
+        .unwrap_or_else(|e| panic!("failed to select Serve in the launcher: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open the serve flow from the launcher: {e}"));
+    tui.wait_for_screen("[ Launch ]", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve form did not open from the launcher: {e}"));
+}
+
+/// The focused host is asserted by what only it draws: `ui::draw_focused`'s
+/// single footer hint, whose whole point is that this window returns to the
+/// launcher menu rather than to a tab shell. The full dashboard draws its tab
+/// legend there instead — so a regression that routed this row into the
+/// dashboard (or that opened the form over a tab shell) fails here rather than
+/// passing on the form alone, which both routes show.
+#[then("the serve form is shown in a window that offers the way back to the menu")]
+async fn focused_serve_window_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Esc  back to menu", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the serve form did not open as a focused window — if the form is \
+                 showing but this footer is not, the launcher's Serve row stopped \
+                 routing to `run_focused`: {e}"
+            )
+        });
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("[ Launch ]"),
+        "the focused window is not showing the serve form:\n{screen}"
+    );
+    // "Updates" is the marker `open_dashboard_from_launcher` waits for to prove
+    // the FULL dashboard opened, so its absence is what distinguishes the two
+    // routes from the same menu.
+    assert!(
+        !screen.contains("Updates"),
+        "the Serve row opened the full dashboard instead of a focused window:\n{screen}"
+    );
 }
 
 #[when("the user quits back to the launcher")]
