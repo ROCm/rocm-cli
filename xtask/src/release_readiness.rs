@@ -77,6 +77,11 @@ pub struct Facts {
     /// failure, so the table has to say it: the E2E row covers only the lanes
     /// that are in the report.
     pub queue_absent: Option<String>,
+    /// The queue lanes its run names but whose lane matrix has no row for them
+    /// (typically a blocking lane that is not in the queue's fleet), as the matrix
+    /// says. The E2E failure count already includes such a lane when it is
+    /// blocking and has no results; this names the lanes and the reason.
+    pub queue_unlisted: Option<String>,
     pub commits: CommitBuckets,
     pub known_issues: Vec<KnownIssue>,
 }
@@ -108,6 +113,7 @@ pub fn run(
         e2e_report_job_result,
     );
     facts.note_queue_absent(queue_absent_reason(&e2e_text));
+    facts.queue_unlisted = queue_unlisted_lanes(&e2e_text);
 
     // Trailing newline so the file ends like a text file.
     write_parented(out, &format!("{}\n", serde_json::to_string_pretty(&facts)?))?;
@@ -171,6 +177,7 @@ fn assemble_facts(
         e2e_fail_total,
         build_skipped: nightly_result == "skipped" || windows_result == "skipped",
         queue_absent: None,
+        queue_unlisted: None,
         commits,
         known_issues,
     }
@@ -422,6 +429,16 @@ fn queue_absent_reason(markdown: &str) -> Option<String> {
     })
 }
 
+/// The lanes the matrix says the queue run names without a row in its lane
+/// matrix, if it says so (`e2e_queue_import`'s unlisted-lanes note).
+fn queue_unlisted_lanes(markdown: &str) -> Option<String> {
+    use crate::e2e_queue_import::{UNLISTED_LEAD, UNLISTED_TAIL};
+    markdown.lines().find_map(|line| {
+        let rest = line.strip_prefix(UNLISTED_LEAD)?;
+        Some(rest.strip_suffix(UNLISTED_TAIL).unwrap_or(rest).to_string())
+    })
+}
+
 /// Sum of the `Fail` column across the consolidated E2E markdown's `**Total**`
 /// row (`crates/e2e-report`'s `consolidated_summary_markdown` format: `|
 /// Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |`), plus one
@@ -560,6 +577,15 @@ pub(crate) fn render_table(facts: &Facts) -> String {
              above does not cover R9700, MI350P, W7900 or the queue's blocking lanes, and a queue \
              that did not run is not a pass: the verdict is NO-GO.\n",
             escape_markdown(reason)
+        );
+    }
+
+    if let Some(lanes) = &facts.queue_unlisted {
+        let _ = writeln!(
+            out,
+            "⚠️ **Queue lanes without a row in the queue's lane matrix:** {}. A lane without \
+             results counts in the E2E failures above when the queue blocks on it.\n",
+            escape_markdown(&lanes.replace('`', ""))
         );
     }
 
@@ -982,6 +1008,39 @@ mod tests {
         facts.failing_gates.clear();
         facts.note_queue_absent(None);
         assert_eq!(facts.verdict, Verdict::Go);
+    }
+
+    #[test]
+    fn the_table_names_a_queue_lane_the_run_names_but_its_matrix_lacks() {
+        use crate::e2e_queue_import::{UNLISTED_LEAD, UNLISTED_TAIL};
+        let md = format!(
+            "## Queue lanes\n\n{UNLISTED_LEAD}`r9700s` (blocking, no results): the queue run \
+             reported it is not in the fleet, so it was not tested{UNLISTED_TAIL}\n\n"
+        );
+        let lanes = queue_unlisted_lanes(&md).expect("the note is recognised");
+        assert_eq!(
+            lanes,
+            "`r9700s` (blocking, no results): the queue run reported it is not in the fleet, so \
+             it was not tested"
+        );
+        assert_eq!(queue_unlisted_lanes("| Total | 0 |\n"), None);
+        let mut facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(1),
+            "success",
+            "success",
+            "success",
+        );
+        facts.queue_unlisted = Some(lanes);
+        let table = render_table(&facts);
+        assert!(
+            table.contains("without a row in the queue's lane matrix"),
+            "{table}"
+        );
+        assert!(table.contains("r9700s"), "{table}");
+        assert!(!table.contains("\\`"), "no visible backticks: {table}");
     }
 
     #[test]
