@@ -2747,7 +2747,10 @@ the folder before anything is removed.
 
 When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the ROCm CLI binaries in that build
-directory.
+directory. It also skips binary removal when `rocm` runs from a Python
+environment that a package manager (`pip`, `pipx`, `uv tool`) may own, and names
+the command that removes it (`pip uninstall rocm-cli`); `--force-dev-binaries`
+does not change that.
 
 Before removing anything, `uninstall` prints warnings, among them:
 

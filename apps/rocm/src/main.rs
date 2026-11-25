@@ -53,6 +53,7 @@ mod model_fit;
 mod prompt_text;
 mod provider_keys;
 mod providers;
+mod python_install;
 mod remote;
 mod rocm_argv;
 mod runtime_adopt;
