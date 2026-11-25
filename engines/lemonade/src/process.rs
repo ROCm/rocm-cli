@@ -755,27 +755,35 @@ pub(crate) fn lemonade_model_load_args(
 /// the remaining flags are passed through to llama-server. The `--ctx-size=N`
 /// spelling is accepted too.
 ///
-/// A `--ctx-size` with no value is left in place for llama-server to reject
-/// rather than guessed at, in all three ways it can lack one: last in the list,
-/// spelled `--ctx-size=` with nothing after the `=`, and followed by something
+/// Only a value that parses as a count is taken, in either spelling. A
+/// `--ctx-size` that names anything else is left in place for llama-server to
+/// reject rather than guessed at: last in the list with nothing after it,
+/// `--ctx-size=` with nothing or nonsense after the `=`, or followed by a token
 /// that is not a number. The last is why the next token is inspected and not
 /// merely counted — swallowing it would send Lemonade `--ctx-size --temperature`
 /// and hand llama-server the orphaned `0.5`. The test is that the token parses
 /// as a count, not that it lacks a leading `--`: llama-server's short flags
 /// (`-ngl`, `-fa`, `-b`, `-np`) carry a single dash and would otherwise be
-/// swallowed by the same mistake in a different spelling. All three also leave
-/// [`crate::context_size::recipe_pins_context`] false, so the host sizing still
-/// runs for a recipe that named no usable window.
+/// swallowed by the same mistake in a different spelling. The two spellings are
+/// held to the same test deliberately — a `--ctx-size=-1` taken as a value would
+/// reach `lemonade load` as one *and* leave
+/// [`crate::context_size::recipe_pins_context`] true, so the host sizing would
+/// stand down for a window the recipe never actually named. Everything left in
+/// place leaves that predicate false, so the sizing still runs.
+///
+/// `-c`, llama-server's short spelling, is not recognized in either form; no
+/// catalog recipe uses it, and validating flag spellings at catalog-load time is
+/// the place to close that rather than a second spelling here.
 pub(crate) fn split_context_size_flag(flags: &[String]) -> (Option<String>, Vec<&str>) {
     let mut context_size = None;
     let mut rest = Vec::with_capacity(flags.len());
     let mut iter = flags.iter().map(String::as_str).peekable();
     while let Some(flag) = iter.next() {
         if let Some(value) = flag.strip_prefix("--ctx-size=") {
-            if value.is_empty() {
-                rest.push(flag);
-            } else {
+            if value.parse::<u64>().is_ok() {
                 context_size = Some(value.to_owned());
+            } else {
+                rest.push(flag);
             }
         } else if flag == "--ctx-size"
             && iter.peek().is_some_and(|next| next.parse::<u64>().is_ok())
@@ -1524,6 +1532,17 @@ helper line
         let (context_size, rest) = split_context_size_flag(&flags);
         assert_eq!(context_size, None);
         assert_eq!(rest, ["--ctx-size="]);
+
+        // The `=` spelling is held to the same test as the bare one. Taking
+        // these would both forward nonsense to `lemonade load` and leave
+        // `recipe_pins_context` true, standing the host sizing down for a window
+        // the recipe never named.
+        for flag in ["--ctx-size=abc", "--ctx-size=-1", "--ctx-size=8192x"] {
+            let flags = owned(&[flag]);
+            let (context_size, rest) = split_context_size_flag(&flags);
+            assert_eq!(context_size, None, "{flag}");
+            assert_eq!(rest, [flag], "{flag}");
+        }
 
         // A real value is still taken, in either spelling, and does not reach
         // llama-server a second time.

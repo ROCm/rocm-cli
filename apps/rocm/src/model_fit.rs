@@ -328,19 +328,32 @@ fn classify_accelerator_memory(
         if gpu_reported {
             // No `amd-smi` rows (a Windows host whose GPU has no ROCm build ships
             // none), so nothing says how much memory the card has -- except that
-            // the gfx target names an APU, whose pool is read without them. The
-            // reader attributes the figure to one adapter or DRM card only when
-            // exactly one exists, so a host pairing the APU with a discrete card
-            // gets `None` here and stays `Unknown`. A mask that hides every card
-            // is not promoted either: that is not a pool anyone can allocate from.
-            let pool = gfx_target
-                .is_some_and(rocm_core::gfx_is_apu_family)
-                .then_some(unified_gib)
-                .flatten()
-                .filter(|_| usable_indices.is_none_or(|indices| !indices.is_empty()));
-            return pool.map_or(AcceleratorMemory::Unknown, |gtt_total_gib| {
-                AcceleratorMemory::Unified { gtt_total_gib }
-            });
+            // the gfx target names an APU, whose pool is read without them.
+            if !gfx_target.is_some_and(rocm_core::gfx_is_apu_family) {
+                // Not known to be an APU, so there is no second pool to fall
+                // back on and no telemetry of any kind: `amd-smi metric --json`
+                // is a real next step here.
+                return AcceleratorMemory::Unknown;
+            }
+            // A mask that hides every card is "no GPU is visible", as on both
+            // branches below: not a pool anyone can allocate from, and not a
+            // reading failure to report either.
+            if usable_indices.is_some_and(<[u32]>::is_empty) {
+                return AcceleratorMemory::None;
+            }
+            let Some(gtt_total_gib) = unified_gib else {
+                // An APU whose pool this host does not answer for -- the reader
+                // attributes the figure to a single adapter or DRM card, so a
+                // host pairing the APU with a discrete card lands here too. Not
+                // `Unknown`: that variant's remediation is "run `amd-smi metric
+                // --json`", and this is the one host class that has no
+                // `amd-smi` to run -- having shipped none is why this branch was
+                // taken at all. Sending it there is the circle
+                // `model_readiness.rs`'s `UnifiedMemoryUnreadable` exists to
+                // break, exactly as on the carve-out branch below.
+                return AcceleratorMemory::UnifiedMemoryUnreadable;
+            };
+            return AcceleratorMemory::Unified { gtt_total_gib };
         }
         return AcceleratorMemory::None;
     };
@@ -1024,12 +1037,27 @@ mod tests {
             classify_accelerator_memory(None, Some("gfx90c"), true, Some(&[0]), Some(7.7)),
             AcceleratorMemory::Unified { gtt_total_gib: 7.7 }
         );
+        // The pool is unreadable too. `amd-smi` shipped no rows, so "run
+        // `amd-smi metric --json`" -- what `Unknown` asks for -- is the one
+        // remediation this host can never carry out.
         assert_eq!(
             classify_accelerator_memory(None, Some("gfx90c"), true, None, None),
+            AcceleratorMemory::UnifiedMemoryUnreadable
+        );
+        // A mask that leaves no card is "no GPU is visible", not a pool and not
+        // a reading failure.
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx90c"), true, Some(&[]), Some(7.7)),
+            AcceleratorMemory::None
+        );
+        // Nothing says this is an APU, so there is no second pool to reach for
+        // and `amd-smi` really is the next step.
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx1100"), true, None, None),
             AcceleratorMemory::Unknown
         );
         assert_eq!(
-            classify_accelerator_memory(None, Some("gfx90c"), true, Some(&[]), Some(7.7)),
+            classify_accelerator_memory(None, None, true, None, Some(7.7)),
             AcceleratorMemory::Unknown
         );
         assert_eq!(
