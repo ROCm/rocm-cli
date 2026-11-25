@@ -180,7 +180,11 @@ pub struct Route {
 /// The full diagnosis output (mirrors `diagnose.py --json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnoseReport {
-    /// All nonzero-score diagnoses, highest score first.
+    /// All nonzero-score diagnoses, ranked: those that cleared
+    /// [`MIN_SCORE_FOR_MATCH`] first, a finding that the process has no working
+    /// path to the GPU ahead of the others, each group by score descending; then
+    /// the rest by score descending. `run_all_checks` in `diagnose/catalog.rs`
+    /// sorts it, from each entry's `Precedence` there.
     ///
     /// Every checker that fired at all lands here, including ones scoring below
     /// [`MIN_SCORE_FOR_MATCH`] — so a non-empty `matched` does NOT mean a cause

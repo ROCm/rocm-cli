@@ -74,9 +74,9 @@ pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
 #[cfg(test)]
 pub(crate) use terminal::restore_after_session;
 pub use types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, MENU_ITEMS, MenuItem,
-    Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction, ReplayState, ResolvedArgs,
-    ScrollTarget, UpdateStatus, format_mmss,
+    ActiveTab, ChatConsent, ChatEndpointHealth, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus,
+    MENU_ITEMS, MenuItem, Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction,
+    ReplayState, ResolvedArgs, ScrollTarget, UpdateStatus, format_mmss,
 };
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
@@ -197,6 +197,19 @@ pub struct AppState {
     pub chat_llm: Option<crate::llm::LlmConfig>,
     /// One-time consent gate for using the detected endpoint.
     pub chat_consent: ChatConsent,
+    /// Whether a managed instance has ever been seen serving the chat
+    /// endpoint's loopback port.
+    ///
+    /// Stopping a service removes its record, so the instance does not turn
+    /// `Stopped` — it vanishes (`Event::InstanceGone`). An absent instance is
+    /// therefore ambiguous on its own: it means "stopped" only for an endpoint
+    /// we once saw registered, and "never ours to watch" for a local engine
+    /// started outside the dashboard. This remembers which.
+    ///
+    /// Deliberately a flag rather than a container id: a service restarted on
+    /// the same port gets a fresh id, and matching by port lets the endpoint
+    /// recover on its own instead of pinning a dead one.
+    pub(crate) chat_endpoint_managed: bool,
     /// A locally-detected chat endpoint awaiting the user's use/save/dismiss
     /// choice (the in-TUI "detect a local engine" flow). `None` normally.
     pub chat_detect_offer: Option<crate::llm::LlmConfig>,
@@ -420,6 +433,7 @@ impl AppState {
             chat_follow: true,
             chat_llm: None,
             chat_consent: ChatConsent::Unavailable,
+            chat_endpoint_managed: false,
             chat_detect_offer: None,
             chat_detecting: false,
             chat_detect_dispatch: false,
@@ -618,6 +632,7 @@ impl AppState {
             self.instances
                 .insert(inst.container_id.clone(), inst.clone());
         }
+        self.refresh_chat_endpoint_health();
         self.push_history_and_latest(snap);
     }
 
@@ -651,6 +666,7 @@ impl AppState {
             live.into_iter()
                 .map(|inst| (inst.container_id.clone(), inst)),
         );
+        self.refresh_chat_endpoint_health();
         self.clamp_selectors();
     }
 
@@ -670,6 +686,7 @@ impl AppState {
 
     fn upsert_instance(&mut self, inst: Instance) {
         self.instances.insert(inst.container_id.clone(), inst);
+        self.refresh_chat_endpoint_health();
         self.clamp_selectors();
     }
 

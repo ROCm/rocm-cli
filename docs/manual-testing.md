@@ -2531,6 +2531,27 @@ HSA_OVERRIDE_GFX_VERSION=11.0.0 rocm diagnose --json
 The e2e scenarios `diagnose-62`, `diagnose-63` and `diagnose-64` run these three
 checks on every lane.
 
+### 15a. A GPU the container cannot reach ranks first
+
+On WSL2 with Docker, start a container without the GPU device, which also
+leaves it Docker's default 64 MiB `/dev/shm`, and diagnose from inside it with
+a Linux `rocm` binary mounted in:
+
+```bash
+docker run --rm -v "$(command -v rocm)":/usr/local/bin/rocm:ro ubuntu:24.04 rocm diagnose
+```
+
+- `#1` is `fix-wsl-1-gpu-not-exposed`, whose evidence says this is a container
+  that was not given `/dev/dxg`, even though `fix-19-shm-too-small` below it
+  scores higher.
+- The closing line tells you to run `rocm fix fix-wsl-1-gpu-not-exposed` and
+  calls it the top-ranked cause; it does not name the shared-memory fix. Before
+  ROCMAI-785 both the ranking and that line put `fix-19-shm-too-small` first.
+
+The e2e scenario `diagnose-90` runs the ranking on a planted host on every
+Linux lane, with a pasted out-of-memory error as the higher-scoring finding,
+because a planted host cannot shrink `/dev/shm`.
+
 ## 16. Dashboard Chat With A Small-Context Local Model
 
 Needs a local OpenAI-compatible endpoint serving a model with a small context

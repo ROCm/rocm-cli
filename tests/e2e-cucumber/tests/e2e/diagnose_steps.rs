@@ -3856,6 +3856,144 @@ async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+// ── A GPU the program cannot reach ranks first (ROCMAI-785) ────────
+
+/// The id of the finding that means a WSL distro or container has no
+/// `/dev/dxg`, so nothing in it can reach the GPU.
+const GPU_NOT_EXPOSED_FIX_ID: &str = "fix-wsl-1-gpu-not-exposed";
+
+/// The id of the vLLM out-of-memory finding.
+const VLLM_OOM_FIX_ID: &str = "fix-16-vllm-oom";
+
+/// The planted host root of diagnose-90.
+fn container_on_wsl_host_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("wsl-container-host-root")
+}
+
+#[given("a container on a WSL machine that was started without the GPU")]
+async fn container_on_wsl_without_the_gpu(world: &mut E2eWorld) {
+    // A WSL2 kernel string is what makes the probe read the host as WSL even on
+    // a bare-metal runner (`is_wsl_host` in rocm-core trusts it on its own), and
+    // `/.dockerenv` is the docker marker. No `/dev/dxg` is planted: that absence
+    // is the machine under test. Both are read through the host root
+    // (`hardware_root.rs` lists them), so a WSL lane's real `/dev/dxg` is hidden
+    // too.
+    let host = container_on_wsl_host_root(world);
+    std::fs::create_dir_all(host.join("proc")).expect("failed to create planted /proc");
+    std::fs::write(
+        host.join("proc/version"),
+        "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@builder) #1 SMP\n",
+    )
+    .expect("failed to write planted /proc/version");
+    std::fs::write(host.join(".dockerenv"), "").expect("failed to plant /.dockerenv");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user asks the CLI to diagnose that symptom on that machine")]
+async fn user_diagnoses_symptom_on_planted_machine(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    // `--top 20` so the whole ranking is read, not the default five.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["diagnose", "--symptom", &symptom, "--top", "20"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Each ranked row of a text report, in order, as `(id, score)`, read from its
+/// `#N (<id>) [<TIER> score=<n>/100]` header line.
+fn ranked_rows(output: &str) -> Vec<(String, i32)> {
+    output
+        .lines()
+        .filter(|line| line.starts_with('#'))
+        .filter_map(|line| {
+            let id = line.split_once(" (")?.1.split_once(')')?.0;
+            let score = line.split_once("score=")?.1.split_once('/')?.0;
+            Some((id.to_owned(), score.parse().ok()?))
+        })
+        .collect()
+}
+
+#[then(
+    "the cause ranked first is that the GPU is not exposed to the container, above the out-of-memory finding that scores higher"
+)]
+async fn assert_unreachable_gpu_ranks_first(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "{output}");
+    let rows = ranked_rows(output);
+    assert_eq!(
+        rows.first().map(|(id, _)| id.as_str()),
+        Some(GPU_NOT_EXPOSED_FIX_ID),
+        "{rows:?}\n{output}"
+    );
+    // The container branch of the finding, not the Windows-driver one: this
+    // machine's host driver was never the problem.
+    assert!(
+        output
+            .contains("this is a container, and containers only see /dev/dxg when it is passed in"),
+        "the finding must say the container was started without the device:\n{output}"
+    );
+    // The premise: the out-of-memory finding is listed below it with the
+    // higher score, so the order is not the score order.
+    let first_score = rows[0].1;
+    let oom = rows
+        .iter()
+        .find(|(id, _)| id == VLLM_OOM_FIX_ID)
+        .unwrap_or_else(|| {
+            panic!("the pasted out-of-memory error must still be listed:\n{output}")
+        });
+    assert!(
+        oom.1 > first_score,
+        "the out-of-memory finding must score higher than the cause ranked above it, or \
+         this scenario no longer shows the ranking puts the GPU first: {rows:?}"
+    );
+}
+
+#[then("the closing advice names that cause, and the CLI accepts the fix it names on that machine")]
+async fn assert_closing_advice_names_the_unreachable_gpu(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let closing = format!("run `rocm fix {GPU_NOT_EXPOSED_FIX_ID}` (the top-ranked cause)");
+    assert!(output.contains(&closing), "{output}");
+    assert!(
+        !output.contains(&format!("Next step: run `rocm fix {VLLM_OOM_FIX_ID}`")),
+        "the out-of-memory finding scores HIGH but is not the next step:\n{output}"
+    );
+    // The named command, run on the same planted machine: `rocm fix` decides
+    // whether a WSL entry applies by reading `/dev/dxg` and `/proc/version`
+    // through the host root, so off it a bare-metal lane would refuse the id
+    // for a reason unrelated to the advice.
+    let host = container_on_wsl_host_root(world);
+    let (fix_stdout, fix_stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", GPU_NOT_EXPOSED_FIX_ID],
+        &[("ROCM_CLI_TEST_HOST_ROOT", host.to_string_lossy().as_ref())],
+    );
+    assert_eq!(
+        rc,
+        0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["fix", GPU_NOT_EXPOSED_FIX_ID],
+            rc,
+            &fix_stdout,
+            &fix_stderr
+        )
+    );
+    assert!(
+        fix_stdout.contains("--device=/dev/dxg"),
+        "the fix the advice names must print how to pass the device in:\n{fix_stdout}"
+    );
+}
+
 // ── Stale repo advice on a simulated Ubuntu host ───────────────────
 
 #[given("an Ubuntu 24.04 machine with two stale ROCm repo files")]
