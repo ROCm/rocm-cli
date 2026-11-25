@@ -235,6 +235,49 @@ pub(super) const KEYWORDS_IOMMU_HANG: KeywordTable = &[
     ("iommu", 30, "user mentions iommu"),
 ];
 
+/// What an exhausted unified-memory pool leaves in a paste, for
+/// [`check_24_apu_unified_memory`](super::linux::check_24_apu_unified_memory).
+///
+/// The first entry is the amdkfd driver's own line
+/// (`crate::examine::SVM_MAPPING_FAILED`), which clears
+/// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) alone because nothing
+/// else in the kernel prints it: it comes from one `pr_info` in
+/// `kfd_svm.c`'s `svm_range_new`, on the one path where a host-memory
+/// reservation was refused.
+///
+/// The rest stay below the threshold on their own. A bare `ttm.pages_limit` or
+/// `amdgpu.gttsize` only says the user is talking about the parameters, which
+/// is as true of someone who has just set them correctly, and "out of memory"
+/// belongs to every allocator on the machine -- the vLLM entry already scores
+/// that shape, and this one must not claim it.
+pub(super) const KEYWORDS_APU_UNIFIED_MEMORY: KeywordTable = &[
+    (
+        "svm mapping failed",
+        50,
+        "error names the kernel's 'SVM mapping failed' line",
+    ),
+    (
+        "exceeds resident system memory limit",
+        45,
+        "error names the kernel's resident system memory limit",
+    ),
+    (
+        "already allocated by svm",
+        30,
+        "error says a host buffer is already covered by an SVM range",
+    ),
+    (
+        r"(?:amd)?ttm\.pages_limit",
+        25,
+        "user mentions the ttm.pages_limit kernel parameter",
+    ),
+    (
+        r"amdgpu\.gttsize",
+        25,
+        "user mentions the amdgpu.gttsize kernel parameter",
+    ),
+];
+
 pub(super) const KEYWORDS_DPKG_BROKEN: KeywordTable = &[
     ("half[- ]configured", 50, "dpkg 'half-configured'"),
     ("dkms .*failed", 45, "DKMS build failure"),

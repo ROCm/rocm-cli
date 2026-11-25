@@ -69,6 +69,14 @@ pub(super) fn probe_os(e: &mut Examination) {
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
+        e.amdgpu_gttsize_mib = parse_gttsize_mib(&e.kernel_cmdline);
+        e.ttm_pages_limit = parse_ttm_pages_limit(&e.kernel_cmdline);
+        // Read here rather than in the GPU probes: the figure is the host's
+        // installed memory, not a property of any device, and the unified-memory
+        // entry in the catalog sizes its advice against it. `/proc/meminfo` is a
+        // re-rooted read like `/proc/cmdline` above, so a simulated host root
+        // supplies both.
+        e.system_ram_gib = crate::host_gpu::detect_system_ram_gib();
         // One shared answer. This used to be its own predicate, and it differed
         // from the install summary's — so `rocm examine` and `rocm examine
         // --json` could disagree about the platform they were describing.
@@ -118,6 +126,41 @@ pub(super) fn parse_iommu_param(cmdline: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     })
+}
+
+/// The value of the first `<key>=<number>` token on `cmdline`, for the keys in
+/// `keys`.
+///
+/// Decimal only: the amdgpu and TTM module parameters are `uint`/`ulong`
+/// parameters the kernel parses with `kstrtouint`, which accepts `0x`-prefixed
+/// and octal forms as well, but nothing in the wild writes them that way and
+/// accepting a form this function cannot round-trip into advice would be worse
+/// than reporting the parameter as unset. A token that does not parse reads as
+/// absent for the same reason.
+fn parse_u64_kernel_param(cmdline: &str, keys: &[&str]) -> Option<u64> {
+    cmdline.split_whitespace().find_map(|token| {
+        keys.iter()
+            .find_map(|key| token.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
+/// `amdgpu.gttsize=<MiB>`: the cap the amdgpu driver puts on the GTT aperture,
+/// in **MiB**.
+pub(super) fn parse_gttsize_mib(cmdline: &str) -> Option<u64> {
+    parse_u64_kernel_param(cmdline, &["amdgpu.gttsize"])
+}
+
+/// `ttm.pages_limit=<pages>`: the cap TTM puts on the pages it will hand out,
+/// in **4 KiB pages**.
+///
+/// Two spellings, because the module that owns the parameter depends on how the
+/// driver was installed: the in-tree driver's TTM is `ttm`, while the
+/// out-of-tree `amdgpu-dkms` packages ship their own copy as `amdttm`. A host
+/// that set the parameter under the name its own driver uses must not read as
+/// not having set it at all.
+pub(super) fn parse_ttm_pages_limit(cmdline: &str) -> Option<u64> {
+    parse_u64_kernel_param(cmdline, &["ttm.pages_limit", "amdttm.pages_limit"])
 }
 
 /// Fill the CPU fields from the shared reader's answer. A CPU that could not be
@@ -287,8 +330,85 @@ pub(super) fn probe_container(e: &mut Examination) {
     }
 }
 
+/// How many lines of the kernel log [`probe_dmesg_amdgpu`] asks `journalctl`
+/// for.
+///
+/// Published because a reader of a finding has to know how far back the
+/// evidence goes: an amdgpu failure older than this window is simply not in
+/// `dmesg_amdgpu_tail`, and a check that said "no such failure" without saying
+/// where it looked would be reporting the window as the machine's history.
+/// `check_24_apu_unified_memory` in `diagnose/linux.rs` states both figures in
+/// its evidence from these constants.
+pub(crate) const DMESG_LINES_SCANNED: usize = 400;
+
+/// How many matching lines [`probe_dmesg_amdgpu`] keeps, the newest ones.
+pub(crate) const DMESG_HITS_KEPT: usize = 15;
+
+/// The kernel log line the amdkfd driver leaves when an SVM range could not be
+/// reserved, lower-cased for matching.
+///
+/// `pr_info("SVM mapping failed, exceeds resident system memory limit\n")` in
+/// `drivers/gpu/drm/amd/amdkfd/kfd_svm.c`'s `svm_range_new`, reached when
+/// `amdgpu_amdkfd_reserve_mem_limit` refuses the registration. The line is
+/// carried through to the user by `check_24_apu_unified_memory`, so the probe's
+/// keyword list and the check's detector read the same constant.
+pub(crate) const SVM_MAPPING_FAILED: &str = "svm mapping failed";
+
+/// The companion line, emitted when a host buffer the application asked the GPU
+/// to use is already covered by an SVM range.
+pub(crate) const SVM_ALREADY_ALLOCATED: &str = "already allocated by svm";
+
+/// The phrases that make an amdgpu kernel-log line worth keeping, matched
+/// against the lower-cased line.
+const INTERESTING_DMESG_PHRASES: &[&str] = &[
+    "page fault",
+    "ras controller",
+    "vm_fault",
+    "amdgpu_device_init",
+    "out_of_registers",
+    "ring",
+    "gpu reset",
+    "psp",
+    "hw_fault",
+    SVM_MAPPING_FAILED,
+    SVM_ALREADY_ALLOCATED,
+];
+
+/// The amdgpu lines of `text` worth keeping, newest last, at most
+/// [`DMESG_HITS_KEPT`] of them.
+///
+/// Split out of [`probe_dmesg_amdgpu`] so the selection can be tested against
+/// real kernel-log lines without a kernel log.
+///
+/// The line filter stays `amdgpu`/`amdkfd` rather than widening to `kfd` or
+/// `svm`. The amdkfd sources are compiled into the amdgpu module and include
+/// `amdgpu.h`, which does `#define pr_fmt(fmt) "amdgpu: " fmt`, so every
+/// `pr_*` line those files emit -- `SVM mapping failed, ...` included -- is
+/// prefixed `amdgpu:` and already passes. Widening to a bare `svm` would admit
+/// the unrelated AMD-V lines a host prints at boot (`kvm_amd`'s `SVM` messages
+/// name the virtualisation extension, not shared virtual memory), which is the
+/// flooding this filter exists to prevent.
+fn amdgpu_log_hits(text: &str) -> Vec<String> {
+    let mut hits: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !line.contains("amdgpu") && !line.contains("amdkfd") {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if INTERESTING_DMESG_PHRASES
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+        {
+            hits.push(line.trim().chars().take(300).collect());
+        }
+    }
+    let start = hits.len().saturating_sub(DMESG_HITS_KEPT);
+    hits.split_off(start)
+}
+
 pub(super) fn probe_dmesg_amdgpu(e: &mut Examination) {
-    let (rc, out, _) = run("journalctl", &["-k", "--no-pager", "-n", "400"], MEDIUM);
+    let lines = DMESG_LINES_SCANNED.to_string();
+    let (rc, out, _) = run("journalctl", &["-k", "--no-pager", "-n", &lines], MEDIUM);
     let text = if rc == 0 && !out.is_empty() {
         out
     } else {
@@ -298,29 +418,7 @@ pub(super) fn probe_dmesg_amdgpu(e: &mut Examination) {
     if text.is_empty() {
         return;
     }
-    let interesting = [
-        "page fault",
-        "ras controller",
-        "vm_fault",
-        "amdgpu_device_init",
-        "out_of_registers",
-        "ring",
-        "gpu reset",
-        "psp",
-        "hw_fault",
-    ];
-    let mut hits: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if !line.contains("amdgpu") && !line.contains("amdkfd") {
-            continue;
-        }
-        let lower = line.to_lowercase();
-        if interesting.iter().any(|s| lower.contains(s)) {
-            hits.push(line.trim().chars().take(300).collect());
-        }
-    }
-    let start = hits.len().saturating_sub(15);
-    e.dmesg_amdgpu_tail = hits.split_off(start);
+    e.dmesg_amdgpu_tail = amdgpu_log_hits(&text);
 }
 
 #[cfg(test)]
@@ -335,6 +433,88 @@ mod tests {
             has_amd_gpu: true,
             ..Examination::default()
         }
+    }
+
+    /// The two unified-memory parameters are lifted out of the cmdline the way
+    /// `iommu=` is, in the units the kernel documents for each, and both
+    /// spellings of the TTM one are read.
+    #[test]
+    fn the_unified_memory_kernel_parameters_are_read_in_their_own_units() {
+        let cmdline = "BOOT_IMAGE=/vmlinuz root=UUID=1234 amdgpu.gttsize=98304 \
+                       ttm.pages_limit=25165824 quiet splash";
+        assert_eq!(parse_gttsize_mib(cmdline), Some(98_304));
+        assert_eq!(parse_ttm_pages_limit(cmdline), Some(25_165_824));
+
+        // The out-of-tree `amdgpu-dkms` driver ships TTM as `amdttm`, and a
+        // host that set it under that name has set it.
+        assert_eq!(
+            parse_ttm_pages_limit("amdttm.pages_limit=16777216"),
+            Some(16_777_216)
+        );
+
+        // Nothing set, a value that is not a number, and a bare key with no
+        // value all read as absent rather than as zero: zero is a real
+        // (catastrophic) setting and must not be invented.
+        for absent in [
+            "quiet splash",
+            "amdgpu.gttsize=huge ttm.pages_limit=",
+            "amdgpu.gttsize ttm.pages_limit",
+        ] {
+            assert_eq!(parse_gttsize_mib(absent), None, "{absent:?}");
+            assert_eq!(parse_ttm_pages_limit(absent), None, "{absent:?}");
+        }
+        // A parameter that merely ends with the key's name is a different
+        // parameter.
+        assert_eq!(parse_gttsize_mib("notamdgpu.gttsize=4096"), None);
+    }
+
+    /// The amdkfd SVM failure reaches `dmesg_amdgpu_tail`, as the real kernel
+    /// prints it, while the AMD-V boot lines that also say "SVM" do not.
+    #[test]
+    fn an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not() {
+        // Verbatim shapes: `kvm_amd`'s are what an AMD host prints at boot, and
+        // the amdgpu one carries the `amdgpu: ` prefix `amdgpu.h`'s `pr_fmt`
+        // puts on every `pr_*` line the amdkfd sources emit.
+        let log = "\
+[    3.100000] kvm_amd: SVM: Virtual VMLOAD VMSAVE supported
+[    3.100001] kvm_amd: SVM: LBR virtualization supported
+[ 1234.567890] amdgpu: SVM mapping failed, exceeds resident system memory limit
+[ 1234.567891] amdgpu: User Buffer Address: 0x7a117c0dc000 already allocated by SVM
+[ 1234.600000] systemd[1]: Started something unrelated.
+";
+        let hits = amdgpu_log_hits(log);
+        assert_eq!(
+            hits,
+            vec![
+                "[ 1234.567890] amdgpu: SVM mapping failed, exceeds resident system memory limit"
+                    .to_owned(),
+                "[ 1234.567891] amdgpu: User Buffer Address: 0x7a117c0dc000 already allocated by SVM"
+                    .to_owned(),
+            ],
+            "the kfd SVM lines must be kept and the kvm_amd ones dropped"
+        );
+    }
+
+    /// Only the newest [`DMESG_HITS_KEPT`] lines survive, which is why the
+    /// finding that reads them has to say the window is recent rather than
+    /// claiming the machine never failed.
+    #[test]
+    fn the_kept_tail_is_bounded_and_keeps_the_newest_lines() {
+        use std::fmt::Write as _;
+        let mut log = String::new();
+        for n in 0..DMESG_HITS_KEPT + 5 {
+            let _ = writeln!(
+                log,
+                "[{n}.0] amdgpu: SVM mapping failed, exceeds resident system memory limit #{n}"
+            );
+        }
+        let hits = amdgpu_log_hits(&log);
+        assert_eq!(hits.len(), DMESG_HITS_KEPT);
+        assert!(
+            hits[0].ends_with("#5"),
+            "the oldest five must have been dropped, not the newest: {:?}",
+            hits[0]
+        );
     }
 
     /// The message and the state it describes, asserted together: an

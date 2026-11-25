@@ -153,6 +153,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     // nothing. Leaving it out here would let the two published forms drift.
     "info-20-gpu-no-rocm-support",
     "fix-23-vllm-extension-load",
+    "fix-24-apu-unified-memory",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -232,6 +233,11 @@ const BARE_METAL_ONLY_FIX_IDS: &[&str] = &[
     "fix-10-container",
     "fix-11-iommu",
     "fix-12-installer",
+    // The GTT aperture and the TTM page limit are amdgpu/TTM module parameters
+    // on the distro's own kernel command line, which governs nothing under
+    // WSL2: there the GPU is reached through /dev/dxg and the Windows host
+    // driver.
+    "fix-24-apu-unified-memory",
 ];
 
 /// A catalog entry that cannot apply on the host running the suite, whichever
@@ -6052,5 +6058,358 @@ async fn assert_gguf_text_report_names_its_pool_as_shared(world: &mut E2eWorld) 
         output.contains("a ceiling it shares with the operating system"),
         "a bare \"fits\" against a shared ceiling reads as free memory, so the report has to \
          say the pool is shared:\n{output}"
+    );
+}
+
+// ── An APU's GTT/TTM limits and the kernel's SVM failures (ROCMAI-912) ──
+
+/// Installed RAM for the unified-memory fixtures, in kB as `/proc/meminfo`
+/// spells it: 128 GiB, a Strix Halo configuration.
+const UNIFIED_MEMORY_RAM_KB: u64 = 128 * 1024 * 1024;
+
+/// `amdgpu.gttsize` as the fixtures set it, in MiB: 96 GiB.
+///
+/// Equal to three quarters of [`UNIFIED_MEMORY_RAM_KB`] on purpose, so the
+/// aperture the host asked for is already the one the CLI would recommend and
+/// the finding is unambiguously about the *page limit*, not about the aperture
+/// being greedy.
+const UNIFIED_MEMORY_GTTSIZE_MIB: u64 = 96 * 1024;
+
+/// 4 KiB pages per MiB, the conversion the whole finding turns on. Restated
+/// here rather than imported: `rocm-core`'s copy is private to the catalog, and
+/// a test that computed its expectation with the same constant the code uses
+/// could not notice that constant being wrong.
+const PAGES_PER_MIB: u64 = 256;
+
+/// The page limit a host must set for [`UNIFIED_MEMORY_GTTSIZE_MIB`] to mean
+/// anything.
+const UNIFIED_MEMORY_CONSISTENT_PAGES: u64 = UNIFIED_MEMORY_GTTSIZE_MIB * PAGES_PER_MIB;
+
+/// The misconfigured page limit: 32 GiB worth of 4 KiB pages, a third of what
+/// the aperture asks for. This is the number that really decides, which is the
+/// whole point of the finding.
+const UNIFIED_MEMORY_CAPPED_PAGES: u64 = 32 * 1024 * PAGES_PER_MIB;
+
+/// A kernel log with nothing about SVM in it, but with an amdgpu line so the
+/// probe's `journalctl` branch is taken rather than falling through to `dmesg`.
+///
+/// The `kvm_amd` lines are not filler: an AMD host really does print them at
+/// boot, they contain the letters `SVM`, and they are about the virtualisation
+/// extension rather than shared virtual memory. A detector that widened its
+/// line filter to match `svm` would report them as a mapping failure.
+const KERNEL_LOG_WITHOUT_SVM_FAILURE: &str = "\
+[    3.100000] kvm_amd: SVM: Virtual VMLOAD VMSAVE supported
+[    3.100001] kvm_amd: SVM: LBR virtualization supported
+[    4.200000] amdgpu: amdgpu_device_init completed";
+
+/// The line the amdkfd driver prints when a host-memory reservation is refused
+/// (`pr_info` in `kfd_svm.c`'s `svm_range_new`), with the `amdgpu: ` prefix
+/// `amdgpu.h`'s `pr_fmt` puts on it.
+const KERNEL_SVM_FAILURE_LINE: &str =
+    "[ 1234.567890] amdgpu: SVM mapping failed, exceeds resident system memory limit";
+
+/// A kernel log carrying that failure, among the same boot noise.
+fn kernel_log_with_svm_failure() -> String {
+    format!("{KERNEL_LOG_WITHOUT_SVM_FAILURE}\n{KERNEL_SVM_FAILURE_LINE}")
+}
+
+/// Plant a Strix-Halo-shaped APU whose kernel command line and kernel log are
+/// the scenario's own.
+///
+/// Built on [`plant_single_gpu_with_memory`], which supplies the KFD node and
+/// the DRM card that make `has_apu` true and pushes the one `PATH` entry this
+/// cluster may push (a second would replace it, not extend it). Everything
+/// added here goes under that same simulated root and that same `PATH`
+/// directory: `/proc/cmdline` and `/proc/meminfo` are re-rooted reads, while
+/// the kernel log is not a file at all -- the probe runs `journalctl`, so the
+/// only way to decide what it says is to put a `journalctl` of our own ahead of
+/// the host's.
+fn plant_unified_memory_apu(world: &mut E2eWorld, cmdline: &str, kernel_log: &str) {
+    plant_single_gpu_with_memory(
+        world,
+        GFX1151_TARGET_VERSION,
+        CARVE_OUT_BYTES,
+        Some(APERTURE_BYTES),
+    );
+
+    let proc_dir = simulated_host_root(world).join("proc");
+    std::fs::create_dir_all(&proc_dir).expect("failed to create the planted /proc");
+    std::fs::write(proc_dir.join("cmdline"), format!("{cmdline}\n"))
+        .expect("failed to plant /proc/cmdline");
+    std::fs::write(
+        proc_dir.join("meminfo"),
+        format!("MemTotal:       {UNIFIED_MEMORY_RAM_KB} kB\nMemFree:          524288 kB\n"),
+    )
+    .expect("failed to plant /proc/meminfo");
+
+    plant_fake_journalctl(world, kernel_log);
+}
+
+/// Put a `journalctl` that prints `kernel_log` ahead of the host's own, in the
+/// `PATH` directory [`plant_single_gpu_with_memory`] already prepended.
+fn plant_fake_journalctl(world: &E2eWorld, kernel_log: &str) {
+    let journalctl = shared_pool_bin_dir(world).join("journalctl");
+    rocm_core::fake_executable::write_fake_executable(
+        &journalctl,
+        format!("#!/bin/sh\ncat <<'ROCM_E2E_EOF'\n{kernel_log}\nROCM_E2E_EOF\n"),
+    )
+    .expect("failed to write the fake journalctl");
+}
+
+/// Put the planted machine's environment back on the World for a *second* run.
+///
+/// `run_rocm_with_scenario_env` takes `command_env` rather than borrowing it, so
+/// a scenario that runs the CLI twice gets the real host on the second run
+/// unless it re-states the fixture. That is not a detail worth discovering from
+/// a mysterious result: without this, the second run of diagnose-91 described
+/// the runner instead of the planted APU.
+fn restate_planted_machine_env(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        simulated_host_root(world).into_os_string(),
+    ));
+    let path = std::env::join_paths(std::iter::once(shared_pool_bin_dir(world)).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+/// The kernel command line for a host that set both parameters, with the page
+/// limit given as `pages`.
+fn unified_memory_cmdline(pages: u64) -> String {
+    format!(
+        "BOOT_IMAGE=/boot/vmlinuz root=UUID=00000000-0000-0000-0000-000000000000 ro \
+         amdgpu.gttsize={UNIFIED_MEMORY_GTTSIZE_MIB} ttm.pages_limit={pages} quiet splash"
+    )
+}
+
+/// The `fix-24-apu-unified-memory` entry of the JSON report, or a panic naming
+/// what was reported instead.
+fn unified_memory_finding(world: &E2eWorld) -> serde_json::Value {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let output = world.cli_output.clone().expect("no diagnose output");
+    let report: serde_json::Value = serde_json::from_str(&output)
+        .unwrap_or_else(|e| panic!("diagnose did not print JSON ({e}):\n{output}"));
+    report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries no matched array:\n{output}"))
+        .iter()
+        .find(|entry| entry["id"] == "fix-24-apu-unified-memory")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "no unified-memory cause was reported; the report listed {:?}:\n{output}",
+                report["matched"]
+                    .as_array()
+                    .map(|rows| rows.iter().map(|r| r["id"].clone()).collect::<Vec<_>>())
+            )
+        })
+}
+
+/// Every evidence line of a finding, joined.
+fn finding_evidence(finding: &serde_json::Value) -> String {
+    finding["evidence"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the finding carries no evidence: {finding:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[given("an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other")]
+async fn apu_with_inconsistent_memory_limits(world: &mut E2eWorld) {
+    plant_unified_memory_apu(
+        world,
+        &unified_memory_cmdline(UNIFIED_MEMORY_CAPPED_PAGES),
+        KERNEL_LOG_WITHOUT_SVM_FAILURE,
+    );
+}
+
+#[given("an integrated-GPU machine whose GTT aperture and TTM page limit agree")]
+async fn apu_with_consistent_memory_limits(world: &mut E2eWorld) {
+    plant_unified_memory_apu(
+        world,
+        &unified_memory_cmdline(UNIFIED_MEMORY_CONSISTENT_PAGES),
+        KERNEL_LOG_WITHOUT_SVM_FAILURE,
+    );
+}
+
+#[given("an integrated-GPU machine whose kernel log reports an SVM mapping failure")]
+async fn apu_whose_kernel_log_reports_an_svm_failure(world: &mut E2eWorld) {
+    // The parameters agree, so the only thing left to carry the finding is the
+    // kernel's own line -- without that, this scenario would pass on the
+    // inconsistency instead and prove nothing about SVM.
+    plant_unified_memory_apu(
+        world,
+        &unified_memory_cmdline(UNIFIED_MEMORY_CONSISTENT_PAGES),
+        &kernel_log_with_svm_failure(),
+    );
+}
+
+#[when("the user asks the CLI to diagnose that machine's memory limits, in machine-readable form")]
+async fn user_diagnoses_unified_memory(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["diagnose", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI names the page limit as the ceiling that really applies")]
+async fn assert_page_limit_named_as_the_real_ceiling(world: &mut E2eWorld) {
+    let finding = unified_memory_finding(world);
+    let evidence = finding_evidence(&finding);
+    let capped_mib = UNIFIED_MEMORY_CAPPED_PAGES / PAGES_PER_MIB;
+    assert!(
+        evidence.contains(&format!("capped at {capped_mib} MiB")),
+        "the aperture the host asked for is {UNIFIED_MEMORY_GTTSIZE_MIB} MiB and the page limit \
+         allows {capped_mib} MiB; the evidence has to name the smaller one, because \"both \
+         parameters are set\" is what the user already believes: {evidence}"
+    );
+    assert!(
+        evidence.contains(&format!("ttm.pages_limit={UNIFIED_MEMORY_CAPPED_PAGES}"))
+            && evidence.contains(&format!("amdgpu.gttsize={UNIFIED_MEMORY_GTTSIZE_MIB}")),
+        "both parameters have to be quoted back as the machine has them: {evidence}"
+    );
+}
+
+#[then("the CLI offers a consistent pair sized to installed RAM, needing sudo and a reboot")]
+async fn assert_sized_pair_is_offered(world: &mut E2eWorld) {
+    let finding = unified_memory_finding(world);
+    let fix = &finding["fix"];
+    let commands = fix["commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the fix carries no commands: {fix:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Three quarters of the planted 128 GiB, and a page limit derived from it,
+    // so the pair the CLI prints cannot itself be inconsistent.
+    assert!(
+        commands.contains(&format!(
+            "amdgpu.gttsize={UNIFIED_MEMORY_GTTSIZE_MIB} ttm.pages_limit={UNIFIED_MEMORY_CONSISTENT_PAGES}"
+        )),
+        "the plan must offer a pair sized to the machine's {} GiB of RAM: {commands}",
+        UNIFIED_MEMORY_RAM_KB / 1024 / 1024
+    );
+    assert_eq!(fix["needs_sudo"], serde_json::Value::Bool(true), "{fix:#}");
+    assert_eq!(
+        fix["needs_reboot"],
+        serde_json::Value::Bool(true),
+        "{fix:#}"
+    );
+    // A reboot is the only thing that makes the change real, so the check has
+    // to read the parameter back off the booted kernel rather than assert that
+    // an editor exited.
+    let verify = fix["verify"].as_str().unwrap_or_default();
+    assert!(
+        verify.contains("/proc/cmdline") && verify.contains("gttsize"),
+        "the verify step has to re-read the parameter after the reboot: {verify}"
+    );
+}
+
+#[then("the BIOS carve-out is given as advice rather than as a command to run")]
+async fn assert_bios_carve_out_is_advice(world: &mut E2eWorld) {
+    let finding = unified_memory_finding(world);
+    let fix = &finding["fix"];
+    let notes = fix["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the fix carries no notes: {fix:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        notes.contains("UMA Frame Buffer Size"),
+        "the carve-out is a firmware setting, so the advice has to name what to look for in the \
+         UEFI setup: {notes}"
+    );
+    let commands = fix["commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the fix carries no commands: {fix:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        !commands
+            .iter()
+            .any(|line| line.to_lowercase().contains("bios")
+                || line.to_lowercase().contains("carve-out")),
+        "nobody can run a firmware setting, so it must not appear among the commands: \
+         {commands:?}"
+    );
+}
+
+#[then("no unified-memory cause is reported for that machine")]
+async fn assert_no_unified_memory_cause(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let output = world.cli_output.clone().expect("no diagnose output");
+    let report: serde_json::Value = serde_json::from_str(&output)
+        .unwrap_or_else(|e| panic!("diagnose did not print JSON ({e}):\n{output}"));
+    let matched = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries no matched array:\n{output}"));
+    assert!(
+        matched
+            .iter()
+            .all(|entry| entry["id"] != "fix-24-apu-unified-memory"),
+        "a machine whose two limits agree, with nothing in its kernel log, is correctly \
+         configured and must not be told otherwise:\n{output}"
+    );
+}
+
+#[then("the CLI reports the kernel's own SVM mapping failure as the cause")]
+async fn assert_svm_failure_is_reported(world: &mut E2eWorld) {
+    let finding = unified_memory_finding(world);
+    let evidence = finding_evidence(&finding);
+    assert!(
+        evidence.contains("SVM mapping failed, exceeds resident system memory limit"),
+        "the kernel line itself is the evidence, so it has to be quoted: {evidence}"
+    );
+    assert!(
+        finding["score"].as_i64().unwrap_or_default() >= 50,
+        "the driver's own refusal is a cause, not a hint: {finding:#}"
+    );
+}
+
+#[when("that machine's kernel log no longer carries the failure, and the CLI is asked again")]
+async fn user_diagnoses_the_same_machine_with_the_failure_gone(world: &mut E2eWorld) {
+    // The same machine, so the two answers are compared on one host rather than
+    // across lanes.
+    plant_fake_journalctl(world, KERNEL_LOG_WITHOUT_SVM_FAILURE);
+    // And a page limit that disagrees, so there is still a finding to read the
+    // log verdict off: with the limits agreeing and the failure gone there is
+    // correctly nothing to report at all.
+    std::fs::write(
+        simulated_host_root(world).join("proc/cmdline"),
+        format!("{}\n", unified_memory_cmdline(UNIFIED_MEMORY_CAPPED_PAGES)),
+    )
+    .expect("failed to rewrite the planted /proc/cmdline");
+    restate_planted_machine_env(world);
+
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["diagnose", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the report says only that the recent log was read, not that the machine never failed")]
+async fn assert_absent_svm_failure_is_qualified(world: &mut E2eWorld) {
+    let finding = unified_memory_finding(world);
+    let evidence = finding_evidence(&finding);
+    assert!(
+        !evidence.contains("SVM mapping failed, exceeds resident"),
+        "the failure was removed from the log, so nothing may still quote it: {evidence}"
+    );
+    let verdict = evidence
+        .lines()
+        .find(|line| line.contains("SVM mapping failure"))
+        .unwrap_or_else(|| panic!("the log verdict is always stated: {evidence}"));
+    assert!(
+        verdict.contains("recent kernel log") && verdict.contains("would not be seen here"),
+        "\"no SVM failures\" and \"none in the window that was read\" are different answers, and \
+         only the second one is true: {verdict}"
     );
 }

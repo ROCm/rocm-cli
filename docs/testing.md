@@ -6840,6 +6840,32 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   integrated-GPU hardware. The planted pool is far larger than the tiny file, so
   only the "fits" polarity is exercised there.
 
+  The other half of ROCMAI-912 is the advice, not the measurement: the
+  `fix-24-apu-unified-memory` catalog entry, which reads `amdgpu.gttsize` and
+  `ttm.pages_limit` off `/proc/cmdline` and the amdkfd SVM failures out of the
+  recent kernel log. `diagnose-89`, `diagnose-90` and `diagnose-91`
+  (`@requires-os:linux`; these are Linux kernel parameters) extend the same
+  planted gfx1151 host with a `/proc/cmdline`, a `/proc/meminfo` reporting
+  128 GiB, and a `journalctl` of their own on the CLI's `PATH` - the kernel log
+  is obtained by running a command, not by reading a file, so the host-root seam
+  cannot supply it. `diagnose-89` plants a `ttm.pages_limit` a third of what
+  `amdgpu.gttsize` asks for and requires the smaller ceiling to be named, a
+  consistent pair sized to installed RAM to be offered, and the BIOS carve-out
+  to stay in the notes rather than appear among the commands. `diagnose-90` is
+  the negative: the same host with a page limit that covers its aperture gets no
+  finding, which is what stops the entry firing on the mere presence of the
+  parameters. `diagnose-91` plants the driver's own
+  `SVM mapping failed, exceeds resident system memory limit` line, requires it
+  to be reported as a cause, then removes it and requires the report to say the
+  recent log was read rather than that the machine never failed. The `kvm_amd`
+  boot lines that also contain "SVM" are in every one of those planted logs, so
+  a detector widened to match the bare word fails
+  `an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not` in
+  [examine/host_env.rs](../crates/rocm-core/src/examine/host_env.rs) and
+  `diagnose-90` here. **No APU runs this entry on real hardware**: no CI lane
+  and no development machine has one whose `gttsize` and `pages_limit` are set,
+  so every check of it is simulated.
+
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question

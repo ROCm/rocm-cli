@@ -1355,3 +1355,55 @@ Feature: Diagnosing failures and listing fixes
     And nothing on the machine is changed
     And this machine's shared memory allowance is what it was
     And the reason the fix gives says WSL2 normally gives half the VM's memory
+
+  # ROCMAI-912. An integrated GPU has no VRAM of its own: what it may allocate
+  # is capped by `amdgpu.gttsize` (MiB), by `ttm.pages_limit` (4 KiB pages) and
+  # by the BIOS carve-out. The two kernel parameters are in different units, so
+  # a page limit below `gttsize x 256` silently caps the aperture however large
+  # `gttsize` reads -- and the user, who can see both parameters set on
+  # /proc/cmdline, has no way to tell. Naming the smaller ceiling is the single
+  # most useful thing this entry does, which is why the fixture sets a gttsize
+  # that is already the figure the CLI would recommend: the finding can only be
+  # about the page limit.
+  #
+  # The machine is planted (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by
+  # `e2e-test-hooks` builds): a gfx1151 KFD node and DRM card for the
+  # integrated GPU, a /proc/cmdline carrying the pair and a /proc/meminfo
+  # reporting 128 GiB, so the advice is sized against a machine the lane does
+  # not have. @requires-os:linux because these are Linux kernel parameters;
+  # the catalog scopes the entry to bare-metal Linux for the same reason.
+  @id:diagnose-apu-page-limit-caps-the-aperture @requires-os:linux
+  Scenario: diagnose-89 - An integrated GPU whose page limit undercuts its aperture is told which one decides
+    Given an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other
+    When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
+    Then the CLI names the page limit as the ceiling that really applies
+    And the CLI offers a consistent pair sized to installed RAM, needing sudo and a reboot
+    And the BIOS carve-out is given as advice rather than as a command to run
+
+  # The other direction, and the reason diagnose-89 means anything: the same
+  # planted machine with a page limit that covers its aperture, and the same
+  # clean kernel log, is correctly configured. An entry that fired on the mere
+  # presence of the parameters would pass diagnose-89 and fail here.
+  @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
+  Scenario: diagnose-90 - An integrated GPU whose two limits agree is not told to change them
+    Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
+    When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
+    Then no unified-memory cause is reported for that machine
+
+  # The kernel's own verdict. When a host-memory reservation is refused, amdkfd
+  # prints "SVM mapping failed, exceeds resident system memory limit" and the
+  # model load stalls with nothing in userspace naming a cause. The kernel log
+  # is read by running `journalctl`, not by reading a file, so the scenario
+  # stands its own `journalctl` on the CLI's PATH.
+  #
+  # The second half is the honesty requirement: the probe reads a bounded
+  # window of the log and keeps a bounded number of matches out of it, so a
+  # failure from an earlier run is not there to find. The report must say the
+  # recent log was read rather than that the machine never failed.
+  @id:diagnose-apu-svm-mapping-failure-is-detected @requires-os:linux
+  Scenario: diagnose-91 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
+    Given an integrated-GPU machine whose kernel log reports an SVM mapping failure
+    When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
+    Then the CLI reports the kernel's own SVM mapping failure as the cause
+    When that machine's kernel log no longer carries the failure, and the CLI is asked again
+    Then the report says only that the recent log was read, not that the machine never failed

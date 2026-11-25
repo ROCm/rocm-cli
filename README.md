@@ -722,6 +722,23 @@ position.
   violation in `MSVCP140.dll` on an older one. `rocm examine --json` shows the
   version it read as `msvc_redist_version`. `rocm fix` only prints the update
   plan, including a `winget install` line; it never runs the install.
+- On Linux, `diagnose` also checks how much system memory an integrated GPU is
+  allowed to use (`fix-24-apu-unified-memory`). An APU has no VRAM of its own,
+  and its share of system memory is capped by three settings: the
+  `amdgpu.gttsize` kernel parameter, the `ttm.pages_limit` kernel parameter
+  (`amdttm.pages_limit` where the out-of-tree `amdgpu-dkms` packages are
+  installed), and the BIOS carve-out. The two kernel parameters are in
+  different units - `gttsize` counts MiB, `pages_limit` counts 4 KiB pages - so
+  a `pages_limit` below `gttsize` x 256 caps the aperture however large
+  `gttsize` reads. `rocm diagnose` names that smaller ceiling specifically and
+  offers both parameters sized to installed RAM; the carve-out is a firmware
+  setting, so it is given as advice rather than as a command to run.
+  `rocm examine --json` shows the values it read as `amdgpu_gttsize_mib`,
+  `ttm_pages_limit` and `system_ram_gib`. The same entry reports the kernel's
+  own `SVM mapping failed, exceeds resident system memory limit` line when it
+  is in the recent kernel log; only a bounded window of that log is read, so
+  its absence is reported as "not in the log that was read", never as "this
+  machine has never failed".
 - `--top` caps how many matches are shown in the human-readable output
   (default 5). `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of

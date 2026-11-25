@@ -33,6 +33,9 @@ mod windows;
 mod wsl;
 
 use framework::probe_framework;
+pub(crate) use host_env::{
+    DMESG_HITS_KEPT, DMESG_LINES_SCANNED, SVM_ALREADY_ALLOCATED, SVM_MAPPING_FAILED,
+};
 use host_env::{
     probe_container, probe_cpu_linux, probe_cpu_windows, probe_dmesg_amdgpu, probe_env, probe_os,
     probe_shared_memory,
@@ -261,6 +264,19 @@ pub struct Examination {
     // hardware
     pub cpu_vendor: String,
     pub cpu_model: String,
+    /// Installed system memory in GiB, from `MemTotal` in `/proc/meminfo`.
+    ///
+    /// Linux only, and `None` where it could not be read. Collected because an
+    /// integrated GPU allocates out of this memory rather than out of VRAM of
+    /// its own, so it is what the unified-memory advice is sized against; it is
+    /// deliberately **not** read on Windows, where the equivalent query starts
+    /// a PowerShell process that nothing in the catalog would read the answer
+    /// of.
+    ///
+    /// `#[serde(default)]` so an examination from an older CLI still
+    /// deserializes.
+    #[serde(default)]
+    pub system_ram_gib: Option<f64>,
     pub gpus: Vec<Gpu>,
     /// Whether an AMD GPU was found. On bare metal the hardware probes own this
     /// field. WSL skips those probes, so [`Examination::probe_with_interpreter`]
@@ -299,6 +315,29 @@ pub struct Examination {
     pub amdkfd_loaded: Option<bool>,
     pub secure_boot: String,
     pub iommu_kernel_param: String,
+    /// `amdgpu.gttsize=<MiB>` from `/proc/cmdline`, in **MiB**, or `None` when
+    /// the parameter is not set.
+    ///
+    /// Lifted out of `kernel_cmdline` into its own field for the same reason
+    /// `iommu_kernel_param` is: the catalog reasons over the value, and a check
+    /// re-parsing the whole command line would be a second parser to keep
+    /// correct. On an APU this is the ceiling on the system memory the GPU may
+    /// be given as GTT, which is the only memory it has.
+    ///
+    /// `#[serde(default)]` so `rocm remote doctor` still accepts an examination
+    /// produced by a CLI that predates the field.
+    #[serde(default)]
+    pub amdgpu_gttsize_mib: Option<u64>,
+    /// `ttm.pages_limit=<pages>` (or `amdttm.pages_limit=`, the spelling the
+    /// out-of-tree `amdgpu-dkms` driver uses) from `/proc/cmdline`, in **4 KiB
+    /// pages**, or `None` when the parameter is not set.
+    ///
+    /// The units differ from [`Examination::amdgpu_gttsize_mib`] and that is
+    /// the whole point of carrying both: TTM hands out the pages the GTT
+    /// aperture is made of, so a limit below `gttsize * 256` caps the aperture
+    /// no matter what `gttsize` says.
+    #[serde(default)]
+    pub ttm_pages_limit: Option<u64>,
     pub kfd: Option<Device>,
     pub render_devices: Vec<Device>,
 
@@ -461,6 +500,7 @@ impl Default for Examination {
             wsl: None,
             cpu_vendor: "unknown".to_owned(),
             cpu_model: String::new(),
+            system_ram_gib: None,
             gpus: Vec::new(),
             has_amd_gpu: false,
             has_nvidia_gpu: false,
@@ -471,6 +511,8 @@ impl Default for Examination {
             amdkfd_loaded: None,
             secure_boot: "unknown".to_owned(),
             iommu_kernel_param: String::new(),
+            amdgpu_gttsize_mib: None,
+            ttm_pages_limit: None,
             kfd: None,
             render_devices: Vec::new(),
             user_name: String::new(),
@@ -770,6 +812,10 @@ mod tests {
             "wsl",
             "cpu_vendor",
             "cpu_model",
+            // CLI addition beyond examine.py, added deliberately: installed
+            // RAM, which is the pool an integrated GPU allocates from and so
+            // what `fix-24-apu-unified-memory`'s advice is sized against.
+            "system_ram_gib",
             "gpus",
             "has_amd_gpu",
             "has_nvidia_gpu",
@@ -780,6 +826,12 @@ mod tests {
             "amdkfd_loaded",
             "secure_boot",
             "iommu_kernel_param",
+            // CLI additions beyond examine.py, added deliberately: the two
+            // amdgpu/TTM kernel parameters that between them cap the memory an
+            // integrated GPU may be given, lifted out of `kernel_cmdline` the
+            // way `iommu_kernel_param` is.
+            "amdgpu_gttsize_mib",
+            "ttm_pages_limit",
             "kfd",
             "render_devices",
             "user_name",

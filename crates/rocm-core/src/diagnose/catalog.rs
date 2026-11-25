@@ -16,7 +16,7 @@ use super::host::{
 use super::linux::{
     check_3_rocm_kernel_unsupported, check_4_render_group, check_5_amdgpu_blacklisted,
     check_7_stale_repos, check_10_container_devices, check_11_iommu_hang,
-    check_12_repo_native_broken,
+    check_12_repo_native_broken, check_24_apu_unified_memory,
 };
 use super::windows::{
     check_13_hip_sdk_missing, check_14_adrenalin_too_old, check_15_msvc_redist,
@@ -178,6 +178,13 @@ const CHECKERS: &[Checker] = &[
     // Linux and WSL2, like the other vLLM entries: the engine runs on both and
     // its startup-failure hint points here on both.
     (Check::Text(check_23_vllm_extension_load), &["linux", "wsl"]),
+    // Linux only: `amdgpu.gttsize` and `ttm.pages_limit` are amdgpu/TTM kernel
+    // module parameters read off `/proc/cmdline`. Windows has no equivalent --
+    // the WDDM shared budget is the driver's own policy and is not set from a
+    // boot command line -- and a WSL distro reaches the GPU through `/dev/dxg`
+    // and the Windows host driver, so its own kernel command line does not
+    // govern the aperture either.
+    (Check::Text(check_24_apu_unified_memory), &["linux"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];

@@ -7,8 +7,9 @@
 //! helpers that pick which package manager's commands to print.
 
 use super::scoring::{
-    KEYWORDS_CONTAINER, KEYWORDS_DPKG_BROKEN, KEYWORDS_IOMMU_HANG, KEYWORDS_KFD_PERMISSION,
-    KEYWORDS_MODULE_NOT_LOADED, KEYWORDS_REPO_BROKEN, amd_gpu_count, finalize, keyword_score, zero,
+    KEYWORDS_APU_UNIFIED_MEMORY, KEYWORDS_CONTAINER, KEYWORDS_DPKG_BROKEN, KEYWORDS_IOMMU_HANG,
+    KEYWORDS_KFD_PERMISSION, KEYWORDS_MODULE_NOT_LOADED, KEYWORDS_REPO_BROKEN, amd_gpu_count,
+    finalize, keyword_score, zero,
 };
 use super::{Diagnosis, Fix};
 use crate::examine::Examination;
@@ -661,6 +662,230 @@ pub(super) fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Dia
         evidence,
         fix,
     )
+}
+
+/// The stable handle for the unified-memory entry, shared with its recipe in
+/// [`crate::fix`].
+pub const APU_UNIFIED_MEMORY_FIX_ID: &str = "fix-24-apu-unified-memory";
+
+/// 4 KiB pages per MiB.
+///
+/// The two kernel parameters this check reads are in different units:
+/// `amdgpu.gttsize` counts MiB and `ttm.pages_limit` counts 4 KiB pages. A
+/// consistent pair therefore satisfies
+/// `pages_limit >= gttsize_mib * TTM_PAGES_PER_MIB`; a smaller `pages_limit`
+/// caps the aperture at `pages_limit / TTM_PAGES_PER_MIB` MiB however large
+/// `gttsize` is, which is the misconfiguration this entry exists to name.
+const TTM_PAGES_PER_MIB: u64 = 256;
+
+/// The share of installed RAM the recommended `amdgpu.gttsize` takes.
+///
+/// Three quarters, and both halves of the reason have to hold.
+///
+/// It has to stay under the kernel's own ceiling on host memory the KFD will
+/// hand out. `amdgpu_amdkfd_gpuvm_init_mem_limits` in
+/// `drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c` sets `max_system_mem_limit`
+/// to `RAM - RAM/64 - 1.5 GiB`, and a reservation refused against that limit is
+/// what prints the `SVM mapping failed` line this check reads. Three quarters is
+/// below `RAM - RAM/64 - 1.5 GiB` whenever RAM is at least 6.4 GiB, so on any
+/// machine with 8 GiB or more the recommendation cannot itself be what trips the
+/// limit. `the_recommended_pair_stays_under_the_kernels_own_memory_limit` holds
+/// that arithmetic.
+///
+/// The quarter it leaves is the operating system's: the page cache the weights
+/// are read through, the host-side copy the loader makes, and everything else
+/// running. A larger share is a defensible choice on a box that does nothing
+/// else, which is why this entry prints the figure instead of applying it.
+const RECOMMENDED_GTT_SHARE_OF_RAM: f64 = 0.75;
+
+/// The pair to recommend on a host with `ram_gib` of installed memory, as
+/// `(gttsize_mib, pages_limit)`.
+///
+/// Consistent by construction: the page limit is derived from the MiB figure
+/// through [`TTM_PAGES_PER_MIB`], so the advice can never reproduce the
+/// inconsistency it is given to fix. `None` when the figure is not a usable
+/// measurement or rounds down to nothing.
+fn recommended_limits(ram_gib: f64) -> Option<(u64, u64)> {
+    if !ram_gib.is_finite() || ram_gib <= 0.0 {
+        return None;
+    }
+    // Whole GiB, rounded down, so the printed command line is one a user can
+    // read back against `free -g`.
+    let gib = (ram_gib * RECOMMENDED_GTT_SHARE_OF_RAM).floor() as u64;
+    let mib = gib.checked_mul(1024)?;
+    let pages = mib.checked_mul(TTM_PAGES_PER_MIB)?;
+    (mib > 0).then_some((mib, pages))
+}
+
+/// The recent kernel log's verdict on SVM mapping, as an evidence line.
+///
+/// Both answers are stated, and neither is "this machine has never failed".
+/// The probe reads the last [`DMESG_LINES_SCANNED`](crate::examine::DMESG_LINES_SCANNED)
+/// lines of the kernel log and keeps at most
+/// [`DMESG_HITS_KEPT`](crate::examine::DMESG_HITS_KEPT) amdgpu matches out of
+/// them, so a failure from an earlier run is simply not in the evidence this
+/// check can see. Saying so is the difference between "it did not happen" and
+/// "it is not in the window that was read".
+fn svm_evidence(e: &Examination) -> (bool, String) {
+    let hit = e.dmesg_amdgpu_tail.iter().find(|line| {
+        let lower = line.to_lowercase();
+        lower.contains(crate::examine::SVM_MAPPING_FAILED)
+            || lower.contains(crate::examine::SVM_ALREADY_ALLOCATED)
+    });
+    match hit {
+        Some(line) => (
+            true,
+            format!("the kernel log reports an SVM mapping failure: {line}"),
+        ),
+        None => (
+            false,
+            format!(
+                "no SVM mapping failure in the recent kernel log (the last {} lines, of which at \
+                 most {} amdgpu matches are kept), so an older one would not be seen here",
+                crate::examine::DMESG_LINES_SCANNED,
+                crate::examine::DMESG_HITS_KEPT,
+            ),
+        ),
+    }
+}
+
+pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Diagnosis {
+    const TITLE: &str = "Unified memory GTT/TTM limits on an integrated GPU";
+
+    let gttsize = e.amdgpu_gttsize_mib;
+    let pages_limit = e.ttm_pages_limit;
+    // Nothing to say about a machine with no integrated GPU that has set
+    // neither parameter and whose recent kernel log is clean: every piece of
+    // evidence this entry reasons over is absent.
+    if !e.has_apu && gttsize.is_none() && pages_limit.is_none() && e.dmesg_amdgpu_tail.is_empty() {
+        return zero(APU_UNIFIED_MEMORY_FIX_ID, TITLE);
+    }
+
+    let mut score = 0;
+    let mut evidence = Vec::new();
+
+    let (svm_failed, svm_line) = svm_evidence(e);
+    if svm_failed {
+        score += 50;
+    }
+    evidence.push(svm_line);
+
+    match (gttsize, pages_limit) {
+        (Some(mib), Some(pages)) => {
+            let needed = mib.saturating_mul(TTM_PAGES_PER_MIB);
+            if pages < needed {
+                score += 50;
+                evidence.push(format!(
+                    "amdgpu.gttsize={mib} (MiB) asks for {needed} pages of 4 KiB, but \
+                     ttm.pages_limit={pages} allows only {} MiB: the page limit is the one that \
+                     decides, so the aperture is capped at {} MiB whatever gttsize says",
+                    pages / TTM_PAGES_PER_MIB,
+                    pages / TTM_PAGES_PER_MIB,
+                ));
+            } else {
+                evidence.push(format!(
+                    "amdgpu.gttsize={mib} (MiB) and ttm.pages_limit={pages} agree: the page limit \
+                     covers the aperture"
+                ));
+            }
+        }
+        (Some(mib), None) => {
+            score += 25;
+            evidence.push(format!(
+                "amdgpu.gttsize={mib} (MiB) is set but ttm.pages_limit is not, so TTM's default \
+                 of about half of installed RAM decides instead"
+            ));
+        }
+        (None, Some(pages)) => {
+            score += 25;
+            evidence.push(format!(
+                "ttm.pages_limit={pages} is set but amdgpu.gttsize is not, so the aperture is \
+                 whatever amdgpu defaults to and the page limit allows at most {} MiB",
+                pages / TTM_PAGES_PER_MIB,
+            ));
+        }
+        (None, None) if e.has_apu => {
+            score += 15;
+            evidence.push(
+                "this machine has an integrated GPU and sets neither amdgpu.gttsize nor \
+                 ttm.pages_limit, so the memory it may be given is whatever the driver defaults \
+                 and the BIOS carve-out leave it"
+                    .to_owned(),
+            );
+        }
+        (None, None) => {}
+    }
+
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_APU_UNIFIED_MEMORY);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    if score <= 0 {
+        return zero(APU_UNIFIED_MEMORY_FIX_ID, TITLE);
+    }
+
+    let recommended = e.system_ram_gib.and_then(recommended_limits);
+    let mut commands = vec![
+        "# Inspect the current cmdline:".to_owned(),
+        "cat /proc/cmdline".to_owned(),
+        "# Edit /etc/default/grub and put BOTH parameters on".to_owned(),
+        "# GRUB_CMDLINE_LINUX_DEFAULT; ttm.pages_limit counts 4 KiB pages, so it".to_owned(),
+        format!("# must be at least {TTM_PAGES_PER_MIB} x the MiB figure in amdgpu.gttsize:"),
+    ];
+    let summary = if let Some((mib, pages)) = recommended {
+        commands.push(format!(
+            "#   amdgpu.gttsize={mib} ttm.pages_limit={pages}   # {} GiB",
+            mib / 1024
+        ));
+        format!(
+            "Give the integrated GPU a {} GiB aperture by setting amdgpu.gttsize={mib} together \
+             with ttm.pages_limit={pages}, and raise the BIOS carve-out as the notes say. This \
+             means editing GRUB and rebooting.",
+            mib / 1024
+        )
+    } else {
+        commands.push("#   amdgpu.gttsize=<MiB> ttm.pages_limit=<MiB x 256>".to_owned());
+        commands
+            .push("# Installed RAM could not be read here, so size the pair yourself:".to_owned());
+        commands.push("free -g".to_owned());
+        "Set amdgpu.gttsize and ttm.pages_limit as a consistent pair sized to installed RAM, and \
+         raise the BIOS carve-out as the notes say. This means editing GRUB and rebooting."
+            .to_owned()
+    };
+    commands.extend([
+        "sudo $EDITOR /etc/default/grub".to_owned(),
+        "sudo update-grub                # Debian/Ubuntu".to_owned(),
+        "sudo grub2-mkconfig -o /boot/grub2/grub.cfg   # Fedora/RHEL".to_owned(),
+        "# Reboot for the change to take effect, then retry the model load.".to_owned(),
+    ]);
+
+    let fix = Fix {
+        summary,
+        commands,
+        needs_sudo: true,
+        needs_reboot: true,
+        fix_id: APU_UNIFIED_MEMORY_FIX_ID.to_owned(),
+        // Reads the parameters back off the live command line rather than
+        // reporting that the editor exited: the only thing that proves the
+        // change took is the kernel having been booted with it.
+        verify:
+            "grep -o 'amdgpu\\.gttsize=[0-9]*\\|\\(amd\\)\\?ttm\\.pages_limit=[0-9]*' /proc/cmdline"
+                .to_owned(),
+        notes: vec![
+            "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for \
+             UMA Frame Buffer Size, Dedicated Graphics Memory or GART size, and give it the \
+             largest value the board offers that still leaves the operating system enough RAM. \
+             The carve-out is what the GPU reports as its own VRAM; the GTT aperture above is \
+             memory on top of it."
+                .to_owned(),
+            "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms \
+             packages are installed, because they ship their own copy of TTM. Set the name your \
+             own driver uses; setting the other one has no effect."
+                .to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(APU_UNIFIED_MEMORY_FIX_ID, TITLE, score, evidence, fix)
 }
 
 #[cfg(test)]
@@ -1835,5 +2060,251 @@ mod tests {
             .expect("unsupported kernel triple should be diagnosed");
         assert!(!fix.commands.join("\n").contains("rocm install sdk"));
         assert!(!fix.verify.contains("| head"), "{}", fix.verify);
+    }
+
+    // ── fix-24: unified memory GTT/TTM limits ──────────────────────
+
+    /// A Strix Halo-class APU with 128 GiB of RAM and nothing set.
+    fn apu_host() -> Examination {
+        let mut e = linux_base();
+        e.has_apu = true;
+        e.system_ram_gib = Some(128.0);
+        e.gpus = vec![Gpu {
+            gfx_target: "gfx1151".to_owned(),
+            is_amd: true,
+            is_apu: Some(true),
+            ..Gpu::default()
+        }];
+        e
+    }
+
+    /// The headline finding: the pair is set, and the page limit is the one
+    /// that decides.
+    ///
+    /// Asserted against the arithmetic rather than against a repeated literal:
+    /// 98304 MiB needs 25165824 pages, and 8388608 pages is only 32768 MiB.
+    /// The evidence has to name that capped figure, because "the parameters
+    /// are set" is exactly what the user already believes.
+    #[test]
+    fn an_inconsistent_gttsize_and_pages_limit_pair_is_named_as_the_cap() {
+        let mut e = apu_host();
+        e.amdgpu_gttsize_mib = Some(98_304);
+        e.ttm_pages_limit = Some(8_388_608);
+        let finding = check_24_apu_unified_memory(&e, "");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "an inconsistent pair must match on host state alone: {finding:?}"
+        );
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("capped at 32768 MiB"),
+            "the evidence must name the ceiling the page limit really imposes: {evidence}"
+        );
+        assert!(
+            evidence.contains("ttm.pages_limit=8388608")
+                && evidence.contains("amdgpu.gttsize=98304"),
+            "both parameters must be quoted as set: {evidence}"
+        );
+
+        // The same host with a pair that agrees is not told anything is wrong.
+        let mut consistent = apu_host();
+        consistent.amdgpu_gttsize_mib = Some(98_304);
+        consistent.ttm_pages_limit = Some(98_304 * TTM_PAGES_PER_MIB);
+        let ok = check_24_apu_unified_memory(&consistent, "");
+        assert_eq!(
+            ok.score, 0,
+            "a consistent pair with a clean log is not a finding: {ok:?}"
+        );
+    }
+
+    /// The recommendation is sized from installed RAM, and the two numbers it
+    /// prints are consistent with each other by construction.
+    #[test]
+    fn the_recommended_pair_is_sized_to_installed_ram_and_is_self_consistent() {
+        let mut e = apu_host();
+        e.amdgpu_gttsize_mib = Some(98_304);
+        e.ttm_pages_limit = Some(8_388_608);
+        let fix = check_24_apu_unified_memory(&e, "")
+            .fix
+            .expect("a matched finding carries a fix");
+        // Three quarters of 128 GiB is 96 GiB = 98304 MiB = 25165824 pages.
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("amdgpu.gttsize=98304 ttm.pages_limit=25165824")),
+            "the plan must print the sized pair: {:?}",
+            fix.commands
+        );
+        assert!(fix.needs_sudo && fix.needs_reboot, "{fix:?}");
+        // The carve-out is firmware, so it is advice and not a command line.
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("UMA Frame Buffer Size")),
+            "the BIOS carve-out belongs in the notes: {:?}",
+            fix.notes
+        );
+        assert!(
+            !fix.commands
+                .iter()
+                .any(|c| c.to_lowercase().contains("bios")),
+            "nothing about the carve-out may look like a command to run: {:?}",
+            fix.commands
+        );
+        // The verify step has to read the parameter back off the booted
+        // kernel, not report that an editor exited.
+        assert!(
+            fix.verify.contains("/proc/cmdline") && fix.verify.contains("gttsize"),
+            "verify must re-read the parameter: {}",
+            fix.verify
+        );
+
+        // A host whose RAM could not be read is told to size the pair itself
+        // rather than given a figure derived from nothing.
+        let mut unknown_ram = e;
+        unknown_ram.system_ram_gib = None;
+        let fix = check_24_apu_unified_memory(&unknown_ram, "")
+            .fix
+            .expect("a matched finding carries a fix");
+        assert!(
+            fix.commands.iter().any(|c| c.trim() == "free -g"),
+            "with no RAM figure the plan must show how to read it: {:?}",
+            fix.commands
+        );
+        assert!(
+            !fix.commands.iter().any(|c| c.contains("gttsize=98304")),
+            "no figure may be invented when RAM is unknown: {:?}",
+            fix.commands
+        );
+    }
+
+    /// The recommendation must never be the thing that trips the kernel limit
+    /// whose refusal prints `SVM mapping failed`.
+    ///
+    /// `amdgpu_amdkfd_gpuvm_init_mem_limits` caps host memory the KFD hands out
+    /// at `RAM - RAM/64 - 1.5 GiB`; this is the arithmetic that
+    /// [`RECOMMENDED_GTT_SHARE_OF_RAM`]'s doc comment claims, run over the RAM
+    /// sizes an APU actually ships with.
+    #[test]
+    fn the_recommended_pair_stays_under_the_kernels_own_memory_limit() {
+        for ram_gib in [8.0, 16.0, 32.0, 64.0, 96.0, 128.0, 256.0] {
+            let (mib, pages) = recommended_limits(ram_gib).expect("a usable RAM figure");
+            let kernel_limit_gib = ram_gib - ram_gib / 64.0 - 1.5;
+            assert!(
+                (mib / 1024) as f64 <= kernel_limit_gib,
+                "{ram_gib} GiB: recommending {} GiB exceeds the kernel's own \
+                 {kernel_limit_gib} GiB limit",
+                mib / 1024
+            );
+            assert_eq!(
+                pages,
+                mib * TTM_PAGES_PER_MIB,
+                "{ram_gib} GiB: the recommended pair must be consistent with itself"
+            );
+        }
+        // Figures that are not a measurement yield no recommendation at all.
+        for bad in [0.0, -1.0, f64::NAN, 0.5] {
+            assert_eq!(recommended_limits(bad), None, "{bad}");
+        }
+    }
+
+    /// The SVM failure reaches the report, and its absence is reported as
+    /// "not in the window that was read" rather than as "it never happened".
+    #[test]
+    fn an_svm_mapping_failure_is_reported_and_its_absence_is_qualified() {
+        let mut e = apu_host();
+        e.dmesg_amdgpu_tail = vec![
+            "[ 1234.567890] amdgpu: SVM mapping failed, exceeds resident system memory limit"
+                .to_owned(),
+        ];
+        let finding = check_24_apu_unified_memory(&e, "");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the kernel's own SVM failure is enough on its own: {finding:?}"
+        );
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|line| line.contains("SVM mapping failed, exceeds resident system memory")),
+            "the matched kernel line must be quoted: {:?}",
+            finding.evidence
+        );
+
+        // Without it, the finding says where it looked and does not claim the
+        // machine never failed.
+        let mut clean = apu_host();
+        clean.amdgpu_gttsize_mib = Some(98_304);
+        clean.ttm_pages_limit = Some(8_388_608);
+        let qualified = check_24_apu_unified_memory(&clean, "");
+        let window = qualified
+            .evidence
+            .iter()
+            .find(|line| line.contains("SVM mapping failure"))
+            .expect("the log verdict is always stated");
+        assert!(
+            window.contains("recent kernel log")
+                && window.contains(&crate::examine::DMESG_LINES_SCANNED.to_string())
+                && window.contains("would not be seen here"),
+            "the absence has to be bounded by the window that was read: {window}"
+        );
+    }
+
+    /// A host with no integrated GPU, neither parameter set and a clean log is
+    /// not given unified-memory advice at all, and this entry never fires off
+    /// bare-metal Linux.
+    #[test]
+    fn an_ordinary_discrete_linux_host_is_told_nothing_about_unified_memory() {
+        let mut e = linux_base();
+        e.has_discrete_amd = true;
+        e.system_ram_gib = Some(64.0);
+        assert_eq!(check_24_apu_unified_memory(&e, "").score, 0);
+
+        let report = diagnose(&e, "");
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
+            "{:?}",
+            report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+
+        // The same facts on WSL2 reach no unified-memory entry either: the
+        // distro's own kernel command line does not govern a /dev/dxg GPU.
+        let mut wsl = crate::diagnose::test_support::wsl_base();
+        wsl.has_apu = true;
+        wsl.amdgpu_gttsize_mib = Some(98_304);
+        wsl.ttm_pages_limit = Some(8_388_608);
+        let report = diagnose(&wsl, "");
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
+            "{:?}",
+            report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// An APU that has set neither parameter is advised, but only advised: the
+    /// entry stays below the match threshold on that alone, because a default
+    /// aperture is a tuning opportunity, not a fault.
+    #[test]
+    fn an_untuned_apu_is_advised_without_being_told_it_is_broken() {
+        let finding = check_24_apu_unified_memory(&apu_host(), "");
+        assert!(
+            finding.score > 0 && finding.score < MIN_SCORE_FOR_MATCH,
+            "an untuned APU is advice, not a diagnosis: {finding:?}"
+        );
+        // The user's own paste of the kernel line is what turns it into one.
+        let matched = check_24_apu_unified_memory(
+            &apu_host(),
+            "amdgpu: SVM mapping failed, exceeds resident system memory limit",
+        );
+        assert!(
+            matched.score >= MIN_SCORE_FOR_MATCH,
+            "the pasted kernel line must carry it over the threshold: {matched:?}"
+        );
     }
 }

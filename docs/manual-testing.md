@@ -2897,3 +2897,66 @@ ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
 
 Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
 gone, and `real-cache/keep` is still there.
+
+## 22. An APU's Unified Memory Limits (Linux)
+
+Needs a machine whose only AMD GPU is integrated — a Strix Halo, Strix Point,
+Phoenix or Rembrandt part. Nothing in CI has one, and the e2e scenarios
+(`diagnose-90` to `diagnose-92`) plant a simulated one, so this is the only
+check of `fix-24-apu-unified-memory` against real firmware and a real driver.
+
+First, read what the machine has:
+
+```bash
+cat /proc/cmdline
+rocm examine --json | grep -E 'gttsize|pages_limit|system_ram_gib'
+rocm diagnose --top 20
+```
+
+Expected result: `amdgpu_gttsize_mib`, `ttm_pages_limit` and `system_ram_gib`
+report what `/proc/cmdline` and `free -g` say — `null` for a parameter the
+command line does not carry. On a machine with neither parameter set,
+`rocm diagnose` lists `fix-24-apu-unified-memory` with a WEAK score: an
+untuned aperture is a tuning opportunity, not a fault, so it must not be
+reported as an established cause.
+
+Then make the pair disagree. Add both parameters to
+`GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, with the page limit
+deliberately too small for the aperture (`256` pages per MiB), run
+`sudo update-grub` and reboot:
+
+```text
+amdgpu.gttsize=32768 ttm.pages_limit=2097152
+```
+
+Expected result: `rocm diagnose` reports `fix-24-apu-unified-memory` as a
+match, and its evidence names `capped at 8192 MiB` — the ceiling the page limit
+really imposes, not the 32768 MiB the aperture asks for. The plan offers a pair
+sized to this machine's installed RAM (three quarters of it, rounded down to a
+whole GiB, with the page limit 256× the MiB figure), says it needs sudo and a
+reboot, and leaves the BIOS carve-out in the notes rather than among the
+commands. `rocm fix fix-24-apu-unified-memory` prints the plan and changes
+nothing.
+
+Finally, apply the pair the plan offered, reboot, and run the verify line it
+printed:
+
+```bash
+grep -o 'amdgpu\.gttsize=[0-9]*\|\(amd\)\?ttm\.pages_limit=[0-9]*' /proc/cmdline
+```
+
+Expected result: it prints both parameters with the values the plan offered,
+and `rocm diagnose` no longer reports the entry as a match. Then load a model
+larger than the old ceiling but inside the new one (`rocm serve <model>`) and
+check the kernel log:
+
+```bash
+journalctl -k --no-pager -n 400 | grep -i 'svm mapping failed'
+```
+
+Expected result: nothing. Before the change, loading that model prints
+`amdgpu: SVM mapping failed, exceeds resident system memory limit` and
+`rocm diagnose` quotes that line back as the cause. On a machine where the line
+is in an older boot's log rather than this one's, the report must say the
+*recent* kernel log was read — it must never say the machine has had no such
+failure.

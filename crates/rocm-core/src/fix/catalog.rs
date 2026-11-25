@@ -1004,6 +1004,47 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
     },
+    // Print-only: the change is a kernel command line and a firmware setting,
+    // and neither is something the CLI edits for the user.
+    //
+    // The generic plan below is what `rocm fix` prints when asked for this id
+    // directly, with no host to size it against. `check_24_apu_unified_memory`
+    // in diagnose/linux.rs builds its own copy with the figures filled in from
+    // the examined machine's installed RAM, the way fix-7 and fix-12 build
+    // theirs per package-manager family, so the two are deliberately not
+    // byte-identical and this id is not in
+    // `diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`.
+    FixRecipe {
+        fix_id: crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID,
+        title: "Size the GTT aperture and the TTM page limit to installed RAM",
+        rationale: "An integrated GPU has no VRAM of its own: it allocates from system memory through a GTT aperture whose ceiling is set by amdgpu.gttsize, by ttm.pages_limit and by the BIOS carve-out. The two kernel parameters are in different units -- gttsize counts MiB, pages_limit counts 4 KiB pages -- so a pages_limit below gttsize x 256 silently caps the aperture however large gttsize is, and a model that should fit fails to load.",
+        commands: &[
+            "cat /proc/cmdline",
+            "free -g                                # installed RAM, to size the pair against",
+            "# Edit /etc/default/grub and put BOTH parameters on GRUB_CMDLINE_LINUX_DEFAULT,",
+            "# sized to about three quarters of installed RAM and consistent with each other:",
+            "#   amdgpu.gttsize=<MiB> ttm.pages_limit=<MiB x 256>",
+            "sudo $EDITOR /etc/default/grub",
+            "sudo update-grub                       # Debian/Ubuntu",
+            "sudo grub2-mkconfig -o /boot/grub2/grub.cfg   # Fedora/RHEL",
+            "# Reboot, then retry the model load.",
+        ],
+        needs_sudo: true,
+        needs_reboot: true,
+        needs_relogin: false,
+        // Reads the parameters back off the live command line: only a kernel
+        // booted with them proves the edit took.
+        verify: r"grep -o 'amdgpu\.gttsize=[0-9]*\|\(amd\)\?ttm\.pages_limit=[0-9]*' /proc/cmdline",
+        verify_linux: None,
+        notes: &[
+            "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for UMA Frame Buffer Size, Dedicated Graphics Memory or GART size, and give it the largest value the board offers that still leaves the operating system enough RAM. The carve-out is what the GPU reports as its own VRAM; the GTT aperture above is memory on top of it.",
+            "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms packages are installed, because they ship their own copy of TTM. Set the name your own driver uses; setting the other one has no effect.",
+        ],
+        doc_url: None,
+        // Matches `check_24_apu_unified_memory`'s `["linux"]`.
+        applies_on: PRINT_ON_LINUX,
+        runner: None,
+    },
 ];
 
 /// Assert that a recipe whose steps span more than one shell says which shell
@@ -1660,12 +1701,13 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 23 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 24 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
         // fix-21-msvc-redist-outdated, fix-22-display-driver-old,
-        // fix-23-vllm-extension-load and the informational
-        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
-        assert_eq!(count, 30, "expected 30 catalog entries");
+        // fix-23-vllm-extension-load, fix-24-apu-unified-memory and the
+        // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL
+        // ones.
+        assert_eq!(count, 31, "expected 31 catalog entries");
     }
 
     #[test]
@@ -2477,6 +2519,7 @@ mod tests {
             "fix-12-installer",
             "fix-14-adrenalin-too-old",
             "fix-22-display-driver-old",
+            crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID,
         ]
         .into_iter()
         .collect();
