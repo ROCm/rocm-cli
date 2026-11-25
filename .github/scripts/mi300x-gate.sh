@@ -3,12 +3,14 @@
 #
 # SPDX-License-Identifier: MIT
 
-# Decide whether a pull request's MI300X requirement is met.
+# Decide whether a pull request's gfx942 requirement is met.
 #
-# A pull request has two MI300X lanes: `e2e-gpu-queue` (the shared GPU queue, the
-# primary) and `e2e-gpu` (a self-hosted runner, a bonus). Either one satisfies the
-# requirement, so a self-hosted lane that never got a runner must not turn the
-# pull request red when the queue lane passed.
+# A pull request has two gfx942 lanes: `e2e-gpu-queue` (an MI325X of the shared
+# GPU queue, the primary) and `e2e-gpu` (a self-hosted MI300X runner, a bonus).
+# The script keeps its name and the `MI300X_REQUIRED` variable from when the queue
+# lane was an MI300X too. Either lane satisfies the requirement, so a
+# self-hosted lane that never got a runner must not turn the pull request red
+# when the queue lane passed.
 #
 # Each lane is put in one class from its job result, its `skipped` output and
 # whether its report artifact was uploaded:
@@ -126,7 +128,7 @@ else
     reason="the self-hosted lane's result is unknown (the settle job ${SETTLE_RESULT})"
   elif [[ "${selfhosted_result}" = abandoned ]]; then
     # No queue lane to fall back on: a lane that never got a runner is the only
-    # MI300X signal missing, and it failed the check before this job gave up on it.
+    # gfx942 signal missing, and it failed the check before this job gave up on it.
     verdict=1
     reason="the self-hosted lane never got a runner and no queue lane covers it"
   elif ran_without_report "${QUEUE_RESULT-}" "${QUEUE_SKIPPED-}" "${QUEUE_ARTIFACT}" ||
@@ -153,9 +155,9 @@ mark=":white_check_mark:"
 [[ "${required}" = true ]] || mark=":information_source:"
 [[ "${verdict}" = 0 ]] || mark=":x:"
 {
-  echo "### MI300X: ${mark} ${reason}"
-  echo "- queue lane (\`e2e-gpu-queue\`): ${queue_label} (result: ${QUEUE_RESULT:-absent})"
-  echo "- self-hosted lane (\`e2e-gpu\`): ${selfhosted_label} (result: ${selfhosted_result:-absent})"
+  echo "### gfx942: ${mark} ${reason}"
+  echo "- queue lane, MI325X (\`e2e-gpu-queue\`): ${queue_label} (result: ${QUEUE_RESULT:-absent})"
+  echo "- self-hosted lane, MI300X (\`e2e-gpu\`): ${selfhosted_label} (result: ${selfhosted_result:-absent})"
   if [[ "${queue}" = absent && "${required}" = true ]]; then
     echo "- The queue lane did not run for this push (switched off, or refused for the nightly window), and a skipped lane is never a pass: re-run once it can, or when the self-hosted lane has a runner."
   fi
@@ -165,8 +167,8 @@ mark=":white_check_mark:"
     echo "- A self-hosted lane that was cancelled, skipped or never got a runner counts as absent, not failed."
   fi
 } >>"${summary_file}"
-echo "MI300X queue lane: ${queue_label}; self-hosted lane: ${selfhosted_label}; ${reason}"
+echo "gfx942 queue lane: ${queue_label}; self-hosted lane: ${selfhosted_label}; ${reason}"
 if [[ "${verdict}" != 0 ]]; then
-  echo "::error::MI300X requirement not met: ${reason} (queue: ${queue_label}, self-hosted: ${selfhosted_label})"
+  echo "::error::gfx942 requirement not met: ${reason} (queue: ${queue_label}, self-hosted: ${selfhosted_label})"
 fi
 exit "${verdict}"

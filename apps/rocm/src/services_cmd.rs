@@ -38,13 +38,14 @@ use crate::service_hints::{
     self, sandbox_tool_arg_from_service_tool, service_action_command, service_action_past_tense,
     service_action_verb,
 };
+use crate::service_log_follow::follow_service_logs;
 use crate::service_records::{
     prune_managed_service_records, remove_managed_service_record_with, service_prune_min_age_hours,
 };
 use crate::services_text::{
-    follow_service_logs, render_service_action_result,
-    render_service_action_result_with_helper_note, render_service_logs_text, render_services_json,
-    render_services_text, service_stop_unconfirmed, validate_service_id,
+    render_service_action_result, render_service_action_result_with_helper_note,
+    render_service_logs_text, render_services_json, render_services_text, service_stop_unconfirmed,
+    validate_service_id,
 };
 
 pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {

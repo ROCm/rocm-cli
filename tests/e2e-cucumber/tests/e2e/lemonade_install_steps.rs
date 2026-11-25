@@ -270,7 +270,7 @@ fn pinned_lemonade_version(world: &mut E2eWorld) -> String {
 
 /// What the planted tree holds, file by file, so the Then can show it was left
 /// exactly as it was.
-fn tree_files(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+pub(crate) fn tree_files(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -663,7 +663,7 @@ async fn lemonade_reinstall_failed_alignment(world: &mut E2eWorld) {
         runtime_dir.display(),
         e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
     );
-    let pin = pinned_rocm_version(&runtime_dir);
+    let pin = pinned_rocm_version(&runtime_dir).unwrap_or_else(|error| panic!("{error}"));
     assert_ne!(
         pin, UNPUBLISHED_ROCM_VERSION,
         "the failed alignment left its target pinned instead of reverting it"
@@ -679,68 +679,103 @@ async fn lemonade_reinstall_failed_alignment(world: &mut E2eWorld) {
 /// stops matching the engine constant, so keep it on one line as written.
 const ALIGNMENT_FAILURE_RECORD: &str = ".rocm-cli-alignment-failed.json";
 
-/// The runtime tree an `engines install` reports as its `env_path:`.
-fn install_env_path(stdout: &str) -> PathBuf {
+/// The runtime tree an `engines install` reports as its `env_path:`, if it does.
+fn find_env_path(stdout: &str) -> Option<PathBuf> {
     stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("env_path: "))
-        .map_or_else(
-            || panic!("no env_path in install output:\n{stdout}"),
-            PathBuf::from,
-        )
+        .map(PathBuf::from)
+}
+
+/// [`find_env_path`] for a step that cannot go on without it.
+fn install_env_path(stdout: &str) -> PathBuf {
+    find_env_path(stdout).unwrap_or_else(|| panic!("no env_path in install output:\n{stdout}"))
 }
 
 /// `therock.version` in the runtime tree's `resources/backend_versions.json`.
-fn pinned_rocm_version(runtime_dir: &std::path::Path) -> String {
+fn pinned_rocm_version(runtime_dir: &std::path::Path) -> Result<String, String> {
     let pin_file = runtime_dir.join("resources/backend_versions.json");
-    let pins: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&pin_file)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", pin_file.display())),
-    )
-    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", pin_file.display()));
+    let bytes = std::fs::read(&pin_file)
+        .map_err(|error| format!("failed to read {}: {error}", pin_file.display()))?;
+    let pins: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse {}: {error}", pin_file.display()))?;
     pins["therock"]["version"]
         .as_str()
-        .unwrap_or_else(|| panic!("no therock.version in {}:\n{pins}", pin_file.display()))
-        .to_owned()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no therock.version in {}:\n{pins}", pin_file.display()))
+}
+
+#[then("the install reuses Lemonade's pinned backend without trying the alignment again")]
+async fn assert_pinned_backend_reused(world: &mut E2eWorld) {
+    let Err(failure) = check_pinned_backend_reused(world) else {
+        return;
+    };
+    // Why the backend was not reused is not in the install output (ROCMAI-1318),
+    // so the failure carries what Lemonade and the runtime tree say about it.
+    let evidence = match world.lemonade_runtime_dir.clone() {
+        Some(runtime_dir) => {
+            let evidence = e2e_cucumber::lemonade_runtime_evidence::collect(&runtime_dir).await;
+            let archived = e2e_cucumber::lemonade_runtime_evidence::archive(
+                &evidence,
+                &crate::results_path(),
+                world.current_scenario.as_deref().unwrap_or("scenario"),
+            );
+            format!("{evidence}\n{archived}")
+        }
+        None => "<no Lemonade runtime evidence: the install output names no env_path>".to_owned(),
+    };
+    panic!("{failure}\n\n{evidence}");
 }
 
 /// No alignment tier ran and nothing was force-reinstalled: the install reused
 /// the backend already in place, the pin is exactly the one the failed alignment
 /// reverted to, and the record that skipped the alignment is still there.
-#[then("the install reuses Lemonade's pinned backend without trying the alignment again")]
-async fn assert_pinned_backend_reused(world: &mut E2eWorld) {
+/// `Err` carries what did not hold.
+fn check_pinned_backend_reused(world: &mut E2eWorld) -> Result<(), String> {
     let output = combined_output(world);
-    assert_eq!(world.cli_rc, Some(0), "the install failed:\n{output}");
+    // Before anything can fail, so the evidence can still be taken.
+    world.lemonade_runtime_dir = find_env_path(stdout(world));
+    if world.cli_rc != Some(0) {
+        return Err(format!("the install failed:\n{output}"));
+    }
     for attempt in [
         ALIGNMENT_FAILED_LINE,
         "could not install its pinned llama.cpp build",
         "Aligned Lemonade's ROCm backend",
         "Installing Lemonade llamacpp:",
     ] {
-        assert!(
-            !output.contains(attempt),
-            "the install tried the alignment or reinstalled the backend again \
-             (`{attempt}`):\n{output}"
-        );
+        if output.contains(attempt) {
+            return Err(format!(
+                "the install tried the alignment or reinstalled the backend again \
+                 (`{attempt}`):\n{output}"
+            ));
+        }
     }
-    assert!(
-        output.contains("Using installed Lemonade llamacpp:rocm backend."),
-        "the install did not reuse the installed ROCm backend:\n{output}"
-    );
-    let runtime_dir = install_env_path(stdout(world));
+    if !output.contains("Using installed Lemonade llamacpp:rocm backend.") {
+        return Err(format!(
+            "the install did not reuse the installed ROCm backend:\n{output}"
+        ));
+    }
+    let Some(runtime_dir) = world.lemonade_runtime_dir.clone() else {
+        return Err(format!("no env_path in install output:\n{output}"));
+    };
     let expected_pin = world
         .lemonade_pin_after_failed_alignment
         .as_deref()
         .expect("no pin captured after the failed alignment - did the Given run?");
-    assert_eq!(
-        pinned_rocm_version(&runtime_dir),
-        expected_pin,
-        "the install changed the pin the failed alignment had reverted to:\n{output}"
-    );
-    assert!(
-        runtime_dir.join(ALIGNMENT_FAILURE_RECORD).is_file(),
-        "the record that skipped the alignment is gone:\n{output}"
-    );
+    let pin = pinned_rocm_version(&runtime_dir)?;
+    if pin != expected_pin {
+        return Err(format!(
+            "the install changed the pin the failed alignment had reverted to \
+             (`{expected_pin}` -> `{pin}`):\n{output}"
+        ));
+    }
+    if !runtime_dir.join(ALIGNMENT_FAILURE_RECORD).is_file() {
+        return Err(format!(
+            "the record that skipped the alignment is gone:\n{output}"
+        ));
+    }
+    Ok(())
 }
 
 /// Pins the advice only; this scenario does not run the `--reinstall` it names.

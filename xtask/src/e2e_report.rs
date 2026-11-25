@@ -300,8 +300,8 @@ mod tests {
             // its own breadth-over-versions tradeoff -- so strip the `-n-1`/
             // `-n-2` legs before comparing; the `current` leg's name is
             // unaffected by the matrix and must still match nightly's.
-            // `-selfhosted` is the same MI300X silicon on a self-hosted runner,
-            // beside the queue's `e2e-gpu-report` on a pull request; nightly
+            // `-selfhosted` is the self-hosted MI300X lane, beside the queue's
+            // `e2e-gpu-report` (an MI325X) on a pull request; nightly
             // runs the one MI300X lane under that base name.
             for suffix in ["-n-1-report", "-n-2-report", "-selfhosted-report"] {
                 for name in &mut names {

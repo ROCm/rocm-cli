@@ -58,32 +58,35 @@ otherwise the job fails at once.
 
 ## Pull requests
 
-A pull request from this repository also runs its MI300X check on the queue.
+A pull request from this repository also runs its gfx942 check on the queue, on
+an MI325X.
 The gate job `e2e-gpu-queue` in
 [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml) runs on a
 GitHub-hosted runner, holds no queue credential and needs only `actions: write`:
 it dispatches [`queue-pr-run.yml`](../.github/workflows/queue-pr-run.yml) on
 `main` with the pull request's branch, waits for that run, and publishes the
-release-channel report of the MI300X lane as `e2e-gpu-report`, the MI300X cell
-of the consolidated report. The run's files are the artifact
+release-channel report of the MI325X lane as `e2e-gpu-report`. The consolidated
+report labels that cell MI300X, since an MI325X lane probes as `mi300x` and the
+same name is the nightly's self-hosted MI300X lane. The run's files are the artifact
 `queue-pr-run-results` from `queue-pr-run.yml`, as `queue-run-results` is
 `queue-run.yml`'s.
 The self-hosted MI300X lane of the same pull request uploads
 `e2e-gpu-selfhosted-report`, shown beside it as "MI300X (self-hosted)": the queue
-run is the primary MI300X check and the self-hosted one the second.
+run is the primary gfx942 check and the self-hosted one the second.
 
-A pull request's run is a preset of the queue side: one GPU model (MI300X), the
+A pull request's run is a preset of the queue side: one GPU model (MI325X, which
+has the same gfx942 target as the MI300X), the
 `release` channel alone and no `@nightly` scenarios, a lane that waits at most 45
 minutes to be started and runs at most 75, and a limited number of such runs
 at once (the queue side sets the limit). The
 queue side does not take one while the nightly goes, or when it has no healthy
-MI300X worker: the gate job then fails with the reason the queue gave, which is
-capacity, not a failing test (the consolidated report's MI300X check,
+MI325X worker: the gate job then fails with the reason the queue gave, which is
+capacity, not a failing test (the consolidated report's gfx942 check,
 [`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh), still counts a run the
 queue refused as a lane that ran and failed). The nightly window is the exception, being by design:
 the gate ends green with a note in its summary to re-run once the window has
 passed (the queue side defines the window), and
-the consolidated report reads the lane as skipped, not missing; the MI300X check
+the consolidated report reads the lane as skipped, not missing; the gfx942 check
 still needs a passing report from the self-hosted lane, since a skipped lane is
 never a pass. A superseded push cancels the gate job, which cancels
 the run it started, freeing the runner; the queue side's lanes are left to their
@@ -99,8 +102,8 @@ on `main`, never the pull request's own copy of any workflow.
 **Merge order.** The queue side (the runner's allow-list and the pull request
 run kind) goes live before the gate does anything. The gate is switched by the
 repository variable `QUEUE_PR_GATE`: until it is `true` the gate ends green with
-a note in its summary, as a skip, not a pass of the MI300X check, and the
-self-hosted `e2e-gpu` is the only MI300X check that runs. Set it once the queue
+a note in its summary, as a skip, not a pass of the gfx942 check, and the
+self-hosted `e2e-gpu` is the only gfx942 check that runs. Set it once the queue
 side is deployed. Without it, merging `queue-pr-run.yml` first would turn every
 pull request red.
 
@@ -114,9 +117,12 @@ the same two constants the script is checked against):
   `queue-pr-run-results`, whose first line is the reason. A reason that starts
   with `nightly:` is the nightly window and skips the gate; any other reason
   fails it.
-- **The report.** The MI300X lane's release-channel report is
-  `mi300x/release/results/report.json` in that artifact, and its whole
-  `results` directory is the job's report. A run with none fails the gate.
+- **The report.** The MI325X lane's release-channel report is
+  `mi325x/release/results/report.json` in that artifact, and its whole
+  `results` directory is the job's report. A run with none fails the gate. While
+  the queue side still runs pull requests on `mi300x`, the gate takes
+  `mi300x/release/results` when `mi325x`'s is missing, so the two sides can be
+  deployed in either order; that fallback goes once the queue side runs `mi325x`.
 
 GitHub cancels an older run of a branch that is still pending when a newer run
 of the same branch is dispatched; the gate of the older run then sees a run

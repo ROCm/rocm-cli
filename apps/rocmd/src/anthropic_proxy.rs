@@ -46,9 +46,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rocm_core::{
-    ANTHROPIC_ENDPOINT_MODE_STATE_KEY, ANTHROPIC_ENDPOINT_URL_STATE_KEY, AnthropicEndpointMode,
-    JsonStateFileRefused, format_http_base_url, http_get_with_auth, http_post_json_with_auth,
-    merge_json_state_file, openai_models_endpoint_has_model,
+    AnthropicEndpointMode, JsonStateFileRefused, format_http_base_url, http_get_with_auth,
+    http_post_json_with_auth, openai_models_endpoint_has_model, publish_anthropic_endpoint,
 };
 use serde_json::{Value, json};
 
@@ -153,11 +152,17 @@ const PUBLISH_RETRY_PAUSE: Duration = Duration::from_millis(200);
 
 /// Record the endpoint in the engine's state file.
 ///
-/// `merge_json_state_file` refuses a state file it cannot merge into rather
-/// than replace it. The vLLM and AIM engines still rewrite their state files
-/// in place, so a file refused as empty or not valid JSON can be one caught
-/// mid-write and whole again a moment later: that refusal is tried again, up
-/// to [`PUBLISH_ATTEMPTS`] attempts [`PUBLISH_RETRY_PAUSE`] apart. Any other
+/// Through `rocm_core::publish_anthropic_endpoint`, not a bare merge: the
+/// engine adapter running in this same process rewrites that file *whole* a
+/// moment after it spawns the server, and only a publication that function has
+/// noted survives such a rewrite. See its documentation for why a bare merge
+/// loses the endpoint for good.
+///
+/// It refuses a state file it cannot merge into rather than replace it. The
+/// vLLM and AIM engines still rewrite their state files in place, so a file
+/// refused as empty or not valid JSON can be one caught mid-write and whole
+/// again a moment later: that refusal is tried again, up to
+/// [`PUBLISH_ATTEMPTS`] attempts [`PUBLISH_RETRY_PAUSE`] apart. Any other
 /// failure (a whole document that is not an object, or failing to lock, read
 /// or write the file) is returned at once.
 fn publish(
@@ -178,13 +183,9 @@ fn publish_with_pause(
 ) -> anyhow::Result<()> {
     // The listener URL carries no `/v1`: Anthropic SDKs append `/v1/messages`.
     let base = url.trim_end_matches('/').trim_end_matches("/v1");
-    let patch = json!({
-        ANTHROPIC_ENDPOINT_URL_STATE_KEY: base,
-        ANTHROPIC_ENDPOINT_MODE_STATE_KEY: mode.as_str(),
-    });
     let mut attempt = 1;
     loop {
-        let error = match merge_json_state_file(&config.state_path, &patch) {
+        let error = match publish_anthropic_endpoint(&config.state_path, base, mode) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };

@@ -887,3 +887,167 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then each GPU is reported with its own architecture and no model name
     And the inspection says the runtime's readings could not be matched to a listed GPU
+
+
+  # ROCMAI-550. `rocm examine` answers "can this machine run ROCm?" with a
+  # `rocm_support` line on EVERY host -- the ROCm-capable runners and the no-GPU
+  # mock lane included, not only the Vulkan-only hosts the ticket started from.
+  # Other surfaces send people here for that answer (`lemonade_engine_note` in
+  # apps/rocm/src/main.rs tells an unclassifiable host to run `rocm examine`), so
+  # silence there is a dead end rather than a smaller report.
+  #
+  # Deliberately untagged: the line's content is keyed to what this host turns
+  # out to be, so the lanes disagreeing about their GPUs is the coverage rather
+  # than an obstacle to it. The assertion is a cross-check and not a tautology --
+  # the claim is held against `detected_gfx_target` and
+  # `compatible_therock_family` from the same report, so a line reading "full
+  # ROCm/HIP support" on the mock lane, or "not supported by ROCm" on an MI300X,
+  # fails here.
+  @id:examine-reports-this-hosts-rocm-support-level
+  Scenario: examine-60 - System inspection says whether this machine's GPU is supported by ROCm
+    When the user inspects the system
+    Then the inspection states this host's ROCm support level
+    And the support level agrees with the GPU the inspection detected
+    And the support level leaves a command that fits this host
+
+  # The `VulkanOnly` door needs a Renoir/Cezanne Vega APU and no runner has one,
+  # but it does not need the hardware: only the two signals the CLI reads for it
+  # -- a KFD node naming the target, and the host's Vulkan driver state -- both
+  # of which the harness can plant. So these run on the ungated mock lane, which
+  # is the lane that has neither.
+  #
+  # Each pins one of the answers a probe can reach where inference from the gfx
+  # table reaches only one: "no ROCm build" does not mean "Vulkan then" on a
+  # machine nobody has looked at, and these scenarios are what keep those
+  # answers distinguishable.
+  @id:examine-names-the-vulkan-driver-an-unsupported-gpu-can-use @requires-os:linux
+  Scenario: examine-61 - A GPU the official stack rejects is told which way it can still run models
+    Given a machine whose GPU has no official support but has a working Vulkan driver
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection reports that models can still run through Vulkan
+    And the inspection names the Vulkan driver it found
+
+  # What this plants is the exit-0-and-empty shape, not a driverless host. A
+  # host with no driver at all fails to create a Vulkan instance and exits
+  # non-zero, which the probe reads as a source that did not answer -- so such
+  # a host is reported as inconclusive, not as a confirmed absence. Confirmed
+  # absence is deliberately the narrower claim (see `VulkanStatus::Absent` for
+  # why a failing probe must not be promoted to one), and this scenario covers
+  # that narrower claim rather than the driverless host.
+  @id:examine-does-not-promise-vulkan-without-a-driver @requires-os:linux
+  Scenario: examine-62 - A machine with no way to run models is not told it has one
+    Given a machine whose GPU has no official support and no Vulkan driver
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not claim models can run through Vulkan
+    And the inspection says no Vulkan driver was found
+
+  # A software renderer is a complete Vulkan implementation that runs on the
+  # CPU. Counting it would put a GPU-required run on the processor while
+  # reporting a GPU path - the one outcome the no-fallback rule exists to
+  # prevent, reached through a backend rather than a policy change.
+  @id:examine-does-not-count-a-software-renderer-as-a-gpu-path @requires-os:linux
+  Scenario: examine-63 - A software renderer does not count as a way to run on the GPU
+    Given a machine whose GPU has no official support and only a software renderer
+    When the user inspects that machine
+    Then the inspection does not claim models can run through Vulkan
+    And the inspection says the only renderer it found runs on the CPU
+
+  # The shape examine-62 does not reach. examine-62 plants a `vulkaninfo` that
+  # runs and reports no devices, which is the only shape that earns a confirmed
+  # absence; this host has no `vulkaninfo` to ask at all, and must be told the
+  # check could not be made rather than either promised Vulkan or declared to
+  # have nothing.
+  #
+  # Known gap, measured rather than assumed: a real `vulkaninfo` on a Linux host
+  # with no reachable driver does NOT produce examine-62's shape. It prints
+  # "Found no drivers!" and exits 1, which this probe classifies as
+  # inconclusive — so such a host lands at *this* scenario's level rather than
+  # examine-62's. Telling "no drivers" apart from "the tool is broken" needs the
+  # loader's own message, which the shared capture discards.
+  @id:examine-cannot-confirm-vulkan-without-vulkaninfo @requires-os:linux
+  Scenario: examine-64 - A machine that cannot be checked for Vulkan is not told either way
+    Given a machine whose GPU has no official support and no way to check Vulkan
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not claim models can run through Vulkan
+    And the inspection says it could not confirm whether a Vulkan driver is there
+
+  # examine-63 with one thing changed: the manifest beside the software renderer
+  # names a real GPU driver. That is the common `render`-group permission shape
+  # -- the driver is installed, and the user's own account cannot open the
+  # device, so the loader falls back to llvmpipe -- and it is the one case where
+  # the device evidence must NOT be allowed to deny the driver. "No Vulkan GPU
+  # driver was found - install one" would contradict the `icds` field of the
+  # same report and name an install the host has already done.
+  #
+  # The pair is the test: examine-63 and this scenario plant the same
+  # enumeration and differ only in the manifest, so an implementation that reads
+  # the devices before the manifests passes one and fails the other instead of
+  # collapsing both into a confirmed absence.
+  @id:examine-does-not-deny-an-installed-vulkan-driver-a-software-renderer-masks @requires-os:linux
+  Scenario: examine-65 - An installed GPU driver masked by a software renderer is not reported as missing
+    Given a machine whose GPU has no official support and a Vulkan driver masked by a software renderer
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection names the installed Vulkan driver it could not confirm
+
+  # NOT covered end to end: the one-line banner at the top of `rocm engines`.
+  #
+  # A pair of scenarios was written for it and removed again. They planted a GPU
+  # the official stack rejects and differed only in whether a Vulkan driver
+  # answered, on the premise that the banner would say "Vulkan" for one and
+  # "a GPU is required" for the other. It cannot: `rocm engines` resolves its
+  # level through `host_gpu_support_level`, which passes
+  # `VulkanStatus::Unknown` on purpose so the listing stays cheap and never
+  # spawns `vulkaninfo`. Both hosts therefore read `VulkanOnly` from the gfx
+  # table alone. The no-driver arm failed, and the driver arm passed for a
+  # reason that had nothing to do with the driver it planted.
+  #
+  # So the banner's wording stays unit-tested against `GpuSupportLevel`
+  # literals. Covering it end to end means either driving `rocm examine`'s
+  # banner (it does probe) or giving the listing a probe, which is the cost
+  # decision recorded on `host_gpu_support_level`.
+
+  # The remaining three arms of the "a GPU driver is installed, but nothing
+  # confirms it reaches a GPU" split. examine-65 covers the fourth (a software
+  # renderer masking it); all four render the same `vulkan:` status and differ
+  # only in the sentence that tells the user what to do next, so the status
+  # alone cannot tell them apart and each needs its own scenario (AGENTS.md
+  # section 3).
+  #
+  # This one enumerates real hardware that is simply not AMD. It must not be
+  # reported as a missing driver, and must not be told to install `vulkaninfo`
+  # -- the tool ran and answered.
+  @id:examine-names-a-non-amd-enumeration-as-such @requires-os:linux
+  Scenario: examine-66 - A machine whose only Vulkan device is not an AMD GPU is told exactly that
+    Given a machine whose GPU has no official support and a Vulkan driver that enumerates only non-AMD hardware
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection says none of the enumerated devices is an AMD GPU
+
+  # `vulkaninfo` ran, exited 0 and listed nothing. The answer is in hand, so
+  # sending this user to install `vulkaninfo` would name a tool they already
+  # have -- the usual cause is a `render`-group permission problem.
+  @id:examine-does-not-send-an-answered-host-after-vulkaninfo @requires-os:linux
+  Scenario: examine-67 - A machine whose Vulkan driver enumerates nothing is not sent to install vulkaninfo
+    Given a machine whose GPU has no official support and a Vulkan driver that enumerates nothing
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection says vulkaninfo ran and listed no device
+
+  # examine-67 with one thing changed: no `vulkaninfo` on the host at all. This
+  # is the only one of the four where "install `vulkaninfo` to confirm" is true,
+  # and the pair is the test -- an implementation that stops distinguishing
+  # "answered empty" from "never ran" passes one and fails the other.
+  @id:examine-asks-an-unanswered-host-to-install-vulkaninfo @requires-os:linux
+  Scenario: examine-68 - A machine with a Vulkan driver but no vulkaninfo is asked to install it
+    Given a machine whose GPU has no official support and a Vulkan driver but no way to enumerate
+    When the user inspects that machine
+    Then the inspection reports the GPU as unsupported by the official stack
+    And the inspection does not say a Vulkan driver is missing
+    And the inspection asks for vulkaninfo to confirm

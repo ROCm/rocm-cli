@@ -105,6 +105,9 @@ different goal.
    `rocm fix` match known failures against a catalog with a stable id for
    each. Where a fix is safe to automate, `rocm fix` applies it after asking.
    Otherwise it prints the steps to take, or says plainly that no fix exists.
+   You do not have to wait for it to break: `rocm diagnose` checks the machine
+   as it is and installs nothing, and no fix is applied until you run
+   `rocm fix`.
 7. **Built for people, scripts, and agents alike.** A launcher and a live
    dashboard for people, `--json` output from `examine`, `diagnose`, `fix`
    and other inspection commands for scripts, and the
@@ -599,7 +602,10 @@ Checks this computer's GPU, ROCm install, engines, and managed setup
 folders. Run this command first to see whether a system is ready and what
 `rocm install sdk` and `rocm serve` will see. `--json` emits a
 machine-readable report for diagnosis tooling instead of the human-readable
-summary. `--framework` controls which ML framework the `--json` report probes
+summary. To check the same machine against the catalog of known failure modes,
+before anything has failed or after, run `rocm diagnose` (see
+[Diagnose and fix](#diagnose-and-fix)). `--framework` controls which ML
+framework the `--json` report probes
 for its ROCm build and compiled GPU architectures:
 
 - `auto` (the default) tries PyTorch, then falls back to llama.cpp.
@@ -642,9 +648,25 @@ only recognize failure modes that are in the catalog: no match means "not
 recognized", not "nothing is wrong". In that case it points you at where to
 report the symptom.
 
+Nothing has to have failed first. With no `--symptom`, `diagnose` examines the
+machine as it is and reports any catalogued misconfiguration it finds, so you
+can run it before you install or serve anything. A diagnosis applies no fix and
+installs nothing; `rocm fix` is the step that changes the machine. Run that way
+on a machine where nothing matched, the report says no known misconfiguration
+matched and still lists the issue tracker to use; that pointer matters only if
+you have a failure to report. A few failure modes show only
+in the error a failing run prints (a vLLM out-of-memory error, for one), so
+pass that text with `--symptom` once you have it.
+
 Each result prints an `id:` and an `apply with:` command. The leading `#1`, `#2`
 are ranking positions for reading order only. `rocm fix` takes the id, not the
 position.
+
+Results that clear the match threshold come first. Among them, a cause that
+leaves the GPU unreachable (no device node, no kernel or host driver, no
+permission to open it, or on WSL2 no path from ROCm to the Windows driver) is
+listed before any other, whatever the scores; the rest follow by score. The
+closing line names the first cause listed.
 
 `rocm diagnose` takes these flags:
 
@@ -893,7 +915,51 @@ a target yourself with `--family gfx90c`: the request is refused, and no other
 family is substituted for it. `rocm examine` reports the same conclusion on a
 `rocm_support` line (see [Examine](#examine)).
 
-These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
+These GPUs can still work with the Vulkan backend, which needs no ROCm SDK —
+but whether they *do* depends on a Vulkan driver being installed, so `rocm
+examine` looks for one rather than assuming it. It reads the Vulkan ICD
+manifests (the Khronos `Drivers` registry key on Windows) and, where available,
+enumerates devices with `vulkaninfo`. A software rasteriser such as lavapipe or
+swiftshader does not count as a GPU driver.
+
+`rocm examine` prints that `rocm_support` line on **every** host, not only this
+case, at one of five levels:
+
+| Level | Meaning |
+| --- | --- |
+| ROCm/HIP-supported | A TheRock package family covers this GPU. |
+| Vulkan-only | No ROCm build, **and** either a Vulkan GPU driver was found here, or the platform cannot be probed for one at all (anything other than Linux and Windows, or a summary from an older `rocm remote doctor` that predates the probe). The `rocm_support` line says which of the two it is, and only names a driver when one was actually found. |
+| Vulkan-unconfirmed | No ROCm build, and the probe could not reach an answer: nothing was found, and at least one of the two sources — the ICD/registry listing or `vulkaninfo` — never answered. Either one can be the source that went unread (on Windows the registry read is a separate PowerShell call that can fail on its own), and the `vulkan:` line names which. |
+| no GPU backend | No ROCm build, **and** the probe looked and found no Vulkan GPU driver. This takes `vulkaninfo`'s own answer: the ICD listing is not exhaustive on either platform, so it never denies a driver by itself. |
+| unknown | No GPU detected, or a target this build's catalog does not recognize. |
+
+The last row is a detection gap rather than a verdict about the hardware, which
+is why it is not reported as "no ROCm build". Vulkan-unconfirmed is kept
+separate from "no GPU backend" for the same reason in the other direction: on
+Windows the Khronos `Drivers` key is legacy and `vulkaninfo` is rarely on PATH,
+so a working machine can land there, and it has not earned a confirmed "no".
+
+`rocm examine --json` reports the evidence behind this in a `summary.vulkan`
+object (status, ICD manifests found, devices enumerated). The host summary is
+flattened into the document's `summary` member, so the object is there and not
+at the top level. The field is optional, so an older `rocm remote doctor`
+summary that predates it reads as unknown rather than as a false "no Vulkan".
+
+The probe runs wherever the full host summary is gathered, not on `rocm examine`
+alone: the text and JSON of `rocm examine`, the MCP and bridge snapshots, the
+free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'s
+host snapshot, MCP and sandbox paths. Each of those pays one `vulkaninfo` (or, on
+Windows, one registry read) per gather.
+
+It does not run on the lean scope, `ExamineSummary::gather_without_driver_facts`,
+which the runtime-install finalizer uses to read the GPU target: that leaves
+`vulkan` as `None`, meaning "not probed", which reads as unknown rather than as a
+false "no Vulkan".
+
+`rocm engines` and the `rocm diagnose` finding `info-20-gpu-no-rocm-support` still
+speak from the gfx table alone, so they can name Vulkan on a host where `rocm
+examine` would say otherwise; spawning `vulkaninfo` (and PowerShell on Windows)
+was judged too expensive for a plain listing command.
 
 On such an integrated GPU, `rocm serve` on Lemonade chooses the llama.cpp
 context window itself. Lemonade sizes it from the memory it can see and, when
@@ -1771,8 +1837,14 @@ While it starts, the status line follows the engine: a download, a weight load,
 or the latest log line, until the server is ready or that wait fails (the engine
 exits, a download stops advancing, or the startup deadline passes). When the
 server is ready it prints a deployment summary: a table with the status, the
-full inference endpoint, the API-qualified model name, and a quick smoke test
-(time to first token and approximate tokens per second).
+engine and the backend device the engine reports (for example
+`rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)` where the
+engine pinned no GPU ordinal), the full inference endpoint, the API-qualified
+model name, and a quick smoke test (time to first token and approximate tokens
+per second). The device is read back from the running engine, so it is that
+engine's own account of the backend it was launched on rather than an
+independent measurement of the hardware. `rocm services` reports the same
+`device` for each running service.
 
 On an interactive terminal, if the smoke test cannot complete, the summary is
 headed `(smoke test failed)`, shows the status as `started, smoke test failed`
@@ -1804,6 +1876,15 @@ Engine log lines shown on the status line have credentials (the endpoint key,
 `--api-key` and token values, `hf_` tokens) masked. Once the server lists the
 model, the wait checks whether it can answer with a one-token request, first
 right away and then at growing intervals up to every 15 seconds.
+
+The device line is omitted when the engine cannot say yet. A server is reported
+ready as soon as it answers, which can be before it has finished loading the
+model, and until then the engine does not know which device it ended up on;
+`rocm serve` waits for it rather than holding your terminal — up to about 14
+seconds worst case (a 6-second device probe, plus Lemonade's 8-second inference
+probe) — and `rocm services` shows it once it is known. The GPU name is omitted
+on a machine with more than one AMD GPU, where naming one of them could name the
+wrong one.
 
 Piped output, or a stderr that is not a terminal (`2>log`), keeps the 45-second
 wait and reports the server as it stood then. Control returns to your shell with
@@ -2126,6 +2207,18 @@ signals nothing and names an operating-system command to check on it. It does
 not suggest running the stop again: when only a process under the recorded one
 survived, a second stop can report the server stopped while that process still
 runs.
+
+`list` asks each running server which backend and GPU it is actually on, so it
+can take a few seconds rather than returning instantly. With the built-in
+engines the query is capped in total — about 18 seconds worst case, however
+many servers are listed — and a server that does not answer in time simply has
+no `device` line rather than holding up the rest of the list. That cap is not
+universal: an external plugin engine is run as a child process and waited on
+without a deadline, so one that never exits can hold the listing indefinitely.
+Only the engines shipped here are bounded. The same applies to asking about servers in
+`rocm chat`, which prints the same list. `list --json` is unaffected: it emits
+the stored service records, which have no `device` field, asks no server
+anything, and returns as fast as it always did.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts

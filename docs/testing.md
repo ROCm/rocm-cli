@@ -10,7 +10,7 @@ This page collects developer verification commands. The README stays focused on 
 
 ## Local Verification
 
-The minimum quality gate is in [AGENTS.md](../AGENTS.md) section 8.
+How hooks and CI gate a change is in [AGENTS.md](../AGENTS.md) section 8.
 
 `cargo test` runs every test as a thread in **one process**, which is
 also what the `windows-debug` job of the required `windows-build-and-test` lane
@@ -897,8 +897,8 @@ place fails it), so a change of route is caught even when the endpoint still ans
 inference and stops the scenario-owned service. It needs a usable AMD GPU on a
 Lemonade Linux lane (`@requires-gpu`, `@requires-os:linux`,
 `@requires-engine:lemonade`). It has no flaky expectations row, so a route
-regression fails the lane. Of the other direct-route serves, `serve-07` keeps its
-flaky Linux row; `serve-08` has none, so it fails the lane too.
+regression fails the lane. The other direct-route serves, `serve-07` and
+`serve-08`, have no row either, so they fail the lane too.
 
 The daemon's Lemonade contracts in
 [telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
@@ -931,17 +931,15 @@ The dashboard scenarios in
   claims. One remaining model shows its throughput, an empty or unreachable
   server shows no models, and a reload restores both.
 - `dash-lemonade-managed-inference-journey`: a GPU-gated real Lemonade serve and
-  inference followed by dashboard observation. On Linux Lemonade hosts it is
-  expected to be flaky and its serve is bounded by `serve_timeout_secs` (readiness polling; the CLI process is killed only 300 s after that) in
-  [expectations.toml](../tests/e2e-cucumber/expectations.toml). The model must
-  appear as a full row in Observe, and its instance detail must show it READY
-  on the port it was served on. This is real engine acceptance;
-  the protocol fixtures do not prove GPU inference or engine installation.
-  The flaky row matches every lane that can run this scenario, so the whole
-  journey is advisory: its dashboard, instance detail, and post-quit inference
-  checks cannot block a merge. Only the serve step is intermittent, but
-  expectations apply per scenario. It also does not gate the
-  "Lemonade — managed runtime installed" wording.
+  inference followed by dashboard observation. It has no row in
+  [expectations.toml](../tests/e2e-cucumber/expectations.toml), so it is an
+  expected pass on every Linux Lemonade lane that runs it, and a failure of its
+  serve, dashboard, instance detail, or post-quit inference checks fails that
+  lane. The model must appear as a full row in Observe, and its instance detail
+  must show it READY on the port it was served on. This is real engine
+  acceptance; the protocol fixtures do not prove GPU inference or engine
+  installation. It does not gate the "Lemonade — managed runtime installed"
+  wording.
   Unit tests gate that wording instead:
   `managed_installed_verdict_follows_detect_result` in
   [dash.rs](../apps/rocm/src/dash.rs), and the engine pane glyph and verdict
@@ -1221,8 +1219,7 @@ no category names, and that is not in the action's `inert` list (files no gated
 job reads, such as `CODE_OF_CONDUCT.md` or the issue templates), turns every
 category on and prints a notice naming the file, so a new kind of file runs the
 full suite until someone adds it to the categories whose jobs read it. Off pull
-requests every category is on. The minimum quality gate in
-[AGENTS.md](../AGENTS.md) section 8 does not use `affected`, which is a CI optimization
+requests every category is on. `affected` is a CI optimization
 that also narrows the local pre-push hooks (next section).
 
 ### Pre-push hook scope
@@ -2105,8 +2102,17 @@ is the `kill/reap failed` branch, which needs an operating system that refuses t
 kill a child it just started.
 
 Use the evidence to distinguish backend startup, download, and router readiness
-failures; ROCMAI-898 tracks the Strix Halo Ubuntu investigation (first tracked
-as [issue #897](https://github.com/ROCm/rocm-cli/issues/897), which is closed). A
+failures. The evidence was added for the Strix Halo Ubuntu investigation of
+ROCMAI-898, first tracked as
+[issue #897](https://github.com/ROCm/rocm-cli/issues/897). Both are closed. #963
+fixed one signature (resolving a registered Lemonade model name when it is
+served directly on Linux), and #1150 serves simple `chat`-labelled registered
+GGUFs directly instead of through Lemonade's router. Before #1150 a serve could
+find port 11435 already taken or come up on another port; #1150's own account
+names a router serve as the likely occupant, but that has not been observed.
+The rows were deleted because of the lane evidence since #1150 (see the
+ROCMAI-898 comment in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml)). A
 backend's ready line does not establish that the router serves the requested
 model, and a readiness timeout alone does not establish a shutdown. Diagnostics do not change the CLI's asynchronous
 managed-launch contract or imply a backend fix.
@@ -3919,6 +3925,11 @@ the endpoint key file, and that the standalone `rocmd` got an answer to its
 engine `Stop` request (it reaches the engine through the `rocm` beside it). Run it with
 `ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
 cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
+`model-catalog-06` to `-08` state the host's GPU memory through the `e2e-test-hooks`
+seam `ROCM_E2E_FORCE_GPU_TOTAL_GIB`: a whole number of GiB for a machine of that
+size, or `unreadable` for one whose memory could not be read, so the listing's
+selection does not depend on what the lane's GPU reports. A value it cannot parse is
+ignored and the host is measured as usual.
 `service-stop-03`, `-04` and `-05` (Linux, mock lane) cover `rocm services
 stop`'s unconfirmed half through the `e2e-test-hooks` seam
 `ROCM_E2E_STOP_OUTCOME` (`timed_out` or `unverified`), which makes the verified
@@ -4428,12 +4439,12 @@ bad config from failing a `serve` after its launch. The user-visible side is `au
 (mock lane: enable starts a live helper, disabling the last watcher makes it
 exit) and `serve-40` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
-(GPU lane: serving with no watcher enabled starts no helper; on a Linux host
-that runs it with lemonade it is an expected failure in
-[expectations.toml](../tests/e2e-cucumber/expectations.toml) while lemonade
-serving on the Strix Halo Ubuntu lanes is broken (ROCMAI-898), so the helper check is
-not reached on those lanes. The Strix Halo Windows lane runs it and passes, and
-the row also matches other Linux lemonade hosts, where a pass is tolerated).
+(GPU lanes: serving with no watcher enabled starts no helper. It pins lemonade, so
+the Strix Halo Windows and Ubuntu lanes and the MI300X lane, whose default
+engine is vLLM, all serve it with lemonade, and it has no row in
+[expectations.toml](../tests/e2e-cucumber/expectations.toml): the Linux row it
+carried while lemonade serving there was broken (ROCMAI-898) was deleted once the
+fix reached those lanes).
 
 Anthropic-compatible `/v1/messages` endpoint (ROCMAI-597). The translation and
 its HTTP front are tested in
@@ -4489,16 +4500,15 @@ It carries `@requires-gpu` and deliberately no `@requires-engine`, because the
 engine is the CLI's to pick here — so the lane that exercises the Lemonade half
 is whichever GPU lane defaults to Lemonade (the Strix Halo lanes, and W7900 on
 the queue nightly only) and the vLLM half falls to the Instinct lane. Of all
-these lanes only MI300X (two checks, `e2e-gpu-queue` on the shared GPU queue
-and `e2e-gpu` on a self-hosted runner, the same silicon) and the Strix Halo
+these lanes only gfx942 (two checks: `e2e-gpu-queue`, an MI325X on the shared GPU queue,
+and `e2e-gpu`, a self-hosted MI300X) and the Strix Halo
 Windows and WSL2 lanes run on pull requests ([e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml), when
 the `serve` path filter matches; W7900 has no per-PR lane any more and runs only
 on the queue nightly), and none of their check names is a required status
 check, so the two unit tests above are the blocking per-PR coverage. The scenario
 carries no [expectations.toml](../tests/e2e-cucumber/expectations.toml) row,
-unlike its managed-Lemonade siblings on the Linux Strix lane: whether it shares
-their known serve failure there has not been observed, and a row claiming a
-known bug before one is seen would say something untrue.
+like the managed-Lemonade serves whose ROCMAI-898 rows were deleted (see the
+ROCMAI-898 comment in that file for the evidence and what it does not cover).
 
 An installed vLLM whose compiled extensions (`vllm._C`, `vllm._rocm_C`,
 `vllm._C_stable_libtorch`) do not import against the runtime's torch is listed as
@@ -5679,6 +5689,62 @@ To run them on a host that *does* have a GPU, mask it so the harness resolves to
 its no-GPU premise — `HIP_VISIBLE_DEVICES="" cargo xtask e2e -- -n "serve-(67|68)"`
 — otherwise `@requires-no-gpu` skips them.
 
+## The Reported Backend Device And Support Level
+
+ROCMAI-550 made two surfaces report what this host can actually do instead of a
+static ROCm claim. Both are worth knowing about before reading a failure in
+them.
+
+**`rocm serve` and `rocm services list` print a `device:` row** — the backend
+and GPU the engine says it selected, read back over the engine's own
+`Healthcheck` RPC rather than inferred from the launch plan. Every engine
+renders it through `rocm_engine_protocol::format_reported_device`, so the shape
+is one and the same everywhere: a backend word, then an optional ` gpu <n>`,
+then an optional ` (<gpu name>)`.
+
+**The row is optional, and a missing one is not a defect.** An engine answers
+`unknown` until it can really say — `engines/lemonade` until its own inference
+probe returns, which for a model still loading its weights is minutes rather
+than seconds — and the CLI drops `unknown` rather than printing it. `rocm serve`
+retries within `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` (~6s, plus one in-flight
+probe) and then prints the summary without the row; `rocm services list` shows
+it once the engine can answer. So:
+
+- a test may assert that a row, where present, is well-formed and that the two
+  surfaces agree — which is what `the services list reports the engine's actual
+  backend device` (serve-05, serve-07) does;
+- a test may **not** assert that a `ready` serve printed one.
+
+The GPU name is optional in the same way, and deliberately so:
+`rocm_core::pinned_gpu_name` reports a name only on a host with exactly one AMD
+GPU and no visibility mask, because every name probe here answers for the
+host's primary adapter rather than for a HIP ordinal. On a multi-GPU host the
+row is the backend and ordinal with no name — correct and unspecific, rather
+than specific and wrong. No CI lane has two AMD GPUs, so that branch is covered
+by unit tests in [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) only.
+
+**`rocm examine` prints a `rocm_support` line on every host**, at one of five
+levels (`gpu_support_level`): ROCm/HIP-supported, Vulkan-only,
+Vulkan-unconfirmed, no-GPU-backend, or unknown. The three middle levels are
+decided by probing for a Vulkan driver rather than by the gfx table. Unknown
+covers both "nothing detected" and "a target this build's catalog does not
+recognise" — conflating the latter with "confirmed to have no ROCm build"
+would turn a detection gap into a claim about the hardware. `examine-60` holds
+the line against the `detected_gfx_target` and `compatible_therock_family` the
+same report prints, so every lane checks the level its own hardware implies:
+
+```bash
+cargo xtask e2e -- -n '(examine-60)'
+```
+
+Not every surface pays for that probe. `rocm engines` and the MCP `engines`
+tool resolve their level through `host_gpu_support_level`, which passes
+`VulkanStatus::Unknown` on purpose so a listing never spawns `vulkaninfo`, and
+`install sdk --family <gfx>` asks about a target the user named rather than
+about this host. Those three still answer from the gfx table alone; `rocm
+examine`, which already gathers the probe, is the surface that can tell a host
+with a Vulkan driver from one without.
+
 ## Two Dashboards Share One Telemetry Daemon
 
 Every live `rocm dash` of a user points at one unix socket, and the telemetry
@@ -6545,6 +6611,25 @@ gates still apply (a `-n` name filter would bypass them):
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-wsl-usual-shared-memory-is-not-reported-short cargo xtask e2e
 ```
 
+### Diagnosing before anything has failed
+
+`diagnose-89` holds `rocm diagnose --help` to what the command does for a user
+who has hit no failure. It plants the unneeded GPU override that `diagnose-62`
+uses, a misconfiguration every lane reads from the environment, then reads the
+help for three lines (nothing has to have failed first, a diagnosis applies no
+fix, only `rocm fix` changes the machine), runs `rocm diagnose` with no
+`--symptom`, and requires the override to be reported with its `rocm fix`
+command. It also compares the CLI's `config` and `data` folders file by file
+before and after. That is what "installs nothing" is checked as: a change
+outside those two folders is not observed, and neither are the cache folder
+(CI shares it between scenarios) or the CLI's own log. With no symptom the
+override scores below the match threshold, so it is listed as a weak result
+rather than a match. The scenario is untagged and runs on every lane:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-89)'
+```
+
 ## Symptom From A File Or Standard Input
 
 `rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
@@ -6647,6 +6732,42 @@ only those three without bypassing the harness's gates:
 
 ```bash
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
+```
+
+### Which cause ranks first
+
+Each catalog entry in `CHECKERS` in
+[catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs) names a
+`Precedence`, and `run_all_checks` there sorts the findings that cleared the
+match threshold by it before their score: a finding that the process has no
+working path to the GPU (`GpuPath`: no device node, no kernel or host driver,
+no permission to open it, or on WSL2 no bridge from ROCm to the host driver)
+ranks ahead of every other finding, such as a small `/dev/shm` or a vLLM
+out-of-memory error, even when that one scores higher. Below the threshold
+precedence does not count, so a weak signal such as merely being in a
+container never climbs over an established finding. The text report's closing
+line names the first cause in that order (`render_report_text` in
+[report.rs](../crates/rocm-core/src/diagnose/report.rs)), whether or not a
+lower-ranked one clears `HIGH_CONFIDENCE`. The unit tests in catalog.rs pin the
+reported WSL container with a 64 MiB `/dev/shm`, the same container with a
+pasted out-of-memory error, a sub-threshold container finding, and a bare-metal
+container without `/dev/kfd`:
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/diagnose::catalog::tests::(in_a_docker|a_high_confidence|a_weak_gpu|a_linux_container)/)'
+```
+
+`diagnose-90` in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+covers it end to end on every Linux lane, WSL included: it plants a host root
+that reads as a docker container on WSL2 with no `/dev/dxg`, pastes a vLLM
+out-of-memory error, and requires the missing device first, the closing line
+to name it, and `rocm fix` to accept that id on the same planted machine. The
+shared-memory shape of the original report is unit-only, because `/dev/shm` is
+measured from the process's own mount rather than through the host root
+([hardware_root.rs](../crates/rocm-core/src/hardware_root.rs)). To run it alone:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-a-gpu-the-program-cannot-reach-is-ranked-first cargo xtask e2e
 ```
 
 ## Model Fit Preflight
@@ -6789,7 +6910,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   integrated-GPU hardware. The planted pool is far larger than the tiny file, so
   only the "fits" polarity is exercised there.
 
-  `diagnose-89` covers the host none of the others describe: one where nothing
+  `diagnose-91` covers the host none of the others describe: one where nothing
   reports the GPU's memory at all. That is a Windows laptop whose integrated GPU
   has no ROCm build, since `amd-smi` ships inside the SDK and an unsupported
   part has no telemetry to read a carve-out from. Such a host used to be told
@@ -6803,7 +6924,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   — `plant_single_gpu_with_memory`, with `GFX1151_TARGET_VERSION` and
   `CARVE_OUT_BYTES` widened to `pub(crate)` for them — because `rocm model` has
   to reach the same verdict about a machine that `rocm diagnose --model` does.
-  `-12` plants the same host *shape* as `diagnose-89` — an APU with a readable
+  `-12` plants the same host *shape* as `diagnose-91` — an APU with a readable
   aperture and no VRAM counters at all — at this cluster's own pool size rather
   than that scenario's. Its presence is what stops the listing's
   evidence-of-a-GPU test drifting from the one the diagnosis uses: the two
