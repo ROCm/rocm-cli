@@ -46,13 +46,13 @@ needs, see [Installing ROCm CLI](install/installation.md). For WSL2 setup, see
 
 | Engine | Linux | Windows | WSL2 |
 |---|---|---|---|
-| Lemonade | Supported | Supported | Not verified |
+| Lemonade | Supported | Supported | Partial |
 | vLLM | Supported | Not supported | Partial |
 | AIM | Supported (needs Docker) | Not supported | Not verified |
 ```
 
-- **Lemonade on WSL2**: ROCm CLI installs Lemonade on WSL2, but GPU serving
-  there hasn't been confirmed on GPU hardware.
+- **Lemonade on WSL2**: GPU serving has been confirmed only in the
+  end-to-end test run on a Strix Halo computer under WSL2.
 - **vLLM on WSL2**: GPU serving has been confirmed only with a pre-release
   ROCm 10.2 SDK.
 - **AIM on Windows**: ROCm CLI has no GPU passthrough for AIM containers on
