@@ -13,6 +13,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 // renderer prints from.
 use rocm_core::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE;
 use rocm_core::gguf_fit::{DEDICATED_VRAM_OPENING, SHARED_POOL_OPENING};
+use rocm_core::gguf_source::MAX_PROBED_QUANTIZATIONS;
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -4674,10 +4675,14 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
 
 /// Start a stand-in Hugging Face endpoint on a loopback port and point the CLI at
 /// it. It counts every connection. A repository listing request
-/// (`/api/models/...`) is answered with `listing` when one is given; every other
-/// request, and a listing when none is given, gets an empty 404. It stops when
-/// the World lets go of its handle, so a scenario leaves no thread behind.
-fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
+/// (`/api/models/...`) is answered with `listing` when one is given; a file
+/// request (`.../resolve/main/...`) is answered, when `serve_files` is set, with
+/// the bytes of [`tiny_gguf_bytes`] over the range asked for, padded with zeros
+/// past the end of the fixture so a file the listing declared larger reads as
+/// that size; every other request, and a listing when none is given, gets an
+/// empty 404. It stops when the World lets go of its handle, so a scenario
+/// leaves no thread behind.
+fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<String>, serve_files: bool) {
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4688,6 +4693,7 @@ fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
     let port = listener.local_addr().expect("hub address").port();
     let requests = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&requests);
+    let fixture = serve_files.then(tiny_gguf_bytes);
     std::thread::spawn(move || {
         while Arc::strong_count(&seen) > 1 {
             match listener.accept() {
@@ -4695,15 +4701,40 @@ fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
                     seen.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                    // The request line is all that is needed, and it arrives first.
+                    // The request line and its headers are all that is needed,
+                    // and they arrive before any body.
                     let mut buf = [0_u8; 2048];
                     let read = stream.read(&mut buf).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..read]);
-                    let is_listing = request
-                        .split_whitespace()
-                        .nth(1)
-                        .is_some_and(|path| path.starts_with("/api/models/"));
-                    let response = match listing {
+                    let path = request.split_whitespace().nth(1).unwrap_or("");
+                    let is_listing = path.starts_with("/api/models/");
+                    let range = request.lines().find_map(|line| {
+                        line.strip_prefix("Range: bytes=")
+                            .or_else(|| line.strip_prefix("range: bytes="))
+                            .and_then(|value| value.trim().split_once('-'))
+                            .and_then(|(start, end)| {
+                                Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                            })
+                    });
+                    if let (Some(bytes), Some((start, end))) = (fixture.as_ref(), range)
+                        && path.contains("/resolve/main/")
+                    {
+                        let body: Vec<u8> = (start..=end)
+                            .map(|at| bytes.get(at).copied().unwrap_or(0))
+                            .collect();
+                        let _ = write!(
+                            stream,
+                            // `*` for the total: the fixture is served for
+                            // every file the listing declares, at whatever size
+                            // it declared, so the server does not know it.
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/*\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(&body);
+                        continue;
+                    }
+                    let response = match listing.as_deref() {
                         Some(body) if is_listing => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -4726,7 +4757,7 @@ fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
 
 #[given("a Hugging Face endpoint that records every request made to it")]
 async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
-    start_stand_in_hub(world, None);
+    start_stand_in_hub(world, None, false);
 }
 
 /// A repository holding one model and its multimodal projector, as llama.cpp
@@ -4735,7 +4766,7 @@ const MODEL_AND_PROJECTOR_LISTING: &str = r#"{"siblings":[{"rfilename":"e2e-mode
 
 #[given("a Hugging Face repository that holds a model and its multimodal projector")]
 async fn a_hub_repository_with_a_model_and_a_projector(world: &mut E2eWorld) {
-    start_stand_in_hub(world, Some(MODEL_AND_PROJECTOR_LISTING));
+    start_stand_in_hub(world, Some(MODEL_AND_PROJECTOR_LISTING.to_owned()), false);
 }
 
 #[when("the user asks the CLI whether the projector file would run, naming it exactly")]
@@ -5025,17 +5056,227 @@ async fn user_asks_about_a_bare_repository_with_a_context_size(world: &mut E2eWo
     );
 }
 
-#[then("the answer says the reference names a repository and asks for a quantization")]
-async fn assert_bare_repository_asks_for_a_quantization(world: &mut E2eWorld) {
+/// The three quantizations the repository fixtures publish, smallest first, and
+/// the size the listing declares for each. The fixture GGUF is about a
+/// megabyte, so a declared size is the window one header read fetches.
+const REPOSITORY_QUANTIZATIONS: [(&str, u64); 3] = [
+    ("e2e-model-Q2_K.gguf", 1_200_000),
+    ("e2e-model-Q4_K_M.gguf", 1_400_000),
+    ("e2e-model-Q8_0.gguf", 1_600_000),
+];
+
+/// A repository listing of `(file, size)` pairs, as the hub returns it.
+fn repository_listing(files: &[(&str, u64)]) -> String {
+    let siblings: Vec<String> = files
+        .iter()
+        .map(|(name, size)| format!(r#"{{"rfilename":"{name}","size":{size}}}"#))
+        .collect();
+    format!(r#"{{"siblings":[{}]}}"#, siblings.join(","))
+}
+
+/// The per-quantization rows of the answer, in the order the CLI put them.
+fn quantization_rows(model: &serde_json::Value) -> Vec<serde_json::Value> {
+    model_field(model, "quantizations")
+        .get("quantizations")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("the answer carries no per-quantization rows: {model:#}"))
+        .clone()
+}
+
+fn row_label(row: &serde_json::Value) -> String {
+    row.get("quantization")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| row["file"].as_str().unwrap_or_default())
+        .to_owned()
+}
+
+/// How many connections the stand-in hub accepted, after a moment for one in
+/// flight to be counted.
+fn hub_connections(world: &E2eWorld) -> usize {
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[given("a Hugging Face repository publishing three quantizations and a multimodal projector")]
+async fn a_hub_repository_with_three_quantizations(world: &mut E2eWorld) {
+    let mut files: Vec<(&str, u64)> = REPOSITORY_QUANTIZATIONS.to_vec();
+    files.push(("mmproj-e2e-model-f16.gguf", 1_100_000));
+    start_stand_in_hub(world, Some(repository_listing(&files)), true);
+}
+
+#[given("a Hugging Face repository publishing fifteen quantizations")]
+async fn a_hub_repository_with_fifteen_quantizations(world: &mut E2eWorld) {
+    let names: Vec<String> = (0..REPOSITORY_QUANTIZATION_COUNT)
+        .map(|index| format!("e2e-model-Q{index:02}_K.gguf"))
+        .collect();
+    let files: Vec<(&str, u64)> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), 1_200_000 + index as u64 * 1000))
+        .collect();
+    start_stand_in_hub(world, Some(repository_listing(&files)), true);
+}
+
+/// More than the CLI reads in one command, so the cap is exercised.
+const REPOSITORY_QUANTIZATION_COUNT: usize = 15;
+
+#[given("a Hugging Face repository that holds only a multimodal projector")]
+async fn a_hub_repository_with_only_a_projector(world: &mut E2eWorld) {
+    start_stand_in_hub(
+        world,
+        Some(repository_listing(&[(
+            "mmproj-e2e-model-f16.gguf",
+            1_100_000,
+        )])),
+        true,
+    );
+}
+
+#[when("the user asks the CLI whether that repository would run, in machine-readable form")]
+async fn user_asks_about_a_bare_repository(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &["diagnose", "--model", UNCURATED_MODEL_REF, "--json"],
+    );
+}
+
+#[then(
+    "every quantization is answered in its own right, smallest first, and the projector is not among them"
+)]
+async fn assert_every_quantization_is_answered(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let rows = quantization_rows(&model);
+    let files: Vec<String> = rows
+        .iter()
+        .map(|row| row["file"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    let expected: Vec<String> = REPOSITORY_QUANTIZATIONS
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect();
+    assert_eq!(
+        files, expected,
+        "smallest first, projector excluded: {model:#}"
+    );
+    assert_eq!(
+        rows.iter().map(row_label).collect::<Vec<String>>(),
+        ["Q2_K", "Q4_K_M", "Q8_0"],
+        "each row is named by its own quantization: {model:#}"
+    );
+    // Each row carries figures read from its own file, not one file's figures
+    // repeated: the declared sizes differ, so the weights must differ too.
+    let weights: Vec<u64> = rows
+        .iter()
+        .map(|row| {
+            row["weights_bytes"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("a row carries no weights: {row:#}"))
+        })
+        .collect();
+    assert!(
+        weights[0] < weights[1] && weights[1] < weights[2],
+        "every quantization was sized from one shared header: {weights:?}"
+    );
+}
+
+#[then("the endpoint was asked for the file list and one header per quantization")]
+async fn assert_the_hub_was_asked_once_per_quantization(world: &mut E2eWorld) {
+    assert_eq!(
+        hub_connections(world),
+        1 + REPOSITORY_QUANTIZATIONS.len(),
+        "one listing request and one header read per quantization, and nothing for the projector"
+    );
+}
+
+#[then("the quantizations past the cap are reported as not estimated, with the reason")]
+async fn assert_the_quantizations_past_the_cap_say_why(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let rows = quantization_rows(&model);
+    assert_eq!(
+        rows.len(),
+        REPOSITORY_QUANTIZATION_COUNT,
+        "every quantization gets a row, read or not: {model:#}"
+    );
+    let unread: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row["answer"] == "not_estimated")
+        .collect();
+    assert_eq!(
+        unread.len(),
+        REPOSITORY_QUANTIZATION_COUNT - MAX_PROBED_QUANTIZATIONS,
+        "{model:#}"
+    );
+    for row in unread {
+        assert_eq!(row["reason"], "too_many_quantizations", "{row:#}");
+        assert!(
+            row["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("ask about this one by name")),
+            "a row that was not read has to say what to do about it: {row:#}"
+        );
+    }
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains("not estimated, for the reason on its row"),
+        "an incomplete answer must not read as a complete one: {model:#}"
+    );
+}
+
+#[then("the endpoint was asked for no more headers than the cap allows")]
+async fn assert_the_hub_was_asked_no_more_than_the_cap(world: &mut E2eWorld) {
+    assert_eq!(
+        hub_connections(world),
+        1 + MAX_PROBED_QUANTIZATIONS,
+        "the cap has to stop the requests, not only the wording"
+    );
+}
+
+#[then("the CLI says the repository holds no language model, and no header was read")]
+async fn assert_a_projector_only_repository_has_nothing_to_size(world: &mut E2eWorld) {
     assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
     let model = model_section(world);
     let evidence = evidence_text(&model);
     assert!(
         evidence.contains(&format!(
-            "`{UNCURATED_MODEL_REF}` names a repository, not a model file: add `:QUANT`"
+            "every GGUF file in `{UNCURATED_MODEL_REF}` is a multimodal projector (mmproj), not \
+             a language model, so there is nothing to size"
         )),
         "{model:#}"
     );
+    assert!(
+        quantization_rows(&model).is_empty(),
+        "a projector was offered as a quantization: {model:#}"
+    );
+    assert_eq!(
+        hub_connections(world),
+        1,
+        "only the file list may be asked for when there is no language model to size"
+    );
+}
+
+#[then("every quantization was sized at 8192 tokens")]
+async fn assert_every_quantization_was_sized_at_the_context_asked_for(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    assert_eq!(
+        model_field(&model, "quantizations")["context_size"],
+        8192,
+        "{model:#}"
+    );
+    let rows = quantization_rows(&model);
+    assert_eq!(rows.len(), REPOSITORY_QUANTIZATIONS.len(), "{model:#}");
+    for row in &rows {
+        assert_eq!(
+            row["context_size"], 8192,
+            "a row was sized for another context: {row:#}"
+        );
+    }
     assert!(
         model.get("estimate").is_none_or(serde_json::Value::is_null),
         "a repository was estimated as if it were one file: {model:#}"

@@ -190,6 +190,12 @@ pub(crate) enum Command {
         ///
         /// Takes a curated model name or alias (see `rocm model`), or a GGUF
         /// model: a local `.gguf` path, or `owner/repo:QUANT` on Hugging Face.
+        /// A bare `owner/repo`, with no quantization, names the repository
+        /// rather than one file and is answered for every quantization it
+        /// publishes - one row each, smallest first, with the file's size and
+        /// its verdict, a header read per file; the twelve smallest at most,
+        /// and only as far as the two-minute budget reaches, with the rest
+        /// listed as not estimated and the reason given rather than guessed.
         /// No weights are downloaded. A curated model is answered from its
         /// recipe and this host's GPU. A GGUF outside the catalog is estimated
         /// from its file header (for a remote file: one repository listing, a

@@ -50,6 +50,7 @@ use crate::gguf_fit::{
     CannotEstimateReason, ContextEstimate, ESTIMATE_CAVEAT, EstimateOutcome, FitRequest,
     KvCacheType, SERVE_CONTEXT_NOTE, SERVE_OPTIONS_NOTE, estimate_fit, evidence_lines, tokens,
 };
+use crate::gguf_repo_fit::{RepositoryFit, repository_fit_lines};
 use crate::gguf_source::{GgufRef, GgufSource, ProjectorNamed, parse_gguf_ref};
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +267,15 @@ pub struct ModelReadiness {
     /// recipe's tested minimum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<ContextEstimate>,
+    /// Every quantization of a Hugging Face repository named without one, each
+    /// with its own estimate or the reason it has none. Set by
+    /// [`crate::gguf_repo_fit::attach_repository_fit`]; `None` for every
+    /// reference that names one model file.
+    ///
+    /// Beside `estimate` rather than inside it: an estimate is one file's
+    /// figures, and this is a list of files, some of which have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantizations: Option<RepositoryFit>,
 }
 
 impl ModelReadiness {
@@ -293,6 +303,7 @@ impl ModelReadiness {
             undetermined_reason: Some(reason),
             warnings: Vec::new(),
             estimate: None,
+            quantizations: None,
         }
     }
 }
@@ -521,6 +532,7 @@ fn assess(
         undetermined_reason: None,
         warnings: recipe.warnings.clone(),
         estimate: None,
+        quantizations: None,
     };
 
     // Ordered by what pre-empts what. The engine gate comes first because a
@@ -917,17 +929,14 @@ fn plan_context_estimate(readiness: &ModelReadiness, request: &ContextRequest) -
                 .to_owned(),
         );
     };
-    // `owner/repo` with no quantization names a repository, not a file, and a
-    // repository is not read (every file in it is a different model). Without a
-    // context flag the answer is the plain "not in the catalog" it always was,
-    // reached without touching the network; with one, the user is told what
-    // would make it answerable.
+    // `owner/repo` with no quantization names a repository, not one file, and
+    // one file is all this path can size. It is not left unanswered: every
+    // quantization in it is sized by `gguf_repo_fit::attach_repository_fit`,
+    // which the caller runs beside this, and which applies the same
+    // `--context-size` and `--kv-cache-type` to each row -- so no note about a
+    // flag that did not apply is owed here.
     if matches!(reference, GgufRef::Hub { variant: None, .. }) {
-        return leave(format!(
-            "`{}` names a repository, not a model file: add `:QUANT` (for example \
-             `:Q4_K_M`) to estimate one of its GGUF files",
-            readiness.model_ref
-        ));
+        return ContextPlan::LeaveAsIs { note: None };
     }
     ContextPlan::Estimate {
         reference,
@@ -1285,6 +1294,15 @@ pub fn note_unverified_mask(readiness: &mut ModelReadiness, mask_set: bool, gpu_
     {
         estimate.notes.push(MASK_UNVERIFIED_NOTE.to_owned());
     }
+    // A repository's rows were compared against the same figure one file's
+    // estimate is, so the same doubt applies to every one of them. Carried on
+    // the answer rather than on each row: the caveat is about which card was
+    // measured, which is one fact about the host, not one per quantization.
+    if let Some(fit) = readiness.quantizations.as_ref()
+        && fit.estimated() > 0
+    {
+        readiness.warnings.push(MASK_UNVERIFIED_NOTE.to_owned());
+    }
 }
 
 /// The word this verdict is reported under.
@@ -1310,7 +1328,19 @@ fn header_label(readiness: &ModelReadiness) -> String {
             "ESTIMATED: does not fit at {} (calibrated on one MI300X, not a tested minimum)",
             tokens(estimate.context_size)
         ),
-        _ => verdict_label(readiness.verdict).to_owned(),
+        // A repository has no single verdict: how many of its quantizations
+        // fit is the answer, and "0 of 14" is as clear a no as a single
+        // estimate's is.
+        _ => match &readiness.quantizations {
+            Some(fit) if fit.compared() > 0 => format!(
+                "ESTIMATED: {} of {} quantizations fit at {} (calibrated on one MI300X, not a \
+                 tested minimum)",
+                fit.fitting(),
+                fit.quantizations.len(),
+                tokens(fit.context_size)
+            ),
+            _ => verdict_label(readiness.verdict).to_owned(),
+        },
     }
 }
 
@@ -1336,6 +1366,19 @@ pub fn render_model_readiness_text(readiness: &ModelReadiness) -> String {
     }
     for line in &readiness.evidence {
         let _ = writeln!(out, "   - {line}");
+    }
+    // The per-quantization table, laid out like the alternatives below it: a
+    // heading at the evidence indent, its rows one step further in.
+    if let Some(fit) = &readiness.quantizations
+        && !fit.quantizations.is_empty()
+    {
+        let mut lines = repository_fit_lines(fit).into_iter();
+        if let Some(heading) = lines.next() {
+            let _ = writeln!(out, "   {heading}");
+        }
+        for row in lines {
+            let _ = writeln!(out, "     {row}");
+        }
     }
     if let Some(estimate) = &readiness.estimate
         && !estimate.suggestions.is_empty()
@@ -1383,7 +1426,11 @@ pub fn render_model_readiness_text(readiness: &ModelReadiness) -> String {
         }
     }
     for warning in &readiness.warnings {
-        let label = if readiness.estimate.is_some() {
+        // "recipe note" is for a curated recipe's own warnings. A warning that
+        // came with an estimate -- one file's, or a repository's rows -- is
+        // about the figures, and calling it a recipe note would credit it to a
+        // recipe that was never read.
+        let label = if readiness.estimate.is_some() || readiness.quantizations.is_some() {
             "note"
         } else {
             "recipe note"
@@ -2383,14 +2430,23 @@ mod tests {
                 },
             }
         );
-        let not_gguf = not_curated("some-lab/never-curated-7b");
-        assert_eq!(
-            plan_context_estimate(&not_gguf, &ContextRequest::default()),
-            ContextPlan::LeaveAsIs { note: None }
-        );
+        // A bare repository is left to `gguf_repo_fit::attach_repository_fit`,
+        // which sizes every quantization in it at the context asked for -- so
+        // this step neither estimates it nor owes an explanation for a flag,
+        // with or without one.
+        let repository = not_curated("some-lab/never-curated-7b");
+        for request in [ContextRequest::default(), asked(8192)] {
+            assert_eq!(
+                plan_context_estimate(&repository, &request),
+                ContextPlan::LeaveAsIs { note: None },
+                "{request:?}"
+            );
+        }
+        // A reference that is not a GGUF at all still is.
+        let not_gguf = not_curated("not-a-gguf-at-all");
         assert!(matches!(
             plan_context_estimate(&not_gguf, &asked(8192)),
-            ContextPlan::LeaveAsIs { note: Some(note) } if note.contains("add `:QUANT`")
+            ContextPlan::LeaveAsIs { note: Some(note) } if note.contains("GGUF models only")
         ));
         // Flags that were passed are carried as given, not replaced by defaults.
         let both = ContextRequest {
@@ -2665,38 +2721,90 @@ mod tests {
         );
     }
 
+    /// `owner/repo` with no quantization names a repository, not one file, so
+    /// this step opens nothing for it and leaves the answer exactly as it was,
+    /// with or without a context flag. The repository is answered instead by
+    /// `gguf_repo_fit::attach_repository_fit`, which sizes every quantization
+    /// in it; `every_quantization_of_a_repository_gets_its_own_header_read_smallest_first`
+    /// in `gguf_source.rs` is what shows that read happening.
     #[test]
-    fn a_bare_repository_is_answered_as_before_and_read_nowhere() {
-        // `owner/repo` with no quantization names a repository, not a file. With
-        // no context flag the answer is exactly the plain "not in the catalog"
-        // one, reached without touching the network or the disk.
+    fn a_bare_repository_is_not_opened_as_one_file() {
         let plain = not_curated("some-lab/never-curated-7b");
-        let mut readiness = plain.clone();
         let source = FakeSource::weights(64);
-        attach_context_estimate(
-            &mut readiness,
-            &ContextRequest::default(),
-            &host_with(24.0, 64.0),
-            &source,
+        for request in [ContextRequest::default(), asked(8192)] {
+            let mut readiness = plain.clone();
+            attach_context_estimate(&mut readiness, &request, &host_with(24.0, 64.0), &source);
+            assert_eq!(readiness, plain, "{request:?}");
+            assert_eq!(source.calls(), 0, "{request:?}");
+            assert!(readiness.estimate.is_none() && readiness.route.is_some());
+        }
+    }
+
+    /// The repository answer as a reader sees it: the label says how many of
+    /// its quantizations fit rather than giving one verdict, and the table is a
+    /// heading at the evidence indent with its rows one step further in, as the
+    /// alternatives below it are. The figures themselves are
+    /// `gguf_repo_fit`'s; what is held here is that they reach the report.
+    #[test]
+    fn a_repository_answer_is_labelled_by_how_many_fit_and_its_rows_are_indented() {
+        use crate::gguf_repo_fit::repository_fit;
+        use crate::gguf_source::{QuantProbe, QuantProbeOutcome, RepositoryProbe};
+        let header = parse_gguf_header(&mut std::io::Cursor::new(
+            crate::gguf::test_builder::llama_like(10).file(0),
+        ))
+        .expect("a header");
+        let quant = |name: &str, weights: u64| QuantProbe {
+            file: name.to_owned(),
+            size: Some(header.data_offset + weights),
+            outcome: QuantProbeOutcome::Read(Box::new(header.clone())),
+        };
+        let host = host_with(24.0, 64.0);
+        let fit = repository_fit(
+            "some-lab/never-curated-7b",
+            RepositoryProbe {
+                quants: vec![
+                    quant("m-Q4_K_M.gguf", 4 << 30),
+                    quant("m-F16.gguf", 60 << 30),
+                ],
+                projectors: 0,
+            },
+            &FitRequest {
+                context_size: 4096,
+                context_size_defaulted: true,
+                kv_cache_type: KvCacheType::F16,
+            },
+            &host,
         );
-        assert_eq!(readiness, plain);
-        assert_eq!(source.calls(), 0);
-        assert!(readiness.estimate.is_none() && readiness.route.is_some());
-        // With a flag, the user is told what would make it answerable -- still
-        // without reading anything.
-        attach_context_estimate(
-            &mut readiness,
-            &asked(8192),
-            &host_with(24.0, 64.0),
-            &source,
-        );
-        assert_eq!(source.calls(), 0);
-        assert!(readiness.estimate.is_none());
+        let mut readiness = not_curated("some-lab/never-curated-7b");
+        readiness.quantizations = Some(fit);
         let text = render_model_readiness_text(&readiness);
         assert!(
-            text.contains("names a repository, not a model file: add `:QUANT`"),
+            text.lines().next().is_some_and(|line| line.ends_with(
+                "ESTIMATED: 1 of 2 quantizations fit at 4096 tokens (calibrated on one MI300X, \
+                 not a tested minimum)"
+            )),
             "{text}"
         );
+        assert!(
+            text.contains(
+                "   quantizations of some-lab/never-curated-7b, smallest first, at 4096 tokens:"
+            ),
+            "{text}"
+        );
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("     Q4_K_M") || line.starts_with("     F16"))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both rows have to be indented one step past the heading:\n{text}"
+        );
+        assert!(rows[0].contains("fits: about"), "{text}");
+        assert!(rows[1].contains("does not fit: about"), "{text}");
+        // An answer with no repository behind it grows no table.
+        let plain = render_model_readiness_text(&not_curated("some-lab/never-curated-7b"));
+        assert!(!plain.contains("quantizations of"), "{plain}");
     }
 
     /// The command a GGUF plan offers asks the same question again: the flags

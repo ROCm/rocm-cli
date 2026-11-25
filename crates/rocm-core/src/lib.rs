@@ -29,6 +29,7 @@ pub mod fix;
 mod gfx_target;
 pub mod gguf;
 pub mod gguf_fit;
+pub mod gguf_repo_fit;
 pub mod gguf_source;
 pub mod hardware_root;
 pub mod host_gpu;

@@ -775,6 +775,7 @@ mod tests {
             undetermined_reason: None,
             warnings: Vec::new(),
             estimate: None,
+            quantizations: None,
         };
         let readiness_text = rocm_core::model_readiness::render_model_readiness_text(&readiness);
         report.model = Some(readiness);

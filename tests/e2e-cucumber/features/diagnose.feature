@@ -848,14 +848,15 @@ Feature: Diagnosing failures and listing fixes
     And the plan is to ask again about that path
 
   # owner/repo with no :QUANT names a repository, and every file in it is a
-  # different model, so nothing is read; with a context size the user is told
-  # what would make it answerable. The stand-in hub shows no request was made.
-  @id:diagnose-a-bare-repository-with-a-context-size-asks-for-a-quantization
-  Scenario: diagnose-56 - A bare repository with a context size is told to name a quantization, and nothing is fetched
-    Given a Hugging Face endpoint that records every request made to it
+  # different model. The CLI used to answer that by asking the user to pick one
+  # blind; it now sizes each of them, and `--context-size` applies to every row
+  # rather than to nothing. The repository is named with no quantization and the
+  # context size is asked for, so a row sized at the default would show.
+  @id:diagnose-a-bare-repository-with-a-context-size-sizes-every-quantization
+  Scenario: diagnose-56 - A bare repository with a context size sizes every quantization at that size
+    Given a Hugging Face repository publishing three quantizations and a multimodal projector
     When the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form
-    Then the answer says the reference names a repository and asks for a quantization
-    And no request reached the endpoint
+    Then every quantization was sized at 8192 tokens
 
   # A quantization that matches nothing lists what the repository does hold,
   # and a multimodal projector is among the files listed, marked as one, rather
@@ -1407,3 +1408,48 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI reports the kernel's own SVM mapping failure as the cause
     When that machine's kernel log no longer carries the failure, and the CLI is asked again
     Then the report says only that the recent log was read, not that the machine never failed
+  # The question a user who does not know which quantization to pick actually
+  # has. A GGUF repository publishes the same model a dozen times over at sizes
+  # that differ by a factor of five, and naming one of them is what the CLI used
+  # to require. Naming the repository now answers for every quantization in it.
+  #
+  # The projector is the control: a repository's mmproj file is a GGUF, is not a
+  # language model, and must neither be sized nor fetched. The weights assertion
+  # is the other one: the three files are declared at three sizes, so three rows
+  # carrying three different weight figures is what shows a header was read per
+  # file rather than one header's figures repeated -- which is the design
+  # decision behind the whole feature, and the one a shortcut would break
+  # invisibly.
+  @id:diagnose-a-bare-repository-answers-for-every-quantization
+  Scenario: diagnose-92 - A repository named without a quantization is answered for every quantization it publishes
+    Given a Hugging Face repository publishing three quantizations and a multimodal projector
+    When the user asks the CLI whether that repository would run, in machine-readable form
+    Then every quantization is answered in its own right, smallest first, and the projector is not among them
+    And the endpoint was asked for the file list and one header per quantization
+
+  # A header per quantization is a request per quantization, so a repository of
+  # a hundred files would be a hundred requests. The cap stops the reading, and
+  # the quantizations past it are rows that say why they were not read rather
+  # than rows left out -- an answer that silently listed only the first twelve
+  # would read as the whole repository.
+  #
+  # The request count is the assertion that matters: the wording can be printed
+  # by a build that went on fetching regardless.
+  @id:diagnose-a-repository-past-the-probe-cap-says-which-were-not-read
+  Scenario: diagnose-93 - A repository with more quantizations than one command reads stops asking and says which it did not read
+    Given a Hugging Face repository publishing fifteen quantizations
+    When the user asks the CLI whether that repository would run, in machine-readable form
+    Then the quantizations past the cap are reported as not estimated, with the reason
+    And the endpoint was asked for no more headers than the cap allows
+
+  # The empty case, which must not read like a complete one. A repository whose
+  # only GGUF is a multimodal projector has nothing a context estimate applies
+  # to, and a table with no rows under it would read as "nothing fits". It says
+  # which kind of nothing it found, and reads no header to find out: the file
+  # list alone settles it, as diagnose-52 relies on for a projector named
+  # exactly.
+  @id:diagnose-a-repository-of-only-projectors-has-nothing-to-size
+  Scenario: diagnose-94 - A repository whose only GGUF files are multimodal projectors is told it holds no language model
+    Given a Hugging Face repository that holds only a multimodal projector
+    When the user asks the CLI whether that repository would run, in machine-readable form
+    Then the CLI says the repository holds no language model, and no header was read

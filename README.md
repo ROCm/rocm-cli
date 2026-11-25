@@ -1484,9 +1484,9 @@ Some references are handled specially:
   projector file is not recognized as one; it is read like any other GGUF.
 - A file that exists on this machine is read as that file even when its name
   looks like `owner/repo:QUANT`.
-- A bare `owner/repo`, with no quantization, names a repository instead of a
-  file and is answered like any other model outside the catalog: undetermined,
-  with nothing read.
+- A bare `owner/repo`, with no quantization, names a repository rather than a
+  file, and is answered for every quantization it publishes — see
+  [a whole repository at once](#a-whole-repository-at-once) below.
 
 Instead of a recipe's minimum, `diagnose` reads the file's header, which holds
 the layer count, the KV head count and head width, and the tensor shapes. For a
@@ -1512,6 +1512,29 @@ The answer is labeled `ESTIMATED: fits at N tokens` or
 `ESTIMATED: does not fit at N tokens`, never `ready` or `blocked`: in `--json`
 the `verdict` stays `undetermined` and the figures are under `model.estimate`.
 It reports the largest context that fits with that KV cache type.
+
+##### A whole repository at once
+
+A GGUF repository usually publishes the same model at a dozen quantizations,
+and picking one before you know which your GPU can hold is guesswork. Name the
+repository with no `:QUANT` and every quantization in it is answered at once:
+
+```
+rocm diagnose --model owner/repo
+```
+
+The report lists them smallest first, each with its quantization, the size of
+its file and its verdict, so the one a modest machine can run is at the top.
+`--context-size` and `--kv-cache-type` apply to every row.
+
+Each row is read from its own file's header: the weights are a file's size less
+*its* header, so one quantization's header is never reused to size another.
+That costs one request per quantization, so the read is bounded twice — the
+twelve smallest quantizations at most, and the same two-minute budget for the
+whole repository. Anything past either is listed as **not estimated**, with the
+reason, and never guessed; naming that quantization on its own sizes it. A
+multimodal projector is not a language model and is left out, and a repository
+whose only GGUF files are projectors says so rather than showing an empty list.
 
 When the file does not fit at the size you asked for, it lists what would make
 it fit:

@@ -2450,8 +2450,29 @@ Expected result:
 - `rocm serve` is unchanged: it takes no context-size option, and the report
   names llama.cpp's options only as llama.cpp's.
 
-Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
-`--context-size`, says a quantization is needed; a repository that does not
+Then ask about the repository itself, with no `:QUANT`:
+
+```bash
+rocm diagnose --model <owner>/<repo> --context-size 8192
+```
+
+Expected result:
+
+- The report opens `ESTIMATED: N of M quantizations fit at 8192 tokens` and
+  lists them smallest first, each row naming its quantization, the size of its
+  file and whether it fits.
+- The sizes match what the repository shows on Hugging Face, and the rows
+  carry different totals: one header is read per file, so two quantizations
+  must not report the same figure.
+- A repository publishing more than twelve quantizations lists the rest as not
+  estimated, saying that only the twelve smallest are read in one command.
+- No `mmproj-*.gguf` appears as a quantization.
+- The whole thing finishes within two minutes, or says which quantizations the
+  budget did not reach.
+- Asking about one of the quantizations by name (`<owner>/<repo>:<QUANT>`)
+  gives the full breakdown for it, and its total agrees with that row.
+
+Also check the refusals: a repository that does not
 exist says it was not found; a `.gguf` path that does not exist says it could
 not be opened and does not point at the upstream tracker; and naming a vision
 model's `mmproj-*.gguf` file on Hugging Face (`owner/repo:mmproj-....gguf`) says

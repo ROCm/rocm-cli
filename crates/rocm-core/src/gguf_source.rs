@@ -16,8 +16,10 @@
 //! rather than streamed, because streaming it is exactly the download this
 //! exists to avoid.
 
+use crate::gguf::GgufHeader;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -37,6 +39,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// sixteen minutes.
 const TOTAL_BUDGET: Duration = Duration::from_mins(2);
 const DEFAULT_HUB: &str = "https://huggingface.co";
+/// The most quantizations one repository probe reads a header for.
+///
+/// A GGUF repository publishes a dozen or so; each header is its own range
+/// read, so an unbounded loop over a repository with a hundred files would make
+/// a hundred requests. The ones past this are reported as not estimated, with
+/// the reason, rather than left out.
+pub const MAX_PROBED_QUANTIZATIONS: usize = 12;
 
 /// A model reference that names a GGUF file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +53,9 @@ pub enum GgufRef {
     /// A path on this machine.
     Local(PathBuf),
     /// `owner/repo` on Hugging Face, with the quantization label or file name
-    /// after a colon. The variant is optional here so that a reference without
-    /// one can be refused with a message, not mistaken for something else.
+    /// after a colon. The variant is optional because a reference without one
+    /// names the whole repository, which is answered for every quantization in
+    /// it ([`GgufSource::probe_quantizations`]) rather than as one file.
     Hub {
         owner: String,
         repo: String,
@@ -76,7 +86,7 @@ fn is_safe_component(component: &str) -> bool {
 /// A file name may also carry `+`, which hub file names do (`m+x-Q4_K_M.gguf`):
 /// it reaches the hub percent-encoded, so it is as safe as the other characters,
 /// and refusing it would leave such a file impossible to name exactly.
-fn is_safe_variant(variant: &str) -> bool {
+pub(crate) fn is_safe_variant(variant: &str) -> bool {
     if is_safe_component(variant) {
         return true;
     }
@@ -91,10 +101,10 @@ fn is_safe_variant(variant: &str) -> bool {
 /// A file that exists on this machine is that file, whatever its name looks
 /// like. Otherwise `owner/repo:variant` is a Hugging Face repository, a name
 /// ending in `.gguf` is a local path (that does not exist, so it is reported as
-/// not openable rather than sent to the hub), and a bare `owner/repo` is a
-/// repository with no variant, recognised so the caller can say a quantization is
-/// needed. Returns `None` for names, aliases and anything else, so a catalog model
-/// never reaches this module.
+/// not openable rather than sent to the hub), and a bare `owner/repo` is the
+/// repository itself, which [`GgufSource::probe_quantizations`] answers for
+/// every quantization in it. Returns `None` for names, aliases and anything
+/// else, so a catalog model never reaches this module.
 #[must_use]
 pub fn parse_gguf_ref(model_ref: &str) -> Option<GgufRef> {
     parse_gguf_ref_with(model_ref, &|path| path.is_file())
@@ -385,6 +395,96 @@ fn names_for_error(files: &[&HubFile]) -> String {
     }
 }
 
+/// The language-model GGUFs of a repository, one entry per quantization,
+/// smallest first.
+///
+/// Multimodal projectors are left out ([`names_projector`]): they are not
+/// language models, so there is nothing to size them against. The shards of one
+/// split model collapse to their lowest-numbered shard, so a four-way split is
+/// one entry rather than four. A file the listing did not size sorts last,
+/// because its size is only learnt by asking for it.
+///
+/// Smallest first is also the order [`LiveGgufSource::probe_quantizations`]
+/// reads headers in: a run the budget cuts short then answers a contiguous run
+/// of the smallest quantizations, which are the ones a host that cannot take
+/// the whole repository is most likely to be able to run.
+#[must_use]
+pub fn repository_quantizations(files: &[HubFile]) -> Vec<HubFile> {
+    let mut singles: Vec<HubFile> = Vec::new();
+    let mut sets: BTreeMap<String, (u32, HubFile)> = BTreeMap::new();
+    for file in files
+        .iter()
+        .filter(|file| file.name.to_ascii_lowercase().ends_with(".gguf"))
+        .filter(|file| !names_projector(&file.name))
+    {
+        match shard_parts(&file.name) {
+            Some((set, index)) => {
+                let lowest = sets.entry(set).or_insert_with(|| (index, file.clone()));
+                if index < lowest.0 {
+                    *lowest = (index, file.clone());
+                }
+            }
+            None => singles.push(file.clone()),
+        }
+    }
+    let mut all = singles;
+    all.extend(sets.into_values().map(|(_, file)| file));
+    all.sort_by(|left, right| {
+        left.size
+            .is_none()
+            .cmp(&right.size.is_none())
+            .then(left.size.cmp(&right.size))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    all
+}
+
+/// Why a quantization of a repository has no header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotProbed {
+    /// The shared deadline passed before this file's header was read.
+    BudgetSpent,
+    /// The repository holds more quantizations than one command reads
+    /// ([`MAX_PROBED_QUANTIZATIONS`]).
+    TooManyQuantizations,
+    /// The header was asked for and could not be read.
+    Unreadable,
+}
+
+/// What reading one quantization's header found.
+#[derive(Debug)]
+pub enum QuantProbeOutcome {
+    /// The header, read inside the budget.
+    Read(Box<GgufHeader>),
+    /// No header, and why not, in words.
+    NotRead { reason: NotProbed, detail: String },
+}
+
+/// One quantization of a repository, as a probe found it.
+#[derive(Debug)]
+pub struct QuantProbe {
+    /// The GGUF file in the repository, by full name.
+    pub file: String,
+    /// The size of the whole file in bytes, when it is known: from the listing,
+    /// or from the `HEAD` the probe sent when the listing left it out. `None`
+    /// for a file that was never reached.
+    pub size: Option<u64>,
+    pub outcome: QuantProbeOutcome,
+}
+
+/// Every language-model GGUF of a repository, each with its header or the
+/// reason it has none.
+#[derive(Debug)]
+pub struct RepositoryProbe {
+    /// One entry per quantization, smallest first, as
+    /// [`repository_quantizations`] ordered them.
+    pub quants: Vec<QuantProbe>,
+    /// How many GGUF files of the repository are multimodal projectors, which
+    /// are not language models and are left out of `quants`. Counted so a
+    /// repository with nothing to size can say which kind of nothing it has.
+    pub projectors: usize,
+}
+
 /// `Read + Seek`, as one object-safe trait.
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
@@ -458,6 +558,24 @@ pub trait GgufSource {
     /// its file name) is a multimodal projector: then the error is a
     /// [`ProjectorNamed`], which a caller can downcast to.
     fn open(&self, reference: &GgufRef) -> Result<OpenedGguf>;
+
+    /// Read a GGUF header for each quantization a repository publishes, under
+    /// one shared budget.
+    ///
+    /// A header per file, never one header reused with the others' sizes: the
+    /// weights are the file's size less *its* header, and the input embedding
+    /// is clamped against *its* next tensor, so a borrowed header would state
+    /// another file's breakdown with this file's confidence. A quantization the
+    /// budget or [`MAX_PROBED_QUANTIZATIONS`] left unread comes back as
+    /// [`QuantProbeOutcome::NotRead`] with the reason, never as a guess.
+    ///
+    /// # Errors
+    ///
+    /// When the repository itself cannot be listed. A file that could not be
+    /// read is an entry of the answer, not an error.
+    fn probe_quantizations(&self, _owner: &str, _repo: &str) -> Result<RepositoryProbe> {
+        bail!("this model source does not read Hugging Face repositories")
+    }
 }
 
 /// The real source: the local filesystem and Hugging Face.
@@ -519,6 +637,43 @@ impl LiveGgufSource {
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
+    }
+
+    /// Where one file of a repository is fetched from: each path segment
+    /// percent-encoded, never handed to the filesystem.
+    fn hub_file_url(&self, owner: &str, repo: &str, name: &str) -> String {
+        let path: Vec<String> = name
+            .split('/')
+            .map(crate::report_delivery::percent_encode)
+            .collect();
+        format!(
+            "{}/{owner}/{repo}/resolve/main/{}",
+            self.hub,
+            path.join("/")
+        )
+    }
+
+    /// Read one quantization's header, and the size it was sized against.
+    fn read_one_header(
+        &self,
+        agent: &ureq::Agent,
+        owner: &str,
+        repo: &str,
+        file: &HubFile,
+        deadline: Instant,
+    ) -> Result<(GgufHeader, u64)> {
+        let url = self.hub_file_url(owner, repo, &file.name);
+        // The listing carries a size for a file the hub stores whole; if it
+        // left one out, the file's own headers say -- at the cost of one more
+        // request from the same budget.
+        let size = match file.size {
+            Some(size) => size,
+            None => head_size(agent, &url, deadline)?,
+        };
+        let mut reader = RangedReader::new(agent.clone(), url, size).with_deadline(deadline);
+        let header = crate::gguf::parse_gguf_header(&mut reader)
+            .map_err(|error| anyhow!("the GGUF header could not be read: {error}"))?;
+        Ok((header, size))
     }
 
     fn list_files(
@@ -658,25 +813,17 @@ impl GgufSource for LiveGgufSource {
             } => {
                 let Some(variant) = variant else {
                     bail!(
-                        "`{owner}/{repo}` needs a quantization to read: use \
-                         `{owner}/{repo}:QUANT` (for example `{owner}/{repo}:Q4_K_M`) or a file \
-                         name ending in .gguf"
+                        "`{owner}/{repo}` names a repository, not one file: \
+                         `probe_quantizations` answers for every quantization in it, and `open` \
+                         needs one named, as `{owner}/{repo}:QUANT` (for example \
+                         `{owner}/{repo}:Q4_K_M`) or a file name ending in .gguf"
                     );
                 };
                 let agent = Self::agent();
                 let deadline = Instant::now() + self.budget;
                 let files = self.list_files(&agent, owner, repo, deadline)?;
                 let file = select_gguf_file(&files, variant)?;
-                let path: Vec<String> = file
-                    .name
-                    .split('/')
-                    .map(crate::report_delivery::percent_encode)
-                    .collect();
-                let url = format!(
-                    "{}/{owner}/{repo}/resolve/main/{}",
-                    self.hub,
-                    path.join("/")
-                );
+                let url = self.hub_file_url(owner, repo, &file.name);
                 // The listing carries a size for a file the hub stores whole; if
                 // it left one out, the file's own headers say.
                 let size = match file.size {
@@ -691,6 +838,76 @@ impl GgufSource for LiveGgufSource {
             }
         }
     }
+
+    fn probe_quantizations(&self, owner: &str, repo: &str) -> Result<RepositoryProbe> {
+        let agent = Self::agent();
+        // One deadline for the listing and every header after it. A deadline
+        // per file would let a repository of a dozen quantizations hold the
+        // command for twenty-four minutes.
+        let deadline = Instant::now() + self.budget;
+        let files = self.list_files(&agent, owner, repo, deadline)?;
+        let projectors = files
+            .iter()
+            .filter(|file| file.name.to_ascii_lowercase().ends_with(".gguf"))
+            .filter(|file| names_projector(&file.name))
+            .count();
+        let candidates = repository_quantizations(&files);
+        let mut quants = Vec::with_capacity(candidates.len());
+        for (index, file) in candidates.iter().enumerate() {
+            let not_read = |reason, detail| QuantProbe {
+                file: file.name.clone(),
+                size: file.size,
+                outcome: QuantProbeOutcome::NotRead { reason, detail },
+            };
+            if index >= MAX_PROBED_QUANTIZATIONS {
+                quants.push(not_read(
+                    NotProbed::TooManyQuantizations,
+                    format!(
+                        "only the {MAX_PROBED_QUANTIZATIONS} smallest quantizations of a \
+                         repository are read in one command; ask about this one by name to size \
+                         it"
+                    ),
+                ));
+                continue;
+            }
+            // Checked before the request rather than left to the request's own
+            // timeout, so a budget that is already spent costs no connection.
+            if Instant::now() >= deadline {
+                quants.push(not_read(
+                    NotProbed::BudgetSpent,
+                    budget_spent_detail(self.budget),
+                ));
+                continue;
+            }
+            match self.read_one_header(&agent, owner, repo, file, deadline) {
+                Ok((header, size)) => quants.push(QuantProbe {
+                    file: file.name.clone(),
+                    size: Some(size),
+                    outcome: QuantProbeOutcome::Read(Box::new(header)),
+                }),
+                // A read that failed *because* the shared deadline passed is
+                // the budget running out, not the file being unreadable: the
+                // next quantization would fail the same way whatever it holds.
+                Err(_) if Instant::now() >= deadline => quants.push(not_read(
+                    NotProbed::BudgetSpent,
+                    budget_spent_detail(self.budget),
+                )),
+                Err(error) => {
+                    quants.push(not_read(NotProbed::Unreadable, format!("{error:#}")));
+                }
+            }
+        }
+        Ok(RepositoryProbe { quants, projectors })
+    }
+}
+
+/// What a quantization the shared deadline cut off is told.
+fn budget_spent_detail(budget: Duration) -> String {
+    format!(
+        "the {} seconds a repository read has in all ran out before this file's header was \
+         reached; ask about this quantization by name to size it on its own",
+        budget.as_secs()
+    )
 }
 
 /// How long is left before `deadline`, as the timeout for the next request.
@@ -970,7 +1187,8 @@ mod tests {
                 variant: Some("model-Q4_K_M.gguf".into())
             })
         );
-        // A bare repository is recognised so it can be refused with a message.
+        // A bare repository is recognised as the repository itself, which is
+        // answered for every quantization in it rather than as one file.
         assert_eq!(
             parse_gguf_ref("owner/repo"),
             Some(GgufRef::Hub {
@@ -1502,7 +1720,10 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("needs a quantization"), "{error}");
+        assert!(
+            error.contains("names a repository, not one file"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2506,5 +2727,227 @@ mod tests {
         let encode = crate::report_delivery::percent_encode;
         assert_eq!(encode("m Q4+K.gguf"), "m%20Q4%2BK.gguf");
         assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    /// A listing of `(name, size)` pairs, as the hub returns it.
+    fn listing_of(files: &[(&str, u64)]) -> String {
+        let siblings: Vec<String> = files
+            .iter()
+            .map(|(name, size)| format!(r#"{{"rfilename":"{name}","size":{size}}}"#))
+            .collect();
+        format!(r#"{{"siblings":[{}]}}"#, siblings.join(","))
+    }
+
+    /// Which files of the repository were actually fetched, in request order
+    /// and without the repeats a multi-window read would make.
+    fn files_fetched(hub: &FakeHub) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for request in hub.requests.lock().unwrap().iter() {
+            let name = request
+                .rsplit("/resolve/main/")
+                .next()
+                .unwrap_or(request)
+                .to_owned();
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+        seen
+    }
+
+    /// Which quantizations a repository offers, and in what order they are
+    /// read: projectors are not models, the shards of one split model are one
+    /// entry, and the smallest comes first.
+    #[test]
+    fn a_repositorys_quantizations_drop_projectors_collapse_shards_and_sort_smallest_first() {
+        let files = [
+            file("m-Q8_0.gguf", 8),
+            file("mmproj-m-f16.gguf", 2),
+            file("m-Q2_K.gguf", 2),
+            file("notes.md", 1),
+            file("m-F16-00002-of-00003.gguf", 5),
+            file("m-F16-00001-of-00003.gguf", 5),
+            file("m-F16-00003-of-00003.gguf", 5),
+            HubFile {
+                name: "m-unsized.gguf".to_owned(),
+                size: None,
+            },
+        ];
+        let names: Vec<String> = repository_quantizations(&files)
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "m-Q2_K.gguf",
+                "m-F16-00001-of-00003.gguf",
+                "m-Q8_0.gguf",
+                "m-unsized.gguf",
+            ],
+            "projectors and non-GGUFs are left out, the three shards are one entry (the first), \
+             and a file the listing did not size comes last"
+        );
+    }
+
+    /// The repository arm reads one header per quantization -- never one header
+    /// reused for the rest -- and reads them smallest first. The hub's own
+    /// request log is the evidence: one file fetched per quantization, in size
+    /// order.
+    #[test]
+    fn every_quantization_of_a_repository_gets_its_own_header_read_smallest_first() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Honour,
+            listing_of(&[
+                ("m-Q8_0.gguf", 3 << 20),
+                ("mmproj-m-f16.gguf", 1 << 20),
+                ("m-Q2_K.gguf", 1 << 20),
+                ("m-Q4_K_M.gguf", 2 << 20),
+            ]),
+        );
+        let probe = LiveGgufSource::with_hub(&hub.base)
+            .probe_quantizations("o", "r")
+            .unwrap();
+        assert_eq!(probe.projectors, 1, "the projector is counted, not sized");
+        let read: Vec<(&str, bool)> = probe
+            .quants
+            .iter()
+            .map(|quant| {
+                (
+                    quant.file.as_str(),
+                    matches!(quant.outcome, QuantProbeOutcome::Read(_)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("m-Q2_K.gguf", true),
+                ("m-Q4_K_M.gguf", true),
+                ("m-Q8_0.gguf", true),
+            ]
+        );
+        // Each quantization is sized against its own file's size, which is what
+        // makes a per-file header necessary rather than one header scaled.
+        let sizes: Vec<Option<u64>> = probe.quants.iter().map(|quant| quant.size).collect();
+        assert_eq!(sizes, [Some(1 << 20), Some(2 << 20), Some(3 << 20)]);
+        assert_eq!(
+            files_fetched(&hub),
+            ["m-Q2_K.gguf", "m-Q4_K_M.gguf", "m-Q8_0.gguf"],
+            "the projector must never be fetched, and the order is smallest first"
+        );
+    }
+
+    /// The cap on how many quantizations one command reads is a cap on
+    /// requests, not only on what the output says: the files past it are never
+    /// asked for, and each is reported as not estimated with the reason.
+    #[test]
+    fn a_repository_larger_than_the_cap_stops_requesting_and_says_which_were_not_read() {
+        let over = MAX_PROBED_QUANTIZATIONS + 3;
+        let names: Vec<String> = (0..over)
+            .map(|index| format!("m-Q{index:02}_K.gguf"))
+            .collect();
+        let files: Vec<(&str, u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), (index as u64 + 1) << 20))
+            .collect();
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Honour,
+            listing_of(&files),
+        );
+        let probe = LiveGgufSource::with_hub(&hub.base)
+            .probe_quantizations("o", "r")
+            .unwrap();
+        assert_eq!(probe.quants.len(), over, "every quantization gets a row");
+        assert_eq!(
+            files_fetched(&hub).len(),
+            MAX_PROBED_QUANTIZATIONS,
+            "the cap must stop the requests, not just the wording"
+        );
+        for quant in &probe.quants[MAX_PROBED_QUANTIZATIONS..] {
+            assert!(
+                matches!(
+                    quant.outcome,
+                    QuantProbeOutcome::NotRead {
+                        reason: NotProbed::TooManyQuantizations,
+                        ..
+                    }
+                ),
+                "{quant:?}"
+            );
+        }
+        assert!(
+            probe.quants[..MAX_PROBED_QUANTIZATIONS]
+                .iter()
+                .all(|quant| matches!(quant.outcome, QuantProbeOutcome::Read(_))),
+            "{:?}",
+            probe.quants
+        );
+    }
+
+    /// The budget is shared by the whole repository read, so a hub too slow to
+    /// answer them all stops making requests rather than spending a fresh
+    /// deadline on each file. The request log is the proof: the quantizations
+    /// after the budget ran out were never asked for.
+    #[test]
+    fn a_repository_read_that_runs_out_of_budget_stops_requesting() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            // Every answer for a model file takes 1.5 s.
+            Serve::Slow,
+            listing_of(&[
+                ("m-Q2_K.gguf", 1 << 20),
+                ("m-Q4_K_M.gguf", 2 << 20),
+                ("m-Q5_K_M.gguf", 3 << 20),
+                ("m-Q8_0.gguf", 4 << 20),
+                ("m-F16.gguf", 5 << 20),
+            ]),
+        );
+        let began = Instant::now();
+        let probe = LiveGgufSource::with_hub(&hub.base)
+            .with_budget(Duration::from_secs(2))
+            .probe_quantizations("o", "r")
+            .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "a deadline per file would have taken 7.5 s: {:?}",
+            began.elapsed()
+        );
+        assert_eq!(probe.quants.len(), 5, "every quantization still gets a row");
+        let fetched = files_fetched(&hub);
+        assert!(
+            fetched.len() < 5,
+            "the budget did not stop the requests: {fetched:?}"
+        );
+        assert!(
+            probe
+                .quants
+                .iter()
+                .any(|quant| matches!(quant.outcome, QuantProbeOutcome::Read(_))),
+            "premise: at least one header must be read before the budget runs out, or this \
+             proves nothing about stopping: {:?}",
+            probe.quants
+        );
+        for quant in &probe.quants {
+            if !fetched.contains(&quant.file) {
+                assert!(
+                    matches!(
+                        quant.outcome,
+                        QuantProbeOutcome::NotRead {
+                            reason: NotProbed::BudgetSpent,
+                            ..
+                        }
+                    ),
+                    "`{}` was never fetched, so it has to say the budget ran out: {quant:?}",
+                    quant.file
+                );
+            }
+        }
     }
 }

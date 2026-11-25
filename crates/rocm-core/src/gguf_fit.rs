@@ -726,6 +726,19 @@ fn shown_parts(estimate: &ContextEstimate) -> Option<([u64; 4], u64)> {
     Some((parts, parts.iter().sum()))
 }
 
+/// What an estimate's parts come to, as a figure that has to cover a need.
+///
+/// Exactly the total [`evidence_lines`] prints after `= about N MiB`, read off
+/// the same [`shown_parts`] sum. `None` when the estimate carries no figures.
+///
+/// Public so a per-quantization row ([`crate::gguf_repo_fit`]) and the evidence
+/// lines for one file cannot state different totals for one estimate.
+#[must_use]
+pub fn shown_total_need(estimate: &ContextEstimate) -> Option<String> {
+    let (_, total) = shown_parts(estimate)?;
+    Some(need((total * MIB) as f64))
+}
+
 /// Estimate whether the model described by `header` fits at `request`.
 ///
 /// `file_size` is the size of the whole file in bytes; the weights are what
