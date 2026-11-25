@@ -2464,8 +2464,10 @@ Expected result:
 - The sizes match what the repository shows on Hugging Face, and the rows
   carry different totals: one header is read per file, so two quantizations
   must not report the same figure.
-- A repository publishing more than twelve quantizations lists the rest as not
-  estimated, saying that only the twelve smallest are read in one command.
+- A repository publishing more quantizations than one command reads (how many
+  that is, `rocm diagnose --help` says under `--model`) lists the rest as not
+  estimated, saying that only that many smallest are read in one command and to
+  ask about one of them by name.
 - No `mmproj-*.gguf` appears as a quantization.
 - The whole thing finishes within two minutes, or says which quantizations the
   budget did not reach.

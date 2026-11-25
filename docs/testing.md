@@ -6921,7 +6921,7 @@ shows the requests stopped (`diagnose-93`), and a repository holding only a
 projector, answered from the file list alone (`diagnose-94`).
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[3-5])'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[2-4])'
 ```
 
 ## Doctor Report Preflight

@@ -5056,13 +5056,18 @@ async fn user_asks_about_a_bare_repository_with_a_context_size(world: &mut E2eWo
     );
 }
 
-/// The three quantizations the repository fixtures publish, smallest first, and
-/// the size the listing declares for each. The fixture GGUF is about a
-/// megabyte, so a declared size is the window one header read fetches.
+/// The three quantizations the repository fixtures publish, and the size the
+/// listing declares for each. The fixture GGUF is about a megabyte, so a
+/// declared size is the window one header read fetches.
+///
+/// Declared **largest first, deliberately**, so that the order the hub serves
+/// and the order the answer must print disagree. Against a fixture already in
+/// size order, a scenario asserting "smallest first" passes whether or not
+/// anything sorts.
 const REPOSITORY_QUANTIZATIONS: [(&str, u64); 3] = [
+    ("e2e-model-Q8_0.gguf", 1_600_000),
     ("e2e-model-Q2_K.gguf", 1_200_000),
     ("e2e-model-Q4_K_M.gguf", 1_400_000),
-    ("e2e-model-Q8_0.gguf", 1_600_000),
 ];
 
 /// A repository listing of `(file, size)` pairs, as the hub returns it.
@@ -5155,10 +5160,12 @@ async fn assert_every_quantization_is_answered(world: &mut E2eWorld) {
         .iter()
         .map(|row| row["file"].as_str().unwrap_or_default().to_owned())
         .collect();
-    let expected: Vec<String> = REPOSITORY_QUANTIZATIONS
-        .iter()
-        .map(|(name, _)| (*name).to_owned())
-        .collect();
+    // Sorted here rather than taken in declaration order: the fixture is
+    // declared largest first on purpose, so this is what makes the assertion
+    // name an order the hub did not serve.
+    let mut by_size = REPOSITORY_QUANTIZATIONS;
+    by_size.sort_by_key(|(_, size)| *size);
+    let expected: Vec<String> = by_size.iter().map(|(name, _)| (*name).to_owned()).collect();
     assert_eq!(
         files, expected,
         "smallest first, projector excluded: {model:#}"

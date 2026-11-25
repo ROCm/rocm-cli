@@ -1430,7 +1430,7 @@ Feature: Diagnosing failures and listing fixes
   # A header per quantization is a request per quantization, so a repository of
   # a hundred files would be a hundred requests. The cap stops the reading, and
   # the quantizations past it are rows that say why they were not read rather
-  # than rows left out -- an answer that silently listed only the first twelve
+  # than rows left out -- an answer that silently listed only the ones it read
   # would read as the whole repository.
   #
   # The request count is the assertion that matters: the wording can be printed

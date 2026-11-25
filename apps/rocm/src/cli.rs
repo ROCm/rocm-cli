@@ -193,7 +193,7 @@ pub(crate) enum Command {
         /// A bare `owner/repo`, with no quantization, names the repository
         /// rather than one file and is answered for every quantization it
         /// publishes - one row each, smallest first, with the file's size and
-        /// its verdict, a header read per file; the twelve smallest at most,
+        /// its verdict, a header read per file; the 12 smallest at most,
         /// and only as far as the two-minute budget reaches, with the rest
         /// listed as not estimated and the reason given rather than guessed.
         /// No weights are downloaded. A curated model is answered from its
@@ -1630,6 +1630,38 @@ mod tests {
         }
         let over = (rocm_core::gguf_fit::MAX_CONTEXT_SIZE + 1).to_string();
         assert!(parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", &over]).is_err());
+    }
+
+    // How many quantizations of one repository `rocm diagnose --model` reads is
+    // `MAX_PROBED_QUANTIZATIONS` in `gguf_source.rs`, and `--model`'s help is
+    // where a user reads it before running the command. A doc comment cannot
+    // interpolate a constant, so nothing but this ties the sentence to the cap
+    // it describes. Mutation: change the constant and this fails on the stale
+    // sentence, which is the one surface a bump would otherwise leave behind.
+    #[test]
+    fn the_model_help_states_the_cap_on_quantizations_read_in_one_command() {
+        let mut command = Cli::command();
+        let model = command
+            .find_subcommand_mut("diagnose")
+            .expect("diagnose subcommand")
+            .get_arguments()
+            .find(|arg| arg.get_id() == "model")
+            .expect("`rocm diagnose` must offer --model");
+        let model_help = model
+            .get_long_help()
+            .or_else(|| model.get_help())
+            .expect("--model must be documented")
+            .to_string();
+        let flat = model_help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cap = format!(
+            "the {} smallest at most",
+            rocm_core::gguf_source::MAX_PROBED_QUANTIZATIONS
+        );
+        assert!(
+            flat.contains(&cap),
+            "`rocm diagnose --help` must state the cap the command actually \
+             applies (`{cap}`):\n{model_help}"
+        );
     }
 
     // `--yes` approves a restart, so on its own it asks for something that was

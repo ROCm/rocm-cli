@@ -176,8 +176,10 @@ fn attach_gguf_estimate_with(
     vram: Option<&[GpuVramUsage]>,
     mask_set: bool,
 ) {
-    // The one step that can touch a file or the network, and only for a GGUF
-    // reference the catalog does not carry; it reads the header, not the weights.
+    // The two steps that can touch a file or the network, and only for a GGUF
+    // reference the catalog does not carry: this one reads the header of the
+    // file named, and the repository step below reads one header per
+    // quantization. Headers, never weights.
     attach_context_estimate(readiness, context, host, gguf_source);
     // The repository arm of the same question. `attach_context_estimate` sizes
     // one named file and leaves a bare `owner/repo` alone; this sizes every

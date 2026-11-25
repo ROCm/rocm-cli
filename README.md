@@ -1513,29 +1513,6 @@ The answer is labeled `ESTIMATED: fits at N tokens` or
 the `verdict` stays `undetermined` and the figures are under `model.estimate`.
 It reports the largest context that fits with that KV cache type.
 
-##### A whole repository at once
-
-A GGUF repository usually publishes the same model at a dozen quantizations,
-and picking one before you know which your GPU can hold is guesswork. Name the
-repository with no `:QUANT` and every quantization in it is answered at once:
-
-```
-rocm diagnose --model owner/repo
-```
-
-The report lists them smallest first, each with its quantization, the size of
-its file and its verdict, so the one a modest machine can run is at the top.
-`--context-size` and `--kv-cache-type` apply to every row.
-
-Each row is read from its own file's header: the weights are a file's size less
-*its* header, so one quantization's header is never reused to size another.
-That costs one request per quantization, so the read is bounded twice — the
-twelve smallest quantizations at most, and the same two-minute budget for the
-whole repository. Anything past either is listed as **not estimated**, with the
-reason, and never guessed; naming that quantization on its own sizes it. A
-multimodal projector is not a language model and is left out, and a repository
-whose only GGUF files are projectors says so rather than showing an empty list.
-
 When the file does not fit at the size you asked for, it lists what would make
 it fit:
 
@@ -1618,6 +1595,35 @@ read, the answer stays `undetermined` but still shows what the file needs.
 Layouts the formula does not describe (a file that is one shard of a split
 model, latent attention, a model with no attention layers) are reported as such
 instead of being estimated.
+
+##### A whole repository at once
+
+A GGUF repository usually publishes the same model at a dozen quantizations,
+and picking one before you know which your GPU can hold is guesswork. Name the
+repository with no `:QUANT` and every quantization in it is answered at once:
+
+```
+rocm diagnose --model owner/repo
+```
+
+The report lists them smallest first, each with its quantization, the size of
+its file and its verdict, so the one a modest machine can run is at the top.
+`--context-size` and `--kv-cache-type` apply to every row, and each row's
+figures are built the same way, from the same parts, as the single-file
+estimate above. What a row does not carry is the breakdown: it gives the
+total, and asking about that quantization by name (`owner/repo:QUANT`) gives
+the parts and the list of what would make it fit.
+
+Each row is read from its own file's header: the weights are a file's size less
+*its* header, so one quantization's header is never reused to size another.
+That costs one request per quantization, so the read is bounded twice — the
+12 smallest quantizations at most, and the same two-minute budget for the
+whole repository. Anything past either is listed as **not estimated**, with the
+reason, and never guessed; naming that quantization on its own sizes it. The
+header line counts only the quantizations that were compared with this host,
+so it never reports an unread file as one that does not fit. A multimodal
+projector is not a language model and is left out, and a repository whose only
+GGUF files are projectors says so rather than showing an empty list.
 
 ### Curated models
 

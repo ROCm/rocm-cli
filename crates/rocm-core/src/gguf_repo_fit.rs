@@ -160,9 +160,9 @@ impl RepositoryFit {
 /// Whether `readiness` is an answer about a bare `owner/repo`: a reference the
 /// catalog does not carry, naming a repository rather than one file.
 ///
-/// The one place that decides it, so the spinner the CLI draws
-/// (`reads_from_the_hub` in `apps/rocm/src/diagnose_model.rs`) and the probe
-/// itself cannot disagree about whether a request is about to be made.
+/// The one place that decides it, so the spinner the CLI draws (`hub_read` in
+/// `apps/rocm/src/diagnose_model.rs`) and the probe itself cannot disagree
+/// about whether a request is about to be made.
 #[must_use]
 pub fn names_a_bare_repository(readiness: &ModelReadiness) -> Option<(String, String)> {
     if readiness.canonical_model_id.is_some()
@@ -371,12 +371,22 @@ fn apply_repository_fit(readiness: &mut ModelReadiness, fit: RepositoryFit) {
         .or_else(|| fit.quantizations.first())
         && let Some(reference) = quantization_reference(&fit.repository, next)
     {
+        // "The largest that fits" is only true of the rows that were read: a
+        // row the cap or the budget cut off was never compared, and a larger
+        // one among them could fit too. Where one went unread the claim is
+        // narrowed to what was actually looked at, rather than promising a
+        // maximum over files this command never saw.
+        let largest = if unanswered > 0 {
+            "the largest of those read that fits"
+        } else {
+            "the largest that fits"
+        };
         readiness.fix = Some(Fix {
             summary: format!(
                 "ask about one quantization by name for the parts behind its total ({} is {})",
                 next.label(),
                 if next.fits() {
-                    "the largest that fits"
+                    largest
                 } else {
                     "the smallest in the repository"
                 }
@@ -394,18 +404,20 @@ const fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
 }
 
 /// How to name one quantization on the command line, when it can be named at
-/// all: the label when the file carries one, else the file name, and only when
-/// that name is one `rocm diagnose --model` would accept. A plan that printed
-/// an unquotable name would name a command that does not run.
+/// all: the label when the file carries one, else the file name as the listing
+/// gives it, and only when that name is one `rocm diagnose --model` would
+/// accept. A plan that printed an unquotable name would name a command that
+/// does not run.
+///
+/// The file keeps any sub-directory it came with. `select_gguf_file` in
+/// [`crate::gguf_source`] refuses a bare name two directories share ("matches
+/// several files; name one exactly, as `owner/repo:dir/file.gguf`"), which is
+/// exactly the form the listing already gave, and `is_safe_variant` accepts it.
 fn quantization_reference(repository: &str, quant: &QuantFit) -> Option<String> {
-    let variant = quant.quantization.clone().unwrap_or_else(|| {
-        quant
-            .file
-            .rsplit('/')
-            .next()
-            .unwrap_or(&quant.file)
-            .to_owned()
-    });
+    let variant = quant
+        .quantization
+        .clone()
+        .unwrap_or_else(|| quant.file.clone());
     is_safe_variant(&variant).then(|| format!("{repository}:{variant}"))
 }
 
@@ -552,13 +564,25 @@ mod tests {
     use super::*;
     use crate::gguf::parse_gguf_header;
     use crate::gguf::test_builder::llama_like;
-    use crate::gguf_source::QuantProbe;
+    use crate::gguf_source::{LiveGgufSource, QuantProbe};
     use crate::model_readiness::AcceleratorMemory;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn host(gpu_gib: f64) -> HostFacts {
         HostFacts {
             accelerator_memory: AcceleratorMemory::Dedicated(gpu_gib),
+            system_ram_gib: Some(64.0),
+        }
+    }
+
+    /// A host whose memory is not a figure at all: one whose GPU memory could
+    /// not be read, and one with no GPU. Every quantization is still sized
+    /// against it, and none of them is compared with it.
+    fn host_without_memory(accelerator_memory: AcceleratorMemory) -> HostFacts {
+        HostFacts {
+            accelerator_memory,
             system_ram_gib: Some(64.0),
         }
     }
@@ -870,6 +894,339 @@ mod tests {
             Some("rocm diagnose --model o/r:Q4_K_M".to_owned()),
             "{:?}",
             readiness.fix
+        );
+    }
+
+    /// The plan names the largest quantization that fits, so the user keeps the
+    /// most quality their host can hold -- not the first row that happened to
+    /// pass, which on a capable machine is the one with the least quality in
+    /// the repository.
+    #[test]
+    fn the_plan_names_the_largest_quantization_that_fits_not_the_smallest() {
+        let three = || {
+            vec![
+                read("m-Q4_K_M.gguf", 4 << 30),
+                read("m-Q6_K.gguf", 8 << 30),
+                read("m-F16.gguf", 60 << 30),
+            ]
+        };
+        let fit = repository_fit(
+            "o/r",
+            RepositoryProbe {
+                quants: three(),
+                projectors: 0,
+            },
+            &request(),
+            &host(24.0),
+        );
+        assert_eq!(
+            fit.fitting(),
+            2,
+            "premise: two of the three have to fit, or there is no larger one to prefer: {fit:?}"
+        );
+        let mut readiness = not_curated("o/r");
+        apply_repository_fit(&mut readiness, fit);
+        let plan = readiness.fix.as_ref().expect("a plan");
+        assert_eq!(plan.verify, "rocm diagnose --model o/r:Q6_K", "{plan:?}");
+        assert!(
+            plan.summary.contains("Q6_K is the largest that fits"),
+            "{}",
+            plan.summary
+        );
+        // With a row that was never read, "the largest that fits" would be a
+        // claim about a file this command never looked at, so the plan narrows
+        // it to the ones it did read.
+        let mut quants = three();
+        quants.push(unread("m-Q8_0.gguf", 9 << 30, NotProbed::BudgetSpent));
+        let partial = repository_fit(
+            "o/r",
+            RepositoryProbe {
+                quants,
+                projectors: 0,
+            },
+            &request(),
+            &host(24.0),
+        );
+        let mut readiness = not_curated("o/r");
+        apply_repository_fit(&mut readiness, partial);
+        let plan = readiness.fix.as_ref().expect("a plan");
+        assert_eq!(plan.verify, "rocm diagnose --model o/r:Q6_K", "{plan:?}");
+        assert!(
+            plan.summary
+                .contains("Q6_K is the largest of those read that fits"),
+            "{}",
+            plan.summary
+        );
+    }
+
+    /// A host whose memory is not a figure gets every quantization's need and
+    /// no verdict, and is told that once, in the host's own terms. "0 of 14
+    /// fit" would read as a firm no about a comparison that never happened.
+    #[test]
+    fn a_host_whose_memory_was_not_read_is_told_that_nothing_was_compared() {
+        for (memory, because) in [
+            (
+                AcceleratorMemory::Unknown,
+                "this host's GPU memory could not be read",
+            ),
+            (AcceleratorMemory::None, "no GPU is visible to ROCm"),
+        ] {
+            let fit = repository_fit(
+                "o/r",
+                RepositoryProbe {
+                    quants: vec![read("m-Q4_K_M.gguf", 4 << 30), read("m-F16.gguf", 60 << 30)],
+                    projectors: 0,
+                },
+                &request(),
+                &host_without_memory(memory),
+            );
+            assert_eq!(fit.estimated(), 2, "{memory:?}: {fit:?}");
+            assert_eq!(fit.compared(), 0, "{memory:?}: {fit:?}");
+            let mut readiness = not_curated("o/r");
+            apply_repository_fit(&mut readiness, fit);
+            assert!(
+                readiness.evidence.iter().any(|line| line.contains(&format!(
+                    "none of them was compared with this host: {because}"
+                ))),
+                "{memory:?}: {:?}",
+                readiness.evidence
+            );
+            // ...and never the sentence for a comparison that did happen.
+            assert!(
+                !readiness
+                    .evidence
+                    .iter()
+                    .any(|line| line.contains("no quantization that was compared fits")),
+                "{memory:?}: {:?}",
+                readiness.evidence
+            );
+            let rows =
+                repository_fit_lines(readiness.quantizations.as_ref().expect("a fit")).join("\n");
+            assert!(
+                rows.contains(&format!("not compared: {because}")),
+                "{memory:?}: {rows}"
+            );
+        }
+    }
+
+    /// A repository where no header was read carries no estimate caveat: the
+    /// caveat qualifies figures, and there are none here to qualify. Each row
+    /// keeps the reason it was not read, rather than one standing in for all.
+    #[test]
+    fn a_repository_with_no_figures_carries_no_estimate_caveat() {
+        let fit = repository_fit(
+            "o/r",
+            RepositoryProbe {
+                quants: vec![
+                    unread("m-Q4_K_M.gguf", 4 << 30, NotProbed::Unreadable),
+                    unread("m-Q8_0.gguf", 8 << 30, NotProbed::TooManyQuantizations),
+                ],
+                projectors: 0,
+            },
+            &request(),
+            &host(24.0),
+        );
+        assert_eq!(fit.estimated(), 0, "{fit:?}");
+        assert!(
+            matches!(
+                fit.quantizations[0].outcome,
+                QuantFitOutcome::NotEstimated {
+                    reason: NotEstimatedReason::HeaderUnreadable,
+                    ..
+                }
+            ),
+            "{fit:?}"
+        );
+        assert!(
+            matches!(
+                fit.quantizations[1].outcome,
+                QuantFitOutcome::NotEstimated {
+                    reason: NotEstimatedReason::TooManyQuantizations,
+                    ..
+                }
+            ),
+            "{fit:?}"
+        );
+        let mut readiness = not_curated("o/r");
+        apply_repository_fit(&mut readiness, fit);
+        for caveat in [ESTIMATE_CAVEAT, SERVE_CONTEXT_NOTE] {
+            assert!(
+                !readiness.warnings.iter().any(|warning| warning == caveat),
+                "{:?}",
+                readiness.warnings
+            );
+        }
+        // Nor the sentence about a comparison, which needs figures too.
+        assert!(
+            !readiness
+                .evidence
+                .iter()
+                .any(|line| line.contains("none of them was compared")),
+            "{:?}",
+            readiness.evidence
+        );
+    }
+
+    /// A file whose name carries no quantization label is named by the whole
+    /// path the listing gave, sub-directory and all: the last component alone
+    /// is a name two directories can share, which the file selector refuses as
+    /// ambiguous, so the plan would print a command that does not run.
+    #[test]
+    fn a_file_with_no_label_is_named_by_the_whole_path_the_listing_gave() {
+        let fit = repository_fit(
+            "o/r",
+            RepositoryProbe {
+                quants: vec![read("dir/model.gguf", 4 << 30)],
+                projectors: 0,
+            },
+            &request(),
+            &host(24.0),
+        );
+        assert_eq!(fit.quantizations[0].quantization, None, "{fit:?}");
+        let mut readiness = not_curated("o/r");
+        apply_repository_fit(&mut readiness, fit);
+        assert_eq!(
+            readiness.fix.as_ref().map(|fix| fix.verify.clone()),
+            Some("rocm diagnose --model o/r:dir/model.gguf".to_owned()),
+            "{:?}",
+            readiness.fix
+        );
+        // And that command names the same file back.
+        assert_eq!(
+            parse_gguf_ref("o/r:dir/model.gguf"),
+            Some(GgufRef::Hub {
+                owner: "o".to_owned(),
+                repo: "r".to_owned(),
+                variant: Some("dir/model.gguf".to_owned()),
+            })
+        );
+    }
+
+    /// A hub on loopback that publishes two quantizations: one the listing gave
+    /// no size for, whose `HEAD` says how large it is, and one whose bytes come
+    /// back `403`. Both are answers only a real read produces, which is why
+    /// this serves HTTP rather than canning a probe.
+    fn fake_repository_hub(header: Vec<u8>, size: u64) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                let text = String::from_utf8_lossy(&request).into_owned();
+                let method = text.split_whitespace().next().unwrap_or("").to_owned();
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let range = text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Range: bytes=")
+                            .or_else(|| line.strip_prefix("range: bytes="))
+                    })
+                    .map(str::to_owned);
+                if path.starts_with("/api/models/o/r") {
+                    // `gated-Q4_K_M.gguf` carries a size, so it sorts first and
+                    // is read without a `HEAD`; `unsized-Q8_0.gguf` carries
+                    // none, which sorts it last.
+                    let body = format!(
+                        r#"{{"siblings":[{{"rfilename":"gated-Q4_K_M.gguf","size":{size}}},{{"rfilename":"unsized-Q8_0.gguf"}}]}}"#
+                    );
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                } else if path.contains("gated-Q4_K_M.gguf") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                } else if method == "HEAD" {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+                    );
+                } else if let Some(range) = range {
+                    let (start, end) = range.split_once('-').expect("a byte range");
+                    let (start, end): (u64, u64) = (
+                        start.parse().expect("a start"),
+                        end.parse().expect("an end"),
+                    );
+                    let body: Vec<u8> = (start..=end)
+                        .map(|at| header.get(at as usize).copied().unwrap_or(0))
+                        .collect();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(&body);
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+            }
+        });
+        base
+    }
+
+    /// The read behind the table, against a hub: a file the listing left a size
+    /// off is sized from its own `HEAD` rather than dropped, and a file that
+    /// came back `403` is reported as unreadable -- which is a different answer
+    /// from the shared budget running out, because the budget would mean every
+    /// later file failed too and naming this one again would not help.
+    #[test]
+    fn a_file_with_no_listed_size_is_sized_by_head_and_an_unreadable_one_is_not_the_budget() {
+        let size = 4_u64 << 30;
+        let base = fake_repository_hub(llama_like(10).header_bytes(), size);
+        let probe = LiveGgufSource::with_hub(&base)
+            .probe_quantizations("o", "r")
+            .expect("the listing is readable");
+        assert_eq!(probe.quants.len(), 2, "{probe:?}");
+        assert_eq!(probe.quants[1].file, "unsized-Q8_0.gguf", "{probe:?}");
+        assert_eq!(
+            probe.quants[1].size,
+            Some(size),
+            "the size a HEAD reported has to be the one the row is sized against: {probe:?}"
+        );
+        assert!(
+            matches!(probe.quants[1].outcome, QuantProbeOutcome::Read(_)),
+            "{probe:?}"
+        );
+        assert!(
+            matches!(
+                &probe.quants[0].outcome,
+                QuantProbeOutcome::NotRead {
+                    reason: NotProbed::Unreadable,
+                    detail,
+                } if detail.contains("gated or private")
+            ),
+            "a file that could not be read is unreadable, never the budget: {probe:?}"
+        );
+        let fit = repository_fit("o/r", probe, &request(), &host(24.0));
+        assert_eq!(fit.estimated(), 1, "{fit:?}");
+        assert!(
+            matches!(
+                fit.quantizations[0].outcome,
+                QuantFitOutcome::NotEstimated {
+                    reason: NotEstimatedReason::HeaderUnreadable,
+                    ..
+                }
+            ),
+            "{fit:?}"
+        );
+        let rendered = repository_fit_lines(&fit).join("\n");
+        assert!(
+            !rendered.contains("ran out before this file's header was reached"),
+            "{rendered}"
         );
     }
 }

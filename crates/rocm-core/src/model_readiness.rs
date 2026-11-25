@@ -1298,8 +1298,12 @@ pub fn note_unverified_mask(readiness: &mut ModelReadiness, mask_set: bool, gpu_
     // estimate is, so the same doubt applies to every one of them. Carried on
     // the answer rather than on each row: the caveat is about which card was
     // measured, which is one fact about the host, not one per quantization.
+    // `compared`, not `estimated`, for the same reason the single-file branch
+    // above asks for `available_gib`: a row that was sized but never compared
+    // with this host's memory has no figure the mask could have taken from the
+    // wrong card, and `gguf_repo_fit` already says none of them was compared.
     if let Some(fit) = readiness.quantizations.as_ref()
-        && fit.estimated() > 0
+        && fit.compared() > 0
     {
         readiness.warnings.push(MASK_UNVERIFIED_NOTE.to_owned());
     }
@@ -1330,13 +1334,17 @@ fn header_label(readiness: &ModelReadiness) -> String {
         ),
         // A repository has no single verdict: how many of its quantizations
         // fit is the answer, and "0 of 14" is as clear a no as a single
-        // estimate's is.
+        // estimate's is. The denominator is how many were compared, never how
+        // many rows there are: a row the cap or the budget cut off was never
+        // sized, and counting it would report a quantization as not fitting
+        // when nothing was ever worked out about it. The evidence says how
+        // many went unread.
         _ => match &readiness.quantizations {
             Some(fit) if fit.compared() > 0 => format!(
                 "ESTIMATED: {} of {} quantizations fit at {} (calibrated on one MI300X, not a \
                  tested minimum)",
                 fit.fitting(),
-                fit.quantizations.len(),
+                fit.compared(),
                 tokens(fit.context_size)
             ),
             _ => verdict_label(readiness.verdict).to_owned(),
@@ -2807,6 +2815,97 @@ mod tests {
         assert!(!plain.contains("quantizations of"), "{plain}");
     }
 
+    /// A repository answer about a host with `memory`: three rows, of which two
+    /// were read (one fits, one does not) and one the budget cut off. The row
+    /// count and the compared count differ on purpose, so anything counting
+    /// rows where it should count comparisons reads differently from the truth.
+    fn repository_answer(memory: AcceleratorMemory) -> ModelReadiness {
+        use crate::gguf_repo_fit::repository_fit;
+        use crate::gguf_source::{NotProbed, QuantProbe, QuantProbeOutcome, RepositoryProbe};
+        let header = parse_gguf_header(&mut std::io::Cursor::new(
+            crate::gguf::test_builder::llama_like(10).file(0),
+        ))
+        .expect("a header");
+        let sized = |name: &str, weights: u64| QuantProbe {
+            file: name.to_owned(),
+            size: Some(header.data_offset + weights),
+            outcome: QuantProbeOutcome::Read(Box::new(header.clone())),
+        };
+        let fit = repository_fit(
+            "some-lab/never-curated-7b",
+            RepositoryProbe {
+                quants: vec![
+                    sized("m-Q4_K_M.gguf", 4 << 30),
+                    sized("m-F16.gguf", 60 << 30),
+                    QuantProbe {
+                        file: "m-Q8_0.gguf".to_owned(),
+                        size: Some(9 << 30),
+                        outcome: QuantProbeOutcome::NotRead {
+                            reason: NotProbed::BudgetSpent,
+                            detail: "the budget ran out".to_owned(),
+                        },
+                    },
+                ],
+                projectors: 0,
+            },
+            &FitRequest {
+                context_size: 4096,
+                context_size_defaulted: true,
+                kv_cache_type: KvCacheType::F16,
+            },
+            &HostFacts {
+                accelerator_memory: memory,
+                system_ram_gib: Some(64.0),
+            },
+        );
+        let mut readiness = not_curated("some-lab/never-curated-7b");
+        readiness.quantizations = Some(fit);
+        readiness
+    }
+
+    /// The label's denominator is how many quantizations were compared, never
+    /// how many rows the table has: a row the budget cut off was never sized,
+    /// and counting it would report a quantization as not fitting when nothing
+    /// was ever worked out about it. A host that compared none of them gets no
+    /// count at all.
+    #[test]
+    fn the_repository_label_counts_what_was_compared_not_how_many_rows_there_are() {
+        let compared = repository_answer(AcceleratorMemory::Dedicated(24.0));
+        let fit = compared.quantizations.as_ref().expect("a repository fit");
+        assert_eq!(
+            (fit.quantizations.len(), fit.compared(), fit.fitting()),
+            (3, 2, 1),
+            "premise: the row count and the compared count have to differ: {fit:?}"
+        );
+        let text = render_model_readiness_text(&compared);
+        assert!(
+            text.lines().next().is_some_and(|line| line.ends_with(
+                "ESTIMATED: 1 of 2 quantizations fit at 4096 tokens (calibrated on one MI300X, \
+                 not a tested minimum)"
+            )),
+            "{text}"
+        );
+        // Nothing compared: "0 of 3 fit" would be a firm no about a comparison
+        // that never happened, so the verdict's own word is kept instead.
+        let uncompared = repository_answer(AcceleratorMemory::Unknown);
+        assert_eq!(
+            uncompared
+                .quantizations
+                .as_ref()
+                .expect("a repository fit")
+                .compared(),
+            0
+        );
+        let text = render_model_readiness_text(&uncompared);
+        assert!(!text.contains("quantizations fit at"), "{text}");
+        assert!(
+            text.lines()
+                .next()
+                .is_some_and(|line| line.ends_with(verdict_label(uncompared.verdict))),
+            "{text}"
+        );
+    }
+
     /// The command a GGUF plan offers asks the same question again: the flags
     /// that were passed come with it, and a path a shell would split is quoted.
     #[test]
@@ -3105,6 +3204,61 @@ mod tests {
             "{:?}",
             notes(&unmeasured)
         );
+    }
+
+    /// Every row of a repository answer was compared against the one figure a
+    /// mask could have taken from the wrong card, so the same doubt applies to
+    /// the answer -- carried once on it rather than repeated on a dozen rows. A
+    /// host that compared nothing has no figure to doubt, and `gguf_repo_fit`
+    /// already says none of them was compared.
+    #[test]
+    fn a_mask_is_doubted_on_a_repository_answer_only_where_something_was_compared() {
+        let flagged = |readiness: &ModelReadiness| {
+            readiness
+                .warnings
+                .iter()
+                .filter(|warning| *warning == MASK_UNVERIFIED_NOTE)
+                .count()
+        };
+        let mut compared = repository_answer(AcceleratorMemory::Dedicated(24.0));
+        assert!(
+            compared
+                .quantizations
+                .as_ref()
+                .expect("a repository fit")
+                .compared()
+                > 0
+        );
+        note_unverified_mask(&mut compared, true, &[24_576, 8192]);
+        assert_eq!(flagged(&compared), 1, "{:?}", compared.warnings);
+        assert!(
+            render_model_readiness_text(&compared).contains("has not been verified"),
+            "{}",
+            render_model_readiness_text(&compared)
+        );
+        // Sized against this host but compared with nothing: no figure to doubt.
+        let mut uncompared = repository_answer(AcceleratorMemory::Unknown);
+        assert_eq!(
+            uncompared
+                .quantizations
+                .as_ref()
+                .expect("a repository fit")
+                .estimated(),
+            2,
+            "premise: the rows still carry figures, they were just not compared"
+        );
+        note_unverified_mask(&mut uncompared, true, &[24_576, 8192]);
+        assert_eq!(flagged(&uncompared), 0, "{:?}", uncompared.warnings);
+        // No mask, or cards that are all alike: nothing to doubt either.
+        for (mask_set, totals) in [
+            (false, vec![24_576_u64, 8192]),
+            (true, vec![24_576, 24_576]),
+            (true, Vec::new()),
+        ] {
+            let mut readiness = repository_answer(AcceleratorMemory::Dedicated(24.0));
+            note_unverified_mask(&mut readiness, mask_set, &totals);
+            assert_eq!(flagged(&readiness), 0, "{mask_set} {totals:?}");
+        }
     }
 
     /// `owner/repo:dir/file.gguf` selects an exact file for the estimate; `rocm
