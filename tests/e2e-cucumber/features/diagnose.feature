@@ -1356,6 +1356,31 @@ Feature: Diagnosing failures and listing fixes
     And this machine's shared memory allowance is what it was
     And the reason the fix gives says WSL2 normally gives half the VM's memory
 
+  # `rocm diagnose --help` tells a user who has hit no failure that the command
+  # is for them too: with no `--symptom` it reports what it finds on the
+  # machine as it is, and a diagnosis applies no fix and installs nothing. The
+  # help line alone would only pin the wording, so the same scenario holds the
+  # command to both halves of it. The machine carries the unneeded GPU override
+  # diagnose-62 plants, a misconfiguration every lane reads from the
+  # environment, so a diagnosis with nothing pasted has something to find on
+  # Linux, Windows and WSL alike. "Installs nothing" is checked as what the CLI
+  # owns: its settings and data folders, where a saved setting or an installed
+  # runtime would land, are compared file by file before and after. The cache
+  # folder is left out, because CI shares it between scenarios running at once,
+  # and so is the CLI's own log, which every command opens.
+  # Changes outside the CLI's folders are not observed here. What keeps a
+  # diagnosis from applying a fix is that `rocm_core::apply_fix` has one
+  # caller, `fix` in apps/rocm/src/diagnose_cmd.rs, which only `rocm fix`
+  # dispatches to (diagnose-08 holds that a fix asks first).
+  @id:diagnose-runs-before-a-failure-and-installs-nothing
+  Scenario: diagnose-89 - A user who has hit no failure is told to diagnose anyway, and the diagnosis finds a misconfiguration and installs nothing
+    Given a machine with a known misconfiguration in its environment
+    When the user asks how to diagnose this machine
+    Then the help says the machine can be diagnosed before anything has failed, and that only a fix changes it
+    When the user diagnoses the machine without describing a failure
+    Then the misconfiguration on the machine is reported, with a fix to apply
+    And the CLI's own settings and installs are left as they were
+
   # The host the pool read exists for, and the one none of diagnose-81 to
   # diagnose-87 describes: a machine where nothing reports the GPU's memory at
   # all. That is a Windows laptop whose integrated GPU has no ROCm build --
@@ -1375,7 +1400,7 @@ Feature: Diagnosing failures and listing fixes
   # it runs on lanes that have no Windows APU. Linux-gated for the reason
   # diagnose-81 is -- the simulation seam re-roots Linux paths only.
   @id:diagnose-model-an-apu-with-no-memory-telemetry-is-still-measured @requires-os:linux
-  Scenario: diagnose-89 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
+  Scenario: diagnose-90 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
     Given a machine whose only GPU shares system memory and reports no memory telemetry
     And a user asking about the smallest curated model
     When the user asks the CLI whether that model would run, in machine-readable form

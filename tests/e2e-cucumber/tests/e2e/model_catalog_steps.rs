@@ -245,9 +245,8 @@ async fn catalog_warns_aim_entry_is_stale(world: &mut E2eWorld) {
 /// Plant the GPU capacity the recommendation is selected on.
 ///
 /// `ROCM_E2E_FORCE_GPU_TOTAL_GIB` is the `e2e-test-hooks` seam for this: the
-/// no-GPU lane measures no capacity and the GPU box measures none either (no
-/// `amd-smi`, unreadable `mem_info_vram_total`), so a planted figure is the
-/// only way a narrowed listing is reachable from a test.
+/// no-GPU lane measures no capacity and the GPU lanes cannot be made small, so a
+/// planted figure is the only way a narrowed listing is reachable from a test.
 fn plant_gpu_capacity_gib(world: &mut E2eWorld, total_gib: u32) {
     world
         .command_env
@@ -269,11 +268,16 @@ async fn a_tiny_gpu_machine(world: &mut E2eWorld) {
     plant_gpu_capacity_gib(world, 1);
 }
 
-/// Planting nothing is the premise: with no hook set and no readable telemetry
-/// on the lane, the capacity is genuinely unknown rather than small.
+/// The premise is stated, not left to the lane: a lane whose GPU memory
+/// `gpu_vram_usage` can read (`amd-smi`, else the DRM sysfs fallback) measures
+/// its real capacity when nothing is planted and is narrowed, which is how this
+/// scenario failed on the MI300X lanes. The hook is told the memory is
+/// unreadable instead.
 #[given("a machine whose GPU memory cannot be read")]
 async fn an_unmeasured_machine(world: &mut E2eWorld) {
-    let _ = world;
+    world
+        .command_env
+        .push(("ROCM_E2E_FORCE_GPU_TOTAL_GIB", "unreadable".into()));
 }
 
 /// The same question through the assistant's tool, on the same machine.

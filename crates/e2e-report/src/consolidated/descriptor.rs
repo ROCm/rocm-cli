@@ -201,7 +201,8 @@ const KNOWN_PLATFORMS: &[KnownPlatform] = &[
         os: "Linux",
         slugs: &["mi300x"],
     },
-    // The same silicon, run on a self-hosted runner instead of on the shared GPU
+    // The same gfx942 target (the queue's pull request lane is an MI325X), run on a
+    // self-hosted MI300X runner instead of on the shared GPU
     // queue: a pull request's `e2e-gpu-report` is the queue's, so the self-hosted
     // MI300X lane uploads under this name and renders beside it. No slug names it:
     // the sidecar's `mi300x` is the queue's row, and a report with only a

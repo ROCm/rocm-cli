@@ -5331,6 +5331,108 @@ async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
     );
 }
 
+// ── Diagnosing before anything has failed (diagnose-89) ────────────
+
+#[when("the user asks how to diagnose this machine")]
+async fn user_asks_for_diagnose_help(world: &mut E2eWorld) {
+    world.cli_output = Some(crate::run_rocm_ok(world, &["diagnose", "--help"]));
+}
+
+#[then(
+    "the help says the machine can be diagnosed before anything has failed, and that only a fix changes it"
+)]
+async fn assert_diagnose_help_runs_before_a_failure(world: &mut E2eWorld) {
+    let help = world.cli_output.as_deref().expect("no diagnose help");
+    // Compared with every run of whitespace made one space: a build that
+    // unifies clap's features with this harness's (`cucumber` enables
+    // `wrap_help`) wraps the help at 100 columns, mid-sentence.
+    let flowed = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The wording of `Command::Diagnose`'s doc comment in apps/rocm/src/cli.rs.
+    // What it promises is held to the command by the two Thens after the
+    // diagnosis below, not by these strings.
+    for claim in [
+        "Nothing has to have failed first",
+        "with no `--symptom` it examines the machine as it is",
+        "A diagnosis applies no fix and installs nothing; `rocm fix` is the step that changes the machine.",
+    ] {
+        assert!(
+            flowed.contains(claim),
+            "`rocm diagnose --help` must say `{claim}`:\n{help}"
+        );
+    }
+}
+
+/// The CLI's settings and data folders of this scenario, where a saved setting
+/// or an installed runtime would land. The cache folder is not one of them: CI
+/// shares it between concurrent scenarios (`cache_dir_for` in `e2e.rs`), so
+/// another scenario's download would read as a change made here. Nor is the
+/// CLI's own log, `AppPaths::client_log_dir`: `logging::init` in
+/// apps/rocm/src/logging.rs opens the day's log file on every command but
+/// `uninstall`, so a run crossing midnight would create one whatever it did.
+fn cli_settings_and_installs(world: &E2eWorld) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    let log_dir = root.join("data").join("logs");
+    ["config", "data"]
+        .into_iter()
+        .map(|folder| root.join(folder))
+        .filter(|folder| folder.is_dir())
+        .flat_map(|folder| crate::e2e::lemonade_install_steps::tree_files(&folder))
+        .filter(|(path, _)| !path.starts_with(&log_dir))
+        .collect()
+}
+
+#[when("the user diagnoses the machine without describing a failure")]
+async fn user_diagnoses_before_a_failure(world: &mut E2eWorld) {
+    world.planted_tree_snapshot = Some(cli_settings_and_installs(world));
+    run_diagnose(world, None, false);
+}
+
+#[then("the misconfiguration on the machine is reported, with a fix to apply")]
+async fn assert_env_misconfig_reported_with_a_fix(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose failed:\n{output}\n{stderr}"
+    );
+    let block = cause_block(output, ENV_MISCONFIG_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "with nothing pasted, the misconfiguration on the machine must still be reported:\n{output}"
+    );
+    let apply = format!("apply with: rocm fix {ENV_MISCONFIG_FIX_ID}");
+    assert!(
+        block.iter().any(|line| line.trim() == apply),
+        "the reported cause must name the `rocm fix` command that applies it:\n{output}"
+    );
+}
+
+#[then("the CLI's own settings and installs are left as they were")]
+async fn assert_cli_settings_and_installs_unchanged(world: &mut E2eWorld) {
+    let before = world
+        .planted_tree_snapshot
+        .clone()
+        .expect("no snapshot - did the diagnosis step run?");
+    let after = cli_settings_and_installs(world);
+    let paths = |files: &[(std::path::PathBuf, Vec<u8>)]| {
+        files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        after == before,
+        "a diagnosis changed the CLI's settings or data folders.\nbefore: {:?}\nafter: {:?}",
+        paths(&before),
+        paths(&after)
+    );
+}
+
 // ── An integrated GPU's shared memory pool (ROCMAI-912) ────────────
 
 /// `gfx_target_version` for gfx1151 (Strix Halo), in the kernel's decimal

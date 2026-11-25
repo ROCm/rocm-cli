@@ -2369,7 +2369,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
 
     const REPORT_CHECK_STEP: &str = "- name: Check every lane that ran uploaded its report";
 
-    /// The per-PR workflow's MI300X lanes: the queue lane and the self-hosted one.
+    /// The per-PR workflow's gfx942 lanes: the queue lane and the self-hosted one.
     const MI300X_LANES: &[&str] = &["e2e-gpu", "e2e-gpu-queue"];
 
     /// A step block, found by its exact `- name:` line, including that line.
@@ -3492,11 +3492,11 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             .to_owned()
     }
 
-    const MI300X_GATE_STEP: &str = "- name: Check the MI300X requirement (queue or self-hosted)";
+    const MI300X_GATE_STEP: &str = "- name: Check the gfx942 requirement (queue or self-hosted)";
 
     #[test]
     fn mi300x_requirement_is_met_by_the_queue_or_the_self_hosted_lane() {
-        // A pull request's MI300X requirement is either lane. The self-hosted
+        // A pull request's gfx942 requirement is either lane. The self-hosted
         // lane can sit queued for a day on a pool at zero replicas, so the report
         // reads it through `e2e-gpu-settled` (a job that gives up on it) instead
         // of through `needs`, and the decision is `mi300x-gate.sh`, fed both lanes.
@@ -3537,7 +3537,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // The deadlines are ordered and the job's cap lets the script stop itself.
         // `${{ <MI300X_REQUIRED's condition> && '<pr>' || '<other>' }}`: a short
         // queue deadline where the queue lane is the primary check, a long one
-        // where this lane is the only MI300X signal (a fork or dependabot pull
+        // where this lane is the only gfx942 signal (a fork or dependabot pull
         // request included). Both pairs must be ordered.
         let required_cond = env_value(&named_step(report, MI300X_GATE_STEP), "MI300X_REQUIRED")
             .trim_start_matches("${{ ")
@@ -3950,7 +3950,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
                 ":x:"
             };
             assert!(
-                summary.contains(&format!("MI300X: {mark}")),
+                summary.contains(&format!("gfx942: {mark}")),
                 "{why}: the verdict mark is said in the summary: {summary}"
             );
         }
@@ -4046,7 +4046,7 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         // `::error::` is emitted when the requirement is not met.
         let (code, log, _) = run_mi300x_gate(true, "skipped", "skipped", &[]);
         assert_eq!(code, 1);
-        assert!(log.contains("::error::MI300X requirement not met"), "{log}");
+        assert!(log.contains("::error::gfx942 requirement not met"), "{log}");
     }
 
     #[test]
@@ -11157,6 +11157,54 @@ fi
         }
     }
 
+    /// hawkeye reports an included file that has no comment-style rule as
+    /// `unsupported` and still exits 0, so a new `includes` glob without a
+    /// matching `[[rules]]` entry, or a deleted rules block, would stop
+    /// enforcing headers on that file type with every check green.
+    /// `--fail-on-unknown` turns that into a failure, so both the local hook
+    /// and the CI step must pass it.
+    #[test]
+    fn license_header_checks_fail_on_files_hawkeye_cannot_check() {
+        let flag = "--fail-on-unknown";
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let entry = hook_block(&config, "license-headers")
+            .lines()
+            .map(strip_comment)
+            .find_map(|line| line.trim().strip_prefix("entry:"))
+            .expect("the license-headers hook has an `entry:`");
+        let words: Vec<&str> = entry.split_whitespace().collect();
+        assert!(
+            words.contains(&"hawkeye") && words.contains(&"check") && words.contains(&flag),
+            "the license-headers hook's `entry:` is `{entry}`, which must run `hawkeye check \
+             {flag}`: without it hawkeye exits 0 for an included file type it has no rule for"
+        );
+
+        let ci = read_workflow("ci.yml");
+        let step = named_step(
+            job_block(&ci, "license-headers"),
+            "- name: Check license headers",
+        );
+        let code: Vec<&str> = step.lines().map(strip_comment).collect();
+        assert!(
+            code.iter().any(|line| {
+                line.contains("hawkeye")
+                    && line.contains(" check ")
+                    && line.split_whitespace().any(|word| word == flag)
+            }),
+            "the CI `Check license headers` step must run `hawkeye check {flag}`, or a file \
+             type hawkeye has no rule for is skipped with the job green:\n{step}"
+        );
+        assert!(
+            !code
+                .iter()
+                .any(|line| line.contains("|| true") || line.contains("continue-on-error")),
+            "the CI `Check license headers` step must not swallow hawkeye's exit status \
+             (`|| true`, `continue-on-error`), or the flag above cannot fail the job:\n{step}"
+        );
+    }
+
     /// `cargo xtask check-architecture-doc` is only a gate if all three places
     /// that can fail a change actually run it: the pre-commit hook, the pre-push
     /// hook (which reads the working tree, so it catches a commit made with
@@ -11271,6 +11319,102 @@ fi
                 .any(|line| strip_comment(line).contains("advisory")),
             "the cargo-module-size hook's name and entry must not say advisory:\n{block}"
         );
+    }
+
+    /// The `feature-naming` hook runs the e2e suite's naming guard at commit time,
+    /// so a mis-numbered scenario or a missing `@id:` fails the commit that stages
+    /// it instead of a CI run. Its entry names a test target by file name, so the
+    /// target must still exist. Its `files:` filter is checked against fixed
+    /// sample paths: it must match a `.feature` file directly under
+    /// `tests/e2e-cucumber/features/` and the guard itself, and must not match a
+    /// `.feature` file under a directory that only contains that path further
+    /// down (which the `^` anchor rules out), a name that continues past
+    /// `.feature` (which the `$` anchor rules out), or a `.feature` file or
+    /// README elsewhere in the crate. It stays at pre-commit and in `local-tools`,
+    /// and sets none of `types:`, `types_or:`, `exclude:` or `always_run:`, so
+    /// `files:` alone decides when it fires.
+    #[test]
+    fn feature_naming_hook_runs_the_naming_guard_when_a_feature_file_is_staged() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "feature-naming");
+        assert!(
+            hook_block_sets(
+                block,
+                "entry: cargo test -p e2e-cucumber --test feature_naming"
+            ),
+            "feature-naming hook must run exactly the `feature_naming` test target:\n{block}"
+        );
+        assert!(
+            repo_root()
+                .join("tests/e2e-cucumber/tests/feature_naming.rs")
+                .is_file(),
+            "the feature-naming hook's entry names tests/e2e-cucumber/tests/feature_naming.rs, \
+             which no longer exists"
+        );
+        for (flag, why) in [
+            (
+                "stages: [pre-commit]",
+                "it is the commit-time mirror of a CI test",
+            ),
+            (
+                "pass_filenames: false",
+                "cargo would read one appended filename as a test-name filter that \
+                 matches no test, so the hook would pass having run nothing",
+            ),
+            ("language: system", "it runs the local cargo"),
+            (
+                "groups: [local-tools]",
+                "it compiles e2e-cucumber, and `local-tools` is the group for hooks \
+                 that need a full Rust compile",
+            ),
+        ] {
+            assert!(
+                hook_block_sets(block, flag),
+                "feature-naming hook must set `{flag}`: {why}:\n{block}"
+            );
+        }
+        for filter_key in ["types:", "types_or:", "exclude:", "always_run:"] {
+            assert!(
+                !hook_block_mentions(block, filter_key),
+                "feature-naming hook must not set `{filter_key}`: `files:` alone decides \
+                 when it fires, and the samples below check only `files:`:\n{block}"
+            );
+        }
+
+        let files = strip_quotes(
+            block
+                .lines()
+                .find_map(|line| strip_comment(line).trim().strip_prefix("files: "))
+                .unwrap_or_else(|| {
+                    panic!("feature-naming hook must set a `files:` filter:\n{block}")
+                }),
+        );
+        let filter = regex::Regex::new(&files)
+            .unwrap_or_else(|e| panic!("feature-naming `files:` is not a valid regex: {e}"));
+        for path in [
+            "tests/e2e-cucumber/features/chat.feature",
+            "tests/e2e-cucumber/features/new_area.feature",
+            "tests/e2e-cucumber/tests/feature_naming.rs",
+        ] {
+            assert!(
+                filter.is_match(path),
+                "feature-naming `files:` filter {files:?} must match {path}"
+            );
+        }
+        for path in [
+            "vendor/tests/e2e-cucumber/features/x.feature",
+            "tests/e2e-cucumber/features/x.feature.orig",
+            "tests/e2e-cucumber/src/x.feature",
+            "tests/e2e-cucumber/README.md",
+        ] {
+            assert!(
+                !filter.is_match(path),
+                "feature-naming `files:` filter {files:?} must not match {path}, or the \
+                 hook compiles e2e-cucumber on commits it has nothing to say about"
+            );
+        }
     }
 
     // Extractor guards: prove the helpers above actually parse the shapes they
@@ -13494,7 +13638,7 @@ permissions:
 
     /// What the pull request's gate job may and may not do: it holds no queue
     /// credential, dispatches the workflow as it is on main, and publishes only
-    /// the queue run's release report as the MI300X one.
+    /// the queue run's release report as the gfx942 one.
     #[test]
     fn the_pull_request_gate_dispatches_the_workflow_on_main_and_nothing_else() {
         let text = read_workflow("e2e-selfhosted.yml");
@@ -13585,7 +13729,7 @@ permissions:
             gate.contains("=~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$"),
             "the branch name must be checked before it is passed on"
         );
-        // Its one report, the MI300X cell the queue's run stands for.
+        // Its one report, the gfx942 cell the queue's run stands for.
         assert_eq!(
             uploaded_report_artifact("e2e-selfhosted.yml", &text, "e2e-gpu-queue"),
             "e2e-gpu-report"
@@ -13608,12 +13752,17 @@ permissions:
 
     /// The queue side's half of the gate's contract, as the gate reads it: the
     /// first line of `refused.txt` starts with this when the queue refused for
-    /// the nightly's window, and the MI300X lane's release report sits at this
+    /// the nightly's window, and the MI325X lane's release report sits at this
     /// path of the `queue-pr-run-results` artifact. The queue side is not in this
     /// repository: these are the gate's half, shared by the script check, the
     /// mock runs and the doc check below so none can drift alone.
     const QUEUE_NIGHTLY_REFUSAL: &str = "nightly:";
-    const QUEUE_REPORT_PATH: &str = "mi300x/release/results/report.json";
+    const QUEUE_REPORT_PATH: &str = "mi325x/release/results/report.json";
+    /// The lane the queue side ran pull requests on before it moved to mi325x: the
+    /// gate still reads it, so either order of the two deployments works. Only the
+    /// mock runs, which are Unix-only, use it.
+    #[cfg(unix)]
+    const QUEUE_REPORT_PATH_BEFORE_MI325X: &str = "mi300x/release/results/report.json";
 
     /// One run of the gate's script against a mock `gh`: what to answer and what
     /// the queue run published.
@@ -13872,10 +14021,10 @@ esac
         let run = run_gate_script(&Gate {
             results: Some(vec![
                 (QUEUE_REPORT_PATH, "{}"),
-                ("mi300x/release/results/platform.json", "{}"),
+                ("mi325x/release/results/platform.json", "{}"),
                 // Another lane's and another channel's files are not this job's.
                 ("w7900/release/results/report.json", "{}"),
-                ("mi300x/nightly/results/report.json", "{}"),
+                ("mi325x/nightly/results/report.json", "{}"),
             ]),
             ..Gate::default()
         });
@@ -13909,6 +14058,46 @@ esac
         );
     }
 
+    /// The queue side and this workflow are deployed apart: while the queue still
+    /// runs pull requests on mi300x, the gate takes that lane's report, and it
+    /// prefers mi325x's when both are there.
+    #[test]
+    #[cfg(unix)]
+    fn queue_gate_script_reads_the_mi300x_lane_until_the_queue_side_moves() {
+        if !jq_available() {
+            return;
+        }
+        let before = run_gate_script(&Gate {
+            results: Some(vec![
+                (QUEUE_REPORT_PATH_BEFORE_MI325X, "{}"),
+                ("mi300x/release/results/platform.json", "{}"),
+            ]),
+            ..Gate::default()
+        });
+        assert_eq!(before.code, 0, "{}", before.log);
+        assert_eq!(
+            before.report,
+            ["platform.json", "report.json"],
+            "{}",
+            before.log
+        );
+        let both = run_gate_script(&Gate {
+            results: Some(vec![
+                (QUEUE_REPORT_PATH_BEFORE_MI325X, "{}"),
+                (QUEUE_REPORT_PATH, "{}"),
+                ("mi325x/release/results/platform.json", "{}"),
+            ]),
+            ..Gate::default()
+        });
+        assert_eq!(both.code, 0, "{}", both.log);
+        assert_eq!(
+            both.report,
+            ["platform.json", "report.json"],
+            "{}",
+            both.log
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn queue_gate_script_follows_the_runs_verdict_but_still_publishes_its_report() {
@@ -13922,7 +14111,7 @@ esac
         });
         assert_eq!(failed.code, 1, "{}", failed.log);
         assert_eq!(failed.report, ["report.json"], "{}", failed.log);
-        // A run with no MI300X release report is red, whatever else it published.
+        // A run with no MI325X release report is red, whatever else it published.
         let none = run_gate_script(&Gate {
             results: Some(vec![("w7900/release/results/report.json", "{}")]),
             ..Gate::default()
@@ -13930,7 +14119,8 @@ esac
         assert_eq!(none.code, 1, "{}", none.log);
         assert!(none.report.is_empty());
         assert!(
-            none.log.contains("left no MI300X release report"),
+            none.log
+                .contains("left no MI325X (or, until the queue side moves, MI300X) release report"),
             "{}",
             none.log
         );
@@ -14240,7 +14430,7 @@ esac
                     "results=queue-results/{}",
                     QUEUE_REPORT_PATH.trim_end_matches("/report.json")
                 )),
-            "the gate must read refused.txt and the MI300X release results directory"
+            "the gate must read refused.txt and the MI325X release results directory"
         );
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

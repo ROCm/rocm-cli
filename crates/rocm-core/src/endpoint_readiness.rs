@@ -70,8 +70,9 @@ pub fn json_state_lock_path(path: &Path) -> PathBuf {
 /// run under one cross-process lock ([`json_state_lock_path`]) and no merge
 /// can drop a key another merge recorded. The lock orders writers rather than
 /// combining them: a full rewrite through [`write_json_state_file`] still
-/// replaces every key merged before it, and a writer that bypasses both
-/// functions (the vLLM and AIM engines' own state writes) takes no lock at all.
+/// replaces every key merged before it. Every built-in engine adapter's state
+/// writes go through one of the two; a writer that bypasses both (an
+/// out-of-tree engine plugin writing the file itself) takes no lock at all.
 ///
 /// The result is published atomically
 /// ([`crate::atomic_write::write_file_atomically`]), so a reader that takes no
@@ -124,6 +125,16 @@ fn merge_json_state_file_with(
 /// Takes the same lock as [`merge_json_state_file`] and publishes the same
 /// atomic way, so a full rewrite cannot land in the middle of another
 /// writer's merge.
+///
+/// It replaces every key merged before it — that is what a full rewrite is for,
+/// and how a new run of a service clears what the previous run recorded — with
+/// one exception: an Anthropic endpoint *this process* published
+/// (`crate::publish_anthropic_endpoint`) is carried into the document first.
+/// The publisher is a thread of the same process as the engine adapter calling
+/// this, it publishes exactly once, and since ROCMAI-550 the adapter's
+/// post-spawn rewrite spends a multi-second host GPU probe building its
+/// document — wide enough for the publication to land inside it and be lost.
+/// See `anthropic_endpoint::carry_published_anthropic_endpoint`.
 pub fn write_json_state_file(path: &Path, value: &serde_json::Value) -> Result<()> {
     write_json_state_file_with(path, value, || {})
 }
@@ -137,8 +148,15 @@ fn write_json_state_file_with(
     before_publish: impl FnOnce(),
 ) -> Result<()> {
     let _lock = FileLock::acquire(json_state_lock_path(path))?;
+    // Read inside the file lock, which leaves no gap: a publisher notes the
+    // endpoint before it asks for this lock, so one that is waiting here has
+    // already been noted and is carried, and one that has not noted yet merges
+    // after this rewrite and lands on its own. `publish_anthropic_endpoint`
+    // releases its in-memory note before taking the file lock, so the two locks
+    // are never held in both orders.
+    let carried = crate::anthropic_endpoint::carry_published_anthropic_endpoint(path, value);
     before_publish();
-    publish_json_state(path, value)
+    publish_json_state(path, carried.as_ref().unwrap_or(value))
 }
 
 /// Why [`merge_json_state_file`] refused an existing state file.
@@ -1638,6 +1656,80 @@ mod tests {
         for n in 0..MERGES_PER_WRITER {
             merge_json_state_file(path, &serde_json::json!({ format!("{writer}-{n}"): n }))?;
         }
+        Ok(())
+    }
+
+    /// The lock-ordering argument in `publish_anthropic_endpoint`'s doc comment,
+    /// raced rather than asserted sequentially.
+    ///
+    /// Both existing tests drive publish-then-rewrite on one thread, so they
+    /// only cover the interleaving where the note is already taken when
+    /// `carry_published_anthropic_endpoint` reads it. The dangerous one is the
+    /// other: a publisher that notes *after* the carry has already run. This
+    /// parks a whole-file writer at `before_publish` -- past the carry, still
+    /// holding the file lock -- and only then lets the publisher go, so the
+    /// note lands in exactly that window every run rather than by timing luck.
+    ///
+    /// The endpoint must reach the file either way: carried by the rewrite if
+    /// it was noted first, or merged by the publisher afterwards if it was
+    /// not. What must never happen is the rewrite winning and the endpoint
+    /// being gone, which is the `anthropic endpoint:` row never coming back.
+    ///
+    /// Also pins that the two locks are not taken in both orders: the
+    /// publisher takes the in-memory note and releases it before asking for
+    /// the file lock, so parking a writer that holds the file lock cannot
+    /// deadlock it. A regression to "note held across the file lock" hangs
+    /// this test rather than failing it, which the harness reports as a
+    /// timeout.
+    #[test]
+    fn a_publication_landing_after_the_carry_still_reaches_the_file() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-anthropic-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let state_path = dir.join("state.json");
+        write_json_state_file(&state_path, &serde_json::json!({ "status": "starting" }))?;
+
+        // Released once the writer is parked past its carry, with the lock held.
+        let carried = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = std::sync::Arc::clone(&carried);
+        let writer_path = state_path.clone();
+        let writer = std::thread::spawn(move || {
+            write_json_state_file_with(
+                &writer_path,
+                &serde_json::json!({ "status": "running", "server_pid": 7 }),
+                || {
+                    writer_barrier.wait();
+                },
+            )
+        });
+
+        carried.wait();
+        // The writer has read the (empty) note and is holding the file lock.
+        // This publication therefore cannot be carried; it has to land on its
+        // own once the lock is free.
+        crate::publish_anthropic_endpoint(
+            &state_path,
+            "http://127.0.0.1:41999",
+            crate::AnthropicEndpointMode::Proxy,
+        )?;
+        writer.join().expect("writer thread panicked")?;
+
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(
+            state[crate::ANTHROPIC_ENDPOINT_URL_STATE_KEY],
+            "http://127.0.0.1:41999",
+            "a publication racing a whole-file rewrite must survive it, whichever \
+             order they land in: {state}"
+        );
+        assert_eq!(state[crate::ANTHROPIC_ENDPOINT_MODE_STATE_KEY], "proxy");
+        // And the rewrite's own document is still there, so the endpoint did
+        // not survive by the rewrite having been lost instead.
+        assert_eq!(state["status"], "running", "{state}");
+        assert_eq!(state["server_pid"], 7, "{state}");
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

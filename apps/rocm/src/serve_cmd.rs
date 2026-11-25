@@ -66,6 +66,7 @@ use crate::gpu_policy::{
     serve_gpu_low_memory_warning, validate_pinned_gpu_index, write_unchecked_index_warning,
 };
 use crate::managed_service_status::{find_live_managed_service, live_managed_services_for_model};
+use crate::serve_device_probe::serve_device_after_launch;
 use crate::serve_port;
 use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_recipe::{
@@ -1307,6 +1308,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 };
             spinner.clear();
 
+            let device = serve_device_after_launch(&paths, &selected_engine, &report);
+
             let mut notes = collect_serve_notes(
                 cpu_only,
                 &gpu_selection,
@@ -1371,6 +1374,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 anthropic_endpoint,
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
+                device,
                 already_running: report.already_running,
                 metrics,
                 smoke_failure,

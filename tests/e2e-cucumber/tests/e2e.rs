@@ -88,6 +88,14 @@ pub struct E2eWorld {
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
     pub model_name: Option<String>,
+    /// Stdout of the `rocm serve` that this scenario's Given step launched,
+    /// kept so a Then can assert on the deployment summary it printed.
+    ///
+    /// Separate from `cli_output`, which belongs to the scenario's When step:
+    /// these serves happen in a *precondition*, and overwriting `cli_output`
+    /// from a Given would change what every existing Then on those scenarios
+    /// reads. `None` when the scenario served nothing.
+    pub serve_summary: Option<String>,
     pub chat_response: Option<serde_json::Value>,
     /// The reply to a request sent to the served model's Anthropic-compatible
     /// `/v1/messages` endpoint.
@@ -235,6 +243,9 @@ pub struct E2eWorld {
     /// runtime-33's failed alignment had reverted it, so the install that follows
     /// can be held to leaving exactly that pin in place.
     pub lemonade_pin_after_failed_alignment: Option<String>,
+    /// The Lemonade runtime tree runtime-33's install reported, so a failed
+    /// check can attach what the tree holds (see `lemonade_runtime_evidence`).
+    pub lemonade_runtime_dir: Option<PathBuf>,
     /// The pasted error a diagnose-59 or diagnose-60 scenario hands to
     /// `rocm diagnose --symptom-file`. Its own field for the reason
     /// `skill_symptom` is.
@@ -278,8 +289,10 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
-    /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
-    /// can show a refused install left that tree exactly as it was.
+    /// Every file of a tree, with its bytes, recorded before a command runs so
+    /// a Then can show the command left that tree exactly as it was: a planted
+    /// Lemonade tree a refused install must not touch, or the CLI's settings
+    /// and data folders a diagnosis must not change (diagnose-89).
     pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
     /// The size of this machine's `/dev/shm`, in bytes, as a Given measured it,
     /// so a Then can show a fix that only explains itself left it as it was.
@@ -420,6 +433,7 @@ impl Default for E2eWorld {
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
+            serve_summary: None,
             chat_response: None,
             anthropic_response: None,
             anthropic_stream: None,
@@ -455,6 +469,7 @@ impl Default for E2eWorld {
             skill_reference: None,
             skill_symptom: None,
             lemonade_pin_after_failed_alignment: None,
+            lemonade_runtime_dir: None,
             symptom_paste: None,
             symptom_file_runs: Vec::new(),
             helper_identity: None,

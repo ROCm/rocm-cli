@@ -16,8 +16,9 @@
 # source of truth for the lint/format/hygiene checks. Hooks tagged
 # `groups: [local-tools]` need a full Rust compile, hawkeye, lychee, PowerShell,
 # or commit-history/signing access and are covered by their own dedicated CI
-# jobs (clippy / build-and-test / license-headers / docs-links /
-# powershell-lint / commit-signatures), so the prek job skips them.
+# jobs (clippy / test / windows-debug / license-headers / docs-links /
+# powershell-lint / third-party-notices / commit-signatures), so the prek job
+# skips them.
 
 default_install_hook_types: [pre-commit, pre-push]
 
@@ -89,7 +90,7 @@ repos:
     hooks:
       - id: license-headers
         name: license header check (hawkeye)
-        entry: hawkeye check --config licenserc.toml
+        entry: hawkeye check --config licenserc.toml --fail-on-unknown
         language: system
         always_run: true # hawkeye always scans licenserc.toml's full file list regardless
                           # of what changed (pass_filenames: false below); a file-type
@@ -138,6 +139,38 @@ repos:
         pass_filenames: false
         stages: [pre-commit, pre-push]
         groups: [local-tools] # runs in the `clippy` CI job (compiles xtask)
+
+  # E2E scenario naming: the `<key>-<NN>` scenario names and `@id:` tags in the
+  # .feature files, which tests/e2e-cucumber/tests/feature_naming.rs enforces
+  # (the e2e README's "Naming" section says what the convention is). CI runs that
+  # test in the `test` job (`Test (affected crates)`) and the `windows-debug` job;
+  # this hook only moves a violation from a CI round-trip to the commit that
+  # stages it. It runs that one test target, which links the e2e-cucumber crate:
+  # `cargo xtask e2e` builds the crate with the same profile and features (`run`
+  # in xtask/src/e2e.rs), so after an e2e run the hook takes seconds, but its
+  # first run on a fresh target directory compiles the harness's dependencies.
+  # The test reads only the .feature files in tests/e2e-cucumber/features/ and
+  # the `FEATURE_KEYS` list in feature_naming.rs, so `files:` names the inputs
+  # it can see; `lychee` and `architecture-doc` are `always_run` because a
+  # rename or deletion anywhere in the tree can change their answer. It fires
+  # when the commit stages a .feature file under tests/e2e-cucumber/features/
+  # or the guard feature_naming.rs itself. prek never matches a deleted path,
+  # so a commit that only deletes a .feature file, renames one out of
+  # features/, or renames one to a name `files:` does not match
+  # (`x.feature` to `x.feature.off`) skips the hook: a stale `FEATURE_KEYS`
+  # entry it leaves behind is caught only by CI. To commit an intermediate
+  # state the guard rejects, skip it for that commit:
+  # `SKIP=feature-naming git commit`.
+  - repo: local
+    hooks:
+      - id: feature-naming
+        name: e2e scenario names and ids follow the feature-key convention
+        entry: cargo test -p e2e-cucumber --test feature_naming
+        language: system
+        files: '^tests/e2e-cucumber/(features/.*\.feature|tests/feature_naming\.rs)$'
+        pass_filenames: false
+        stages: [pre-commit]
+        groups: [local-tools] # compiles e2e-cucumber; CI runs the test in `test` and `windows-debug`
 
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
@@ -199,7 +232,7 @@ repos:
         pass_filenames: false
         verbose: true
         stages: [pre-push]
-        groups: [local-tools] # runs in the dedicated build-and-test CI job
+        groups: [local-tools] # runs in the `test` and `windows-debug` CI jobs
       - id: powershell-script-analyzer
         name: PSScriptAnalyzer
         # Lints every .ps1 with PSScriptAnalyzer, which also covers syntax (a file
