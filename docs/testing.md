@@ -1258,10 +1258,13 @@ the reader is not skipped), and fails on a path Windows resolves differently (a 
 in `.` or a space), so a new cross-crate read cannot be added without a decision. A second test
 holds every table entry to that `rust` category.
 The scan has limits. A path held in a const (`.github/scripts/gpu-preflight.sh`, read through
-`SHARED_PREFLIGHT`) is not seen at all; the per-glob sample test pins that file's glob and checks
-the glob is there, not that a test reads the file (the `.github/scripts/**` glob is also held
-by the literal reads of `settle-e2e-lanes.sh`). And a read whose path is
-written out (an `include_str!` literal, a `CARGO_MANIFEST_DIR` chain ending in literal
+`SHARED_PREFLIGHT`) is not seen at all; for scripts under `scripts/` and `.github/scripts/`,
+`scripts_xtask_tests_read_are_in_the_rust_filter` (xtask) covers that gap by checking every script
+an xtask source names against the `rust` category (the cross-crate scan also holds the
+`.github/scripts/**` glob, through the literal reads of `settle-e2e-lanes.sh`), and any other such
+file's `rust` glob is pinned only by a per-glob sample test, which checks the glob is there, not
+that a test reads the file.
+And a read whose path is written out (an `include_str!` literal, a `CARGO_MANIFEST_DIR` chain ending in literal
 `.join("...")` segments, or `repo_root().join("...")` with a literal path) is checked file by
 file, but a test that derives the repo root in one place and joins the rest elsewhere (the result
 of xtask's `repo_root()` helper stored and joined later, or joined with a computed path) is only
@@ -4752,11 +4755,46 @@ that the private download directory is removed. A failed install also exits
 non-zero and removes that directory, and a good download installs once and
 exits zero. It is Unix-only.
 
-The eight native Linux GPU preflights are one script,
+The native Linux GPU preflights, in four jobs and the shared-queue lane, are
+one script,
 [`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
 with its own `GPU_PREFLIGHT_MIN_FREE_GIB` (16 on the discrete lanes, 8 on
-Strix). It applies two gates, because neither sees what the other does: a
-bounded wait on free memory, and then `reclaim-gpu.sh --assert-clear`. The
+Strix). It first runs
+[`host-baseline.sh`](../.github/scripts/host-baseline.sh), which fails the lane
+at once, without retrying, when the runner's glibc or libstdc++ is older than
+the glibc/`GLIBCXX` pair of the product's supported floor in
+[README.md](../README.md); the OpenSSL version that floor also names is not
+checked (see
+[ci-hardware-testing.md](ci-hardware-testing.md#self-hosted-runner-baseline)).
+[`host_baseline_contract.rs`](../xtask/src/host_baseline_contract.rs) drives
+that script under stubbed `getconf` and `ldconfig` — at, above and below the
+floor, versions that a string comparison gets wrong, multilib hosts that list
+an old 32-bit libstdc++ first, a cache with two x86-64 copies, a cache of
+thousands of entries, an `ldconfig` found only in sbin, an os-release path
+that is a directory (passed over for the next file, or for "unknown"), and
+hosts where a value cannot be read — and fails when its floor and the one in
+`README.md` disagree, or when a place that restates its glibc/`GLIBCXX`
+pair — [wsl.md](wsl.md), or the WSL distro check and its fix recipe in
+`rocm-core` — disagrees with `README.md`. Only the pair is compared: the
+Ubuntu release name is not.
+In [`workflow_contract.rs`](../xtask/src/workflow_contract.rs),
+`preflight_fails_a_host_below_the_baseline_without_querying_the_gpu` holds that
+a failing baseline stops the preflight before `rocm-smi` is asked anything,
+`preflight_runs_the_host_baseline_once_however_many_polls_it_takes` that it is
+not retried with the GPU wait,
+`preflight_bounds_a_host_baseline_that_never_returns` that its 15s bound,
+pinned in the source as `BASELINE_TIMEOUT_SECS=15` on the one `timeout` call,
+fails the preflight,
+`preflight_fails_when_the_host_baseline_could_not_be_run` that a baseline that
+never ran fails it too, and
+`preflight_stops_on_the_real_host_baseline_below_the_floor` that the real
+script, on a host whose stubbed `getconf` reports glibc 2.37, stops the real
+preflight with its own verdict before `rocm-smi` is asked anything;
+`preflight_runs_the_real_host_baseline` is a smoke test of the same pair on the
+real host, which on CI's runners exercises only the path that meets the floor.
+Then it applies two GPU gates, because neither sees what the
+other does: a bounded wait on free memory, and then
+`reclaim-gpu.sh --assert-clear`. The
 memory floor is a fixed number of GiB against whatever pool `rocm-smi` reports,
 so its sensitivity is set by the pool's size rather than by what a serve holds —
 against a ~62 GiB Strix GTT aperture it trips only past ~54 GiB held, and

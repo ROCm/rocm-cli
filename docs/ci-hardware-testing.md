@@ -488,6 +488,51 @@ guessed platform on Linux, which would report a Windows lane as Linux;
 `xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
 against it.
 
+## Self-hosted runner baseline
+
+Every native Linux GPU job that runs the shared GPU preflight must run on a host
+that meets the product's own minimum supported Linux release, as
+[README.md](../README.md) states it: the Ubuntu release it names, or on other
+distributions the equivalent glibc, `GLIBCXX` and OpenSSL versions it names. The
+baseline below asserts the glibc and `GLIBCXX` half of that floor; it does not
+check OpenSSL. This page does not repeat the numbers; the script's `MIN_GLIBC`
+and `MIN_GLIBCXX` hold them, and a test ties those to README.md (below). Below
+that floor the Lemonade engine cannot load, and the suite would fail late, for
+a reason it does not name.
+
+[`host-baseline.sh`](../.github/scripts/host-baseline.sh) checks it. It reads
+glibc from `getconf GNU_LIBC_VERSION` and the newest `GLIBCXX_3.4.N` from the
+first x86-64 `libstdc++.so.6` in the loader cache (the host's system copy, not
+one an engine's `LD_LIBRARY_PATH` might substitute), logs the distribution's name
+without gating on it, and fails on any value it cannot read. The shared GPU
+preflight, [`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), runs it
+once before its GPU gates, without retrying, so it covers every job that runs
+that preflight: `e2e-gpu` (MI300X) and `e2e-gpu-strix-ubuntu` in
+`e2e-selfhosted.yml`; `e2e-gpu-nightly` (MI300X) and `e2e-gpu-nightly-strix` in
+`nightly.yml`; and each channel of a
+[shared-queue lane](nightly-on-the-queue.md), whose lane image must therefore
+meet the floor too.
+
+The CI glibc/`GLIBCXX` floor equals the product's on purpose. A runner below it
+cannot run what users are told is supported, and a floor raised above it would
+hide a break on the oldest host the product supports.
+[`host_baseline_contract.rs`](../xtask/src/host_baseline_contract.rs) fails
+when the script's constants and the README sentence's glibc/`GLIBCXX` pair
+disagree, or when a place that restates the pair — [wsl.md](wsl.md), or the
+WSL distro check and its fix recipe in `rocm-core` — disagrees with README.md, so
+raising the CI floor is a change to the product's support floor, made as its
+own decision rather than on the runners alone. The Ubuntu release those texts
+also name (README.md, wsl.md, `WSL_MIN_UBUNTU` in `rocm-core`) is not compared
+by any test, so raising the floor also means updating it by hand.
+
+The WSL lanes meet the floor by construction: each run installs a fresh
+Ubuntu-24.04 distro (see "Platforms" above), and they do not run the shared
+preflight. The native Windows lanes have no glibc. Their equivalent runtime
+floor would be the Visual C++ runtime that `rocm diagnose` checks against
+`MSVC_REDIST_MIN_VERSION` in
+[`diagnose/windows.rs`](../crates/rocm-core/src/diagnose/windows.rs); no
+Windows lane asserts it today.
+
 ## GPU visibility on the hardware pool
 
 A hardware job does not necessarily get every GPU its host has. On the
