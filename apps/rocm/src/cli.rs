@@ -94,16 +94,19 @@ pub(crate) enum Command {
         #[arg(long, value_enum, default_value_t = FrameworkArg::Auto)]
         framework: FrameworkArg,
     },
-    /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
+    /// Check this machine against a closed catalog of known ROCm/PyTorch/llama.cpp failure modes.
     ///
     /// Matches this machine against a fixed catalog of known misconfigurations and
-    /// ranks what it finds. It can only recognise failure modes that are in the
-    /// catalog: no match means "not recognised", not "nothing is wrong" - in that
-    /// case it points you at where to report the symptom.
+    /// ranks what it finds. Nothing has to have failed first: with no `--symptom`
+    /// it examines the machine as it is. A diagnosis applies no fix and installs
+    /// nothing; `rocm fix` is the step that changes the machine. It can only
+    /// recognise catalogued failure modes: no match means "not recognised", not
+    /// "nothing is wrong" - then it points you at where to report the symptom.
     ///
     /// Each cause is printed with an `id:` and an `apply with:` command. The
     /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
-    /// takes the id, not the position.
+    /// takes the id, not the position. An established cause that leaves the GPU
+    /// unreachable is listed first, and the closing line names the first cause.
     ///
     /// On Linux it also sizes an integrated GPU's share of system memory
     /// (`fix-24-apu-unified-memory`): `amdgpu.gttsize` counts MiB and
@@ -114,7 +117,8 @@ pub(crate) enum Command {
     /// window of that log is read, so its absence is reported as such rather
     /// than as "this machine has never failed".
     Diagnose {
-        /// Raw error text from the user; sharpens keyword scoring.
+        /// Raw error text from the user; sharpens keyword scoring. A few failure
+        /// modes show only in such text (a vLLM out-of-memory error, for one).
         ///
         /// A shell reads this text before `rocm` does, so quotes, `$(...)`
         /// and a leading `-` in a pasted error can be changed, run, or taken

@@ -6596,6 +6596,25 @@ gates still apply (a `-n` name filter would bypass them):
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-wsl-usual-shared-memory-is-not-reported-short cargo xtask e2e
 ```
 
+### Diagnosing before anything has failed
+
+`diagnose-89` holds `rocm diagnose --help` to what the command does for a user
+who has hit no failure. It plants the unneeded GPU override that `diagnose-62`
+uses, a misconfiguration every lane reads from the environment, then reads the
+help for three lines (nothing has to have failed first, a diagnosis applies no
+fix, only `rocm fix` changes the machine), runs `rocm diagnose` with no
+`--symptom`, and requires the override to be reported with its `rocm fix`
+command. It also compares the CLI's `config` and `data` folders file by file
+before and after. That is what "installs nothing" is checked as: a change
+outside those two folders is not observed, and neither are the cache folder
+(CI shares it between scenarios) or the CLI's own log. With no symptom the
+override scores below the match threshold, so it is listed as a weak result
+rather than a match. The scenario is untagged and runs on every lane:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-89)'
+```
+
 ## Symptom From A File Or Standard Input
 
 `rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
@@ -6698,6 +6717,42 @@ only those three without bypassing the harness's gates:
 
 ```bash
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
+```
+
+### Which cause ranks first
+
+Each catalog entry in `CHECKERS` in
+[catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs) names a
+`Precedence`, and `run_all_checks` there sorts the findings that cleared the
+match threshold by it before their score: a finding that the process has no
+working path to the GPU (`GpuPath`: no device node, no kernel or host driver,
+no permission to open it, or on WSL2 no bridge from ROCm to the host driver)
+ranks ahead of every other finding, such as a small `/dev/shm` or a vLLM
+out-of-memory error, even when that one scores higher. Below the threshold
+precedence does not count, so a weak signal such as merely being in a
+container never climbs over an established finding. The text report's closing
+line names the first cause in that order (`render_report_text` in
+[report.rs](../crates/rocm-core/src/diagnose/report.rs)), whether or not a
+lower-ranked one clears `HIGH_CONFIDENCE`. The unit tests in catalog.rs pin the
+reported WSL container with a 64 MiB `/dev/shm`, the same container with a
+pasted out-of-memory error, a sub-threshold container finding, and a bare-metal
+container without `/dev/kfd`:
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/diagnose::catalog::tests::(in_a_docker|a_high_confidence|a_weak_gpu|a_linux_container)/)'
+```
+
+`diagnose-90` in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+covers it end to end on every Linux lane, WSL included: it plants a host root
+that reads as a docker container on WSL2 with no `/dev/dxg`, pastes a vLLM
+out-of-memory error, and requires the missing device first, the closing line
+to name it, and `rocm fix` to accept that id on the same planted machine. The
+shared-memory shape of the original report is unit-only, because `/dev/shm` is
+measured from the process's own mount rather than through the host root
+([hardware_root.rs](../crates/rocm-core/src/hardware_root.rs)). To run it alone:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-a-gpu-the-program-cannot-reach-is-ranked-first cargo xtask e2e
 ```
 
 ## Model Fit Preflight
@@ -6843,18 +6898,18 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   The other half of ROCMAI-912 is the advice, not the measurement: the
   `fix-24-apu-unified-memory` catalog entry, which reads `amdgpu.gttsize` and
   `ttm.pages_limit` off `/proc/cmdline` and the amdkfd SVM failures out of the
-  recent kernel log. `diagnose-89`, `diagnose-90` and `diagnose-91`
+  recent kernel log. `diagnose-91`, `diagnose-92` and `diagnose-93`
   (`@requires-os:linux`; these are Linux kernel parameters) extend the same
   planted gfx1151 host with a `/proc/cmdline`, a `/proc/meminfo` reporting
   128 GiB, and a `journalctl` of their own on the CLI's `PATH` - the kernel log
   is obtained by running a command, not by reading a file, so the host-root seam
-  cannot supply it. `diagnose-89` plants a `ttm.pages_limit` a third of what
+  cannot supply it. `diagnose-91` plants a `ttm.pages_limit` a third of what
   `amdgpu.gttsize` asks for and requires the smaller ceiling to be named, a
   consistent pair sized to installed RAM to be offered, and the BIOS carve-out
-  to stay in the notes rather than appear among the commands. `diagnose-90` is
+  to stay in the notes rather than appear among the commands. `diagnose-92` is
   the negative: the same host with a page limit that covers its aperture gets no
   finding, which is what stops the entry firing on the mere presence of the
-  parameters. `diagnose-91` plants the driver's own
+  parameters. `diagnose-93` plants the driver's own
   `SVM mapping failed, exceeds resident system memory limit` line, requires it
   to be reported as a cause, then removes it and requires the report to say the
   recent log was read rather than that the machine never failed. The `kvm_amd`
@@ -6862,7 +6917,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   a detector widened to match the bare word fails
   `an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not` in
   [examine/host_env.rs](../crates/rocm-core/src/examine/host_env.rs) and
-  `diagnose-90` here. **No APU runs this entry on real hardware**: no CI lane
+  `diagnose-92` here. **No APU runs this entry on real hardware**: no CI lane
   and no development machine has one whose `gttsize` and `pages_limit` are set,
   so every check of it is simulated.
 

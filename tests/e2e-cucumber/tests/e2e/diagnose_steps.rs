@@ -3862,6 +3862,144 @@ async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+// ── A GPU the program cannot reach ranks first (ROCMAI-785) ────────
+
+/// The id of the finding that means a WSL distro or container has no
+/// `/dev/dxg`, so nothing in it can reach the GPU.
+const GPU_NOT_EXPOSED_FIX_ID: &str = "fix-wsl-1-gpu-not-exposed";
+
+/// The id of the vLLM out-of-memory finding.
+const VLLM_OOM_FIX_ID: &str = "fix-16-vllm-oom";
+
+/// The planted host root of diagnose-90.
+fn container_on_wsl_host_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("wsl-container-host-root")
+}
+
+#[given("a container on a WSL machine that was started without the GPU")]
+async fn container_on_wsl_without_the_gpu(world: &mut E2eWorld) {
+    // A WSL2 kernel string is what makes the probe read the host as WSL even on
+    // a bare-metal runner (`is_wsl_host` in rocm-core trusts it on its own), and
+    // `/.dockerenv` is the docker marker. No `/dev/dxg` is planted: that absence
+    // is the machine under test. Both are read through the host root
+    // (`hardware_root.rs` lists them), so a WSL lane's real `/dev/dxg` is hidden
+    // too.
+    let host = container_on_wsl_host_root(world);
+    std::fs::create_dir_all(host.join("proc")).expect("failed to create planted /proc");
+    std::fs::write(
+        host.join("proc/version"),
+        "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@builder) #1 SMP\n",
+    )
+    .expect("failed to write planted /proc/version");
+    std::fs::write(host.join(".dockerenv"), "").expect("failed to plant /.dockerenv");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user asks the CLI to diagnose that symptom on that machine")]
+async fn user_diagnoses_symptom_on_planted_machine(world: &mut E2eWorld) {
+    let symptom = world.model_name.clone().expect("no symptom set");
+    // `--top 20` so the whole ranking is read, not the default five.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["diagnose", "--symptom", &symptom, "--top", "20"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Each ranked row of a text report, in order, as `(id, score)`, read from its
+/// `#N (<id>) [<TIER> score=<n>/100]` header line.
+fn ranked_rows(output: &str) -> Vec<(String, i32)> {
+    output
+        .lines()
+        .filter(|line| line.starts_with('#'))
+        .filter_map(|line| {
+            let id = line.split_once(" (")?.1.split_once(')')?.0;
+            let score = line.split_once("score=")?.1.split_once('/')?.0;
+            Some((id.to_owned(), score.parse().ok()?))
+        })
+        .collect()
+}
+
+#[then(
+    "the cause ranked first is that the GPU is not exposed to the container, above the out-of-memory finding that scores higher"
+)]
+async fn assert_unreachable_gpu_ranks_first(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    assert_eq!(world.cli_rc, Some(0), "{output}");
+    let rows = ranked_rows(output);
+    assert_eq!(
+        rows.first().map(|(id, _)| id.as_str()),
+        Some(GPU_NOT_EXPOSED_FIX_ID),
+        "{rows:?}\n{output}"
+    );
+    // The container branch of the finding, not the Windows-driver one: this
+    // machine's host driver was never the problem.
+    assert!(
+        output
+            .contains("this is a container, and containers only see /dev/dxg when it is passed in"),
+        "the finding must say the container was started without the device:\n{output}"
+    );
+    // The premise: the out-of-memory finding is listed below it with the
+    // higher score, so the order is not the score order.
+    let first_score = rows[0].1;
+    let oom = rows
+        .iter()
+        .find(|(id, _)| id == VLLM_OOM_FIX_ID)
+        .unwrap_or_else(|| {
+            panic!("the pasted out-of-memory error must still be listed:\n{output}")
+        });
+    assert!(
+        oom.1 > first_score,
+        "the out-of-memory finding must score higher than the cause ranked above it, or \
+         this scenario no longer shows the ranking puts the GPU first: {rows:?}"
+    );
+}
+
+#[then("the closing advice names that cause, and the CLI accepts the fix it names on that machine")]
+async fn assert_closing_advice_names_the_unreachable_gpu(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let closing = format!("run `rocm fix {GPU_NOT_EXPOSED_FIX_ID}` (the top-ranked cause)");
+    assert!(output.contains(&closing), "{output}");
+    assert!(
+        !output.contains(&format!("Next step: run `rocm fix {VLLM_OOM_FIX_ID}`")),
+        "the out-of-memory finding scores HIGH but is not the next step:\n{output}"
+    );
+    // The named command, run on the same planted machine: `rocm fix` decides
+    // whether a WSL entry applies by reading `/dev/dxg` and `/proc/version`
+    // through the host root, so off it a bare-metal lane would refuse the id
+    // for a reason unrelated to the advice.
+    let host = container_on_wsl_host_root(world);
+    let (fix_stdout, fix_stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", GPU_NOT_EXPOSED_FIX_ID],
+        &[("ROCM_CLI_TEST_HOST_ROOT", host.to_string_lossy().as_ref())],
+    );
+    assert_eq!(
+        rc,
+        0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["fix", GPU_NOT_EXPOSED_FIX_ID],
+            rc,
+            &fix_stdout,
+            &fix_stderr
+        )
+    );
+    assert!(
+        fix_stdout.contains("--device=/dev/dxg"),
+        "the fix the advice names must print how to pass the device in:\n{fix_stdout}"
+    );
+}
+
 // ── Stale repo advice on a simulated Ubuntu host ───────────────────
 
 #[given("an Ubuntu 24.04 machine with two stale ROCm repo files")]
@@ -5337,6 +5475,108 @@ async fn assert_no_cause_marked_without_a_paste(world: &mut E2eWorld) {
     );
 }
 
+// ── Diagnosing before anything has failed (diagnose-89) ────────────
+
+#[when("the user asks how to diagnose this machine")]
+async fn user_asks_for_diagnose_help(world: &mut E2eWorld) {
+    world.cli_output = Some(crate::run_rocm_ok(world, &["diagnose", "--help"]));
+}
+
+#[then(
+    "the help says the machine can be diagnosed before anything has failed, and that only a fix changes it"
+)]
+async fn assert_diagnose_help_runs_before_a_failure(world: &mut E2eWorld) {
+    let help = world.cli_output.as_deref().expect("no diagnose help");
+    // Compared with every run of whitespace made one space: a build that
+    // unifies clap's features with this harness's (`cucumber` enables
+    // `wrap_help`) wraps the help at 100 columns, mid-sentence.
+    let flowed = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The wording of `Command::Diagnose`'s doc comment in apps/rocm/src/cli.rs.
+    // What it promises is held to the command by the two Thens after the
+    // diagnosis below, not by these strings.
+    for claim in [
+        "Nothing has to have failed first",
+        "with no `--symptom` it examines the machine as it is",
+        "A diagnosis applies no fix and installs nothing; `rocm fix` is the step that changes the machine.",
+    ] {
+        assert!(
+            flowed.contains(claim),
+            "`rocm diagnose --help` must say `{claim}`:\n{help}"
+        );
+    }
+}
+
+/// The CLI's settings and data folders of this scenario, where a saved setting
+/// or an installed runtime would land. The cache folder is not one of them: CI
+/// shares it between concurrent scenarios (`cache_dir_for` in `e2e.rs`), so
+/// another scenario's download would read as a change made here. Nor is the
+/// CLI's own log, `AppPaths::client_log_dir`: `logging::init` in
+/// apps/rocm/src/logging.rs opens the day's log file on every command but
+/// `uninstall`, so a run crossing midnight would create one whatever it did.
+fn cli_settings_and_installs(world: &E2eWorld) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    let log_dir = root.join("data").join("logs");
+    ["config", "data"]
+        .into_iter()
+        .map(|folder| root.join(folder))
+        .filter(|folder| folder.is_dir())
+        .flat_map(|folder| crate::e2e::lemonade_install_steps::tree_files(&folder))
+        .filter(|(path, _)| !path.starts_with(&log_dir))
+        .collect()
+}
+
+#[when("the user diagnoses the machine without describing a failure")]
+async fn user_diagnoses_before_a_failure(world: &mut E2eWorld) {
+    world.planted_tree_snapshot = Some(cli_settings_and_installs(world));
+    run_diagnose(world, None, false);
+}
+
+#[then("the misconfiguration on the machine is reported, with a fix to apply")]
+async fn assert_env_misconfig_reported_with_a_fix(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no diagnose output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose failed:\n{output}\n{stderr}"
+    );
+    let block = cause_block(output, ENV_MISCONFIG_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "with nothing pasted, the misconfiguration on the machine must still be reported:\n{output}"
+    );
+    let apply = format!("apply with: rocm fix {ENV_MISCONFIG_FIX_ID}");
+    assert!(
+        block.iter().any(|line| line.trim() == apply),
+        "the reported cause must name the `rocm fix` command that applies it:\n{output}"
+    );
+}
+
+#[then("the CLI's own settings and installs are left as they were")]
+async fn assert_cli_settings_and_installs_unchanged(world: &mut E2eWorld) {
+    let before = world
+        .planted_tree_snapshot
+        .clone()
+        .expect("no snapshot - did the diagnosis step run?");
+    let after = cli_settings_and_installs(world);
+    let paths = |files: &[(std::path::PathBuf, Vec<u8>)]| {
+        files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        after == before,
+        "a diagnosis changed the CLI's settings or data folders.\nbefore: {:?}\nafter: {:?}",
+        paths(&before),
+        paths(&after)
+    );
+}
+
 // ── An integrated GPU's shared memory pool (ROCMAI-912) ────────────
 
 /// `gfx_target_version` for gfx1151 (Strix Halo), in the kernel's decimal
@@ -6161,7 +6401,7 @@ fn plant_fake_journalctl(world: &E2eWorld, kernel_log: &str) {
 /// `run_rocm_with_scenario_env` takes `command_env` rather than borrowing it, so
 /// a scenario that runs the CLI twice gets the real host on the second run
 /// unless it re-states the fixture. That is not a detail worth discovering from
-/// a mysterious result: without this, the second run of diagnose-91 described
+/// a mysterious result: without this, the second run of diagnose-93 described
 /// the runner instead of the planted APU.
 fn restate_planted_machine_env(world: &mut E2eWorld) {
     world.command_env.push((
