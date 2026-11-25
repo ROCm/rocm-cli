@@ -238,12 +238,25 @@ pub(super) async fn detect_managed_chat(
         return None;
     };
     let picked = pick_managed_chat_endpoint(&value)?;
-    match fetch_first_model(&picked.base_url).await {
-        Some(model) => Some(crate::llm::detected_llm_config(&picked.base_url, &model)),
-        None => picked
-            .model
-            .map(|model| crate::llm::detected_llm_config(&picked.base_url, &model)),
-    }
+    managed_chat_config(&picked).await
+}
+
+/// The [`LlmConfig`] for a picked managed endpoint.
+///
+/// The model is the one the service was launched with whenever `/v1/models`
+/// lists it, not the first id listed: Lemonade lists every downloaded model, so
+/// the first id can be a different one, and requesting it makes Lemonade evict
+/// the served model and load that one with its own default context window
+/// (4096 tokens on an integrated GPU, smaller than the chat prompt). Only when
+/// the registry's model is not listed does the first listed id stand in, and
+/// when the fetch fails the registry's model is used as-is.
+async fn managed_chat_config(picked: &ManagedChatEndpoint) -> Option<crate::llm::LlmConfig> {
+    let served = fetch_models_json(&picked.base_url)
+        .await
+        .and_then(|models| crate::llm::pick_served_model(&models, picked.model.as_deref()));
+    served
+        .or_else(|| picked.model.clone())
+        .map(|model| crate::llm::detected_llm_config(&picked.base_url, &model))
 }
 
 /// Probe for a local chat engine, returning a ready [`LlmConfig`] or `None`.
@@ -374,16 +387,20 @@ pub(super) fn with_discovered_model(
     llm
 }
 
-/// GET `{base}/models` and return the first served model id, or `None`.
-pub(super) async fn fetch_first_model(base_url: &str) -> Option<String> {
+/// GET `{base}/models` and return the parsed body, or `None`.
+async fn fetch_models_json(base_url: &str) -> Option<serde_json::Value> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
     let resp = client.get(&url).send().await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    crate::llm::pick_first_model(&json)
+    resp.json().await.ok()
+}
+
+/// GET `{base}/models` and return the first served model id, or `None`.
+pub(super) async fn fetch_first_model(base_url: &str) -> Option<String> {
+    crate::llm::pick_first_model(&fetch_models_json(base_url).await?)
 }
 
 /// Startup served-model discovery for a *configured* chat endpoint (an explicit
@@ -583,6 +600,54 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// A Lemonade server lists every downloaded model, the served one not first.
+    /// The chat must ask for the model the service was launched with: asking for
+    /// the first listed makes Lemonade evict the served model and reload another
+    /// with its default 4096-token window. Fails when the first listed id wins.
+    #[tokio::test]
+    async fn managed_endpoint_chats_with_the_launched_model_not_the_first_listed() {
+        let base = spawn_models_server(
+            r#"{"data":[{"id":"Qwen3-0.6B-GGUF"},{"id":"Qwen3-4B-Instruct-2507-GGUF"}]}"#,
+        );
+        let picked = ManagedChatEndpoint {
+            base_url: base.clone(),
+            model: Some("Qwen3-4B-Instruct-2507-GGUF".to_string()),
+        };
+        let cfg = managed_chat_config(&picked).await.expect("endpoint config");
+        assert_eq!(cfg.base_url, base);
+        assert_eq!(cfg.model, "Qwen3-4B-Instruct-2507-GGUF");
+    }
+
+    /// The registry's model is not listed (or the service records none): the
+    /// first listed id stands in, as before.
+    #[tokio::test]
+    async fn managed_endpoint_falls_back_to_the_first_listed_model() {
+        let base = spawn_models_server(r#"{"data":[{"id":"served-a"},{"id":"served-b"}]}"#);
+        let picked = ManagedChatEndpoint {
+            base_url: base,
+            model: Some("org/not-listed".to_string()),
+        };
+        let cfg = managed_chat_config(&picked).await.expect("endpoint config");
+        assert_eq!(cfg.model, "served-a");
+    }
+
+    /// The listing cannot be fetched: the registry's model is used as-is, and
+    /// with none there is no config to offer.
+    #[tokio::test]
+    async fn managed_endpoint_uses_the_registry_model_when_the_listing_fails() {
+        let picked = ManagedChatEndpoint {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            model: Some("from-registry".to_string()),
+        };
+        let cfg = managed_chat_config(&picked).await.expect("endpoint config");
+        assert_eq!(cfg.model, "from-registry");
+        let none = ManagedChatEndpoint {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            model: None,
+        };
+        assert_eq!(managed_chat_config(&none).await, None);
     }
 
     /// Matrix (configured URL + no model + reachable): the startup path queries

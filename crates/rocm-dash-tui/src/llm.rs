@@ -254,6 +254,32 @@ pub fn pick_first_model(models_json: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Pick the model to chat with from a `/v1/models` response, preferring `preferred`.
+///
+/// A Lemonade server lists every model it has downloaded, not the one it has
+/// loaded, so "the first id" is whichever model sorts first on disk. Asking for
+/// it makes Lemonade evict the model that was served and load that one with its
+/// own default context window. `preferred` (the model the managed service was
+/// launched with) wins when the server lists it; otherwise this is
+/// [`pick_first_model`]. Pure.
+pub fn pick_served_model(
+    models_json: &serde_json::Value,
+    preferred: Option<&str>,
+) -> Option<String> {
+    // The id as the server spells it, not as the registry does.
+    let listed = preferred.and_then(|wanted| {
+        models_json
+            .get("data")?
+            .as_array()?
+            .iter()
+            .filter_map(|m| m.get("id").and_then(serde_json::Value::as_str))
+            .find(|id| id.eq_ignore_ascii_case(wanted))
+    });
+    listed
+        .map(str::to_string)
+        .or_else(|| pick_first_model(models_json))
+}
+
 /// Build an [`LlmConfig`] for a locally-detected engine. Local OpenAI-compatible
 /// servers (Lemonade / vLLM) need no gateway auth, so `api_key`/`auth_header`
 /// are `None`. Pure.
@@ -286,6 +312,33 @@ mod tests {
             pick_first_model(&serde_json::json!({"data":[{"x":1}]})),
             None
         );
+    }
+
+    #[test]
+    fn pick_served_model_prefers_the_launched_model_over_the_first_listed() {
+        // Lemonade lists every downloaded model; the served one is not first.
+        let j = serde_json::json!({"data":[
+            {"id":"Qwen3-0.6B-GGUF"},{"id":"Qwen3-4B-Instruct-2507-GGUF"}
+        ]});
+        assert_eq!(
+            pick_served_model(&j, Some("Qwen3-4B-Instruct-2507-GGUF")).as_deref(),
+            Some("Qwen3-4B-Instruct-2507-GGUF")
+        );
+        assert_eq!(
+            pick_served_model(&j, Some("qwen3-4b-instruct-2507-gguf")).as_deref(),
+            Some("Qwen3-4B-Instruct-2507-GGUF")
+        );
+    }
+
+    #[test]
+    fn pick_served_model_falls_back_to_the_first_when_the_preferred_is_not_listed() {
+        let j = serde_json::json!({"data":[{"id":"a"},{"id":"b"}]});
+        assert_eq!(
+            pick_served_model(&j, Some("org/other")).as_deref(),
+            Some("a")
+        );
+        assert_eq!(pick_served_model(&j, None).as_deref(), Some("a"));
+        assert_eq!(pick_served_model(&serde_json::json!({}), Some("a")), None);
     }
 
     #[test]
