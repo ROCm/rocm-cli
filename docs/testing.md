@@ -4745,6 +4745,7 @@ cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_
 cargo test -p rocm --bin rocm wsl_rocdxg_generated_steps_install_exactly_the_verified_file
 cargo test -p rocm --bin rocm wsl_doc_manual_steps_stop_before_the_check_when_the_download_fails
 python scripts/release_readiness.py --self-test
+python scripts/build_wheel.py --self-test
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 bash scripts/reclaim-gpu.sh --self-test
 ```
@@ -4857,6 +4858,33 @@ release asset sets, so stale archives and orphan checksum/signature sidecars in
 `dist` fail before upload, and it validates both missing and explicitly
 configured production trust inputs. Normal Linux and Windows CI run this
 self-test before the install-lifecycle E2E scenarios.
+
+The wheel self-test is offline and cross-platform too: normal Linux and Windows
+CI run it (the `Wheel builder self-test` steps, under the same `heavy` path
+filter as the other script self-tests, which any change under `scripts/`
+reaches), and release CI runs it again before building a wheel. It runs inside a system temporary
+directory, building wheels from a synthetic workspace and throwaway binaries,
+and covers the git-tag-to-PEP-440 mapping (including the tags with no wheel and
+the `--skip-unmappable-tag` policy, which forgives nothing but the tag's
+shape), both platform tags, the exact wheel member set,
+`METADATA`'s `License-File` lines, `RECORD` hashes and sizes, byte-identical
+rebuilds, the `.sha256` sidecar text, the executable mode bits on the packed
+`rocm`/`rocmd` entries (without them a pip install yields non-executable
+binaries) and the reading of an `auditwheel` report. A real wheel is checked by
+the release job itself: installed into a clean environment, `rocm --version`
+must match the tag, `rocmd --version` must run and `rocm uninstall --dry-run`
+must leave the pip-owned binaries alone. The self-test is what a pull request
+runs; building a real wheel, installing it and running `auditwheel` against the
+release container's binaries happen only in the release workflow (a tag push or a
+`workflow_dispatch` run, either of which also publishes the release; it has no
+dry-run mode). To try that locally, build the binaries, run
+`python scripts/build_wheel.py --bin-dir target/release --platform <linux-amd64|windows-amd64> --version <workspace version>`,
+install the wheel with `pip install --no-index` into a scratch virtual
+environment and run `rocm uninstall --dry-run --keep-config --keep-data --keep-cache`
+from it. `uninstall.feature` scenarios `uninstall-26` and `uninstall-27` cover
+the guard on the blocking mock `e2e` lane with a copy of the binary under test
+placed in a fake virtual environment and in a plain install folder. See
+[release-trust.md](release-trust.md) for how the PyPI channel is secured.
 
 ### Packaging
 

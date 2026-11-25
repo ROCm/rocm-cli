@@ -255,30 +255,21 @@ If your shell can't find the `rocm` command, for example with
 The directory is `~/.local/bin` on Linux, `%USERPROFILE%\.local\bin` on Windows,
 or the folder you set with `ROCM_CLI_INSTALL_DIR`.
 
-### Python package (x86_64 Linux and Windows)
+### Python package (not published yet)
 
-No wheels are published yet; once the first release ships, `rocm-cli` on PyPI
-is the supported install path for Python-packaging workflows. It carries the
-same prebuilt `rocm` and `rocmd` binaries as the installers above. Because
-these are command-line tools rather than a library, install them into their own
-isolated environment:
+The release workflow also builds `rocm-cli` as a Python wheel for Linux x86_64
+and Windows x86_64: the same prebuilt `rocm` and `rocmd` binaries that are in
+the signed release archives, with no Python code and no source distribution.
+The wheels are built and tested on every release, but publishing them to PyPI
+is switched off until the project name is registered and its publisher is
+configured, so `pip install rocm-cli` does not work yet. Use the installers
+above.
 
-```bash
-pipx install rocm-cli
-```
-
-```bash
-uv tool install rocm-cli
-```
-
-A plain `pip install rocm-cli` also works, but it only puts `rocm` and `rocmd`
-on `PATH` while that virtual environment is active.
-
-Wheels are built for Linux x86_64 and Windows x86_64 only, and there is no
-source distribution — the wheel ships the same binaries that are inside the
-signed release archives, not a Python reimplementation. It cannot carry the
-release `.sig` sidecar, so see `docs/release-trust.md` for what secures this
-channel instead.
+A binary that a Python package manager installed is left alone by
+`rocm uninstall`, which says to remove it with `pip uninstall rocm-cli`,
+`pipx uninstall rocm-cli` or `uv tool uninstall rocm-cli` instead. See
+`docs/release-trust.md` for how this channel is secured, and for the one layout
+(a Windows `pipx` or `uv tool` launcher) the uninstall cannot recognise.
 
 ## Build from source
 

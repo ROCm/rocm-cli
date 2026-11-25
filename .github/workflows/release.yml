@@ -8,6 +8,14 @@ on:
       tag:
         description: "Release tag (e.g. v0.1.0)"
         required: true
+      pypi_repository:
+        description: "PyPI index the publish-pypi job uploads to when that job is enabled (a TestPyPI rehearsal by default)"
+        required: false
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
 
 permissions:
   contents: read
@@ -53,6 +61,9 @@ jobs:
     runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
       version: ${{ steps.version.outputs.value }}
+      # "true" only when the wheel was built, passed its checks and was
+      # uploaded; the publish-pypi job needs it.
+      wheel_built: ${{ steps.upload_wheel.outcome == 'success' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -244,6 +255,130 @@ jobs:
             --notes "${NOTES}" \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
 
+      # The wheel steps run after the release upload, so the release asset set
+      # is settled before anything lands under dist/wheels. The wheel is built
+      # from the exact target/release binaries that were just packaged and
+      # signed: nothing is rebuilt, so its payload is byte-identical to the
+      # copy inside the signed archive.
+      - name: Build Python wheel
+        id: wheel
+        # The wheel channel is dormant (see publish-pypi), so a wheel problem
+        # must not hold back the release that carries the signed archives. The
+        # failure still shows on the step and in the "Report wheel status"
+        # annotation, and publish-pypi stays skipped. Remove
+        # continue-on-error from the wheel steps when publishing is turned on.
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          # The wheel builder's own checks run on every release.
+          python scripts/build_wheel.py --self-test
+          # A tag PEP 440 cannot express (v0.1.0-preview.1, for one) is valid
+          # for the release but has no wheel: the script prints a notice and
+          # writes nothing, and the steps below stand down.
+          python scripts/build_wheel.py \
+            --bin-dir target/release \
+            --platform linux-amd64 \
+            --tag "${VERSION}" \
+            --skip-unmappable-tag \
+            --out-dir dist/wheels
+          if compgen -G 'dist/wheels/*.whl' > /dev/null; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No Python wheel::${VERSION} has no PEP 440 spelling, so no wheel was built; the release carries on with its archives"
+          fi
+
+      # The wheel is tagged manylinux_2_17; this reads that tag back from the
+      # binaries instead of trusting the build container. auditwheel is pinned
+      # and installed into a throwaway venv.
+      - name: Verify the wheel's manylinux tag
+        id: manylinux
+        if: steps.wheel.outputs.built == 'true'
+        continue-on-error: true # see "Build Python wheel"
+        run: |
+          python -m venv "${RUNNER_TEMP}/auditwheel"
+          "${RUNNER_TEMP}/auditwheel/bin/python" -m pip install --disable-pip-version-check auditwheel==6.8.2
+          python scripts/build_wheel.py \
+            --auditwheel "${RUNNER_TEMP}/auditwheel/bin/auditwheel" \
+            --check-manylinux dist/wheels/*.whl
+
+      - name: Smoke test the Python wheel
+        id: smoke
+        if: steps.wheel.outputs.built == 'true'
+        continue-on-error: true # see "Build Python wheel"
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          shopt -s nullglob
+          wheels=(dist/wheels/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly one linux wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          venv="${RUNNER_TEMP}/wheel-smoke"
+          rm -rf "${venv}"
+          python -m venv "${venv}"
+          "${venv}/bin/python" -m pip install --no-index --disable-pip-version-check "${wheels[0]}"
+          # The wheel ships the real ELF binaries in its .data/scripts
+          # directory rather than console-script shims, so these must be the
+          # native executables themselves.
+          for binary in rocm rocmd; do
+            magic="$(head -c 4 "${venv}/bin/${binary}" | od -An -tx1 | tr -d ' \n')"
+            if [ "${magic}" != "7f454c46" ]; then
+              echo "${binary} is not an ELF executable (magic ${magic}); a shim would break current_exe()" >&2
+              exit 1
+            fi
+          done
+          # The installed binaries must be the ones this tag built, so a stale
+          # target/release tree cannot ship a wheel that disagrees with the
+          # release. `rocm --version` is `rocm-cli X.Y.Z (<tag>, <hash>)`, the
+          # shape "Check the release binary's version" checks. `rocmd` reports
+          # the workspace package version, which is not bumped per release, so
+          # it is only required to run and name itself.
+          release="${VERSION#v}"
+          reported="$("${venv}/bin/rocm" --version)"
+          prefix="rocm-cli ${release} (${VERSION}, "
+          if [[ "${reported}" != "${prefix}"*")" ]]; then
+            echo "rocm reports '${reported}', expected '${prefix}<hash>)'" >&2
+            exit 1
+          fi
+          reported="$("${venv}/bin/rocmd" --version)"
+          if [[ "${reported}" != "rocmd "* ]]; then
+            echo "rocmd reports '${reported}', expected 'rocmd <version>'" >&2
+            exit 1
+          fi
+          # `rocm uninstall` must leave pip's files to pip. A dry run, from a
+          # scratch home, removes nothing.
+          scratch="${RUNNER_TEMP}/wheel-smoke-home"
+          plan="$(HOME="${scratch}" ROCM_CLI_CONFIG_DIR="${scratch}/config" ROCM_CLI_DATA_DIR="${scratch}/data" ROCM_CLI_CACHE_DIR="${scratch}/cache" \
+            "${venv}/bin/rocm" uninstall --dry-run --keep-config --keep-data --keep-cache)"
+          echo "${plan}"
+          if ! grep -q "binary removal skipped because .* sits in a Python environment" <<<"${plan}"; then
+            echo "rocm uninstall --dry-run did not leave the pip-owned binaries alone" >&2
+            exit 1
+          fi
+          if grep -q -- "- binary:" <<<"${plan}"; then
+            echo "rocm uninstall --dry-run plans to remove a pip-owned binary" >&2
+            exit 1
+          fi
+          rm -rf "${venv}" "${scratch}"
+
+      # Uploaded only once the wheel has passed both checks above.
+      - name: Upload Python wheel
+        id: upload_wheel
+        if: steps.wheel.outputs.built == 'true' && steps.manylinux.outcome == 'success' && steps.smoke.outcome == 'success'
+        continue-on-error: true # see "Build Python wheel"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-linux-amd64
+          path: dist/wheels/
+          if-no-files-found: error
+
+      - name: Report wheel status
+        if: always() && steps.upload_wheel.outcome != 'success'
+        run: echo "::warning title=Python wheel not staged::the Linux wheel was not built, did not pass its checks or was not uploaded; see the Python wheel steps above. The release itself is not affected and publish-pypi stays skipped."
+
   windows-release:
     # Creates, uploads and deletes releases; the workflow default is read-only.
     permissions:
@@ -251,6 +386,9 @@ jobs:
     name: Build and upload Windows release
     runs-on: windows-latest
     needs: release
+    outputs:
+      # See the same output of the `release` job.
+      wheel_built: ${{ steps.upload_wheel.outcome == 'success' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -321,8 +459,123 @@ jobs:
           NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
         run: |
           $version = "$env:NEEDS_RELEASE_OUTPUTS_VERSION"
-          $assets = Get-ChildItem dist -File -Include *.zip,*.sha256,*.sig -Recurse | ForEach-Object { $_.FullName }
+          # `dist\*` plus -Include, never -Recurse: with -Recurse this glob also
+          # matches the wheel checksum sidecars under dist\wheels, which are not
+          # release assets. Without a path wildcard, -Include silently matches
+          # nothing at all.
+          $assets = Get-ChildItem dist\* -File -Include *.zip,*.sha256,*.sig | ForEach-Object { $_.FullName }
           gh release upload $version @assets --clobber
+
+      # The wheel steps run after the release upload, for the reason the Linux
+      # job gives. See its "Build Python wheel" step.
+      - name: Build Python wheel
+        id: wheel
+        continue-on-error: true # see "Build Python wheel" in the Linux job
+        shell: pwsh
+        env:
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          python .\scripts\build_wheel.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "wheel builder self-test failed" }
+          python .\scripts\build_wheel.py `
+            --bin-dir target\release `
+            --platform windows-amd64 `
+            --tag "$env:NEEDS_RELEASE_OUTPUTS_VERSION" `
+            --skip-unmappable-tag `
+            --out-dir dist\wheels
+          if ($LASTEXITCODE -ne 0) { throw "wheel build failed" }
+          $built = @(Get-ChildItem dist\wheels -File -Filter *.whl -ErrorAction SilentlyContinue).Count -gt 0
+          "built=$($built.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $built) {
+            Write-Host "::warning title=No Python wheel::$env:NEEDS_RELEASE_OUTPUTS_VERSION has no PEP 440 spelling, so no wheel was built; the release carries on with its archives"
+          }
+
+      - name: Smoke test the Python wheel
+        id: smoke
+        if: steps.wheel.outputs.built == 'true'
+        continue-on-error: true # see "Build Python wheel" in the Linux job
+        shell: pwsh
+        env:
+          NEEDS_RELEASE_OUTPUTS_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Invoke-Checked {
+            param([string]$Exe, [string[]]$Arguments)
+            & $Exe @Arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Exe $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+            }
+          }
+          $tag = $env:NEEDS_RELEASE_OUTPUTS_VERSION
+          $wheels = @(Get-ChildItem dist\wheels -File -Filter *.whl)
+          if ($wheels.Count -ne 1) {
+            throw "expected exactly one windows wheel, found $($wheels.Count)"
+          }
+          $venv = Join-Path $env:RUNNER_TEMP "wheel-smoke"
+          if (Test-Path -LiteralPath $venv) {
+            Remove-Item -Recurse -Force -LiteralPath $venv
+          }
+          Invoke-Checked python @("-m", "venv", $venv)
+          Invoke-Checked "$venv\Scripts\python.exe" @("-m", "pip", "install", "--no-index", "--disable-pip-version-check", $wheels[0].FullName)
+          # The wheel ships the real PE binaries in its .data/scripts directory
+          # rather than console-script shims, so these must be the native
+          # executables themselves.
+          foreach ($binary in @("rocm.exe", "rocmd.exe")) {
+            $path = Join-Path "$venv\Scripts" $binary
+            $magic = [System.IO.File]::ReadAllBytes($path)[0..1]
+            if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
+              throw "$binary is not a PE executable; a shim would break current_exe()"
+            }
+          }
+          # See the Linux job's smoke test: `rocm --version` is
+          # `rocm-cli X.Y.Z (<tag>, <hash>)`, and `rocmd` only has to run and
+          # name itself.
+          $release = if ($tag.StartsWith("v", [StringComparison]::Ordinal)) { $tag.Substring(1) } else { $tag }
+          $reported = ((& "$venv\Scripts\rocm.exe" "--version") -join "").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "rocm --version failed with exit code $LASTEXITCODE" }
+          $prefix = "rocm-cli $release ($tag, "
+          if (-not ($reported.StartsWith($prefix, [StringComparison]::Ordinal) -and $reported.EndsWith(')', [StringComparison]::Ordinal))) {
+            throw "rocm reports '$reported', expected '$prefix<hash>)'"
+          }
+          $reported = ((& "$venv\Scripts\rocmd.exe" "--version") -join "").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "rocmd --version failed with exit code $LASTEXITCODE" }
+          if (-not $reported.StartsWith("rocmd ", [StringComparison]::Ordinal)) {
+            throw "rocmd reports '$reported', expected 'rocmd <version>'"
+          }
+          # `rocm uninstall` must leave pip's files to pip. A dry run, from a
+          # scratch home, removes nothing.
+          $scratch = Join-Path $env:RUNNER_TEMP "wheel-smoke-home"
+          $env:HOME = $scratch
+          $env:USERPROFILE = $scratch
+          $env:ROCM_CLI_CONFIG_DIR = Join-Path $scratch "config"
+          $env:ROCM_CLI_DATA_DIR = Join-Path $scratch "data"
+          $env:ROCM_CLI_CACHE_DIR = Join-Path $scratch "cache"
+          $plan = (& "$venv\Scripts\rocm.exe" uninstall --dry-run --keep-config --keep-data --keep-cache | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "rocm uninstall --dry-run failed with exit code $LASTEXITCODE" }
+          Write-Host $plan
+          if ($plan -notmatch 'binary removal skipped because .* sits in a Python environment') {
+            throw "rocm uninstall --dry-run did not leave the pip-owned binaries alone"
+          }
+          if ($plan.Contains("- binary:")) {
+            throw "rocm uninstall --dry-run plans to remove a pip-owned binary"
+          }
+          Remove-Item -Recurse -Force -LiteralPath $venv
+
+      - name: Upload Python wheel
+        id: upload_wheel
+        if: steps.wheel.outputs.built == 'true' && steps.smoke.outcome == 'success'
+        continue-on-error: true # see "Build Python wheel" in the Linux job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-windows-amd64
+          path: dist/wheels/
+          if-no-files-found: error
+
+      - name: Report wheel status
+        if: always() && steps.upload_wheel.outcome != 'success'
+        shell: pwsh
+        run: Write-Host "::warning title=Python wheel not staged::the Windows wheel was not built, did not pass its checks or was not uploaded; see the Python wheel steps above. The release itself is not affected and publish-pypi stays skipped."
 
   publish-release:
     # Creates, uploads and deletes releases; the workflow default is read-only.
@@ -343,3 +596,104 @@ jobs:
           VERSION="${NEEDS_RELEASE_OUTPUTS_VERSION}"
           RELEASE_ID="$(gh release view "${VERSION}" --json databaseId -q .databaseId)"
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -f draft=false
+
+  # Dormant: the job runs only once the owner has registered the PyPI project
+  # and its Trusted Publisher and set the repository variable
+  # ROCM_CLI_PUBLISH_PYPI to "1" or "true". The gate is an allowlist, so any
+  # other value ("FALSE", "no", "off", unset) leaves it skipped, like the
+  # ROCM_CLI_REQUIRE_PRODUCTION_TRUST gate in the env block above. While it is
+  # skipped nothing reaches any index; the wheels are still built, smoke-tested
+  # and kept as workflow artifacts, and the release asset set is unchanged. It
+  # also skips when either platform has no wheel (a tag with no PEP 440
+  # spelling, or a wheel that failed its checks).
+  publish-pypi:
+    name: Publish wheels to PyPI
+    runs-on: ubuntu-24.04 # one LTS: publishing only
+    needs:
+      - release
+      - windows-release
+      # After publish-release, so wheels never reach an index before the
+      # release they correspond to is out of draft.
+      - publish-release
+    if: (vars.ROCM_CLI_PUBLISH_PYPI == '1' || vars.ROCM_CLI_PUBLISH_PYPI == 'true') && needs.release.outputs.wheel_built == 'true' && needs.windows-release.outputs.wheel_built == 'true'
+    environment: pypi
+    permissions:
+      # Trusted Publishing mints a short-lived OIDC token instead of using a
+      # stored API token, so this job needs id-token: write and no upload
+      # secrets, and nothing else.
+      contents: read
+      id-token: write
+    steps:
+      - name: Resolve publication target
+        id: target
+        env:
+          # Empty on a tag push, which always means the real index. A manual
+          # dispatch defaults to testpypi, so the irreversible action (a real
+          # upload burns that version for good) is always opt-in.
+          REQUESTED: ${{ github.event.inputs.pypi_repository }}
+        run: |
+          TARGET="${REQUESTED:-pypi}"
+          case "${TARGET}" in
+            pypi|testpypi) ;;
+            *)
+              echo "unknown pypi_repository input: ${TARGET}" >&2
+              exit 1
+              ;;
+          esac
+          echo "value=${TARGET}" >> "$GITHUB_OUTPUT"
+
+      - name: Download built wheels
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+
+      - name: Verify wheel checksums and stage the upload directory
+        run: |
+          shopt -s nullglob
+          wheels=(dist/wheels/*.whl)
+          if [ "${#wheels[@]}" -ne 2 ]; then
+            echo "expected 2 wheels (linux + windows), found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          # Re-verify each wheel against the sidecar written beside it on the
+          # builder runner. The sidecar travels in the same artifact, so this
+          # catches a file corrupted or truncated in artifact storage, not a
+          # compromised builder that wrote both consistently.
+          for wheel in "${wheels[@]}"; do
+            sidecar="${wheel}.sha256"
+            if [ ! -f "${sidecar}" ]; then
+              echo "missing checksum sidecar: ${sidecar}" >&2
+              exit 1
+            fi
+            expected="$(awk 'NR == 1 { print $1 }' "${sidecar}")"
+            actual="$(sha256sum "${wheel}" | awk '{ print $1 }')"
+            if [ -z "${expected}" ] || [ "${expected}" != "${actual}" ]; then
+              echo "checksum mismatch for ${wheel}: expected '${expected}', got '${actual}'" >&2
+              exit 1
+            fi
+            echo "verified $(basename "${wheel}") ${actual}"
+          done
+          # The publish action uploads every file in packages-dir, so stage the
+          # wheels on their own: the .sha256 sidecars are not distributions.
+          mkdir -p dist/pypi
+          cp "${wheels[@]}" dist/pypi/
+
+      # Exactly one of the two steps below runs; neither passes credentials
+      # (Trusted Publishing only), and both leave PEP 740 attestations at the
+      # action's enabled default.
+      - name: Publish to TestPyPI (rehearsal)
+        if: steps.target.outputs.value == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/pypi
+          repository-url: https://test.pypi.org/legacy/
+          print-hash: true
+
+      - name: Publish to PyPI
+        if: steps.target.outputs.value == 'pypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/pypi
+          print-hash: true

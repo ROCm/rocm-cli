@@ -190,6 +190,101 @@ and `ROCM_CLI_DOWNLOAD_BASE` is refused with this channel by both installers,
 one that has them. These builds are for trying a pull request, never for a
 release or an offline mirror.
 
+## PyPI Wheel Channel
+
+The release workflow builds a Python wheel for each platform from the binaries
+it has just built and signed, and can publish them to PyPI. **Publishing is
+off**: the `publish-pypi` job in [release.yml](../.github/workflows/release.yml)
+runs only when the repository variable `ROCM_CLI_PUBLISH_PYPI` is `1` or `true`
+(every other value, including unset, leaves it skipped), and the owner must
+first register the `rocm-cli` project on PyPI, and on TestPyPI for a
+rehearsal, and add this workflow and its `pypi` environment as the project's
+Trusted Publisher. Until then the wheels are built, smoke-tested and kept as
+workflow artifacts, nothing is uploaded, and the release asset set is
+unchanged. Nothing in the user documentation tells anyone to
+`pip install rocm-cli` for that reason.
+
+A wheel is not covered by the detached `.sig` sidecar described above: PyPI
+stores only the uploaded distribution, so a wheel consumer has nowhere to fetch
+`<wheel>.sig` from and `pip` would not check it. Do not describe the wheel
+channel as detached-signature verified. What it has instead:
+
+- **Trusted Publishing (OIDC).** The publish job authenticates with a
+  short-lived OpenID Connect token minted for this repository's release
+  workflow and its `pypi` environment, so PyPI accepts `rocm-cli` uploads only
+  from that identity. There is no long-lived upload token to leak or rotate.
+- **PEP 740 attestations.** `pypa/gh-action-pypi-publish` publishes a signed
+  attestation with each wheel, binding the file digest to the workflow that
+  produced it; the publish steps do not opt out. `pip` does not verify
+  attestations at install time, so for a plain `pip install` this is an
+  auditable provenance record, not an install-time gate. It is served from
+  PyPI's integrity API,
+  `https://pypi.org/integrity/rocm-cli/<version>/<filename>/provenance`.
+- **In-pipeline verification.** Each wheel is built in the job that packaged
+  and signed the release archive, from the same `target/release` binaries, so
+  its `rocm` and `rocmd` are byte-identical to the copies in the signed archive
+  for that tag. The release job then installs the wheel into a throwaway
+  environment and checks that the installed files are native executables,
+  that `rocm --version` reports `rocm-cli X.Y.Z (<tag>, <hash>)` for this tag,
+  that `rocmd --version` runs, and that `rocm uninstall --dry-run` leaves them
+  alone. The Linux wheel's `manylinux_2_17` tag is read back from the
+  binaries with a pinned `auditwheel` (`--check-manylinux` in
+  [build_wheel.py](../scripts/build_wheel.py)). The publish job re-checks each
+  wheel against its `.sha256` sidecar before upload; the sidecar travels in the
+  same artifact, so that catches a file corrupted in storage, not a compromised
+  builder that wrote both consistently. The control against that is the
+  attestation's binding to the workflow identity.
+
+Anyone who needs the detached signature as their trust root installs from the
+release with `install.sh` or `install.ps1` and verifies there.
+
+Before turning publishing on, restrict the `pypi` environment to `v*` tags and
+add required reviewers: TestPyPI and PyPI share that one environment name, and a
+manual dispatch with `pypi_repository` set to `pypi` would otherwise publish
+irreversibly from any ref.
+
+### Version mapping
+
+[build_wheel.py](../scripts/build_wheel.py) maps the git tag onto a PEP 440
+version: `vX.Y.Z` to `X.Y.Z`, `-alpha.N` and `-experimental.N` to `X.Y.ZaN`,
+`-beta.N` to `X.Y.ZbN`, `-rc.N` to `X.Y.ZrcN`. The wheel's version is the
+tag's; it is not compared with `[workspace.package] version`, which is shared by
+every crate and not bumped per release. What ties the installed binaries to the
+tag is the smoke test's check of `rocm --version`.
+
+The release workflow accepts more tag shapes than PEP 440 can express, such as
+`v0.1.0-preview.1`. For those the wheel step prints `wheel skipped: ...` and a
+warning annotation, builds no wheel and the release carries on with its
+archives; the publish job is skipped too.
+
+While publishing is off, a wheel step that fails does not fail the release
+either: those steps are `continue-on-error`, the failure shows on the step and
+as a warning annotation, nothing is uploaded or staged, and the publish job
+stays skipped. Remove `continue-on-error` from the wheel steps in
+[release.yml](../.github/workflows/release.yml) when turning publishing on, so
+that a wheel regression blocks the release again.
+
+PyPI never lets a version be re-uploaded, even after deletion. Two consequences
+bind the tagging policy: a botched release is yanked and superseded by a new
+version rather than replaced, and because `-alpha.N` and `-experimental.N` both
+map to `X.Y.ZaN`, only one of the two spellings may be used for a given serial.
+Tagging both `v1.2.3-experimental.1` and `v1.2.3-alpha.1` makes the second
+release fail at upload.
+
+### What `rocm uninstall` does with a Python-installed binary
+
+`rocm uninstall` removes the `rocm*` files beside the running executable.
+Inside a Python environment those files are in the wheel's `RECORD`, so it
+leaves them and names the matching `pip`, `pipx` or `uv tool` command instead;
+[python_install.rs](../apps/rocm/src/python_install.rs) lists the layouts it
+recognises (a `pyvenv.cfg`, or a `RECORD` listing the executable under the
+`site-packages`/`dist-packages` folders of Linux, Debian, Fedora, Windows and
+`pip install --user`) and resolves a tree it cannot read to "managed". It cannot
+see a Windows `pipx` or `uv tool` install run from the launcher those tools copy
+into `%USERPROFILE%\.local\bin`, which has no Python environment above it and
+looks like an installer-managed binary: uninstall those with `pipx uninstall
+rocm-cli` or `uv tool uninstall rocm-cli`.
+
 ## WSL ROCDXG Package Verification
 
 The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to
