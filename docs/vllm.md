@@ -422,6 +422,12 @@ the fault is not proven to depend on the size, and 0.3 is the only fraction that
 was reported to work. Pass `--gpu-memory-utilization 0.8` (or any fraction in
 `(0, 1]`) to choose your own; an explicit value is never changed.
 
+The reservation covers the weights plus the KV cache, so 0.3 of the machine's
+memory is also a ceiling on the model: a model larger than that share (a 32B
+FP8 model on a 108 GiB pool, for example) fails to start under the default.
+Raise the value with `--gpu-memory-utilization` for such a model; the
+out-of-memory note says the same.
+
 A vLLM server for the same model that is already running with the recipe you
 ask for, for example one started before this default existed, is reused as it is:
 the default is not added to the request, so it cannot make `rocm serve` refuse

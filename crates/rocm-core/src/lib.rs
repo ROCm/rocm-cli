@@ -400,7 +400,8 @@ pub(crate) fn command_failure_detail_or_else(
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
      <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
-     GPU with `--gpu <index>`.";
+     GPU with `--gpu <index>`. On an APU, `rocm serve` already reserves a smaller share (0.3) \
+     unless told otherwise; if the model does not fit in that, raise the value instead.";
 
 pub fn sanitize_component(value: &str) -> String {
     value

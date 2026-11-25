@@ -1988,6 +1988,29 @@ Windows it reads `Engine: vllm (named with --engine; no entry for vllm exists
 on this OS, so the flag changed nothing).`, and the rest of the report is the
 same as without `--engine`.
 
+### 6c. The APU memory default
+
+Needs an APU host (for example Strix Halo, native or WSL2) with no discrete GPU
+beside it. Run without `--gpu-memory-utilization`:
+
+```bash
+rocm serve <small model> --engine vllm
+```
+
+Expected result:
+
+- The serve prints a `note:` saying vLLM was given a smaller memory reservation,
+  and the engine recipe the launch uses carries `--gpu-memory-utilization 0.3`
+  (pipe the serve through `cat` for the plain form, whose
+  `engine_recipe_required_flags:` line lists it).
+- Re-run with `--gpu-memory-utilization 0.8`: that line carries 0.8 and no
+  default note is printed.
+- With the first server still running, `rocm serve` for the same model reuses
+  it instead of refusing over "different serve options".
+- On a host with a discrete GPU (or a second GPU), no default is applied.
+- A model larger than 0.3 of the machine's memory fails to start under the
+  default; the out-of-memory note tells you to raise the value.
+
 ## 7. vLLM Endpoint Key Coverage
 
 Needs a Linux or WSL host where the vLLM engine can start. Check that an

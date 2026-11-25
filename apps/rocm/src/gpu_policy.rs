@@ -1023,8 +1023,10 @@ pub(crate) fn vram_capacity_is_meaningful(gfx_target: Option<&str>, gpu_count: u
 /// treated as one GPU, unlike there: the APU target is then the only evidence, and
 /// the count is unreadable on a WSL2 host (it has `/dev/dxg` and no `/dev/kfd`,
 /// so [`detect_gpu_count`]'s `amd-smi` probe finds nothing), the host the default
-/// was written for. A wrong "true" costs a smaller KV cache that the serve output
-/// names and `--gpu-memory-utilization` overrides.
+/// was written for. A wrong "true" caps the whole reservation (weights plus KV
+/// cache) at that share, so a model that does not fit in it fails to start rather
+/// than getting a smaller cache; the serve output names the value and
+/// `--gpu-memory-utilization` overrides it.
 pub(crate) fn host_gpu_shares_system_memory(
     host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
 ) -> bool {
@@ -1033,10 +1035,20 @@ pub(crate) fn host_gpu_shares_system_memory(
         None => rocm_core::detect_host_gfx_target(),
     };
     // Counted only for an APU target, so a discrete host never spawns `amd-smi`.
-    gfx_target
-        .as_deref()
-        .is_some_and(rocm_core::gfx_is_apu_family)
-        && gpu_count_leaves_target_attributable(detect_gpu_count())
+    apu_target_shares_system_memory(gfx_target.as_deref(), || {
+        gpu_count_leaves_target_attributable(detect_gpu_count())
+    })
+}
+
+/// The composition [`host_gpu_shares_system_memory`] makes of its two inputs,
+/// with the GPU count behind a closure so it is read only for an APU target and a
+/// test can supply either answer: an APU part, and a count that leaves it
+/// attributable.
+fn apu_target_shares_system_memory(
+    gfx_target: Option<&str>,
+    count_leaves_target_attributable: impl FnOnce() -> bool,
+) -> bool {
+    gfx_target.is_some_and(rocm_core::gfx_is_apu_family) && count_leaves_target_attributable()
 }
 
 /// The count half of [`host_gpu_shares_system_memory`]: one GPU, or a count that
@@ -1153,6 +1165,21 @@ mod tests {
         record.status = "starting".to_owned();
         record.gpu_indices = gpu.to_vec();
         record.write().expect("write claiming record");
+    }
+
+    #[test]
+    fn the_apu_default_needs_an_apu_target_and_an_attributable_count() {
+        use super::apu_target_shares_system_memory as shares;
+        // Strix Halo: an APU target on a host with one GPU.
+        assert!(shares(Some("gfx1151"), || true));
+        // The same part beside a second GPU is the multi-GPU exemption; dropping
+        // the count term from the composition turns this red.
+        assert!(!shares(Some("gfx1151"), || false));
+        // A discrete part never counts, and never pays for the count probe.
+        assert!(!shares(Some("gfx942"), || panic!(
+            "counted a discrete host"
+        )));
+        assert!(!shares(None, || panic!("counted a host with no target")));
     }
 
     #[test]

@@ -1128,6 +1128,26 @@ mod tests {
             !live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--x"]))),
             "a different recipe is not the one the service runs"
         );
+        // The common real case: a server of a model whose catalog recipe carries
+        // tool-parser flags recorded `Some`. Equal counts; `None` and another
+        // value do not. Weakening the comparison to "both absent" turns the
+        // first assertion red.
+        record.engine_recipe_json = Some(serde_json::to_string(&hint(&["--x"]))?);
+        record.write()?;
+        assert!(
+            live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--x"]))),
+            "a service started with this exact recipe is the one requested"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen", None),
+            "a recorded recipe is not the same as asking for none"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--y"]))),
+            "a service started with another recipe is not the one requested"
+        );
+        record.engine_recipe_json = None;
+        record.write()?;
         assert!(
             !live_service_started_with(&paths, "lemonade", "qwen", None),
             "another engine's service is not this one"

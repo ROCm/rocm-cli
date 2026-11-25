@@ -5570,6 +5570,35 @@ hardware:
   helper, not the call site, and the four no-GPU scenarios above run where the
   gate opens either way.
 
+## Serve APU Memory Default
+
+On an APU whose GPU shares system memory, `rocm serve` starts vLLM with
+`--gpu-memory-utilization 0.3` when nothing else chose a value, and prints a
+note saying so (see [vllm.md](vllm.md#apus-whose-gpu-shares-system-memory)).
+Scenarios in `features/model_serving.feature`, each reading the engine recipe
+the launch recorded, not only the screen. The test-only `ready` hook of the
+managed-launch fixture records that recipe, and the planted host root stands in
+for the GPU the mock lane does not have (`@requires-no-gpu`, Linux only):
+
+- `serve-72` (`@id:serve-apu-vllm-reserves-a-smaller-share`): an APU launch is
+  given 0.3 and the summary says so.
+- `serve-73` (`@id:serve-apu-vllm-keeps-the-users-reservation`): an explicit
+  `--gpu-memory-utilization 0.8` is never replaced.
+- `serve-74` (`@id:serve-discrete-gpu-vllm-keeps-its-own-default`): a discrete
+  GPU keeps vLLM's own reservation.
+- `serve-75` (`@id:serve-apu-reuses-a-server-started-without-the-default`): a running vLLM server started without the default is still reused
+  rather than refused over "different serve options".
+
+Unit coverage, including the multi-GPU exemption and the live-service
+comparison:
+
+```bash
+cargo test -p rocm --bin rocm the_apu_default_needs_an_apu_target_and_an_attributable_count
+cargo test -p rocm --bin rocm a_second_gpu_makes_the_apu_target_unattributable
+cargo test -p rocm --bin rocm the_default_never_overrides_a_value_the_user_or_recipe_chose
+cargo test -p rocm --bin rocm a_live_service_counts_only_when_it_was_started_with_the_same_recipe
+```
+
 ## Serve OOM Guidance
 
 The `rocm serve` interactive deployment summary's out-of-memory note is checked
