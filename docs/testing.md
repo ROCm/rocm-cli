@@ -6596,6 +6596,25 @@ gates still apply (a `-n` name filter would bypass them):
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-wsl-usual-shared-memory-is-not-reported-short cargo xtask e2e
 ```
 
+### Diagnosing before anything has failed
+
+`diagnose-89` holds `rocm diagnose --help` to what the command does for a user
+who has hit no failure. It plants the unneeded GPU override that `diagnose-62`
+uses, a misconfiguration every lane reads from the environment, then reads the
+help for three lines (nothing has to have failed first, a diagnosis applies no
+fix, only `rocm fix` changes the machine), runs `rocm diagnose` with no
+`--symptom`, and requires the override to be reported with its `rocm fix`
+command. It also compares the CLI's `config` and `data` folders file by file
+before and after. That is what "installs nothing" is checked as: a change
+outside those two folders is not observed, and neither are the cache folder
+(CI shares it between scenarios) or the CLI's own log. With no symptom the
+override scores below the match threshold, so it is listed as a weak result
+rather than a match. The scenario is untagged and runs on every lane:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-89)'
+```
+
 ## Symptom From A File Or Standard Input
 
 `rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
