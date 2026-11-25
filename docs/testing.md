@@ -6719,6 +6719,42 @@ only those three without bypassing the harness's gates:
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
 ```
 
+### Which cause ranks first
+
+Each catalog entry in `CHECKERS` in
+[catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs) names a
+`Precedence`, and `run_all_checks` there sorts the findings that cleared the
+match threshold by it before their score: a finding that the process has no
+working path to the GPU (`GpuPath`: no device node, no kernel or host driver,
+no permission to open it, or on WSL2 no bridge from ROCm to the host driver)
+ranks ahead of every other finding, such as a small `/dev/shm` or a vLLM
+out-of-memory error, even when that one scores higher. Below the threshold
+precedence does not count, so a weak signal such as merely being in a
+container never climbs over an established finding. The text report's closing
+line names the first cause in that order (`render_report_text` in
+[report.rs](../crates/rocm-core/src/diagnose/report.rs)), whether or not a
+lower-ranked one clears `HIGH_CONFIDENCE`. The unit tests in catalog.rs pin the
+reported WSL container with a 64 MiB `/dev/shm`, the same container with a
+pasted out-of-memory error, a sub-threshold container finding, and a bare-metal
+container without `/dev/kfd`:
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/diagnose::catalog::tests::(in_a_docker|a_high_confidence|a_weak_gpu|a_linux_container)/)'
+```
+
+`diagnose-90` in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+covers it end to end on every Linux lane, WSL included: it plants a host root
+that reads as a docker container on WSL2 with no `/dev/dxg`, pastes a vLLM
+out-of-memory error, and requires the missing device first, the closing line
+to name it, and `rocm fix` to accept that id on the same planted machine. The
+shared-memory shape of the original report is unit-only, because `/dev/shm` is
+measured from the process's own mount rather than through the host root
+([hardware_root.rs](../crates/rocm-core/src/hardware_root.rs)). To run it alone:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-a-gpu-the-program-cannot-reach-is-ranked-first cargo xtask e2e
+```
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a model will run on this host

@@ -662,6 +662,12 @@ Each result prints an `id:` and an `apply with:` command. The leading `#1`, `#2`
 are ranking positions for reading order only. `rocm fix` takes the id, not the
 position.
 
+Results that clear the match threshold come first. Among them, a cause that
+leaves the GPU unreachable (no device node, no kernel or host driver, no
+permission to open it, or on WSL2 no path from ROCm to the Windows driver) is
+listed before any other, whatever the scores; the rest follow by score. The
+closing line names the first cause listed.
+
 `rocm diagnose` takes these flags:
 
 - `--symptom` takes raw error text to sharpen keyword scoring. Your shell

@@ -1380,3 +1380,28 @@ Feature: Diagnosing failures and listing fixes
     When the user diagnoses the machine without describing a failure
     Then the misconfiguration on the machine is reported, with a fix to apply
     And the CLI's own settings and installs are left as they were
+
+  # A container on WSL that was started without the GPU device cannot reach the
+  # GPU at all, and until that is put right nothing the report says about the
+  # workload can be tried. The pasted out-of-memory error scores far higher,
+  # though, and the report used to rank it first and close with "Next step:
+  # run `rocm fix fix-16-vllm-oom`", sending the user to tune memory on a GPU
+  # their container cannot see (ROCMAI-785).
+  #
+  # The machine is planted: a host root whose kernel string reads as WSL2, with
+  # a docker marker and no `/dev/dxg`, which every Linux lane can stand up.
+  # The report the ticket came from had a 64 MiB `/dev/shm` outranking the
+  # missing device instead, and that shape cannot be planted: `/dev/shm` is
+  # measured from this process's own mount, deliberately not through the host
+  # root (`hardware_root.rs`). The out-of-memory finding stands in for it as the
+  # higher-scoring finding, and being HIGH it also reaches the closing line's
+  # "Next step" branch, which the shared-memory one would not. The
+  # shared-memory host is pinned in rocm-core by
+  # `in_a_docker_container_on_wsl_without_a_gpu_the_missing_device_ranks_first`.
+  @id:diagnose-a-gpu-the-program-cannot-reach-is-ranked-first @requires-os:linux
+  Scenario: diagnose-90 - A GPU the program cannot reach is ranked first and named as the next step
+    Given a container on a WSL machine that was started without the GPU
+    And a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom on that machine
+    Then the cause ranked first is that the GPU is not exposed to the container, above the out-of-memory finding that scores higher
+    And the closing advice names that cause, and the CLI accepts the fix it names on that machine

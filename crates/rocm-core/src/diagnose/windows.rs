@@ -1137,7 +1137,7 @@ mod tests {
         assert!(text.contains(&report.route_when_no_match.url), "{text}");
         assert!(text.contains("rocm examine --json"), "{text}");
         assert!(text.contains("fix-22-display-driver-old"), "{text}");
-        assert!(!text.contains("highest-scoring match"), "{text}");
+        assert!(!text.contains("top-ranked cause"), "{text}");
         assert!(!text.contains("HIGH_CONFIDENCE"), "{text}");
 
         // The line that introduces the advice makes a promise: nothing in it is
@@ -1163,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn a_real_cause_beside_an_old_driver_is_still_the_highest_scoring_match() {
+    fn a_real_cause_beside_an_old_driver_is_still_the_top_ranked_cause() {
         // The advice row must not be named as the best match, and a real
         // finding must keep that role.
         let mut e = old_driver_only_exam();
@@ -1182,7 +1182,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+            !text.contains("run `rocm fix fix-22-display-driver-old` (the top-ranked"),
             "{text}"
         );
     }
@@ -1214,13 +1214,11 @@ mod tests {
                 "{text}"
             );
             assert!(
-                text.contains(
-                    "run `rocm fix fix-99-synthetic-real-cause` (the highest-scoring match)"
-                ),
+                text.contains("run `rocm fix fix-99-synthetic-real-cause` (the top-ranked cause)"),
                 "{text}"
             );
             assert!(
-                !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+                !text.contains("run `rocm fix fix-22-display-driver-old` (the top-ranked"),
                 "{text}"
             );
             // The advice row is still listed, after the real cause.
