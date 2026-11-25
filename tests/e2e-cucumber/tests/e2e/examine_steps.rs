@@ -524,9 +524,9 @@ async fn assert_install_method_is_current(world: &mut E2eWorld) {
 async fn user_inspects_both_ways(world: &mut E2eWorld) {
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
-    // Both are needed by the comparison step; the human form goes in the stderr
-    // slot rather than adding a World field for one scenario.
-    world.cli_stderr = Some(human);
+    // Both are needed by the comparison step. The human form is a second
+    // command's output, so it goes in `cli_other_output`, not the stderr slot.
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -651,7 +651,7 @@ async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
     // second, so the comparison step can hold the two to each other.
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
-    world.cli_stderr = Some(human);
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -745,7 +745,7 @@ fn human_states(human: &str, label: &str) -> Option<String> {
 #[then("the framework report names the runtime's interpreter")]
 async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -824,7 +824,7 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
 #[then("the machine-readable form states everything the readable one does")]
 async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -851,7 +851,7 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
 async fn assert_json_names_setup_runtime_folder(world: &mut E2eWorld) {
     let planted = planted_setup_runtime_root(world).display().to_string();
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -909,7 +909,7 @@ async fn assert_json_keeps_setup_and_active_apart(world: &mut E2eWorld) {
 #[then("both reports agree on whether this machine has an AMD GPU")]
 async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
@@ -932,7 +932,7 @@ async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
 #[then("both reports agree on whether this platform is in scope")]
 async fn assert_forms_agree_on_platform(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
@@ -2393,7 +2393,10 @@ fn age_expected_from_date(record: &serde_json::Value) -> &'static str {
 )]
 async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
     let json = parsed_json(world);
-    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let text = world
+        .cli_other_output
+        .as_ref()
+        .expect("no readable inspection");
     let record = windows_driver_record(&json).unwrap_or_else(|| {
         panic!("the machine-readable form carries no Windows driver record:\n{json:#}")
     });
@@ -2421,7 +2424,10 @@ async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
 #[then("the inspection calls the driver old only when its date is before 27 July 2023")]
 async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
     let json = parsed_json(world);
-    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let text = world
+        .cli_other_output
+        .as_ref()
+        .expect("no readable inspection");
     let record = windows_driver_record(&json)
         .unwrap_or_else(|| panic!("no Windows driver record in the machine-readable form"));
     let expected = age_expected_from_date(record);

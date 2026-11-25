@@ -189,6 +189,7 @@ async fn serve_failure_evidence(
         .isolated_root
         .as_ref()
         .map(|root| root.path().to_owned());
+    let stop_env = world.isolate_env();
     let (stop_status, backend_evidence) =
         e2e_cucumber::lemonade_diagnostics::backend_evidence_around_stop(
             move || {
@@ -197,7 +198,7 @@ async fn serve_failure_evidence(
                     .ok_or_else(|| "the scenario has no isolated root".to_owned())
             },
             engine,
-            move || stop_services_in(isolated_root.as_deref()),
+            move || stop_services_in(isolated_root.as_deref(), &stop_env),
         )
         .await;
     serve_attempt_report(&ServeAttempt {
@@ -620,16 +621,22 @@ fn default_engine_serve_target() -> &'static str {
 /// attempt shares the device with this one, and that must be visible in the
 /// failure rather than inferred from a serve that looks broken.
 fn stop_scenario_services(world: &E2eWorld) -> String {
-    stop_services_in(world.isolated_root.as_ref().map(tempfile::TempDir::path))
+    stop_services_in(
+        world.isolated_root.as_ref().map(tempfile::TempDir::path),
+        &world.isolate_env(),
+    )
 }
 
 /// [`stop_scenario_services`] on the scenario's isolated root rather than the
 /// world, so a caller that must hand the stop to a `Send` closure (the world holds
 /// PTY handles and is not `Sync`) can capture the path alone.
-fn stop_services_in(isolated_root: Option<&std::path::Path>) -> String {
+fn stop_services_in(
+    isolated_root: Option<&std::path::Path>,
+    env: &[(&'static str, std::ffi::OsString)],
+) -> String {
     isolated_root.map_or_else(
         || "not attempted: scenario has no isolated root".to_owned(),
-        crate::stop_managed_services,
+        |root| crate::stop_managed_services(root, env),
     )
 }
 
