@@ -21,8 +21,10 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -61,12 +63,18 @@ PRE_RELEASE_MARKERS = {
     "rc": "rc",
 }
 # Every version this builder is allowed to emit. Deliberately narrower than
-# PEP 440: local versions (`+local`) are illegal in a wheel filename, and dev,
-# post, and epoch versions are rejected by PyPI or sort confusingly against the
-# release tags this project actually pushes. `--version` bypasses the tag
-# mapper, so it is validated against the same shape rather than trusted.
+# PEP 440, as policy: local versions (`+local`) are illegal in a wheel
+# filename, and this project's release tags never spell a dev, post or epoch
+# version, so a version of that shape is a mistake rather than a release.
+# `--version` bypasses the tag mapper, so it is validated against the same
+# shape rather than trusted.
+#
+# The wheel's version is the tag's. It is deliberately not compared with
+# `[workspace.package] version`: that number is shared by every crate and is
+# not bumped per release (see `apps/rocm/build.rs`), and `rocm --version`
+# reports the tag, so the release job's smoke test is what ties the installed
+# binaries to the tag.
 PUBLISHABLE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?$")
-WORKSPACE_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"\s*$')
 
 DESCRIPTION = """\
 # rocm-cli
@@ -94,6 +102,17 @@ class WheelBuildError(Exception):
     """The wheel could not be built."""
 
 
+class UnmappableTagError(WheelBuildError):
+    """The release tag has no PEP 440 spelling, so no wheel exists for it.
+
+    Kept apart from the other build errors because it is the one failure that
+    is not a defect: the release workflow accepts any `vX.Y.Z-<pre>` tag (a
+    `-preview.1`, for one), and PEP 440 cannot express most of them. Release CI
+    passes `--skip-unmappable-tag` so such a tag ships its archives without a
+    wheel instead of failing the whole release. Every other error still fails.
+    """
+
+
 def fail(message: str) -> None:
     print(f"wheel build failed: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -103,8 +122,8 @@ def pep440_version_from_tag(tag: str) -> str:
     """Map a release git tag onto its PEP 440 version.
 
     `vX.Y.Z` -> `X.Y.Z`, `-alpha.N`/`-experimental.N` -> `X.Y.ZaN`,
-    `-beta.N` -> `X.Y.ZbN`, `-rc.N` -> `X.Y.ZrcN`. Every other shape (nightly
-    and staging tags included) is a hard error.
+    `-beta.N` -> `X.Y.ZbN`, `-rc.N` -> `X.Y.ZrcN`. Every other shape (nightly,
+    staging and `-preview.N` tags included) raises [`UnmappableTagError`].
 
     `-alpha.N` and `-experimental.N` intentionally collapse onto the same
     `aN` form, because PEP 440 has one alpha marker and both tag spellings mean
@@ -115,7 +134,7 @@ def pep440_version_from_tag(tag: str) -> str:
     """
     match = TAG_RE.fullmatch(tag.strip())
     if match is None:
-        raise WheelBuildError(f"tag is not a publishable release tag: {tag}")
+        raise UnmappableTagError(f"tag is not a publishable release tag: {tag}")
     release = match.group("release")
     kind = match.group("kind")
     if kind is None:
@@ -124,40 +143,8 @@ def pep440_version_from_tag(tag: str) -> str:
     return f"{release}{PRE_RELEASE_MARKERS[kind]}{serial}"
 
 
-def release_segment(version: str) -> str:
-    """Return the `X.Y.Z` release segment of a mapped PEP 440 version."""
-    match = re.match(r"^(\d+\.\d+\.\d+)", version)
-    if match is None:
-        raise WheelBuildError(f"version is not a PEP 440 release version: {version}")
-    return match.group(1)
-
-
-def workspace_version(repo_root: Path) -> str:
-    """Parse `[workspace.package] version` out of the root `Cargo.toml`."""
-    manifest = repo_root / "Cargo.toml"
-    if not manifest.is_file():
-        raise WheelBuildError(f"workspace manifest not found: {manifest}")
-    in_section = False
-    for raw_line in manifest.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line.startswith("["):
-            # A section header may carry a trailing comment. Strip it before
-            # matching so `[workspace.package] # ...` is still recognized.
-            header = line.split("#", 1)[0].strip()
-            if not header.endswith("]"):
-                continue
-            in_section = header == "[workspace.package]"
-            continue
-        if not in_section:
-            continue
-        match = WORKSPACE_VERSION_RE.match(line)
-        if match is not None:
-            return match.group(1)
-    raise WheelBuildError(f"[workspace.package] version not found in {manifest}")
-
-
-def resolve_version(repo_root: Path, *, tag: str | None, version: str | None) -> str:
-    """Resolve the wheel version and cross-check it against the workspace."""
+def resolve_version(*, tag: str | None, version: str | None) -> str:
+    """Resolve the wheel version from a release tag or an already-mapped version."""
     if (tag is None) == (version is None):
         raise WheelBuildError("exactly one of --tag or --version is required")
     resolved = pep440_version_from_tag(tag) if tag is not None else str(version)
@@ -167,14 +154,6 @@ def resolve_version(repo_root: Path, *, tag: str | None, version: str | None) ->
             f"{source} resolves to {resolved}, which is not a publishable wheel "
             "version (expected X.Y.Z with an optional aN, bN, or rcN suffix; "
             "local, dev, post, and epoch versions are refused)"
-        )
-    expected = workspace_version(repo_root)
-    actual = release_segment(resolved)
-    if actual != expected:
-        source = f"tag {tag}" if tag is not None else f"version {version}"
-        raise WheelBuildError(
-            f"{source} maps to release segment {actual}, but the workspace version "
-            f"in {repo_root / 'Cargo.toml'} is {expected}"
         )
     return resolved
 
@@ -219,8 +198,7 @@ def metadata_text(version: str) -> str:
         f"Version: {version}",
         f"Summary: {SUMMARY}",
         "License-Expression: MIT",
-        "License-File: LICENSE.TXT",
-        "License-File: THIRD_PARTY_NOTICES.txt",
+        *(f"License-File: {name}" for name in LICENSE_FILES),
         "Requires-Python: >=3.9",
         "Project-URL: Source, https://github.com/ROCm/rocm-cli",
         "Classifier: Environment :: Console",
@@ -236,12 +214,10 @@ def metadata_text(version: str) -> str:
 
 
 def wheel_text(platform_tag: str) -> str:
-    return (
-        "Wheel-Version: 1.0\n"
-        f"Generator: {GENERATOR}\n"
-        "Root-Is-Purelib: false\n"
-        f"Tag: py3-none-{platform_tag}\n"
-    )
+    # The filename compresses a platform tag set with dots; the `WHEEL` file
+    # lists each tag of the set on its own line.
+    tags = "".join(f"Tag: py3-none-{tag}\n" for tag in platform_tag.split("."))
+    return f"Wheel-Version: 1.0\nGenerator: {GENERATOR}\nRoot-Is-Purelib: false\n{tags}"
 
 
 def zip_info(name: str, mode: int) -> zipfile.ZipInfo:
@@ -330,6 +306,74 @@ def build_wheel(
     return wheel_path
 
 
+# The oldest glibc the Linux wheel's platform tag promises (manylinux_2_17 is
+# manylinux2014). The tag is asserted by PLATFORM_TAGS and verified, not
+# trusted, by `check_manylinux_report`.
+MANYLINUX_GLIBC = (2, 17)
+LEGACY_MANYLINUX_GLIBC = {
+    "manylinux1": (2, 5),
+    "manylinux2010": (2, 12),
+    "manylinux2014": (2, 17),
+}
+MANYLINUX_TAG_RE = re.compile(
+    r"^(?:manylinux_(?P<major>\d+)_(?P<minor>\d+)|(?P<legacy>manylinux(?:1|2010|2014)))"
+    r"_x86_64$"
+)
+
+
+def check_manylinux_report(report: str) -> str:
+    """Judge `auditwheel show --json` output against the Linux wheel's tag.
+
+    Returns the platform tag auditwheel says the wheel's binaries need. Raises
+    [`WheelBuildError`] when that tag needs a newer glibc than manylinux_2_17,
+    when the binaries use CPU extensions beyond the baseline, or when the
+    report cannot be read as the object this check understands: an
+    unreadable report is a failed check, never a passed one.
+    """
+    try:
+        data = json.loads(report)
+    except json.JSONDecodeError as error:
+        raise WheelBuildError(f"auditwheel report is not JSON: {error}") from None
+    tag = data.get("overall_tag") if isinstance(data, dict) else None
+    if not isinstance(tag, str):
+        raise WheelBuildError("auditwheel report has no overall_tag")
+    match = MANYLINUX_TAG_RE.fullmatch(tag)
+    if match is None:
+        raise WheelBuildError(f"auditwheel says the wheel needs {tag}, not manylinux")
+    legacy = match.group("legacy")
+    glibc = (
+        LEGACY_MANYLINUX_GLIBC[legacy]
+        if legacy is not None
+        else (int(match.group("major")), int(match.group("minor")))
+    )
+    if glibc > MANYLINUX_GLIBC:
+        raise WheelBuildError(
+            f"the wheel is tagged manylinux_2_17 but its binaries need {tag}"
+        )
+    if data.get("unsupported_isa") is not False:
+        raise WheelBuildError("auditwheel reports CPU extensions beyond the baseline")
+    return tag
+
+
+def check_manylinux(wheel: Path, auditwheel: str) -> str:
+    """Run `auditwheel show --json` on `wheel` and judge it."""
+    try:
+        result = subprocess.run(
+            [auditwheel, "show", "--json", str(wheel)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WheelBuildError(f"cannot run {auditwheel}: {error}") from None
+    if result.returncode != 0:
+        raise WheelBuildError(
+            f"auditwheel show failed ({result.returncode}): {result.stderr.strip()}"
+        )
+    return check_manylinux_report(result.stdout)
+
+
 def expect_error(label: str, func) -> None:
     try:
         func()
@@ -347,6 +391,8 @@ def self_test_tag_mapping() -> None:
         "v1.2.3-beta.4": "1.2.3b4",
         "v1.2.3-rc.4": "1.2.3rc4",
         "v0.1.0-experimental.1": "0.1.0a1",
+        "v0.3.0": "0.3.0",
+        "v0.3.0-rc.1": "0.3.0rc1",
     }
     for tag, expected in cases.items():
         actual = pep440_version_from_tag(tag)
@@ -358,28 +404,156 @@ def self_test_tag_mapping() -> None:
         "v1.2.3-experimental",
         "v1.2.3-alpha",
         "v1.2.3-pre.1",
+        "v0.1.0-preview.1",
+        "v1.2.3+build.5",
         "1.2",
         "v1.2.3.4",
         "",
     ):
-        expect_error(f"tag {bad!r}", lambda bad=bad: pep440_version_from_tag(bad))
+        try:
+            pep440_version_from_tag(bad)
+        except UnmappableTagError:
+            continue
+        raise WheelBuildError(f"tag {bad!r} must raise UnmappableTagError")
+
+
+# Real `auditwheel show --json` reports (auditwheel 6.8.2, run in the
+# quay.io/pypa/manylinux2014_x86_64 image the release builds in, on a wheel made
+# by build_wheel.py). Captured, not written by hand, so the keys the check reads
+# are the real ones. This one is a program built on Ubuntu 24.04 (glibc 2.39)
+# that calls `strlcpy`: the report this check has to reject.
+REAL_REPORT_NEEDS_GLIBC_2_38 = """{
+    "version": 1,
+    "wheel": "rocm_cli-0.0.1rc1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "pure": false,
+    "overall_tag": "manylinux_2_38_x86_64",
+    "sym_tag": "manylinux_2_38_x86_64",
+    "pyfpe": false,
+    "ucs2": false,
+    "unsupported_isa": false,
+    "versioned_symbols": {
+        "libc.so.6": [
+            "GLIBC_2.2.5",
+            "GLIBC_2.34",
+            "GLIBC_2.38",
+            "GLIBC_2.4"
+        ]
+    },
+    "external_libs": {},
+    "policy_upgrades": {}
+}"""
+
+
+# The same command on the `rocm` and `rocmd` the release container builds
+# (`cargo build --release -p rocm -p rocmd`): the report it has to accept.
+REAL_REPORT_RELEASE_BINARIES = """{
+    "version": 1,
+    "wheel": "rocm_cli-0.0.1rc1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "pure": false,
+    "overall_tag": "manylinux_2_17_x86_64",
+    "sym_tag": "manylinux_2_17_x86_64",
+    "pyfpe": false,
+    "ucs2": false,
+    "unsupported_isa": false,
+    "versioned_symbols": {
+        "libc.so.6": [
+            "GLIBC_2.10",
+            "GLIBC_2.14",
+            "GLIBC_2.15",
+            "GLIBC_2.16",
+            "GLIBC_2.2.5",
+            "GLIBC_2.3",
+            "GLIBC_2.3.2",
+            "GLIBC_2.3.4",
+            "GLIBC_2.4",
+            "GLIBC_2.5",
+            "GLIBC_2.6",
+            "GLIBC_2.7",
+            "GLIBC_2.9"
+        ],
+        "libdl.so.2": [
+            "GLIBC_2.2.5"
+        ],
+        "libgcc_s.so.1": [
+            "GCC_3.0",
+            "GCC_3.3",
+            "GCC_4.2.0"
+        ],
+        "libm.so.6": [
+            "GLIBC_2.2.5"
+        ],
+        "libpthread.so.0": [
+            "GLIBC_2.12",
+            "GLIBC_2.2.5"
+        ],
+        "librt.so.1": [
+            "GLIBC_2.2.5"
+        ]
+    },
+    "external_libs": {},
+    "policy_upgrades": {}
+}"""
+
+
+def self_test_manylinux_report() -> None:
+    try:
+        check_manylinux_report(REAL_REPORT_NEEDS_GLIBC_2_38)
+    except WheelBuildError as error:
+        if "manylinux_2_38_x86_64" not in str(error):
+            raise WheelBuildError(f"wrong rejection reason: {error}") from None
+    else:
+        raise WheelBuildError("a glibc 2.38 report must be rejected")
+    if check_manylinux_report(REAL_REPORT_RELEASE_BINARIES) != "manylinux_2_17_x86_64":
+        raise WheelBuildError("the release binaries' report must pass")
+
+    def report(tag: object, isa: object = False) -> str:
+        return json.dumps({"overall_tag": tag, "unsupported_isa": isa})
+
+    for good in (
+        "manylinux_2_17_x86_64",
+        "manylinux2014_x86_64",
+        "manylinux_2_12_x86_64",
+        "manylinux2010_x86_64",
+        "manylinux_2_5_x86_64",
+        "manylinux1_x86_64",
+    ):
+        if check_manylinux_report(report(good)) != good:
+            raise WheelBuildError(f"{good} must pass")
+    # A binary built on a current glibc needs a tag newer than 2_17, which is the
+    # failure this check exists to catch (`REAL_REPORT_NEEDS_GLIBC_2_38`).
+    for bad in (
+        "manylinux_2_38_x86_64",
+        "manylinux_2_18_x86_64",
+        "manylinux_3_0_x86_64",
+        "musllinux_1_2_x86_64",
+        "manylinux_2_17_aarch64",
+        "linux_x86_64",
+        "",
+        None,
+        17,
+    ):
+        expect_error(
+            f"overall_tag {bad!r}", lambda bad=bad: check_manylinux_report(report(bad))
+        )
+    expect_error(
+        "unsupported ISA",
+        lambda: check_manylinux_report(report("manylinux_2_17_x86_64", True)),
+    )
+    expect_error(
+        "missing ISA field",
+        lambda: check_manylinux_report('{"overall_tag": "manylinux_2_17_x86_64"}'),
+    )
+    expect_error("not JSON", lambda: check_manylinux_report("The wheel is consistent"))
+    expect_error("not an object", lambda: check_manylinux_report("[]"))
+    expect_error(
+        "missing auditwheel",
+        lambda: check_manylinux(Path("x.whl"), "no-such-auditwheel-here"),
+    )
 
 
 def make_fake_repo(root: Path) -> Path:
     repo = root / "repo"
-    (repo).mkdir(parents=True)
-    (repo / "Cargo.toml").write_text(
-        "[workspace]\n"
-        'members = ["apps/rocm"]\n'
-        "\n"
-        "[workspace.dependencies]\n"
-        'version = "9.9.9"\n'
-        "\n"
-        "[workspace.package]\n"
-        'version = "0.1.0"\n'
-        'edition = "2024"\n',
-        encoding="utf-8",
-    )
+    repo.mkdir(parents=True)
     for name in LICENSE_FILES:
         (repo / name).write_text(f"{name} test content\n", encoding="utf-8")
     return repo
@@ -391,7 +565,7 @@ def self_test_wheel(root: Path, repo: Path) -> None:
     for name in BINARY_STEMS:
         (bin_dir / name).write_bytes(b"\x7fELF fake " + name.encode("ascii") + b"\n")
 
-    version = resolve_version(repo, tag="v0.1.0-experimental.1", version=None)
+    version = resolve_version(tag="v0.1.0-experimental.1", version=None)
     if version != "0.1.0a1":
         raise WheelBuildError(f"unexpected resolved version: {version}")
 
@@ -449,10 +623,17 @@ def self_test_wheel(root: Path, repo: Path) -> None:
         wheel_meta = package.read(f"{dist_info}/WHEEL").decode("utf-8")
         if "Root-Is-Purelib: false" not in wheel_meta:
             raise WheelBuildError("WHEEL is missing Root-Is-Purelib: false")
-        if "Tag: py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64" not in wheel_meta:
-            raise WheelBuildError("WHEEL is missing the expected platform tag")
+        for tag in ("manylinux_2_17_x86_64", "manylinux2014_x86_64"):
+            if f"Tag: py3-none-{tag}\n" not in wheel_meta:
+                raise WheelBuildError(f"WHEEL is missing the {tag} tag line")
         metadata = package.read(f"{dist_info}/METADATA").decode("utf-8")
-        for required in ("Metadata-Version: 2.4", "Name: rocm-cli", "Version: 0.1.0a1"):
+        license_lines = tuple(f"License-File: {name}" for name in LICENSE_FILES)
+        for required in (
+            "Metadata-Version: 2.4",
+            "Name: rocm-cli",
+            "Version: 0.1.0a1",
+            *license_lines,
+        ):
             if required not in metadata:
                 raise WheelBuildError(f"METADATA is missing {required!r}")
 
@@ -513,8 +694,52 @@ def self_test_wheel(root: Path, repo: Path) -> None:
         if names != expected_windows:
             raise WheelBuildError(f"unexpected windows wheel members: {sorted(names)}")
         wheel_meta = package.read(f"{dist_info}/WHEEL").decode("utf-8")
-        if "Tag: py3-none-win_amd64" not in wheel_meta:
+        if "Tag: py3-none-win_amd64\n" not in wheel_meta:
             raise WheelBuildError("windows WHEEL is missing the win_amd64 tag")
+
+
+def self_test_unmappable_tag_policy(root: Path, repo: Path) -> None:
+    """A tag with no wheel spelling skips only when the caller opts in, and
+    nothing else is forgiven by that opt-in."""
+    bin_dir = root / "bin"
+    out_dir = root / "out-skip"
+    common = [
+        "--bin-dir",
+        str(bin_dir),
+        "--platform",
+        "linux-amd64",
+        "--repo-root",
+        str(repo),
+        "--out-dir",
+        str(out_dir),
+    ]
+    preview = ["--tag", "v0.1.0-preview.1"]
+    if main([*common, *preview, "--skip-unmappable-tag"]) != 0:
+        raise WheelBuildError("an unmappable tag with the skip flag must exit 0")
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise WheelBuildError("a skipped tag must not leave a wheel behind")
+    try:
+        main([*common, *preview])
+    except SystemExit as error:
+        if error.code != 1:
+            raise WheelBuildError(
+                f"an unmappable tag must exit 1, got {error.code}"
+            ) from None
+    else:
+        raise WheelBuildError("an unmappable tag without the skip flag must fail")
+    # The opt-in covers the tag shape only: a mappable tag whose binaries are
+    # missing is a real release defect and still fails.
+    missing = [*common, "--tag", "v0.1.0", "--skip-unmappable-tag"]
+    missing[missing.index(str(bin_dir))] = str(root / "no-such-bin-dir")
+    try:
+        main(missing)
+    except SystemExit as error:
+        if error.code != 1:
+            raise WheelBuildError(
+                f"missing binaries must exit 1, got {error.code}"
+            ) from None
+    else:
+        raise WheelBuildError("the skip flag must not forgive a build failure")
 
 
 def run_self_test(root: Path) -> None:
@@ -523,6 +748,7 @@ def run_self_test(root: Path) -> None:
     root.mkdir(parents=True)
     try:
         self_test_tag_mapping()
+        self_test_manylinux_report()
 
         if wheel_platform_tag("windows-amd64") != "win_amd64":
             raise WheelBuildError("windows platform tag is wrong")
@@ -536,46 +762,26 @@ def run_self_test(root: Path) -> None:
         )
 
         repo = make_fake_repo(root)
-        if workspace_version(repo) != "0.1.0":
-            raise WheelBuildError(
-                f"workspace version parsed as {workspace_version(repo)}"
-            )
-        expect_error(
-            "workspace version cross-check",
-            lambda: resolve_version(repo, tag="v9.9.9", version=None),
-        )
-        expect_error(
-            "explicit version cross-check",
-            lambda: resolve_version(repo, tag=None, version="2.0.0"),
-        )
         for rejected in ("0.1.0+local", "0.1.0.dev1", "0.1.0.post1", "1!0.1.0"):
             expect_error(
                 f"unpublishable explicit version {rejected}",
-                lambda value=rejected: resolve_version(repo, tag=None, version=value),
+                lambda value=rejected: resolve_version(tag=None, version=value),
             )
-        if resolve_version(repo, tag=None, version="0.1.0a1") != "0.1.0a1":
+        if resolve_version(tag=None, version="0.1.0a1") != "0.1.0a1":
             raise WheelBuildError("a mapped pre-release version must be accepted")
+        if resolve_version(tag="v0.3.0", version=None) != "0.3.0":
+            raise WheelBuildError("a release tag need not match the workspace version")
         expect_error(
             "both tag and version",
-            lambda: resolve_version(repo, tag="v0.1.0", version="0.1.0"),
+            lambda: resolve_version(tag="v0.1.0", version="0.1.0"),
         )
         expect_error(
             "neither tag nor version",
-            lambda: resolve_version(repo, tag=None, version=None),
+            lambda: resolve_version(tag=None, version=None),
         )
-        expect_error(
-            "missing manifest", lambda: workspace_version(root / "does-not-exist")
-        )
-        commented = root / "commented"
-        commented.mkdir()
-        (commented / "Cargo.toml").write_text(
-            '[workspace.package] # release metadata\nversion = "0.1.0"\n',
-            encoding="utf-8",
-        )
-        if workspace_version(commented) != "0.1.0":
-            raise WheelBuildError("a commented section header must still be parsed")
 
         self_test_wheel(root, repo)
+        self_test_unmappable_tag_policy(root, repo)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("wheel builder self-test: ok")
@@ -595,6 +801,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "dist" / "wheels")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument(
+        "--skip-unmappable-tag",
+        action="store_true",
+        help=(
+            "When --tag has no PEP 440 spelling (for example v0.1.0-preview.1), "
+            "print a notice, write no wheel and exit 0 instead of failing. Any "
+            "other error still fails."
+        ),
+    )
+    parser.add_argument(
+        "--check-manylinux",
+        type=Path,
+        metavar="WHEEL",
+        help="Verify the Linux wheel's binaries satisfy manylinux_2_17 with auditwheel.",
+    )
+    parser.add_argument(
+        "--auditwheel", default="auditwheel", help="auditwheel executable to run."
+    )
+    parser.add_argument(
         "--self-test", action="store_true", help="Run offline wheel policy tests."
     )
     return parser.parse_args(argv)
@@ -607,12 +831,22 @@ def main(argv: list[str] | None = None) -> int:
             with tempfile.TemporaryDirectory(prefix="rocm-wheel-selftest-") as temp:
                 run_self_test(Path(temp) / "work")
             return 0
+        if args.check_manylinux is not None:
+            tag = check_manylinux(args.check_manylinux, args.auditwheel)
+            print(f"manylinux check: {args.check_manylinux.name} needs {tag}")
+            return 0
         if args.bin_dir is None:
             raise WheelBuildError("--bin-dir is required")
         if args.platform is None:
             raise WheelBuildError("--platform is required")
         repo_root = args.repo_root.resolve()
-        version = resolve_version(repo_root, tag=args.tag, version=args.version)
+        try:
+            version = resolve_version(tag=args.tag, version=args.version)
+        except UnmappableTagError as error:
+            if not args.skip_unmappable_tag:
+                raise
+            print(f"wheel skipped: {error}; no Python wheel is built for this tag")
+            return 0
         wheel = build_wheel(
             repo_root=repo_root,
             bin_dir=args.bin_dir.resolve(),
