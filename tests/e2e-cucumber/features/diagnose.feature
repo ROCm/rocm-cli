@@ -1466,3 +1466,22 @@ Feature: Diagnosing failures and listing fixes
     Given a machine whose GPU compute device belongs to the video group, which the user is not in
     When the user compares the diagnosis with a preview of the fix it names
     Then both propose adding the user to the device's own group, once, in the same command
+
+  # A proposed remedy has to name a group that exists on the machine. When the
+  # device belongs to a group the local group database does not name, `stat`
+  # answers the literal `UNKNOWN`, and the diagnosis used to print that lookup
+  # failure as a group the user could join. Fixed by #302 (EAI-8240): the
+  # lookup failure now falls back to `render`. This guards the fix.
+  #
+  # The device is a plain file under a simulated host root and a stand-in `stat`
+  # answers for it, and a stand-in `getent` holds the machine's group database
+  # (`render` and `video`), so neither the lane's own groups nor its GPU matter:
+  # this runs on every Linux lane, GPU or not -- WSL2
+  # included, as `@requires-os:linux` matches a host whose `os_family` is
+  # `linux` and WSL2's is. Every `rocm` call in the scenario carries the planted
+  # host root.
+  @id:diagnose-commands-name-a-real-group @requires-os:linux
+  Scenario: diagnose-94 - Every group named in a diagnosis is one the machine recognises
+    Given a machine whose GPU device belongs to a group the machine cannot name
+    When the user diagnoses a device-permission failure on that machine
+    Then every group named in the remedy exists on the machine

@@ -4554,3 +4554,75 @@ async fn assert_software_renderer_reported(world: &mut E2eWorld) {
          line must say so:\n{output}"
     );
 }
+
+// ── What the help itself promises ──────────────────────────────────
+
+#[when("the user reads the serve examples the help offers")]
+async fn user_reads_serve_examples(world: &mut E2eWorld) {
+    // Both example blocks that name a model: the top-level one a new user meets
+    // first, and `serve`'s own.
+    let (general, _, _) = crate::run_rocm(world, &["help"]);
+    let (serve, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let (listing, _, _) = crate::run_rocm(world, &["model", "--verbose"]);
+    world.cli_output = Some(format!("{general}\n{serve}"));
+    world.cli_other_output = Some(listing);
+}
+
+#[then("every model named there is one the CLI can resolve")]
+async fn assert_example_models_resolve(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    let listing = world.cli_other_output.as_ref().expect("no model listing");
+    let examples = e2e_cucumber::help_text::serve_example_models(help);
+    assert!(
+        !examples.is_empty(),
+        "no `rocm serve <model>` example found in the help:\n{help}"
+    );
+    let known = e2e_cucumber::help_text::known_model_names(listing);
+    assert!(
+        !known.is_empty(),
+        "could not read any model name out of the listing:\n{listing}"
+    );
+    // Two forms are legitimate, and the README documents both: a name the CLI's
+    // own catalog answers to, or an explicit `owner/repo` reference to fetch. The
+    // check accepts either, so it says the example must WORK without dictating
+    // which model it should be.
+    let unresolvable: Vec<&String> = examples
+        .iter()
+        .filter(|model| {
+            !model.contains('/') && !known.iter().any(|name| name.eq_ignore_ascii_case(model))
+        })
+        .collect();
+    assert!(
+        unresolvable.is_empty(),
+        "the help offers {unresolvable:?} as models to serve, but they are neither a name the \
+         model listing knows nor an `owner/repo` reference, so copying the example verbatim \
+         cannot work.\nmodel listing knows: {known:?}"
+    );
+}
+
+#[then("running the CLI with no subcommand is not described as the dashboard command")]
+async fn assert_default_command_described_distinctly(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    // What the help says the dedicated dashboard command does, read from the
+    // help rather than hardcoded so the check follows a rewording of it.
+    let dash = e2e_cucumber::help_text::command_summary(help, "dash")
+        .unwrap_or_else(|| panic!("the help lists no `dash` command:\n{help}"));
+    assert!(
+        dash.to_ascii_lowercase().contains("dashboard"),
+        "expected the help to list a `dash` command that opens the dashboard, but it says \
+         {dash:?}:\n{help}"
+    );
+    // The one sentence describing what the plain command does. Two commands, two
+    // different screens: describing the plain one as the dashboard leaves the
+    // reader unable to tell them apart, and unaware that it opens something else.
+    let sentence = e2e_cucumber::help_text::sentence_containing(help, "with no subcommand")
+        .unwrap_or_else(|| {
+            panic!("the help does not say what running the CLI with no subcommand does:\n{help}")
+        });
+    assert!(
+        !sentence.to_ascii_lowercase().contains("dashboard"),
+        "the help describes running the CLI with no subcommand as opening the dashboard, which \
+         is what it also says `dash` does, and the two are different screens:\n  \
+         default: {sentence}\n  dash:    {dash}"
+    );
+}

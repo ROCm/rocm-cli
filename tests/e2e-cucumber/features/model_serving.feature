@@ -1230,3 +1230,17 @@ Feature: Model serving
     Given a host whose only GPU is a gfx90c Vega iGPU the kernel reports no compute node for
     When the user is told to serve on Lemonade because this GPU has no ROCm build
     Then serving got past the no-GPU pre-flight and reported this host's usable GPU
+
+  # `serve` advertises a set of device policies, and the list the user is offered
+  # has to be the list the command accepts. Runs on the no-GPU lane, where a
+  # refusal that names the policy itself is cleanly distinguishable from the
+  # ordinary "this machine has no GPU" refusal every policy gets there.
+  #
+  # `--device` used to be a free-form string whose advertised list was written by
+  # hand; #304 made it a clap `ValueEnum` (`DevicePolicyArg` in
+  # `apps/rocm/src/cli_args.rs`), so the advertised and the accepted list now come
+  # from one enum. This guards that.
+  @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
+  Scenario: serve-71 - Every device policy the serve command offers is one it accepts
+    When the user serves a model under each device policy the command offers
+    Then no policy is refused for being that policy
