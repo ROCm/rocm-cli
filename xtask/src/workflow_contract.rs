@@ -7215,6 +7215,8 @@ fi
         for needed in [
             "cargo xtask e2e-queue-import",
             "--queue-dir queue-results/results",
+            // The log is where the lanes and their gates come from.
+            "--log queue-results/job.log",
             "--absent",
             "--artifacts-dir e2e-artifacts",
             "--section-out queue-results/queue-lanes.md",
@@ -7555,6 +7557,7 @@ fi
             e2e_fail_total: None,
             build_skipped: false,
             queue_absent: None,
+            queue_unlisted: None,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
@@ -7575,6 +7578,7 @@ fi
             e2e_fail_total: Some(0),
             build_skipped: false,
             queue_absent: None,
+            queue_unlisted: None,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
