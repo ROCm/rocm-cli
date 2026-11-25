@@ -397,13 +397,14 @@ on two counts, and both change how you edit it:
   (each mode's checker and OS scoping) — adding, renaming, or re-scoping a
   failure mode means changing the CLI **first**, then the two docs. That feature is what
   catches you if you forget. Some sentences in
-  [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too: the module doc of
-  [skill_reference.rs](tests/e2e-cucumber/tests/skill_reference.rs) lists them all
-  and says which test reads each. Reword them only together with the test that reads
-  them. One is the Phase 0 sentence "requires `contract_version` N or higher": scenario
-  skill-07 parses it and holds that number (the contract number) equal to what
-  `rocm fix --json` publishes.
-  Raise the contract number only after a release publishes that contract. The
+  [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too: tests find them by a
+  fixed phrase and read the number or list after it, so reword one only together
+  with the test that reads it. The module doc of
+  [skill_reference.rs](tests/e2e-cucumber/tests/skill_reference.rs) says which test
+  reads which; scenario skill-07 holds the `contract_version` N that Phase 0
+  requires equal to the one `rocm fix --json` publishes, and skill-08 holds the
+  apply replay in the skill's `evals/` equal to what `rocm fix` prints. Raise N
+  only after a release publishes that contract. The
   skill is federated from `main`, and the installer that Phase 0 offers installs
   the release channel, so an earlier raise would make the published skill stop
   on every released CLI.

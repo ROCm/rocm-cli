@@ -84,6 +84,49 @@ pub fn number_after_phrase(md: &str, phrase: &str) -> Option<(u64, String)> {
     Some((number, after[digits.len()..].to_owned()))
 }
 
+/// The phrases in `skills/rocm-doctor/SKILL.md` that tests read the skill at.
+///
+/// Each one anchors a fixture sentence: a test finds the phrase and reads a
+/// number or a list after it, so rewording the sentence breaks the test. They
+/// live here, in one place, so a self-test in `tests/skill_reference.rs` can hold
+/// every one in [`ALL`](skill_anchors::ALL) to that file's module doc (which names
+/// the test that reads each) and to `SKILL.md`. A new anchor goes into `ALL` too:
+/// nothing checks that the list is complete.
+pub mod skill_anchors {
+    /// "requires `contract_version` N or higher": the catalog contract Phase 0
+    /// requires, read by `skill-07` in `tests/e2e/skill_steps.rs`.
+    pub const REQUIRED_CONTRACT: &str = "requires `contract_version` ";
+    /// "The other N are **print-only**": the print-only count, read with
+    /// [`PRINT_ONLY_CLAUSE`] by `free_standing_catalog_counts_match_the_table`.
+    pub const PRINT_ONLY_COUNT: &str = "The other ";
+    /// What has to follow the number after [`PRINT_ONLY_COUNT`], so the number
+    /// is the count of print-only entries and not of something else.
+    pub const PRINT_ONLY_CLAUSE: &str = " are **print-only**";
+    /// Starts the list of `rocm fix` exit-code names, read by
+    /// `exit_code_names_listed_in_the_skill_are_the_manifest_failure_exits`.
+    pub const EXIT_CODES: &str = "by its `exit_codes` name";
+    /// Starts the list of `fix` fields an agent reads, which ends at
+    /// [`FIX_FIELDS_END`], read by
+    /// `fix_fields_quoted_in_the_skill_exist_in_the_diagnosis_json`.
+    pub const FIX_FIELDS_START: &str = "a `fix` whose ";
+    /// Ends the list [`FIX_FIELDS_START`] starts.
+    pub const FIX_FIELDS_END: &str = " are the fields";
+    /// Starts step 3's list of what each `fix.class` does, read by
+    /// `fix_classes_listed_in_the_skill_are_the_ones_the_cli_serializes`.
+    pub const FIX_CLASSES: &str = "is the entry's `fix.class`";
+
+    /// Every anchor above.
+    pub const ALL: &[&str] = &[
+        REQUIRED_CONTRACT,
+        PRINT_ONLY_COUNT,
+        PRINT_ONLY_CLAUSE,
+        EXIT_CODES,
+        FIX_FIELDS_START,
+        FIX_FIELDS_END,
+        FIX_CLASSES,
+    ];
+}
+
 /// Select the single binary directory consumed by lifecycle packaging.
 ///
 /// `xtask package` accepts one `ROCM_BIN_DIR`, so prebuilt `rocm` and `rocmd`
