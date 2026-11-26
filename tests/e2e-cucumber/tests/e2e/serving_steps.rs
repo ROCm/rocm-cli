@@ -1620,7 +1620,12 @@ async fn setup_background_model(world: &mut E2eWorld) {
     // `@requires-gpu` and run on the GitHub-hosted mock lane every PR, with no
     // coverage loss. Real inference stays covered by the `@requires-gpu`
     // serve-*-inference scenarios.
-    if e2e_cucumber::capability::host_capability().has_amd_gpu {
+    //
+    // The same holds on a GPU lane whose pre-warm recorded the serving engine as
+    // not applicable (an unpinned nightly SDK with no vLLM build): a real serve
+    // can only fail on the missing engine, so the mock backs it there too
+    // (`HostCapability::backs_background_model_with_mock`).
+    if !e2e_cucumber::capability::host_capability().backs_background_model_with_mock() {
         setup_gpu_model(world).await;
     } else {
         let mock = MockServer::start("TestModel/E2E-1B").await;
