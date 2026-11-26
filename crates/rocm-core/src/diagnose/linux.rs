@@ -809,10 +809,20 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
 
     let gttsize = e.amdgpu_gttsize_mib;
     let pages_limit = e.ttm_pages_limit;
-    // Nothing to say about a machine with no integrated GPU that has set
-    // neither parameter and whose recent kernel log is clean: every piece of
-    // evidence this entry reasons over is absent.
-    if !e.has_apu && gttsize.is_none() && pages_limit.is_none() && e.dmesg_amdgpu_tail.is_empty() {
+    // Every conclusion this entry reaches is about the pool an integrated GPU
+    // shares with the operating system, and its plan rewrites the two kernel
+    // parameters that size that pool. A discrete card allocates from its own
+    // VRAM, so the same parameters on such a host -- set for a different
+    // machine, or left on the cmdline after the APU they were meant for -- say
+    // nothing about it, and an SVM reservation that failed there failed for
+    // another reason.
+    //
+    // Gated once, for the whole entry, rather than per arm: only the
+    // `(None, None)` arm below used to ask, so a discrete host that merely
+    // carried `amdgpu.gttsize` or `ttm.pages_limit` scored and was handed a
+    // full integrated-GPU plan. `a_discrete_host_carrying_the_parameters_is_not_given_an_apu_plan`
+    // drives each of the other three arms on such a host.
+    if !e.has_apu {
         return zero(APU_UNIFIED_MEMORY_FIX_ID, TITLE);
     }
 
@@ -859,7 +869,9 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
                 pages / TTM_PAGES_PER_MIB,
             ));
         }
-        (None, None) if e.has_apu => {
+        // No `if e.has_apu` guard: the entry returned above unless this host
+        // has one.
+        (None, None) => {
             score += 15;
             evidence.push(
                 "this machine has an integrated GPU and sets neither amdgpu.gttsize nor \
@@ -868,7 +880,6 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
                     .to_owned(),
             );
         }
-        (None, None) => {}
     }
 
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_APU_UNIFIED_MEMORY);
@@ -894,8 +905,8 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
         ));
         format!(
             "Give the integrated GPU a {} GiB aperture by setting amdgpu.gttsize={mib} together \
-             with ttm.pages_limit={pages}, and raise the BIOS carve-out as the notes say. This \
-             means editing GRUB and rebooting.",
+             with ttm.pages_limit={pages}. Leave the BIOS carve-out alone unless the notes \
+             below say otherwise. This means editing GRUB and rebooting.",
             mib / 1024
         )
     } else {
@@ -903,8 +914,9 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
         commands
             .push("# Installed RAM could not be read here, so size the pair yourself:".to_owned());
         commands.push("free -g".to_owned());
-        "Set amdgpu.gttsize and ttm.pages_limit as a consistent pair sized to installed RAM, and \
-         raise the BIOS carve-out as the notes say. This means editing GRUB and rebooting."
+        "Set amdgpu.gttsize and ttm.pages_limit as a consistent pair sized to installed RAM. \
+         Leave the BIOS carve-out alone unless the notes below say otherwise. This means \
+         editing GRUB and rebooting."
             .to_owned()
     };
     commands.extend([
@@ -928,10 +940,15 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
                 .to_owned(),
         notes: vec![
             "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for \
-             UMA Frame Buffer Size, Dedicated Graphics Memory or GART size, and give it the \
-             largest value the board offers that still leaves the operating system enough RAM. \
-             The carve-out is what the GPU reports as its own VRAM; the GTT aperture above is \
-             memory on top of it."
+             UMA Frame Buffer Size, Dedicated Graphics Memory or GART size. Do not simply give \
+             it the largest value on offer. The carve-out is taken from the operating system's \
+             RAM for as long as the machine is on, and the host-memory ceiling an SVM \
+             reservation is checked against is worked out from the RAM that is left -- so \
+             raising it can cause the very failure this entry reports. The GTT aperture the \
+             commands above set is memory on top of the carve-out, handed out only as it is \
+             used, and it is the figure to raise for a larger model. Leave the carve-out at the \
+             smallest value the board will boot and drive the display with, commonly 512 MiB to \
+             4 GiB. The carve-out is what the GPU reports as its own VRAM."
                 .to_owned(),
             "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms \
              packages are installed, because they ship their own copy of TTM. Set the name your \
@@ -2455,6 +2472,66 @@ mod tests {
                 .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
             "{:?}",
             report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// The parameters on a machine with no integrated GPU say nothing about it.
+    ///
+    /// A discrete card allocates from its own VRAM, so `amdgpu.gttsize` and
+    /// `ttm.pages_limit` left on such a host's cmdline -- copied from another
+    /// machine, or outliving the APU they were set for -- are not a fault of
+    /// its, and an SVM reservation that failed there failed for another reason.
+    /// The sibling above only exercises the host that set *neither*, which the
+    /// early return covered on its own; this drives each of the other three
+    /// `(gttsize, pages_limit)` arms, which scored on any host and handed a
+    /// discrete machine a plan to resize an aperture it does not use.
+    #[test]
+    fn a_discrete_host_carrying_the_parameters_is_not_given_an_apu_plan() {
+        let discrete = |gttsize, pages_limit| {
+            let mut e = linux_base();
+            e.has_discrete_amd = true;
+            e.has_apu = false;
+            e.system_ram_gib = Some(64.0);
+            e.amdgpu_gttsize_mib = gttsize;
+            e.ttm_pages_limit = pages_limit;
+            // The log an APU would be scored 50 for.
+            e.dmesg_amdgpu_tail = vec![
+                "amdgpu: svm_range_new: failed to reserve memory, already allocated by svm"
+                    .to_owned(),
+            ];
+            e
+        };
+        // Inconsistent pair, gttsize alone, pages_limit alone: every arm that
+        // used to score without asking whose GPU it was.
+        for (gttsize, pages_limit) in [
+            (Some(98_304), Some(1_048_576)),
+            (Some(98_304), None),
+            (None, Some(1_048_576)),
+        ] {
+            let e = discrete(gttsize, pages_limit);
+            let diagnosis = check_24_apu_unified_memory(&e, "");
+            assert_eq!(
+                diagnosis.score, 0,
+                "{gttsize:?}/{pages_limit:?}: {diagnosis:?}"
+            );
+            let report = diagnose(&e, "");
+            assert!(
+                report
+                    .matched
+                    .iter()
+                    .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
+                "{gttsize:?}/{pages_limit:?}: {:?}",
+                report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+        }
+        // The same inconsistent pair on an APU is the fault this entry exists
+        // for, so the gate above is scoping and not a blanket silence.
+        let mut apu = discrete(Some(98_304), Some(1_048_576));
+        apu.has_apu = true;
+        apu.has_discrete_amd = false;
+        assert!(
+            check_24_apu_unified_memory(&apu, "").score > 0,
+            "the gate must not silence the host this entry is for"
         );
     }
 

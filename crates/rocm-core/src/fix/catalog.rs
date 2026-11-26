@@ -1081,7 +1081,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         verify: r"grep -o 'amdgpu\.gttsize=[0-9]*\|\(amd\)\?ttm\.pages_limit=[0-9]*' /proc/cmdline",
         verify_linux: None,
         notes: &[
-            "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for UMA Frame Buffer Size, Dedicated Graphics Memory or GART size, and give it the largest value the board offers that still leaves the operating system enough RAM. The carve-out is what the GPU reports as its own VRAM; the GTT aperture above is memory on top of it.",
+            "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for UMA Frame Buffer Size, Dedicated Graphics Memory or GART size. Do not simply give it the largest value on offer. The carve-out is taken from the operating system's RAM for as long as the machine is on, and the host-memory ceiling an SVM reservation is checked against is worked out from the RAM that is left -- so raising it can cause the very failure this entry reports. The GTT aperture the commands above set is memory on top of the carve-out, handed out only as it is used, and it is the figure to raise for a larger model. Leave the carve-out at the smallest value the board will boot and drive the display with, commonly 512 MiB to 4 GiB. The carve-out is what the GPU reports as its own VRAM.",
             "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms packages are installed, because they ship their own copy of TTM. Set the name your own driver uses; setting the other one has no effect.",
         ],
         doc_url: None,
