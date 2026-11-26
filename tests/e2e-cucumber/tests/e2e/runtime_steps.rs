@@ -1728,11 +1728,11 @@ async fn ask_rollback_help(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-#[then("the help states that rollback has no history")]
+#[then("the help states that rollback remembers only one runtime")]
 async fn rollback_help_states_limit(world: &mut E2eWorld) {
     let out = world.cli_output.clone().unwrap_or_default();
     assert!(
-        out.contains("rollback has no history"),
+        out.contains("rollback remembers only the runtime you just left"),
         "expected `rocm runtimes rollback --help` to state the single-level limit, got:\n{out}"
     );
 }

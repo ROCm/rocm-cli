@@ -262,8 +262,8 @@ pub(crate) enum RuntimesCommand {
     },
     /// Switch back to the previously selected ROCm runtime.
     #[command(
-        after_help = "NOTE: rollback has no history - it remembers only the runtime you just \
-left, so it cannot undo more than one activation."
+        after_help = "NOTE: rollback remembers only the runtime you just left, so it cannot \
+undo more than one activation."
     )]
     Rollback {
         /// Restart running local servers so they use the restored runtime.

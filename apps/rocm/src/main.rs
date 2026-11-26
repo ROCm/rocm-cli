@@ -1148,7 +1148,7 @@ fn platform_refusal(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Op
 /// `append_update_activate_summary`, and `render_sdk_install_success` for the
 /// call sites.
 const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
-(no history - undoes only this one activation)";
+to return to the runtime you just left (only one step back is remembered)";
 
 pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[

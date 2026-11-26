@@ -214,7 +214,7 @@ Feature: Runtime configuration
   @id:runtime-rollback-help-states-single-level-limit
   Scenario: runtime-10 - Stating rollback's single-level limit in --help
     When the user asks for rollback help
-    Then the help states that rollback has no history
+    Then the help states that rollback remembers only one runtime
 
   # Installing over the active default managed runtime must not silently
   # displace it. Outside an interactive terminal (as every e2e invocation
