@@ -906,6 +906,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`tests/e2e/uninstall_steps.rs`](../tests/e2e-cucumber/tests/e2e/uninstall_steps.rs) | Steps for [`uninstall.feature`](../tests/e2e-cucumber/features/uninstall.feature): `rocm uninstall` confined to the scenario root with `--keep-binaries` and redirected caches. | flat |
 | [`tests/e2e/update_steps.rs`](../tests/e2e-cucumber/tests/e2e/update_steps.rs) | Steps for [`update.feature`](../tests/e2e-cucumber/features/update.feature): the report-only `rocm update`, its feed status, and a loopback catalog where runtimes are planted. | flat |
 | [`tests/e2e/vllm_tensorizer_steps.rs`](../tests/e2e-cucumber/tests/e2e/vllm_tensorizer_steps.rs) | Steps for [`vllm_tensorizer.feature`](../tests/e2e-cucumber/features/vllm_tensorizer.feature): a planted Python and `uv` model vLLM's unimportable tensorizer pin, and the install must upgrade it, report it as a deliberate divergence, or refuse. | flat |
+| [`tests/e2e/vllm_companion_steps.rs`](../tests/e2e-cucumber/tests/e2e/vllm_companion_steps.rs) | Steps for [`vllm_companion.feature`](../tests/e2e-cucumber/features/vllm_companion.feature): a mixed-wheel index stand-in records installed companion versions to verify strict plain-wheel recovery, fail-closed refusal, and SDK torch retention. | flat |
 
 Boundaries:
 

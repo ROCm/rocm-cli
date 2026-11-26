@@ -7455,3 +7455,22 @@ There is no Gherkin scenario: the timeout is a dashboard (TUI) behavior that no
 `rocm` command output exposes, and driving it end to end needs a model that
 answers slower than the wait. The manual check is in
 [manual-testing.md](manual-testing.md#4d-dashboard-chat-request-timeout).
+
+## Offline vLLM Companion Recovery
+
+[vllm_companion.feature](../tests/e2e-cucumber/features/vllm_companion.feature)
+covers three Linux scenarios without downloads or a GPU. The
+`vllm-companion-01` outline checks SDK 10.1 and 10.2: plain `flash-attn` and
+`amd-aiter` versions are installed with strict `===` requirements, the recovery
+warning is printed, and the SDK torch/torchvision/torchaudio stack is retained
+and realigned from its recorded index. `vllm-companion-02` checks that a
+cross-line companion with no plain wheel is refused before any package install.
+The [step definitions](../tests/e2e-cucumber/tests/e2e/vllm_companion_steps.rs)
+use shell stand-ins that record installed versions separately from command arguments.
+
+Run against a freshly built CLI:
+
+```bash
+cargo build -p rocm
+ROCM_CLI_BINARY=$PWD/target/debug/rocm cargo xtask e2e -- -n '^vllm-companion-'
+```

@@ -2954,3 +2954,24 @@ ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
 
 Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
 gone, and `real-cache/keep` is still there.
+
+## vLLM SDK 10.1 Retained Stack
+
+On a Linux or WSL host with a supported AMD GPU and an installed ROCm 10.1
+wheel runtime, record that runtime's exact `torch`, `torchvision`, and
+`torchaudio` versions before reinstalling vLLM. Run
+`rocm engines install vllm --runtime-id <runtime_key> --yes --reinstall`.
+Verify the three versions remain unchanged, retain their `+rocm10.1` local
+tags, and are realigned from the wheel index recorded in the runtime manifest
+rather than rediscovered by series. The selection is implemented by
+`torch_stack_pins` and `torch_index_url_for` in
+[install.rs](../engines/vllm/src/install.rs).
+
+If the companion index resolves a wheel tagged for another ROCm line and
+serves the same release as a plain wheel, check that the recovery warning
+names the original pin and strict `===` replacement and the installed
+companion has the plain version. If the plain wheel is absent, expect refusal
+before package installation. Finally, serve a small model with vLLM on that
+runtime and confirm GPU inference succeeds. The offline checks are described
+in [testing.md](testing.md#offline-vllm-companion-recovery); they do not replace
+this live GPU acceptance check.
