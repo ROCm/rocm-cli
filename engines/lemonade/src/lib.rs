@@ -53,6 +53,7 @@ mod llamacpp_backend;
 mod process;
 mod router_serve;
 mod runtime_dir;
+mod sdk_root;
 mod state;
 #[cfg(test)]
 mod test_http;
@@ -460,12 +461,19 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     )?;
     // Announced and space-checked before anything is downloaded: a fresh tree
     // is a multi-gigabyte install, and `rocm serve` reaches this on its own.
-    if let Some(preflight) = crate::footprint::plan_install_preflight(
+    if let Some(mut preflight) = crate::footprint::plan_install_preflight(
         &paths,
         env_root.as_deref(),
         request.reinstall,
         crate::footprint::available_space_for_install,
     ) {
+        // Resolved the way the install resolves it, so the notice names the SDK
+        // the install offers. An environment that cannot be resolved is left
+        // out of the notice; the steps below resolve it again and report why.
+        if let Ok(process_env) = crate::process::lemonade_process_environment() {
+            preflight.offered_sdk = process_env.offered_sdk;
+            preflight.sdk_offer_failure = process_env.offer_failure;
+        }
         for line in preflight.notice_lines() {
             eprintln!("{line}");
         }

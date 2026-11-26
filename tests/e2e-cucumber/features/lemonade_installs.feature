@@ -4,7 +4,7 @@ Feature: Lemonade installs on disk
   # ROCm runtime is active: into the data folder when none is, into that
   # runtime's own folder when one is. So `rocm engines install lemonade` before
   # `rocm install sdk`, then `rocm serve` after it, leaves two full copies of
-  # roughly 25 GiB each, and the second one used to arrive silently from
+  # roughly 25 GiB each with its own ROCm runtime, and the second one used to arrive silently from
   # `rocm serve` (ROCMAI-825). These scenarios cover what the user is now told
   # about that: what an install needs before it starts, both copies in the disk
   # report, and the install record when a runtime holding a copy is removed.
@@ -17,7 +17,9 @@ Feature: Lemonade installs on disk
   # lemonade-installs-01 and -02 need the `rocm/e2e-test-hooks` build
   # `cargo xtask e2e` makes, to report a nearly full drive without filling a
   # real one; lemonade-installs-07, -08 and -09 need it to report old host
-  # libraries on a host whose libraries are new.
+  # libraries on a host whose libraries are new; lemonade-installs-10 and -11
+  # need it for the nearly full drive again, which stops them before anything
+  # is downloaded.
 
   @id:lemonade-installs-refused-without-space
   Scenario: lemonade-installs-01 - A Lemonade install the drive cannot hold is refused before downloading
@@ -107,3 +109,39 @@ Feature: Lemonade installs on disk
     And the pinned Lemonade is already installed in the data folder
     When the user installs the Lemonade engine
     Then the Lemonade install is refused for the host's libraries and the installed copy is left as it is
+
+  # Lemonade downloads a ROCm runtime of its own, several gigabytes, unless it is
+  # given a ROCm root it accepts, and the install is where the user is told
+  # which of the two happens (issue #1139). On Linux the managed SDK's
+  # wheel layout is not a root Lemonade accepts: it looks for an unversioned
+  # `libamdhip64.so` and the SDK has `libamdhip64.so.7`. So ROCm CLI stages a
+  # small root of its own, and says the SDK is offered when it hands Lemonade a
+  # root Lemonade accepts: one it staged here, or on Windows the SDK's own
+  # root, which is accepted as it is and has no root staged. The message and the
+  # staged root are asserted together. That
+  # Lemonade then takes the root and skips its download is Lemonade's own
+  # decision, so it cannot be seen without a real backend download: it is
+  # checked by hand (docs/manual-testing.md, section 3's Lemonade install
+  # checks) and by the unit tests in engines/lemonade/src/sdk_root.rs, which
+  # mirror Lemonade's probe. Linux only: Windows offers the SDK's own root, and
+  # nothing is staged there.
+  @id:lemonade-installs-offers-the-active-sdk @requires-os:linux
+  Scenario: lemonade-installs-10 - A Lemonade install says the active ROCm SDK is offered to it and stages the root Lemonade accepts
+    Given a ROCm SDK is active that has the Linux wheel layout and a version file
+    And the drive for a new Lemonade install cannot hold even Lemonade itself
+    When the user installs the Lemonade engine
+    Then the user is told the active ROCm SDK is offered to Lemonade as its ROCm runtime
+    And the root staged for that SDK links to the SDK's HIP library and carries its version
+    And the Lemonade install is refused before anything is downloaded
+
+  # A root with no version file is accepted by Lemonade for any ROCm version, so
+  # ROCm CLI does not stage one for an SDK whose version it cannot read. The
+  # install then says nothing about offering the SDK, because it is not
+  # offered: Lemonade downloads its own runtime, as it did before.
+  @id:lemonade-installs-does-not-claim-an-sdk-it-cannot-offer @requires-os:linux
+  Scenario: lemonade-installs-11 - A Lemonade install does not say the active ROCm SDK is offered when its version cannot be read
+    Given a ROCm SDK is active that has the Linux wheel layout and no version file
+    And the drive for a new Lemonade install cannot hold even Lemonade itself
+    When the user installs the Lemonade engine
+    Then the user is not told an ROCm SDK is offered to Lemonade and no root is staged
+    And the Lemonade install is refused before anything is downloaded
