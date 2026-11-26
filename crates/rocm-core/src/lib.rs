@@ -138,9 +138,10 @@ pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
 pub use fix::{
-    CATALOG_CONTRACT_VERSION, CatalogManifest, DRY_RUN_NOTICE, FixOptions, ManifestEntry,
-    ManifestPlatform, NON_INTERACTIVE_REFUSAL, apply as apply_fix, catalog_manifest,
-    catalog_manifest_json, exit as fix_exit, fix_plan_text, list_recipes as list_fix_recipes,
+    CATALOG_CONTRACT_VERSION, CatalogManifest, DRY_RUN_NOTICE, FixOptions, FixPreview,
+    ManifestEntry, ManifestPlatform, NON_INTERACTIVE_REFUSAL, apply as apply_fix, catalog_manifest,
+    catalog_manifest_json, exit as fix_exit, fix_plan_text, fix_preview_text,
+    list_recipes as list_fix_recipes,
 };
 pub use gfx_target::{
     GpuSupportLevel, VULKAN_ONLY_SUPPORT_CLAIM, VULKAN_UNCONFIRMED_CLAIM,

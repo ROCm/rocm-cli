@@ -7341,18 +7341,24 @@ A case may also name an `apply` fix id, for a case that reaches the apply step. 
 stub then answers `rocm fix <id> --dry-run` (the flag before or after the id) and
 `rocm fix <id>` with no flag, and never `--yes`, so an agent that applies before the
 user said OK meets the stub's refusal and the transcript shows the command. The fix
-must be `fix-4-render-group`, the only one whose layout around the plan the generator
-writes (another `auto` runner, such as fix-6, prints its own `Plan:` block, so naming
-one is refused), and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
+must be `fix-4-render-group`, the only one whose preview rocm-core models (another
+`auto` runner, such as fix-6, prints its own `Plan:` block, so naming one is refused),
+and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
 `linux`), and the case's symptom and host must make the replayed
 diagnosis match it, that is list it at or above `min_score_for_match`; otherwise the
-generator fails with "the replayed diagnosis carries no match for ...". The plan is the CLI's own (`rocm_core::fix_plan_text`), so it
-carries the command's wording; only the `Will run:` line the runner adds is not there,
-because it names the user and the machine. The layout around the plan (the blank line,
-then the notice) is written by hand in the generator and checked only against the
-committed replay. The bare command's refusal exit code
-and message, and the dry-run notice, are the CLI's own constants, so they cannot drift
-from the command's.
+generator fails with "the replayed diagnosis carries no match for ...". Both stdouts
+come from rocm-core (`rocm_core::fix_preview_text`, its `FixPreview` in `fix/runners.rs`):
+the plan and the blank line after it, then for `--dry-run` the dry-run notice. The bare
+command's stdout ends at that blank line, because the refusal goes to stderr. Only the
+`Will run:` line the runner adds is not there, because it names the user and the machine. The rocm-core unit test
+`the_dry_run_replay_is_the_runner_output_without_its_will_run_line` holds that preview
+to what the runner prints, on every lane, and the e2e scenario skill-08
+(`@id:skill-apply-replay-is-what-the-cli-prints`) holds the committed replay to the
+real `rocm fix`, with the `Will run:` line put back. skill-08 runs only on bare-metal
+Linux, where fix-4 applies: in CI the Linux lanes run it, the blocking mock `e2e`
+job among them, and the Windows and WSL2 lanes skip it. The bare command's refusal
+exit code and message are the CLI's own constants, so they cannot drift from the
+command's.
 
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the

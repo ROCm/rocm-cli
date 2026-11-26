@@ -67,7 +67,7 @@ const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 /// `$PATH`, so a scenario-controlled `$PATH` (see `command_fails_bin_dir`) can
 /// stand a fake `usermod`/`sudo` in for it, failing or never finishing, without
 /// needing real root or touching real group membership.
-const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
+pub(crate) const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
 /// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
 /// coverage lives here rather than being folded into [`MUTATING_FIX_ID`]'s
@@ -296,7 +296,7 @@ fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
 
 /// Where the fake `usermod`/`sudo` record each call, one `<name> <args>` line
 /// per call. Outside [`command_fails_bin_dir`] so it is not on the CLI's PATH.
-fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
+pub(crate) fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
     world
         .isolated_root
         .as_ref()
@@ -306,7 +306,7 @@ fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
 }
 
 /// The `$USER` the render-group scenarios run the fix as.
-const RENDER_GROUP_USER: &str = "e2e-test-user";
+pub(crate) const RENDER_GROUP_USER: &str = "e2e-test-user";
 
 /// The line `fix-4-render-group` prints once the user was added. Built from
 /// the same user the scenario sets, and absent from every failure path.
@@ -753,7 +753,7 @@ async fn user_approved_fix_that_never_finishes(world: &mut E2eWorld) {
 /// holding nothing else. Each appends `<name> <args>` to
 /// [`render_group_helper_log`] and then runs `tail`, so a scenario can say
 /// both what the CLI reported and what it asked the helper to do.
-fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
+pub(crate) fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
     let bin_dir = command_fails_bin_dir(world);
     std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
     let log = render_group_helper_log(world);

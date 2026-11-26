@@ -24,9 +24,13 @@
 //!   column. The channel is there because a lane's manifest names the channel of
 //!   the runtime it found, which need not be the one the lane was told to run.
 //! * which lanes exist and which of them the queue blocks on is read from the
-//!   run's lane matrix in its job log, the only place either is published. A lane
-//!   the queue marks advisory is labelled so, and `release-readiness` leaves it
-//!   out of its verdict. Anything this cannot read counts as blocking.
+//!   run's job log, the only place either is published: the lane matrix, and the
+//!   `blocking:` and `lanes:` lines the queue prints above it. A lane the queue
+//!   marks advisory is labelled so, and `release-readiness` leaves it out of its
+//!   verdict. Anything this cannot read counts as blocking. A lane those header
+//!   lines name that has no matrix row and no results (the queue drops a blocking
+//!   lane that is not in the fleet from the matrix) is still a lane that reported
+//!   nothing, and is imported as one.
 //! * a lane that reported nothing, or that did not finish cleanly and lacks a
 //!   channel, gets an empty report for it, which the report shows as `EMPTY` and
 //!   `release-readiness` counts as a failure for a blocking lane: a lane without
@@ -59,8 +63,8 @@ pub struct Args {
     /// into: one subdirectory per lane.
     #[arg(long, requires = "run_url", conflicts_with = "absent")]
     queue_dir: Option<PathBuf>,
-    /// The queue run's job log, which prints the branch the run tested and its
-    /// lane matrix. Without it, or when it names a branch other than `main`,
+    /// The queue run's job log, which prints the branch the run tested, the
+    /// `blocking:` and `lanes:` lines and its lane matrix. Without it, or when it names a branch other than `main`,
     /// nothing is imported.
     #[arg(long, requires = "queue_dir")]
     log: Option<PathBuf>,
@@ -142,14 +146,23 @@ struct QueueLog {
     branch: Option<String>,
     commit: Option<String>,
     lanes: Vec<MatrixRow>,
+    /// The lanes the run's `blocking:` header line names, `None` when the log has
+    /// no such line. A lane in it may have no matrix row (the queue leaves out a
+    /// blocking lane that is not in the fleet, as in `LOG_RUN_17`).
+    blocking: Option<Vec<String>>,
+    /// The lanes the `lanes:` header line names: the lanes the run submitted.
+    fleet: Vec<String>,
+    /// Blocking lanes the queue warned are not in the fleet and were not tested.
+    not_in_fleet: Vec<String>,
 }
 
 /// One row of the lane matrix the queue prints.
 #[derive(Debug, PartialEq, Eq)]
 struct MatrixRow {
     lane: String,
-    /// The lane's phase (`Done`, `Failed`, ...), when the matrix header names a
-    /// `PHASE` column and the row has one token per header column.
+    /// The lane's phase (`Done`, `Failed`, `Cancelled(no capacity)`, ...), when
+    /// the matrix header names a `PHASE` column and the row's tokens fit it (see
+    /// [`Columns::read`]).
     phase: Option<String>,
     /// The lane command's exit status, or `-` when it never ran; read under the
     /// same condition as `phase`, from the `EXIT` column.
@@ -184,20 +197,68 @@ fn is_lane_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// A phase the queue prints: a word, with a parenthesised reason after it that
+/// may hold spaces (`Done`, `Cancelled(no capacity)`).
+fn is_phase(phase: &str) -> bool {
+    let (word, reason) = phase.split_once('(').unwrap_or((phase, ""));
+    let reason_ok = reason.is_empty()
+        || reason.strip_suffix(')').is_some_and(|inner| {
+            !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_lowercase() || b == b' ')
+        });
+    phase.len() <= 40
+        && !word.is_empty()
+        && word.bytes().all(|b| b.is_ascii_alphabetic())
+        && reason_ok
+}
+
 /// Where the columns a row is read from sit in the lane matrix, taken from the
 /// matrix's own header line: the positions of `PHASE` and `EXIT`, and how many
 /// columns the header names. The header itself and each row's lane and gate are
 /// still anchored on the first and last token (`LANE`, `GATE`).
 #[derive(Default)]
 struct Columns {
-    /// How many columns the header names; a row with another token count is not
-    /// read by position.
+    /// How many columns the header names; a row with fewer tokens is not read by
+    /// position, one with more only as [`Columns::read`] describes.
     width: usize,
     phase: Option<usize>,
     exit: Option<usize>,
 }
 
 impl Columns {
+    /// A row's phase and exit status, read by the header's column positions.
+    ///
+    /// A row with one token per header column is read straight. A row with more
+    /// is read on the guess that its phase holds spaces (`Cancelled(no capacity)`),
+    /// which shifts every later column by the surplus: the phase is the tokens
+    /// from its column on, and the exit column moves along. The guess is kept only
+    /// when both cells then match their strict patterns; otherwise the row stays
+    /// unknown rather than misread. A row with fewer tokens is never read.
+    fn read(&self, tokens: &[&str]) -> (Option<String>, Option<String>) {
+        let Some(extra) = tokens.len().checked_sub(self.width) else {
+            return (None, None);
+        };
+        let phase = self.phase.and_then(|i| {
+            let phase = tokens.get(i..=i + extra)?.join(" ");
+            is_phase(&phase).then_some(phase)
+        });
+        let exit = self.exit.and_then(|i| {
+            // A column after the phase has moved right by the surplus.
+            let shifted = if self.phase.is_some_and(|p| p < i) {
+                i + extra
+            } else {
+                i
+            };
+            let exit = *tokens.get(shifted)?;
+            (exit == "-" || (exit.len() <= 4 && exit.bytes().all(|b| b.is_ascii_digit())))
+                .then(|| exit.to_owned())
+        });
+        // Under a guess, a cell that does not fit means the guess is wrong.
+        if extra > 0 && (phase.is_none() || (self.exit.is_some() && exit.is_none())) {
+            return (None, None);
+        }
+        (phase, exit)
+    }
+
     fn from_header(header: &[&str]) -> Self {
         let find = |name: &str| header.iter().position(|column| *column == name);
         Self {
@@ -208,12 +269,15 @@ impl Columns {
     }
 }
 
-/// Read the lane matrix and the tested commit out of the run's job log.
+/// Read the lane matrix, the tested commit, the `blocking:` and `lanes:` header
+/// lines and the not-in-fleet warnings out of the run's job log.
 ///
 /// The publisher prints its report with a `| ` prefix on every line, which the
 /// runner puts a timestamp in front of. Only the fields that match a strict
 /// pattern are kept; a line that does not is ignored, so a log that is not what
-/// was expected yields no lanes rather than text to publish.
+/// was expected yields no lanes rather than text to publish. A name in the
+/// `blocking:` line that is no lane name still counts, as a blocking
+/// `unnamed-header-N` lane; one in the `lanes:` line or the warning is dropped.
 fn parse_log(log: Option<&str>) -> QueueLog {
     #[expect(
         clippy::expect_used,
@@ -223,14 +287,32 @@ fn parse_log(log: Option<&str>) -> QueueLog {
     static TESTED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^rocm-cli (\S+) at ([0-9a-f]{40})$").expect("static pattern")
     });
+    #[expect(
+        clippy::expect_used,
+        reason = "a literal pattern; `the_import_writes_only_what_the_report_reads_under_names_that_say_lane_and_gate` \
+                  compiles it on every test run"
+    )]
+    static NOT_IN_FLEET: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\S+ ##\[warning\]blocking lane (\S+) is not in the fleet now \S+ not tested$")
+            .expect("static pattern")
+    });
     let mut out = QueueLog::default();
     let Some(log) = log else { return out };
     let tested = &*TESTED;
     let mut in_matrix = false;
     let mut columns = Columns::default();
     let mut unnamed = 0;
+    let mut unnamed_declared = 0;
     for line in log.lines() {
         let line = line.trim_start_matches('\u{feff}');
+        // The queue warns, outside its report, of a blocking lane it left out of
+        // the matrix. The lane's name is checked before it is kept.
+        if let Some(caps) = NOT_IN_FLEET.captures(line.trim_end())
+            && is_lane_name(&caps[1])
+        {
+            out.not_in_fleet.push(caps[1].to_owned());
+            continue;
+        }
         // `<timestamp> | <text>`: the part after the first `| `.
         let Some((_, body)) = line.split_once("| ") else {
             // A blank report line is `|` alone; either way the matrix is over.
@@ -245,6 +327,34 @@ fn parse_log(log: Option<&str>) -> QueueLog {
             out.commit = Some(caps[2].to_owned());
         }
         let tokens: Vec<&str> = body.split_whitespace().collect();
+        if !in_matrix {
+            // The header lines the queue prints above its matrix.
+            if let Some(names) = body
+                .strip_prefix("blocking: \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+            {
+                let declared = out.blocking.get_or_insert_with(Vec::new);
+                for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                    // A name that cannot be kept safely still names a blocking lane.
+                    let name = if is_lane_name(name) {
+                        name.to_owned()
+                    } else {
+                        unnamed_declared += 1;
+                        format!("unnamed-header-{unnamed_declared}")
+                    };
+                    if !declared.contains(&name) {
+                        declared.push(name);
+                    }
+                }
+            } else if let Some(names) = body.strip_prefix("lanes: ") {
+                out.fleet.extend(
+                    names
+                        .split_whitespace()
+                        .filter(|n| is_lane_name(n))
+                        .map(str::to_owned),
+                );
+            }
+        }
         if tokens.first() == Some(&"LANE") && tokens.last() == Some(&"GATE") {
             in_matrix = true;
             columns = Columns::from_header(&tokens);
@@ -275,22 +385,7 @@ fn parse_log(log: Option<&str>) -> QueueLog {
             });
             continue;
         }
-        // Only a row with one token per header column is read by position: a
-        // phase such as `Cancelled(no capacity)` holds a space, which shifts
-        // every later column, so such a row stays unknown.
-        let shaped = tokens.len() == columns.width;
-        let phase = columns
-            .phase
-            .filter(|_| shaped)
-            .map(|i| tokens[i])
-            .filter(|p| p.bytes().all(|b| b.is_ascii_alphabetic()))
-            .map(str::to_owned);
-        let exit = columns
-            .exit
-            .filter(|_| shaped)
-            .map(|i| tokens[i])
-            .filter(|e| *e == "-" || (e.len() <= 4 && e.bytes().all(|b| b.is_ascii_digit())))
-            .map(str::to_owned);
+        let (phase, exit) = columns.read(&tokens);
         out.lanes.push(MatrixRow {
             lane: (*lane).to_owned(),
             phase,
@@ -350,6 +445,9 @@ struct LanePlan {
     reported: Vec<&'static str>,
     /// Channels (or, for `None`, the lane as a whole) an empty report stands in for.
     placeholders: Vec<Option<&'static str>>,
+    /// Why the lane has no matrix row, when the run's header names it but its
+    /// matrix does not.
+    unlisted: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -362,9 +460,15 @@ struct Plan {
 /// lane matrix could be read at all: without it nothing is known of a lane's
 /// state beyond its files.
 fn plan(log: &QueueLog, found: BTreeMap<String, Vec<&'static str>>, have_matrix: bool) -> Plan {
+    // The lanes the run's header names count as lanes whether or not the matrix
+    // has a row for them: the queue leaves a blocking lane that is not in the
+    // fleet out of it.
     let mut names: Vec<&String> = found
         .keys()
         .chain(log.lanes.iter().map(|r| &r.lane))
+        .chain(log.blocking.iter().flatten())
+        .chain(&log.fleet)
+        .chain(&log.not_in_fleet)
         .collect();
     names.sort();
     names.dedup();
@@ -388,9 +492,39 @@ fn plan(log: &QueueLog, found: BTreeMap<String, Vec<&'static str>>, have_matrix:
                     .map(Some),
             );
         }
+        // Without a row the header says the lane's gate: the `blocking:` line
+        // names every lane the queue blocks on, so a lane of the fleet outside it is
+        // advisory. That is trusted only beside a matrix that was read and a
+        // `blocking:` line that names something: a header read without its matrix,
+        // or an empty one, says nothing safe, and a lane the header does not name
+        // is unknown. Unknown is blocking.
+        let declared = log
+            .blocking
+            .as_ref()
+            .filter(|names| have_matrix && !names.is_empty());
+        let declared_blocking =
+            declared.map(|b| b.contains(name) || log.not_in_fleet.contains(name));
+        let in_fleet = log.fleet.contains(name);
+        let blocking = match row {
+            Some(row) => row.blocking,
+            None => declared_blocking.unwrap_or(true) || !in_fleet,
+        };
+        let unlisted = (row.is_none()
+            && have_matrix
+            && (declared_blocking == Some(true) || in_fleet || log.not_in_fleet.contains(name)))
+        .then(|| {
+            if log.not_in_fleet.contains(name) {
+                "the queue run reported it is not in the fleet, so it was not tested"
+            } else if name.starts_with("unnamed-header-") {
+                "the queue run names a blocking lane whose name cannot be shown"
+            } else {
+                "the queue run names it, but its lane matrix has no row for it"
+            }
+        });
         lanes.push(LanePlan {
             lane: name.clone(),
-            blocking: row.is_none_or(|r| r.blocking),
+            blocking,
+            unlisted,
             phase: row.and_then(|r| r.phase.clone()),
             exit: row.and_then(|r| r.exit.clone()),
             reported,
@@ -487,6 +621,12 @@ fn one_line(text: &str) -> String {
 }
 
 const SECTION_HEADING: &str = "## Queue lanes\n\n";
+/// How the note on lanes the run names but its matrix lacks starts and ends;
+/// `release-readiness` looks for it in the matrix to say the same on its page.
+pub(crate) const UNLISTED_LEAD: &str =
+    "⚠️ Lanes the queue run names but its lane matrix has no row for: ";
+pub(crate) const UNLISTED_TAIL: &str =
+    ". A lane without results is shown as `EMPTY`, and a blocking one counts as a failure.";
 /// How the "nothing imported" note starts; `release-readiness` looks for it in
 /// the matrix so the verdict page can say the queue lanes are missing too.
 pub(crate) const ABSENT_LEAD: &str = "_No queue lanes are in this report: ";
@@ -568,6 +708,34 @@ fn render_section(
             lane.exit.as_deref().unwrap_or("unknown"),
         );
     }
+    let unlisted: Vec<String> = plan
+        .lanes
+        .iter()
+        .filter_map(|lane| {
+            let reason = lane.unlisted?;
+            Some(format!(
+                "`{}` ({}{}): {reason}",
+                lane.lane,
+                if lane.blocking {
+                    "blocking"
+                } else {
+                    "advisory"
+                },
+                if lane.reported.is_empty() {
+                    ", no results"
+                } else {
+                    ""
+                },
+            ))
+        })
+        .collect();
+    if !unlisted.is_empty() {
+        let _ = write!(
+            out,
+            "\n{UNLISTED_LEAD}{}{UNLISTED_TAIL}\n",
+            unlisted.join("; ")
+        );
+    }
     let _ = write!(
         out,
         "\nThe queue's own gate decides which lanes count: a lane it marks advisory is labelled \
@@ -583,14 +751,14 @@ mod tests {
     use super::*;
 
     /// The lane matrix of the 2026-11-13 scheduled run, as its public job log
-    /// printed it.
+    /// printed it, abridged: its `lanes:` line names only the four lanes shown.
     const LOG: &str = "\u{feff}2026-11-13T02:22:14.0268419Z started gh-43351651832-1; waiting for it to finish
 2026-11-13T03:45:26.1317642Z gh-43351651832-1 still running (10 min, 0 of 7 lane(s) finished)
 2026-11-13T03:45:26.1323838Z request gh-43351651832-1, finished 2026-11-13T03:45:26Z
 2026-11-13T03:45:26.1361153Z | image: \"rocm/dev-ubuntu-24.04:7.2.4\"
 2026-11-13T03:45:26.1361751Z | blocking: \"mi300x,r9700s\"
 2026-11-13T03:45:26.1362299Z | rocm-cli main at 691834a04540743d0dced173bd2ef70c1244b351
-2026-11-13T03:45:26.1362503Z | lanes: mi300x mi325x mi350p mi350x mi355x r9700s w7900-dual
+2026-11-13T03:45:26.1362503Z | lanes: mi300x mi325x r9700s w7900-dual
 2026-11-13T03:45:26.1362739Z |
 2026-11-13T03:45:26.1362910Z | LANE         WORKLOAD                       PHASE                EXIT  EXPORT    WAITED  GATE
 2026-11-13T03:45:26.1363201Z | mi300x       rocm-cli-gh-43351651832-1-mi300x Failed               1     Exported  0m      block
@@ -663,14 +831,196 @@ mod tests {
             vec![
                 row("mi300x", "Done", "0", true),
                 row("mi325x", "Failed", "1", false),
-                // A phase with a space shifts the columns: unknown, not misread.
-                unknown_row("mi355x", false),
-                unknown_row("r9700s", true),
+                // A phase with a space shifts the later columns by one token.
+                row("mi355x", "Cancelled(no capacity)", "-", false),
+                row("r9700s", "Cancelled(no capacity)", "-", true),
             ]
         );
         assert!(log.lanes[0].is_clean(), "an 8-token Done/0 row is clean");
         assert!(!log.lanes[1].is_clean());
         assert!(!log.lanes[2].is_clean());
+    }
+
+    /// The header and matrix of queue run 17 (2026-11-25), abridged: the mi300x
+    /// row's phase holds a space and its exit status is 1; the blocking lane
+    /// r9700s has no row.
+    const LOG_RUN_17: &str = "2026-11-25T06:57:40.0605134Z | blocking: \"mi300x,r9700s\"
+2026-11-25T06:57:40.0605809Z | rocm-cli main at 609fa629131c6345d0634303d466e351d4a4f6b2
+2026-11-25T06:57:40.0625196Z ##[warning]blocking lane r9700s is not in the fleet now \u{2014} not tested
+2026-11-25T06:57:40.0629059Z | lanes: mi300x mi325x mi350p
+2026-11-25T06:57:40.0629218Z |
+2026-11-25T06:57:40.0629413Z | LANE         WORKLOAD                             PHASE                  EXIT  EXPORT    WAITED  RETRIES GATE
+2026-11-25T06:57:40.0629798Z | mi300x       rocm-cli-gh-45532943041-1-mi300x     Cancelled(no capacity) 1     Exported  0m      1       block
+2026-11-25T06:57:40.0630508Z | mi325x       rocm-cli-gh-45532943041-1-mi325x     Failed                 1     Exported  0m      1       advisory
+2026-11-25T06:57:40.0630845Z | mi350p       rocm-cli-gh-45532943041-1-mi350p     Failed                 1     Pending   0m      1       advisory
+2026-11-25T06:57:40.0632871Z ##[error]1 lane(s) never started: no GPU in the claim budget - fleet capacity, not a test failure
+2026-11-25T06:57:40.0633365Z |
+2026-11-25T06:57:40.0633530Z | SUMMARY: 3 lane(s), 0 passed, 0 failed, 1 incomplete, 0 missing, 2 advisory
+";
+
+    #[test]
+    fn a_phase_with_a_space_is_read_whole_and_its_exit_follows_it() {
+        let log = parse_log(Some(LOG_RUN_17));
+        assert_eq!(
+            log.lanes,
+            vec![
+                row("mi300x", "Cancelled(no capacity)", "1", true),
+                row("mi325x", "Failed", "1", false),
+                row("mi350p", "Failed", "1", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_surplus_token_that_is_no_phase_with_a_space_leaves_the_row_unknown() {
+        let log = "2026-11-19T07:23:50Z | LANE WORKLOAD PHASE EXIT WAITED GATE\n\
+                   2026-11-19T07:23:50Z | mi300x wl-mi300x Done 0 0 m block\n\
+                   2026-11-19T07:23:50Z | mi325x wl-mi325x Cancelled(no capacity) x 0m block\n";
+        assert_eq!(
+            parse_log(Some(log)).lanes,
+            vec![unknown_row("mi300x", true), unknown_row("mi325x", true)]
+        );
+        assert!(is_phase("Cancelled(no capacity)"));
+        assert!(is_phase("Done"));
+        for bad in [
+            "",
+            "(x)",
+            "Done 0",
+            "Cancelled(no capacity",
+            "Cancelled()",
+            "A|B",
+        ] {
+            assert!(!is_phase(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_headers_declared_blocking_lanes_and_fleet_are_read() {
+        let log = parse_log(Some(LOG_RUN_17));
+        assert_eq!(
+            log.blocking,
+            Some(vec!["mi300x".to_owned(), "r9700s".to_owned()])
+        );
+        assert_eq!(log.fleet, ["mi300x", "mi325x", "mi350p"]);
+        assert_eq!(log.not_in_fleet, ["r9700s"]);
+        // Text that is no lane name is never kept, and a blocking one counts.
+        let hostile = parse_log(Some(
+            "2026-11-25T06:57:40Z | blocking: \"../x,mi300x\"\n\
+             2026-11-25T06:57:40Z ##[warning]blocking lane ../x is not in the fleet now \u{2014} not tested\n",
+        ));
+        assert_eq!(
+            hostile.blocking,
+            Some(vec!["unnamed-header-1".to_owned(), "mi300x".to_owned()])
+        );
+        assert!(hostile.not_in_fleet.is_empty());
+    }
+
+    #[test]
+    fn a_blocking_lane_the_matrix_lacks_is_planned_as_an_empty_blocking_lane_with_its_reason() {
+        let log = parse_log(Some(LOG_RUN_17));
+        let plan = plan(
+            &log,
+            found(&[
+                ("mi300x", &["release", "nightly"]),
+                ("mi325x", &["release", "nightly"]),
+                ("mi350p", &["release", "nightly"]),
+            ]),
+            true,
+        );
+        let r9700s = plan
+            .lanes
+            .iter()
+            .find(|l| l.lane == "r9700s")
+            .expect("a lane the header names is planned");
+        assert!(r9700s.blocking);
+        assert!(r9700s.reported.is_empty());
+        assert_eq!(r9700s.placeholders, vec![None]);
+        assert_eq!(
+            r9700s.unlisted,
+            Some("the queue run reported it is not in the fleet, so it was not tested")
+        );
+        // The lanes with rows carry no such note.
+        assert!(
+            plan.lanes
+                .iter()
+                .filter(|l| l.lane != "r9700s")
+                .all(|l| l.unlisted.is_none())
+        );
+    }
+
+    #[test]
+    fn an_advisory_lane_the_fleet_names_but_the_matrix_lacks_is_an_empty_advisory_lane() {
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z | blocking: \"mi300x\"\n\
+             2026-11-25T06:57:40Z | lanes: mi300x mi325x\n\
+             2026-11-25T06:57:40Z | LANE WORKLOAD PHASE EXIT GATE\n\
+             2026-11-25T06:57:40Z | mi300x wl Done 0 block\n\
+             2026-11-25T06:57:40Z |\n",
+        ));
+        let plan = plan(&log, found(&[("mi300x", &["release"])]), true);
+        let mi325x = plan
+            .lanes
+            .iter()
+            .find(|l| l.lane == "mi325x")
+            .expect("planned");
+        assert!(!mi325x.blocking);
+        assert_eq!(mi325x.placeholders, vec![None]);
+        assert_eq!(
+            mi325x.unlisted,
+            Some("the queue run names it, but its lane matrix has no row for it")
+        );
+    }
+
+    #[test]
+    fn a_blocking_lane_the_matrix_lacks_shows_up_empty_with_its_reason_in_the_import() {
+        let queue = tempfile::tempdir().expect("tempdir");
+        for lane in ["mi300x", "mi325x", "mi350p"] {
+            for channel in CHANNELS {
+                let results = queue.path().join(lane).join(channel).join("results");
+                write(&results.join("report.json"), "[]\n");
+            }
+        }
+        let out = tempfile::tempdir().expect("tempdir");
+        let log = out.path().join("job.log");
+        write(&log, LOG_RUN_17);
+        let section = out.path().join("queue-lanes.md");
+        run(&Args {
+            queue_dir: Some(queue.path().to_owned()),
+            log: Some(log),
+            run_url: Some("https://github.com/ROCm/rocm-cli/actions/runs/45532943041".to_owned()),
+            run_started: None,
+            absent: None,
+            artifacts_dir: out.path().join("e2e-artifacts"),
+            section_out: section.clone(),
+        })
+        .expect("import");
+        // The empty stand-in is what the report shows as EMPTY and counts.
+        assert_eq!(
+            std::fs::read_to_string(
+                out.path()
+                    .join("e2e-artifacts/e2e-queue-r9700s-report/report.json")
+            )
+            .expect("placeholder"),
+            "[]\n"
+        );
+        let text = std::fs::read_to_string(section).expect("section");
+        assert!(
+            text.contains("| r9700s | R9700 | blocking | unknown | unknown | none |"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "| mi300x | MI300X | blocking | Cancelled(no capacity) | 1 | release, nightly |"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{UNLISTED_LEAD}`r9700s` (blocking, no results): the queue run reported it is \
+                 not in the fleet, so it was not tested{UNLISTED_TAIL}"
+            )),
+            "{text}"
+        );
     }
 
     #[test]
@@ -806,6 +1156,7 @@ mod tests {
             branch: Some("main".to_owned()),
             commit: None,
             lanes: vec![row("mi300x", "Done", "0", true)],
+            ..QueueLog::default()
         };
         let plan = plan(&log, found(&[("mi300x", &["release"])]), true);
         assert!(plan.lanes[0].placeholders.is_empty());
@@ -821,6 +1172,120 @@ mod tests {
         assert!(plan.lanes.iter().all(|l| l.blocking));
         assert!(plan.lanes[0].placeholders.is_empty());
         assert_eq!(plan.lanes[1].placeholders, vec![None]);
+    }
+
+    #[test]
+    fn a_header_read_without_its_matrix_leaves_every_lane_blocking() {
+        // The matrix header is renamed (`STATE` for `PHASE`), so the rows are read
+        // without a phase and the matrix is emptied here; the header lines still
+        // are read. They must not turn the fleet advisory under a banner that
+        // says every lane is blocking.
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z | blocking: \"mi300x\"\n\
+             2026-11-25T06:57:40Z | lanes: mi300x mi325x\n\
+             2026-11-25T06:57:40Z | LANE WORKLOAD STATE GATE\n\
+             2026-11-25T06:57:40Z | mi300x wl Done block\n",
+        ));
+        assert_eq!(log.lanes.len(), 1, "the renamed header still ends in GATE");
+        let log = QueueLog {
+            lanes: Vec::new(),
+            ..log
+        };
+        let plan = plan(&log, found(&[("mi300x", &["release"])]), false);
+        assert!(
+            plan.lanes
+                .iter()
+                .all(|l| l.blocking && l.unlisted.is_none())
+        );
+        assert_eq!(plan.lanes.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_blocking_line_does_not_make_a_lane_without_a_row_advisory() {
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z | blocking: \"\"\n\
+             2026-11-25T06:57:40Z | lanes: mi300x mi325x\n\
+             2026-11-25T06:57:40Z | LANE WORKLOAD PHASE EXIT GATE\n\
+             2026-11-25T06:57:40Z | mi300x wl Done 0 advisory\n",
+        ));
+        let plan = plan(&log, found(&[("mi300x", &["release"])]), true);
+        let mi325x = plan
+            .lanes
+            .iter()
+            .find(|l| l.lane == "mi325x")
+            .expect("lane");
+        assert!(
+            mi325x.blocking,
+            "an empty list is unknown, and unknown blocks"
+        );
+    }
+
+    #[test]
+    fn a_lane_only_on_disk_is_blocking_even_beside_a_blocking_line() {
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z | blocking: \"mi300x\"\n\
+             2026-11-25T06:57:40Z | lanes: mi300x\n\
+             2026-11-25T06:57:40Z | LANE WORKLOAD PHASE EXIT GATE\n\
+             2026-11-25T06:57:40Z | mi300x wl Done 0 block\n",
+        ));
+        let plan = plan(
+            &log,
+            found(&[("mi300x", &["release"]), ("mi999x", &["release"])]),
+            true,
+        );
+        let stray = plan
+            .lanes
+            .iter()
+            .find(|l| l.lane == "mi999x")
+            .expect("lane");
+        assert!(stray.blocking, "a lane the header does not name is unknown");
+        assert!(stray.unlisted.is_none());
+    }
+
+    #[test]
+    fn a_blocking_lane_the_queue_warned_about_is_planned_even_if_the_header_omits_it() {
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z ##[warning]blocking lane r9700s is not in the fleet now \u{2014} not tested\n\
+             2026-11-25T06:57:40Z | blocking: \"mi300x\"\n\
+             2026-11-25T06:57:40Z | LANE WORKLOAD PHASE EXIT GATE\n\
+             2026-11-25T06:57:40Z | mi300x wl Done 0 block\n",
+        ));
+        // The header does not name r9700s; only the warning does.
+        let reason = Some("the queue run reported it is not in the fleet, so it was not tested");
+        let planned = plan(&log, found(&[("mi300x", &["release"])]), true);
+        let r9700s = planned
+            .lanes
+            .iter()
+            .find(|l| l.lane == "r9700s")
+            .expect("planned");
+        assert!(r9700s.blocking);
+        assert_eq!(r9700s.unlisted, reason);
+        assert_eq!(r9700s.placeholders, vec![None]);
+        // The same without any `blocking:` line.
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z ##[warning]blocking lane r9700s is not in the fleet now \u{2014} not tested\n\
+             2026-11-25T06:57:40Z | LANE WORKLOAD PHASE EXIT GATE\n\
+             2026-11-25T06:57:40Z | mi300x wl Done 0 block\n",
+        ));
+        let planned = plan(&log, found(&[("mi300x", &["release"])]), true);
+        let r9700s = planned
+            .lanes
+            .iter()
+            .find(|l| l.lane == "r9700s")
+            .expect("planned");
+        assert!(r9700s.blocking);
+        assert_eq!(r9700s.unlisted, reason);
+    }
+
+    #[test]
+    fn whitespace_around_a_name_in_the_blocking_line_is_not_part_of_it() {
+        let log = parse_log(Some(
+            "2026-11-25T06:57:40Z | blocking: \"mi300x, r9700s\"\n",
+        ));
+        assert_eq!(
+            log.blocking,
+            Some(vec!["mi300x".to_owned(), "r9700s".to_owned()])
+        );
     }
 
     #[test]

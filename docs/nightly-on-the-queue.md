@@ -304,14 +304,17 @@ queue has (MI325X, MI350X, MI355X) is on them.
   takes the first that tested `main`, so a run of another branch does not hide
   an earlier run of `main`.
 - **Which lanes, and whether each blocks.** The artifact holds the lanes'
-  files and nothing else about the run, so the job reads the run's job log, whose
-  lane matrix is the only place the queue prints which lanes it ran and which of
-  them can fail the run (the `GATE` column). Only the tested branch and commit
-  and each lane's name, phase, exit status and gate are taken from it, each
-  checked against a strict pattern first. A lane whose name is not a plain
-  lowercase word (letters, digits and dashes, and not ending in `-advisory`,
-  `-release` or `-nightly`) is shown as `unnamed-1` and so on, as a blocking
-  lane with no result. Without the log nothing is imported.
+  files and nothing else about the run, so the job reads the run's job log. Its
+  lane matrix, and the `blocking:` and `lanes:` lines the queue prints above it,
+  are the only place the queue says which lanes it ran or meant to run and which
+  of them can fail the run (the `GATE` column). Only the tested branch and commit,
+  those two header lines, the queue's "not in the fleet" warning, and each lane's
+  name, phase, exit status and gate are taken from it, each checked against a
+  strict pattern first. A lane whose name is not a plain lowercase word
+  (letters, digits and dashes, and not ending in `-advisory`, `-release` or
+  `-nightly`) is shown as `unnamed-row-1` (in the matrix), `unnamed-dir-1` (in
+  the artifact) or `unnamed-header-1` (in the `blocking:` line) and so on, as a
+  blocking lane with no result. Without the log nothing is imported.
 - **What is imported.** For each lane and channel,
   `<lane>/<channel>/results/{report.json,platform.json,commands.jsonl}`, the
   three files the report reads, as an artifact named
@@ -326,14 +329,26 @@ queue has (MI325X, MI350X, MI355X) is on them.
 - **How it reads.** A queue row is labelled `MI325X (queue) Linux (release)`,
   so it is not confused with the self-hosted MI300X lane, and a lane the queue
   does not block on is `MI325X (queue, advisory) Linux (release)`. The page
-  opens with a `Queue lanes` table: one row per lane the queue ran, with its
-  gate, phase, exit status and the channels that reported.
-- **What counts towards the verdict.** The same as for the queue's own run. A
-  blocking lane's failures are in the `E2E` failure count. An advisory lane's are
+  opens with a `Queue lanes` table: one row per lane the queue ran or named,
+  with its gate, phase, exit status and the channels that reported. A phase with
+  a space in it, such as `Cancelled(no capacity)`, is read whole.
+- **What counts towards the verdict.** The same as for the queue's own run,
+  except for a lane the matrix leaves out (below), which the queue only warns
+  about and this counts. A blocking lane's failures are in the `E2E` failure count. An advisory lane's are
   shown but left out of it. A lane that came back with no result, or whose
   channel is missing after it did not finish cleanly, is shown as `EMPTY` and
   counts for a blocking lane, because a blocking lane without a result is not
   a pass.
+- **A lane the matrix leaves out.** The queue prints a `blocking:` line and a
+  `lanes:` line above its lane matrix, and leaves a blocking lane that is not in
+  the fleet out of the matrix (its log warns that the lane "is not in the fleet
+  now"). The import counts every lane those two lines and that warning name, so such a lane is
+  shown as `EMPTY` with its gate, counts as a failure when blocking, and is named
+  with the reason under the `Queue lanes` table and below the
+  release-readiness table. A blocking lane that is away from the fleet therefore reads `NO-GO`
+  until it is back, though the queue's own run only warns. The `blocking:` line
+  is trusted for a lane's gate only beside a matrix that was read, and an empty
+  one is not trusted: a lane with no row then counts as blocking.
 - **When there is nothing to import.** No run in the window, a run of another
   branch, an artifact or log that cannot be downloaded or an import that fails
   never fails the nightly report: the page opens with a `Queue lanes` note
