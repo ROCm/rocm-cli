@@ -1357,6 +1357,82 @@ Feature: Diagnosing failures and listing fixes
     And this machine's shared memory allowance is what it was
     And the reason the fix gives says WSL2 normally gives half the VM's memory
 
+  # `rocm diagnose --help` tells a user who has hit no failure that the command
+  # is for them too: with no `--symptom` it reports what it finds on the
+  # machine as it is, and a diagnosis applies no fix and installs nothing. The
+  # help line alone would only pin the wording, so the same scenario holds the
+  # command to both halves of it. The machine carries the unneeded GPU override
+  # diagnose-62 plants, a misconfiguration every lane reads from the
+  # environment, so a diagnosis with nothing pasted has something to find on
+  # Linux, Windows and WSL alike. "Installs nothing" is checked as what the CLI
+  # owns: its settings and data folders, where a saved setting or an installed
+  # runtime would land, are compared file by file before and after. The cache
+  # folder is left out, because CI shares it between scenarios running at once,
+  # and so is the CLI's own log, which every command opens.
+  # Changes outside the CLI's folders are not observed here. What keeps a
+  # diagnosis from applying a fix is that `rocm_core::apply_fix` has one
+  # caller, `fix` in apps/rocm/src/diagnose_cmd.rs, which only `rocm fix`
+  # dispatches to (diagnose-08 holds that a fix asks first).
+  @id:diagnose-runs-before-a-failure-and-installs-nothing
+  Scenario: diagnose-89 - A user who has hit no failure is told to diagnose anyway, and the diagnosis finds a misconfiguration and installs nothing
+    Given a machine with a known misconfiguration in its environment
+    When the user asks how to diagnose this machine
+    Then the help says the machine can be diagnosed before anything has failed, and that only a fix changes it
+    When the user diagnoses the machine without describing a failure
+    Then the misconfiguration on the machine is reported, with a fix to apply
+    And the CLI's own settings and installs are left as they were
+
+  # A container on WSL that was started without the GPU device cannot reach the
+  # GPU at all, and until that is put right nothing the report says about the
+  # workload can be tried. The pasted out-of-memory error scores far higher,
+  # though, and the report used to rank it first and close with "Next step:
+  # run `rocm fix fix-16-vllm-oom`", sending the user to tune memory on a GPU
+  # their container cannot see (ROCMAI-785).
+  #
+  # The machine is planted: a host root whose kernel string reads as WSL2, with
+  # a docker marker and no `/dev/dxg`, which every Linux lane can stand up.
+  # The report the ticket came from had a 64 MiB `/dev/shm` outranking the
+  # missing device instead, and that shape cannot be planted: `/dev/shm` is
+  # measured from this process's own mount, deliberately not through the host
+  # root (`hardware_root.rs`). The out-of-memory finding stands in for it as the
+  # higher-scoring finding, and being HIGH it also reaches the closing line's
+  # "Next step" branch, which the shared-memory one would not. The
+  # shared-memory host is pinned in rocm-core by
+  # `in_a_docker_container_on_wsl_without_a_gpu_the_missing_device_ranks_first`.
+  @id:diagnose-a-gpu-the-program-cannot-reach-is-ranked-first @requires-os:linux
+  Scenario: diagnose-90 - A GPU the program cannot reach is ranked first and named as the next step
+    Given a container on a WSL machine that was started without the GPU
+    And a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom on that machine
+    Then the cause ranked first is that the GPU is not exposed to the container, above the out-of-memory finding that scores higher
+    And the closing advice names that cause, and the CLI accepts the fix it names on that machine
+
+  # The host the pool read exists for, and the one none of diagnose-81 to
+  # diagnose-87 describes: a machine where nothing reports the GPU's memory at
+  # all. That is a Windows laptop whose integrated GPU has no ROCm build --
+  # `amd-smi` ships inside the SDK, so an unsupported part has no telemetry to
+  # read a carve-out from. Such a host used to be told "the GPU memory on this
+  # host could not be read", with a plan whose one step was to run the telemetry
+  # it does not have; every one of those machines got the same dead end.
+  #
+  # The pool the GPU shares is a different counter and is readable without any
+  # of that, and the kernel topology still names the part, which is what says
+  # the pool belongs to a GPU that allocates from it rather than to a discrete
+  # card beside it. So the answer is a verdict against the pool, as on any other
+  # integrated GPU.
+  #
+  # Simulated as the same APU and the same 60 GiB pool diagnose-81 plants, with
+  # every VRAM counter taken away: that is the Linux spelling of the shape, so
+  # it runs on lanes that have no Windows APU. Linux-gated for the reason
+  # diagnose-81 is -- the simulation seam re-roots Linux paths only.
+  @id:diagnose-model-an-apu-with-no-memory-telemetry-is-still-measured @requires-os:linux
+  Scenario: diagnose-91 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
+    Given a machine whose only GPU shares system memory and reports no memory telemetry
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the pool the GPU shares
+    And the model is reported as degraded, because the pool is shared rather than set aside
+
   # ROCMAI-912. An integrated GPU has no VRAM of its own: what it may allocate
   # is capped by `amdgpu.gttsize` (MiB), by `ttm.pages_limit` (4 KiB pages) and
   # by the BIOS carve-out. The two kernel parameters are in different units, so
@@ -1374,7 +1450,7 @@ Feature: Diagnosing failures and listing fixes
   # not have. @requires-os:linux because these are Linux kernel parameters;
   # the catalog scopes the entry to bare-metal Linux for the same reason.
   @id:diagnose-apu-page-limit-caps-the-aperture @requires-os:linux
-  Scenario: diagnose-89 - An integrated GPU whose page limit undercuts its aperture is told which one decides
+  Scenario: diagnose-92 - An integrated GPU whose page limit undercuts its aperture is told which one decides
     Given an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI names the page limit as the ceiling that really applies
@@ -1386,7 +1462,7 @@ Feature: Diagnosing failures and listing fixes
   # clean kernel log, is correctly configured. An entry that fired on the mere
   # presence of the parameters would pass diagnose-89 and fail here.
   @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
-  Scenario: diagnose-90 - An integrated GPU whose two limits agree is not told to change them
+  Scenario: diagnose-93 - An integrated GPU whose two limits agree is not told to change them
     Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then no unified-memory cause is reported for that machine
@@ -1402,7 +1478,7 @@ Feature: Diagnosing failures and listing fixes
   # failure from an earlier run is not there to find. The report must say the
   # recent log was read rather than that the machine never failed.
   @id:diagnose-apu-svm-mapping-failure-is-detected @requires-os:linux
-  Scenario: diagnose-91 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
+  Scenario: diagnose-94 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
     Given an integrated-GPU machine whose kernel log reports an SVM mapping failure
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI reports the kernel's own SVM mapping failure as the cause
@@ -1421,7 +1497,7 @@ Feature: Diagnosing failures and listing fixes
   # decision behind the whole feature, and the one a shortcut would break
   # invisibly.
   @id:diagnose-a-bare-repository-answers-for-every-quantization
-  Scenario: diagnose-92 - A repository named without a quantization is answered for every quantization it publishes
+  Scenario: diagnose-95 - A repository named without a quantization is answered for every quantization it publishes
     Given a Hugging Face repository publishing three quantizations and a multimodal projector
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then every quantization is answered in its own right, smallest first, and the projector is not among them
@@ -1436,7 +1512,7 @@ Feature: Diagnosing failures and listing fixes
   # The request count is the assertion that matters: the wording can be printed
   # by a build that went on fetching regardless.
   @id:diagnose-a-repository-past-the-probe-cap-says-which-were-not-read
-  Scenario: diagnose-93 - A repository with more quantizations than one command reads stops asking and says which it did not read
+  Scenario: diagnose-96 - A repository with more quantizations than one command reads stops asking and says which it did not read
     Given a Hugging Face repository publishing fifteen quantizations
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then the quantizations past the cap are reported as not estimated, with the reason
@@ -1449,7 +1525,7 @@ Feature: Diagnosing failures and listing fixes
   # list alone settles it, as diagnose-52 relies on for a projector named
   # exactly.
   @id:diagnose-a-repository-of-only-projectors-has-nothing-to-size
-  Scenario: diagnose-94 - A repository whose only GGUF files are multimodal projectors is told it holds no language model
+  Scenario: diagnose-97 - A repository whose only GGUF files are multimodal projectors is told it holds no language model
     Given a Hugging Face repository that holds only a multimodal projector
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then the CLI says the repository holds no language model, and no header was read

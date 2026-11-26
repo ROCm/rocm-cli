@@ -2723,10 +2723,7 @@ mod tests {
         assert!(!text.contains("     $ "), "{text}");
         assert!(!text.contains("rocm serve some-lab"), "{text}");
         assert!(!text.contains("rocm serve --"), "{text}");
-        assert!(
-            text.contains("`rocm serve` does not take a context size"),
-            "{text}"
-        );
+        assert!(text.contains("`rocm serve` has no context-size"), "{text}");
     }
 
     /// `owner/repo` with no quantization names a repository, not one file, so

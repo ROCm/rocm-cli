@@ -270,7 +270,7 @@ fn pinned_lemonade_version(world: &mut E2eWorld) -> String {
 
 /// What the planted tree holds, file by file, so the Then can show it was left
 /// exactly as it was.
-fn tree_files(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+pub(crate) fn tree_files(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

@@ -1784,6 +1784,13 @@ mod tests {
 
     #[test]
     fn vllm_oom_keyword_diagnosis_is_available_on_wsl() {
+        // A bare `is_wsl` host has no WSL facts, so it also reads as having no
+        // /dev/dxg: fix-wsl-1 fires and, as a GPU the process cannot reach,
+        // ranks first (ROCMAI-785, pinned in `catalog.rs`). What this test is
+        // about is that the out-of-memory entry runs on WSL at all, so it asks
+        // for the entry rather than for the top row; the top row on a healthy
+        // WSL host is
+        // `a_genuine_vllm_oom_match_on_wsl_is_surfaced_not_routed_out_of_scope`.
         let mut e = linux_base();
         e.is_wsl = true;
         let report = diagnose(
@@ -1792,7 +1799,12 @@ mod tests {
         );
         assert!(report.out_of_scope.is_none());
         assert!(report.has_match());
-        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the out-of-memory entry runs on WSL");
+        assert!(oom.score >= MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
     }
 
     #[test]

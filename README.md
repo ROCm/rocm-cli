@@ -105,6 +105,9 @@ different goal.
    `rocm fix` match known failures against a catalog with a stable id for
    each. Where a fix is safe to automate, `rocm fix` applies it after asking.
    Otherwise it prints the steps to take, or says plainly that no fix exists.
+   You do not have to wait for it to break: `rocm diagnose` checks the machine
+   as it is and installs nothing, and no fix is applied until you run
+   `rocm fix`.
 7. **Built for people, scripts, and agents alike.** A launcher and a live
    dashboard for people, `--json` output from `examine`, `diagnose`, `fix`
    and other inspection commands for scripts, and the
@@ -599,7 +602,10 @@ Checks this computer's GPU, ROCm install, engines, and managed setup
 folders. Run this command first to see whether a system is ready and what
 `rocm install sdk` and `rocm serve` will see. `--json` emits a
 machine-readable report for diagnosis tooling instead of the human-readable
-summary. `--framework` controls which ML framework the `--json` report probes
+summary. To check the same machine against the catalog of known failure modes,
+before anything has failed or after, run `rocm diagnose` (see
+[Diagnose and fix](#diagnose-and-fix)). `--framework` controls which ML
+framework the `--json` report probes
 for its ROCm build and compiled GPU architectures:
 
 - `auto` (the default) tries PyTorch, then falls back to llama.cpp.
@@ -642,9 +648,25 @@ only recognize failure modes that are in the catalog: no match means "not
 recognized", not "nothing is wrong". In that case it points you at where to
 report the symptom.
 
+Nothing has to have failed first. With no `--symptom`, `diagnose` examines the
+machine as it is and reports any catalogued misconfiguration it finds, so you
+can run it before you install or serve anything. A diagnosis applies no fix and
+installs nothing; `rocm fix` is the step that changes the machine. Run that way
+on a machine where nothing matched, the report says no known misconfiguration
+matched and still lists the issue tracker to use; that pointer matters only if
+you have a failure to report. A few failure modes show only
+in the error a failing run prints (a vLLM out-of-memory error, for one), so
+pass that text with `--symptom` once you have it.
+
 Each result prints an `id:` and an `apply with:` command. The leading `#1`, `#2`
 are ranking positions for reading order only. `rocm fix` takes the id, not the
 position.
+
+Results that clear the match threshold come first. Among them, a cause that
+leaves the GPU unreachable (no device node, no kernel or host driver, no
+permission to open it, or on WSL2 no path from ROCm to the Windows driver) is
+listed before any other, whatever the scores; the rest follow by score. The
+closing line names the first cause listed.
 
 `rocm diagnose` takes these flags:
 
@@ -955,6 +977,29 @@ false "no Vulkan".
 speak from the gfx table alone, so they can name Vulkan on a host where `rocm
 examine` would say otherwise; spawning `vulkaninfo` (and PowerShell on Windows)
 was judged too expensive for a plain listing command.
+
+On such an integrated GPU, `rocm serve` on Lemonade chooses the llama.cpp
+context window itself. Lemonade sizes it from the memory it can see and, when
+it can see none (it logs `memory undetectable, returning 4096`), uses 4096
+tokens whatever the model, which is less than the assistant's own prompt. `rocm`
+reads the model's GGUF header (from the cached file — the first shard, for a
+split model whose shards are all present — or by a header-only range request to
+Hugging Face before the model is downloaded), estimates the largest context that
+fits in 75% of the pool the GPU shares with the operating system, and serves with
+that, at most 32768 tokens. This happens on both serving paths: the window
+reaches `lemonade load` as `--ctx-size`, or a directly launched `llama-server` as
+the same argument. The chosen size is written to the service log as
+`Context window: N tokens, ...`.
+
+A recipe that carries its own `--ctx-size` keeps it, and a discrete GPU is not
+affected. Where the window cannot be chosen — the header cannot be read, the
+model's memory is not something the estimate measures (a mixture-of-experts or
+state-space model, or a header missing a figure the estimate needs), or the model
+so nearly fills the pool that nothing larger than Lemonade's own 4096-token
+fallback fits — the model is served exactly as it would have been, and the
+service log says which of those it was, on a `Context window: left to the engine
+to choose, because ...` line. The 4096-token floor is deliberate: a smaller computed window
+would replace Lemonade's number with a worse one.
 
 #### Compiler toolchain (--devel)
 
@@ -1462,7 +1507,9 @@ advance how it will go.
 
 An integrated GPU whose pool **can** be read is judged on that pool — the
 memory its engine actually allocates from, not the small VRAM carve-out the
-BIOS reserves. That pool is shared with the operating system, so it is a
+BIOS reserves. That includes a host with no `amd-smi`, such as a Windows
+machine whose GPU has no ROCm build: its gfx target says it is an integrated
+GPU, and the pool is read without `amd-smi`. That pool is shared with the operating system, so it is a
 ceiling and not an allocation: a model that fits under it is answered
 `degraded` rather than `ready`, with the reason, because nothing here measures
 how much of the pool is free. A model larger than the ceiling is `blocked`, and
@@ -1525,6 +1572,10 @@ it fit:
 Those are llama.cpp options (`--ctx-size`, `--cache-type-k`/`-v`,
 `--n-gpu-layers`): **`rocm serve` does not take a context size, KV cache type
 or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
+On an integrated GPU `rocm serve` does size the context window itself, from the
+memory the GPU shares with the operating system (see
+[GPUs with no ROCm build](#gpus-with-no-rocm-build)); that window is chosen for
+the host, not for the context size estimated here, so the two can differ.
 
 The estimate is built from these parts:
 

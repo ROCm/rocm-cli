@@ -239,6 +239,9 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// The eval replay of `rocm fix` that skill-08 holds the real command to, and
+    /// what the command printed. See `e2e::skill_steps`.
+    pub skill_apply: Option<e2e::skill_steps::ApplyReplay>,
     /// The `therock.version` Lemonade's `backend_versions.json` held after
     /// runtime-33's failed alignment had reverted it, so the install that follows
     /// can be held to leaving exactly that pin in place.
@@ -289,8 +292,10 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
-    /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
-    /// can show a refused install left that tree exactly as it was.
+    /// Every file of a tree, with its bytes, recorded before a command runs so
+    /// a Then can show the command left that tree exactly as it was: a planted
+    /// Lemonade tree a refused install must not touch, or the CLI's settings
+    /// and data folders a diagnosis must not change (diagnose-89).
     pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
     /// The size of this machine's `/dev/shm`, in bytes, as a Given measured it,
     /// so a Then can show a fix that only explains itself left it as it was.
@@ -466,6 +471,7 @@ impl Default for E2eWorld {
             side_by_side: None,
             skill_reference: None,
             skill_symptom: None,
+            skill_apply: None,
             lemonade_pin_after_failed_alignment: None,
             lemonade_runtime_dir: None,
             symptom_paste: None,

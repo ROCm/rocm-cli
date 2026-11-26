@@ -64,8 +64,8 @@ pub(super) fn route_when_no_match(e: &Examination) -> Route {
 /// cause of the reported symptom.
 ///
 /// Such an entry reads only evidence, never the symptom, so it fires whatever
-/// the user reported. The text report must not call it "the highest-scoring
-/// match" nor let it stand in for the upstream escalation.
+/// the user reported. The text report must not call it "the top-ranked cause"
+/// nor let it stand in for the upstream escalation.
 fn is_advice_only(fix_id: &str) -> bool {
     fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID
 }
@@ -270,21 +270,28 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         );
     }
 
-    if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
-        let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
-    } else if let Some(best) = report.matched.iter().find(|d| !is_advice_only(&d.id)) {
-        // Below the threshold the caution still stands, but it is advice about
-        // confidence -- not a reason to withhold the command. Ending here was the
-        // bug: the user was told to confirm more evidence and given nothing to
-        // run once they had.
-        out.push_str(
-            "Highest-scoring match is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n",
-        );
-        let _ = writeln!(
-            out,
-            "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
-            best.id
-        );
+    // The closing line names the cause the list above ranks first, so it reads
+    // the ranking `run_all_checks` (in `catalog.rs`) built rather than searching
+    // `matched` again by score. A search for the first HIGH_CONFIDENCE row named
+    // a lower-ranked one whenever a cause with precedence (a GPU the process
+    // cannot reach) ranked above a higher-scoring one (ROCMAI-785).
+    if let Some(first) = report.matched.iter().find(|d| !is_advice_only(&d.id)) {
+        if first.score >= HIGH_CONFIDENCE {
+            let _ = writeln!(out, "Next step: run `rocm fix {}`.", first.id);
+        } else {
+            // Below the threshold the caution still stands, but it is advice
+            // about confidence -- not a reason to withhold the command. Ending
+            // here was the bug: the user was told to confirm more evidence and
+            // given nothing to run once they had.
+            out.push_str(
+                "The top-ranked cause is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n",
+            );
+            let _ = writeln!(
+                out,
+                "When you are ready, run `rocm fix {}` (the top-ranked cause), or use the `apply with:` line of whichever cause fits.",
+                first.id
+            );
+        }
     }
     out
 }

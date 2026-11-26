@@ -2876,6 +2876,21 @@ cargo test -p rocm --bin rocm tests::an_error
 cargo test -p rocm-dash-tui --lib agent::tools
 ```
 
+A request that does not fit the window the model was served with is explained
+rather than relayed. `chat-24`
+(`chat-context-overflow-is-explained-in-plain-language`) drives the Chat tab
+against a mock endpoint that refuses the way a llama.cpp-backed server does,
+with an `exceed_context_size_error` body, and requires the transcript to name
+the window and what counts toward it while showing none of the provider's wire
+detail. The unit tests beside the message fabricate that body, so nothing
+otherwise held the tab to reaching the rewrite against an endpoint that
+returns one:
+
+```bash
+cargo xtask e2e -- -n "chat-24"
+cargo test -p rocm-dash-tui --lib chat_runtime
+```
+
 Log browser smoke:
 
 ```bash
@@ -6596,6 +6611,25 @@ gates still apply (a `-n` name filter would bypass them):
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-wsl-usual-shared-memory-is-not-reported-short cargo xtask e2e
 ```
 
+### Diagnosing before anything has failed
+
+`diagnose-89` holds `rocm diagnose --help` to what the command does for a user
+who has hit no failure. It plants the unneeded GPU override that `diagnose-62`
+uses, a misconfiguration every lane reads from the environment, then reads the
+help for three lines (nothing has to have failed first, a diagnosis applies no
+fix, only `rocm fix` changes the machine), runs `rocm diagnose` with no
+`--symptom`, and requires the override to be reported with its `rocm fix`
+command. It also compares the CLI's `config` and `data` folders file by file
+before and after. That is what "installs nothing" is checked as: a change
+outside those two folders is not observed, and neither are the cache folder
+(CI shares it between scenarios) or the CLI's own log. With no symptom the
+override scores below the match threshold, so it is listed as a weak result
+rather than a match. The scenario is untagged and runs on every lane:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-89)'
+```
+
 ## Symptom From A File Or Standard Input
 
 `rocm diagnose --symptom-file <PATH>` reads the symptom from a file, or from
@@ -6698,6 +6732,42 @@ only those three without bypassing the harness's gates:
 
 ```bash
 E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-json-says-which-causes-the-paste-contributed-to,diagnose-text-marks-causes-the-paste-did-not-contribute-to,diagnose-without-a-paste-credits-no-cause-to-one cargo xtask e2e
+```
+
+### Which cause ranks first
+
+Each catalog entry in `CHECKERS` in
+[catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs) names a
+`Precedence`, and `run_all_checks` there sorts the findings that cleared the
+match threshold by it before their score: a finding that the process has no
+working path to the GPU (`GpuPath`: no device node, no kernel or host driver,
+no permission to open it, or on WSL2 no bridge from ROCm to the host driver)
+ranks ahead of every other finding, such as a small `/dev/shm` or a vLLM
+out-of-memory error, even when that one scores higher. Below the threshold
+precedence does not count, so a weak signal such as merely being in a
+container never climbs over an established finding. The text report's closing
+line names the first cause in that order (`render_report_text` in
+[report.rs](../crates/rocm-core/src/diagnose/report.rs)), whether or not a
+lower-ranked one clears `HIGH_CONFIDENCE`. The unit tests in catalog.rs pin the
+reported WSL container with a 64 MiB `/dev/shm`, the same container with a
+pasted out-of-memory error, a sub-threshold container finding, and a bare-metal
+container without `/dev/kfd`:
+
+```bash
+cargo nextest run -p rocm-core -E 'test(/diagnose::catalog::tests::(in_a_docker|a_high_confidence|a_weak_gpu|a_linux_container)/)'
+```
+
+`diagnose-90` in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
+covers it end to end on every Linux lane, WSL included: it plants a host root
+that reads as a docker container on WSL2 with no `/dev/dxg`, pastes a vLLM
+out-of-memory error, and requires the missing device first, the closing line
+to name it, and `rocm fix` to accept that id on the same planted machine. The
+shared-memory shape of the original report is unit-only, because `/dev/shm` is
+measured from the process's own mount rather than through the host root
+([hardware_root.rs](../crates/rocm-core/src/hardware_root.rs)). To run it alone:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-a-gpu-the-program-cannot-reach-is-ranked-first cargo xtask e2e
 ```
 
 ## Model Fit Preflight
@@ -6854,21 +6924,31 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   integrated-GPU hardware. The planted pool is far larger than the tiny file, so
   only the "fits" polarity is exercised there.
 
+  `diagnose-91` covers the host none of the others describe: one where nothing
+  reports the GPU's memory at all. That is a Windows laptop whose integrated GPU
+  has no ROCm build, since `amd-smi` ships inside the SDK and an unsupported
+  part has no telemetry to read a carve-out from. Such a host used to be told
+  the memory could not be read, and given a plan whose one step was to run the
+  telemetry it does not have. The pool the GPU shares is a separate counter that
+  is readable anyway, and the kernel topology still names the part, so the
+  scenario plants the same APU with every VRAM counter taken away and requires a
+  verdict against the shared pool rather than that dead end.
+
   The other half of ROCMAI-912 is the advice, not the measurement: the
   `fix-24-apu-unified-memory` catalog entry, which reads `amdgpu.gttsize` and
   `ttm.pages_limit` off `/proc/cmdline` and the amdkfd SVM failures out of the
-  recent kernel log. `diagnose-89`, `diagnose-90` and `diagnose-91`
+  recent kernel log. `diagnose-92`, `diagnose-93` and `diagnose-94`
   (`@requires-os:linux`; these are Linux kernel parameters) extend the same
   planted gfx1151 host with a `/proc/cmdline`, a `/proc/meminfo` reporting
   128 GiB, and a `journalctl` of their own on the CLI's `PATH` - the kernel log
   is obtained by running a command, not by reading a file, so the host-root seam
-  cannot supply it. `diagnose-89` plants a `ttm.pages_limit` a third of what
+  cannot supply it. `diagnose-92` plants a `ttm.pages_limit` a third of what
   `amdgpu.gttsize` asks for and requires the smaller ceiling to be named, a
   consistent pair sized to installed RAM to be offered, and the BIOS carve-out
-  to stay in the notes rather than appear among the commands. `diagnose-90` is
+  to stay in the notes rather than appear among the commands. `diagnose-93` is
   the negative: the same host with a page limit that covers its aperture gets no
   finding, which is what stops the entry firing on the mere presence of the
-  parameters. `diagnose-91` plants the driver's own
+  parameters. `diagnose-94` plants the driver's own
   `SVM mapping failed, exceeds resident system memory limit` line, requires it
   to be reported as a cause, then removes it and requires the report to say the
   recent log was read rather than that the machine never failed. The `kvm_amd`
@@ -6876,7 +6956,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   a detector widened to match the bare word fails
   `an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not` in
   [examine/host_env.rs](../crates/rocm-core/src/examine/host_env.rs) and
-  `diagnose-90` here. **No APU runs this entry on real hardware**: no CI lane
+  `diagnose-93` here. **No APU runs this entry on real hardware**: no CI lane
   and no development machine has one whose `gttsize` and `pages_limit` are set,
   so every check of it is simulated.
 
@@ -6910,18 +6990,18 @@ plan to ask again about that path, the path quoted where the platform's shell
 needs it, so the step accepts it bare or quoted). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
 nothing, and the answer lists the model and the projector, marked as one.
 
-Scenarios `diagnose-56` and `diagnose-92` to `diagnose-94` cover the repository
+Scenarios `diagnose-56` and `diagnose-95` to `diagnose-97` cover the repository
 answer, against a stand-in hub that serves a listing and range requests over the
 same tiny GGUF fixture and counts every connection: a bare `owner/repo` sized at
 the `--context-size` given (`diagnose-56`), one row per quantization smallest
 first with the projector left out and three different weight figures showing a
-header was read per file (`diagnose-92`), a repository of fifteen quantizations
+header was read per file (`diagnose-95`), a repository of fifteen quantizations
 whose rows past the cap say why they were not read while the connection count
-shows the requests stopped (`diagnose-93`), and a repository holding only a
-projector, answered from the file list alone (`diagnose-94`).
+shows the requests stopped (`diagnose-96`), and a repository holding only a
+projector, answered from the file list alone (`diagnose-97`).
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[2-4])'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[5-7])'
 ```
 
 ## Doctor Report Preflight
@@ -7299,18 +7379,24 @@ A case may also name an `apply` fix id, for a case that reaches the apply step. 
 stub then answers `rocm fix <id> --dry-run` (the flag before or after the id) and
 `rocm fix <id>` with no flag, and never `--yes`, so an agent that applies before the
 user said OK meets the stub's refusal and the transcript shows the command. The fix
-must be `fix-4-render-group`, the only one whose layout around the plan the generator
-writes (another `auto` runner, such as fix-6, prints its own `Plan:` block, so naming
-one is refused), and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
+must be `fix-4-render-group`, the only one whose preview rocm-core models (another
+`auto` runner, such as fix-6, prints its own `Plan:` block, so naming one is refused),
+and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
 `linux`), and the case's symptom and host must make the replayed
 diagnosis match it, that is list it at or above `min_score_for_match`; otherwise the
-generator fails with "the replayed diagnosis carries no match for ...". The plan is the CLI's own (`rocm_core::fix_plan_text`), so it
-carries the command's wording; only the `Will run:` line the runner adds is not there,
-because it names the user and the machine. The layout around the plan (the blank line,
-then the notice) is written by hand in the generator and checked only against the
-committed replay. The bare command's refusal exit code
-and message, and the dry-run notice, are the CLI's own constants, so they cannot drift
-from the command's.
+generator fails with "the replayed diagnosis carries no match for ...". Both stdouts
+come from rocm-core (`rocm_core::fix_preview_text`, its `FixPreview` in `fix/runners.rs`):
+the plan and the blank line after it, then for `--dry-run` the dry-run notice. The bare
+command's stdout ends at that blank line, because the refusal goes to stderr. Only the
+`Will run:` line the runner adds is not there, because it names the user and the machine. The rocm-core unit test
+`the_dry_run_replay_is_the_runner_output_without_its_will_run_line` holds that preview
+to what the runner prints, on every lane, and the e2e scenario skill-08
+(`@id:skill-apply-replay-is-what-the-cli-prints`) holds the committed replay to the
+real `rocm fix`, with the `Will run:` line put back. skill-08 runs only on bare-metal
+Linux, where fix-4 applies: in CI the Linux lanes run it, the blocking mock `e2e`
+job among them, and the Windows and WSL2 lanes skip it. The bare command's refusal
+exit code and message are the CLI's own constants, so they cannot drift from the
+command's.
 
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the

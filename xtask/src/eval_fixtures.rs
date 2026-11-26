@@ -26,19 +26,18 @@
 //! leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in it.
 //!
 //! A case may also name an `apply` fix id, which makes the stub answer `rocm fix <id>`
-//! with `--dry-run` and with no flag. The fix must be one of `APPLY_FIXES` (only
-//! fix-4: another runner prints its own lines around the plan, which the generator
-//! does not write), `auto` on the host's platform (`wsl` for the WSL host, else
-//! `linux`), and the case's symptom and host must make
-//! the replayed diagnosis match it, or the generator fails (a fix the agent could not
-//! be pointed at has nothing to replay). The plan is the CLI's own
-//! ([`rocm_core::fix_plan_text`]), so it carries the command's wording; only the
+//! with `--dry-run` and with no flag. The fix must be one rocm-core models the
+//! preview of (only fix-4: another runner prints its own lines around the plan),
+//! `auto` on the host's platform (`wsl` for the WSL host, else `linux`), and the
+//! case's symptom and host must make the replayed diagnosis match it, or the
+//! generator fails (a fix the agent could not be pointed at has nothing to replay).
+//! Both stdouts come from rocm-core ([`rocm_core::fix_preview_text`]): the plan, its
+//! layout and the dry-run notice, so they carry the command's wording. Only the
 //! `Will run:` line the runner adds is not there, because it names the user and the
-//! machine. The layout around the plan (the blank line, then the notice) is written
-//! here by hand, copying the runner, and is checked only against the committed
-//! replay. The refusal's exit code, its message and the dry-run notice are the CLI's
-//! own constants ([`rocm_core::fix_exit`], [`rocm_core::NON_INTERACTIVE_REFUSAL`],
-//! [`rocm_core::DRY_RUN_NOTICE`]).
+//! machine. A rocm-core unit test holds that preview to the runner's own output,
+//! and the e2e scenario skill-08 holds the committed replay to the real command.
+//! The refusal's exit code and message are the CLI's own constants
+//! ([`rocm_core::fix_exit`], [`rocm_core::NON_INTERACTIVE_REFUSAL`]).
 //!
 //! Some replies are not rendered from the catalog. What an OLDER CLI printed was
 //! recorded once from a real older binary and is committed under `recorded/`. The
@@ -93,11 +92,6 @@ fn replayed_os(host: Option<Host>) -> &'static str {
         "linux"
     }
 }
-
-/// The fixes an `apply` case may name: those whose output around the plan the
-/// generator reproduces. Another `auto` runner prints its own lines, and replaying
-/// fix-4's layout for it would show text the CLI never prints.
-const APPLY_FIXES: &[&str] = &["fix-4-render-group"];
 
 /// The part of the dataset this module reads: which prompt each case id has.
 #[derive(Debug, Deserialize)]
@@ -377,20 +371,19 @@ fn replies_for(root: &Path, case: &Case, recorded: &rocm_core::Examination) -> R
 }
 
 /// What the stub answers for `rocm fix <fix_id>` in the case's replay, on the platform
-/// `os`. The plan is the CLI's own, from [`rocm_core::fix_plan_text`], so its wording
-/// cannot drift from the command's. Only [`APPLY_FIXES`] are modelled: what a runner
-/// prints around the plan is its own (fix-6 prints a `Plan:` block, for one), and the
-/// layout written here is fix-4's. The fix must also be `auto` on `os`. And the
-/// replayed diagnosis must match the fix, that is list it at or above
-/// `min_score_for_match`, or the agent has no way to be pointed at its id.
+/// `os`. Both stdouts are the CLI's own, from [`rocm_core::fix_preview_text`], so
+/// neither the plan's wording nor the layout around it can drift from the command's;
+/// that function models only fix-4's runner (fix-6 prints a `Plan:` block of its own,
+/// for one). The fix must also be `auto` on `os`. And the replayed diagnosis must
+/// match the fix, that is list it at or above `min_score_for_match`, or the agent has
+/// no way to be pointed at its id.
 fn apply_for(fix_id: &str, os: &str, report: &rocm_core::DiagnoseReport) -> Result<Apply> {
-    let plan = rocm_core::fix_plan_text(fix_id, os)
-        .with_context(|| format!("the catalog has no fix {fix_id:?}"))?;
-    if !APPLY_FIXES.contains(&fix_id) {
-        bail!(
-            "the apply replay writes only the layout of {APPLY_FIXES:?}, and {fix_id:?} prints its own"
-        );
+    if rocm_core::fix_plan_text(fix_id, os).is_none() {
+        bail!("the catalog has no fix {fix_id:?}");
     }
+    let preview = rocm_core::fix_preview_text(fix_id, os).with_context(|| {
+        format!("rocm-core models the preview of a fix whose runner it can render, and {fix_id:?} is not one")
+    })?;
     if rocm_core::fix::class_on(fix_id, os) != Some(rocm_core::fix::FixClass::Auto) {
         bail!("the apply replay models only a fix that is `auto` on {os}, and {fix_id:?} is not");
     }
@@ -402,9 +395,9 @@ fn apply_for(fix_id: &str, os: &str, report: &rocm_core::DiagnoseReport) -> Resu
     }
     Ok(Apply {
         fix_id: fix_id.to_owned(),
-        dry_run: Reply::ok(format!("{plan}\n{}\n", rocm_core::DRY_RUN_NOTICE)),
+        dry_run: Reply::ok(preview.dry_run),
         bare: Reply {
-            stdout: format!("{plan}\n"),
+            stdout: preview.refused,
             stderr: format!("{}\n", rocm_core::NON_INTERACTIVE_REFUSAL),
             rc: rocm_core::fix_exit::DECLINED,
         },
@@ -1050,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn an_apply_replay_is_the_catalogs_plan_followed_by_the_dry_run_notice() {
+    fn an_apply_replay_is_the_preview_rocm_core_gives() {
         let root = paths::workspace_root().expect("workspace root");
         let examination = load_examination(&root).expect("examination");
         let case = cases(&root)
@@ -1061,15 +1054,13 @@ mod tests {
             .expect("replies")
             .apply
             .expect("an `apply` case replays the fix commands");
-        let plan =
-            rocm_core::fix_plan_text(&apply.fix_id, replayed_os(case.host)).expect("the plan");
-        assert_eq!(
-            apply.dry_run.stdout,
-            format!("{plan}\n{}\n", rocm_core::DRY_RUN_NOTICE)
-        );
-        // What the plan says is the CLI's, not a second rendering of it. How it is laid
-        // out around the notice is this generator's own, so the equality above checks
-        // the replay against the generator and not against the command.
+        let os = replayed_os(case.host);
+        let preview = rocm_core::fix_preview_text(&apply.fix_id, os).expect("the preview");
+        assert_eq!(apply.dry_run.stdout, preview.dry_run);
+        assert_eq!(apply.bare.stdout, preview.refused);
+        // Both are rocm-core's, not a second rendering here, and the plan opens them.
+        let plan = rocm_core::fix_plan_text(&apply.fix_id, os).expect("the plan");
+        assert!(apply.dry_run.stdout.starts_with(&plan));
         for line in [
             "Fix:        ",
             "OS scope:   ",
@@ -1131,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn an_apply_replay_is_refused_for_a_fix_whose_layout_it_does_not_write() {
+    fn an_apply_replay_is_refused_for_a_fix_whose_preview_rocm_core_does_not_model() {
         let root = paths::workspace_root().expect("workspace root");
         let examination = load_examination(&root).expect("examination");
         let host = examination_for(&examination, Host::ContainerSmallShm);
@@ -1144,7 +1135,7 @@ mod tests {
                 apply_for(fix_id, "linux", &report).expect_err("another fix is refused")
             );
             assert!(
-                message.contains("writes only the layout of"),
+                message.contains("models the preview of a fix whose runner it can render"),
                 "{fix_id}: {message}"
             );
         }

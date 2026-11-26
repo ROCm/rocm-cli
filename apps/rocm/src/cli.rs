@@ -94,16 +94,19 @@ pub(crate) enum Command {
         #[arg(long, value_enum, default_value_t = FrameworkArg::Auto)]
         framework: FrameworkArg,
     },
-    /// Diagnose known ROCm/PyTorch/llama.cpp failure modes against a closed catalog.
+    /// Check this machine against a closed catalog of known ROCm/PyTorch/llama.cpp failure modes.
     ///
     /// Matches this machine against a fixed catalog of known misconfigurations and
-    /// ranks what it finds. It can only recognise failure modes that are in the
-    /// catalog: no match means "not recognised", not "nothing is wrong" - in that
-    /// case it points you at where to report the symptom.
+    /// ranks what it finds. Nothing has to have failed first: with no `--symptom`
+    /// it examines the machine as it is. A diagnosis applies no fix and installs
+    /// nothing; `rocm fix` is the step that changes the machine. It can only
+    /// recognise catalogued failure modes: no match means "not recognised", not
+    /// "nothing is wrong" - then it points you at where to report the symptom.
     ///
     /// Each cause is printed with an `id:` and an `apply with:` command. The
     /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
-    /// takes the id, not the position.
+    /// takes the id, not the position. An established cause that leaves the GPU
+    /// unreachable is listed first, and the closing line names the first cause.
     ///
     /// On Linux it also sizes an integrated GPU's share of system memory
     /// (`fix-24-apu-unified-memory`): `amdgpu.gttsize` counts MiB and
@@ -114,7 +117,8 @@ pub(crate) enum Command {
     /// window of that log is read, so its absence is reported as such rather
     /// than as "this machine has never failed".
     Diagnose {
-        /// Raw error text from the user; sharpens keyword scoring.
+        /// Raw error text from the user; sharpens keyword scoring. A few failure
+        /// modes show only in such text (a vLLM out-of-memory error, for one).
         ///
         /// A shell reads this text before `rocm` does, so quotes, `$(...)`
         /// and a leading `-` in a pasted error can be changed, run, or taken
@@ -236,8 +240,8 @@ pub(crate) enum Command {
         /// neither case against
         /// what other processes have left free. Applies to a GGUF outside the
         /// catalog (a curated model's memory minimum is fixed, and says so);
-        /// `rocm serve` has no context-size option yet, so this answers the
-        /// question without changing what serve does.
+        /// `rocm serve` has no context-size option, but on an integrated GPU
+        /// it sizes the window itself, which may differ from this.
         #[arg(
             long,
             value_name = "TOKENS",
@@ -1439,10 +1443,18 @@ mod tests {
         }
     }
 
-    /// `rocm diagnose --model` tells the user that `rocm serve` takes no context
-    /// size, KV cache type or GPU layer count and passes none to the engine
+    /// `rocm diagnose --model` tells the user that `rocm serve` has no
+    /// context-size, KV cache type or GPU layer count option
     /// (`SERVE_OPTIONS_NOTE` and `SERVE_CONTEXT_NOTE` in `gguf_fit.rs`). This
     /// fails when `rocm serve` gains one of them, so the notes are updated with it.
+    ///
+    /// It can only see the option. Parsing an argv says nothing about what
+    /// `rocm serve` hands the engine, which is how the notes came to claim it
+    /// passed no context size at all long after the Lemonade route began
+    /// computing one for an integrated GPU. That half is guarded where the
+    /// window is computed, by
+    /// `the_serve_notes_do_not_deny_the_window_this_module_passes` in
+    /// `engines/lemonade/src/context_size.rs`.
     #[test]
     fn serve_takes_no_estimate_options_yet() {
         let serve = |extra: &[&str]| {
