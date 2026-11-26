@@ -1670,7 +1670,11 @@ Each row is read from its own file's header: the weights are a file's size less
 That costs one request per quantization, so the read is bounded twice — the
 12 smallest quantizations at most, and the same two-minute budget for the
 whole repository. Anything past either is listed as **not estimated**, with the
-reason, and never guessed; naming that quantization on its own sizes it. The
+reason, and never guessed; naming that quantization on its own reads and sizes
+it. A row can also be *read* and still not sizeable — one shard of a split
+model carries the metadata and not the weights — and that row says so
+separately, because naming it alone gives the same answer rather than a size.
+The
 header line counts only the quantizations this host's memory produced a verdict
 for, so it never reports as "does not fit" a file that was never read, or one
 whose layout the estimate declines to judge — each of those says so on its own

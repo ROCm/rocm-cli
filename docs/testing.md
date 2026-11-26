@@ -6897,10 +6897,13 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   label read off the file name (and a family name starting with `Q` not
   mistaken for one), a repository whose only GGUFs are projectors, a listing
   that could not be read, a host that none of the quantizations fits, and the
-  guard that leaves every reference naming one file alone. [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs)
+  guard that leaves every reference naming one file alone.
+- [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs):
   runs `rocm diagnose --model owner/repo:QUANT` against such a server with every
   Hugging Face token variable set, and checks that the listing, `HEAD` and
-  range requests carry no `Authorization` or `Cookie` header.
+  range requests carry no `Authorization` or `Cookie` header. It belongs to the
+  hub reads rather than to `gguf_repo_fit.rs`, whose own tests are the list
+  above.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
   host-memory states (dedicated, none, unknown, an APU's measured shared pool,
   an APU whose pool could not be read), what is attached to a

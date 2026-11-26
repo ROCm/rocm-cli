@@ -305,8 +305,15 @@ pub fn repository_fit(
                     QuantFitOutcome::Estimated(Box::new(estimate))
                 }
                 // A header with no size cannot be sized: the weights are the
-                // file's size less its header. The probe only produces this
-                // pairing if a `HEAD` answered without a length.
+                // file's size less its header.
+                //
+                // Not reachable through `probe_quantizations` today:
+                // `read_one_header` returns `Ok((header, size))`, so a `Read`
+                // outcome always arrives with a length. Kept rather than made
+                // `unreachable!()` because the pairing is representable in the
+                // types a caller may build -- the e2e hub fixtures construct
+                // `QuantProbe` directly -- and a panic in a sizing path is a
+                // worse answer than a row saying the length was not reported.
                 (QuantProbeOutcome::Read(_), None) => QuantFitOutcome::NotEstimated {
                     reason: NotEstimatedReason::HeaderUnreadable,
                     detail: "the hub did not report how large this file is, so its weights \
@@ -1060,6 +1067,39 @@ mod tests {
             plan.summary
                 .contains("Q6_K is the largest of those read that fits"),
             "{}",
+            plan.summary
+        );
+
+        // The other way a row can carry no size: read, and unsizeable. A shard
+        // was looked at, so "of those read" is not about the reading -- it is
+        // about the sizing, which is what `len() > estimated()` asks. Covered
+        // here beside a fitting row, because the two apart never exercise a
+        // plan that has both a maximum to name and a row it cannot rank.
+        let mut quants = three();
+        quants.push(read_shard("m-Q8_0-00001-of-00003.gguf", 9 << 30));
+        let with_shard = repository_fit(
+            "o/r",
+            RepositoryProbe {
+                quants,
+                projectors: 0,
+            },
+            &request(),
+            &host(24.0),
+        );
+        assert_eq!(
+            (with_shard.read(), with_shard.estimated()),
+            (4, 3),
+            "premise: the shard has to be read and unsized: {with_shard:?}"
+        );
+        let mut readiness = not_curated("o/r");
+        apply_repository_fit(&mut readiness, with_shard);
+        let plan = readiness.fix.as_ref().expect("a plan");
+        assert_eq!(plan.verify, "rocm diagnose --model o/r:Q6_K", "{plan:?}");
+        assert!(
+            plan.summary
+                .contains("Q6_K is the largest of those read that fits"),
+            "a shard is a row with no size, so the maximum is still only over \
+             what was sized: {}",
             plan.summary
         );
     }
