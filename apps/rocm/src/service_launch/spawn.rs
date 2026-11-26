@@ -644,9 +644,10 @@ fn launch_managed_engine_child_locked(
     };
     let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
     // Hand the child the *path* to the endpoint key file (stored for a public bind
-    // or a `--require-api-key` launch) via the environment. A path — not the secret value — is what the detached-spawn
-    // primitives accept as an env override, and it keeps the key off both the argv
-    // and the environment block. `serve()` wrote the file before spawning.
+    // or a `--require-api-key` launch) via the environment. A path — not the
+    // secret value — is what the detached-spawn primitives accept as an env
+    // override, and it keeps the key off both the argv and the environment block.
+    // `serve()` wrote the file before spawning.
     // Validity, not mere existence: the engine adapters resolve the key with
     // `endpoint_api_key_from_file` and enforce nothing when it yields `None`, so
     // an empty or malformed key file would otherwise satisfy the guard below and

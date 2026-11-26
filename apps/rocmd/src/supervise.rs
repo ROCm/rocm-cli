@@ -4595,6 +4595,11 @@ mod tests {
     /// restart re-execs the test binary, which rejects the `supervise`
     /// arguments and exits at once, so the restart itself still reports
     /// failure — after writing the supervisor identity this test reads.
+    ///
+    /// The record is on a public host with no key file, which the keyless-respawn
+    /// guard refuses, but this test does not exercise that guard: it runs in
+    /// `supervise_service_on` (`refuse_keyless_respawn`), inside the supervisor
+    /// the restart spawns, and that process here is the test binary exiting at once.
     #[cfg(target_os = "linux")]
     #[test]
     fn restart_on_a_custom_host_skips_the_loopback_lease() -> Result<()> {
