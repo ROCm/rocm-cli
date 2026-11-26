@@ -160,23 +160,23 @@ pub(super) fn stat_device(path: &str, user_name: &str, user_groups: &[String]) -
     if !device.exists {
         return device;
     }
-    let (rc, out, _) = run("stat", &["-c", "%A|%U|%G", &host.to_string_lossy()], SHORT);
-    if rc == 0 {
-        let fields: Vec<&str> = out.trim().split('|').collect();
-        if fields.len() == 3 {
-            device.mode = fields[0].to_owned();
-            device.owner_user = fields[1].to_owned();
-            device.owner_group = fields[2].to_owned();
-            let (can_read, can_write) = mode_access(
-                &device.mode,
-                &device.owner_user,
-                &device.owner_group,
-                user_name,
-                user_groups,
-            );
-            device.user_can_read = can_read;
-            device.user_can_write = can_write;
-        }
+    let format = crate::fix::DEVICE_STAT_FORMAT;
+    let (rc, out, _) = run("stat", &["-c", format, &host.to_string_lossy()], SHORT);
+    if rc == 0
+        && let Some((mode, owner_user, owner_group)) = crate::fix::parse_device_stat(&out)
+    {
+        device.mode = mode;
+        device.owner_user = owner_user;
+        device.owner_group = owner_group;
+        let (can_read, can_write) = mode_access(
+            &device.mode,
+            &device.owner_user,
+            &device.owner_group,
+            user_name,
+            user_groups,
+        );
+        device.user_can_read = can_read;
+        device.user_can_write = can_write;
     }
     device
 }
@@ -216,6 +216,16 @@ pub(super) fn probe_user(e: &mut Examination) {
     }
     e.in_render_group = Some(e.user_groups.iter().any(|g| g == "render"));
     e.in_video_group = Some(e.user_groups.iter().any(|g| g == "video"));
+}
+
+/// Record which of the groups the render-group fix can name the host's group
+/// database resolves ([`Examination::groups_on_host`]). Run after
+/// [`probe_devices`], whose `/dev/kfd` owner is one of the groups asked about.
+pub(super) fn probe_device_groups(e: &mut Examination) {
+    let owner = e.kfd.as_ref().map_or("", |kfd| kfd.owner_group.as_str());
+    let (rc, out, _) = run("getent", &crate::fix::getent_args(owner), SHORT);
+    e.groups_on_host =
+        crate::fix::getent_answered(rc).then(|| crate::fix::parse_getent_group(&out));
 }
 
 pub(super) fn probe_secure_boot(e: &mut Examination) {

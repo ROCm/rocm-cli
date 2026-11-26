@@ -2662,14 +2662,18 @@ them by hand on a release build.
 
 Linux, a helper that never finishes. Stand a hanging `sudo` in for the real
 one, on a `PATH` that holds nothing else (so the run is not as root and changes
-no group):
+no group). The fix reads the owner of `/dev/kfd` and the host's groups before it
+runs anything, so `stat` and `getent` stand-ins answer `render`, and `render`
+and `video`:
 
 ```bash
 ROCM=$(command -v rocm)
 FAKE=$(mktemp -d)
 printf '#!/bin/sh\nexec /bin/sleep 600\n' > "$FAKE/sudo"
 printf '#!/bin/sh\nexit 1\n' > "$FAKE/usermod"
-chmod +x "$FAKE/sudo" "$FAKE/usermod"
+printf '#!/bin/sh\necho "crw-rw----|root|render"\n' > "$FAKE/stat"
+printf '#!/bin/sh\necho render:x:110:\necho video:x:44:\n' > "$FAKE/getent"
+chmod +x "$FAKE/sudo" "$FAKE/usermod" "$FAKE/stat" "$FAKE/getent"
 PATH="$FAKE" "$ROCM" fix fix-4-render-group --yes; echo "exit $?"
 ```
 
@@ -2681,6 +2685,22 @@ Expected result:
 - The exit code is 4. Nothing says `NOT changed`, and there is no
   `Added <user> to render,video.` line.
 - `pgrep -f 'sleep 600'` finds nothing afterwards.
+
+Linux, no group to name. Make `stat` answer `UNKNOWN` (a group with no name)
+and take `render` out of the `getent` stand-in, then preview the fix:
+
+```bash
+printf '#!/bin/sh\necho "crw-rw----|root|UNKNOWN"\n' > "$FAKE/stat"
+printf '#!/bin/sh\necho video:x:44:\nexit 2\n' > "$FAKE/getent"
+PATH="$FAKE" "$ROCM" fix fix-4-render-group --dry-run; echo "exit $?"
+```
+
+Expected result: there is no `Will run:` line, stderr says ``No group to add
+<user> to: /dev/kfd is owned by 'UNKNOWN', which is not a group name, and the
+host has no 'render' group. Nothing was changed.``, and the exit code is 3.
+With the `getent` stand-in removed, stderr instead says ``Could not read the
+current group database: getent could not be started: it was not found; nothing
+was changed.`` and the exit code is 4.
 
 Windows, a read that fails. In a PowerShell window, empty `PATH` for that window
 only and start `rocm.exe` by its full path:
@@ -2939,7 +2959,7 @@ gone, and `real-cache/keep` is still there.
 
 Needs a machine whose only AMD GPU is integrated — a Strix Halo, Strix Point,
 Phoenix or Rembrandt part. Nothing in CI has one, and the e2e scenarios
-(`diagnose-92` to `diagnose-94`) plant a simulated one, so this is the only
+(`diagnose-94` to `diagnose-96`) plant a simulated one, so this is the only
 check of `fix-24-apu-unified-memory` against real firmware and a real driver.
 
 First, read what the machine has:

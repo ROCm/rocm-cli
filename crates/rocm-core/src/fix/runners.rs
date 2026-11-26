@@ -11,12 +11,19 @@
 //! the catalog in `fix/catalog.rs` names the entry point of each recipe's
 //! runner and the running OS decides which variant runs.
 
-use super::catalog::{IGPU_DGPU_ID, PATH_ID, RENDER_GROUP_ID, UNSET_OVERRIDE_ID};
+use super::catalog::{
+    IGPU_DGPU_ID, IGPU_PIN_LINUX, IGPU_PIN_WINDOWS, IGPU_QUERY_LINUX, IGPU_QUERY_WINDOWS, PATH_ID,
+    RENDER_GROUP_ID, UNSET_OVERRIDE_ID, path_export_line, with_device_index,
+};
 use super::consent::{
-    CheckIn, DRY_RUN_NOTICE, QUERY_TIMEOUT, RUN_TIMEOUT, Step, confirm, fail, read_failure,
-    run_step,
+    CheckIn, DRY_RUN_NOTICE, QUERY_TIMEOUT, RUN_TIMEOUT, Step, StepFailure, confirm, fail,
+    read_failure, run_step,
 };
 use super::options::{FixOptions, exit};
+use super::render_group::{
+    DEVICE_STAT_FORMAT, PlanReader, getent_answered, getent_args, no_target_reason,
+    parse_device_stat, parse_getent_group, render_group_targets, usermod_args,
+};
 use crate::command_capture::{CommandCapture, CommandOutcome};
 use crate::probe_exec::{run, which};
 use crate::quoting::ps_single_quote_escape;
@@ -70,7 +77,7 @@ fn append_line(path: &Path, header: &str, line: &str) -> std::io::Result<()> {
 // Runners (one per auto-applicable fix)
 // ---------------------------------------------------------------------------
 
-/// fix-4: add the current user to the render group (and 'video' for safety).
+/// fix-4: add the current user to the groups [`render_group_targets`] names.
 pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -88,10 +95,15 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
         fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
         return exit::NOT_APPLICABLE;
     }
+    let kfd = crate::host_path("/dev/kfd");
+    let kfd = kfd.exists().then(|| kfd.to_string_lossy().into_owned());
     render_group_with(
         opts,
-        &user,
-        root,
+        RenderGroupHost {
+            user: &user,
+            root,
+            kfd: kfd.as_deref(),
+        },
         run_step,
         |prompt| confirm(prompt, opts.yes),
         &mut std::io::stdout(),
@@ -99,27 +111,93 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
     )
 }
 
-/// Does the plan/consent/run work for [`run_render_group`] once the user and
-/// the privilege route are known, with the command runner, the consent prompt
-/// and the stdout and stderr sinks injected so every way `usermod` can end, and
-/// every line the runner prints itself, is testable on any host. Two things
-/// still reach the real streams: a child's own output, which `Step::run`
-/// relays, and what `confirm` (which production passes in as `consent`)
-/// writes, its refusal line included.
+/// Who [`render_group_with`] adds to the groups, and how: the user, whether
+/// the process is root (so `usermod` runs without `sudo`), and the `/dev/kfd`
+/// node as the host stores it (`None` when there is none).
+struct RenderGroupHost<'a> {
+    user: &'a str,
+    root: bool,
+    kfd: Option<&'a str>,
+}
+
+/// The groups fix-4 adds the user to, read from the host through `run`: the
+/// group that owns `kfd` (the node as the host stores it, `None` when there is
+/// none) and which groups the host's group database names. The same two facts
+/// `rocm diagnose` reads from its examination, handed to the same
+/// [`render_group_targets`].
+///
+/// A `stat` that fails reads as no owning group, as it does in the
+/// examination. A `getent` that does not answer stops the fix: every group the
+/// fix names has to be one the host has, and that is what it would not know.
+fn read_render_group_targets(
+    kfd: Option<&str>,
+    run: &mut impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+) -> Result<(String, Vec<String>), StepFailure> {
+    let owner = kfd
+        .map(|path| run("stat", &["-c", DEVICE_STAT_FORMAT, path], QUERY_TIMEOUT))
+        .filter(|capture| capture.outcome == CommandOutcome::Exited(0))
+        .and_then(|capture| parse_device_stat(&capture.stdout))
+        .map(|(_, _, group)| group)
+        .unwrap_or_default();
+    let capture = run("getent", &getent_args(&owner), QUERY_TIMEOUT);
+    match capture.outcome {
+        CommandOutcome::Exited(code) if getent_answered(code) => {
+            let known = parse_getent_group(&capture.stdout);
+            let targets = render_group_targets(&owner, |group| known.iter().any(|g| g == group));
+            Ok((owner, targets))
+        }
+        // "the current ...", as every read failure of a runner starts, which
+        // is the prefix the rocm-doctor skill reads it by.
+        outcome => Err(read_failure(
+            "the current group database",
+            "getent",
+            outcome,
+            QUERY_TIMEOUT,
+        )),
+    }
+}
+
+/// Does the read/plan/consent/run work for [`run_render_group`] once the user,
+/// the privilege route and the `/dev/kfd` path are known (`host`), with the command
+/// runner, the consent prompt and the stdout and stderr sinks injected so every
+/// way the reads and `usermod` can end, and every line the runner prints
+/// itself, is testable on any host. Two things still reach the real streams: a
+/// child's own output, which `Step::run` relays, and what `confirm` (which
+/// production passes in as `consent`) writes, its refusal line included.
+///
+/// The reads run under `--dry-run` too, so the `Will run:` line it previews is
+/// the one a real run would run. With no group to name it changes nothing and
+/// says why.
 ///
 /// A `usermod` stopped by the timeout is reported as such, not as an exit
 /// code: the executor stops only `sudo`, so `usermod` may still finish, and
 /// the line says how to find out (`id -nG`) and what to re-run.
 fn render_group_with(
     opts: &FixOptions,
-    user: &str,
-    root: bool,
+    host: RenderGroupHost<'_>,
     mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
     consent: impl FnOnce(&str) -> bool,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> i32 {
-    let usermod_args = ["-a", "-G", "render,video", user];
+    let RenderGroupHost { user, root, kfd } = host;
+    let (owner, targets) = match read_render_group_targets(kfd, &mut run) {
+        Ok(read) => read,
+        Err(failure) => {
+            let _ = writeln!(err, "{}", failure.line);
+            return failure.code;
+        }
+    };
+    if targets.is_empty() {
+        let _ = writeln!(
+            err,
+            "No group to add {user} to: {}. Nothing was changed.",
+            no_target_reason(&owner, PlanReader::Live)
+        );
+        return exit::NOT_APPLICABLE;
+    }
+    let groups = targets.join(",");
+    let usermod_args = usermod_args(&groups, user);
     let (program, label, args): (&str, &str, Vec<&str>) = if root {
         ("usermod", "usermod", usermod_args.to_vec())
     } else {
@@ -134,7 +212,7 @@ fn render_group_with(
         let _ = writeln!(out, "{DRY_RUN_NOTICE}");
         return exit::OK;
     }
-    if !consent("Add user to render,video groups?") {
+    if !consent(&format!("Add user to {groups}?")) {
         return exit::DECLINED;
     }
     let check = format!("id -nG {user}");
@@ -152,10 +230,11 @@ fn render_group_with(
     if let Err(code) = step.run(&mut run, err) {
         return code;
     }
-    let _ = writeln!(out, "Added {user} to render,video.");
+    let _ = writeln!(out, "Added {user} to {groups}.");
     let _ = writeln!(
         out,
-        "IMPORTANT: log out and back in (or reboot) for the membership to take effect in new shells and services. `newgrp render` patches the current shell only."
+        "IMPORTANT: log out and back in (or reboot) for the membership to take effect in new shells and services. `newgrp {}` patches the current shell only.",
+        targets[0]
     );
     exit::OK
 }
@@ -471,7 +550,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
         fail!("Could not determine your home directory.");
         return exit::NOT_APPLICABLE;
     };
-    let export_line = format!("export PATH=\"{bin_dir}:$PATH\"");
+    let export_line = path_export_line(bin_dir);
     if let Ok(existing) = std::fs::read_to_string(&rc_file)
         && existing
             .lines()
@@ -650,7 +729,7 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         // Print-only path: without an index the fix only prints the query that
         // helps the user identify N, so it succeeds like any other preview.
         println!(
-            "Run `rocminfo | grep -E 'Agent |Marketing|gfx'` and identify the row of your DISCRETE GPU (the iGPU is typically Agent 1). Then re-run with --device-index N."
+            "Run `{IGPU_QUERY_LINUX}` and identify the row of your DISCRETE GPU (the iGPU is typically Agent 1). Then re-run with --device-index N."
         );
         return exit::OK;
     };
@@ -679,7 +758,7 @@ fn pin_device_in_rc_file(
     opts: &FixOptions,
     consent: impl FnOnce() -> bool,
 ) -> i32 {
-    let export_line = format!("export HIP_VISIBLE_DEVICES={idx}");
+    let export_line = with_device_index(IGPU_PIN_LINUX, idx);
     if let Ok(existing) = std::fs::read_to_string(rc_file)
         && existing.contains("HIP_VISIBLE_DEVICES=")
     {
@@ -718,9 +797,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         // Print-only path: without an index the fix only prints the query that
         // helps the user identify N, so it succeeds like any other preview.
         println!("Run the following to identify the discrete GPU's index:");
-        println!(
-            "  & \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name|gcnArchName\""
-        );
+        println!("  {IGPU_QUERY_WINDOWS}");
         println!(
             "Then re-run with --device-index N (the iGPU is typically device# 0; the dGPU is usually device# 1)."
         );
@@ -768,7 +845,7 @@ fn hip_visible_devices_windows(
         out,
         "Plan: persist HIP_VISIBLE_DEVICES in the User env scope:"
     );
-    let _ = writeln!(out, "  setx HIP_VISIBLE_DEVICES {idx}");
+    let _ = writeln!(out, "  {}", with_device_index(IGPU_PIN_WINDOWS, idx));
     if opts.dry_run {
         let _ = writeln!(out, "{DRY_RUN_NOTICE}");
         return exit::OK;
@@ -1249,14 +1326,66 @@ mod tests {
 
     const SUDO_USERMOD: [&str; 6] = ["sudo", "usermod", "-a", "-G", "render,video", "alice"];
 
+    /// Where the render-group tests say `/dev/kfd` is.
+    const KFD: Option<&str> = Some("/dev/kfd");
+
+    /// A runner that answers fix-4's two reads and hands every other command to
+    /// `inner`: `stat` with a node owned by `owner`, and `getent` with the
+    /// groups it was asked about that are in `existing`, exiting `2` as
+    /// `getent` does when one of them is not.
+    fn group_db<'a>(
+        owner: &'a str,
+        existing: &'a [&'a str],
+        mut inner: impl FnMut(&str, &[&str], Duration) -> CommandCapture + 'a,
+    ) -> impl FnMut(&str, &[&str], Duration) -> CommandCapture + 'a {
+        move |program, args, timeout| {
+            let answer = |code: i32, stdout: String| {
+                CommandCapture::from_run(
+                    std::iter::once(program)
+                        .chain(args.iter().copied())
+                        .map(str::to_owned)
+                        .collect(),
+                    exited(code),
+                    None,
+                    stdout.into_bytes(),
+                    Vec::new(),
+                    None,
+                )
+            };
+            match program {
+                "stat" => answer(0, format!("crw-rw----|root|{owner}\n")),
+                "getent" => {
+                    let asked = &args[1..];
+                    let found: Vec<&&str> = asked.iter().filter(|g| existing.contains(g)).collect();
+                    let code = if found.len() == asked.len() { 0 } else { 2 };
+                    answer(
+                        code,
+                        found
+                            .iter()
+                            .map(|g| format!("{g}:x:100:"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                }
+                _ => inner(program, args, timeout),
+            }
+        }
+    }
+
+    /// fix-4 run approved against a host whose `/dev/kfd` is owned by `render`
+    /// and which has `render` and `video`, with `usermod` ending in `write`.
     fn render_group(write: CommandOutcome) -> (i32, Vec<Vec<String>>, Duration, String) {
         let host = FakeHost::new(unset(), write);
         let mut err = Vec::new();
+        let run = group_db("render", &["render", "video"], host.runner());
         let code = render_group_with(
             &approved(),
-            "alice",
-            false,
-            host.runner(),
+            RenderGroupHost {
+                user: "alice",
+                root: false,
+                kfd: KFD,
+            },
+            run,
             |_| true,
             &mut Vec::new(),
             &mut err,
@@ -1279,11 +1408,15 @@ mod tests {
     #[test]
     fn render_group_as_root_runs_usermod_directly() {
         let host = FakeHost::new(unset(), exited(0));
+        let run = group_db("render", &["render", "video"], host.runner());
         let code = render_group_with(
             &approved(),
-            "alice",
-            true,
-            host.runner(),
+            RenderGroupHost {
+                user: "alice",
+                root: true,
+                kfd: KFD,
+            },
+            run,
             |_| true,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -1337,17 +1470,261 @@ mod tests {
             dry_run: true,
             ..approved()
         };
+        let mut out = Vec::new();
+        let run = group_db("render", &["render", "video"], host.runner());
         let code = render_group_with(
             &opts,
-            "alice",
-            false,
-            host.runner(),
+            RenderGroupHost {
+                user: "alice",
+                root: false,
+                kfd: KFD,
+            },
+            run,
             |_| panic!("a dry run asks for no consent"),
-            &mut Vec::new(),
+            &mut out,
             &mut Vec::new(),
         );
         assert_eq!(code, exit::OK);
         assert!(host.calls().is_empty());
+        assert_eq!(
+            text(&out),
+            format!("Will run: {}\n{DRY_RUN_NOTICE}\n", SUDO_USERMOD.join(" "))
+        );
+    }
+
+    /// The group database is what makes every group the fix names one the
+    /// host has. A `getent` that does not answer stops the fix before it plans
+    /// anything and says nothing was changed.
+    #[test]
+    fn render_group_stops_when_the_group_database_cannot_be_read() {
+        for outcome in [
+            CommandOutcome::NotFound,
+            exited(1),
+            CommandOutcome::TimedOut,
+        ] {
+            let host = FakeHost::new(unset(), exited(0));
+            let mut answered = group_db("render", &["render", "video"], host.runner());
+            let run = |program: &str, args: &[&str], timeout: Duration| {
+                if program == "getent" {
+                    CommandCapture::from_run(
+                        Vec::new(),
+                        outcome,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                } else {
+                    answered(program, args, timeout)
+                }
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = render_group_with(
+                &approved(),
+                RenderGroupHost {
+                    user: "alice",
+                    root: false,
+                    kfd: KFD,
+                },
+                run,
+                |_| panic!("no consent is asked for here"),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, exit::FAILED, "{outcome:?}");
+            assert!(host.calls().is_empty(), "{outcome:?}: nothing may run");
+            assert_eq!(
+                text(&out),
+                "",
+                "{outcome:?}: no plan from an unread database"
+            );
+            let err = text(&err);
+            assert!(
+                err.starts_with("Could not read the current group database: getent ")
+                    && err.ends_with("; nothing was changed.\n"),
+                "{outcome:?}: {err}"
+            );
+        }
+    }
+
+    /// No group can be named: `/dev/kfd`'s group has no name and the host has
+    /// no `render`. The fix runs nothing, says why on stderr, and exits 3
+    /// (not applicable here), under `--dry-run` as well.
+    #[test]
+    fn render_group_with_no_group_to_name_changes_nothing_and_says_why() {
+        for dry_run in [false, true] {
+            let host = FakeHost::new(unset(), exited(0));
+            let opts = FixOptions {
+                dry_run,
+                ..approved()
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let run = group_db("UNKNOWN", &["video"], host.runner());
+            let code = render_group_with(
+                &opts,
+                RenderGroupHost {
+                    user: "alice",
+                    root: false,
+                    kfd: KFD,
+                },
+                run,
+                |_| panic!("no consent is asked for here"),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, exit::NOT_APPLICABLE);
+            assert!(host.calls().is_empty(), "nothing may run");
+            assert_eq!(text(&out), "", "no `Will run:` line without a group");
+            assert_eq!(
+                text(&err),
+                "No group to add alice to: /dev/kfd is owned by 'UNKNOWN', which is not a group \
+                 name, and the host has no 'render' group. Nothing was changed.\n"
+            );
+        }
+    }
+
+    /// With no `/dev/kfd` (or a `stat` that fails) there is no owning group to
+    /// read, and the live run says that in its own words, not the
+    /// examination's, then changes nothing: exit 3, no `usermod`, no consent.
+    #[test]
+    fn render_group_with_no_owning_group_says_so_in_live_wording() {
+        let ran = std::cell::RefCell::new(Vec::new());
+        let stat_fails = |program: &str, _: &[&str], _: Duration| {
+            ran.borrow_mut().push(program.to_owned());
+            // `stat` fails; `getent` answers that no group asked about exists.
+            let code = if program == "stat" { 1 } else { 2 };
+            CommandCapture::from_run(
+                vec![program.to_owned()],
+                exited(code),
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+        };
+        for kfd in [KFD, None] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = render_group_with(
+                &approved(),
+                RenderGroupHost {
+                    user: "alice",
+                    root: false,
+                    kfd,
+                },
+                stat_fails,
+                |_| panic!("no consent is asked for here"),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, exit::NOT_APPLICABLE);
+            assert!(
+                !ran.borrow().iter().any(|p| p == "usermod" || p == "sudo"),
+                "nothing may be changed: {:?}",
+                ran.borrow()
+            );
+            assert_eq!(text(&out), "", "no `Will run:` line without a group");
+            assert_eq!(
+                text(&err),
+                "No group to add alice to: no owning group of /dev/kfd could be read (the node is missing or `stat` failed on it), and the host has no 'render' group. Nothing was changed.\n"
+            );
+        }
+    }
+
+    /// The `usermod` line `rocm diagnose` prints for fix-4 is the command
+    /// `rocm fix fix-4-render-group` runs, for every owner of `/dev/kfd` and
+    /// every set of groups the host has. The diagnosis reads both facts from
+    /// its examination and the fix reads them live (stand-ins here), and both
+    /// hand them to one resolver; the groups are also listed per row, so a
+    /// resolver that went wrong on both sides at once still fails.
+    #[test]
+    fn the_render_group_plan_diagnose_prints_is_the_one_fix_runs() {
+        use crate::examine::{Device, Examination};
+        // (owner of /dev/kfd, None when there is no node; the groups the host
+        // has; the groups both must name, empty for none)
+        let rows: &[(Option<&str>, &[&str], &[&str])] = &[
+            (Some("render"), &["render", "video"], &["render", "video"]),
+            (Some("video"), &["render", "video"], &["video"]),
+            (Some("video"), &["video"], &["video"]),
+            (Some("UNKNOWN"), &["render", "video"], &["render", "video"]),
+            (Some("unknown"), &["render"], &["render"]),
+            (Some(""), &["render", "video"], &["render", "video"]),
+            (None, &["render", "video"], &["render", "video"]),
+            (
+                Some("110"),
+                &["render", "video", "110"],
+                &["render", "video"],
+            ),
+            (Some("kfd"), &["kfd", "render", "video"], &["kfd", "video"]),
+            (Some("gone"), &["render", "video"], &["render", "video"]),
+            (Some("gone"), &["video"], &[]),
+            (Some("UNKNOWN"), &["video"], &[]),
+        ];
+        for &(owner, existing, want) in rows {
+            let e = Examination {
+                os_family: "linux".to_owned(),
+                in_render_group: Some(false),
+                kfd: owner.map(|owner| Device {
+                    path: "/dev/kfd".to_owned(),
+                    exists: true,
+                    mode: "crw-rw----".to_owned(),
+                    owner_group: owner.to_owned(),
+                    user_can_write: Some(false),
+                    ..Device::default()
+                }),
+                groups_on_host: Some(existing.iter().map(|g| (*g).to_owned()).collect()),
+                ..Examination::default()
+            };
+            let report = crate::diagnose::diagnose(&e, "");
+            let fix = report
+                .matched
+                .iter()
+                .find(|d| d.id == RENDER_GROUP_ID)
+                .and_then(|d| d.fix.as_ref())
+                .unwrap_or_else(|| panic!("{owner:?} {existing:?}: fix-4 is diagnosed"));
+            let printed: Vec<&String> = fix
+                .commands
+                .iter()
+                .filter(|c| !c.starts_with('#'))
+                .collect();
+
+            let host = FakeHost::new(unset(), exited(0));
+            let opts = FixOptions {
+                dry_run: true,
+                ..approved()
+            };
+            let mut out = Vec::new();
+            let run = group_db(owner.unwrap_or(""), existing, host.runner());
+            let kfd = owner.map(|_| "/dev/kfd");
+            let code = render_group_with(
+                &opts,
+                RenderGroupHost {
+                    user: "alice",
+                    root: false,
+                    kfd,
+                },
+                run,
+                |_| panic!("no consent is asked for here"),
+                &mut out,
+                &mut Vec::new(),
+            );
+            let out = text(&out);
+            let will_run = out.lines().find_map(|l| l.strip_prefix("Will run: "));
+
+            if want.is_empty() {
+                assert!(printed.is_empty(), "{owner:?} {existing:?}: {printed:?}");
+                assert_eq!(code, exit::NOT_APPLICABLE, "{owner:?} {existing:?}");
+                assert_eq!(will_run, None, "{owner:?} {existing:?}");
+                continue;
+            }
+            let line = format!("sudo usermod -a -G {} \"$USER\"", want.join(","));
+            assert_eq!(printed, [&line], "{owner:?} {existing:?}: the diagnosis");
+            assert_eq!(code, exit::OK, "{owner:?} {existing:?}");
+            assert_eq!(
+                will_run,
+                Some(line.replace("\"$USER\"", "alice").as_str()),
+                "{owner:?} {existing:?}: the fix"
+            );
+        }
     }
 
     /// The eval replay of fix-4 (`fix_preview_text`) is what the command prints with
@@ -1374,11 +1751,15 @@ mod tests {
             dry_run: true,
             ..FixOptions::default()
         };
+        let run = group_db("render", &["render", "video"], host.runner());
         let code = render_group_with(
             &opts,
-            "alice",
-            false,
-            host.runner(),
+            RenderGroupHost {
+                user: "alice",
+                root: false,
+                kfd: KFD,
+            },
+            run,
             |_| panic!("a dry run asks for no consent"),
             &mut out,
             &mut Vec::new(),
@@ -1395,11 +1776,15 @@ mod tests {
         // and nothing run.
         let host = FakeHost::new(unset(), exited(0));
         let mut out = Vec::new();
+        let run = group_db("render", &["render", "video"], host.runner());
         let code = render_group_with(
             &FixOptions::default(),
-            "alice",
-            false,
-            host.runner(),
+            RenderGroupHost {
+                user: "alice",
+                root: false,
+                kfd: KFD,
+            },
+            run,
             |_| false,
             &mut out,
             &mut Vec::new(),

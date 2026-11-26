@@ -308,6 +308,17 @@ mod tests {
         assert_eq!(parsed.distro_id_like, "");
     }
 
+    /// An examination from a CLI that predates `groups_on_host` reads as "not
+    /// known", which `rocm diagnose` answers with no `usermod` line rather than
+    /// a guessed group.
+    #[test]
+    fn a_remote_on_an_older_cli_without_groups_on_host_still_parses() {
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().remove("groups_on_host");
+        let parsed = parse_examination(&value.to_string()).expect("older remote must parse");
+        assert_eq!(parsed.groups_on_host, None);
+    }
+
     #[test]
     fn a_remote_on_another_version_says_so_instead_of_failing_obscurely() {
         let error = parse_examination(r#"{"unexpected": true}"#)

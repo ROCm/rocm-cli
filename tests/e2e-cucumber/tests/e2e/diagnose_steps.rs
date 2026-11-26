@@ -777,6 +777,20 @@ pub(crate) fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
         rocm_core::fake_executable::write_fake_executable(&script, body)
             .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
     }
+    // The fix reads which groups to add before it runs anything: the group
+    // that owns `/dev/kfd` (`stat`) and which groups the host has (`getent`).
+    // On this PATH the answers are `render`, and both `render` and `video`, on
+    // every runner, GPU or not, so the command asked for is `render,video`.
+    for (name, body) in [
+        ("stat", "#!/bin/sh\necho 'crw-rw----|root|render'\n"),
+        (
+            "getent",
+            "#!/bin/sh\necho 'render:x:110:'\necho 'video:x:44:'\n",
+        ),
+    ] {
+        rocm_core::fake_executable::write_fake_executable(&bin_dir.join(name), body)
+            .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
+    }
     // Restricting `$PATH` to only the fakes above also makes the recipe's
     // root-detection deterministic: it shells out to `id -u`, which is not on
     // this PATH, so the spawn itself fails and reads as "not root" regardless of
@@ -4084,6 +4098,199 @@ async fn assert_advised_driver_command_exists(world: &mut E2eWorld) {
     }
 }
 
+// ── The render-group cause on a simulated device ───────────────────
+
+/// The groups the simulated host's group database has.
+const SIMULATED_HOST_GROUPS: &[&str] = &["render", "video"];
+
+/// Plants a `/dev/kfd` under the scenario's host root, and stand-ins ahead of
+/// the real tools on `PATH`: `stat` answers every node with `mode` and the
+/// group `owner`; `id` puts [`RENDER_GROUP_USER`] in the `users` group only and
+/// says it is not root; `getent group` knows [`SIMULATED_HOST_GROUPS`] and
+/// exits 2 for any other group, as `getent` does; `sudo` and `usermod` record
+/// their arguments in [`render_group_helper_log`] and fail, so nothing could
+/// change even if a step ran one.
+fn plant_simulated_kfd_host(world: &mut E2eWorld, mode: &str, owner: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create the planted /dev");
+    std::fs::write(host.join("dev/kfd"), b"").expect("failed to plant /dev/kfd");
+    let bin = root.join("kfd-host-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    let log = render_group_helper_log(world);
+    let log = log.to_str().expect("the scenario root is UTF-8");
+    assert!(
+        !log.contains('\''),
+        "the helper log path is single-quoted in the stand-in script: {log}"
+    );
+    let known = SIMULATED_HOST_GROUPS.join(" ");
+    let scripts = [
+        ("stat", format!("#!/bin/sh\necho '{mode}|root|{owner}'\n")),
+        (
+            "id",
+            "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; *) echo users ;; esac\n".to_owned(),
+        ),
+        (
+            "getent",
+            format!(
+                "#!/bin/sh\nshift\nrc=0\nfor g in \"$@\"; do\n  case ' {known} ' in\n    *\" $g \"*) echo \"$g:x:1000:\" ;;\n    *) rc=2 ;;\n  esac\ndone\nexit $rc\n"
+            ),
+        ),
+        (
+            "sudo",
+            format!("#!/bin/sh\necho \"sudo $*\" >> '{log}'\nexit 1\n"),
+        ),
+        (
+            "usermod",
+            format!("#!/bin/sh\necho \"usermod $*\" >> '{log}'\nexit 1\n"),
+        ),
+    ];
+    for (name, body) in scripts {
+        rocm_core::fake_executable::write_fake_executable(&bin.join(name), body)
+            .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+    world.command_env.push(("USER", RENDER_GROUP_USER.into()));
+    world
+        .command_env
+        .push(("LOGNAME", RENDER_GROUP_USER.into()));
+}
+
+#[given(
+    "a machine whose GPU compute device every user can read and write, with the user in no GPU group"
+)]
+async fn machine_with_a_writable_kfd(world: &mut E2eWorld) {
+    plant_simulated_kfd_host(world, "crw-rw-rw-", "render");
+}
+
+#[given("a machine whose GPU compute device belongs to the video group, which the user is not in")]
+async fn machine_with_a_video_owned_kfd(world: &mut E2eWorld) {
+    plant_simulated_kfd_host(world, "crw-rw----", "video");
+}
+
+#[when("the user asks the CLI to diagnose the machine, in machine-readable form")]
+async fn user_diagnoses_simulated_machine_json(world: &mut E2eWorld) {
+    // Each run consumes the scenario's environment, and both have to see the
+    // simulated machine: the inspection is what the Then step checks the
+    // premise against.
+    let env = world.command_env.clone();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--json", "--top", "20"]);
+    world.command_env = env;
+    let (examined, _, _) = crate::run_rocm_with_scenario_env(world, &["examine", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_outputs = Some(vec![examined]);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user compares the diagnosis with a preview of the fix it names")]
+async fn user_compares_diagnosis_with_fix_preview(world: &mut E2eWorld) {
+    // Each run consumes the scenario's environment; both are about the
+    // simulated machine.
+    let env = world.command_env.clone();
+    let (diagnosis, _, _) = crate::run_rocm_with_scenario_env(world, &["diagnose", "--top", "20"]);
+    world.command_env = env;
+    let (preview, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["fix", COMMAND_FAILURE_FIX_ID, "--dry-run"]);
+    world.cli_outputs = Some(vec![diagnosis, preview]);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("adding the user to a GPU group is not offered as a cause")]
+async fn assert_render_group_not_offered(world: &mut E2eWorld) {
+    // The premise, from the CLI's own inspection: the device is writable and
+    // the user is in no GPU group, which is the state that used to raise it.
+    let examined = world
+        .cli_outputs
+        .as_ref()
+        .and_then(|outputs| outputs.first())
+        .expect("no inspection output");
+    let examined: serde_json::Value = serde_json::from_str(examined)
+        .unwrap_or_else(|e| panic!("`rocm examine --json` is not JSON ({e}):\n{examined}"));
+    assert_eq!(
+        examined["kfd"]["user_can_write"],
+        serde_json::Value::Bool(true),
+        "the premise: the inspection must see the planted device as writable:\n{examined:#}"
+    );
+    assert_eq!(
+        examined["in_render_group"],
+        serde_json::Value::Bool(false),
+        "the premise: the user must be in no GPU group:\n{examined:#}"
+    );
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let report: serde_json::Value = serde_json::from_str(output)
+        .unwrap_or_else(|e| panic!("`rocm diagnose --json` is not JSON ({e}):\n{output}"));
+    let ids: Vec<&str> = report["matched"]
+        .as_array()
+        .expect("the report lists its matches")
+        .iter()
+        .filter_map(|d| d["id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&COMMAND_FAILURE_FIX_ID),
+        "a writable device was still diagnosed as a group-membership problem: {ids:?}"
+    );
+}
+
+#[then("both propose adding the user to the device's own group, once, in the same command")]
+async fn assert_diagnosis_and_fix_propose_the_same_groups(world: &mut E2eWorld) {
+    let [diagnosis, preview] = world
+        .cli_outputs
+        .as_deref()
+        .expect("no diagnosis and preview output")
+    else {
+        panic!("expected the diagnosis and the preview");
+    };
+    let block = cause_block(diagnosis, COMMAND_FAILURE_FIX_ID);
+    assert!(
+        !block.is_empty(),
+        "the render-group cause was not diagnosed on a device the user cannot open:\n{diagnosis}"
+    );
+    let proposed: Vec<&str> = block
+        .iter()
+        .filter_map(|line| line.trim_start().strip_prefix("$ "))
+        .filter(|line| line.contains("usermod"))
+        .collect();
+    let will_run: Vec<&str> = preview
+        .lines()
+        .filter_map(|line| line.strip_prefix("Will run: "))
+        .collect();
+    // The device's own group, named once: `video`, not `video,video`, and not
+    // the `render,video` the fix used to hard-code.
+    assert_eq!(
+        proposed,
+        ["sudo usermod -a -G video \"$USER\""],
+        "the diagnosis's command:\n{}",
+        block.join("\n")
+    );
+    assert_eq!(
+        will_run,
+        [format!("sudo usermod -a -G video {RENDER_GROUP_USER}")],
+        "the preview's command (exit {:?}, stderr {:?}):\n{preview}",
+        world.cli_rc,
+        world.cli_stderr
+    );
+    assert!(
+        !render_group_helper_log(world).exists(),
+        "a preview ran a helper: {:?}",
+        std::fs::read_to_string(render_group_helper_log(world))
+    );
+}
+
 // ── The verify line `rocm diagnose` prints on Linux ────────────────
 
 /// The reported cause block for `fix_id`: the `#N (id)` header line and
@@ -6453,7 +6660,7 @@ fn plant_fake_journalctl(world: &E2eWorld, kernel_log: &str) {
 /// `run_rocm_with_scenario_env` takes `command_env` rather than borrowing it, so
 /// a scenario that runs the CLI twice gets the real host on the second run
 /// unless it re-states the fixture. That is not a detail worth discovering from
-/// a mysterious result: without this, the second run of diagnose-94 described
+/// a mysterious result: without this, the second run of diagnose-96 described
 /// the runner instead of the planted APU.
 fn restate_planted_machine_env(world: &mut E2eWorld) {
     world.command_env.push((

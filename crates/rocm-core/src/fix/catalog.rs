@@ -40,6 +40,42 @@ pub(crate) const COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED: &str = "Neither opti
 /// for the user to read. The `\$` keeps the anchor literal in sh, bash and fish.
 pub(crate) const RENDER_GROUP_VERIFY: &str = r#"groups | tr ' ' '\n' | grep -E "^($(stat -c %G /dev/kfd 2>/dev/null)|render|video)\$" && ls -l /dev/kfd && rocminfo | head -n 5"#;
 
+/// The placeholder fix-9's lines carry for the discrete GPU's index, which only
+/// the user can name (`--device-index`).
+pub(crate) const DGPU_INDEX: &str = "<dGPU-index>";
+/// fix-9's lines, each shared verbatim by this recipe, the `Fix` that
+/// `diagnose/host.rs`'s `check_9_igpu_dgpu_collision` builds, and the runner
+/// (`run_hip_visible_devices` in `fix/runners.rs`), so the three show the same
+/// query and the same change. The runner puts the index it was given in place
+/// of [`DGPU_INDEX`] with [`with_device_index`].
+pub(crate) const IGPU_QUERY_LINUX: &str = "rocminfo | grep -E 'Agent |Marketing|gfx'";
+/// See [`IGPU_QUERY_LINUX`].
+pub(crate) const IGPU_QUERY_WINDOWS: &str =
+    "& \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name|gcnArchName\"";
+/// See [`IGPU_QUERY_LINUX`].
+pub(crate) const IGPU_PIN_LINUX: &str = "export HIP_VISIBLE_DEVICES=<dGPU-index>";
+/// See [`IGPU_QUERY_LINUX`].
+pub(crate) const IGPU_PIN_WINDOWS: &str = "setx HIP_VISIBLE_DEVICES <dGPU-index>";
+/// fix-9's verify line. It reads the variable the change persisted, in a new
+/// shell, rather than setting an index of its own.
+pub(crate) const IGPU_VERIFY: &str =
+    "python -c \"import torch; print(torch.cuda.device_count(), torch.cuda.get_device_name(0))\"";
+
+/// `line` with [`DGPU_INDEX`] replaced by `index`.
+pub(crate) fn with_device_index(line: &str, index: i64) -> String {
+    line.replace(DGPU_INDEX, &index.to_string())
+}
+
+/// The line fix-6 puts `bin_dir` on `PATH` with, on Linux and WSL: the line
+/// `run_path_export_linux` in `fix/runners.rs` appends to the shell rc file, and
+/// the line `diagnose/host.rs`'s `check_6_path_missing` prints. The recipe's
+/// `echo` line is this one for `/opt/rocm/bin`, held by
+/// `the_path_fix_plan_diagnose_prints_is_the_one_fix_appends`. Quoted, so a
+/// directory with a space in it stays one `PATH` entry.
+pub(crate) fn path_export_line(bin_dir: &str) -> String {
+    format!("export PATH=\"{bin_dir}:$PATH\"")
+}
+
 /// One operating system a recipe applies on, and what it does there.
 ///
 /// Scope and class are held together rather than in two parallel lists because
@@ -274,8 +310,16 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: RENDER_GROUP_ID,
         title: "Add user to render/video groups",
-        rationale: "The current user can't open /dev/kfd because they aren't in the render group. Adding the user is the safe, standard fix.",
-        commands: &["sudo usermod -a -G render,video \"$USER\""],
+        rationale: "The current user can't open /dev/kfd because they aren't in the group that owns it. Adding the user is the safe, standard fix.",
+        // The groups are the host's, so the line names them with a
+        // placeholder. `rocm diagnose` prints the resolved line and the runner
+        // its `Will run:` line, both from `fix/render_group.rs`.
+        commands: &[
+            "# <kfd-group> is the group that owns /dev/kfd, or render when that group has no name.",
+            "# video follows when it is another group. Only groups this host has are named, and",
+            "# `rocm fix` prints the line it runs as `Will run:`.",
+            "sudo usermod -a -G <kfd-group>,video \"$USER\"",
+        ],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: true,
@@ -401,17 +445,17 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         title: "Hide the iGPU with HIP_VISIBLE_DEVICES",
         rationale: "Both an APU iGPU and a discrete AMD GPU are visible. Pin the runtime to the dGPU so the iGPU doesn't destabilise it.",
         commands: &[
-            "# Linux:",
-            "rocminfo | grep -E 'Agent |Marketing|gfx'   # find the dGPU index",
-            "export HIP_VISIBLE_DEVICES=<dGPU-index>",
-            "# Windows:",
-            "& \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name\"",
-            "setx HIP_VISIBLE_DEVICES <dGPU-index>",
+            "# Linux (find the dGPU index, then pin it):",
+            IGPU_QUERY_LINUX,
+            IGPU_PIN_LINUX,
+            "# Windows (find the dGPU index, then pin it):",
+            IGPU_QUERY_WINDOWS,
+            IGPU_PIN_WINDOWS,
         ],
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "python -c \"import torch; print(torch.cuda.device_count(), torch.cuda.get_device_name(0))\"",
+        verify: IGPU_VERIFY,
         verify_linux: None,
         notes: &[
             "Pass --device-index N to persist the env var; without it, this fix only prints the rocminfo / hipInfo query so you can identify N.",
@@ -1210,6 +1254,22 @@ pub(crate) fn recipe_verify_notes_and_run_commands(
             .collect::<Vec<_>>();
         (recipe.verify, recipe.notes, run_commands)
     })
+}
+
+/// Test-only: the ids of the recipes that act on the machine somewhere, that
+/// is, are [`FixClass::Auto`] or [`FixClass::NeedsArgument`] on at least one
+/// platform, in catalog order.
+#[cfg(test)]
+pub(crate) fn acting_fix_ids() -> Vec<&'static str> {
+    RECIPES
+        .iter()
+        .filter(|r| {
+            r.applies_on
+                .iter()
+                .any(|p| matches!(p.class, FixClass::Auto | FixClass::NeedsArgument))
+        })
+        .map(|r| r.fix_id)
+        .collect()
 }
 
 /// Test-only: the Linux and WSL verify line of a recipe, when it has one.
