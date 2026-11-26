@@ -237,13 +237,17 @@ impl RouterSteps for LemondRouterSteps<'_> {
     }
 
     fn load_model(&mut self, router_model_ref: &str, backend: &str) -> Result<()> {
+        // Where Lemonade has no memory to size the context from, it picks 4096
+        // tokens, which is less than the assistant's own prompt; see
+        // `context_size`. On every other host this is the request's own recipe.
+        let recipe = crate::context_size::recipe_for_load(self.request, router_model_ref);
         crate::process::run_lemonade_model_load_with_parent(
             &self.runtime.manifest,
             &self.request.host,
             self.request.port,
             router_model_ref,
             backend,
-            self.request.engine_recipe.as_ref(),
+            recipe.as_ref(),
             self.log_path,
             self.process_env,
             &self.parent,

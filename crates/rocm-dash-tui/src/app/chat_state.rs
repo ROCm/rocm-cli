@@ -10,9 +10,75 @@
 //! reducer focused. Distinct from `app/chat.rs`, which holds the chat-config
 //! and agent-factory free functions this state calls into.
 
-use super::{AppState, ChatConsent, ChatProvider, ChatTurn, SlashOutcome};
+use rocm_dash_core::metrics::InstanceStatus;
+
+use super::{AppState, ChatConsent, ChatEndpointHealth, ChatProvider, ChatTurn, SlashOutcome};
+
+/// Shown instead of dispatching a message the backing endpoint cannot answer.
+/// Names both recovery paths, since neither is discoverable from the tab.
+pub(crate) const ENDPOINT_DOWN_MSG: &str = "the model backing this chat is no longer being served — start it again, or use \
+     `/detect` to pick up another local engine (`/provider` switches to a cloud backend)";
 
 impl AppState {
+    /// The loopback port of the chat endpoint, when it is one a managed
+    /// instance could be serving.
+    ///
+    /// `None` for a remote endpoint, and for any endpoint reached through a
+    /// provider other than `Local` — `/provider anthropic` leaves `chat_llm`
+    /// pointing at the local URL it replaced, so the provider has to be checked
+    /// too or a stopped local service would block a cloud chat that never
+    /// touched it.
+    fn chat_endpoint_port(&self) -> Option<u16> {
+        if self.active_provider != ChatProvider::Local {
+            return None;
+        }
+        let base_url = &self.chat_llm.as_ref()?.base_url;
+        // Reuse the crate's authority parser: it strips the brackets from an
+        // IPv6 loopback (`http://[::1]:8000` → host `::1`) that a hand-rolled
+        // `rsplit(':')` would mangle, and defaults the port from the scheme.
+        let (host, port) = crate::llm::parse_host_port(base_url)?;
+        crate::llm::is_loopback_host(&host).then_some(port)
+    }
+
+    /// Whether the instance backing the chat endpoint can answer a request.
+    ///
+    /// I/O-free, so the reducer and the renderer can share one liveness rule
+    /// rather than each carrying its own.
+    pub fn chat_endpoint_health(&self) -> ChatEndpointHealth {
+        let Some(port) = self.chat_endpoint_port() else {
+            return ChatEndpointHealth::Serving;
+        };
+        match self.instances.values().find(|i| i.port == Some(port)) {
+            Some(inst) => match inst.status {
+                InstanceStatus::Ready | InstanceStatus::Running | InstanceStatus::Unknown => {
+                    ChatEndpointHealth::Serving
+                }
+                InstanceStatus::Starting { .. } => ChatEndpointHealth::Starting,
+                InstanceStatus::Stopped => ChatEndpointHealth::Stopped,
+                InstanceStatus::Error => ChatEndpointHealth::Failed,
+            },
+            // Nothing on that port. That is only a verdict for an endpoint we
+            // once saw registered; otherwise it is an engine we never tracked.
+            None if self.chat_endpoint_managed => ChatEndpointHealth::Stopped,
+            None => ChatEndpointHealth::Serving,
+        }
+    }
+
+    /// Record that the chat endpoint's port is served by a managed instance, so
+    /// a later disappearance reads as "stopped" rather than "never watched".
+    ///
+    /// Called wherever `instances` changes. Latches on rather than tracking the
+    /// instance both ways: the absence this exists to interpret is exactly the
+    /// state that would otherwise clear it.
+    pub(crate) fn refresh_chat_endpoint_health(&mut self) {
+        let Some(port) = self.chat_endpoint_port() else {
+            return;
+        };
+        if self.instances.values().any(|i| i.port == Some(port)) {
+            self.chat_endpoint_managed = true;
+        }
+    }
+
     /// Accept the detected endpoint and enable chat. No-op when no endpoint is
     /// available. Focuses the input so the user can type immediately.
     pub const fn accept_chat_consent(&mut self) {
@@ -100,6 +166,9 @@ impl AppState {
             self.chat_llm = Some(cfg);
             self.chat_consent = ChatConsent::Accepted;
             self.chat_focused = true;
+            // A new endpoint has its own liveness history; carrying the old
+            // latch over would report the new one stopped before it is seen.
+            self.chat_endpoint_managed = false;
             // The accepted endpoint is local; align the displayed provider and
             // raise the rebuild edge so `event_loop` swaps the live agent to it
             // (the startup agent may be a cloud gateway — see
@@ -153,6 +222,16 @@ impl AppState {
             self.chat_input.clear();
             return;
         }
+        // Refuse a message the endpoint is known not to answer. Dispatching it
+        // only buys a raw transport error in the transcript; this says what
+        // happened and how to get back. Deliberately below the slash branch —
+        // `/detect` and `/provider` are the ways out, so they must still run.
+        if self.chat_endpoint_health().blocks_send() {
+            self.chat_input.clear();
+            self.chat
+                .push(ChatTurn::error(ENDPOINT_DOWN_MSG.to_string()));
+            return;
+        }
         self.chat.push(ChatTurn::user(text));
         self.chat_input.clear();
         self.chat_sending = true;
@@ -186,9 +265,224 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use rocm_dash_core::metrics::{Instance, InstanceStatus};
+    use rocm_dash_core::protocol::Event;
+
+    use super::ENDPOINT_DOWN_MSG;
     use crate::app::test_support::st;
     use crate::app::types::NO_CHAT_BACKEND_MSG;
-    use crate::app::{ChatConsent, ChatRole};
+    use crate::app::{AppState, ChatConsent, ChatEndpointHealth, ChatProvider, ChatRole, ChatTurn};
+
+    const SERVED_PORT: u16 = 8000;
+
+    /// A chat accepted against a model served on `SERVED_PORT`, with the
+    /// dashboard already having seen the instance serving it.
+    ///
+    /// Drives the real event path (`apply_event`) rather than writing
+    /// `instances` directly — the wiring between an instance arriving and the
+    /// chat endpoint noticing is exactly what is under test.
+    fn chatting_with_a_served_model() -> AppState {
+        let mut s = st();
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: format!("http://127.0.0.1:{SERVED_PORT}/v1"),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+        s.apply_event(Event::InstanceDiscovered(served_instance()));
+        assert_eq!(
+            s.chat_endpoint_health(),
+            ChatEndpointHealth::Serving,
+            "precondition: the model is being served"
+        );
+        s
+    }
+
+    fn served_instance() -> Instance {
+        Instance {
+            container_id: "svc".into(),
+            port: Some(SERVED_PORT),
+            status: InstanceStatus::Ready,
+            ..Default::default()
+        }
+    }
+
+    /// Stopping a service removes its record, so the dashboard sees the
+    /// instance vanish rather than turn `Stopped`.
+    fn stop_serving(s: &mut AppState) {
+        s.apply_event(Event::InstanceGone {
+            container_id: "svc".into(),
+        });
+    }
+
+    /// Scenario 1 — the chat tab reflects that the model is gone, and the
+    /// earlier conversation survives.
+    #[test]
+    fn stopping_the_served_model_marks_the_chat_endpoint_down() {
+        let mut s = chatting_with_a_served_model();
+        s.chat.push(ChatTurn::user("earlier question"));
+        s.chat.push(ChatTurn::agent("earlier answer"));
+
+        stop_serving(&mut s);
+
+        assert_eq!(s.chat_endpoint_health(), ChatEndpointHealth::Stopped);
+        assert!(
+            s.chat_endpoint_health().blocks_send(),
+            "a stopped endpoint must not accept a message"
+        );
+        assert_eq!(s.chat.len(), 2, "the transcript is kept, not discarded");
+    }
+
+    /// Scenario 2 — sending to a stopped model explains the problem instead of
+    /// dispatching a request that can only come back as a transport error.
+    #[test]
+    fn sending_to_a_stopped_model_explains_instead_of_dispatching() {
+        let mut s = chatting_with_a_served_model();
+        stop_serving(&mut s);
+
+        s.chat_input = "are you there?".into();
+        s.submit_chat();
+
+        assert!(
+            !s.chat_dispatch,
+            "no request may be dispatched to a stopped endpoint"
+        );
+        assert!(!s.chat_sending, "and nothing may be left spinning");
+        let last = s.chat.last().expect("a turn explaining the refusal");
+        assert_eq!(last.role, ChatRole::Error);
+        assert_eq!(last.content, ENDPOINT_DOWN_MSG);
+        assert!(
+            last.content.contains("/detect"),
+            "the refusal must name a way back, got: {}",
+            last.content
+        );
+    }
+
+    /// Scenario 3 — the recovery commands are the way out of the stopped
+    /// state, so they must still run while it holds.
+    #[test]
+    fn slash_commands_still_run_while_the_model_is_stopped() {
+        let mut s = chatting_with_a_served_model();
+        stop_serving(&mut s);
+
+        s.chat_input = "/detect".into();
+        s.submit_chat();
+
+        assert!(
+            s.chat_detect_dispatch,
+            "/detect must still reach the detect flow when the endpoint is down"
+        );
+        assert!(
+            s.chat.iter().all(|t| t.content != ENDPOINT_DOWN_MSG),
+            "a slash command must not be refused as an unanswerable message"
+        );
+    }
+
+    /// Scenario 4 — serving the model again restores chat without the user
+    /// reconfiguring anything. A restarted service gets a fresh id, so this
+    /// also pins that recovery is matched by port rather than by instance id.
+    #[test]
+    fn serving_the_model_again_restores_chat() {
+        let mut s = chatting_with_a_served_model();
+        stop_serving(&mut s);
+        assert!(s.chat_endpoint_health().blocks_send());
+
+        s.apply_event(Event::InstanceDiscovered(Instance {
+            container_id: "svc-restarted".into(),
+            ..served_instance()
+        }));
+
+        assert_eq!(s.chat_endpoint_health(), ChatEndpointHealth::Serving);
+        s.chat_input = "back?".into();
+        s.submit_chat();
+        assert!(s.chat_dispatch, "chat accepts messages again");
+    }
+
+    /// Scenario 5 — a cloud provider is reached through its own backend, and
+    /// `chat_llm` still holds the local URL it replaced. A locally served model
+    /// stopping must not block a chat that never touched it.
+    #[test]
+    fn a_stopped_local_model_does_not_block_a_remote_provider() {
+        let mut s = chatting_with_a_served_model();
+        s.active_provider = ChatProvider::Anthropic;
+
+        stop_serving(&mut s);
+
+        assert_eq!(s.chat_endpoint_health(), ChatEndpointHealth::Serving);
+        s.chat_input = "still fine".into();
+        s.submit_chat();
+        assert!(
+            s.chat_dispatch,
+            "the remote provider still accepts messages"
+        );
+    }
+
+    /// A local engine the dashboard never saw registered (started by hand,
+    /// found by `/detect`) has no instance to watch. Its absence from the map
+    /// is the normal state, and must never be read as "stopped".
+    #[test]
+    fn an_engine_that_was_never_registered_is_not_reported_stopped() {
+        let mut s = st();
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: format!("http://127.0.0.1:{SERVED_PORT}/v1"),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+
+        assert_eq!(s.chat_endpoint_health(), ChatEndpointHealth::Serving);
+        s.chat_input = "hello".into();
+        s.submit_chat();
+        assert!(s.chat_dispatch);
+    }
+
+    /// Pointing the chat at a different endpoint starts its liveness history
+    /// over. Carrying the old one across would report a perfectly good new
+    /// endpoint stopped before anything had been seen on it.
+    #[test]
+    fn switching_endpoints_does_not_inherit_the_old_ones_liveness() {
+        let mut s = chatting_with_a_served_model();
+        stop_serving(&mut s);
+        assert!(s.chat_endpoint_health().blocks_send());
+
+        s.set_chat_config(
+            Some(crate::llm::LlmConfig {
+                base_url: format!("http://127.0.0.1:{}/v1", SERVED_PORT + 7),
+                model: "m".into(),
+                api_key: None,
+                auth_header: None,
+            }),
+            true,
+        );
+
+        assert_eq!(s.chat_endpoint_health(), ChatEndpointHealth::Serving);
+    }
+
+    /// An instance on a different port is not this chat's endpoint, so its
+    /// coming and going says nothing about whether the model is served.
+    #[test]
+    fn an_instance_on_another_port_is_not_this_chat_endpoint() {
+        let mut s = chatting_with_a_served_model();
+        s.apply_event(Event::InstanceDiscovered(Instance {
+            container_id: "other".into(),
+            port: Some(SERVED_PORT + 1),
+            status: InstanceStatus::Ready,
+            ..Default::default()
+        }));
+        stop_serving(&mut s);
+
+        assert_eq!(
+            s.chat_endpoint_health(),
+            ChatEndpointHealth::Stopped,
+            "an unrelated instance must not stand in for the stopped one"
+        );
+    }
 
     #[test]
     fn detect_none_sets_message() {

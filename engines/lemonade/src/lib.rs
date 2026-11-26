@@ -41,6 +41,7 @@ mod archive_extract;
 #[path = "../../../crates/rocm-core/src/archive_props.rs"]
 mod archive_props;
 mod backend_alignment;
+mod context_size;
 mod device_policy;
 mod direct_llama;
 mod footprint;

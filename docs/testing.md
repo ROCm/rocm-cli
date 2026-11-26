@@ -2876,6 +2876,21 @@ cargo test -p rocm --bin rocm tests::an_error
 cargo test -p rocm-dash-tui --lib agent::tools
 ```
 
+A request that does not fit the window the model was served with is explained
+rather than relayed. `chat-24`
+(`chat-context-overflow-is-explained-in-plain-language`) drives the Chat tab
+against a mock endpoint that refuses the way a llama.cpp-backed server does,
+with an `exceed_context_size_error` body, and requires the transcript to name
+the window and what counts toward it while showing none of the provider's wire
+detail. The unit tests beside the message fabricate that body, so nothing
+otherwise held the tab to reaching the rewrite against an endpoint that
+returns one:
+
+```bash
+cargo xtask e2e -- -n "chat-24"
+cargo test -p rocm-dash-tui --lib chat_runtime
+```
+
 Log browser smoke:
 
 ```bash
@@ -6894,6 +6909,16 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   branch of the text report runs on every Linux lane rather than only on
   integrated-GPU hardware. The planted pool is far larger than the tiny file, so
   only the "fits" polarity is exercised there.
+
+  `diagnose-91` covers the host none of the others describe: one where nothing
+  reports the GPU's memory at all. That is a Windows laptop whose integrated GPU
+  has no ROCm build, since `amd-smi` ships inside the SDK and an unsupported
+  part has no telemetry to read a carve-out from. Such a host used to be told
+  the memory could not be read, and given a plan whose one step was to run the
+  telemetry it does not have. The pool the GPU shares is a separate counter that
+  is readable anyway, and the kernel topology still names the part, so the
+  scenario plants the same APU with every VRAM counter taken away and requires a
+  verdict against the shared pool rather than that dead end.
 
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes

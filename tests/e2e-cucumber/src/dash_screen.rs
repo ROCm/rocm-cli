@@ -62,7 +62,12 @@ pub fn instance_detail_matches(screen: &str, model_prefix: &str, status: &str, p
 }
 
 /// Replace the box-drawing characters of the terminal UI with spaces.
-fn strip_box_drawing(screen: &str) -> String {
+///
+/// A panel border sits at both ends of every row, so a sentence the panel
+/// wrapped across rows reads `… (53,820 of │ │ 32,768 tokens)`. Dropping only
+/// whitespace leaves those borders inside the text; turning them into spaces
+/// first is what lets a wrapped sentence be matched as one string.
+pub fn strip_box_drawing(screen: &str) -> String {
     screen
         .chars()
         .map(|c| {

@@ -478,6 +478,37 @@ async fn running_managed_model(world: &mut E2eWorld) {
     setup_managed_model(world, ServiceRecordOptions::default(), false).await;
 }
 
+/// The figures the refused completion reports, and the way the Chat tab groups
+/// them for a reader. Held as both forms rather than derived: this crate does
+/// not depend on the TUI, so reimplementing the grouping here would only check
+/// the reimplementation. `assert_context_overflow_explained` ties the two
+/// together, so they cannot drift apart silently.
+const OVERFLOW_PROMPT_TOKENS: u64 = 53_820;
+const OVERFLOW_CONTEXT_TOKENS: u64 = 32_768;
+const OVERFLOW_COUNTS_AS_SHOWN: &str = "(53,820 of 32,768 tokens)";
+
+#[given("a running managed model that refuses a request larger than its context window")]
+async fn managed_model_refusing_context_overflow(world: &mut E2eWorld) {
+    let model = "TestModel/E2E-1B";
+    let mock = MockServer::start_refusing_as_context_overflow(
+        model,
+        OVERFLOW_PROMPT_TOKENS,
+        OVERFLOW_CONTEXT_TOKENS,
+    )
+    .await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(model.to_string());
+    world.mock = Some(mock);
+    // Planted with the "inference was verified" latch, as a scripted mock is:
+    // without it the CLI's readiness check sends its own `Say ok.` completion,
+    // which this server refuses too, so the model would be demoted before the
+    // user's own turn is ever sent and the scenario would be about discovery.
+    world.register_mock_service_with(ServiceRecordOptions {
+        inference_verified: true,
+        ..ServiceRecordOptions::default()
+    });
+}
+
 #[given(
     "a running managed model answers a request to start a server with a tool call carrying two sets of arguments"
 )]
@@ -1953,6 +1984,12 @@ fn squash(text: &str) -> String {
     text.split_whitespace().collect()
 }
 
+/// [`squash`] for text still inside a panel, where the border characters of
+/// each row would otherwise land in the middle of a wrapped sentence.
+fn squash_frame(screen: &str) -> String {
+    squash(&e2e_cucumber::dash_screen::strip_box_drawing(screen))
+}
+
 /// Read once the dashboard has exited: the report goes to the terminal the
 /// dashboard gave back, so it is on the main screen. A long line wraps across
 /// rows, possibly at a space, so whitespace is dropped from both sides before
@@ -3058,6 +3095,85 @@ async fn managed_model_response_displayed(world: &mut E2eWorld) {
         .wait_for_screen("mock response for testing", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model's response did not appear: {e}"));
+}
+
+/// The sentence the Chat tab shows in place of a provider's context-overflow
+/// body, copied from `context_overflow_message` in
+/// `crates/rocm-dash-tui/src/app/chat_runtime.rs` because this crate does not
+/// depend on the TUI. Change them together. Squashed before matching: it wraps
+/// across transcript rows, possibly at a space (see [`squash`]).
+const CONTEXT_OVERFLOW_SENTENCE: &str = "This request is larger than the model's context window";
+const CONTEXT_OVERFLOW_CAUSES: &str =
+    "The assistant's built-in instructions and any long ROCm check result both count toward it.";
+const CONTEXT_OVERFLOW_REMEDY: &str = "use a model served with a larger context";
+
+/// The provider's own wire detail, which the transcript used to show verbatim
+/// and must not show now. Deliberately not `400`, which a port or a byte count
+/// elsewhere on screen could supply.
+const PROVIDER_WIRE_DETAIL: [&str; 4] = [
+    "exceed_context_size_error",
+    "n_prompt_tokens",
+    "n_ctx",
+    "HttpError",
+];
+
+#[then(
+    "the user is told the request is larger than the model's context window and what counts toward it"
+)]
+async fn assert_context_overflow_explained(world: &mut E2eWorld) {
+    assert_eq!(
+        OVERFLOW_COUNTS_AS_SHOWN.replace(',', ""),
+        format!("({OVERFLOW_PROMPT_TOKENS} of {OVERFLOW_CONTEXT_TOKENS} tokens)"),
+        "the counts asserted on screen must be the ones the mock refuses with"
+    );
+    let markers = [
+        squash(CONTEXT_OVERFLOW_SENTENCE),
+        squash(OVERFLOW_COUNTS_AS_SHOWN),
+        squash(CONTEXT_OVERFLOW_CAUSES),
+        squash(CONTEXT_OVERFLOW_REMEDY),
+    ];
+    let tui = session(world);
+    wait_for_frame(tui, "the context-overflow explanation", move |screen| {
+        let squashed = squash_frame(screen);
+        markers
+            .iter()
+            .filter(|marker| !squashed.contains(marker.as_str()))
+            .map(|marker| format!("{marker:?}"))
+            .collect()
+    })
+    .await;
+}
+
+#[then("none of the provider's wire detail is shown")]
+async fn assert_no_provider_wire_detail(world: &mut E2eWorld) {
+    // Waits for the tail of the same explanation rather than reading the
+    // screen directly: a negative assertion is only as strong as the frame is
+    // complete, and the frame this returns is one the whole sentence -- which
+    // is where the wire detail used to sit -- was drawn into. See
+    // `wait_for_frame`. The wait itself is already satisfied by the step above.
+    let tui = session(world);
+    let frame = wait_for_frame(
+        tui,
+        "a complete frame carrying the context-overflow explanation",
+        |screen| {
+            let marker = squash(CONTEXT_OVERFLOW_REMEDY);
+            if squash_frame(screen).contains(&marker) {
+                Vec::new()
+            } else {
+                vec![format!("{marker:?}")]
+            }
+        },
+    )
+    .await;
+    // Squashed, so a token the panel wrapped across two rows is still caught:
+    // read raw, `n_prompt_tokens` broken over a border would pass this.
+    let squashed = squash_frame(&frame);
+    for noise in PROVIDER_WIRE_DETAIL {
+        assert!(
+            !squashed.contains(&squash(noise)),
+            "`{noise}` leaked into the transcript:\n{frame}"
+        );
+    }
 }
 
 #[then("the mock received the typed prompt")]

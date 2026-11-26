@@ -16,8 +16,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use rocm_dash_core::metrics::InstanceStatus;
-
 use crate::app::{AppState, ChatConsent, ChatRole, ChatTurn};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -347,52 +345,16 @@ fn transcript_lines_from_turns<'a>(turns: &'a [ChatTurn], theme: &Theme) -> Vec<
     lines
 }
 
-/// If the local instance backing the chat endpoint is not yet answering,
-/// explain why so an in-flight request reads as "the model is still coming up"
-/// rather than an unexplained spinner. Matched to a daemon-surfaced instance by
-/// host + port (daemon-tracked instances are always co-located, so only a
-/// loopback endpoint can be one of them — a remote gateway must never
-/// false-match just because it happens to share a port number with a local
-/// instance).
-///
-/// Returns `None` when the endpoint is remote, isn't a managed instance we can
-/// see, or the instance is serving/unknown — the caller then shows the plain
-/// spinner. `Ready` is the precise probe-backed serving state; `Running` remains
-/// a serving synonym for discovery sources without a readiness signal.
-fn chat_backend_wait_reason(state: &AppState) -> Option<String> {
-    let base_url = &state.chat_llm.as_ref()?.base_url;
-    // Reuse the crate's authority parser: it strips the brackets from an IPv6
-    // loopback (`http://[::1]:8000` → host `::1`) that a hand-rolled
-    // `rsplit(':')` would mangle, and defaults the port from the scheme.
-    let (host, port) = crate::llm::parse_host_port(base_url)?;
-    if !crate::llm::is_loopback_host(&host) {
-        return None;
-    }
-    let inst = state.instances.values().find(|i| i.port == Some(port))?;
-    match inst.status {
-        InstanceStatus::Ready | InstanceStatus::Running => None,
-        InstanceStatus::Starting { .. } => {
-            Some("the model is still starting up — hang tight".to_owned())
-        }
-        InstanceStatus::Stopped => {
-            Some("the endpoint has stopped — restart the service to chat".to_owned())
-        }
-        InstanceStatus::Error => {
-            Some("the endpoint reported an error — check the service logs".to_owned())
-        }
-        InstanceStatus::Unknown => None,
-    }
-}
-
 /// Render the single-row input line. While focused, a caret glyph trails the
 /// buffer; otherwise a muted hint invites focus.
 fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let health = state.chat_endpoint_health();
+
     // While a request is in flight, show a spinner and suppress the caret —
     // input is disabled until the reply or error turn lands. When the backing
     // endpoint isn't ready yet, say so instead of an unexplained spinner.
     if state.chat_sending {
-        let reason = chat_backend_wait_reason(state);
-        let (title, body): (&str, String) = match &reason {
+        let (title, body): (&str, String) = match health.wait_reason() {
             Some(reason) => ("Message (waiting on the model)", format!("⠿ {reason}")),
             None => ("Message (sending…)", "⠿ waiting for the agent…".to_owned()),
         };
@@ -402,13 +364,25 @@ fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
+    // An endpoint that cannot answer has to be visible on arrival at the tab,
+    // not only once a message has already been sent into it. The input stays
+    // drawn: slash commands are the way back, and typing them must still read
+    // normally.
+    let down = health.blocks_send();
+
     // Focused input is the primary actionable surface; idle reads muted.
-    let (title, role) = if state.chat_focused {
-        ("Message (insert)", BoxRole::Primary)
-    } else {
-        ("Message", BoxRole::Muted)
+    let (title, role) = match (down, state.chat_focused) {
+        (true, _) => ("Message (model stopped)", BoxRole::Warning),
+        (false, true) => ("Message (insert)", BoxRole::Primary),
+        (false, false) => ("Message", BoxRole::Muted),
     };
     let inner = panel::bento(f, area, Some(title), role, false, theme);
+
+    let empty_hint = if down {
+        "model stopped — /detect to reconnect"
+    } else {
+        "press i to type…"
+    };
 
     let line = if state.chat_focused {
         Line::from(vec![
@@ -416,10 +390,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Span::styled(CURSOR_GLYPH, Style::default().fg(theme.accent)),
         ])
     } else if state.chat_input.is_empty() {
-        Line::from(Span::styled(
-            "press i to type…",
-            Style::default().fg(theme.muted),
-        ))
+        Line::from(Span::styled(empty_hint, Style::default().fg(theme.muted)))
     } else {
         Line::from(Span::styled(
             state.chat_input.as_str(),
@@ -432,6 +403,8 @@ fn draw_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
 #[cfg(test)]
 mod tests {
+    use rocm_dash_core::metrics::InstanceStatus;
+
     use super::*;
     use crate::app::{AppState, ChatTurn};
 
@@ -697,27 +670,36 @@ mod tests {
     #[test]
     fn backend_wait_reason_reflects_instance_status() {
         let mut s = accepted_chat_at_port(8000);
-        // No instance visible → no endpoint-specific reason (falls back to spinner).
-        assert_eq!(chat_backend_wait_reason(&s), None);
+        // No instance visible and none ever seen → the endpoint is a local
+        // engine we never tracked, so there is nothing to explain.
+        assert_eq!(s.chat_endpoint_health().wait_reason(), None);
 
         set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
         assert!(
-            chat_backend_wait_reason(&s)
+            s.chat_endpoint_health()
+                .wait_reason()
                 .unwrap()
                 .contains("starting up")
         );
         set_backing_instance(&mut s, 8000, InstanceStatus::Stopped);
-        assert!(chat_backend_wait_reason(&s).unwrap().contains("stopped"));
+        assert!(
+            s.chat_endpoint_health()
+                .wait_reason()
+                .unwrap()
+                .contains("stopped")
+        );
         set_backing_instance(&mut s, 8000, InstanceStatus::Error);
-        assert!(chat_backend_wait_reason(&s).unwrap().contains("error"));
+        assert!(
+            s.chat_endpoint_health()
+                .wait_reason()
+                .unwrap()
+                .contains("error")
+        );
         // A live instance needs no explanation.
         set_backing_instance(&mut s, 8000, InstanceStatus::Running);
-        assert_eq!(chat_backend_wait_reason(&s), None);
+        assert_eq!(s.chat_endpoint_health().wait_reason(), None);
         set_backing_instance(&mut s, 8000, InstanceStatus::Ready);
-        assert_eq!(chat_backend_wait_reason(&s), None);
-        // A mismatched port is not our endpoint.
-        set_backing_instance(&mut s, 9999, InstanceStatus::Starting { phase: None });
-        assert_eq!(chat_backend_wait_reason(&s), None);
+        assert_eq!(s.chat_endpoint_health().wait_reason(), None);
     }
 
     #[test]
@@ -737,7 +719,8 @@ mod tests {
         s.set_chat_config(Some(llm), true);
         set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
         assert!(
-            chat_backend_wait_reason(&s)
+            s.chat_endpoint_health()
+                .wait_reason()
                 .unwrap()
                 .contains("starting up"),
             "bracketed IPv6 loopback should resolve to its backing instance"
@@ -761,7 +744,45 @@ mod tests {
         };
         s.set_chat_config(Some(llm), true);
         set_backing_instance(&mut s, 8000, InstanceStatus::Starting { phase: None });
-        assert_eq!(chat_backend_wait_reason(&s), None);
+        assert_eq!(s.chat_endpoint_health().wait_reason(), None);
+    }
+
+    /// Scenario 1, as the user meets it: arriving at the tab after the served
+    /// model stopped must show that it is gone, with the conversation still
+    /// readable. Before the fix the tab drew an ordinary, ready-looking input
+    /// and said nothing until a message had already been sent into it.
+    #[test]
+    fn idle_input_shows_the_model_stopped_after_serving_ends() {
+        use rocm_dash_core::protocol::Event;
+
+        let mut s = accepted_chat_at_port(8000);
+        s.chat.push(ChatTurn::user("earlier question"));
+        s.apply_event(Event::InstanceDiscovered(
+            rocm_dash_core::metrics::Instance {
+                container_id: "svc".into(),
+                port: Some(8000),
+                status: InstanceStatus::Ready,
+                ..Default::default()
+            },
+        ));
+        assert!(
+            !render_str(&mut s).contains("stopped"),
+            "precondition: nothing claims the model is stopped while it serves"
+        );
+
+        s.apply_event(Event::InstanceGone {
+            container_id: "svc".into(),
+        });
+
+        let out = render_str(&mut s);
+        assert!(
+            out.contains("stopped"),
+            "the idle tab must say the model is gone, got:\n{out}"
+        );
+        assert!(
+            out.contains("earlier question"),
+            "the conversation stays readable, got:\n{out}"
+        );
     }
 
     #[test]

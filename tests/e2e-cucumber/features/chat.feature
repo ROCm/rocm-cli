@@ -282,3 +282,28 @@ Feature: Chat and endpoint detection
     When the user asks the chat assistant with ROCm tools a question in one-shot chat
     Then the CLI refuses the plan for the assistant's request
     And no command line holding that folder is offered to paste
+
+  # What the user is told when their turn does not fit the window the model was
+  # served with. The transcript used to show the provider's raw refusal -- a
+  # status line, an error type and two token counts -- which says nothing about
+  # what happened or what to do next. The window is often the engine's own
+  # small default, and the assistant's built-in instructions and tool
+  # definitions fill it before any tool result is added, so the replacement
+  # names both causes and blames neither.
+  #
+  # The unit tests beside that sentence fabricate the provider's body, so
+  # nothing held the Chat tab to actually reaching the rewrite against an
+  # endpoint that returns one; the whole rewrite could be bypassed with every
+  # test still green. This drives the real TUI against a mock endpoint that
+  # refuses the way a llama.cpp-backed server does.
+  @id:chat-context-overflow-is-explained-in-plain-language @requires-os:linux
+  Scenario: chat-24 - A request larger than the model's context window is explained in plain language
+    Given a running managed model that refuses a request larger than its context window
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    When the user accepts the local endpoint
+    And the user sends a message to the managed model
+    Then the user is told the request is larger than the model's context window and what counts toward it
+    And none of the provider's wire detail is shown
+    When the user quits interactive chat
+    Then interactive chat exits successfully

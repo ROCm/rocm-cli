@@ -326,7 +326,34 @@ fn classify_accelerator_memory(
 ) -> AcceleratorMemory {
     let Some(vram) = vram else {
         if gpu_reported {
-            return AcceleratorMemory::Unknown;
+            // No `amd-smi` rows (a Windows host whose GPU has no ROCm build ships
+            // none), so nothing says how much memory the card has -- except that
+            // the gfx target names an APU, whose pool is read without them.
+            if !gfx_target.is_some_and(rocm_core::gfx_is_apu_family) {
+                // Not known to be an APU, so there is no second pool to fall
+                // back on and no telemetry of any kind: `amd-smi metric --json`
+                // is a real next step here.
+                return AcceleratorMemory::Unknown;
+            }
+            // A mask that hides every card is "no GPU is visible", as on both
+            // branches below: not a pool anyone can allocate from, and not a
+            // reading failure to report either.
+            if usable_indices.is_some_and(<[u32]>::is_empty) {
+                return AcceleratorMemory::None;
+            }
+            let Some(gtt_total_gib) = unified_gib else {
+                // An APU whose pool this host does not answer for -- the reader
+                // attributes the figure to a single adapter or DRM card, so a
+                // host pairing the APU with a discrete card lands here too. Not
+                // `Unknown`: that variant's remediation is "run `amd-smi metric
+                // --json`", and this is the one host class that has no
+                // `amd-smi` to run -- having shipped none is why this branch was
+                // taken at all. Sending it there is the circle
+                // `model_readiness.rs`'s `UnifiedMemoryUnreadable` exists to
+                // break, exactly as on the carve-out branch below.
+                return AcceleratorMemory::UnifiedMemoryUnreadable;
+            };
+            return AcceleratorMemory::Unified { gtt_total_gib };
         }
         return AcceleratorMemory::None;
     };
@@ -981,18 +1008,62 @@ mod tests {
 
     /// No VRAM telemetry at all, but the examination positively saw an AMD
     /// GPU: unmeasurable, not absent. A readable aperture does not rescue this
-    /// -- without the `amd-smi`/sysfs rows there is nothing saying this host is
-    /// an APU, and attributing a shared pool to an unidentified GPU would be a
-    /// guess.
+    /// when nothing identifies the GPU as an APU -- attributing a shared pool to
+    /// an unidentified or discrete GPU would be a guess.
     #[test]
     fn classify_accelerator_memory_reports_unknown_when_gpu_present_but_unmeasured() {
         for aperture in [None, Some(60.0)] {
-            assert_eq!(
-                classify_accelerator_memory(None, None, true, None, aperture),
-                AcceleratorMemory::Unknown,
-                "aperture {aperture:?}"
-            );
+            for gfx in [None, Some("gfx1100"), Some("gfx942")] {
+                assert_eq!(
+                    classify_accelerator_memory(None, gfx, true, None, aperture),
+                    AcceleratorMemory::Unknown,
+                    "aperture {aperture:?}, gfx {gfx:?}"
+                );
+            }
         }
+    }
+
+    /// A Windows APU without a ROCm build has no `amd-smi` rows, but its gfx
+    /// target names it an APU and the DXGI/GTT pool is readable: that pool is
+    /// the memory, not `Unknown`. Without a readable pool, or when a mask hides
+    /// every card, it stays `Unknown`.
+    #[test]
+    fn an_apu_without_amd_smi_rows_reports_its_shared_pool() {
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx90c"), true, None, Some(7.7)),
+            AcceleratorMemory::Unified { gtt_total_gib: 7.7 }
+        );
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx90c"), true, Some(&[0]), Some(7.7)),
+            AcceleratorMemory::Unified { gtt_total_gib: 7.7 }
+        );
+        // The pool is unreadable too. `amd-smi` shipped no rows, so "run
+        // `amd-smi metric --json`" -- what `Unknown` asks for -- is the one
+        // remediation this host can never carry out.
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx90c"), true, None, None),
+            AcceleratorMemory::UnifiedMemoryUnreadable
+        );
+        // A mask that leaves no card is "no GPU is visible", not a pool and not
+        // a reading failure.
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx90c"), true, Some(&[]), Some(7.7)),
+            AcceleratorMemory::None
+        );
+        // Nothing says this is an APU, so there is no second pool to reach for
+        // and `amd-smi` really is the next step.
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx1100"), true, None, None),
+            AcceleratorMemory::Unknown
+        );
+        assert_eq!(
+            classify_accelerator_memory(None, None, true, None, Some(7.7)),
+            AcceleratorMemory::Unknown
+        );
+        assert_eq!(
+            classify_accelerator_memory(None, Some("gfx90c"), false, None, Some(7.7)),
+            AcceleratorMemory::None
+        );
     }
 
     /// No VRAM telemetry and no evidence of an AMD GPU: there is nothing to

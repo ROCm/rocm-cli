@@ -32,6 +32,9 @@ impl AppState {
             (Some(_), false) => ChatConsent::Pending,
         };
         self.chat_llm = llm;
+        // A new endpoint has its own liveness history; carrying the old latch
+        // over would report the new one stopped before it is seen.
+        self.chat_endpoint_managed = false;
     }
 }
 

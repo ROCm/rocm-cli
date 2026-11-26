@@ -500,11 +500,16 @@ impl LiveGgufSource {
         }
     }
 
-    /// The same source with a shorter total budget, so a test can show the
-    /// reader is bound by the deadline `open` sets rather than by a fresh one.
-    #[cfg(test)]
+    /// The same source with a different total budget.
+    ///
+    /// [`TOTAL_BUDGET`] is sized for a command the user ran to get this answer
+    /// and is waiting on. A caller reading a header as a best-effort step in
+    /// front of something else — where failing costs nothing but the better
+    /// answer — wants a far shorter one, so that an unreachable hub cannot hold
+    /// its real work for two minutes. Tests also use it to show the reader is
+    /// bound by the deadline `open` sets rather than by a fresh one.
     #[must_use]
-    const fn with_budget(mut self, budget: Duration) -> Self {
+    pub const fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
         self
     }

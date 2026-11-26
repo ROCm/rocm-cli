@@ -715,7 +715,7 @@ fn model_reports_ready_backend(model: &Value, backend: &str) -> bool {
     }
 }
 
-fn lemonade_model_load_args(
+pub(crate) fn lemonade_model_load_args(
     host: &str,
     port: u16,
     model_ref: &str,
@@ -733,13 +733,67 @@ fn lemonade_model_load_args(
         backend.to_owned(),
         "--save-options".to_owned(),
     ];
-    if let Some(engine_recipe) = engine_recipe.filter(|recipe| !recipe.required_flags.is_empty()) {
-        args.extend([
-            "--llamacpp-args".to_owned(),
-            engine_recipe.required_flags.join(" "),
-        ]);
+    if let Some(engine_recipe) = engine_recipe {
+        let (context_size, llamacpp_flags) = split_context_size_flag(&engine_recipe.required_flags);
+        if let Some(context_size) = context_size {
+            args.extend(["--ctx-size".to_owned(), context_size]);
+        }
+        if !llamacpp_flags.is_empty() {
+            args.extend(["--llamacpp-args".to_owned(), llamacpp_flags.join(" ")]);
+        }
     }
     args
+}
+
+/// Separate a recipe's `--ctx-size N` from the rest of its flags.
+///
+/// Lemonade owns the context size: `lemonade load` has its own `--ctx-size`,
+/// and without it the router auto-tunes the value (it resolved to 4096 on a
+/// Vega iGPU for a 4B model, less than the assistant's own prompt). A
+/// `--ctx-size` inside `--llamacpp-args` would be a second, conflicting
+/// source, so the recipe's value goes to the option Lemonade reads and only
+/// the remaining flags are passed through to llama-server. The `--ctx-size=N`
+/// spelling is accepted too.
+///
+/// Only a value that parses as a count is taken, in either spelling. A
+/// `--ctx-size` that names anything else is left in place for llama-server to
+/// reject rather than guessed at: last in the list with nothing after it,
+/// `--ctx-size=` with nothing or nonsense after the `=`, or followed by a token
+/// that is not a number. The last is why the next token is inspected and not
+/// merely counted — swallowing it would send Lemonade `--ctx-size --temperature`
+/// and hand llama-server the orphaned `0.5`. The test is that the token parses
+/// as a count, not that it lacks a leading `--`: llama-server's short flags
+/// (`-ngl`, `-fa`, `-b`, `-np`) carry a single dash and would otherwise be
+/// swallowed by the same mistake in a different spelling. The two spellings are
+/// held to the same test deliberately — a `--ctx-size=-1` taken as a value would
+/// reach `lemonade load` as one *and* leave
+/// [`crate::context_size::recipe_pins_context`] true, so the host sizing would
+/// stand down for a window the recipe never actually named. Everything left in
+/// place leaves that predicate false, so the sizing still runs.
+///
+/// `-c`, llama-server's short spelling, is not recognized in either form; no
+/// catalog recipe uses it, and validating flag spellings at catalog-load time is
+/// the place to close that rather than a second spelling here.
+pub(crate) fn split_context_size_flag(flags: &[String]) -> (Option<String>, Vec<&str>) {
+    let mut context_size = None;
+    let mut rest = Vec::with_capacity(flags.len());
+    let mut iter = flags.iter().map(String::as_str).peekable();
+    while let Some(flag) = iter.next() {
+        if let Some(value) = flag.strip_prefix("--ctx-size=") {
+            if value.parse::<u64>().is_ok() {
+                context_size = Some(value.to_owned());
+            } else {
+                rest.push(flag);
+            }
+        } else if flag == "--ctx-size"
+            && iter.peek().is_some_and(|next| next.parse::<u64>().is_ok())
+        {
+            context_size = iter.next().map(str::to_owned);
+        } else {
+            rest.push(flag);
+        }
+    }
+    (context_size, rest)
 }
 
 fn query_health_json(host: &str, port: u16) -> Result<Value> {
@@ -1402,6 +1456,175 @@ helper line
                 "--temperature 0.5 --top-p 0.25 --n-predict 128"
             ]
         );
+    }
+
+    #[test]
+    fn lemonade_model_load_routes_recipe_context_size_to_its_own_option() {
+        let recipe = EngineRecipeHint {
+            required_flags: vec![
+                "--temperature".to_owned(),
+                "0.5".to_owned(),
+                "--ctx-size".to_owned(),
+                "8192".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let args =
+            lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", Some(&recipe));
+        assert_eq!(
+            args[args.len() - 4..],
+            ["--ctx-size", "8192", "--llamacpp-args", "--temperature 0.5"]
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("--ctx-size 8192")),
+            "the context size must not also reach llama-server: {args:?}"
+        );
+
+        let only_ctx = EngineRecipeHint {
+            required_flags: vec!["--ctx-size=4096".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let args =
+            lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", Some(&only_ctx));
+        assert_eq!(args[args.len() - 2..], ["--ctx-size", "4096"]);
+        assert!(!args.contains(&"--llamacpp-args".to_owned()));
+    }
+
+    #[test]
+    fn split_context_size_flag_leaves_a_valueless_flag_for_llama_server() {
+        let owned = |list: &[&str]| {
+            list.iter()
+                .map(|flag| (*flag).to_owned())
+                .collect::<Vec<String>>()
+        };
+
+        // Last in the list, with nothing after it.
+        let flags = owned(&["--ctx-size"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size"]);
+
+        // Followed by another flag rather than a number. Counting the next token
+        // instead of looking at it would send Lemonade `--ctx-size --temperature`
+        // and hand llama-server the orphaned `0.5`.
+        let flags = owned(&["--ctx-size", "--temperature", "0.5"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size", "--temperature", "0.5"]);
+
+        // Followed by a *single*-dash llama-server flag. Excluding only `--`
+        // would consume `-ngl` as the window and orphan its `999`, which is the
+        // `--temperature` bug above wearing llama-server's short spelling.
+        let flags = owned(&["--ctx-size", "-ngl", "999"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size", "-ngl", "999"]);
+
+        // A negative number is not a count either, and llama-server owns the
+        // refusal.
+        let flags = owned(&["--ctx-size", "-1"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size", "-1"]);
+
+        // `--ctx-size=` names no value, and must not become `--ctx-size ""`.
+        let flags = owned(&["--ctx-size="]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, None);
+        assert_eq!(rest, ["--ctx-size="]);
+
+        // The `=` spelling is held to the same test as the bare one. Taking
+        // these would both forward nonsense to `lemonade load` and leave
+        // `recipe_pins_context` true, standing the host sizing down for a window
+        // the recipe never named.
+        for flag in ["--ctx-size=abc", "--ctx-size=-1", "--ctx-size=8192x"] {
+            let flags = owned(&[flag]);
+            let (context_size, rest) = split_context_size_flag(&flags);
+            assert_eq!(context_size, None, "{flag}");
+            assert_eq!(rest, [flag], "{flag}");
+        }
+
+        // A real value is still taken, in either spelling, and does not reach
+        // llama-server a second time.
+        let flags = owned(&["--ctx-size", "8192"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, Some("8192".to_owned()));
+        assert!(rest.is_empty(), "{rest:?}");
+
+        let flags = owned(&["--temperature", "0.5", "--ctx-size=8192"]);
+        let (context_size, rest) = split_context_size_flag(&flags);
+        assert_eq!(context_size, Some("8192".to_owned()));
+        assert_eq!(rest, ["--temperature", "0.5"]);
+    }
+
+    /// The valueless spellings must not reach `lemonade load` as a `--ctx-size`
+    /// with a flag or an empty string after it.
+    ///
+    /// The last case carries a *usable* window alongside other flags, so the
+    /// whole test turns on the split actually happening: pass everything through
+    /// untouched — which is what this function did before the split existed, and
+    /// what satisfies the three valueless cases on its own — and that case fails.
+    #[test]
+    fn a_valueless_context_size_is_passed_through_to_llama_server_untouched() {
+        // A real value is extracted instead of passed through, so "do nothing"
+        // is not an answer that satisfies this test.
+        let pinned = EngineRecipeHint {
+            required_flags: vec![
+                "--temperature".to_owned(),
+                "0.5".to_owned(),
+                "--ctx-size".to_owned(),
+                "8192".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let args =
+            lemonade_model_load_args("127.0.0.1", 11435, DEFAULT_MODEL, "vulkan", Some(&pinned));
+        assert_eq!(
+            args[args.len() - 5..],
+            [
+                "--save-options".to_owned(),
+                "--ctx-size".to_owned(),
+                "8192".to_owned(),
+                "--llamacpp-args".to_owned(),
+                "--temperature 0.5".to_owned()
+            ],
+            "{args:?}"
+        );
+
+        for flags in [
+            vec!["--ctx-size".to_owned()],
+            vec![
+                "--ctx-size".to_owned(),
+                "--temperature".to_owned(),
+                "0.5".to_owned(),
+            ],
+            vec!["--ctx-size=".to_owned()],
+        ] {
+            let recipe = EngineRecipeHint {
+                required_flags: flags.clone(),
+                ..EngineRecipeHint::default()
+            };
+            let args = lemonade_model_load_args(
+                "127.0.0.1",
+                11435,
+                DEFAULT_MODEL,
+                "vulkan",
+                Some(&recipe),
+            );
+            // The whole recipe is passed through to llama-server and nothing is
+            // inserted between `--save-options` and it, so Lemonade is given no
+            // `--ctx-size` of its own. (Looking for the string alone would not
+            // say this: the pass-through *value* is `--ctx-size ...` here.)
+            assert_eq!(
+                args[args.len() - 3..],
+                [
+                    "--save-options".to_owned(),
+                    "--llamacpp-args".to_owned(),
+                    flags.join(" ")
+                ],
+                "{flags:?}"
+            );
+        }
     }
 
     #[test]
