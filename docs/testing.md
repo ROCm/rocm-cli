@@ -4222,9 +4222,9 @@ output (the tests in [fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) na
 `the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
 and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-15 and fix-21
 also must exit non-zero when their DLL is missing, fix-15 in
-`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
-that only `rocm diagnose` prints
-(`the_igpu_verify_pins_the_variable_it_names` in
+`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs fix-9's line,
+which `rocm diagnose` and `rocm fix` share
+(`the_igpu_verify_reads_the_variable_the_change_persisted` in
 [host.rs](../crates/rocm-core/src/diagnose/host.rs)). These tests are compiled on
 Windows only, so the Linux lanes do not run them, and no Windows scenario covers
 the Windows lines `rocm diagnose` prints: those are held by the text rule
@@ -4290,6 +4290,47 @@ is registered for Linux, Windows and WSL and only adds to that score.
 [host.rs](../crates/rocm-core/src/diagnose/host.rs) holds that for all three
 families.
 
+fix-4's command is one plan as well. Which groups it adds the user to depends on
+the host, so the catalog recipe names them `<kfd-group>,video`, and `rocm
+diagnose` and `rocm fix` resolve them with one function, `render_group_targets` in
+[fix/render_group.rs](../crates/rocm-core/src/fix/render_group.rs): the group that
+owns `/dev/kfd` when it is a group name the host has, else `render` when the host
+has it, then `video` when it is another group the host has. With neither the
+owner nor `render` there is no group to name: the diagnosis prints the reason as
+a comment and no `usermod` line, and `rocm fix` says why and exits 3. The
+diagnosis reads the owner and the groups from the examination
+(`groups_on_host`, which `getent group` fills); `rocm fix` reads them live, and
+stops with exit 4 when `getent` does not answer.
+`the_render_group_plan_diagnose_prints_is_the_one_fix_runs` in
+[fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) holds the two to one
+line over a table of owners (`render`, `video`, `UNKNOWN`, none, a number, a group
+of its own, a missing group) and of the groups the host has, and
+`diagnose-93` asserts it end to end on a simulated device owned by `video`. The
+diagnosis does not offer fix-4 at all when the user can already write `/dev/kfd`,
+unless the pasted error names a permission failure on it
+(`a_writable_kfd_does_not_raise_the_render_group_fix` and
+`a_kfd_permission_symptom_still_raises_it_on_a_writable_device` in
+[linux.rs](../crates/rocm-core/src/diagnose/linux.rs); `diagnose-92` end to end).
+Both scenarios plant `/dev/kfd` under `ROCM_CLI_TEST_HOST_ROOT` and put stand-in
+`stat`, `id` and `getent` ahead of the real ones, so they run on every Linux lane,
+WSL2 included, as `diagnose-40` does:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-render-group-not-offered-for-a-writable-device,diagnose-and-fix-propose-the-same-groups cargo xtask e2e
+```
+
+Every entry `rocm fix` carries out is held to one plan this way or verbatim:
+`every_entry_rocm_fix_carries_out_is_held_to_one_plan` in
+[diagnose/catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs) fails for an
+acting entry that is on neither its verbatim list nor its reviewed list of
+host-dependent plans, each of which names the test that holds it. fix-9's query,
+change and verify line are the catalog's (`IGPU_*` in
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)), with the device index
+left as `<dGPU-index>` (`the_igpu_plan_diagnose_prints_is_the_catalogs` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)), and fix-6's Linux line is
+`path_export_line`, the line `rocm fix fix-6-path` appends
+(`the_path_fix_plan_diagnose_prints_is_the_one_fix_appends`).
+
 When a fix's own command does not succeed, `rocm fix` exits 4 and prints one
 line on stderr, built from how the command ended
 (`Step` in [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs)):
@@ -4298,7 +4339,7 @@ line on stderr, built from how the command ended
 |---|---|
 | exited non-zero, or could not be started | it exited `N` (or could not be started), and the change was NOT made |
 | timed out (60s for a change), or was stopped by a signal or a failed wait | it was stopped, the change may or may not have been made, how to check it (`Check with` a shell command on Linux, `Check in PowerShell with` an expression on Windows), and the `rocm fix` command to re-run |
-| a Windows read of the current value did not complete (8s) | it could not read the current value, and nothing was changed; the runner stops before its preview of the change or any prompt, under `--dry-run` too; the catalog entry printed before it still appears |
+| a read of the current value did not complete (8s): a Windows env scope, or fix-4's `getent group` | it could not read the current value, and nothing was changed; the runner stops before its preview of the change or any prompt, under `--dry-run` too; the catalog entry printed before it still appears |
 
 Each row for each runner is unit-tested with an injected command runner in
 [fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) and
@@ -4306,7 +4347,8 @@ Each row for each runner is unit-tested with an injected command runner in
 scenarios in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
 run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-68`
 (it never finishes) stand a fake `sudo` on a restricted `PATH` that records the
-arguments it was given, and assert the line together with the exit code, that
+arguments it was given, beside `stat` and `getent` stand-ins that answer the
+fix's two reads, and assert the line together with the exit code, that
 the helper was asked to add the user to the groups, and that the success line is
 absent. Both are `@requires-os:linux @requires-bare-metal`. `diagnose-68`
 waits out the real one-minute bound; there is no switch to shorten it. The step
@@ -6937,18 +6979,18 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   The other half of ROCMAI-912 is the advice, not the measurement: the
   `fix-24-apu-unified-memory` catalog entry, which reads `amdgpu.gttsize` and
   `ttm.pages_limit` off `/proc/cmdline` and the amdkfd SVM failures out of the
-  recent kernel log. `diagnose-92`, `diagnose-93` and `diagnose-94`
+  recent kernel log. `diagnose-94`, `diagnose-95` and `diagnose-96`
   (`@requires-os:linux`; these are Linux kernel parameters) extend the same
   planted gfx1151 host with a `/proc/cmdline`, a `/proc/meminfo` reporting
   128 GiB, and a `journalctl` of their own on the CLI's `PATH` - the kernel log
   is obtained by running a command, not by reading a file, so the host-root seam
-  cannot supply it. `diagnose-92` plants a `ttm.pages_limit` a third of what
+  cannot supply it. `diagnose-94` plants a `ttm.pages_limit` a third of what
   `amdgpu.gttsize` asks for and requires the smaller ceiling to be named, a
   consistent pair sized to installed RAM to be offered, and the BIOS carve-out
-  to stay in the notes rather than appear among the commands. `diagnose-93` is
+  to stay in the notes rather than appear among the commands. `diagnose-95` is
   the negative: the same host with a page limit that covers its aperture gets no
   finding, which is what stops the entry firing on the mere presence of the
-  parameters. `diagnose-94` plants the driver's own
+  parameters. `diagnose-96` plants the driver's own
   `SVM mapping failed, exceeds resident system memory limit` line, requires it
   to be reported as a cause, then removes it and requires the report to say the
   recent log was read rather than that the machine never failed. The `kvm_amd`
@@ -6956,7 +6998,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   a detector widened to match the bare word fails
   `an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not` in
   [examine/host_env.rs](../crates/rocm-core/src/examine/host_env.rs) and
-  `diagnose-93` here. **No APU runs this entry on real hardware**: no CI lane
+  `diagnose-95` here. **No APU runs this entry on real hardware**: no CI lane
   and no development machine has one whose `gttsize` and `pages_limit` are set,
   so every check of it is simulated.
 
@@ -6990,18 +7032,18 @@ plan to ask again about that path, the path quoted where the platform's shell
 needs it, so the step accepts it bare or quoted). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
 nothing, and the answer lists the model and the projector, marked as one.
 
-Scenarios `diagnose-56` and `diagnose-95` to `diagnose-97` cover the repository
+Scenarios `diagnose-56` and `diagnose-97` to `diagnose-99` cover the repository
 answer, against a stand-in hub that serves a listing and range requests over the
 same tiny GGUF fixture and counts every connection: a bare `owner/repo` sized at
 the `--context-size` given (`diagnose-56`), one row per quantization smallest
 first with the projector left out and three different weight figures showing a
-header was read per file (`diagnose-95`), a repository of fifteen quantizations
+header was read per file (`diagnose-97`), a repository of fifteen quantizations
 whose rows past the cap say why they were not read while the connection count
-shows the requests stopped (`diagnose-96`), and a repository holding only a
-projector, answered from the file list alone (`diagnose-97`).
+shows the requests stopped (`diagnose-98`), and a repository holding only a
+projector, answered from the file list alone (`diagnose-99`).
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[5-7])'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[7-9])'
 ```
 
 ## Doctor Report Preflight

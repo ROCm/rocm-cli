@@ -141,6 +141,12 @@ pub struct Fix {
     pub needs: Option<String>,
     pub notes: Vec<String>,
     pub verify: String,
+    /// The host cannot take this fix as it stands, so `rocm fix <fix_id>` will
+    /// say why and change nothing (fix-4 when no group can be named). Not
+    /// serialized: it only steers `take_applicability_from_the_catalog`, which
+    /// then reports the class and `auto_applicable` the CLI will honour.
+    #[serde(skip)]
+    pub unavailable_here: bool,
 }
 
 /// A single scored match against the failure-mode catalog.

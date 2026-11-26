@@ -1433,6 +1433,41 @@ Feature: Diagnosing failures and listing fixes
     Then the memory the answer was reached against is the pool the GPU shares
     And the model is reported as degraded, because the pool is shared rather than set aside
 
+  # A device the user can already read and write is not a group-membership
+  # problem, whatever groups the user is in. The render-group cause only ever
+  # added score for missing groups, so it was offered here, with a closing
+  # "run `rocm fix fix-4-render-group`" directive asking for sudo and a
+  # re-login. A pasted permission error on the device still raises it; that
+  # half is unit tested (`a_kfd_permission_symptom_still_raises_it_on_a_writable_device`
+  # in crates/rocm-core/src/diagnose/linux.rs).
+  #
+  # The host is simulated like diagnose-40's: a `/dev/kfd` planted under the
+  # scenario's own root, and stand-in `stat`, `id` and `getent` ahead of the
+  # real ones, so the device's mode and owner, the user's groups and the groups
+  # the host has are the scenario's on every lane. The Then step first checks
+  # that the CLI's own inspection sees the device as writable by a user in no
+  # GPU group, the state that used to raise the cause. Not `@requires-bare-metal`:
+  # with the planted root a WSL2 lane examines the simulated machine, as it
+  # does in diagnose-40.
+  @id:diagnose-render-group-not-offered-for-a-writable-device @requires-os:linux
+  Scenario: diagnose-92 - A GPU device the user can already open is not diagnosed as a group-membership problem
+    Given a machine whose GPU compute device every user can read and write, with the user in no GPU group
+    When the user asks the CLI to diagnose the machine, in machine-readable form
+    Then adding the user to a GPU group is not offered as a cause
+
+  # `rocm diagnose` printed a `usermod` line built from the device's owning
+  # group (`video,video` here) while `rocm fix fix-4-render-group` ran its own
+  # hard-coded `render,video`, so the user approved one command and got another.
+  # Both now come from one resolver, which names only groups the host has. The
+  # device belongs to `video`, not the usual `render`, which is where the two
+  # used to differ. Simulated as in diagnose-92; the preview runs nothing, and
+  # the stand-in `sudo` and `usermod` would only record and fail if it did.
+  @id:diagnose-and-fix-propose-the-same-groups @requires-os:linux
+  Scenario: diagnose-93 - The diagnosis and the fix it names propose adding the user to the same groups
+    Given a machine whose GPU compute device belongs to the video group, which the user is not in
+    When the user compares the diagnosis with a preview of the fix it names
+    Then both propose adding the user to the device's own group, once, in the same command
+
   # ROCMAI-912. An integrated GPU has no VRAM of its own: what it may allocate
   # is capped by `amdgpu.gttsize` (MiB), by `ttm.pages_limit` (4 KiB pages) and
   # by the BIOS carve-out. The two kernel parameters are in different units, so
@@ -1450,7 +1485,7 @@ Feature: Diagnosing failures and listing fixes
   # not have. @requires-os:linux because these are Linux kernel parameters;
   # the catalog scopes the entry to bare-metal Linux for the same reason.
   @id:diagnose-apu-page-limit-caps-the-aperture @requires-os:linux
-  Scenario: diagnose-92 - An integrated GPU whose page limit undercuts its aperture is told which one decides
+  Scenario: diagnose-94 - An integrated GPU whose page limit undercuts its aperture is told which one decides
     Given an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI names the page limit as the ceiling that really applies
@@ -1462,7 +1497,7 @@ Feature: Diagnosing failures and listing fixes
   # clean kernel log, is correctly configured. An entry that fired on the mere
   # presence of the parameters would pass diagnose-89 and fail here.
   @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
-  Scenario: diagnose-93 - An integrated GPU whose two limits agree is not told to change them
+  Scenario: diagnose-95 - An integrated GPU whose two limits agree is not told to change them
     Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then no unified-memory cause is reported for that machine
@@ -1478,7 +1513,7 @@ Feature: Diagnosing failures and listing fixes
   # failure from an earlier run is not there to find. The report must say the
   # recent log was read rather than that the machine never failed.
   @id:diagnose-apu-svm-mapping-failure-is-detected @requires-os:linux
-  Scenario: diagnose-94 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
+  Scenario: diagnose-96 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
     Given an integrated-GPU machine whose kernel log reports an SVM mapping failure
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI reports the kernel's own SVM mapping failure as the cause
@@ -1497,7 +1532,7 @@ Feature: Diagnosing failures and listing fixes
   # decision behind the whole feature, and the one a shortcut would break
   # invisibly.
   @id:diagnose-a-bare-repository-answers-for-every-quantization
-  Scenario: diagnose-95 - A repository named without a quantization is answered for every quantization it publishes
+  Scenario: diagnose-97 - A repository named without a quantization is answered for every quantization it publishes
     Given a Hugging Face repository publishing three quantizations and a multimodal projector
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then every quantization is answered in its own right, smallest first, and the projector is not among them
@@ -1512,7 +1547,7 @@ Feature: Diagnosing failures and listing fixes
   # The request count is the assertion that matters: the wording can be printed
   # by a build that went on fetching regardless.
   @id:diagnose-a-repository-past-the-probe-cap-says-which-were-not-read
-  Scenario: diagnose-96 - A repository with more quantizations than one command reads stops asking and says which it did not read
+  Scenario: diagnose-98 - A repository with more quantizations than one command reads stops asking and says which it did not read
     Given a Hugging Face repository publishing fifteen quantizations
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then the quantizations past the cap are reported as not estimated, with the reason
@@ -1525,7 +1560,7 @@ Feature: Diagnosing failures and listing fixes
   # list alone settles it, as diagnose-52 relies on for a projector named
   # exactly.
   @id:diagnose-a-repository-of-only-projectors-has-nothing-to-size
-  Scenario: diagnose-97 - A repository whose only GGUF files are multimodal projectors is told it holds no language model
+  Scenario: diagnose-99 - A repository whose only GGUF files are multimodal projectors is told it holds no language model
     Given a Hugging Face repository that holds only a multimodal projector
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then the CLI says the repository holds no language model, and no header was read

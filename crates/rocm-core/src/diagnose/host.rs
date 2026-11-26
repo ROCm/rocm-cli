@@ -265,9 +265,16 @@ pub(super) fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis 
     } else {
         Fix {
             summary: format!("Add {bin_dir} to PATH for this shell and persist in your shell rc."),
+            // The line `rocm fix` appends, from the one function that builds
+            // it (`path_export_line` in `fix/catalog.rs`).
             commands: vec![
-                format!("export PATH={bin_dir}:$PATH"),
-                format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
+                crate::fix::path_export_line(&bin_dir),
+                format!(
+                    "echo '{}' >> ~/.bashrc",
+                    crate::fix::path_export_line(&bin_dir)
+                ),
+                "# Under zsh use ~/.zshrc; `rocm fix fix-6-path` picks the file for you."
+                    .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
             // The `rocm fix` catalog's Linux line. `rocminfo` lives in the bin
@@ -440,36 +447,39 @@ pub(super) fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Dia
     let note = format!(
         "{note} Without --device-index, `rocm fix` only prints this query and makes no change."
     );
-    let fix = if e.os_family == "windows" {
-        Fix {
-            summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
-            commands: vec![
-                "# Confirm which index is the dGPU (hipInfo.exe output order):".to_owned(),
-                "& \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name|gcnArchName\"".to_owned(),
-                "# Then persist HIP_VISIBLE_DEVICES in the User environment:".to_owned(),
-                "setx HIP_VISIBLE_DEVICES 1".to_owned(),
-                "# `setx` only takes effect in NEW shells; reopen the terminal.".to_owned(),
-            ],
-            fix_id: "fix-9-igpu-dgpu".to_owned(),
-            verify: "powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','1','Process'); python -c 'import torch; print(torch.cuda.device_count())'\"".to_owned(),
-            notes: vec![note],
-            ..Fix::default()
-        }
+    // The query, the change and the verify line are the catalog's own
+    // (`IGPU_*` in `fix/catalog.rs`), which the runner prints too. The index is
+    // a placeholder: which device is the discrete GPU is the user's to read off
+    // the query, and `rocm fix` needs it as `--device-index`.
+    let (summary, query_comment, query, pin) = if e.os_family == "windows" {
+        (
+            "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.",
+            "# Confirm which index is the dGPU (hipInfo.exe output order):",
+            crate::fix::IGPU_QUERY_WINDOWS,
+            crate::fix::IGPU_PIN_WINDOWS,
+        )
     } else {
-        Fix {
-            summary: "Pin the runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
-            commands: vec![
-                "# Confirm which index is the dGPU (`rocminfo` output order):".to_owned(),
-                "rocminfo | grep -E 'Agent |gfx|Marketing'".to_owned(),
-                "# Then pin HIP to the dGPU (typically index 1 when an APU is index 0):".to_owned(),
-                "export HIP_VISIBLE_DEVICES=1".to_owned(),
-                "# Persist in your shell rc or your launch script.".to_owned(),
-            ],
-            fix_id: "fix-9-igpu-dgpu".to_owned(),
-            verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![note],
-            ..Fix::default()
-        }
+        (
+            "Pin the runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.",
+            "# Confirm which index is the dGPU (`rocminfo` output order):",
+            crate::fix::IGPU_QUERY_LINUX,
+            crate::fix::IGPU_PIN_LINUX,
+        )
+    };
+    let fix = Fix {
+        summary: summary.to_owned(),
+        commands: vec![
+            query_comment.to_owned(),
+            query.to_owned(),
+            "# Then pin the runtime to it, with its index in place of <dGPU-index>".to_owned(),
+            "# (`rocm fix fix-9-igpu-dgpu --device-index N` persists it for you):".to_owned(),
+            pin.to_owned(),
+            "# The change only reaches NEW shells; open one before the verify line.".to_owned(),
+        ],
+        fix_id: "fix-9-igpu-dgpu".to_owned(),
+        verify: crate::fix::IGPU_VERIFY.to_owned(),
+        notes: vec![note],
+        ..Fix::default()
     };
     finalize(
         "fix-9-igpu-dgpu",
@@ -1221,60 +1231,83 @@ mod tests {
         );
     }
 
-    /// The Windows `Fix` for fix-9, which only `rocm diagnose` prints: its verify
-    /// differs from the catalog's because it has to run in PowerShell.
-    fn windows_igpu_fix() -> Fix {
-        check_9_igpu_dgpu_collision(&igpu_dgpu_host("windows"), "torch crashes with a segfault")
-            .fix
-            .expect("an APU beside a discrete GPU on Windows gets a fix")
+    /// The lines of `commands` a shell runs: comments dropped.
+    fn executable(commands: &[String]) -> Vec<&str> {
+        commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .collect()
     }
 
-    /// Runs on every host. The Windows fix-9 verify sets `HIP_VISIBLE_DEVICES`
-    /// to `1` for the process, then runs one single-quoted python program, all
-    /// in one double-quoted `-Command` argument.
-    /// `the_igpu_verify_pins_the_variable_it_names` runs it, on Windows.
+    /// The lines of the catalog's fix-9 recipe under its `# <os> ...` heading,
+    /// comments dropped.
+    fn catalog_igpu_lines(os: &str) -> Vec<&'static str> {
+        let (_, _, run) = crate::fix::recipe_verify_notes_and_run_commands("fix-9-igpu-dgpu")
+            .expect("fix-9-igpu-dgpu is in the recipe catalog");
+        // Two lines per OS, Linux first, as the recipe lists them.
+        let start = if os == "windows" { 2 } else { 0 };
+        run[start..start + 2].to_vec()
+    }
+
+    /// fix-9's plan is one plan: the query and the change `rocm diagnose`
+    /// prints on each OS are the catalog recipe's lines for that OS, and the
+    /// verify line is the catalog's. The runner prints the same query and
+    /// writes the same change with the index filled in (both read the
+    /// `IGPU_*` constants in `fix/catalog.rs`; its tests pin the filled-in
+    /// lines). The diagnosis used to print `HIP_VISIBLE_DEVICES=1`, an index
+    /// it cannot know.
     #[test]
-    fn the_windows_igpu_verify_is_one_quoted_powershell_argument() {
-        let verify = windows_igpu_fix().verify;
-        let body = verify
-            .strip_prefix("powershell -NoProfile -Command \"")
-            .and_then(|rest| rest.strip_suffix('"'))
-            .unwrap_or_else(|| panic!("not a quoted `powershell -Command` argument: {verify}"));
-        assert!(
-            !body.contains('"'),
-            "an inner quote ends the argument: {body}"
-        );
-        assert!(
-            body.starts_with("[Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','1','Process'); python -c '"),
-            "{body}"
-        );
+    fn the_igpu_plan_diagnose_prints_is_the_catalogs() {
+        let (catalog_verify, _, _) =
+            crate::fix::recipe_verify_notes_and_run_commands("fix-9-igpu-dgpu")
+                .expect("fix-9-igpu-dgpu is in the recipe catalog");
+        for os in ["linux", "windows"] {
+            let fix = check_9_igpu_dgpu_collision(&igpu_dgpu_host(os), "")
+                .fix
+                .expect("an APU beside a discrete GPU gets a fix");
+            assert_eq!(executable(&fix.commands), catalog_igpu_lines(os), "{os}");
+            assert_eq!(fix.verify, catalog_verify, "{os}");
+            assert!(
+                fix.commands
+                    .iter()
+                    .all(|c| !c.contains("HIP_VISIBLE_DEVICES=1")
+                        && !c.contains("HIP_VISIBLE_DEVICES 1")),
+                "{os}: no index is known before the user reads one off the query: {:?}",
+                fix.commands
+            );
+        }
     }
 
-    /// Runs the fix-9 Windows verify line in cmd and in Windows PowerShell with
-    /// a stand-in `torch` module first on `PYTHONPATH`. The module's
-    /// `cuda.device_count()` returns what `HIP_VISIBLE_DEVICES` holds, so the
-    /// line, unchanged, prints `1` only if it set that variable, to that value,
-    /// before python started. The variable is removed from the child's
-    /// environment first, so a value left on the host cannot satisfy it. Python
-    /// is on PATH on the Windows CI hosts. Only compiled on Windows.
+    /// Runs fix-9's verify line in cmd and in Windows PowerShell with a
+    /// stand-in `torch` module first on `PYTHONPATH`, whose
+    /// `cuda.device_count()` returns what `HIP_VISIBLE_DEVICES` holds. The
+    /// line reads the value the change persisted: with the variable set to `1`
+    /// for the child, as a new shell after the change would have it, the line
+    /// prints `1` and the device name, in both shells. Python is on PATH on the
+    /// Windows CI hosts. Only compiled on Windows.
     #[cfg(windows)]
     #[test]
-    fn the_igpu_verify_pins_the_variable_it_names() {
-        let verify = windows_igpu_fix().verify;
+    fn the_igpu_verify_reads_the_variable_the_change_persisted() {
+        let verify = check_9_igpu_dgpu_collision(&igpu_dgpu_host("windows"), "")
+            .fix
+            .expect("an APU beside a discrete GPU on Windows gets a fix")
+            .verify;
         let dir = std::env::temp_dir().join(format!("rocm igpu torch {}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the stand-in module directory is created");
         std::fs::write(
             dir.join("torch.py"),
             "import os\n\nclass cuda:\n    @staticmethod\n    def device_count():\n        \
-             return os.environ.get('HIP_VISIBLE_DEVICES', 'UNSET')\n",
+             return os.environ.get('HIP_VISIBLE_DEVICES', 'UNSET')\n\n    \
+             @staticmethod\n    def get_device_name(index):\n        return 'dGPU'\n",
         )
         .expect("the stand-in torch is written");
         let python_path = dir.to_string_lossy().into_owned();
         let runs = crate::fix::run_typed_in_cmd_and_powershell(
             &verify,
             &[
-                ("HIP_VISIBLE_DEVICES", None),
+                ("HIP_VISIBLE_DEVICES", Some("1")),
                 ("PYTHONPATH", Some(python_path.as_str())),
             ],
         );
@@ -1292,7 +1325,43 @@ mod tests {
                 stderr.trim().is_empty(),
                 "{shell} wrote to stderr: {stderr}"
             );
-            assert_eq!(stdout.trim(), "1", "{shell}, stderr: {stderr}");
+            assert_eq!(stdout.trim(), "1 dGPU", "{shell}, stderr: {stderr}");
+        }
+    }
+
+    /// fix-6's Linux plan is the line `rocm fix fix-6-path` appends to the
+    /// shell rc file: the diagnosis prints `path_export_line` (in
+    /// `fix/catalog.rs`), which the runner appends, for the install the
+    /// examination found, and for the conventional `/opt/rocm` its `echo` line
+    /// is the catalog recipe's. The diagnosis used to print the line unquoted,
+    /// which the runner never wrote.
+    #[test]
+    fn the_path_fix_plan_diagnose_prints_is_the_one_fix_appends() {
+        let (_, _, catalog_run) = crate::fix::recipe_verify_notes_and_run_commands("fix-6-path")
+            .expect("fix-6-path is in the recipe catalog");
+        for (rocm_path, bin_dir) in [
+            ("/opt/rocm", "/opt/rocm/bin"),
+            ("/opt/rocm-6.4.1", "/opt/rocm-6.4.1/bin"),
+        ] {
+            let fix = check_6_path_missing(
+                &Examination {
+                    os_family: "linux".to_owned(),
+                    rocm_path: rocm_path.to_owned(),
+                    ..Examination::default()
+                },
+                "rocminfo: command not found",
+            )
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+            let export = crate::fix::path_export_line(bin_dir);
+            assert_eq!(
+                executable(&fix.commands),
+                [export.clone(), format!("echo '{export}' >> ~/.bashrc")],
+                "{rocm_path}"
+            );
+            if rocm_path == "/opt/rocm" {
+                assert_eq!(executable(&fix.commands)[1], catalog_run[0]);
+            }
         }
     }
 

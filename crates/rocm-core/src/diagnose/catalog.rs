@@ -370,6 +370,14 @@ pub(super) fn take_applicability_from_the_catalog(
         // An entry the catalog does not list for this OS keeps the default:
         // the CLI will not act on it here, which is exactly what the OS gate in
         // `fix::apply` would tell the user.
+        if fix.unavailable_here {
+            // `rocm fix` refuses this one on this host (exit 3), so the catalog's
+            // `Auto` would promise a run that never happens.
+            fix.class = crate::fix::FixClass::DiagnoseOnly;
+            fix.auto_applicable = false;
+            fix.needs = None;
+            continue;
+        }
         let class = crate::fix::class_on(&fix.fix_id, platform_family).unwrap_or_default();
         fix.class = class;
         fix.auto_applicable = class.applies_itself();
@@ -1052,6 +1060,73 @@ mod tests {
         }
     }
 
+    /// The entries `diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`
+    /// holds to one plan: their diagnosis prints the catalog's command lines,
+    /// verify line and notes verbatim.
+    const SAME_PLAN_IDS: &[&str] = &[
+        "fix-16-vllm-oom",
+        "fix-15-msvc-redist",
+        "fix-21-msvc-redist-outdated",
+        "info-20-gpu-no-rocm-support",
+        "fix-13-hip-sdk-missing",
+        "fix-14-adrenalin-too-old",
+        crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID,
+        "fix-23-vllm-extension-load",
+    ];
+
+    /// The entries whose plan depends on the host, so their diagnosis cannot
+    /// print the catalog's lines verbatim, each with why and the test that
+    /// holds `rocm diagnose` and `rocm fix` to one plan for it. Reviewed: an
+    /// entry joins only with such a test.
+    const HOST_DEPENDENT_PLANS: &[(&str, &str)] = &[
+        (
+            "fix-2-unset-override",
+            "the diagnosis prints the lines for its own OS; the Windows clear line is the \
+             catalog's, the runner reads both env scopes first, and \
+             `the_override_fix_verify_matches_the_catalog_copy` holds the Linux verify line",
+        ),
+        (
+            "fix-4-render-group",
+            "the groups are the host's; both sides resolve them with `render_group_targets`, \
+             held by `the_render_group_plan_diagnose_prints_is_the_one_fix_runs`",
+        ),
+        (
+            "fix-6-path",
+            "the bin directory is the host's install; the Linux line is `path_export_line`, \
+             held by `the_path_fix_plan_diagnose_prints_is_the_one_fix_appends`, and the \
+             Windows line is the paste twin of `path_export_windows`",
+        ),
+        (
+            "fix-9-igpu-dgpu",
+            "the device index is the user's; the diagnosis prints the catalog's lines for its \
+             OS with the index as a placeholder, held by \
+             `the_igpu_plan_diagnose_prints_is_the_catalogs`",
+        ),
+    ];
+
+    /// Every entry `rocm fix` carries out somewhere is one whose diagnosis is
+    /// held to the catalog: either verbatim (`SAME_PLAN_IDS`) or through the
+    /// test its `HOST_DEPENDENT_PLANS` row names. A new acting entry fails
+    /// here until it is put on one of the two lists.
+    #[test]
+    fn every_entry_rocm_fix_carries_out_is_held_to_one_plan() {
+        for id in crate::fix::acting_fix_ids() {
+            assert!(
+                SAME_PLAN_IDS.contains(&id)
+                    || HOST_DEPENDENT_PLANS.iter().any(|(listed, _)| *listed == id),
+                "`{id}` acts on the machine, so the plan `rocm diagnose` prints for it has \
+                 to be held to the one `rocm fix` runs: add it to SAME_PLAN_IDS, or to \
+                 HOST_DEPENDENT_PLANS with the test that holds it"
+            );
+        }
+        for (id, _) in HOST_DEPENDENT_PLANS {
+            assert!(
+                crate::fix::acting_fix_ids().contains(id),
+                "`{id}` no longer acts on the machine; take it off HOST_DEPENDENT_PLANS"
+            );
+        }
+    }
+
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
         // fix-13, fix-14, fix-15, fix-16, fix-21, info-20, fix-22 and fix-23 live in two places: the `rocm fix`
@@ -1135,7 +1210,7 @@ mod tests {
             },
             crate::diagnose::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
         );
-        for diag in [
+        let diagnoses = [
             vllm_oom,
             msvc,
             msvc_outdated,
@@ -1144,7 +1219,13 @@ mod tests {
             adrenalin_old,
             display_driver_old,
             extension_load,
-        ] {
+        ];
+        assert_eq!(
+            diagnoses.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            SAME_PLAN_IDS,
+            "SAME_PLAN_IDS names the entries this test compares"
+        );
+        for diag in diagnoses {
             if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
                 assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);
             } else {
@@ -1189,8 +1270,8 @@ mod tests {
     /// Like that test it pins the text only. Nothing here runs a command in a
     /// shell. The Windows-only tests named on `fails_in_windows_powershell` in
     /// `fix/catalog.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
-    /// and `the_igpu_verify_pins_the_variable_it_names` runs fix-9's, all on
-    /// Windows.
+    /// and `the_igpu_verify_reads_the_variable_the_change_persisted` runs
+    /// fix-9's, all on Windows.
     #[test]
     fn windows_diagnosis_remediation_passes_the_powershell_text_rule() {
         // Host state that wakes the checkers which answer from the machine and
