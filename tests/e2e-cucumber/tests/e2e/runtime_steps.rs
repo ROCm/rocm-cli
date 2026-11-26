@@ -189,15 +189,20 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
 /// holds a superseded runtime beside its replacement. Left unset, the CLI
 /// refuses to auto-select from more than one runtime and every serve behind this
 /// precondition fails for a reason that names none of this.
+///
+/// The tree's marker wins over the newest installed runtime: activating the
+/// newest rewrites the shared `active.json`, so a release `n-2` leg pinned to
+/// 7.14.1 would serve on a newer SDK from the first scenario on (rocm-cli#1131).
 fn activate_shared_runtime_if_unset(world: &mut E2eWorld, runtimes: &str) {
     if !runtimes.contains("active_runtime_key: <unset>") {
         return;
     }
-    let runtime_key = e2e_cucumber::capability::canonical_wheel_runtime_key(runtimes)
-        .unwrap_or_else(|| {
-            panic!("shared runtime tree has no canonical wheel runtime:\n{runtimes}")
-        })
-        .to_owned();
+    let shared = crate::shared_runtimes_dir();
+    let runtime_key =
+        e2e_cucumber::shared_runtime::runtime_key_when_unset(shared.as_deref(), runtimes)
+            .unwrap_or_else(|| {
+                panic!("shared runtime tree has no canonical wheel runtime:\n{runtimes}")
+            });
     crate::run_rocm_ok(world, &["runtimes", "activate", &runtime_key]);
 }
 

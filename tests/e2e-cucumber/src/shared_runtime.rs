@@ -59,6 +59,22 @@ pub fn runtime_key_to_activate(runtimes_dir: &Path) -> Option<String> {
         })
 }
 
+/// The runtime to activate for a scenario whose config has no active runtime.
+///
+/// The tree's own pin comes first: [`runtime_key_to_activate`] reads what the
+/// pre-warm activated, which is the runtime the matrix leg names (for the
+/// release `n-1`/`n-2` legs, an older SDK than the newest one installed). Only
+/// when the tree names none does the newest canonical wheel runtime in
+/// `inventory` (`rocm runtimes list` output, newest first) stand in. Taking the
+/// newest first would rewrite the shared `active.json` and move the whole leg
+/// onto whichever runtime was installed most recently.
+#[must_use]
+pub fn runtime_key_when_unset(runtimes_dir: Option<&Path>, inventory: &str) -> Option<String> {
+    runtimes_dir
+        .and_then(runtime_key_to_activate)
+        .or_else(|| crate::capability::canonical_wheel_runtime_key(inventory).map(str::to_owned))
+}
+
 /// The `runtime_key` recorded in `<runtimes_dir>/active.json`, if it names one.
 fn active_runtime_key(runtimes_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(runtimes_dir.join("active.json")).ok()?;
@@ -493,5 +509,32 @@ mod tests {
         active(dir, "   ");
 
         assert_eq!(runtime_key_to_activate(dir), None);
+    }
+
+    /// A leg pinned to an older SDK than the newest installed one: the pin the
+    /// pre-warm activated wins over the newest-first inventory order.
+    #[test]
+    fn unset_activation_keeps_the_pinned_runtime_over_the_newest() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let dir = tmp.path();
+        installed(dir, "release-wheel-multi-arch-7-14-1");
+        installed(dir, "release-wheel-multi-arch-10-1-0");
+        active(dir, "release-wheel-multi-arch-7-14-1");
+        let inventory = "release-wheel-multi-arch-10-1-0 x\nrelease-wheel-multi-arch-7-14-1 y\n";
+
+        assert_eq!(
+            runtime_key_when_unset(Some(dir), inventory).as_deref(),
+            Some("release-wheel-multi-arch-7-14-1")
+        );
+    }
+
+    /// No marker and no shared tree: the newest canonical runtime stands in.
+    #[test]
+    fn unset_activation_falls_back_to_the_newest_canonical_runtime() {
+        let inventory = "release-wheel-multi-arch-10-1-0 x\nrelease-wheel-multi-arch-7-14-1 y\n";
+        assert_eq!(
+            runtime_key_when_unset(None, inventory).as_deref(),
+            Some("release-wheel-multi-arch-10-1-0")
+        );
     }
 }
