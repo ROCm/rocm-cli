@@ -5659,7 +5659,7 @@ async fn assert_the_quantizations_past_the_cap_say_why(world: &mut E2eWorld) {
     }
     let evidence = evidence_text(&model);
     assert!(
-        evidence.contains("not estimated, for the reason on its row"),
+        evidence.contains("not read, for the reason on its row"),
         "an incomplete answer must not read as a complete one: {model:#}"
     );
 }
