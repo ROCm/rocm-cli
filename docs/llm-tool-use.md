@@ -109,7 +109,8 @@ rocm-cli local assistants use structured tools, not shell commands.
   (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, Lemonade and AIM (a
   Docker-based engine) are the general serving engines; the assistant may inspect or manage them for model
   serving, but it should not switch its own built-in chat engine away from
-  Lemonade.
+  Lemonade. For a one-prompt `rocm chat --provider local`, the same model is
+  what `local` uses without `--model`; any other served model needs `--model`.
 - The assistant prompt is grounded in the host. rocm-cli detects the operating
   system (including WSL), the AMD GPU and its `gfx` target, and which serving
   engines run there, and appends those facts to the system prompt on every chat

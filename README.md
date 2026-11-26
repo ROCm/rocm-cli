@@ -2398,6 +2398,9 @@ standard input, it sends one prompt and prints the reply.
   the default), `openai`, or `anthropic`. A cloud provider needs setup
   first: run `rocm config enable-provider <provider>` and
   `rocm config set-provider-key <provider>`. See [Configuration](#configuration).
+- Without `--model`, `local` uses only the built-in assistant model
+  (`Qwen3-4B-Instruct-2507-GGUF` on Lemonade) and fails if that model is not
+  being served. Any other model that `rocm serve` runs needs `--model`.
 - `--tools` lets an OpenAI-compatible provider request ROCm tool calls.
 - `--provider`, `--model`, and `--tools` apply to the one-prompt form. The
   dashboard chat ignores them.
