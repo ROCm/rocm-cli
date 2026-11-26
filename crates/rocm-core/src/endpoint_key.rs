@@ -634,7 +634,8 @@ mod tests {
             let launch = refusal(host, false, requires, ServiceStart::Launch);
             for stale in [
                 "dropped when a service stops",
-                "Launch it again",
+                "Launching it again",
+                "launch it again",
                 "still be publishing",
                 "managed service",
                 "rocm services stop",
