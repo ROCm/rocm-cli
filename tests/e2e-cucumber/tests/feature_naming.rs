@@ -75,14 +75,73 @@ fn features_dir() -> PathBuf {
 }
 
 /// Every `.feature` file actually present, by file name.
+///
+/// Flat, not recursive, and it refuses to run rather than quietly cover less if
+/// that stops being true. `feature_files` in `src/expectation.rs` makes the same
+/// assumption, and a subdirectory that made one scan fail while the other
+/// skipped it would be the worst of both.
 fn feature_files() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(features_dir())
-        .expect("features dir")
-        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into())
-        .filter(|n: &String| n.ends_with(".feature"))
-        .collect();
+    feature_files_in(&features_dir())
+}
+
+/// The scan itself, split out so the refusals can be driven against a temporary
+/// tree. It is the twin of `feature_files_in` in `src/expectation.rs`, with the
+/// same refusals and the same `Path::extension` test, not a `.feature` suffix
+/// test: a file named exactly `.feature` has no extension, and the two scans
+/// would otherwise cover different sets.
+fn feature_files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("features dir") {
+        let path = entry.expect("dir entry").path();
+        assert!(
+            !path.is_dir(),
+            "features/ has grown a subdirectory ({}), which this scan does not descend \
+             into: make it recursive, here and in src/expectation.rs, before moving any \
+             .feature file into one",
+            path.display()
+        );
+        if path.extension().is_some_and(|ext| ext == "feature") {
+            let name = path.file_name().expect("dir entry name").to_string_lossy();
+            names.push(name.into_owned());
+        }
+    }
+    assert!(
+        !names.is_empty(),
+        "found no .feature files in {}",
+        dir.display()
+    );
     names.sort();
     names
+}
+
+#[test]
+fn the_feature_scan_takes_the_flat_files_it_finds() {
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("b.feature"), "Feature: b\n").unwrap();
+    std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+    std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    // No extension, so neither this scan nor its twin takes it.
+    std::fs::write(dir.path().join(".feature"), "not a feature file\n").unwrap();
+    assert_eq!(feature_files_in(dir.path()), ["a.feature", "b.feature"]);
+}
+
+#[test]
+#[should_panic(expected = "found no .feature files")]
+fn the_feature_scan_refuses_a_directory_with_no_feature_files() {
+    // A non-`.feature` file on purpose: what is refused is an empty result, not
+    // only an empty directory.
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    let _ = feature_files_in(dir.path());
+}
+
+#[test]
+#[should_panic(expected = "has grown a subdirectory")]
+fn the_feature_scan_refuses_a_subdirectory_rather_than_skipping_it() {
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    let _ = feature_files_in(dir.path());
 }
 
 /// The `@id:` tags and scenario names in one feature file, paired in declaration
