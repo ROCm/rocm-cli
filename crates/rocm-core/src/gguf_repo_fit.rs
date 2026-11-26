@@ -147,6 +147,23 @@ impl RepositoryFit {
             .count()
     }
 
+    /// How many had their GGUF header fetched and parsed, whether or not a size
+    /// came out of it.
+    ///
+    /// Apart from [`Self::estimated`], which counts rows that reached figures.
+    /// A header can be read and still yield none -- one shard of a split model
+    /// carries the metadata but not the weights, and a projector is not a
+    /// language model -- so reporting `estimated` as the number of headers read
+    /// called those rows unread, and offered the remedy for a row nobody had
+    /// looked at.
+    #[must_use]
+    pub fn read(&self) -> usize {
+        self.quantizations
+            .iter()
+            .filter(|quant| quant.estimate().is_some())
+            .count()
+    }
+
     /// How many were compared with memory this host was measured to have and
     /// came out of it with a verdict.
     ///
@@ -351,20 +368,39 @@ fn apply_repository_fit(readiness: &mut ModelReadiness, fit: RepositoryFit) {
         return;
     }
     let estimated = fit.estimated();
+    let read = fit.read();
     readiness.evidence.push(format!(
         "`{}` names a repository, so every quantization in it was answered: it publishes {total} \
-         language-model {}, of which {estimated} had {} read; the weights were not downloaded",
+         language-model {}, of which {read} had {} read and {estimated} could be sized from it; \
+         the weights were not downloaded",
         fit.repository,
         plural(total, "quantization", "quantizations"),
-        plural(estimated, "a GGUF header", "GGUF headers"),
+        plural(read, "a GGUF header", "GGUF headers"),
     ));
-    let unanswered = total - estimated;
-    if unanswered > 0 {
+    // Two different reasons a row carries no figures, and only one of them has
+    // this remedy. A row nobody read -- past the probe cap, or past the budget
+    // -- is sized by naming it alone, because that asks for the one header this
+    // command skipped. A row that *was* read and still has no figures is a file
+    // the formula cannot size at all: one shard of a split model carries the
+    // metadata and not the weights, and `rocm diagnose --model owner/repo:QUANT`
+    // on that shard says exactly the same thing again. Offering the remedy for
+    // both sent the second group round a loop.
+    let unread = total - read;
+    if unread > 0 {
         readiness.evidence.push(format!(
-            "{unanswered} of the {total} {} not estimated, for the reason on its row; naming one \
-             as `{}:QUANT` sizes it on its own",
-            plural(unanswered, "was", "were"),
+            "{unread} of the {total} {} not read, for the reason on its row; naming one as \
+             `{}:QUANT` reads and sizes it on its own",
+            plural(unread, "was", "were"),
             fit.repository
+        ));
+    }
+    let read_but_unsized = read - estimated;
+    if read_but_unsized > 0 {
+        readiness.evidence.push(format!(
+            "{read_but_unsized} of the {total} {} read but could not be sized, for the reason on \
+             its row; naming one on its own gives the same answer, because the file itself is \
+             not one this estimate can size",
+            plural(read_but_unsized, "was", "were"),
         ));
     }
     // "0 of 14 fit" and "none of them was compared" are different answers, and
@@ -410,7 +446,7 @@ fn apply_repository_fit(readiness: &mut ModelReadiness, fit: RepositoryFit) {
         // one among them could fit too. Where one went unread the claim is
         // narrowed to what was actually looked at, rather than promising a
         // maximum over files this command never saw.
-        let largest = if unanswered > 0 {
+        let largest = if fit.quantizations.len() > fit.estimated() {
             "the largest of those read that fits"
         } else {
             "the largest that fits"
@@ -631,6 +667,23 @@ mod tests {
 
     fn read(name: &str, size: u64) -> QuantProbe {
         let header = parse_gguf_header(&mut Cursor::new(llama_like(10).file(0))).unwrap();
+        QuantProbe {
+            file: name.to_owned(),
+            size: Some(header.data_offset + size),
+            outcome: QuantProbeOutcome::Read(Box::new(header)),
+        }
+    }
+
+    /// One shard of a split model: the header is read and parsed, and
+    /// `estimate_fit` then declines to size it because the weights are spread
+    /// over files this one does not name. Read, and still no figures -- the
+    /// shape that must not be reported as unread, and must not be offered the
+    /// "name it on its own" remedy.
+    fn read_shard(name: &str, size: u64) -> QuantProbe {
+        let header = parse_gguf_header(&mut Cursor::new(
+            llama_like(10).u32("split.count", 3).file(0),
+        ))
+        .unwrap();
         QuantProbe {
             file: name.to_owned(),
             size: Some(header.data_offset + size),
@@ -1059,6 +1112,61 @@ mod tests {
                 "{memory:?}: {rows}"
             );
         }
+    }
+
+    /// A shard is read and still has no figures, and the evidence has to say
+    /// both halves of that.
+    ///
+    /// Counting the sized rows as "headers read" called the shard unread, and
+    /// then offered it the remedy for a row nobody had looked at -- `naming one
+    /// as owner/repo:QUANT sizes it on its own`, which on a shard produces the
+    /// same refusal a second time. The README documents a shard as the file
+    /// this estimate cannot size, so the loop was guaranteed.
+    #[test]
+    fn a_shard_is_reported_as_read_and_unsizeable_rather_than_unread() {
+        let source = FakeRepository::new(RepositoryProbe {
+            quants: vec![
+                read("m-Q4_K_M.gguf", 4 << 30),
+                read_shard("m-Q8_0-00001-of-00003.gguf", 8 << 30),
+            ],
+            projectors: 0,
+        });
+        let mut readiness = not_curated("o/r");
+        attach_repository_fit(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host(24.0),
+            &source,
+        );
+        let fit = readiness.quantizations.as_ref().expect("a repository fit");
+        let shard = &fit.quantizations[1];
+        assert_eq!(
+            shard
+                .estimate()
+                .map(|estimate| (estimate.total_bytes, estimate.cannot_estimate_reason)),
+            Some((None, Some(CannotEstimateReason::SplitFile))),
+            "premise: the second row has to be read and unsizeable: {fit:?}"
+        );
+        assert_eq!(fit.read(), 2, "both headers were read: {fit:?}");
+        assert_eq!(fit.estimated(), 1, "only one of them sized: {fit:?}");
+
+        let evidence = readiness.evidence.join("\n");
+        assert!(
+            evidence.contains("2 had GGUF headers read and 1 could be sized from it"),
+            "the count of headers read must not be the count that sized: {evidence}"
+        );
+        assert!(
+            evidence.contains("1 of the 2 was read but could not be sized"),
+            "the shard has to be named as read: {evidence}"
+        );
+        assert!(
+            !evidence.contains("was not read"),
+            "nothing here went unread, so no row may be offered that remedy: {evidence}"
+        );
+        assert!(
+            !evidence.contains("`o/r:QUANT` reads and sizes it on its own"),
+            "naming a shard on its own repeats the same refusal: {evidence}"
+        );
     }
 
     /// A row the formula will not judge is not one of those compared.
