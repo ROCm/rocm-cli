@@ -264,7 +264,9 @@ pub(super) const KEYWORDS_PAGE_FAULT: KeywordTable = &[
 // vLLM's OOM apart from an arbitrary training script hitting the same
 // allocator error. `check_16_vllm_oom` therefore scores *only* the lines
 // carrying `VLLM_ANCHOR_PATTERN` (see `vllm_anchored_lines`), never the whole
-// pasted log: an OOM on an unanchored line contributes nothing at all.
+// pasted log: an OOM on an unanchored line contributes nothing at all. The one
+// exception is a symptom the user says came from vLLM (`rocm diagnose --engine
+// vllm`), where every non-blank line is vLLM's by their account and scores.
 //
 // Weighting splits the *allocator message* from the *exception class name*:
 //   - The HIP allocator's own messages (`HIP out of memory`, the
@@ -353,6 +355,99 @@ pub(super) const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
         "error names tvm_ffi's _optional_torch_c_dlpack shim",
     ),
 ];
+
+/// A vLLM compiled extension that failed to load, met later as an op missing
+/// from `torch.ops` (ROCMAI-1058).
+///
+/// vLLM imports some of its extensions inside a `try` that only logs a warning,
+/// so the process carries on and dies at the first call to an op that extension
+/// registers: `AttributeError: '_OpNamespace' '_C' object has no attribute
+/// '<op>'`. That line is worth exactly [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH)
+/// on its own — but **only behind an anchor**, which is why it is the first
+/// entry and why [`vllm_extension_load_keywords`] exists. The namespace pattern
+/// takes vLLM's own op libraries (`_C`, `_rocm_C`, `_moe_C`, `_C_cache_ops`) and
+/// not torch's (`_c10d_functional`), so an op missing from torch itself is not
+/// read as this — but `_C` is the ordinary name for a compiled extension right
+/// across the PyTorch ecosystem (torchvision, xformers, bitsandbytes, apex,
+/// detectron2, mmcv all ship one and all raise this exact `AttributeError`
+/// shape), so the namespace alone says "some extension", not "vLLM's".
+///
+/// The other entries are the cause as the loader states it, from the warning
+/// vLLM logs or from importing the extension by hand. A glibc version error is
+/// below the threshold on its own, because any binary can print one; it counts
+/// together with the vLLM extension it names.
+/// Ordered so the entries that may only be scored behind a vLLM anchor come
+/// FIRST, because [`vllm_extension_load_keywords`] draws its line by index.
+/// That grouping, not weight order, is what the slice boundary means — the two
+/// leading entries are the ones whose text names nothing a reader could tie to
+/// vLLM, so they must never be scored against an unanchored paste.
+pub(super) const KEYWORDS_VLLM_EXTENSION_LOAD: KeywordTable = &[
+    (
+        r"_opnamespace'?\s+'?_(?:\w+_)?c(?:_\w+)?'?\s+object has no attribute",
+        50,
+        "an op a vLLM compiled extension registers is missing from torch.ops",
+    ),
+    // Anchor-only despite being well under the threshold on its own: paired
+    // with the generic glibc entry below it summed to 60 against a threshold of
+    // 50, so an unanchored paste reached a verdict with no vLLM text in it.
+    (
+        "get_cuda_view_from_cpu_tensor",
+        30,
+        "error names an op registered by vllm._C_stable_libtorch",
+    ),
+    (
+        r"failed to import from vllm\._\w+",
+        45,
+        "vLLM logged that one of its compiled extensions failed to import",
+    ),
+    (
+        r"vllm/_\w+\.abi3\.so",
+        40,
+        "error names a vLLM compiled extension module",
+    ),
+    (
+        r"glibc_2\.\d+'? not found",
+        30,
+        "the host's glibc is older than the one the extension was built against",
+    ),
+];
+
+/// The part of [`KEYWORDS_VLLM_EXTENSION_LOAD`] that may be scored against
+/// `symptom` text which carries no vLLM-identifying token (`anchored == false`).
+///
+/// The first **two** entries are withheld: the `_OpNamespace` namespace shape
+/// and `get_cuda_view_from_cpu_tensor`. Neither names anything a reader could
+/// tie to vLLM, which is what the slice boundary means — see the grouping note
+/// on [`KEYWORDS_VLLM_EXTENSION_LOAD`].
+///
+/// Withholding the `_OpNamespace` entry alone is necessary but **not
+/// sufficient**, and an earlier version of this comment wrongly claimed it was.
+/// It is the only entry that clears
+/// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) by itself, but
+/// [`keyword_score`] sums the top **two** weights, so two individually
+/// sub-threshold entries can clear the threshold together — which is exactly
+/// what `get_cuda_view_from_cpu_tensor` (30) and the generic
+/// `GLIBC_2.NN' not found` (30) did, for 60 against a threshold of 50, with no
+/// vLLM token anywhere. The op name is vLLM's own, so it is now matched by
+/// `VLLM_EXTENSION_ANCHOR_PATTERN` and withheld here rather than left to pair
+/// with a generic one. The property this split relies on is therefore about
+/// the *sum*, not about any single entry.
+///
+/// Dropping no more than those two is what keeps the weak signals —
+/// notably a bare `GLIBC_2.NN' not found`, which must stay *present and
+/// sub-threshold* rather than vanish (`a_glibc_error_alone_stays_below_the_match_threshold`).
+///
+/// A whole-table gate returning nothing was tried and is wrong for that reason.
+/// `the_only_unanchored_keyword_is_the_one_this_withholds` and
+/// `an_unanchored_paste_cannot_reach_the_threshold_by_summing` pin both halves,
+/// so a new entry cannot quietly reopen the hole.
+pub(super) fn vllm_extension_load_keywords(anchored: bool) -> KeywordTable {
+    if anchored {
+        KEYWORDS_VLLM_EXTENSION_LOAD
+    } else {
+        &KEYWORDS_VLLM_EXTENSION_LOAD[2..]
+    }
+}
 
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
 ///
@@ -465,6 +560,9 @@ pub(super) fn finalize(
         score: score.min(100),
         evidence,
         fix: Some(fix),
+        // Not a checker's call: `diagnose` sets it by comparing against a run
+        // with no symptom.
+        symptom_matched: false,
     }
 }
 
@@ -511,6 +609,69 @@ pub(super) const KEYWORDS_WSL_LOADER: KeywordTable = &[
 mod tests {
     use super::*;
     use crate::diagnose::{HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH};
+
+    #[test]
+    fn the_only_unanchored_keyword_is_the_one_this_withholds() {
+        // `vllm_extension_load_keywords(false)` drops exactly the first entry.
+        // That is only safe while every *remaining* entry is self-identifying:
+        // it either spells `vllm` in its own pattern, or is worth less than the
+        // match threshold on its own and so cannot carry a verdict. A new entry
+        // that is neither would clear the threshold against text that never
+        // mentions vLLM — the hole this split closes — so it has to fail here
+        // and be placed ahead of the boundary instead.
+        let withheld = vllm_extension_load_keywords(true);
+        let unanchored = vllm_extension_load_keywords(false);
+        assert_eq!(
+            unanchored.len() + 2,
+            withheld.len(),
+            "exactly two entries are withheld without an anchor"
+        );
+        assert!(
+            withheld[0].2.contains("missing from torch.ops"),
+            "the withheld entry must be the `_OpNamespace` one: {:?}",
+            withheld[0]
+        );
+        assert!(
+            withheld[0].1 >= MIN_SCORE_FOR_MATCH,
+            "the withheld entry is the one that clears the threshold alone"
+        );
+        for (pattern, weight, label) in unanchored {
+            assert!(
+                pattern.contains("vllm") || *weight < MIN_SCORE_FOR_MATCH,
+                "`{label}` is scored with no vLLM anchor, names no vLLM token of \
+                 its own, and clears {MIN_SCORE_FOR_MATCH} by itself"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unanchored_paste_cannot_reach_the_threshold_by_summing() {
+        // The sibling test above checks each unanchored entry *in isolation*,
+        // which is not the property that matters: `keyword_score` keeps the top
+        // TWO hits and sums them. Two entries worth 30 each, neither naming
+        // vLLM, cleared the 50-point threshold together — 60 points for a paste
+        // with nothing vLLM-specific in it. Checking entries one at a time could
+        // never see that.
+        //
+        // So this asserts the sum. Of the unanchored entries that do not spell
+        // `vllm` in their own pattern, the two heaviest must not reach the
+        // threshold together, because those two are exactly what a paste with no
+        // vLLM token can collect.
+        let mut generic: Vec<i32> = vllm_extension_load_keywords(false)
+            .iter()
+            .filter(|(pattern, ..)| !pattern.contains("vllm"))
+            .map(|(_, weight, _)| *weight)
+            .collect();
+        generic.sort_unstable_by(|a, b| b.cmp(a));
+        let top_two: i32 = generic.iter().take(2).sum();
+        assert!(
+            top_two < MIN_SCORE_FOR_MATCH,
+            "the two heaviest unanchored entries that name no vLLM token sum to \
+             {top_two}, which reaches {MIN_SCORE_FOR_MATCH}: a paste with no vLLM \
+             text would be diagnosed as a vLLM extension-load failure. Move one of \
+             them behind `VLLM_EXTENSION_ANCHOR_PATTERN` instead. Weights: {generic:?}"
+        );
+    }
 
     #[test]
     fn overlap_dedup_does_not_demote_other_catalog_keyword_tables() {

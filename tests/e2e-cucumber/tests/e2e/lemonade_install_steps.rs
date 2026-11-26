@@ -8,7 +8,14 @@
 //! Black-box throughout. The two Lemonade trees and the install record are
 //! planted as plain files in the layout the engine writes, so no scenario
 //! downloads anything; the refusal scenario reaches the engine's free-space
-//! check through the `rocm/e2e-test-hooks` override instead of a full drive.
+//! check through the `rocm/e2e-test-hooks` override instead of a full drive,
+//! and the host-library refusal through the same build's library override.
+//!
+//! Also the steps of `runtime_setup.feature`'s runtime-33: a Lemonade backend
+//! that could not be aligned to the active ROCm version is not tried again by
+//! the next install. That one is not planted: it runs real installs on a GPU
+//! lane, and only the ROCm version the alignment targets comes from an
+//! `e2e-test-hooks` override.
 
 use std::path::PathBuf;
 
@@ -140,6 +147,196 @@ async fn assert_lemonade_install_refused(world: &mut E2eWorld) {
     assert!(
         !install_record(world).exists(),
         "a refused install must not record Lemonade as installed:\n{output}"
+    );
+}
+
+/// An Ubuntu 20.04-like host, as the probe reads one: glibc 2.31, and no
+/// `libssl.so.3` in the loader cache because it has only OpenSSL 1.1. Reported
+/// through the `rocm/e2e-test-hooks` override, so the refusal is reached on a
+/// host whose real glibc and OpenSSL are new.
+const OLD_HOST_GLIBC: &str = "2.31";
+const OLD_HOST_OPENSSL: &str = "missing";
+
+#[given("this host's glibc is older than the pinned Lemonade server needs and it has no OpenSSL 3")]
+async fn host_libraries_too_old(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_LEMONADE_HOST_GLIBC", OLD_HOST_GLIBC.into()));
+    world
+        .command_env
+        .push(("ROCM_E2E_LEMONADE_HOST_OPENSSL", OLD_HOST_OPENSSL.into()));
+}
+
+/// The refusal names, for each library, the version needed and what the host
+/// has (a version, or no `libssl.so.3`), says nothing was downloaded, and that
+/// is true on disk.
+#[then("the Lemonade install is refused for the host's libraries before anything is downloaded")]
+async fn assert_lemonade_install_refused_for_host_libraries(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    // Without the hook the engine sees this host's real libraries and starts a
+    // real install. Name that cause rather than a baffling mismatch.
+    assert!(
+        output.contains("this host's libraries are too old for the Lemonade "),
+        "no host-library refusal: the binary under test was probably built without \
+         the `rocm/e2e-test-hooks` feature, which `cargo xtask e2e` enables:\n{output}"
+    );
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the install must fail on a host too old for the pinned Lemonade server:\n{output}"
+    );
+    for expected in [
+        format!("or newer (this host's libc.so.6 provides up to GLIBC_{OLD_HOST_GLIBC})"),
+        "or newer (this host's loader cache has no libssl.so.3)".to_owned(),
+        "it needs glibc ".to_owned(),
+        "Nothing was downloaded.".to_owned(),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "missing `{expected}`:\n{output}"
+        );
+    }
+    let tree = data_folder_tree(world);
+    assert!(
+        !tree.join("downloads").exists(),
+        "an archive was downloaded despite the refusal:\n{output}"
+    );
+    assert!(
+        !tree.join("runtime").exists(),
+        "a runtime was extracted despite the refusal:\n{output}"
+    );
+    assert!(
+        !install_record(world).exists(),
+        "a refused install must not record Lemonade as installed:\n{output}"
+    );
+}
+
+#[given("the user has turned off the Lemonade host-library check")]
+async fn host_library_check_turned_off(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK", "1".into()));
+}
+
+/// The warning names the shortfall and the variable that let the install past
+/// it; the next Then shows the install really went on (to the space check).
+#[then("the user is warned that the host's libraries are too old and the install went ahead")]
+async fn assert_host_library_warning(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert!(
+        output.contains("warning: this host's libraries are too old for the Lemonade "),
+        "no host-library warning: the binary under test was probably built without \
+         the `rocm/e2e-test-hooks` feature, which `cargo xtask e2e` enables:\n{output}"
+    );
+    for expected in [
+        format!("or newer (this host's libc.so.6 provides up to GLIBC_{OLD_HOST_GLIBC})"),
+        "going ahead because ROCM_CLI_DISABLE_LEMONADE_HOST_LIBRARY_CHECK is set.".to_owned(),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "missing `{expected}`:\n{output}"
+        );
+    }
+    assert!(
+        !output.contains("to skip this check."),
+        "the install was refused for the host's libraries despite the opt-out:\n{output}"
+    );
+}
+
+/// The Lemonade version this build pins, read black-box from the refusal the
+/// old-host hooks produce on an empty data folder (lemonade-installs-07 shows
+/// that run changes nothing): "... too old for the Lemonade <version> server".
+///
+/// A run consumes the scenario's environment, so the old-host hooks the Given
+/// before this one set are put back for the When.
+fn pinned_lemonade_version(world: &mut E2eWorld) -> String {
+    let scenario_env = world.command_env.clone();
+    let (stdout, stderr, _) =
+        crate::run_rocm_with_scenario_env(world, &["engines", "install", "lemonade", "--yes"]);
+    world.command_env = scenario_env;
+    let output = format!("{stdout}\n{stderr}");
+    output
+        .split("too old for the Lemonade ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| {
+            panic!(
+                "no host-library refusal to read the pinned version from; the binary under \
+                 test was probably built without the `rocm/e2e-test-hooks` feature:\n{output}"
+            )
+        })
+        .to_owned()
+}
+
+/// What the planted tree holds, file by file, so the Then can show it was left
+/// exactly as it was.
+pub(crate) fn tree_files(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("failed to list the planted tree") {
+            let path = entry.expect("failed to read a tree entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("failed to read a tree file");
+                files.push((path, bytes));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[given("the pinned Lemonade is already installed in the data folder")]
+async fn plant_pinned_lemonade_install(world: &mut E2eWorld) {
+    let version = pinned_lemonade_version(world);
+    let tree = data_folder_tree(world);
+    plant_lemonade_tree(&tree, DATA_FOLDER_TREE_BYTES);
+    // The marker `prepare_embeddable` writes after a complete extraction.
+    std::fs::write(tree.join("runtime").join("runtime-version.txt"), &version)
+        .expect("failed to write the runtime version marker");
+    world.planted_tree_snapshot = Some(tree_files(&tree));
+}
+
+#[then(
+    "the Lemonade install is refused for the host's libraries and the installed copy is left as it is"
+)]
+async fn assert_refused_and_installed_copy_kept(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the install must fail on a host too old for the pinned Lemonade server:\n{output}"
+    );
+    let tree = data_folder_tree(world);
+    let runtime_dir = tree.join("runtime");
+    let expected = format!(
+        "already installed in {} stays as it is",
+        runtime_dir.display()
+    );
+    for expected in [
+        format!("or newer (this host's libc.so.6 provides up to GLIBC_{OLD_HOST_GLIBC})"),
+        "Nothing was changed: the Lemonade ".to_owned(),
+        expected,
+    ] {
+        assert!(
+            output.contains(&expected),
+            "missing `{expected}`:\n{output}"
+        );
+    }
+    assert!(
+        !output.contains("Nothing was downloaded."),
+        "the refusal describes a download the re-run would never have made:\n{output}"
+    );
+    // "Nothing was changed" is checked against the disk.
+    let before = world
+        .planted_tree_snapshot
+        .as_ref()
+        .expect("no planted tree snapshot - did the Given run?");
+    assert!(
+        &tree_files(&tree) == before,
+        "the installed tree changed despite the refusal:\n{output}"
     );
 }
 
@@ -399,4 +596,204 @@ async fn assert_lemonade_record_cleared(world: &mut E2eWorld) {
         !report.contains(&runtime_tree(world).display().to_string()),
         "the removed copy must not be listed any more:\n{report}"
     );
+}
+
+/// A ROCm version Lemonade publishes no backend build for, so every alignment
+/// tier fails the same way on every lane. It reaches the engine through the
+/// `rocm/e2e-test-hooks` override of the version the alignment targets, rather
+/// than a planted runtime record, because the runtime tree this scenario installs
+/// into is shared with every other scenario on the runner.
+const UNPUBLISHED_ROCM_VERSION: &str = "7.99.0";
+
+/// The override applies to one command only (`run_rocm_with_scenario_env`
+/// consumes it). So the step that is about to run `rocm` either sets it itself
+/// or relies on an immediately preceding step having set it, and a step that
+/// runs `rocm` and is followed by another such step re-arms it after its own
+/// run: the reinstall Given does, for the shared `When the user installs the
+/// Lemonade engine`.
+fn target_unpublished_rocm_version(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION",
+        UNPUBLISHED_ROCM_VERSION.into(),
+    ));
+}
+
+const ALIGNMENT_FAILED_LINE: &str = "could not align Lemonade's ROCm backend to";
+
+#[given("the active ROCm version is one Lemonade publishes no backend build for")]
+async fn active_rocm_version_has_no_lemonade_build(world: &mut E2eWorld) {
+    target_unpublished_rocm_version(world);
+}
+
+/// `--reinstall` deletes and re-extracts the runtime tree, so this attempt starts
+/// from Lemonade's packaged pin with no record of an earlier failure, whatever an
+/// earlier run on this runner left. That `--reinstall` removes a record is not
+/// shown here (there is none to remove on a fresh runner); it is
+/// `reinstall_removes_the_record_of_a_failed_alignment` in the engine's
+/// `install.rs`.
+///
+/// Also checks the failure left the two things the next install depends on: the
+/// record in the runtime tree, and the pin the revert restored, which it keeps
+/// for the Then to compare against.
+#[given("reinstalling Lemonade has already failed to align its backend to that version")]
+async fn lemonade_reinstall_failed_alignment(world: &mut E2eWorld) {
+    let args = ["engines", "install", "lemonade", "--reinstall"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    // Absent when the binary lacks `rocm/e2e-test-hooks` (the real SDK version is
+    // targeted instead), or on a host where Lemonade selects its Vulkan backend
+    // and the alignment is never attempted.
+    assert!(
+        stderr.contains(&format!(
+            "{ALIGNMENT_FAILED_LINE} {UNPUBLISHED_ROCM_VERSION}"
+        )),
+        "the reinstall did not try and fail to align the backend to \
+         {UNPUBLISHED_ROCM_VERSION}; was `rocm` built with `rocm/e2e-test-hooks`, and does \
+         Lemonade select its ROCm backend here?\n{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    let runtime_dir = install_env_path(&stdout);
+    assert!(
+        runtime_dir.join(ALIGNMENT_FAILURE_RECORD).is_file(),
+        "the failed alignment was not recorded in {}:\n{}",
+        runtime_dir.display(),
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    let pin = pinned_rocm_version(&runtime_dir).unwrap_or_else(|error| panic!("{error}"));
+    assert_ne!(
+        pin, UNPUBLISHED_ROCM_VERSION,
+        "the failed alignment left its target pinned instead of reverting it"
+    );
+    world.lemonade_pin_after_failed_alignment = Some(pin);
+    target_unpublished_rocm_version(world);
+}
+
+/// The record a failed alignment leaves in the Lemonade runtime tree. The
+/// engine's own name for it, repeated here because this crate is black-box;
+/// `the_record_file_name_matches_the_one_the_e2e_steps_hard_code` in the engine's
+/// `alignment_record.rs` reads this definition and fails on every lane if it
+/// stops matching the engine constant, so keep it on one line as written.
+const ALIGNMENT_FAILURE_RECORD: &str = ".rocm-cli-alignment-failed.json";
+
+/// The runtime tree an `engines install` reports as its `env_path:`, if it does.
+fn find_env_path(stdout: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .map(PathBuf::from)
+}
+
+/// [`find_env_path`] for a step that cannot go on without it.
+fn install_env_path(stdout: &str) -> PathBuf {
+    find_env_path(stdout).unwrap_or_else(|| panic!("no env_path in install output:\n{stdout}"))
+}
+
+/// `therock.version` in the runtime tree's `resources/backend_versions.json`.
+fn pinned_rocm_version(runtime_dir: &std::path::Path) -> Result<String, String> {
+    let pin_file = runtime_dir.join("resources/backend_versions.json");
+    let bytes = std::fs::read(&pin_file)
+        .map_err(|error| format!("failed to read {}: {error}", pin_file.display()))?;
+    let pins: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse {}: {error}", pin_file.display()))?;
+    pins["therock"]["version"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no therock.version in {}:\n{pins}", pin_file.display()))
+}
+
+#[then("the install reuses Lemonade's pinned backend without trying the alignment again")]
+async fn assert_pinned_backend_reused(world: &mut E2eWorld) {
+    let Err(failure) = check_pinned_backend_reused(world) else {
+        return;
+    };
+    // Why the backend was not reused is not in the install output (ROCMAI-1318),
+    // so the failure carries what Lemonade and the runtime tree say about it.
+    let evidence = match world.lemonade_runtime_dir.clone() {
+        Some(runtime_dir) => {
+            let evidence = e2e_cucumber::lemonade_runtime_evidence::collect(&runtime_dir).await;
+            let archived = e2e_cucumber::lemonade_runtime_evidence::archive(
+                &evidence,
+                &crate::results_path(),
+                world.current_scenario.as_deref().unwrap_or("scenario"),
+            );
+            format!("{evidence}\n{archived}")
+        }
+        None => "<no Lemonade runtime evidence: the install output names no env_path>".to_owned(),
+    };
+    panic!("{failure}\n\n{evidence}");
+}
+
+/// No alignment tier ran and nothing was force-reinstalled: the install reused
+/// the backend already in place, the pin is exactly the one the failed alignment
+/// reverted to, and the record that skipped the alignment is still there.
+/// `Err` carries what did not hold.
+fn check_pinned_backend_reused(world: &mut E2eWorld) -> Result<(), String> {
+    let output = combined_output(world);
+    // Before anything can fail, so the evidence can still be taken.
+    world.lemonade_runtime_dir = find_env_path(stdout(world));
+    if world.cli_rc != Some(0) {
+        return Err(format!("the install failed:\n{output}"));
+    }
+    for attempt in [
+        ALIGNMENT_FAILED_LINE,
+        "could not install its pinned llama.cpp build",
+        "Aligned Lemonade's ROCm backend",
+        "Installing Lemonade llamacpp:",
+    ] {
+        if output.contains(attempt) {
+            return Err(format!(
+                "the install tried the alignment or reinstalled the backend again \
+                 (`{attempt}`):\n{output}"
+            ));
+        }
+    }
+    if !output.contains("Using installed Lemonade llamacpp:rocm backend.") {
+        return Err(format!(
+            "the install did not reuse the installed ROCm backend:\n{output}"
+        ));
+    }
+    let Some(runtime_dir) = world.lemonade_runtime_dir.clone() else {
+        return Err(format!("no env_path in install output:\n{output}"));
+    };
+    let expected_pin = world
+        .lemonade_pin_after_failed_alignment
+        .as_deref()
+        .expect("no pin captured after the failed alignment - did the Given run?");
+    let pin = pinned_rocm_version(&runtime_dir)?;
+    if pin != expected_pin {
+        return Err(format!(
+            "the install changed the pin the failed alignment had reverted to \
+             (`{expected_pin}` -> `{pin}`):\n{output}"
+        ));
+    }
+    if !runtime_dir.join(ALIGNMENT_FAILURE_RECORD).is_file() {
+        return Err(format!(
+            "the record that skipped the alignment is gone:\n{output}"
+        ));
+    }
+    Ok(())
+}
+
+/// Pins the advice only; this scenario does not run the `--reinstall` it names.
+/// That `--reinstall` removes the record is
+/// `reinstall_removes_the_record_of_a_failed_alignment` in the engine's
+/// `install.rs`, and that the alignment then runs is
+/// `with_no_record_the_alignment_runs_as_before` in its `backend_alignment.rs`.
+#[then("the user is told the alignment failed and how to try it again")]
+async fn assert_alignment_retry_advice(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    for expected in [
+        format!("could not be aligned to ROCm {UNPUBLISHED_ROCM_VERSION}"),
+        "Run `rocm engines install lemonade --reinstall` to try again now".to_owned(),
+        "hours from now or later tries it again.".to_owned(),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "expected `{expected}` in the install output:\n{output}"
+        );
+    }
 }

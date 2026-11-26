@@ -109,8 +109,26 @@ pub struct ManagedServiceRecord {
     /// existed, which is the safe default (keep the key).
     #[serde(default)]
     pub stop_requested_unix_ms: Option<u128>,
-    /// The stop marker a liveness refresh cleared off a record that named no
-    /// process, kept as the evidence that it was cleared and not by a relaunch.
+    /// Where a stop marker goes once consumed, kept as evidence that *a stop*
+    /// consumed it rather than a relaunch clearing it.
+    ///
+    /// # Writers
+    ///
+    /// | Writer | When |
+    /// | --- | --- |
+    /// | `settle_pending_stop_key_cleanup` (`managed_service_status.rs`) | A liveness refresh consumes the marker — either off a record naming no process, or off one whose every recorded process it has just confirmed gone. The second branch performs the same move the next row describes, from the refresh path rather than the stop's. |
+    /// | `stop_internal_managed_service_confirmed_with` (`service_control.rs`) | A stop confirms every recorded process gone and moves its own marker here. |
+    /// | `rocmd`'s stop (`apps/rocmd/src/service.rs`) | The same move, on the daemon's path. |
+    /// | [`Self::reset_for_restart`] | Clears it — a relaunch is no longer the stop settled under it. |
+    ///
+    /// The second writer is newer than this field's original purpose and is why
+    /// it is now load-bearing: the stop-versus-crash check reads it as proof a
+    /// death was asked for. Before that, a confirmed stop dropped its marker and
+    /// left only `status == "stopped"` — which a liveness reconciliation also
+    /// writes for a record whose pids are merely gone, making a crash
+    /// indistinguishable from a stop. Nothing a crash can do sets this field.
+    ///
+    /// The original case still holds:
     ///
     /// A record naming no process has nothing for a pending stop to wait on, so
     /// the refresh drops the marker (and the key) at once. A `starting` or
@@ -612,6 +630,15 @@ impl ManagedServiceRecord {
     /// launch as failed. A stop marker would not hold either, because the
     /// liveness refresh clears it as soon as the recorded PIDs are gone.
     /// `rocmd`'s `find_recoverable_service` ignores `stopped`.
+    ///
+    /// That reasoning covers an abandonment with **no recorded cause** — a
+    /// publication failure, a cleanup after a guard refused — which is all this
+    /// is for. It is not a licence to overwrite a verdict already on disk: the
+    /// CLI's caller (`service_launch::launch_transaction::abandon_launch_record`)
+    /// applies this only to a record that still reads [`Self::is_live`], so a
+    /// launch whose child crashed keeps the `failed` its crash path recorded in
+    /// the manifest *and* the engine state file instead of being talked back
+    /// into a clean stop that only one of the two files would believe.
     pub fn mark_launch_abandoned(&mut self) {
         self.status = "stopped".to_owned();
     }

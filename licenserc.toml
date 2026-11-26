@@ -1,5 +1,5 @@
 ## hawkeye license-header enforcement configuration.
-## Run locally: hawkeye check
+## Run locally: hawkeye check --fail-on-unknown
 ## Docs: https://github.com/fast/hawkeye
 ##
 ## `skills/rocm-doctor/` is excluded. It is a published Agent Skill, not repo
@@ -7,10 +7,25 @@
 ## loader, which pushes any header out of hawkeye's detection window, and the
 ## folder is vendored verbatim into the amd/skills catalog, whose skills carry
 ## no headers. The licence is stated in the skill's own skill-card.md instead.
+##
+## Three docs-site pages are excluded by path: `docs/rocm-docs/index.md`,
+## `release-notes.md`, and `release.md`. They open with a MyST front matter
+## block (page description, keywords, and `orphan` for `release.md`), which
+## MyST only reads from the first line, so the header cannot go above it and
+## hawkeye does not detect it below it. Each file carries the header directly
+## after its front matter. Add any new page that needs front matter here.
 
+## The header text is a template rendered per file. PowerShell files get an ASCII
+## `(c)` instead of the copyright sign: a file with any non-ASCII byte needs a
+## BOM, and install.ps1 cannot have one because a BOM breaks `irm ... | iex`. The
+## other PowerShell files follow so the whole family reads the same.
 [header]
 text = """
+{% if attrs.filename is endingwith(".ps1") or attrs.filename is endingwith(".psm1") or attrs.filename is endingwith(".psd1") -%}
+Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+{%- else -%}
 Copyright © Advanced Micro Devices, Inc., or its affiliates.
+{%- endif %}
 
 SPDX-License-Identifier: MIT
 """
@@ -21,6 +36,9 @@ includes = [
   "**/*.py",
   "**/*.sh",
   "**/*.md",
+  "**/*.ps1",
+  "**/*.psm1",
+  "**/*.psd1",
 ]
 
 excludes = [
@@ -30,8 +48,22 @@ excludes = [
   ".tmp-*/**",
   "third_party/**",
   "skills/rocm-doctor/**",
+  "docs/rocm-docs/index.md",
+  "docs/rocm-docs/release-notes.md",
+  "docs/rocm-docs/release.md",
 ]
 
 [[rules]]
 extensions = ["md"]
 style_out = "xml"
+
+## hawkeye has no built-in comment syntax for PowerShell: without this rule an
+## included .ps1/.psm1/.psd1 file is listed as `unsupported` and its header is
+## never checked. A bare `hawkeye check` still exits 0 on that, so `includes`
+## alone would enforce nothing. `--fail-on-unknown` makes hawkeye exit 1 on any
+## `unsupported` file, and both the CI job (ci.yml's `Check license headers`
+## step) and the prek hook (.pre-commit-config.yaml's `license-headers` entry)
+## pass it, so there an included file type with no rule fails the check.
+[[rules]]
+extensions = ["ps1", "psm1", "psd1"]
+style_out = "script"

@@ -23,9 +23,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rocm_core::{
-    AppPaths, RocmCliConfig, require_yes_or_interactive, runtime_install_root_is_protected,
-};
+use rocm_core::{AppPaths, RocmCliConfig, require_yes_or_interactive};
 use serde::Serialize;
 
 use crate::cli_report::{JsonOrText, print_json_or_text};
@@ -895,15 +893,16 @@ pub(crate) fn build_prune_plan(
         // Belt and braces on top of `should_remove_runtime_install_root`: prune
         // acts on a set the user never typed out, so a runtime whose folder sits
         // in a protected system location is refused outright.
-        if runtime_install_root_is_protected(&manifest.install_root) {
+        if let Some(why) = rocm_core::runtime_protected_location(&manifest.install_root) {
             plan.skipped.push(format!(
-                "{runtime_key}: folder {} is in a protected system location",
-                manifest.install_root.display()
+                "{runtime_key}: folder {} is {}, so it is left in place",
+                manifest.install_root.display(),
+                why.describe()
             ));
             continue;
         }
 
-        // The single source of truth for "may ROCm CLI delete this folder?".
+        // The runtime-folder rule for "may ROCm CLI delete this folder?".
         // It refuses read-only and imported records and requires a matching
         // in-tree manifest, and it runs `ensure_runtime_install_root_is_safe_to_remove`.
         match should_remove_runtime_install_root(manifest) {
@@ -1046,7 +1045,11 @@ pub(crate) fn build_downloads_plan(paths: &AppPaths) -> UninstallPlan {
                     stack.push(path);
                 } else {
                     found = true;
-                    plan.actions.push(UninstallPlanEntry { kind, path });
+                    plan.actions.push(UninstallPlanEntry {
+                        kind,
+                        path,
+                        planned: crate::uninstall_plan::PlannedAs::Unchecked,
+                    });
                 }
             }
         }
@@ -1239,6 +1242,10 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "storage_properties.rs"]
+mod properties;
 
 #[cfg(test)]
 mod tests {
@@ -1624,6 +1631,50 @@ mod tests {
             held.iter()
                 .all(|(_, reason)| *reason == HoldReason::NotOwned)
         );
+    }
+
+    /// A registry entry whose folder sits in a protected location is left in
+    /// place by prune, and the line says which folder and why.
+    #[test]
+    fn prune_plan_leaves_a_protected_install_folder_and_says_why() -> Result<()> {
+        let (root, paths) = test_paths("prune-protected");
+        let mut old = install_fixture(&paths, manifest("old", "gfx110X-all", "7.10.0", 10), 64)?;
+        install_fixture(&paths, manifest("newer", "gfx110X-all", "7.11.0", 20), 64)?;
+        // In the host's own spelling: the registry entry is read back
+        // normalized, and the line prints it that way.
+        let protected = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\rocm-cli-prune-test")
+        } else {
+            PathBuf::from("/etc/rocm-cli-prune-test")
+        };
+        old.install_root = protected.clone();
+        std::fs::write(
+            paths
+                .data_dir
+                .join("runtimes")
+                .join("registry")
+                .join("old.json"),
+            serde_json::to_vec_pretty(&old)?,
+        )?;
+
+        let plan = build_prune_plan(&paths, &RocmCliConfig::default(), 1)?;
+        let _ = std::fs::remove_dir_all(root);
+
+        // "Left in place" is held by the plan: prune removes exactly
+        // `plan.remove`, which `prune_removes_the_install_it_named_and_not_a_case_twin_of_it`
+        // shows on disk. A protected system folder cannot be staged in a
+        // sandbox, so this pins the plan and the line together.
+        assert!(plan.remove.is_empty(), "{:?}", plan.remove);
+        let expected = format!(
+            "old: folder {} is a protected system location, so it is left in place",
+            protected.display()
+        );
+        assert!(
+            plan.skipped.contains(&expected),
+            "expected `{expected}` in {:?}",
+            plan.skipped
+        );
+        Ok(())
     }
 
     #[test]
@@ -2329,6 +2380,9 @@ mod tests {
             active_runtime_key: Some("release-wheel-gfx110x-7-11-0".to_owned()),
             ..RocmCliConfig::default()
         };
+        // Saved, as `storage()` loads it: the uninstall changes the settings
+        // on disk under the config lock, not the copy passed in.
+        config.save(&paths)?;
 
         let plan = build_prune_plan(&paths, &config, 1)?;
         let planned: Vec<&str> = plan
@@ -2385,15 +2439,154 @@ mod tests {
             InstallRootDecision::ReadOnly,
             "an adopted install's folder stays off-limits to deletion"
         );
-        assert_eq!(
-            config.active_runtime_key.as_deref(),
-            Some("release-wheel-gfx110x-7-11-0"),
-            "removing an old install must not deactivate the runtime in use"
-        );
+        let saved = RocmCliConfig::load(&paths)?;
+        for (which, active) in [
+            ("in the caller's settings", &config.active_runtime_key),
+            ("on disk", &saved.active_runtime_key),
+        ] {
+            assert_eq!(
+                active.as_deref(),
+                Some("release-wheel-gfx110x-7-11-0"),
+                "removing an old install must not deactivate the runtime in use ({which})"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
+
+    /// What one generated prune did: the key of the install that was in use
+    /// and whether its folder survived, every install the plan named whose
+    /// folder is still there afterwards, and every install the plan did not
+    /// name whose folder is gone.
+    struct AppliedPlan {
+        in_use_key: String,
+        folder_survives: bool,
+        planned_but_left: Vec<String>,
+        unplanned_but_gone: Vec<String>,
+    }
+
+    /// Removes a test root when it goes out of scope, so a case that fails
+    /// part-way through (an early `?`) does not leave its tree behind.
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn apply_generated_plan(
+        families: &[&str],
+        active_index: usize,
+        keep: usize,
+    ) -> Result<AppliedPlan> {
+        let (root, paths) = test_paths("apply-plan-property");
+        let _cleanup = RemoveOnDrop(root);
+        let mut installed = Vec::new();
+        for (index, family) in families.iter().enumerate() {
+            let record = manifest(
+                &format!("release-wheel-{family}-7-{index}-0"),
+                family,
+                &format!("7.{index}.0"),
+                index as u128,
+            );
+            installed.push(install_fixture(&paths, record, 512)?);
+        }
+        let active = &installed[active_index % installed.len()];
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some(active.runtime_key.clone()),
+            // What `activate_runtime` writes alongside it on a real machine.
+            default_runtime_id: Some(active.runtime_id.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = build_prune_plan(&paths, &config, keep)?;
+        for entry in &plan.remove {
+            crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+        }
+
+        Ok(AppliedPlan {
+            in_use_key: active.runtime_key.clone(),
+            folder_survives: active.install_root.is_dir(),
+            planned_but_left: plan
+                .remove
+                .iter()
+                .filter(|entry| entry.install_root.exists())
+                .map(|entry| entry.runtime_key.clone())
+                .collect(),
+            unplanned_but_gone: installed
+                .iter()
+                .filter(|install| {
+                    !plan
+                        .remove
+                        .iter()
+                        .any(|entry| entry.runtime_key == install.runtime_key)
+                })
+                .filter(|install| !install.install_root.exists())
+                .map(|install| install.runtime_key.clone())
+                .collect(),
+        })
+    }
+
+    proptest::proptest! {
+        // Each case writes and deletes a tree, so this matches the other
+        // filesystem-backed property suites rather than the pure-policy
+        // budget.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(
+            crate::test_support::proptest_cases(256)
+        ))]
+
+        /// The same safety invariant as the pure-policy properties, but
+        /// driven through real registry files, real install folders and the
+        /// real removal call — so it also fails if that removal deletes the
+        /// install in use when the plan did not name it, and checks that no
+        /// other install the plan left out lost its folder either. It also
+        /// checks the other direction: every install the plan named is
+        /// actually gone, so a removal that quietly did nothing cannot pass.
+        /// Every install here is owned and every key is distinct, so neither
+        /// the on-disk ownership guards nor case-twin key lookups are what it
+        /// tests.
+        ///
+        /// It calls `uninstall_runtime` for each planned key directly rather
+        /// than going through `storage()`'s removal loop, so that loop's
+        /// last-second hold re-check is not exercised here;
+        /// `prune_removes_the_install_it_named_and_not_a_case_twin_of_it`
+        /// replays the loop, re-check included.
+        ///
+        /// Keys are lowercase here, as every key ROCm CLI generates is; two
+        /// keys differing only in case are covered by
+        /// `prune_removes_the_install_it_named_and_not_a_case_twin_of_it`.
+        #[test]
+        fn applying_a_whole_plan_never_removes_the_install_in_use(
+            families in proptest::collection::vec(
+                proptest::sample::select(&["gfx110x-all", "gfx120x-all"][..]), 1..5),
+            active_index in 0_usize..5,
+            keep in 0_usize..3,
+        ) {
+            let applied = apply_generated_plan(&families, active_index, keep)
+                .map_err(|error| {
+                    proptest::test_runner::TestCaseError::fail(error.to_string())
+                })?;
+
+            proptest::prop_assert!(
+                applied.folder_survives,
+                "the runtime in use ({}) was removed with --keep {keep}",
+                applied.in_use_key,
+            );
+            proptest::prop_assert!(
+                applied.planned_but_left.is_empty(),
+                "the plan named {:?} for removal with --keep {keep}, but their folders remain",
+                applied.planned_but_left,
+            );
+            proptest::prop_assert!(
+                applied.unplanned_but_gone.is_empty(),
+                "the plan left {:?} out with --keep {keep}, but their folders are gone",
+                applied.unplanned_but_gone,
+            );
+        }
+    }
+
     /// `--yes` is required when there is nobody to answer the prompt. This is
     /// the gate standing between a scripted invocation and a multi-gigabyte
     /// deletion, so it is worth a test of its own.

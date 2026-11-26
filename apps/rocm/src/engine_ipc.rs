@@ -28,8 +28,9 @@
 //! (`engine_request`, `engine_request_with_env_root`,
 //! `engine_stdio_child_request`), the `ScopedEnvVar`/
 //! `with_scoped_builtin_engine_env` env-scoping helpers and the
-//! `BUILTIN_ENGINE_ENV_LOCK` mutex they serialize on, `builtin_engine_request`,
-//! `run_builtin_engine_stdio`, and the built-in HTTP-serving path
+//! `BUILTIN_ENGINE_ENV_LOCK` mutex they serialize on, `builtin_engine_handler`,
+//! `builtin_engine_request`, `run_builtin_engine_stdio` with
+//! `answer_builtin_engine_stdio`, and the built-in HTTP-serving path
 //! (`builtin_engine_available`, `run_builtin_engine_serve_http`,
 //! `builtin_engine_serve_http_args`).
 //!
@@ -49,16 +50,29 @@
 //! `engine_runtime_select.rs`, and `optional_arg` is in `rocm_engine_protocol`.
 
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+// `thread` is reached only from `run_scripted_e2e_engine_serve_http`, which is
+// itself behind this feature; ungated it is unused in a default build.
+// `Duration` is NOT gated alongside it the way it was before ROCMAI-550: the
+// serve device probe uses it in a default build, so it is imported
+// unconditionally with `Instant`.
+#[cfg(feature = "e2e-test-hooks")]
+use std::thread;
 
-use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, ENGINE_ENVS_ROOT_ENV, engine_binary_path, engine_plugin_dirs};
+#[cfg(feature = "e2e-test-hooks")]
+use anyhow::bail;
+use anyhow::{Context, Result};
+use rocm_core::{
+    AppPaths, ENGINE_ENVS_ROOT_ENV, ManagedServiceRecord, engine_binary_path, engine_plugin_dirs,
+};
 use rocm_engine_protocol::{
     DevicePolicy, EngineMethod, EnginePluginDescriptor, EngineRecipeHint, EngineRequestEnvelope,
-    EngineResponseEnvelope, EngineStdioOptions, decode_engine_response, engine_request_envelope,
-    optional_arg, run_engine_stdio,
+    EngineResponseEnvelope, EngineStdioOptions, HealthcheckRequest, HealthcheckResponse,
+    decode_engine_response, engine_request_envelope, optional_arg, run_engine_stdio,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -120,11 +134,55 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
+    engine_request_with_scoped_env(paths, engine, method, request, env_root, None)
+}
+
+/// [`engine_request_with_env_root`], additionally handing a **built-in** engine
+/// the 0600 endpoint key file for one service via `ROCM_SERVE_API_KEY_FILE`.
+///
+/// An engine that probes its own server's HTTP endpoint while answering a
+/// request reads that variable to authenticate
+/// (`rocm_engine_protocol::resolve_endpoint_api_key`, reached from
+/// `engines/lemonade`'s and `engines/vllm`'s `/v1/models` probes). Without it,
+/// a public or `--require-api-key` service answers 401 and the engine reports
+/// the service as not listed - indistinguishable, from the CLI's side, from a
+/// server that is simply down. It is threaded per call rather than per process
+/// because the key is per service id.
+///
+/// **External plugin children are not given it.** The built-in engines run
+/// in-process, so the variable is set and restored around one call
+/// ([`with_scoped_builtin_engine_env`]); a plugin is a third-party binary this
+/// process spawns, and a variable put in its environment is readable from
+/// `/proc/<pid>/environ` and inherited by every grandchild it starts. That is
+/// more exposure than an informational `device:` row is worth — the only caller
+/// that passes a key file is [`fetch_service_device`]. The cost is that a
+/// plugin-backed service with endpoint auth reports no device; it is a row the
+/// summary already declares optional.
+///
+/// This is a reduction in incidental exposure, not a security boundary: a
+/// plugin child is handed `ROCM_CLI_DATA_DIR` by [`apply_app_path_env`] and the
+/// key file's location under it is a documented, deterministic convention
+/// (`rocm_engine_protocol::endpoint_key_file_path`), so a plugin that wants the
+/// key can still derive the path. What changes is that it must go looking.
+fn engine_request_with_scoped_env<T, R>(
+    paths: Option<&AppPaths>,
+    engine: &str,
+    method: EngineMethod,
+    request: &T,
+    env_root: Option<&Path>,
+    endpoint_key_file: Option<&Path>,
+) -> Result<R>
+where
+    T: Serialize,
+    R: DeserializeOwned,
+{
     let stream_progress = matches!(&method, EngineMethod::Install);
     let envelope = engine_request_envelope(method, request)?;
-    if let Some(envelope) = with_scoped_builtin_engine_env(paths, env_root, || {
-        builtin_engine_request(engine, &envelope)
-    }) {
+    if let Some(envelope) =
+        with_scoped_builtin_engine_env(paths, env_root, endpoint_key_file, || {
+            builtin_engine_request(engine, &envelope)
+        })
+    {
         return decode_engine_response(envelope);
     }
 
@@ -177,6 +235,9 @@ const fn stdio_options<'a>(
         app_paths: paths,
         env_root,
         endpoint_key_file: None,
+        // An external plugin is a third-party binary: never hand it a path to
+        // a live endpoint credential, including one we inherited ourselves.
+        withhold_inherited_key_file: true,
         request_progress: stream_progress,
         forward_stderr: true,
         note_failing_exit_after_answer: false,
@@ -211,16 +272,30 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+/// Hold the lock `with_scoped_builtin_engine_env` takes while it rewrites the
+/// `ROCM_CLI_*` variables, for a test that reads them and must not see a
+/// built-in engine call's values in the middle of a parallel test.
+#[cfg(test)]
+pub(crate) fn builtin_engine_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    BUILTIN_ENGINE_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn with_scoped_builtin_engine_env<R>(
     paths: Option<&AppPaths>,
     env_root: Option<&Path>,
+    endpoint_key_file: Option<&Path>,
     f: impl FnOnce() -> R,
 ) -> R {
-    if paths.is_none() && env_root.is_none() {
+    if paths.is_none() && env_root.is_none() && endpoint_key_file.is_none() {
         return f();
     }
     let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().expect("builtin engine env lock poisoned");
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut vars = Vec::new();
     if let Some(paths) = paths {
         for (key, value) in paths.env_vars() {
@@ -230,42 +305,369 @@ fn with_scoped_builtin_engine_env<R>(
     if let Some(env_root) = env_root {
         vars.push(ScopedEnvVar::set_path(ENGINE_ENVS_ROOT_ENV, env_root));
     }
+    if let Some(endpoint_key_file) = endpoint_key_file {
+        vars.push(ScopedEnvVar::set_path(
+            rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV,
+            endpoint_key_file,
+        ));
+    }
     let result = f();
     drop(vars);
     result
+}
+
+/// How a built-in engine answers a decoded request.
+type BuiltinEngineHandler = fn(EngineRequestEnvelope) -> EngineResponseEnvelope;
+
+/// The handler of the engine built into this binary under `engine`, or `None`.
+/// The in-process request path, `rocm __engine-stdio` and
+/// [`builtin_engine_available`] all ask it; `run_builtin_engine_serve_http`
+/// keeps its own match over the same engines.
+fn builtin_engine_handler(engine: &str) -> Option<BuiltinEngineHandler> {
+    match engine {
+        "lemonade" => Some(rocm_engine_lemonade::builtin_handle_envelope),
+        "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope),
+        "aim" => Some(rocm_engine_aim::builtin_handle_envelope),
+        _ => None,
+    }
 }
 
 fn builtin_engine_request(
     engine: &str,
     envelope: &EngineRequestEnvelope,
 ) -> Option<EngineResponseEnvelope> {
-    match engine {
-        "lemonade" => Some(rocm_engine_lemonade::builtin_handle_envelope(
-            envelope.clone(),
-        )),
-        "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope(envelope.clone())),
-        "aim" => Some(rocm_engine_aim::builtin_handle_envelope(envelope.clone())),
-        _ => None,
-    }
+    builtin_engine_handler(engine).map(|handle| handle(envelope.clone()))
 }
 
 pub(crate) fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
+    let handle = builtin_engine_handler(engine)
+        .with_context(|| format!("engine `{engine}` is not built into this rocm binary"))?;
     let mut input = String::new();
     io::stdin()
         .read_to_string(&mut input)
         .context("failed to read engine stdio request")?;
-    let envelope: EngineRequestEnvelope =
-        serde_json::from_str(&input).context("failed to parse engine stdio request")?;
-    let response = builtin_engine_request(engine, &envelope)
-        .with_context(|| format!("engine `{engine}` is not built into this rocm binary"))?;
+    let response = answer_builtin_engine_stdio(handle, &input);
     print!("{}", serde_json::to_string(&response)?);
     Ok(())
 }
 
-pub(crate) fn builtin_engine_available(engine: &str) -> bool {
-    matches!(engine, "lemonade" | "vllm" | "aim")
+/// Best-effort query of the backend/device a running managed service actually
+/// selected (e.g. `"vulkan gpu 0"` / `"rocm gpu 0"`), via the same
+/// `Healthcheck` RPC every engine plugin already answers
+/// (`engines/lemonade` reads it back from its own `backend_requested` state;
+/// `engines/vllm` and `engines/aim` report the ROCm device they pinned). Read
+/// from the engine, never guessed from the launch-time GPU selection, so it
+/// reflects what the server is actually running on. `None` on any failure -
+/// this is informational text, not worth failing `serve`/`services list` over.
+///
+/// How long one call can take, since `rocm services list` makes one per ready
+/// service: [`engine_request`] itself imposes no deadline, so the bound comes
+/// from the engine. The three built-in engines answer in-process and every
+/// endpoint probe they make is timeout-bounded (`engines/vllm`'s and
+/// `engines/aim`'s own `HEALTHCHECK_TIMEOUT_MS`, `engines/lemonade`'s
+/// `rocm_core::INFERENCE_PROBE_TIMEOUT`), so a stalled server costs seconds,
+/// not forever. An *external* plugin is a spawned child that
+/// `engine_request` waits on unbounded, exactly as every other engine call
+/// site in the CLI does. [`fetch_service_devices`] is what keeps a list of
+/// services from multiplying that cost by the number of services.
+pub(crate) fn fetch_service_device(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Option<String> {
+    // Hand the engine this service's 0600 key file. Both built-in engines
+    // authenticate their own `/v1/models` probe from
+    // `ROCM_SERVE_API_KEY_FILE`, so without it a public or `--require-api-key`
+    // service answers 401, the engine reports it as not listed, and the device
+    // comes back `"unknown"` - the row would vanish for exactly the services
+    // that are protected. `None` for a loopback service, which has no key file
+    // and needs none.
+    let endpoint_key_file = crate::endpoint_keys::endpoint_key_file_if_present(paths, service_id);
+    let response: HealthcheckResponse = engine_request_with_scoped_env(
+        Some(paths),
+        engine,
+        EngineMethod::Healthcheck,
+        &HealthcheckRequest {
+            service_id: service_id.to_owned(),
+        },
+        None,
+        endpoint_key_file.as_deref(),
+    )
+    .ok()?;
+    device_worth_reporting(response.device)
 }
 
+/// The engine's reported device, or `None` when it said nothing usable.
+///
+/// `"unknown"` is the engines' own "I cannot say yet", and it is not more
+/// informative than showing nothing — a `device: unknown` row claims the CLI
+/// asked and learned something, which is the opposite of what happened.
+///
+/// *When* an engine stops saying it is not uniform, and that difference is why
+/// [`SERVE_DEVICE_PROBE_BUDGET`] exists at all:
+///
+/// * `engines/vllm` and `engines/aim` answer as soon as a state file exists
+///   for the service id (`Some(state) => reported_device(state)`,
+///   `None => "unknown"`), so the row is available from the launch write
+///   onwards, readiness or not;
+/// * `engines/lemonade` keeps answering `"unknown"` while a state file plainly
+///   exists — its `healthcheck_service_at` reports a device only once the
+///   service is `ready`, which there means its own inference probe has come
+///   back.
+///
+/// So this filter is what keeps the slowest of the three from printing a row
+/// that says nothing; it is not a uniform no-state-on-disk guard.
+///
+/// A named function rather than an inline `then_some` because the only caller
+/// is an RPC to a live engine: in default CI that call never succeeds, so the
+/// filter is unreachable there and deleting it would be invisible until a
+/// freshly-launched Lemonade service printed `device: unknown` on a GPU lane.
+fn device_worth_reporting(device: String) -> Option<String> {
+    (!device.trim().is_empty() && device != "unknown").then_some(device)
+}
+
+/// How long `rocm serve`'s deployment summary may keep asking the engine which
+/// device it selected, and how long it waits between asks.
+///
+/// A managed launch reports `ready` as soon as its server answers, but
+/// `engines/lemonade` reports `device: "unknown"` until its own
+/// `inference_verified` probe has come back — so asking once, immediately,
+/// loses the row on exactly the Vulkan case ROCMAI-550 is about. One retry
+/// window closes the common case: the default smoke test has just put a real
+/// completion through the server, so the engine's own probe is a cache hit.
+///
+/// **It cannot close every case, and is not meant to.** A server that reported
+/// `ready` while weights are still loading can stay unverified for minutes, and
+/// waiting that out would hold the terminal hostage for an informational row
+/// that `rocm services list` will show as soon as it exists. So the row is
+/// *optional by contract* — see [`crate::serve_summary::DeploymentSummary`]'s
+/// `device` field, `docs/manual-testing.md` and README.md, which all say it can
+/// be absent.
+///
+/// The budget is a start gate, like [`SERVICE_DEVICE_PROBE_BUDGET`]: it is
+/// tested before each attempt, never inside one, so the worst-case addition to
+/// `rocm serve` is this budget plus one in-flight probe — about 14s with
+/// Lemonade's 8s `rocm_core::INFERENCE_PROBE_TIMEOUT`, and only on a launch
+/// that was going to have no row at all.
+const SERVE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(6);
+/// Pause between the attempts [`SERVE_DEVICE_PROBE_BUDGET`] allows. Short
+/// enough that the common case (the engine is a second away from verifying)
+/// resolves quickly, long enough not to spin on an engine that answers
+/// instantly.
+const SERVE_DEVICE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// [`fetch_service_device`], retried briefly, for `rocm serve`'s one-shot
+/// deployment summary.
+///
+/// `None` is a legitimate answer and must stay cheap to get: see
+/// [`SERVE_DEVICE_PROBE_BUDGET`] for why the wait is bounded and why the
+/// summary prints no `device:` row rather than blocking on one.
+pub(crate) fn fetch_service_device_briefly(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Option<String> {
+    let started = Instant::now();
+    retry_service_device(
+        || started.elapsed(),
+        || fetch_service_device(paths, engine, service_id),
+        std::thread::sleep,
+    )
+}
+
+/// The retry loop of [`fetch_service_device_briefly`], with the clock, the
+/// probe and the wait injected.
+///
+/// Split out for the same reason as [`collect_service_devices`]: driving this
+/// against the live clock would mean a test that really sleeps out
+/// [`SERVE_DEVICE_PROBE_BUDGET`] against a real engine. What has to be
+/// guaranteed is not just that a late answer is reported but that the loop
+/// *stops* — an unbounded retry here would hang every `rocm serve` whose engine
+/// never verifies.
+fn retry_service_device<C, P, S>(mut elapsed: C, mut probe: P, mut wait: S) -> Option<String>
+where
+    C: FnMut() -> Duration,
+    P: FnMut() -> Option<String>,
+    S: FnMut(Duration),
+{
+    loop {
+        if let Some(device) = probe() {
+            return Some(device);
+        }
+        if elapsed() >= SERVE_DEVICE_PROBE_BUDGET {
+            return None;
+        }
+        wait(SERVE_DEVICE_PROBE_INTERVAL);
+    }
+}
+
+/// How long [`fetch_service_devices`] may spend on live `Healthcheck` RPCs in
+/// total, across however many services were listed.
+///
+/// `rocm services list` was pure local I/O before the `device:` row; the row is
+/// worth a short wait but not an unbounded one, and the cost has to stay flat
+/// in the number of services rather than growing with it. Sized to let a
+/// couple of healthy engines answer (`engines/lemonade`'s endpoint probe is
+/// the slowest at `rocm_core::INFERENCE_PROBE_TIMEOUT`, 8s worst case, and
+/// only on a miss) while still bounding the whole render.
+///
+/// **Worst-case wall time for `rocm services list` is this budget plus one
+/// in-flight probe, i.e. ~18s** with the built-in engines, not 10s. The budget
+/// is a *start* gate: it is tested before each probe, never inside one, so a
+/// probe begun at 9.99s still runs to its own timeout. The arithmetic is 10s
+/// of elapsed budget plus Lemonade's 8s `INFERENCE_PROBE_TIMEOUT`. That bound
+/// applies equally to `rocm chat` when its natural-language interpreter
+/// resolves a request to the `services` command: that path runs the real
+/// command in process (`chat::mcp_bridge`'s `run_rocm_read_only_in_process`)
+/// and so renders through the same
+/// [`crate::services_text::render_services_text`].
+///
+/// It does *not* apply to the structured MCP tool that is also named
+/// `services`. That one renders through `chat::mcp_bridge`'s
+/// `render_services_tool_result_text`, a different and older function with no
+/// `device:` row, so a bridge client calling the tool makes no probe and waits
+/// for nothing — unlike the sibling `engines` MCP tool, which ROCMAI-550 did
+/// make host-aware. The shared name is the trap, so this says which surface it
+/// means; giving the tool the row is a change in its own
+/// right, not something this constant may be read as already covering.
+///
+/// # The decision, recorded
+///
+/// This is accepted rather than merely observed. `rocm services list` and
+/// `rocm chat`'s `services` command can both block ~18s on a host whose
+/// engines are slow to answer, and for the duration the built-in probe holds
+/// the process-wide engine env lock [`with_scoped_builtin_engine_env`] takes,
+/// so a concurrent caller waits behind it.
+///
+/// Two cheaper options were considered and not taken. Moving the probe off the
+/// render path means the row stops reflecting the host at the moment it is
+/// printed, which is the whole reason ROCMAI-550 added it — the `device:` row
+/// exists to answer "what is this actually running on *now*". Probing once and
+/// printing nothing for the rest makes the output depend on service ordering,
+/// which reads as a bug to anyone who lists twice and sees different rows.
+///
+/// Both remain reasonable calls and this one is reversible: it is a constant and
+/// a start gate, not a structural choice. If a maintainer prefers a 10s hard
+/// cap, the change is a per-probe deadline, which needs a cancellable probe
+/// (see below) rather than a smaller number here.
+///
+/// Why not a per-probe deadline that would hold the total at 10s: the probe is
+/// `engine_request`, which for a built-in engine is a synchronous in-process
+/// call and for an external plugin is a `wait()` on a spawned child. Neither
+/// can be cancelled from here without either a thread per probe (ruled out by
+/// the process-wide env/mutex scoping `fetch_service_devices` documents) or a
+/// kill path for a child mid-RPC. Both are larger changes than the row is
+/// worth; the start gate is what keeps the cost flat in the number of
+/// services, which is the growth that actually matters.
+pub(crate) const SERVICE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Devices for several services at once, keyed by service id, under one shared
+/// time budget.
+///
+/// The probes run sequentially on purpose. They cannot usefully be run in
+/// parallel: [`engine_request`] routes the built-in engines through
+/// [`with_scoped_builtin_engine_env`], which takes a process-wide mutex *and*
+/// mutates process-wide `ROCM_CLI_*` env vars for the duration, so concurrent
+/// callers would serialize on that lock anyway and racing them would be
+/// unsound. What this does instead is cap the aggregate: once
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] is spent, the remaining services are left
+/// without a `device:` row rather than each adding its own wait. The row is
+/// informational, so dropping it is strictly better than making
+/// `rocm services list --all` hang behind one unresponsive server.
+///
+/// The budget is checked between probes, not inside one: a single external
+/// plugin that never exits still blocks, because `engine_request` waits on its
+/// child unbounded. That is the pre-existing behavior of every engine call
+/// site in the CLI and is not made worse here. See
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] for what that makes the worst-case wall
+/// time of a `rocm services list`.
+pub(crate) fn fetch_service_devices<'a, I>(
+    paths: &AppPaths,
+    services: I,
+) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let started = Instant::now();
+    collect_service_devices(
+        services,
+        || started.elapsed(),
+        |service_id, engine| fetch_service_device(paths, engine, service_id),
+    )
+}
+
+/// The budget loop of [`fetch_service_devices`], with the clock and the probe
+/// injected.
+///
+/// Split out so the budget-exhausted exit has a test. In the real function the
+/// clock is `Instant::elapsed` and the probe is a live engine RPC, so covering
+/// that branch would otherwise mean making a test wait out
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] against real engines — which is both slow
+/// and exactly the timing-dependent shape that flakes. What the branch has to
+/// guarantee is not just that later services lack a `device:` row but that
+/// they were never *probed*, since the whole point is to stop paying; only an
+/// injected probe can observe that.
+fn collect_service_devices<'a, I, C, P>(
+    services: I,
+    mut elapsed: C,
+    mut probe: P,
+) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+    C: FnMut() -> Duration,
+    P: FnMut(&str, &str) -> Option<String>,
+{
+    let mut devices = std::collections::HashMap::new();
+    for (service_id, engine) in services {
+        if elapsed() >= SERVICE_DEVICE_PROBE_BUDGET {
+            break;
+        }
+        if let Some(device) = probe(service_id, engine) {
+            devices.insert(service_id.to_owned(), device);
+        }
+    }
+    devices
+}
+
+/// The answer a built-in engine's `handle` gives to the request `text` read on
+/// stdin: the version is judged before the method or payload is decoded (see
+/// [`rocm_engine_protocol::answer_engine_request`]), as a separately built
+/// engine's `stdio` command does.
+fn answer_builtin_engine_stdio(handle: BuiltinEngineHandler, text: &str) -> EngineResponseEnvelope {
+    rocm_engine_protocol::answer_engine_request(text, handle)
+}
+
+pub(crate) fn builtin_engine_available(engine: &str) -> bool {
+    builtin_engine_handler(engine).is_some()
+}
+
+/// Entry point for the hidden `__engine-serve-http` subcommand: the process
+/// `spawn_managed_engine_child`/`restart_internal_managed_service_with` launch
+/// detached to actually run the engine.
+///
+/// ROCMAI-541: on Windows this process's stdout/stderr reach the service log
+/// only because the parent attached them at spawn time
+/// (`rocm_core::spawn_detached_with_log_watching_startup`); a gap there (or in a future
+/// caller that spawns this subcommand some other way) would otherwise lose an
+/// engine's failure reason completely, since nothing else reads a detached
+/// child's output. So this wrapper does not rely on that attachment alone: on
+/// any error from the engine dispatch below, it appends a one-line summary of
+/// the error chain directly to the service log file named by `--log-path` (the
+/// same file `rocm services logs <service_id>` tails) — one line, because this process's
+/// stderr reaches that same file, so the full chain is already there whenever
+/// the attachment worked — and the full chain to this process's own
+/// structured log, and marks the engine state file `failed` — regardless of
+/// whether the engine already did either on this particular error path.
+///
+/// With one exception, which the sentence above used to omit: a **deliberate
+/// stop** is not a failure. When the engine state file already says the stop was
+/// asked for, `record_engine_serve_http_failure` writes a `stopped:` line rather
+/// than a `failed:` one and stamps nothing, so an operator's own `rocm services
+/// stop` is not recorded as a crash.
+///
+/// A later success (this function only runs once per process, so there is no
+/// later state to race against) is unaffected; only the error path writes
+/// anything here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_builtin_engine_serve_http(
     engine: &str,
@@ -281,7 +683,32 @@ pub(crate) fn run_builtin_engine_serve_http(
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
-    let parsed_policy = parse_device_policy(Some(device_policy))?;
+    // ROCMAI-541: short-circuit every real engine entirely when the
+    // scripted-engine E2E hook is armed, so a scenario can exercise a managed
+    // child that survives its early-startup liveness checks and then dies (or
+    // runs until stopped) without any real engine logic — GPU, Python venv, or
+    // network download — in the way. Ahead of the Anthropic endpoint below,
+    // which fronts a real engine this path never starts. See
+    // `run_scripted_e2e_engine_serve_http`.
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os("ROCM_E2E_SCRIPTED_ENGINE").is_some() {
+        let result =
+            run_scripted_e2e_engine_serve_http(&service_id, &state_path, log_path.as_deref());
+        if let Err(error) = &result {
+            record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), error);
+        }
+        return result;
+    }
+    // Not `?`: an unparseable policy is as much an engine failure as any other,
+    // and the state file has to say so or the service reads `starting` forever
+    // (ROCMAI-541).
+    let parsed_policy = match parse_device_policy(Some(device_policy)) {
+        Ok(policy) => policy,
+        Err(error) => {
+            record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), &error);
+            return Err(error);
+        }
+    };
     // Every engine is fronted the same way, so the Anthropic endpoint is started
     // here once rather than inside each adapter. It runs on a thread of this
     // process, which is the service's supervisor: it ends when the service does.
@@ -292,9 +719,9 @@ pub(crate) fn run_builtin_engine_serve_http(
         state_path: state_path.clone(),
         probe_api_key: rocm_engine_protocol::resolve_endpoint_api_key(),
     });
-    match engine {
+    let result = match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -302,12 +729,12 @@ pub(crate) fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -315,12 +742,12 @@ pub(crate) fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
         "aim" => rocm_engine_aim::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -328,12 +755,193 @@ pub(crate) fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
-        other => bail!("engine `{other}` is not built into this rocm binary"),
+        other => Err(anyhow::anyhow!(
+            "engine `{other}` is not built into this rocm binary"
+        )),
+    };
+    if let Err(error) = &result {
+        record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), error);
     }
+    result
+}
+
+/// Best-effort, platform-generic failure capture for
+/// [`run_builtin_engine_serve_http`] — see its doc comment for why this exists
+/// alongside the Windows stdio-attach fix rather than instead of it.
+///
+/// Never fails itself: a service already failing must not fail a second time,
+/// less legibly, because its own failure-reporting hit an error.
+fn record_engine_serve_http_failure(
+    service_id: &str,
+    state_path: &Path,
+    log_path: Option<&Path>,
+    error: &anyhow::Error,
+) {
+    let detail = format!("{error:?}");
+    tracing::error!(service_id, %detail, "managed engine serve-http failed");
+    // Decided before anything is written: `lemonade` returns `Err` for a
+    // SIGTERM from `rocm services stop` too (and `vllm` does on its
+    // pre-readiness path — see `engine_stop_was_deliberate`), and a line
+    // reading "failed:" in `rocm services logs` is wrong for a stop the
+    // operator asked for — the state file was already being spared, but the
+    // log was not.
+    let deliberate = engine_stop_was_deliberate(service_id, state_path);
+    if let Some(log_path) = log_path
+        && let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+    {
+        // One compact line (`{:#}`), not the full `{:?}` chain `detail` holds:
+        // this process's stderr is attached to this same log, so whatever the
+        // binary prints on its way out already lands here. The backstop still
+        // has to exist — that attach is exactly what can be missing — but
+        // writing the identical multi-line chain made `rocm services logs`
+        // show it twice. A single `service_id`-tagged summary stays legible
+        // beside the real stderr copy, and is still the only record when
+        // there is none.
+        let outcome = if deliberate { "stopped" } else { "failed" };
+        let _ = writeln!(
+            file,
+            "__engine-serve-http service_id={service_id} {outcome}: {error:#}"
+        );
+    }
+    if deliberate {
+        return;
+    }
+    let _ =
+        rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "failed" }));
+}
+
+/// Whether this exit is an operator-requested stop rather than a crash, so the
+/// blanket `failed` stamp above must not fire.
+///
+/// Needed because the adapters disagree. `aim` makes the distinction itself
+/// (`finish_after_exit` reads `stopping`/`stopped` off its own state file,
+/// writes `stopped` and returns `Ok`), so it never reaches the stamp.
+/// `lemonade` has no such carve-out: a SIGTERM from `rocm services stop` makes
+/// `status.success()` false, so it writes `failed` itself and returns `Err`,
+/// landing here.
+///
+/// `vllm` reaches this only on its *pre-readiness* failure path. Its
+/// `serve_http` (`engines/vllm/src/process.rs`) writes its own terminal state
+/// and then ends an unsuccessful run with `std::process::exit(...)` instead of
+/// returning `Err`, so a post-readiness stop or crash never unwinds this far —
+/// that one is settled supervisor-side by `settle_exited_service`. The check
+/// still has to cover `vllm`, because a stop can land in the pre-readiness
+/// window, but this is not what spares a stopped vLLM server after readiness.
+///
+/// They were already mislabelling a deliberate stop before this change — the
+/// stamp would merely agree with them — but agreeing with a wrong answer is
+/// still wrong, so check both places an intent is recorded:
+///
+/// - the engine's own state file, which is what `aim`'s `stop_service` stamps
+///   `stopping` before it kills anything; and
+/// - the service manifest's `stop_requested_unix_ms`, which
+///   `stop_internal_managed_service_confirmed_with` writes before it signals
+///   anything, for every engine.
+///
+/// Best-effort on purpose: when neither can be read this returns `false` and the
+/// stamp proceeds, because failing to prove a stop must never swallow a crash
+/// report.
+fn engine_stop_was_deliberate(service_id: &str, state_path: &Path) -> bool {
+    engine_stop_was_deliberate_in(AppPaths::discover().ok().as_ref(), service_id, state_path)
+}
+
+/// [`engine_stop_was_deliberate`] with the paths injected.
+///
+/// Split so a test can plant the manifest marker under an isolated root: the
+/// production entry point resolves `AppPaths::discover()`, which reads the real
+/// environment, so a test calling it would answer from the developer's own
+/// services directory rather than its fixture.
+fn engine_stop_was_deliberate_in(
+    paths: Option<&AppPaths>,
+    service_id: &str,
+    state_path: &Path,
+) -> bool {
+    let engine_status = fs::read(state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|state| {
+            state
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if matches!(engine_status.as_deref(), Some("stopping" | "stopped")) {
+        return true;
+    }
+    paths.is_some_and(|paths| {
+        ManagedServiceRecord::read_manifest(paths, service_id)
+            .is_ok_and(|record| record.stop_requested_unix_ms.is_some())
+    })
+}
+
+/// ROCMAI-541 E2E hook, armed by `ROCM_E2E_SCRIPTED_ENGINE`: stands in for
+/// every real engine so a scenario can exercise a managed child dying (or being
+/// stopped) *after* its early-startup window, on a host with no GPU — the gap
+/// the original ROCMAI-541 fix left uncovered (see
+/// `serve-scripted-death-after-startup` and
+/// `serve-scripted-external-stop-while-attached` in `model_serving.feature`).
+///
+/// Marks the engine state file `running` (mirroring a real engine reaching
+/// that point) and appends a progress line to the service log — the same two
+/// signals `finalize_managed_launch_readiness`/`managed_engine_exit_failure_detail`
+/// read — then either:
+///
+/// - `ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS` set to a parseable delay: sleeps that
+///   long (long enough to clear both platforms' early-startup liveness checks,
+///   short enough to land well inside the 45s readiness window) and returns an
+///   error, simulating a crash after startup;
+/// - unset: loops until something kills this process (e.g. `rocm services
+///   stop`), capped at a generous safety ceiling so a scenario that forgets to
+///   stop it cannot hang a CI job forever.
+///
+/// Compiled only into the `e2e-test-hooks` binary; production builds never see
+/// this function or the env vars it reads.
+#[cfg(feature = "e2e-test-hooks")]
+fn run_scripted_e2e_engine_serve_http(
+    service_id: &str,
+    state_path: &Path,
+    log_path: Option<&Path>,
+) -> Result<()> {
+    let append_log = |line: &str| {
+        if let Some(log_path) = log_path
+            && let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    };
+    append_log(&format!(
+        "scripted e2e engine: started service_id={service_id} pid={}",
+        std::process::id()
+    ));
+    let _ =
+        rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "running" }));
+    let death_after_ms = std::env::var("ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if let Some(delay_ms) = death_after_ms {
+        thread::sleep(Duration::from_millis(delay_ms));
+        append_log("scripted e2e engine: dying on schedule");
+        bail!("scripted e2e engine death after startup (service `{service_id}`)");
+    }
+    // No scheduled death: run until something stops this process. The ceiling
+    // only guards against a scenario that forgot to stop it — a real scenario
+    // kills this well before 2 minutes.
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    while std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    append_log("scripted e2e engine: safety ceiling reached, exiting cleanly");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,6 +992,475 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// `run_builtin_engine_serve_http` itself, which no test reached: it has one
+    /// production call site (`main.rs`), and the e2e scenarios arm
+    /// `ROCM_E2E_SCRIPTED_ENGINE`, which takes the early-return hook above and
+    /// never runs the wrapper's own error wiring. So the tests "covering" the
+    /// backstop all called `record_engine_serve_http_failure` directly, and
+    /// unwiring it from this function would have stayed green.
+    ///
+    /// Driven through the unparseable-device-policy arm, which is the one error
+    /// this function can be made to take in-process: the `match engine` arm
+    /// below it is only reachable *after* `spawn_alongside_engine` starts the
+    /// Anthropic proxy thread, which a unit test must not do. That arm's own
+    /// wiring is therefore still uncovered — see the PR body.
+    #[test]
+    fn the_serve_http_wrapper_stamps_a_failure_it_returns_rather_than_only_returning_it() {
+        let (root, _paths) = test_paths("engine-ipc-wrapper");
+        let state_path = root.join("engine-state.json");
+        let log_path = root.join("service.log");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&state_path, br#"{"status":"starting"}"#).unwrap();
+
+        let error = run_builtin_engine_serve_http(
+            "lemonade",
+            "svc-wrapper".to_owned(),
+            "model/one".to_owned(),
+            "127.0.0.1".to_owned(),
+            0,
+            "not-a-device-policy",
+            Vec::new(),
+            None,
+            None,
+            state_path.clone(),
+            Some(log_path.clone()),
+            None,
+        )
+        .expect_err("an unparseable device policy is an engine failure");
+
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            state["status"], "failed",
+            "the service must not be left reading `starting` forever: {error:#}"
+        );
+        assert!(
+            log.contains("svc-wrapper") && log.contains("failed:"),
+            "and the reason must reach the service log: {log}"
+        );
+    }
+
+    /// The backstop itself, which nothing covered directly: on Linux the same
+    /// text also arrives through the stderr attach, so deleting the file write
+    /// would have stayed green on every lane that runs.
+    ///
+    /// Pins all three of its outputs together — the log line, the `failed`
+    /// stamp, and the fact that a deliberate stop gets neither verdict.
+    #[test]
+    fn the_serve_http_backstop_writes_the_log_line_and_the_stamp() {
+        let (root, _paths) = test_paths("engine-ipc-backstop");
+        let state_path = root.join("engine-state.json");
+        let log_path = root.join("service.log");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&state_path, br#"{"status":"running"}"#).unwrap();
+        let error = anyhow::anyhow!("engine blew up").context("while serving");
+
+        record_engine_serve_http_failure(
+            "svc-backstop",
+            &state_path,
+            Some(log_path.as_path()),
+            &error,
+        );
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(
+            log.contains("svc-backstop") && log.contains("failed:"),
+            "the crash must reach the service log even with no stderr attach: {log}"
+        );
+        assert!(
+            log.contains("engine blew up"),
+            "and it must carry the engine's own reason: {log}"
+        );
+        assert_eq!(state["status"], "failed");
+
+        // A deliberate stop gets neither verdict: not stamped, and not called
+        // "failed" in a log the user reads.
+        fs::write(&state_path, br#"{"status":"stopping"}"#).unwrap();
+        fs::write(&log_path, b"").unwrap();
+        record_engine_serve_http_failure(
+            "svc-backstop",
+            &state_path,
+            Some(log_path.as_path()),
+            &error,
+        );
+        let log = fs::read_to_string(&log_path).unwrap();
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            !log.contains("failed:"),
+            "a stop the operator asked for must not read as a failure: {log}"
+        );
+        assert_ne!(state["status"], "failed");
+    }
+
+    /// The blanket `failed` stamp must not relabel an operator-requested stop.
+    ///
+    /// `aim` already makes this distinction itself and returns `Ok`, so it never
+    /// reaches the stamp; `lemonade` and `vllm` do not — a SIGTERM from
+    /// `rocm services stop` makes `status.success()` false and they return
+    /// `Err`. This is the guard that keeps the stamp from agreeing with them.
+    #[test]
+    fn a_deliberate_stop_is_not_stamped_failed_by_the_backstop() {
+        let (root, paths) = test_paths("engine-ipc-deliberate-stop");
+        let state_path = root.join("engine-state.json");
+        fs::create_dir_all(&root).unwrap();
+
+        // What `aim`'s `stop_service` writes before it kills the container.
+        fs::write(&state_path, br#"{"status":"stopping"}"#).unwrap();
+        assert!(
+            engine_stop_was_deliberate_in(Some(&paths), "svc-stopping", &state_path),
+            "a `stopping` engine state is an operator stop, not a crash"
+        );
+
+        fs::write(&state_path, br#"{"status":"running"}"#).unwrap();
+        assert!(
+            !engine_stop_was_deliberate_in(Some(&paths), "svc-no-such-service", &state_path),
+            "a running engine with no stop recorded anywhere must still be \
+             reported as a crash — failing to prove a stop must never swallow one"
+        );
+
+        // The manifest-marker branch, which is the one `lemonade` and `vllm`
+        // actually rely on: their engine state never says `stopping`, so the
+        // only trace of an operator stop is `stop_requested_unix_ms` on the
+        // record. Planted under the isolated root, not the real environment.
+        paths.ensure().unwrap();
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-marked-stopping",
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            11_500,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.stop_requested_unix_ms = Some(1_234);
+        record.write().unwrap();
+        assert!(
+            engine_stop_was_deliberate_in(Some(&paths), "svc-marked-stopping", &state_path),
+            "a stop marker on the manifest is an operator stop even when the \
+             engine state file says nothing about it"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The `unknown` filter, which nothing else can reach: its caller is an RPC
+    /// to a live engine, so in default CI it never runs and deleting it stays
+    /// green.
+    #[test]
+    fn a_device_the_engine_does_not_know_is_not_reported_as_one() {
+        for nothing in ["unknown", "", "   "] {
+            assert_eq!(
+                device_worth_reporting(nothing.to_owned()),
+                None,
+                "`{nothing}` is the engine saying it has no answer yet, and a \
+                 `device:` row would claim otherwise"
+            );
+        }
+        for device in ["rocm gpu 0", "vulkan (AMD Radeon Graphics)"] {
+            assert_eq!(
+                device_worth_reporting(device.to_owned()),
+                Some(device.to_owned())
+            );
+        }
+    }
+
+    /// `rocm` must actually ASK for the withholding, not merely be able to.
+    ///
+    /// The protocol crate's own test proves the flag causes the clearing; this
+    /// is the other half of the chain, and without it flipping the value here
+    /// to `false` would re-open the leak with every test still green. Asserted
+    /// on `stdio_options` rather than on a built `Command` because
+    /// `engine_stdio_command` is private to the protocol crate.
+    #[test]
+    fn every_external_plugin_spawn_asks_to_withhold_the_endpoint_key_file() {
+        for stream_progress in [false, true] {
+            let options = stdio_options(None, None, stream_progress);
+            assert!(
+                options.withhold_inherited_key_file,
+                "an engine plugin is a third-party binary: `rocm` must withhold \
+                 an inherited key-file path from it, whatever else this request \
+                 asks for"
+            );
+            assert!(
+                options.endpoint_key_file.is_none(),
+                "and it must never hand one over either"
+            );
+        }
+    }
+
+    /// The endpoint key file reaches a built-in engine through the process
+    /// environment, and is gone again afterwards.
+    ///
+    /// Both halves matter and neither was covered. Without the variable a
+    /// `--require-api-key` service's own `/v1/models` probe answers 401, the
+    /// engine reports the service as unlisted, and the `device:` row silently
+    /// vanishes for exactly the protected services. Without the restore, one
+    /// service's key would leak into the next service's probe in the same
+    /// `rocm services list` — `with_scoped_builtin_engine_env` mutates
+    /// process-wide state, which is why the probes are serialized in the first
+    /// place.
+    #[test]
+    fn the_endpoint_key_file_is_scoped_to_one_builtin_engine_call() {
+        let key = rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV;
+        // SAFETY-adjacent: the scoped setter takes the same process-wide lock
+        // this test observes through, so no other engine call can interleave.
+        let before = std::env::var_os(key);
+        let seen = with_scoped_builtin_engine_env(
+            None,
+            None,
+            Some(Path::new("/tmp/rocm-e2e-endpoint-key")),
+            || std::env::var_os(key),
+        );
+        assert_eq!(
+            seen.as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/rocm-e2e-endpoint-key")),
+            "the engine must be able to read the key file path it was given"
+        );
+        assert_eq!(
+            std::env::var_os(key),
+            before,
+            "the key must not outlive the call it was scoped to"
+        );
+
+        // And nothing is set when no key file was supplied: a loopback service
+        // has none, and inventing one would point the engine at a file that
+        // does not exist.
+        assert_eq!(
+            with_scoped_builtin_engine_env(None, None, None, || std::env::var_os(key)),
+            before
+        );
+    }
+
+    /// Every service inside the budget is probed and reported.
+    #[test]
+    fn service_device_probes_run_while_the_budget_holds() {
+        let mut probed = Vec::new();
+        let devices = collect_service_devices(
+            [("svc-a", "lemonade"), ("svc-b", "vllm")],
+            || Duration::ZERO,
+            |service_id, engine| {
+                probed.push(service_id.to_owned());
+                Some(format!("{engine}-device"))
+            },
+        );
+
+        assert_eq!(probed, ["svc-a", "svc-b"]);
+        assert_eq!(
+            devices.get("svc-a").map(String::as_str),
+            Some("lemonade-device")
+        );
+        assert_eq!(
+            devices.get("svc-b").map(String::as_str),
+            Some("vllm-device")
+        );
+    }
+
+    /// Once [`SERVICE_DEVICE_PROBE_BUDGET`] is spent the remaining services are
+    /// *not probed at all*, and what was already learned is still rendered.
+    ///
+    /// This is the branch that keeps `rocm services list` — and the chat
+    /// `services` tool, which renders through the same
+    /// `render_services_text` — from scaling its wall time with the number of
+    /// services. Dropping the later rows is only half of it; the point is to
+    /// stop paying for them, so the probe counter below is the real assertion.
+    /// Asserting it against the live clock and live engines would mean a test
+    /// that waits out ten real seconds, which is why the loop takes both
+    /// injected.
+    #[test]
+    fn service_device_probes_stop_once_the_budget_is_exhausted() {
+        let mut probed = Vec::new();
+        // Inside the budget for the first service, over it from then on.
+        let mut tick = 0;
+        let devices = collect_service_devices(
+            [
+                ("svc-fast", "lemonade"),
+                ("svc-hung", "vllm"),
+                ("svc-never-reached", "aim"),
+            ],
+            || {
+                tick += 1;
+                if tick <= 1 {
+                    Duration::ZERO
+                } else {
+                    SERVICE_DEVICE_PROBE_BUDGET
+                }
+            },
+            |service_id, _engine| {
+                probed.push(service_id.to_owned());
+                Some("rocm gpu 0".to_owned())
+            },
+        );
+
+        assert_eq!(
+            probed,
+            ["svc-fast"],
+            "the budget must stop further probing, not merely hide its results"
+        );
+        assert_eq!(
+            devices.get("svc-fast").map(String::as_str),
+            Some("rocm gpu 0"),
+            "what was learned before the budget ran out is still reported"
+        );
+        assert!(
+            !devices.contains_key("svc-hung") && !devices.contains_key("svc-never-reached"),
+            "an unprobed service must get no `device:` row: {devices:?}"
+        );
+    }
+
+    /// The serve summary asks again when the first answer is `None`: the
+    /// engine can be seconds from verifying its own inference probe, which is
+    /// the `device: "unknown"` window `engines/lemonade` has right after a
+    /// launch reports ready.
+    #[test]
+    fn the_serve_summary_probe_waits_for_a_device_that_is_not_ready_yet() {
+        let mut attempts = 0;
+        let mut waited = Duration::ZERO;
+        let device = retry_service_device(
+            || Duration::ZERO,
+            || {
+                attempts += 1;
+                (attempts > 2).then(|| "vulkan gpu 0".to_owned())
+            },
+            |interval| waited += interval,
+        );
+
+        assert_eq!(device.as_deref(), Some("vulkan gpu 0"));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            waited,
+            SERVE_DEVICE_PROBE_INTERVAL * 2,
+            "the retries must pace themselves rather than spin"
+        );
+    }
+
+    /// And it gives up. A lemonade service whose weights are still loading can
+    /// stay `unknown` for minutes; the summary prints no `device:` row rather
+    /// than holding the terminal, which is why the row is documented as
+    /// optional.
+    #[test]
+    fn the_serve_summary_probe_gives_up_within_its_budget() {
+        let mut attempts = 0;
+        // Inside the budget for the first attempt, past it from then on.
+        let mut tick = 0;
+        let device = retry_service_device(
+            || {
+                tick += 1;
+                if tick <= 1 {
+                    Duration::ZERO
+                } else {
+                    SERVE_DEVICE_PROBE_BUDGET
+                }
+            },
+            || {
+                attempts += 1;
+                None
+            },
+            |_| {},
+        );
+
+        assert_eq!(device, None);
+        assert_eq!(
+            attempts, 2,
+            "the budget must end the retries, not merely discard their results"
+        );
+    }
+
+    /// A service whose engine cannot answer costs its own probe and nothing
+    /// more: it is skipped, and the services after it are still probed.
+    #[test]
+    fn a_service_whose_probe_fails_does_not_suppress_the_rest() {
+        let devices = collect_service_devices(
+            [("svc-quiet", "lemonade"), ("svc-ok", "vllm")],
+            || Duration::ZERO,
+            |service_id, _engine| (service_id == "svc-ok").then(|| "rocm gpu 1".to_owned()),
+        );
+
+        assert!(!devices.contains_key("svc-quiet"), "{devices:?}");
+        assert_eq!(
+            devices.get("svc-ok").map(String::as_str),
+            Some("rocm gpu 1")
+        );
+    }
+
+    /// Every engine built into this binary holds the engine protocol contract on
+    /// both of its paths: the decoded request `rocm` hands it in-process, and
+    /// `answer_builtin_engine_stdio`, the function `rocm __engine-stdio <engine>`
+    /// (which `rocmd` runs) answers request text with. The verb's own stdin
+    /// reading is not run here; e2e engine-ipc-08 to -12 cover it, for `vllm`
+    /// only. A refusal reaches the caller through the same
+    /// `decode_engine_response` as a child's answer, naming the engine's code.
+    #[test]
+    fn every_built_in_engine_holds_the_protocol_contract() {
+        assert!(!builtin_engine_available("not-an-engine"));
+        assert!(
+            builtin_engine_request(
+                "not-an-engine",
+                &EngineRequestEnvelope::new(EngineMethod::Capabilities, serde_json::json!({}))
+            )
+            .is_none()
+        );
+        for engine in crate::cli::SUPPORTED_ENGINES {
+            assert!(builtin_engine_available(engine), "{engine}");
+            let handle = builtin_engine_handler(engine).expect("built in");
+            rocm_engine_protocol::engine_contract::assert_engine_holds_protocol_contract(
+                engine,
+                |text| answer_builtin_engine_stdio(handle, text),
+                |envelope| builtin_engine_request(engine, &envelope).expect("built in"),
+            );
+            let mut request = EngineRequestEnvelope::new(EngineMethod::Stop, serde_json::json!({}));
+            request.protocol_version = Some("9.0.0".to_owned());
+            let refusal = builtin_engine_request(engine, &request).expect("built in");
+            assert_eq!(
+                decode_engine_response::<serde_json::Value>(refusal)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "incompatible_protocol: this engine speaks engine protocol \
+                     {}; the request was made for protocol 9.0.0, which \
+                     it cannot serve",
+                    rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
+                ),
+                "{engine}"
+            );
+        }
+    }
+
+    /// Each built-in engine id reaches that engine's own handler: its
+    /// capabilities answer is the one the engine crate itself gives, and the
+    /// three engines' answers differ, so a swapped mapping shows.
+    #[test]
+    fn each_built_in_engine_id_reaches_its_own_engine() {
+        let capabilities =
+            || EngineRequestEnvelope::new(EngineMethod::Capabilities, serde_json::json!({}));
+        let own: [(&str, BuiltinEngineHandler); 3] = [
+            ("lemonade", rocm_engine_lemonade::builtin_handle_envelope),
+            ("vllm", rocm_engine_vllm::builtin_handle_envelope),
+            ("aim", rocm_engine_aim::builtin_handle_envelope),
+        ];
+        let mut answers = Vec::new();
+        for (engine, handle) in own {
+            let mapped = builtin_engine_handler(engine).expect("built in");
+            let expected = handle(capabilities()).data;
+            assert_eq!(mapped(capabilities()).data, expected, "{engine}");
+            answers.push(expected);
+        }
+        assert_ne!(answers[0], answers[1]);
+        assert_ne!(answers[1], answers[2]);
+        assert_ne!(answers[0], answers[2]);
+    }
 
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {
@@ -454,6 +1531,31 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A test that panicked while holding the env lock must not take every
+    /// later scoped request down with it.
+    #[test]
+    fn scoped_engine_env_recovers_a_poisoned_lock() {
+        let lock = BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let (root, paths) = crate::tests::test_paths("engine-ipc-poisoned-lock");
+        let poisoner = std::thread::spawn(move || {
+            let _guard = lock.lock();
+            panic!("poison the engine env lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(lock.is_poisoned());
+
+        // `None` for the endpoint key file: this branch added that parameter
+        // after main wrote this test, and what the test is about is the
+        // poisoned lock and the config dir, not a key file.
+        let seen = with_scoped_builtin_engine_env(Some(&paths), None, None, || {
+            std::env::var("ROCM_CLI_CONFIG_DIR").ok()
+        });
+        lock.clear_poison();
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(seen.as_deref(), paths.config_dir.to_str());
+    }
+
     #[cfg(unix)]
     mod stdio_child {
         use super::*;
@@ -464,7 +1566,7 @@ mod tests {
         const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
 
         fn envelope(method: EngineMethod, payload: serde_json::Value) -> EngineRequestEnvelope {
-            EngineRequestEnvelope { method, payload }
+            EngineRequestEnvelope::new(method, payload)
         }
 
         fn stop_request() -> EngineRequestEnvelope {
@@ -511,7 +1613,11 @@ mod tests {
             assert_eq!(engine.argv(), ["stdio"]);
             assert_eq!(
                 engine.stdin(),
-                "{\"method\":\"stop\",\"payload\":{\"service_id\":\"svc\"}}\n"
+                format!(
+                    "{{\"protocol_version\":\"{}\",\"method\":\"stop\",\
+                     \"payload\":{{\"service_id\":\"svc\"}}}}\n",
+                    rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
+                )
             );
         }
 
@@ -570,7 +1676,7 @@ mod tests {
                 let done = Arc::clone(&done);
                 std::thread::spawn(move || {
                     while !done.load(Ordering::Relaxed) {
-                        with_scoped_builtin_engine_env(Some(&paths), None, || {
+                        with_scoped_builtin_engine_env(Some(&paths), None, None, || {
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         });
                         // Outside the lock, so the test's own turn is not starved.

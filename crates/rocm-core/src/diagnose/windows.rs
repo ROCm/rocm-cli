@@ -126,7 +126,7 @@ pub(super) fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagno
     let fix = Fix {
         summary: "Install the AMD HIP SDK for Windows; the HIP runtime DLLs and hipInfo.exe come from there.".to_owned(),
         commands: vec![
-            "# Download and install the HIP SDK (matched to your framework's HIP major):".to_owned(),
+            "# Download and install the HIP SDK (matched to your framework's HIP X.Y release):".to_owned(),
             "#   https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html".to_owned(),
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.".to_owned(),
         ],
@@ -1137,7 +1137,7 @@ mod tests {
         assert!(text.contains(&report.route_when_no_match.url), "{text}");
         assert!(text.contains("rocm examine --json"), "{text}");
         assert!(text.contains("fix-22-display-driver-old"), "{text}");
-        assert!(!text.contains("highest-scoring match"), "{text}");
+        assert!(!text.contains("top-ranked cause"), "{text}");
         assert!(!text.contains("HIGH_CONFIDENCE"), "{text}");
 
         // The line that introduces the advice makes a promise: nothing in it is
@@ -1163,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn a_real_cause_beside_an_old_driver_is_still_the_highest_scoring_match() {
+    fn a_real_cause_beside_an_old_driver_is_still_the_top_ranked_cause() {
         // The advice row must not be named as the best match, and a real
         // finding must keep that role.
         let mut e = old_driver_only_exam();
@@ -1182,7 +1182,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+            !text.contains("run `rocm fix fix-22-display-driver-old` (the top-ranked"),
             "{text}"
         );
     }
@@ -1200,6 +1200,7 @@ mod tests {
                     score,
                     evidence: vec!["synthetic".to_owned()],
                     fix: None,
+                    ..Diagnosis::default()
                 },
             );
             assert!(score < HIGH_CONFIDENCE);
@@ -1213,13 +1214,11 @@ mod tests {
                 "{text}"
             );
             assert!(
-                text.contains(
-                    "run `rocm fix fix-99-synthetic-real-cause` (the highest-scoring match)"
-                ),
+                text.contains("run `rocm fix fix-99-synthetic-real-cause` (the top-ranked cause)"),
                 "{text}"
             );
             assert!(
-                !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+                !text.contains("run `rocm fix fix-22-display-driver-old` (the top-ranked"),
                 "{text}"
             );
             // The advice row is still listed, after the real cause.

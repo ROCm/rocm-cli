@@ -12,13 +12,14 @@
 //! `daemon_run_argv`, `managed_service_launcher_path`), the `ROCM_CLI_*`
 //! environment variables every managed child inherits
 //! (`app_path_env_var_values`/`app_path_env_var_refs`, over
-//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`), and polling a freshly launched service until it can
-//! actually answer inference requests (`wait_for_service_http_ready`,
-//! `wait_for_service_http_ready_with_progress`,
+//! [`AppPaths::env_vars`]; a command gets them from `AppPaths::apply_env`, and a `rocm`
+//! child also gets the folders' sources from `rocm_child_app_path_env`), and polling a freshly launched service until it can
+//! actually answer inference requests
+//! (`wait_for_service_http_ready_with_progress`,
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `http_post_local_service_json`, `service_http_readiness_response_ready`,
 //! `lemonade_health_ready_for_model`, `model_list_ready_for_model`,
-//! `service_model_gpu_ready`, `service_model_reports_rocm_backend`,
+//! `service_model_gpu_ready`, `service_model_reports_gpu_backend`,
 //! `service_model_names_match`).
 //!
 //! Mechanically relocated from `main.rs` with no behavior change (the
@@ -27,7 +28,9 @@
 //! immediately after it in the original file, `treat_as_natural_language`, is
 //! dispatch-adjacent natural-language-invocation routing that stays in
 //! `main.rs` on purpose — it is not part of this module and is not touched by
-//! this change.
+//! this change. Behavior here has changed since the move: a Lemonade router
+//! entry served on Vulkan now counts as ready (`service_model_gpu_ready`), not
+//! only one served on ROCm.
 //!
 //! One item physically interleaved in this span in `main.rs` stayed there
 //! instead of moving: `const fn status_for_readiness` sits between
@@ -62,21 +65,26 @@
 //! `engine_recipe_json_arg` is `pub(crate)`, read from `engine_ipc.rs`'s
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `service_control.rs`'s `restart_child_argv`.
+//! `rocm_child_app_path_env` is `pub(crate)`, read from `chat/mcp_bridge.rs`;
 //! `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
 //! and `service_control.rs`'s `restart_internal_managed_service_with`.
 //! `daemon_run_argv` is `pub(crate)`, read from `main.rs`'s `dispatch()`;
 //! `managed_service_launcher_path` is `pub(crate)`, read from
 //! `service_launch.rs` and `service_control.rs`'s `restart_internal_managed_service_with`.
-//! `wait_for_service_http_ready` is `pub(crate)`, read from `service_control.rs`'s
-//! `restart_internal_managed_service_with`; `wait_for_service_http_ready_with_progress`
-//! is `pub(crate)`, read from `service_launch.rs`. `http_post_local_service_json`
+//! `wait_for_service_http_ready_with_progress` is `pub(crate)`, read from
+//! `service_launch.rs` and from `service_control.rs`'s
+//! `restart_internal_managed_service_with` — the latter for its per-tick hook
+//! rather than for progress, so a stop landing inside the readiness wait is
+//! seen (ROCMAI-541). `service_http_lists_model` and
+//! `service_http_inference_answers`, the two halves of its readiness probe, are
+//! `pub(crate)`, read from `serve_progress.rs`'s `wait_for_serve_startup`. `http_post_local_service_json`
 //! is `pub(crate)`, read from `service_control.rs`'s `unload_lemonade_service_model`.
 //! `service_model_names_match` is `pub(crate)`, read from `chat/turn.rs`.
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `service_http_readiness_response_ready`, `lemonade_health_ready_for_model`,
 //! `model_list_ready_for_model`, `service_model_gpu_ready`, and
-//! `service_model_reports_rocm_backend` have no callers outside this module
+//! `service_model_reports_gpu_backend` have no callers outside this module
 //! and stay private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
@@ -302,23 +310,24 @@ pub(crate) fn managed_service_launcher_path() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
-pub(crate) fn wait_for_service_http_ready(
-    engine: &str,
-    host: &str,
-    port: u16,
-    canonical_model_id: &str,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> EndpointReadiness {
-    wait_for_service_http_ready_with_progress(
-        engine,
-        host,
-        port,
-        &|| canonical_model_id.to_owned(),
-        endpoint_api_key,
-        timeout,
-        &mut |_elapsed| {},
-    )
+/// [`AppPaths::env_vars`] for a `rocm` child run on the user's behalf (the
+/// dashboard's and assistant's approved commands). The variables pin the
+/// child's folders, which would make it report every one as "set by
+/// ROCM_CLI_*_DIR"; this also tells it where each pinned folder really came
+/// from, so a refusal names a setting the user can change. Not used for an
+/// interactive shell or an engine, which have no use for it.
+pub(crate) fn rocm_child_app_path_env(paths: &AppPaths) -> Vec<(&'static str, OsString)> {
+    let mut vars = paths
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (key, value.as_os_str().to_owned()))
+        .collect::<Vec<_>>();
+    if let Ok(sources) =
+        serde_json::to_string(&rocm_core::ForwardedAppPathSources::for_paths(paths))
+    {
+        vars.push((rocm_core::APP_PATH_SOURCES_ENV, OsString::from(sources)));
+    }
+    vars
 }
 
 /// Wait until the service can actually serve, reporting how far it got.
@@ -346,48 +355,83 @@ pub(crate) fn wait_for_service_http_ready_with_progress(
     on_tick: &mut dyn FnMut(Duration),
 ) -> EndpointReadiness {
     let start = std::time::Instant::now();
-    let endpoint = format_http_base_url(host, port);
     let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
         // Re-evaluated each pass: a container engine reports the name its server
         // answers to only after it starts, so a name fixed up front can be wrong.
-        let canonical_model_id = model_name();
-        let canonical_model_id = canonical_model_id.as_str();
-        let listed = service_http_readiness_paths(engine).iter().any(|path| {
-            http_get_local_service(
-                host,
-                port,
-                path,
-                endpoint_api_key,
-                Duration::from_millis(750),
-            )
-            .is_ok_and(|(status, body)| {
-                service_http_readiness_response_ready(
-                    engine,
-                    path,
-                    status,
-                    &body,
-                    canonical_model_id,
-                )
-            })
-        });
-        if listed {
-            best = EndpointReadiness::Listing;
-            if rocm_core::openai_chat_completion_probe(
-                &endpoint,
-                canonical_model_id,
-                endpoint_api_key,
-                rocm_core::INFERENCE_PROBE_TIMEOUT,
-            )
-            .unwrap_or(false)
-            {
-                return EndpointReadiness::Serving;
-            }
+        match probe_service_http_readiness(engine, host, port, &model_name(), endpoint_api_key) {
+            EndpointReadiness::Serving => return EndpointReadiness::Serving,
+            EndpointReadiness::Listing => best = EndpointReadiness::Listing,
+            EndpointReadiness::Unreachable => {}
         }
         on_tick(start.elapsed());
         thread::sleep(Duration::from_millis(250));
     }
     best
+}
+
+/// One readiness probe: [`EndpointReadiness::Serving`] only after an inference
+/// request comes back, [`EndpointReadiness::Listing`] when the model is
+/// advertised but that request does not, otherwise unreachable.
+///
+/// Probes inference on every call. [`crate::serve_progress::wait_for_serve_startup`]
+/// spaces those probes out instead, through [`service_http_lists_model`] and
+/// [`service_http_inference_answers`], the same two checks, so the interactive
+/// status line and this wait cannot disagree about "ready".
+fn probe_service_http_readiness(
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> EndpointReadiness {
+    if !service_http_lists_model(engine, host, port, canonical_model_id, endpoint_api_key) {
+        return EndpointReadiness::Unreachable;
+    }
+    if service_http_inference_answers(host, port, canonical_model_id, endpoint_api_key) {
+        return EndpointReadiness::Serving;
+    }
+    EndpointReadiness::Listing
+}
+
+/// The cheap half of a readiness probe: the endpoint answers and advertises
+/// the model (a short GET per readiness path).
+pub(crate) fn service_http_lists_model(
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    service_http_readiness_paths(engine).iter().any(|path| {
+        http_get_local_service(
+            host,
+            port,
+            path,
+            endpoint_api_key,
+            Duration::from_millis(750),
+        )
+        .is_ok_and(|(status, body)| {
+            service_http_readiness_response_ready(engine, path, status, &body, canonical_model_id)
+        })
+    })
+}
+
+/// The expensive half: a real one-token chat request, which can wait up to
+/// [`rocm_core::INFERENCE_PROBE_TIMEOUT`] on a model that is still loading.
+pub(crate) fn service_http_inference_answers(
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+) -> bool {
+    rocm_core::openai_chat_completion_probe(
+        &format_http_base_url(host, port),
+        canonical_model_id,
+        endpoint_api_key,
+        rocm_core::INFERENCE_PROBE_TIMEOUT,
+    )
+    .unwrap_or(false)
 }
 
 fn service_http_readiness_paths(engine: &str) -> &'static [&'static str] {
@@ -495,7 +539,7 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && service_model_reports_rocm_backend(model)
+                name_matches && service_model_reports_gpu_backend(model)
             })
         })
 }
@@ -503,7 +547,7 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
 fn model_list_ready_for_model(
     body: &str,
     canonical_model_id: &str,
-    require_rocm_backend: bool,
+    require_gpu_backend: bool,
 ) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return false;
@@ -517,7 +561,7 @@ fn model_list_ready_for_model(
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && (!require_rocm_backend || service_model_gpu_ready(model))
+                name_matches && (!require_gpu_backend || service_model_gpu_ready(model))
             })
         })
 }
@@ -525,22 +569,26 @@ fn model_list_ready_for_model(
 /// Whether a lemonade `/v1/models` entry is served on GPU. A stock `llama-server`
 /// (direct-serve) entry has no `recipe_options` and is accepted (that path only runs
 /// GPU backends); a Lemonade-router entry carries `recipe_options`, so it must report a
-/// ROCm backend — which keeps a registered-but-unloaded model (empty `recipe_options`)
+/// GPU backend (ROCm or Vulkan) — which keeps a registered-but-unloaded model (empty `recipe_options`)
 /// from reading as ready.
 fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
     match model.get("recipe_options") {
         None => true,
-        Some(_) => service_model_reports_rocm_backend(model),
+        Some(_) => service_model_reports_gpu_backend(model),
     }
 }
 
-fn service_model_reports_rocm_backend(model: &serde_json::Value) -> bool {
+fn service_model_reports_gpu_backend(model: &serde_json::Value) -> bool {
     model
         .get("recipe_options")
         .and_then(|options| options.get("llamacpp_backend"))
         .or_else(|| model.get("llamacpp_backend"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|backend| backend.trim().to_ascii_lowercase().starts_with("rocm"))
+        .is_some_and(|backend| {
+            // The GPU backends the engine can select (ROCm, else Vulkan); never `cpu`.
+            let backend = backend.trim().to_ascii_lowercase();
+            backend.starts_with("rocm") || backend.starts_with("vulkan")
+        })
 }
 
 /// Whether two model names refer to the same model, leniently.
@@ -726,6 +774,49 @@ mod tests {
     }
 
     #[test]
+    fn lemonade_router_readiness_accepts_any_gpu_backend_the_engine_selects() {
+        // The engine selects ROCm first and Vulkan otherwise, and records either as
+        // `backend_requested`; a router-served model on a Vulkan host must read as
+        // ready on both probe paths. CPU (or no backend) must never read as ready.
+        for (backend, ready) in [
+            ("rocm", true),
+            ("rocm-stable", true),
+            ("vulkan", true),
+            ("Vulkan", true),
+            ("cpu", false),
+            ("", false),
+        ] {
+            let health = json!({
+                "all_models_loaded": [{
+                    "model_name": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            let models = json!({
+                "data": [{
+                    "id": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            for (path, body) in [("/v1/health", &health), ("/v1/models", &models)] {
+                assert_eq!(
+                    service_http_readiness_response_ready(
+                        "lemonade",
+                        path,
+                        200,
+                        body,
+                        "Qwen3-0.6B-GGUF"
+                    ),
+                    ready,
+                    "{path} with backend `{backend}`"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn serve_readiness_wait_withholds_ready_while_the_model_only_lists() -> Result<()> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -760,13 +851,14 @@ mod tests {
             Ok(())
         });
 
-        let readiness = wait_for_service_http_ready(
+        let readiness = wait_for_service_http_ready_with_progress(
             "vllm",
             "127.0.0.1",
             port,
-            "Qwen3-0.6B-GGUF",
+            &|| "Qwen3-0.6B-GGUF".to_owned(),
             None,
             Duration::from_millis(600),
+            &mut |_elapsed| {},
         );
 
         assert_eq!(
@@ -814,13 +906,14 @@ mod tests {
             Ok(())
         });
 
-        let readiness = wait_for_service_http_ready(
+        let readiness = wait_for_service_http_ready_with_progress(
             "vllm",
             "127.0.0.1",
             port,
-            "Qwen3-0.6B-GGUF",
+            &|| "Qwen3-0.6B-GGUF".to_owned(),
             None,
             Duration::from_secs(5),
+            &mut |_elapsed| {},
         );
 
         assert_eq!(readiness, EndpointReadiness::Serving);
@@ -874,13 +967,14 @@ mod tests {
         });
 
         let started = Instant::now();
-        let readiness = wait_for_service_http_ready(
+        let readiness = wait_for_service_http_ready_with_progress(
             "vllm",
             "127.0.0.1",
             port,
-            "Qwen3-0.6B-GGUF",
+            &|| "Qwen3-0.6B-GGUF".to_owned(),
             None,
             Duration::from_secs(5),
+            &mut |_elapsed| {},
         );
 
         assert_eq!(readiness, EndpointReadiness::Serving);

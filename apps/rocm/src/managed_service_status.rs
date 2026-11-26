@@ -230,7 +230,7 @@ pub(crate) fn container_stop_unresolved(record: &ManagedServiceRecord) -> bool {
 /// operator never asked for it to go away and will want it back: dropping the
 /// key there would make `rocm services restart` and daemon recovery refuse it
 /// permanently — fail-closed guards have no way to re-mint a key. The cost of
-/// this choice is that a crashed public service's 0600 key file outlives the
+/// this choice is that a crashed public service's owner-only key file outlives the
 /// process until the service is stopped or successfully restarted.
 ///
 /// Called before the liveness gate in
@@ -266,7 +266,44 @@ fn settle_pending_stop_key_cleanup(
         return false;
     }
     endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
-    let consumed_marker = record.stop_requested_unix_ms.take();
+    // Moved, not dropped — on *both* branches below, the same way
+    // `service_control::stop_internal_managed_service_confirmed_with` and
+    // `rocmd`'s stop move theirs.
+    //
+    // The non-empty branch used to consume this marker and discard it, leaving
+    // `status: "stopped"` as the only trace of the stop. That is not evidence:
+    // `refresh_managed_service_runtime_liveness` writes the same status for a
+    // record whose tracked PIDs are merely gone, and
+    // `service_launch::readiness::managed_service_stop_was_requested` now reads
+    // these two fields precisely *because* the status cannot tell a stop from a
+    // crash. This helper runs ahead of the stop's own confirmation whenever a
+    // concurrent `rocm services`/`rocm dash`/`rocmd` liveness refresh observes
+    // the signalled PIDs dead first — the race
+    // `stop_internal_managed_service_confirmed_with`'s own comment anticipates —
+    // so dropping the marker here ended the record `stopped` with both fields
+    // unset, and the next read called the operator's own stop a crash
+    // (ROCMAI-541's symptom, through the one path its fix did not touch).
+    //
+    // Written as a guarded move rather than `= take()`, but — unlike the
+    // identical-looking line in
+    // `service_control::stop_internal_managed_service_confirmed_with`, where the
+    // guard is what closes a live race — this one cannot currently fire: the
+    // `stop_requested_unix_ms.is_none()` early return at the top of this
+    // function already means the marker is `Some` by the time control reaches
+    // here, so a second listing arriving after the first settled the stop
+    // returns above instead. The guard states that precondition locally and
+    // keeps the line correct if the early return is ever relaxed, which is the
+    // whole difference it makes; `= take()` would silently assign `None` over
+    // an already-settled timestamp the moment that happened, re-creating the
+    // both-fields-unset record this move exists to prevent.
+    //
+    // Pinned by `a_second_listing_does_not_clear_the_stop_a_first_one_settled`,
+    // which asserts the outcome (the settled stamp survives a second listing)
+    // rather than this line: it stays green if either protection is removed and
+    // goes red only when both are.
+    if let Some(consumed_marker) = record.stop_requested_unix_ms.take() {
+        record.settled_stop_unix_ms = Some(consumed_marker);
+    }
     // A record that named no process has no stop to complete: the key and the
     // stale marker go, as they always did, but it is not read as stopped. It may
     // be a launch that has not recorded its supervisor yet. The marker's value
@@ -274,7 +311,6 @@ fn settle_pending_stop_key_cleanup(
     // this empty record and finds it with no marker would otherwise read this
     // cleanup as a relaunch and report itself unconfirmed.
     if recorded_service_pids(record).is_empty() {
-        record.settled_stop_unix_ms = consumed_marker;
         return true;
     }
     // Every recorded process is confirmed gone, so none of them is the
@@ -1188,8 +1224,27 @@ mod tests {
         Ok(())
     }
 
+    /// Completing a pending stop here must *move* its marker, not drop it
+    /// (ROCMAI-541 review).
+    ///
+    /// This branch is how a deliberate stop most often finishes: it runs ahead
+    /// of `service_control::stop_internal_managed_service_confirmed_with`'s own
+    /// re-read whenever a concurrent `rocm services`/`rocm dash`/`rocmd`
+    /// liveness refresh sees the signalled PIDs dead first, which is the race
+    /// that function's own comment anticipates. It used to `take()` the marker
+    /// and discard it, leaving `status: "stopped"` as the only trace — and the
+    /// status is not evidence, because this very function writes `"stopped"` for
+    /// a record whose PIDs are merely gone, saying so in its own comment.
+    ///
+    /// So the stamp below is the whole assertion: with both fields unset, the
+    /// next `service_launch::readiness::managed_service_stop_was_requested` —
+    /// the attached `--verbose` session's `ServerExited` check among them —
+    /// finds no evidence of the stop the operator asked for and reports it as a
+    /// crash. That is ROCMAI-541's original symptom, reached through the one
+    /// path its fix did not touch. Asserting `supervisor_pid == 0` and
+    /// `status == "stopped"` alone passed with the marker dropped.
     #[test]
-    fn a_completed_pending_stop_reads_stopped_whatever_live_status_it_had() -> Result<()> {
+    fn a_completed_pending_stop_reads_stopped_and_keeps_its_evidence() -> Result<()> {
         for status in ["starting", "running", "ready", "recovering", "failed"] {
             let (root, paths) = test_paths(&format!("liveness-pending-stop-{status}"));
             paths.ensure()?;
@@ -1205,11 +1260,106 @@ mod tests {
             assert_eq!(record.status, "stopped", "{status}");
             assert_eq!(record.supervisor_pid, 0, "{status}");
             assert_eq!(
-                record.settled_stop_unix_ms, None,
-                "{status}: a record that names processes reads stopped and needs no stamp"
+                record.stop_requested_unix_ms, None,
+                "{status}: the pending marker is consumed"
+            );
+            assert_eq!(
+                record.settled_stop_unix_ms,
+                Some(1),
+                "{status}: the consumed marker must move to the settled stamp, or this stop ends \
+                 with no evidence it was deliberate and the next read calls it a crash"
             );
             let _ = fs::remove_dir_all(root);
         }
+        Ok(())
+    }
+
+    /// ROCMAI-541 review: the *second* listing must not undo what the first
+    /// one settled.
+    ///
+    /// The test above starts from a marker that is still there, so it passes
+    /// whether the move is guarded or an unconditional
+    /// `settled_stop_unix_ms = stop_requested_unix_ms.take()`. This helper runs
+    /// on every `rocm services`/`rocm dash`/`rocmd` listing, so two of them
+    /// racing — or one racing the stop's own finalization — reach it with the
+    /// marker already consumed. `.take()` on a field that is already `None` is
+    /// `None`, and assigning that across wipes the timestamp the first listing
+    /// correctly wrote, leaving the record `stopped` with both fields unset:
+    /// indistinguishable from a crash a liveness refresh reconciled, which is
+    /// the state this move exists to prevent.
+    ///
+    /// Two separate things stop that today — `settle_pending_stop_key_cleanup`
+    /// returns early when the marker is already `None`, and its move is written
+    /// as a guarded `if let` — so this asserts the **outcome** rather than
+    /// either mechanism. It stays green if either one is removed on its own and
+    /// goes red when both are, which is the honest strength of it: the guard is
+    /// not independently falsifiable, because the early return makes it
+    /// unreachable. Said plainly here rather than implied, since the line it
+    /// backs reads exactly like the one in `service_control` that *does* close
+    /// a live race.
+    #[test]
+    fn a_second_listing_does_not_clear_the_stop_a_first_one_settled() -> Result<()> {
+        let (root, paths) = test_paths("liveness-pending-stop-resettle");
+        paths.ensure()?;
+        let mut record = pending_stop_record(&paths, "svc-status")?;
+
+        // The first listing: consumes the marker and settles the stamp.
+        assert!(refresh_managed_service_runtime_liveness_with(
+            &paths,
+            &mut record,
+            |_| ProcessProbe::Gone
+        ));
+        assert_eq!(record.stop_requested_unix_ms, None);
+        assert_eq!(record.settled_stop_unix_ms, Some(1));
+
+        // The second listing, over the record the first one left. It has no
+        // marker to move; it must leave the evidence standing rather than
+        // moving `None` over it. The status is put back to a live one so the
+        // helper is actually re-entered instead of short-circuiting.
+        "ready".clone_into(&mut record.status);
+        record.supervisor_pid = 999_999_999;
+        record.write()?;
+        let _ = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+
+        assert_eq!(
+            record.settled_stop_unix_ms,
+            Some(1),
+            "a stop already settled must survive the next listing, or the pair of \
+             them ends with the same both-fields-unset record a crash leaves"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The end-to-end consequence of the stamp above, through the predicate that
+    /// actually consumes it.
+    ///
+    /// `managed_service_stop_was_requested` reads the persisted manifest, so it
+    /// is only satisfied if the refresh *wrote* the settled stamp rather than
+    /// merely leaving it on the in-memory record. Dropping the marker in
+    /// `settle_pending_stop_key_cleanup` makes this read `false` — a deliberate
+    /// stop reported as a crash.
+    #[test]
+    fn a_stop_settled_by_a_concurrent_liveness_refresh_is_still_readable_as_a_stop() -> Result<()> {
+        let (root, paths) = test_paths("liveness-pending-stop-evidence-persisted");
+        paths.ensure()?;
+        let service_id = "svc-status";
+        let mut record = pending_stop_record(&paths, service_id)?;
+        "ready".clone_into(&mut record.status);
+
+        let changed = refresh_managed_service_runtime_liveness_with(&paths, &mut record, |_| {
+            ProcessProbe::Gone
+        });
+        assert!(changed);
+        record.write()?;
+
+        assert!(
+            crate::service_launch::managed_service_stop_was_requested(&paths, service_id),
+            "a stop the liveness refresh settled must still read as a stop, not a crash"
+        );
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

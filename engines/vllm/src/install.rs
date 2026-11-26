@@ -4,20 +4,23 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{
-    AppPaths, command_failure_detail, ensure_uv_binary, split_local_version, uv_command_env,
-    uv_pip_freeze_args, uv_pip_install_base,
+    AppPaths, TENSORIZER_PYTHON314_FIX, command_failure_detail, ensure_uv_binary,
+    split_local_version, tensorizer_override_requirement, uv_command_env, uv_pip_freeze_args,
+    uv_pip_install_base,
 };
 use rocm_engine_protocol::{InstallRequest, InstallResponse};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::discover_builds::{
-    DiscoverVersion, VllmRocmDiscoverBuild, rocm_sdk_series_matches, vllm_rocm_discover_build,
+    DiscoverVersion, TorchStack, VllmRocmDiscoverBuild, rocm_sdk_series_matches, rocm_series,
+    vllm_rocm_discover_build,
 };
 use crate::repair::{RepairAssessment, assess_runtime_repair};
 use crate::runtime::{
-    assessed_python_for_repair, describe_skipped_managed_runtimes, resolve_managed_runtime_python,
-    resolve_vllm_runtime, runtime_is_managed, vllm_runtime_warnings,
+    VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
+    recorded_sdk_index_url, resolve_managed_runtime_python, resolve_vllm_runtime,
+    runtime_is_managed, vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 use crate::wheel_builds::{
@@ -50,6 +53,9 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
     };
     let mut discover_pins: Vec<String> = Vec::new();
     let mut discover_notes: Vec<String> = Vec::new();
+    // True whenever this run installed vLLM: a first install, `--reinstall` or a
+    // repair pass. Only a runtime that was resolved as already installed skips it.
+    let installed_vllm_now = already_installed.is_none();
     let runtime = if let Some(runtime) = already_installed {
         runtime
     } else {
@@ -89,6 +95,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             )
         })?
     };
+    discover_notes.extend(ensure_runtime_tensorizer(&runtime, installed_vllm_now)?);
     let env_path = runtime
         .command
         .parent()
@@ -129,6 +136,287 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             .collect(),
     })
 }
+/// What the tensorizer import probe found.
+#[derive(Debug, PartialEq, Eq)]
+enum TensorizerProbe {
+    /// `tensorizer` imports, is not installed (vLLM guards that case itself), or
+    /// the import failed for a reason that is not tensorizer's (a torch or
+    /// shared-library failure, which the runtime device check reports).
+    Usable,
+    /// `tensorizer` is installed and raises on import; carries the exception line.
+    Broken(String),
+}
+
+/// How long the import probe and the upgrade may run before they are abandoned.
+const TENSORIZER_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// The path of the last `File "..."` frame in a Python traceback.
+fn last_traceback_frame(stderr: &str) -> Option<&str> {
+    stderr.lines().rev().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("File \"")?;
+        rest.split_once('"').map(|(path, _)| path)
+    })
+}
+
+/// Whether `path` lies inside a `tensorizer` package directory, with either
+/// path separator.
+fn path_is_in_tensorizer_package(path: &str) -> bool {
+    path.contains("/tensorizer/") || path.contains("\\tensorizer\\")
+}
+
+/// Judges the stderr of a failed `import tensorizer.serialization`.
+///
+/// The import pulls in torch, so a torch or shared-library failure has tensorizer
+/// frames in its traceback too. A failure is tensorizer's own when the last frame
+/// before the exception is inside the tensorizer package and the exception is not
+/// a library-load or missing-module error (`ImportError`, `OSError`): that is the
+/// shape of the Python 3.14 `KeyError` and of any other tensorizer code that does
+/// not run on this interpreter. Everything else is left to the device check.
+fn classify_tensorizer_failure(stderr: &str) -> TensorizerProbe {
+    // Python 3.13+ colourises tracebacks under `FORCE_COLOR` even when piped, which
+    // wraps the quoted path in `File "..."` in escapes and defeats the frame
+    // parser. The probe asks for no colour; this is the second line of defence.
+    let stderr = stderr
+        .lines()
+        .map(rocm_core::strip_terminal_control_sequences)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = stderr.as_str();
+    let Some(exception) = stderr.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return TensorizerProbe::Usable;
+    };
+    let exception = exception.trim();
+    let kind = exception.split([':', ' ']).next().unwrap_or_default();
+    let is_load_failure = kind.ends_with("ImportError")
+        || kind.ends_with("OSError")
+        || kind == "ModuleNotFoundError"
+        || exception.contains("shared object file")
+        || exception.contains("DLL load failed");
+    let in_tensorizer = last_traceback_frame(stderr).is_some_and(path_is_in_tensorizer_package);
+    if in_tensorizer && !is_load_failure {
+        TensorizerProbe::Broken(exception.to_owned())
+    } else {
+        TensorizerProbe::Usable
+    }
+}
+
+/// The command that imports what vLLM imports from `tensorizer` in `python`.
+///
+/// Colour is switched off (a forced-colour environment makes the interpreter wrap
+/// the traceback's quoted paths in escape codes), and with `runtime` the command
+/// carries the environment the server is launched with (SDK library path,
+/// `PYTHONPATH` for a ROCm 10.x discover build, and the rest), so a runtime that
+/// needs it to import torch is judged as it will run.
+fn tensorizer_probe_command(
+    python: &Path,
+    runtime: Option<&VllmRuntime>,
+) -> Result<ProcessCommand> {
+    let mut command = ProcessCommand::new(python);
+    // Not `-I`: that implies `-E` and would drop the `PYTHONPATH` (and the rest of
+    // the `PYTHON*` environment) the launch sets for a ROCm 10.x discover build,
+    // so a module the server finds would read as missing. `-s` keeps the user's
+    // site directory out, and `PYTHONSAFEPATH` keeps the working directory off
+    // `sys.path` (Python 3.11+; older interpreters ignore it).
+    command
+        .args(["-s", "-c", "import tensorizer.serialization"])
+        .env("PYTHONSAFEPATH", "1");
+    if let Some(runtime) = runtime {
+        // A launch environment that cannot be built is a failure of the check, not
+        // a runtime that imports: probing without it could read as `Usable` a
+        // failure the server would not have.
+        crate::process::apply_therock_env(&mut command, runtime)
+            .context("could not build the environment the server is launched with")?;
+    }
+    command
+        .env_remove("FORCE_COLOR")
+        .env("NO_COLOR", "1")
+        .env("PYTHON_COLORS", "0");
+    Ok(command)
+}
+
+/// Imports what vLLM imports from `tensorizer` in `python`.
+///
+/// vLLM's model loader imports `tensorizer.serialization` at startup and only
+/// guards `ImportError`, so any other exception raised inside tensorizer ends
+/// the engine core. With `runtime`, the probe runs under the environment the
+/// server is launched with (SDK library path and the rest), so a runtime that
+/// needs it to import torch is judged as it will run.
+fn probe_tensorizer_import(
+    python: &Path,
+    runtime: Option<&VllmRuntime>,
+) -> Result<TensorizerProbe> {
+    probe_tensorizer_import_within(python, runtime, TENSORIZER_STEP_TIMEOUT)
+}
+
+/// [`probe_tensorizer_import`] with the deadline as a parameter, so a test can
+/// exercise the timeout without waiting minutes.
+fn probe_tensorizer_import_within(
+    python: &Path,
+    runtime: Option<&VllmRuntime>,
+    limit: std::time::Duration,
+) -> Result<TensorizerProbe> {
+    let command = tensorizer_probe_command(python, runtime)?;
+    let output = rocm_core::process::run_with_timeout(command, limit, "tensorizer import probe")
+        .with_context(|| format!("failed to import tensorizer with {}", python.display()))?;
+    if output.status.success() {
+        return Ok(TensorizerProbe::Usable);
+    }
+    Ok(classify_tensorizer_failure(&String::from_utf8_lossy(
+        &output.stderr,
+    )))
+}
+
+/// Installs the fixed tensorizer over vLLM's pin, leaving everything else as it is.
+fn upgrade_tensorizer(uv: &Path, paths: &AppPaths, python: &Path) -> Result<()> {
+    upgrade_tensorizer_within(uv, paths, python, TENSORIZER_STEP_TIMEOUT)
+}
+
+/// [`upgrade_tensorizer`] with the deadline as a parameter, so a test can
+/// exercise the timeout without waiting minutes.
+fn upgrade_tensorizer_within(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    limit: std::time::Duration,
+) -> Result<()> {
+    let mut args = uv_pip_install_base(python);
+    args.push("--no-deps".to_owned());
+    args.push(tensorizer_override_requirement());
+    let mut command = ProcessCommand::new(uv);
+    command.args(&args).envs(uv_command_env(paths));
+    let output =
+        rocm_core::process::run_with_timeout(command, limit, "uv pip install for tensorizer")
+            .context("failed to run uv pip install for tensorizer")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "`uv {}` failed: {}",
+        args.join(" "),
+        command_failure_detail(&output)
+    )
+}
+
+/// The decision behind [`ensure_runtime_tensorizer`], with the probe and the
+/// upgrade injected.
+///
+/// Only a managed runtime is rocm-cli's to change, so an external one is not
+/// probed at all. The probe runs first so an interpreter the pinned release works
+/// on keeps exactly what vLLM asked for.
+///
+/// Three things can go wrong after a broken tensorizer is found: the upgrade
+/// fails, the probe cannot run, or the upgrade leaves tensorizer unimportable.
+/// Each is an error when `fatal` (this run installed vLLM, whether a first
+/// install, `--reinstall` or a repair, so the runtime would be left unable to
+/// serve or unchecked) and otherwise a note carrying the same facts, so a no-op
+/// install on a runtime this run did not touch (an offline host, say) stays one.
+/// Returns the note describing what was done, if anything.
+fn tensorizer_step(
+    managed: bool,
+    fatal: bool,
+    mut probe: impl FnMut() -> Result<TensorizerProbe>,
+    upgrade: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
+    if !managed {
+        return Ok(None);
+    }
+    // A probe that cannot run (spawn failure, timeout) is a failure of the check,
+    // not a finding. It fails when this run installed vLLM, which must not report
+    // a runtime it could not look at. On a runtime it did not touch it is a note,
+    // so a host where the check cannot run keeps the no-op install it had before.
+    let unchecked = |error: anyhow::Error| -> Result<Option<String>> {
+        if fatal {
+            Err(error)
+        } else {
+            Ok(Some(format!(
+                "could not check whether vLLM's tensorizer imports: {error:#}"
+            )))
+        }
+    };
+    let reason = match probe() {
+        Ok(TensorizerProbe::Broken(reason)) => reason,
+        Ok(TensorizerProbe::Usable) => return Ok(None),
+        Err(error) => return unchecked(error),
+    };
+    let requirement = tensorizer_override_requirement();
+    if let Err(error) = upgrade() {
+        let message = format!(
+            "vLLM's pinned tensorizer cannot be imported ({reason}) and upgrading it to \
+             {requirement} failed: {error:#}"
+        );
+        return if fatal {
+            Err(anyhow::anyhow!("vLLM was installed, but {message}"))
+        } else {
+            Ok(Some(format!("{message}; vLLM would fail at startup")))
+        };
+    }
+    let after = match probe() {
+        Ok(after) => after,
+        Err(error) => return unchecked(error),
+    };
+    match after {
+        TensorizerProbe::Usable => Ok(Some(format!(
+            "vLLM pins a tensorizer that cannot be imported under this Python ({reason}); \
+             upgraded it to {TENSORIZER_PYTHON314_FIX}, so `uv pip check` reports vLLM's pin as \
+             unmet on purpose"
+        ))),
+        TensorizerProbe::Broken(after) => {
+            // An upgrade can fail to help (the exception is not the one 2.12.1
+            // fixes). When this run installed vLLM that leaves a runtime that
+            // cannot serve, so it fails; on a runtime this run did not touch the
+            // install used to be a no-op and stays one, with the same facts as a note.
+            let message = format!(
+                "tensorizer still cannot be imported after upgrading it to {requirement}: \
+                 {after}. vLLM would fail at startup, so this runtime cannot serve with vLLM."
+            );
+            if fatal {
+                bail!("vLLM was installed, but {message}")
+            }
+            Ok(Some(message))
+        }
+    }
+}
+
+/// Makes sure vLLM's `tensorizer` dependency imports in `runtime`, upgrading it
+/// when it does not.
+///
+/// vLLM's wheel pins `tensorizer==2.10.1`, which raises
+/// `KeyError: 'crypto_stream_salsa20_NONCEBYTES'` at import under Python 3.14
+/// (its constants metaclass reads annotations from the class namespace, where
+/// 3.14 no longer puts them; fixed in tensorizer 2.12.1). The ROCm 10.1.0 vLLM
+/// build exists for Python 3.14 only, so the pin cannot be avoided by choosing
+/// another Python, and an install that reports success would end in an engine
+/// core crash at the first `rocm serve`. Runs after an install pass (`installed_now`)
+/// and on an existing runtime, so one installed before this check existed is
+/// repaired by the next `rocm engines install vllm`.
+fn ensure_runtime_tensorizer(runtime: &VllmRuntime, installed_now: bool) -> Result<Option<String>> {
+    ensure_runtime_tensorizer_with(runtime, installed_now, |python| {
+        let paths = AppPaths::discover()?;
+        let uv =
+            ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+        upgrade_tensorizer(&uv, &paths, python)
+    })
+}
+
+/// [`ensure_runtime_tensorizer`] with the upgrade injected, so a test can drive
+/// the real probe (and its launch environment) against a stand-in interpreter.
+fn ensure_runtime_tensorizer_with(
+    runtime: &VllmRuntime,
+    installed_now: bool,
+    upgrade: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Option<String>> {
+    // The managed check lives in `tensorizer_step`, once, so the rule has one home.
+    let Some(python) = runtime.python_executable.as_deref() else {
+        return Ok(None);
+    };
+    tensorizer_step(
+        runtime_is_managed(runtime),
+        installed_now,
+        || probe_tensorizer_import(python, Some(runtime)),
+        || upgrade(python),
+    )
+}
+
 /// What a vLLM install route resolved: the pins worth surfacing as an install
 /// warning, and a note for each place the route fell back to a weaker choice
 /// than the one it prefers. Both are empty for the static-pin route.
@@ -155,11 +443,14 @@ fn install_vllm_with_uv(
             let paths = AppPaths::discover()?;
             let uv =
                 ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
-            // Unwrap is safe: `vllm_install_route` only returns `RocmDiscover`
-            // when `rocm_sdk_version` looks up a build in the table.
-            let build = rocm_sdk_version.and_then(vllm_rocm_discover_build).expect(
-                "vllm_install_route returned RocmDiscover without a matching discover build",
-            );
+            // `vllm_install_route` only returns `RocmDiscover` when
+            // `rocm_sdk_version` looks up a build in the table, so this
+            // context is unreachable; it keeps that invariant from panicking.
+            let build = rocm_sdk_version
+                .and_then(vllm_rocm_discover_build)
+                .context(
+                    "vLLM install route chose the ROCm discover index without a matching build",
+                )?;
             install_vllm_rocm10_discover(&uv, &paths, python, reinstall, build)
         }
         VllmInstallRoute::Static => {
@@ -279,6 +570,104 @@ fn discover_pinned_requirement_for(
             )
         })
 }
+/// The row's torch, torchvision and torchaudio pins, in that order.
+///
+/// A [`TorchStack::Discover`] row resolves them from its index. A
+/// [`TorchStack::FromInstalledSdk`] row takes them from the runtime the SDK
+/// install already resolved, because the index it realigns from serves
+/// several ROCm lines at once and a series such as `torch==2.14.*` would pick
+/// the newest line's build (see [`TorchStack`]).
+fn torch_stack_pins(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    build: &VllmRocmDiscoverBuild,
+) -> Result<Vec<String>> {
+    match build.torch_stack {
+        TorchStack::Discover => ["torch", "torchvision", "torchaudio"]
+            .into_iter()
+            .map(|pkg| {
+                let version = match pkg {
+                    "torch" => DiscoverVersion::Series(build.torch_version_prefix),
+                    "torchvision" => DiscoverVersion::Series(build.torchvision_version_prefix),
+                    _ => build.torchaudio_version,
+                };
+                discover_pinned_requirement(uv, paths, python, build.torch_index_url, pkg, version)
+            })
+            .collect(),
+        TorchStack::FromInstalledSdk => {
+            let output = ProcessCommand::new(uv)
+                .args(uv_pip_freeze_args(python))
+                .envs(uv_command_env(paths))
+                .output()
+                .context("failed to launch `uv pip freeze` to read the SDK's torch stack")?;
+            if !output.status.success() {
+                bail!(
+                    "`uv pip freeze` failed for {}: {}",
+                    python.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            installed_torch_stack_pins(&String::from_utf8_lossy(&output.stdout), build)
+        }
+    }
+}
+
+/// Whether an installed `release` (a `uv pip freeze` version, with any `+local` part)
+/// satisfies `wanted`: a series takes any release inside it, an exact pin takes that
+/// release and no longer one, with the same meaning as PEP 440 `==release`.
+fn stack_release_matches(release: &str, wanted: DiscoverVersion) -> bool {
+    match wanted {
+        DiscoverVersion::Series(series) => release.starts_with(&format!("{series}.")),
+        DiscoverVersion::Exact(exact) => split_local_version(release).0 == exact,
+    }
+}
+/// [`torch_stack_pins`] for a [`TorchStack::FromInstalledSdk`] row, from the
+/// `uv pip freeze` output of the SDK runtime.
+///
+/// Each pin must belong to the row's torch, torchvision and torchaudio series
+/// and be built for the row's ROCm line, so a runtime whose torch is not the
+/// one the vLLM wheel was built against is refused instead of silently kept.
+fn installed_torch_stack_pins(freeze: &str, build: &VllmRocmDiscoverBuild) -> Result<Vec<String>> {
+    let wanted = [
+        ("torch", DiscoverVersion::Series(build.torch_version_prefix)),
+        (
+            "torchvision",
+            DiscoverVersion::Series(build.torchvision_version_prefix),
+        ),
+        ("torchaudio", build.torchaudio_version),
+    ];
+    wanted
+        .into_iter()
+        .map(|(pkg, wanted_release)| {
+            let prefix = format!("{pkg}==");
+            let pin = freeze
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(&prefix))
+                .with_context(|| {
+                    format!(
+                        "the ROCm SDK runtime has no `{pkg}` installed; vLLM for ROCm {} reuses \
+                         the SDK's own torch stack, so reinstall the SDK with `rocm install sdk`",
+                        build.rocm_sdk_version
+                    )
+                })?;
+            let release = &pin[prefix.len()..];
+            if !stack_release_matches(release, wanted_release) {
+                bail!(
+                    "the ROCm SDK runtime has `{pin}`, but vLLM for ROCm {} needs `{pkg}` {}",
+                    build.rocm_sdk_version,
+                    match wanted_release {
+                        DiscoverVersion::Series(series) => format!("{series}.x"),
+                        DiscoverVersion::Exact(release) => release.to_owned(),
+                    }
+                );
+            }
+            ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
+            Ok(pin.to_owned())
+        })
+        .collect()
+}
 /// Runs the dependency-resolving `uv pip install --dry-run` for the discovered
 /// vLLM pin and returns uv's report, without installing anything.
 ///
@@ -396,6 +785,32 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
         (!version.is_empty()).then(|| format!("{pkg}=={version}"))
     })
 }
+/// `err` with the fallbacks this install used appended, so a failure on a fallback
+/// names it. The cause comes first, so plain `{}` display leads with the uv failure and
+/// not with a note about how the pins or the index were chosen.
+fn with_fallback_notes(err: anyhow::Error, notes: &[String]) -> anyhow::Error {
+    if notes.is_empty() {
+        err
+    } else {
+        anyhow!(
+            "{err:#}\n\nFallbacks used during this install: {}",
+            notes.join(" ")
+        )
+    }
+}
+/// The index the torch stack is fetched from for `build`.
+///
+/// A [`TorchStack::FromInstalledSdk`] row reuses the SDK's own builds, so it asks for
+/// them from the index the SDK came from (`recorded`, from the runtime manifest) rather
+/// than the row's fixed one: the row serves nightly and release SDKs alike, and each
+/// one's torch lives only on its own index. A manifest that recorded none, and every
+/// row that discovers its stack, keeps the row's `torch_index_url`.
+fn torch_index_url_for(build: &VllmRocmDiscoverBuild, recorded: Option<&str>) -> String {
+    match (build.torch_stack, recorded) {
+        (TorchStack::FromInstalledSdk, Some(url)) => url.to_owned(),
+        _ => build.torch_index_url.to_owned(),
+    }
+}
 /// Builds the `uv pip install` argv for pinned torch alone, scoped to only
 /// `torch_index_url`.
 ///
@@ -425,7 +840,7 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
 fn vllm_rocm10_discover_torch_install_args(
     python: &Path,
     reinstall: bool,
-    build: &VllmRocmDiscoverBuild,
+    torch_index_url: &str,
     torch_pin: &str,
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -438,7 +853,7 @@ fn vllm_rocm10_discover_torch_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--index-url".to_owned());
-    args.push(build.torch_index_url.to_owned());
+    args.push(torch_index_url.to_owned());
     args
 }
 /// Builds the `uv pip install` argv that realigns torch, torchvision and
@@ -460,7 +875,7 @@ fn vllm_rocm10_discover_torch_install_args(
 /// exists to prevent.
 fn vllm_rocm10_discover_realign_install_args(
     python: &Path,
-    build: &VllmRocmDiscoverBuild,
+    torch_index_url: &str,
     pins: &[String],
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -475,7 +890,7 @@ fn vllm_rocm10_discover_realign_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--index-url".to_owned());
-    args.push(build.torch_index_url.to_owned());
+    args.push(torch_index_url.to_owned());
     args
 }
 /// Builds the `uv pip install` argv for pinned vllm/flash-attn/amd-aiter,
@@ -525,8 +940,7 @@ fn vllm_rocm10_discover_remaining_install_args(
 /// need the same `ignore-error-codes` treatment here. There is no CLI flag or
 /// env var for it, only this config file.
 fn write_vllm_index_uv_config(paths: &AppPaths, build: &VllmRocmDiscoverBuild) -> Result<PathBuf> {
-    std::fs::create_dir_all(&paths.cache_dir)
-        .with_context(|| format!("failed to create {}", paths.cache_dir.display()))?;
+    rocm_core::create_marked_root(&paths.cache_dir)?;
     let path = paths.cache_dir.join("vllm-rocm10-uv.toml");
     let contents = format!(
         "[[index]]\nurl = \"{}\"\nignore-error-codes = [403]\n",
@@ -572,16 +986,49 @@ fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Resul
     let Some(local) = split_local_version(version).1 else {
         return Ok(());
     };
-    let Some(local_rocm) = local.strip_prefix("rocm") else {
+    let Some(matches) = local_rocm_matches(local, rocm_sdk_version) else {
         return Ok(());
     };
-    if rocm_sdk_series_matches(local_rocm, rocm_sdk_version) {
+    if matches {
         return Ok(());
     }
     bail!(
         "discovered `{pin}` for ROCm SDK {rocm_sdk_version}, but its `+{local}` build targets a \
          different ROCm release; the index for this ROCm line is serving another SDK's wheels"
     )
+}
+/// Whether the ROCm line a local version names is `rocm_sdk_version`'s, or `None` when
+/// it has no `rocm` segment at all. A dotted `rocm10.2.0` is read from its first `rocm` segment to the end
+/// of the local version, wherever it sits; a compact `rocm102` is the digits of that
+/// segment alone, so `rocm102` as the whole local version and `d20261110.rocm102` after
+/// other segments are both read.
+fn local_rocm_matches(local: &str, rocm_sdk_version: &str) -> Option<bool> {
+    let segments: Vec<&str> = local.split('.').collect();
+    let at = segments
+        .iter()
+        .position(|segment| segment.starts_with("rocm"))?;
+    let dotted = segments[at..].join(".");
+    if let Some(recorded) = dotted.strip_prefix("rocm")
+        && rocm_series(recorded).is_some()
+    {
+        return Some(rocm_sdk_series_matches(recorded, rocm_sdk_version));
+    }
+    // `.rocm102` names 10.2 with no dot between major and minor. A `rocm` segment
+    // that is neither spelling (`+rocm`, `+rocmabc`) names no line this SDK can be
+    // matched to, so it is a mismatch, not a pass.
+    Some(compact_rocm_local_segment(local).is_some_and(|compact| {
+        rocm_series(rocm_sdk_version)
+            .is_some_and(|(major, minor)| compact == format!("{major}{minor}"))
+    }))
+}
+/// The digits of a `rocm<digits>` segment in a dotted local version, e.g.
+/// `102` for `g5df63a720.d20261110.rocm102`: the spelling the 10.2 vLLM wheels
+/// use, with no dot between the ROCm major and minor.
+fn compact_rocm_local_segment(local: &str) -> Option<&str> {
+    local
+        .split('.')
+        .filter_map(|segment| segment.strip_prefix("rocm"))
+        .find(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 /// The PEP 425 interpreter tag of `python`, e.g. `cp314`.
 fn python_interpreter_tag(python: &Path) -> Result<String> {
@@ -666,37 +1113,37 @@ fn install_vllm_rocm10_discover(
     reinstall: bool,
     build: &VllmRocmDiscoverBuild,
 ) -> Result<VllmInstallOutcome> {
+    let mut notes: Vec<String> = Vec::new();
+    // Every failure after a fallback was taken names it, wherever it happens: a note
+    // kept only for the success path would be lost exactly when the fallback it
+    // describes is what failed.
+    match install_vllm_rocm10_discover_collecting(uv, paths, python, reinstall, build, &mut notes) {
+        Ok(pins) => Ok(VllmInstallOutcome { pins, notes }),
+        Err(err) => Err(with_fallback_notes(err, &notes)),
+    }
+}
+/// [`install_vllm_rocm10_discover`]'s sequence, recording each fallback it takes in
+/// `notes` as it goes and returning the pins installed.
+fn install_vllm_rocm10_discover_collecting(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    reinstall: bool,
+    build: &VllmRocmDiscoverBuild,
+    notes: &mut Vec<String>,
+) -> Result<Vec<String>> {
     ensure_discover_python_tag(python, build)?;
-    let torch = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torch",
-        DiscoverVersion::Series(build.torch_version_prefix),
-    )?;
-    // Discovered fresh from the same index and row as torch, rather than
-    // snapshotted from whatever the SDK install resolved earlier: that
-    // snapshot can pair with a *different* torch version than the one this
-    // row pins (the SDK's own install is unpinned and may have picked the
-    // newest torch/torchvision/torchaudio available, independently of each
-    // other), producing an ABI-incompatible triplet at realign time.
-    let torchvision = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torchvision",
-        DiscoverVersion::Series(build.torchvision_version_prefix),
-    )?;
-    let torchaudio = discover_pinned_requirement(
-        uv,
-        paths,
-        python,
-        build.torch_index_url,
-        "torchaudio",
-        build.torchaudio_version,
-    )?;
+    // Discovered (or read from the SDK runtime) together, as one coherent set,
+    // rather than snapshotted from whatever the SDK install resolved earlier
+    // for a row that discovers: that snapshot can pair with a *different*
+    // torch version than the one this row pins, producing an ABI-incompatible
+    // triplet at realign time.
+    let mut torch_stack = torch_stack_pins(uv, paths, python, build)?.into_iter();
+    let (torch, torchvision, torchaudio) = (
+        torch_stack.next().context("torch pin")?,
+        torch_stack.next().context("torchvision pin")?,
+        torch_stack.next().context("torchaudio pin")?,
+    );
     let vllm = discover_pinned_requirement(
         uv,
         paths,
@@ -710,7 +1157,6 @@ fn install_vllm_rocm10_discover(
     // not fail the install: the real install below is the authority, and it
     // reports its own error. The reason is kept, because the series match is
     // exactly the choice this probe exists to improve on.
-    let mut notes: Vec<String> = Vec::new();
     let vllm_resolution = match resolve_vllm_dependencies(uv, paths, python, &vllm, &config_file) {
         Ok(resolution) => Some(resolution),
         Err(err) => {
@@ -751,34 +1197,42 @@ fn install_vllm_rocm10_discover(
     // Two separate `uv pip install` calls, each scoped to exactly one index:
     // see `vllm_rocm10_discover_torch_install_args` for why combining both
     // indexes into one call is unsafe.
-    let torch_args = vllm_rocm10_discover_torch_install_args(python, reinstall, build, &pins[0]);
+    let torch_index_url = if build.torch_stack == TorchStack::FromInstalledSdk {
+        let recorded_index = recorded_sdk_index_url(paths, python);
+        match &recorded_index {
+            Ok(Some(_)) => {}
+            Ok(None) => notes.push(format!(
+                "no runtime manifest for this interpreter records a wheel index; the torch stack is \
+                 fetched from {}, which may not be the index the SDK was installed from",
+                build.torch_index_url
+            )),
+            Err(err) => notes.push(format!(
+                "could not read the runtime registry ({err:#}); the torch stack is fetched \
+                 from {}, which may not be the index the SDK was installed from",
+                build.torch_index_url
+            )),
+        }
+        torch_index_url_for(build, recorded_index.ok().flatten().as_deref())
+    } else {
+        build.torch_index_url.to_owned()
+    };
+    let torch_args =
+        vllm_rocm10_discover_torch_install_args(python, reinstall, &torch_index_url, &pins[0]);
     run_uv_pip_install(uv, paths, python, torch_args)?;
 
     let mut remaining_args =
         vllm_rocm10_discover_remaining_install_args(python, reinstall, &pins[3..]);
     remaining_args.push("--config-file".to_owned());
     remaining_args.push(config_file.display().to_string());
-    if let Err(err) = run_uv_pip_install(uv, paths, python, remaining_args) {
-        // A note kept only for the success path would be lost exactly when the
-        // fallback pins are what failed.
-        return Err(if notes.is_empty() {
-            err
-        } else {
-            // The cause first, so plain `{}` display leads with the uv failure
-            // and not with a note about how the pins were chosen.
-            anyhow!(
-                "{err:#}\n\nThe fallback pins were used because: {}",
-                notes.join(" ")
-            )
-        });
-    }
+    run_uv_pip_install(uv, paths, python, remaining_args)?;
 
     // The full-dependency resolve above can replace torch (and, pulling it in
     // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
     // force the whole stack back to the coherent trio discovered above. This
     // must run unconditionally, before the device-plugin discovery below: a
     // `uv pip freeze` failure there must not skip restoring the trio too.
-    let trio_realign_args = vllm_rocm10_discover_realign_install_args(python, build, &pins[..3]);
+    let trio_realign_args =
+        vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &pins[..3]);
     run_uv_pip_install(uv, paths, python, trio_realign_args)?;
 
     // The full-dependency resolve can also pull in an AMD device-kernel
@@ -807,17 +1261,534 @@ fn install_vllm_rocm10_discover(
     }
     if !device_pins.is_empty() {
         let device_realign_args =
-            vllm_rocm10_discover_realign_install_args(python, build, &device_pins);
+            vllm_rocm10_discover_realign_install_args(python, &torch_index_url, &device_pins);
         run_uv_pip_install(uv, paths, python, device_realign_args)?;
     }
 
     let mut pins = pins;
     pins.extend(device_pins);
-    Ok(VllmInstallOutcome { pins, notes })
+    Ok(pins)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    const KEY_ERROR_UNIX: &str = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/venv/lib/python3.14/site-packages/tensorizer/serialization.py\", line 40, in <module>\n    from . import _crypt\n  File \"/venv/lib/python3.14/site-packages/tensorizer/_crypt/_encryption.py\", line 367, in __new__\n    type, NamedTuple(name, **{k: annotations[k] for k in entries})\nKeyError: 'crypto_stream_salsa20_NONCEBYTES'\n";
+
+    #[test]
+    fn the_python_314_key_error_is_a_broken_tensorizer() {
+        assert_eq!(
+            classify_tensorizer_failure(KEY_ERROR_UNIX),
+            TensorizerProbe::Broken("KeyError: 'crypto_stream_salsa20_NONCEBYTES'".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_windows_style_tensorizer_path_is_recognised() {
+        let stderr = "Traceback (most recent call last):\n  File \"C:\\venv\\Lib\\site-packages\\tensorizer\\_crypt\\_encryption.py\", line 367, in __new__\nKeyError: 'x'\n";
+        assert!(matches!(
+            classify_tensorizer_failure(stderr),
+            TensorizerProbe::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn a_torch_failure_with_tensorizer_frames_is_not_a_broken_tensorizer() {
+        // `import tensorizer.serialization` imports torch, so a missing HIP library
+        // has tensorizer frames above the torch ones.
+        let stderr = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/venv/lib/python3.14/site-packages/tensorizer/serialization.py\", line 12, in <module>\n    import torch\n  File \"/venv/lib/python3.14/site-packages/torch/__init__.py\", line 300, in <module>\n    _load_global_deps()\nOSError: libamdhip64.so.7: cannot open shared object file: No such file or directory\n";
+        assert_eq!(classify_tensorizer_failure(stderr), TensorizerProbe::Usable);
+    }
+
+    #[test]
+    fn a_non_load_exception_raised_below_tensorizer_is_not_a_broken_tensorizer() {
+        // Tensorizer frames above, but the exception comes from torch and is not a
+        // library-load error, so only the last-frame rule can acquit tensorizer.
+        let stderr = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/venv/lib/python3.14/site-packages/tensorizer/serialization.py\", line 12, in <module>\n    import torch\n  File \"/venv/lib/python3.14/site-packages/torch/_utils.py\", line 80, in helper\n    return table[key]\nKeyError: 'gfx1151'\n";
+        assert_eq!(classify_tensorizer_failure(stderr), TensorizerProbe::Usable);
+    }
+
+    /// Each case raises its exception with tensorizer as the LAST frame, so only
+    /// the library-load rule can acquit it, and each carries exactly one of the
+    /// rule's markers: the exception type or the message.
+    #[test]
+    fn each_library_load_marker_alone_acquits_a_tensorizer_frame() {
+        let cases = [
+            (
+                "OSError type alone",
+                "OSError: [Errno 2] No such file or directory: 'libsodium.so'",
+            ),
+            (
+                "ImportError type alone",
+                "ImportError: cannot import name 'x' from 'y'",
+            ),
+            (
+                "ModuleNotFoundError type alone",
+                "ModuleNotFoundError: No module named 'redis'",
+            ),
+            (
+                "'shared object file' alone, wrapped in another type",
+                "RuntimeError: libamdhip64.so.7: cannot open shared object file",
+            ),
+            (
+                "'DLL load failed' alone, wrapped in another type",
+                "RuntimeError: DLL load failed while importing _tensorizer: The specified module could not be found.",
+            ),
+        ];
+        for (what, exception) in cases {
+            let stderr = format!(
+                "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\n{exception}\n"
+            );
+            assert_eq!(
+                classify_tensorizer_failure(&stderr),
+                TensorizerProbe::Usable,
+                "{what}"
+            );
+        }
+        // The same frame with a non-load exception is tensorizer's own failure.
+        let broken = "Traceback (most recent call last):\n  File \"/venv/site-packages/tensorizer/serialization.py\", line 3, in <module>\nKeyError: 'x'\n";
+        assert!(matches!(
+            classify_tensorizer_failure(broken),
+            TensorizerProbe::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn an_absent_tensorizer_or_empty_stderr_is_not_a_finding() {
+        let absent = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'tensorizer'\n";
+        assert_eq!(classify_tensorizer_failure(absent), TensorizerProbe::Usable);
+        assert_eq!(classify_tensorizer_failure(""), TensorizerProbe::Usable);
+    }
+
+    fn broken() -> TensorizerProbe {
+        TensorizerProbe::Broken("KeyError".to_owned())
+    }
+
+    #[test]
+    fn an_unmanaged_runtime_is_never_probed_or_changed() -> Result<()> {
+        let note = tensorizer_step(
+            false,
+            true,
+            || panic!("an environment rocm-cli does not own must not be probed"),
+            || panic!("an environment rocm-cli does not own must not be changed"),
+        )?;
+        assert_eq!(note, None);
+        let runtime = VllmRuntime {
+            source: "environment python".to_owned(),
+            python_executable: Some(PathBuf::from("/nonexistent/python")),
+            ..VllmRuntime::for_test()
+        };
+        assert!(!runtime_is_managed(&runtime));
+        assert_eq!(ensure_runtime_tensorizer(&runtime, true)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_usable_tensorizer_is_left_alone() -> Result<()> {
+        let note = tensorizer_step(
+            true,
+            true,
+            || Ok(TensorizerProbe::Usable),
+            || panic!("a usable tensorizer must not be upgraded"),
+        )?;
+        assert_eq!(note, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_broken_tensorizer_is_upgraded_once_and_probed_again() -> Result<()> {
+        let mut probes = vec![TensorizerProbe::Usable, broken()];
+        let mut upgrades = 0;
+        let note = tensorizer_step(
+            true,
+            true,
+            || Ok(probes.pop().expect("probed more often than expected")),
+            || {
+                upgrades += 1;
+                Ok(())
+            },
+        )?
+        .expect("an override is reported");
+        assert_eq!(upgrades, 1);
+        assert!(probes.is_empty(), "the upgrade must be probed again");
+        assert!(
+            note.contains("2.12.1") && note.contains("on purpose"),
+            "{note}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_upgrade_that_does_not_help_fails_an_install_this_run_made_and_only_warns_otherwise()
+    -> Result<()> {
+        let note = tensorizer_step(true, false, || Ok(broken()), || Ok(()))?
+            .expect("a runtime this run did not install into gets a note");
+        assert!(note.contains("still cannot be imported"), "{note}");
+        assert!(
+            !note.contains("was installed"),
+            "no install ran on that runtime: {note}"
+        );
+        let error = tensorizer_step(true, true, || Ok(broken()), || Ok(()))
+            .expect_err("an install whose tensorizer still cannot import must not succeed");
+        assert!(
+            format!("{error:#}").contains("vLLM was installed, but tensorizer still cannot"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_upgrade_fails_an_install_but_only_warns_on_an_existing_runtime() -> Result<()> {
+        let fail = || -> Result<()> { bail!("network unreachable") };
+        let error = tensorizer_step(true, true, || Ok(broken()), fail)
+            .expect_err("an install must not leave an unusable runtime");
+        // The message already carries the cause once; chaining the error as a
+        // source as well would print it twice under `{:#}`.
+        assert_eq!(
+            format!("{error:#}").matches("network unreachable").count(),
+            1,
+            "{error:#}"
+        );
+        let note = tensorizer_step(true, false, || Ok(broken()), fail)?
+            .expect("the failure is reported as a note");
+        assert!(
+            note.contains("network unreachable") && note.contains("would fail at startup"),
+            "{note}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_reads_the_interpreters_traceback() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let python = root.path().join("python");
+        write_fake_executable(
+            &python,
+            format!("#!/bin/sh\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nexit 1\n"),
+        )?;
+        assert!(matches!(
+            probe_tensorizer_import(&python, None)?,
+            TensorizerProbe::Broken(_)
+        ));
+        Ok(())
+    }
+
+    /// A ROCm 10.x discover runtime whose stand-in interpreter, like a real one,
+    /// does not see `PYTHONPATH` under `-I` (which implies `-E`), and without it
+    /// stops on a missing module before it ever reaches tensorizer.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_keeps_the_pythonpath_the_server_launches_with() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let venv = tempfile::tempdir()?;
+        std::fs::create_dir_all(venv.path().join("bin"))?;
+        std::fs::create_dir_all(venv.path().join("lib/python3.14/site-packages"))?;
+        let python = venv.path().join("bin/python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" -I \"*) unset PYTHONPATH ;; esac\nif [ -z \"$PYTHONPATH\" ]; then\n  echo \"ModuleNotFoundError: No module named 'amdsmi'\" >&2\n  exit 1\nfi\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nexit 1\n"
+            ),
+        )?;
+        let runtime = VllmRuntime {
+            python_executable: Some(python),
+            rocm_sdk_version: Some("10.1.0".to_owned()),
+            ..VllmRuntime::for_test()
+        };
+        assert!(
+            matches!(
+                probe_tensorizer_import(
+                    runtime.python_executable.as_deref().unwrap(),
+                    Some(&runtime)
+                )?,
+                TensorizerProbe::Broken(_)
+            ),
+            "a missing module the server's PYTHONPATH provides must not hide a broken tensorizer"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_upgrade_is_a_no_deps_install_of_the_fixed_release() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv.log");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!("#!/bin/sh\necho \"$@\" >> \"{}\"\n", log.display()),
+        )?;
+        upgrade_tensorizer(&uv, &paths, Path::new("/venv/bin/python"))?;
+        let calls = std::fs::read_to_string(&log)?;
+        assert!(
+            calls.contains("--no-deps") && calls.contains("tensorizer==2.12.1"),
+            "{calls}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_coloured_traceback_is_still_a_broken_tensorizer() {
+        // What Python 3.13+ writes under FORCE_COLOR: escapes wrap the quoted path.
+        let coloured = "\u{1b}[1;35mTraceback (most recent call last):\u{1b}[0m\n  File \u{1b}[35m\"/venv/lib/python3.14/site-packages/tensorizer/_crypt/_encryption.py\u{1b}[0m\", line \u{1b}[35m367\u{1b}[0m, in \u{1b}[35m__new__\u{1b}[0m\n\u{1b}[1;35mKeyError\u{1b}[0m: \u{1b}[35m'crypto_stream_salsa20_NONCEBYTES'\u{1b}[0m\n";
+        assert_eq!(
+            classify_tensorizer_failure(coloured),
+            TensorizerProbe::Broken("KeyError: 'crypto_stream_salsa20_NONCEBYTES'".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_probe_asks_for_no_colour_and_runs_in_the_launch_environment() {
+        let runtime = VllmRuntime::for_test();
+        let command = tensorizer_probe_command(Path::new("python"), Some(&runtime))
+            .expect("a bare runtime has a launch environment");
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+        assert_eq!(
+            env("FORCE_COLOR"),
+            Some(None),
+            "FORCE_COLOR must be removed"
+        );
+        assert_eq!(env("NO_COLOR"), Some(Some("1".into())));
+        let args: Vec<_> = command.get_args().collect();
+        assert!(
+            !args.contains(&std::ffi::OsStr::new("-I"))
+                && !args.contains(&std::ffi::OsStr::new("-E")),
+            "-I and -E drop the PYTHON* environment the server launches with: {args:?}"
+        );
+        assert!(
+            args.contains(&std::ffi::OsStr::new("-s")),
+            "the user's site directory must stay out of the probe: {args:?}"
+        );
+        assert_eq!(
+            env("PYTHONSAFEPATH"),
+            Some(Some("1".into())),
+            "the working directory must stay off sys.path"
+        );
+        assert_eq!(env("PYTHON_COLORS"), Some(Some("0".into())));
+        assert_eq!(
+            env("VLLM_TARGET_DEVICE"),
+            Some(Some("rocm".into())),
+            "the probe must carry the environment the server launches with"
+        );
+        let bare =
+            tensorizer_probe_command(Path::new("python"), None).expect("no runtime to build");
+        assert!(
+            bare.get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("VLLM_TARGET_DEVICE"))
+        );
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_fails_an_install_but_only_warns_on_an_existing_runtime() -> Result<()>
+    {
+        let cannot = || -> Result<TensorizerProbe> { bail!("timed out after 300s") };
+        let error = tensorizer_step(true, true, cannot, || Ok(()))
+            .expect_err("an install must not report a runtime it could not check");
+        assert!(format!("{error:#}").contains("timed out"));
+        let note = tensorizer_step(true, false, cannot, || Ok(()))?
+            .expect("an existing runtime gets a note");
+        assert!(
+            note.contains("could not check") && note.contains("timed out"),
+            "{note}"
+        );
+
+        // The second probe, after a successful upgrade, is held to the same rule.
+        let mut calls = 0;
+        let second_fails = || {
+            calls += 1;
+            if calls == 1 {
+                Ok(broken())
+            } else {
+                bail!("spawn failed")
+            }
+        };
+        let note = tensorizer_step(true, false, second_fails, || Ok(()))?
+            .expect("an existing runtime gets a note");
+        assert!(note.contains("could not check"), "{note}");
+        Ok(())
+    }
+
+    /// A managed runtime whose interpreter is a stand-in that raises the Python
+    /// 3.14 `KeyError` only when launched with the server's environment, and a
+    /// torch-style `OSError` otherwise.
+    #[cfg(unix)]
+    fn runtime_needing_launch_env(root: &Path) -> Result<VllmRuntime> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let python = root.join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"$VLLM_TARGET_DEVICE\" = rocm ]; then\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nelse\necho 'OSError: libamdhip64.so.7: cannot open shared object file' >&2\nfi\nexit 1\n"
+            ),
+        )?;
+        Ok(VllmRuntime {
+            python_executable: Some(python),
+            ..VllmRuntime::for_test()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_sees_the_launch_environment_and_the_upgrade_follows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime_needing_launch_env(root.path())?;
+        let mut upgraded = false;
+        // Still broken after the "upgrade": the stand-in never changes, so the
+        // refusal proves the probe ran with the launch environment both times.
+        let error = ensure_runtime_tensorizer_with(&runtime, true, |_| {
+            upgraded = true;
+            Ok(())
+        })
+        .expect_err("the stand-in stays broken");
+        assert!(
+            upgraded,
+            "the Python 3.14 failure was only visible with the launch environment"
+        );
+        assert!(format!("{error:#}").contains("still cannot be imported"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_upgrade_fails_an_install_this_run_made_and_only_warns_on_an_existing_runtime()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let runtime = runtime_needing_launch_env(root.path())?;
+        let fail = |_: &Path| -> Result<()> { bail!("network unreachable") };
+        let error = ensure_runtime_tensorizer_with(&runtime, true, fail)
+            .expect_err("an install this run made must fail");
+        assert!(format!("{error:#}").contains("network unreachable"));
+        let note = ensure_runtime_tensorizer_with(&runtime, false, fail)?
+            .expect("an existing runtime only gets a note");
+        assert!(note.contains("network unreachable"), "{note}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_probe_is_abandoned_promptly_and_its_child_killed() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let pid_file = root.path().join("pid");
+        let python = root.path().join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )?;
+        let started = std::time::Instant::now();
+        let error =
+            probe_tensorizer_import_within(&python, None, std::time::Duration::from_millis(300))
+                .expect_err("a hung probe must be abandoned");
+        assert!(format!("{error:#}").contains("exceeded"), "{error:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the probe waited out the child: {:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file)?;
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "the hung child was left running"
+        );
+        Ok(())
+    }
+
+    /// 5 MB on stderr before the real traceback: more than a pipe holds, so an
+    /// undrained pipe would stall the child until the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_prints_more_than_a_pipe_holds_is_still_classified() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let python = root.path().join("python");
+        write_fake_executable(
+            &python,
+            format!(
+                "#!/bin/sh\nhead -c 5000000 /dev/zero | tr '\\0' 'x' >&2\necho >&2\ncat >&2 <<'EOF'\n{KEY_ERROR_UNIX}EOF\nexit 1\n"
+            ),
+        )?;
+        let probe =
+            probe_tensorizer_import_within(&python, None, std::time::Duration::from_secs(20))?;
+        assert!(matches!(probe, TensorizerProbe::Broken(_)), "{probe:?}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_upgrade_that_prints_more_than_a_pipe_holds_still_finishes() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let uv = root.path().join("uv");
+        write_fake_executable(&uv, "#!/bin/sh\nhead -c 5000000 /dev/zero >&2\nexit 0\n")?;
+        upgrade_tensorizer_within(
+            &uv,
+            &paths,
+            Path::new("/venv/bin/python"),
+            std::time::Duration::from_secs(20),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hung_upgrade_is_abandoned_promptly_and_its_child_killed() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let pid_file = root.path().join("pid");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )?;
+        let started = std::time::Instant::now();
+        let error = upgrade_tensorizer_within(
+            &uv,
+            &paths,
+            Path::new("/venv/bin/python"),
+            std::time::Duration::from_millis(300),
+        )
+        .expect_err("a hung upgrade must be abandoned");
+        assert!(format!("{error:#}").contains("exceeded"), "{error:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the upgrade waited out the child: {:?}",
+            started.elapsed()
+        );
+        let pid = std::fs::read_to_string(&pid_file)?;
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "the hung child was left running"
+        );
+        Ok(())
+    }
+
     #[test]
     fn dry_run_resolved_pin_parses_a_rotated_dev_tag() {
         let stdout = "Resolved 1 package in 601ms\nWould download 1 package\nWould install 1 package\n + vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826\n";
@@ -846,7 +1817,12 @@ mod tests {
         let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
         let torch_pin = "torch==2.12.0+rocm10.0.0";
 
-        let args = vllm_rocm10_discover_torch_install_args(&python, false, build, torch_pin);
+        let args = vllm_rocm10_discover_torch_install_args(
+            &python,
+            false,
+            build.torch_index_url,
+            torch_pin,
+        );
         assert!(!args.contains(&"--reinstall".to_owned()));
         assert!(!args.contains(&"--reinstall-package".to_owned()));
         assert!(args.contains(&torch_pin.to_owned()));
@@ -866,10 +1842,48 @@ mod tests {
              and hit a fatal 403 from a nonexistent sub-path"
         );
 
-        let args = vllm_rocm10_discover_torch_install_args(&python, true, build, torch_pin);
+        let args = vllm_rocm10_discover_torch_install_args(
+            &python,
+            true,
+            build.torch_index_url,
+            torch_pin,
+        );
         assert!(args.contains(&"--reinstall-package".to_owned()));
         assert!(args.contains(&"torch".to_owned()));
         assert!(!args.contains(&"--reinstall".to_owned()));
+    }
+    #[test]
+    fn an_installed_sdk_row_fetches_its_torch_stack_from_the_index_the_sdk_came_from() {
+        let python = PathBuf::from("/opt/venv/bin/python");
+        let release = "https://stable.repo.amd.com/rocm/whl-next";
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 has a discover row");
+        assert_eq!(ten_two.torch_stack, TorchStack::FromInstalledSdk);
+
+        // A release SDK's torch is not on the row's nightly index, so the row's own
+        // index must not be the one handed to uv.
+        let index = torch_index_url_for(ten_two, Some(release));
+        assert_eq!(index, release);
+        assert_ne!(index, ten_two.torch_index_url);
+        let pins = vec!["torch==2.14.0+rocm10.2.0".to_owned()];
+        let install = vllm_rocm10_discover_torch_install_args(&python, false, &index, &pins[0]);
+        let realign = vllm_rocm10_discover_realign_install_args(&python, &index, &pins);
+        for args in [&install, &realign] {
+            assert!(args.contains(&release.to_owned()), "{args:?}");
+            assert!(
+                !args.contains(&ten_two.torch_index_url.to_owned()),
+                "{args:?}"
+            );
+        }
+
+        // A manifest that recorded no index keeps the row's.
+        assert_eq!(torch_index_url_for(ten_two, None), ten_two.torch_index_url);
+        // A row that discovers its stack never takes the recorded index.
+        let ten_one = vllm_rocm_discover_build("10.1.0").expect("10.1 has a discover row");
+        assert_eq!(ten_one.torch_stack, TorchStack::Discover);
+        assert_eq!(
+            torch_index_url_for(ten_one, Some(release)),
+            ten_one.torch_index_url
+        );
     }
     #[test]
     fn vllm_rocm10_discover_remaining_install_args_use_only_the_vllm_index() {
@@ -1118,6 +2132,248 @@ exit 0
         Ok((outcome, calls))
     }
 
+    /// Runs `install_vllm_rocm10_discover` on the 10.2 row against a fake `uv`
+    /// whose `pip freeze` reports a release SDK's torch stack, with `prepare`
+    /// free to set up the runtime registry first. Returns the outcome and every
+    /// `uv` argv.
+    #[cfg(unix)]
+    fn run_ten_two_discover_with_fake_uv(
+        prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
+    ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
+        run_discover_row_with_fake_uv("10.2.0", None, prepare)
+    }
+    /// [`run_ten_two_discover_with_fake_uv`] for any row, optionally failing the
+    /// `fail_install`th real `uv pip install` (1 torch, 2 remaining deps, 3 trio
+    /// realign, 4 device realign; the dry-runs and `pip freeze` are not counted).
+    #[cfg(unix)]
+    fn run_discover_row_with_fake_uv(
+        row: &str,
+        fail_install: Option<u32>,
+        prepare: impl FnOnce(&AppPaths, &Path) -> Result<()>,
+    ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+        prepare(&paths, &python)?;
+        let log = root.path().join("uv.log");
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*|*"pip freeze"*) ;;
+  *)
+    n=$(cat "{count}" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "{count}"
+    if [ "$n" = "{fail_at}" ]; then echo 'error: boom' >&2; exit 1; fi
+    ;;
+esac
+case "$*" in
+  *--dry-run*--config-file*)
+    echo "Resolved 3 packages" >&2
+    ;;
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    case "$last" in
+      *'*'*) echo " + ${{pkg}}==9.9.9" >&2 ;;
+      *) echo " + ${{last}}" >&2 ;;
+    esac
+    ;;
+  *"pip freeze"*)
+    echo "torch==2.14.0+rocm10.2.0"
+    echo "torchvision==0.29.2+rocm10.2.0"
+    echo "torchaudio==2.11.1+rocm10.2.0"
+    echo "amd-torch-device-gfx1151==2.14.0+rocm10.2.0"
+    ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                count = root.path().join("uv.count").display(),
+                fail_at = fail_install.unwrap_or(0)
+            ),
+        )?;
+        let build = vllm_rocm_discover_build(row).expect("the row has a discover build");
+        let outcome = install_vllm_rocm10_discover(&uv, &paths, &python, true, build);
+        let calls = std::fs::read_to_string(&log)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Ok((outcome, calls))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_sdk_on_the_ten_two_row_gets_its_torch_stack_from_its_own_index() -> Result<()> {
+        let release = "https://stable.example/rocm/whl-next";
+        let (outcome, calls) = run_ten_two_discover_with_fake_uv(|paths, python| {
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            std::fs::create_dir_all(&registry)?;
+            std::fs::write(
+                registry.join("release.json"),
+                format!(
+                    r#"{{"python_executable":"{}","index_url":"{release}"}}"#,
+                    python.display()
+                ),
+            )?;
+            Ok(())
+        })?;
+        outcome?;
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+        // The torch install, the trio realign and the device realign are the real
+        // installs that name a torch-stack package; each must ask the SDK's index.
+        let torch_stack_installs: Vec<&String> = calls
+            .iter()
+            .filter(|call| !call.contains("--dry-run") && call.contains("--no-deps"))
+            .filter(|call| call.contains("torch"))
+            .collect();
+        assert_eq!(
+            torch_stack_installs.len(),
+            3,
+            "expected torch install, trio realign and device realign: {calls:?}"
+        );
+        for call in torch_stack_installs {
+            assert!(call.contains(&format!("--index-url {release}")), "{call}");
+            assert!(!call.contains(build.torch_index_url), "{call}");
+        }
+        Ok(())
+    }
+
+    /// Plants a runtime manifest for the interpreter, with `extra` JSON fields.
+    #[cfg(unix)]
+    fn plant_manifest(paths: &AppPaths, python: &Path, extra: &str) -> Result<()> {
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        std::fs::create_dir_all(&registry)?;
+        std::fs::write(
+            registry.join("runtime.json"),
+            format!(r#"{{"python_executable":"{}"{extra}}}"#, python.display()),
+        )?;
+        Ok(())
+    }
+    /// Makes the registry unreadable: a directory where a manifest file belongs
+    /// cannot be read as a file by anyone, root included, unlike a mode-000 registry.
+    #[cfg(unix)]
+    fn make_registry_unreadable(paths: &AppPaths) -> Result<()> {
+        let broken = paths
+            .data_dir
+            .join("runtimes")
+            .join("registry")
+            .join("broken.json");
+        std::fs::create_dir_all(broken)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ten_two_row_says_when_it_falls_back_to_its_own_index() -> Result<()> {
+        let build = vllm_rocm_discover_build("10.2.0").expect("10.2.0 has a discover row");
+        let on_row_index = |calls: &[String]| {
+            calls
+                .iter()
+                .any(|call| call.contains(&format!("--index-url {}", build.torch_index_url)))
+        };
+
+        // A manifest that records no index (an older one, or an adopted runtime):
+        // the row's index, and the install says so.
+        let (outcome, calls) =
+            run_ten_two_discover_with_fake_uv(|paths, python| plant_manifest(paths, python, ""))?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("records a wheel index")),
+            "{notes:?}"
+        );
+        assert!(on_row_index(&calls));
+
+        // A registry that cannot be read: the same index, and the install says so.
+        let (outcome, calls) =
+            run_ten_two_discover_with_fake_uv(|paths, _| make_registry_unreadable(paths))?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not read the runtime registry")),
+            "{notes:?}"
+        );
+        assert!(on_row_index(&calls));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_row_that_discovers_its_stack_never_looks_at_the_registry_or_says_anything_about_it()
+    -> Result<()> {
+        // 10.1's index is fixed by design, so an unreadable registry or a manifest
+        // with no index is not something its install has a reason to mention.
+        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", None, |paths, _| {
+            make_registry_unreadable(paths)
+        })?;
+        let notes = outcome?.notes;
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("registry") && !note.contains("wheel index")),
+            "{notes:?}"
+        );
+        let (outcome, _) = run_discover_row_with_fake_uv("10.1.0", None, |paths, python| {
+            plant_manifest(paths, python, "")
+        })?;
+        assert!(
+            outcome?
+                .notes
+                .iter()
+                .all(|note| !note.contains("wheel index"))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_step_on_the_fallback_index_names_the_fallback() -> Result<()> {
+        // Each real install in turn: the torch install, the remaining deps, the trio
+        // realign and the device realign all run after the index fell back.
+        for step in 1..=4 {
+            let (outcome, _) =
+                run_discover_row_with_fake_uv("10.2.0", Some(step), |paths, python| {
+                    plant_manifest(paths, python, "")
+                })?;
+            let err = format!("{:#}", outcome.expect_err("an install step fails"));
+            assert!(err.contains("boom"), "step {step}: {err}");
+            assert!(
+                err.contains("records a wheel index") && err.contains("Fallbacks used"),
+                "step {step}: the uv failure must carry the note about the index it ran \
+                 against: {err}"
+            );
+        }
+
+        // With the SDK's own index recorded there is nothing to add to the failure.
+        let (outcome, _) = run_discover_row_with_fake_uv("10.2.0", Some(1), |paths, python| {
+            plant_manifest(
+                paths,
+                python,
+                r#","index_url":"https://stable.example/whl""#,
+            )
+        })?;
+        let err = format!("{:#}", outcome.expect_err("the torch install fails"));
+        assert!(
+            err.contains("boom") && !err.contains("Fallbacks used"),
+            "{err}"
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn discovery_installs_the_companions_the_discovered_vllm_depends_on() -> Result<()> {
@@ -1274,6 +2530,34 @@ fi
             contents.contains("ignore-error-codes = [403]"),
             "{contents}"
         );
+        // It created the cache folder, so it marked it as ROCm CLI's own.
+        assert!(
+            paths
+                .cache_dir
+                .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+                .is_file()
+        );
+        Ok(())
+    }
+
+    /// A cache folder that already existed is not claimed as ROCm CLI's own.
+    #[test]
+    fn write_vllm_index_uv_config_leaves_an_existing_cache_folder_unmarked() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        std::fs::create_dir_all(&paths.cache_dir)?;
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+        write_vllm_index_uv_config(&paths, build)?;
+        assert!(
+            !paths
+                .cache_dir
+                .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+                .exists()
+        );
         Ok(())
     }
     /// The prefix boundary (`-device-gfx`, not a bare `starts_with` of
@@ -1316,6 +2600,102 @@ fi
         let rendered = format!("{err:#}");
         assert!(rendered.contains("10.1.0"), "{rendered}");
         assert!(rendered.contains("rocm10.0.0"), "{rendered}");
+    }
+    /// The 10.2 vLLM wheels spell their ROCm line `.rocm102`, not
+    /// `+rocm10.2.0`; the guard must still compare it.
+    #[test]
+    fn rocm_local_version_guard_compares_the_compact_rocm_spelling() {
+        let ten_two = "vllm==0.32.1.dev0+g5df63a720.d20261110.rocm102";
+        assert!(ensure_rocm_local_version_matches(ten_two, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(ten_two, "10.2.0a20261022").is_ok());
+        let err = ensure_rocm_local_version_matches(ten_two, "10.1.0")
+            .expect_err("a 10.2 wheel must not install onto a 10.1 SDK");
+        assert!(format!("{err:#}").contains("rocm102"), "{err:#}");
+        // A tagged release carries the compact spelling as the whole local version.
+        let bare = "vllm==0.32.1+rocm102";
+        assert!(ensure_rocm_local_version_matches(bare, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(bare, "10.1.0").is_err());
+        // A `rocm` segment that is neither spelling names no line, so it is no match.
+        for unreadable in [
+            "vllm==0.32.1+rocm",
+            "vllm==0.32.1+rocmabc",
+            "vllm==0.32.1+g5d.rocm.x",
+        ] {
+            assert!(
+                ensure_rocm_local_version_matches(unreadable, "10.2.0").is_err(),
+                "{unreadable}"
+            );
+        }
+        // And the dotted spelling is read as a series wherever its segment sits.
+        let late = "vllm==0.32.1+g5df63a720.rocm10.2.0";
+        assert!(ensure_rocm_local_version_matches(late, "10.2.0").is_ok());
+        assert!(ensure_rocm_local_version_matches(late, "10.3.0").is_err());
+        // And a 10.1 wheel must not slip onto a 10.2 SDK through the dotted spelling.
+        assert!(
+            ensure_rocm_local_version_matches("vllm==0.29.1.dev0+rocm10.1.0.gabc", "10.2.0")
+                .is_err()
+        );
+    }
+    /// A 10.2 runtime keeps the torch stack its SDK install resolved; a stack
+    /// from another series or another ROCm line is refused, not kept.
+    #[test]
+    fn installed_torch_stack_pins_reads_and_checks_the_sdk_stack() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let freeze = "flash-attn==2.8.3\ntorch==2.14.0+rocm10.2.0a20261022\n\
+                      torchaudio==2.11.1+rocm10.2.0a20261022\n\
+                      torchvision==0.29.2+rocm10.2.0a20261022\n";
+        assert_eq!(
+            installed_torch_stack_pins(freeze, ten_two).expect("coherent 10.2 stack"),
+            [
+                "torch==2.14.0+rocm10.2.0a20261022",
+                "torchvision==0.29.2+rocm10.2.0a20261022",
+                "torchaudio==2.11.1+rocm10.2.0a20261022",
+            ]
+        );
+        // The 10.1 torch an unpinned SDK install can leave behind is not 2.14's pair.
+        let old = freeze.replace("2.14.0+rocm10.2.0a20261022", "2.13.0+rocm10.2.0a20261022");
+        let err = installed_torch_stack_pins(&old, ten_two).expect_err("torch 2.13");
+        assert!(
+            format!("{err:#}").contains("needs `torch` 2.14.x"),
+            "{err:#}"
+        );
+        // Another ROCm line is refused by the same guard as every other pin.
+        let other_line = freeze.replace(
+            "torch==2.14.0+rocm10.2.0a20261022",
+            "torch==2.14.0+rocm10.3.0a20261110",
+        );
+        assert!(installed_torch_stack_pins(&other_line, ten_two).is_err());
+        // A runtime with no torch says what to do.
+        let err = installed_torch_stack_pins("flash-attn==2.8.3\n", ten_two).expect_err("no torch");
+        assert!(format!("{err:#}").contains("rocm install sdk"), "{err:#}");
+    }
+    /// An `Exact` torchaudio pin on a row that reuses the SDK's stack means that
+    /// release and no other (PEP 440 `==release`): the `+local` part is not
+    /// compared, and a longer release is not a match.
+    #[test]
+    fn installed_torch_stack_pins_treats_an_exact_pin_as_that_release() {
+        let ten_two = vllm_rocm_discover_build("10.2.0").expect("10.2 row");
+        let exact = |release: &'static str| VllmRocmDiscoverBuild {
+            torchaudio_version: DiscoverVersion::Exact(release),
+            ..*ten_two
+        };
+        let freeze = |torchaudio: &str| {
+            format!(
+                "torch==2.14.0+rocm10.2.0a20261022\ntorchvision==0.29.2+rocm10.2.0a20261022\n\
+                 torchaudio=={torchaudio}+rocm10.2.0a20261022\n"
+            )
+        };
+        let accepted = installed_torch_stack_pins(&freeze("2.11.0.2"), &exact("2.11.0.2"))
+            .expect("the exact release with its local version");
+        assert_eq!(accepted[2], "torchaudio==2.11.0.2+rocm10.2.0a20261022");
+        for installed in ["2.11.0.2.9", "2.11.0.3", "2.11.1"] {
+            assert!(
+                installed_torch_stack_pins(&freeze(installed), &exact("2.11.0.2")).is_err(),
+                "{installed} is not the release 2.11.0.2"
+            );
+        }
+        // A shorter pin does not accept the longer rebuild it is a prefix of.
+        assert!(installed_torch_stack_pins(&freeze("2.11.0.2"), &exact("2.11.0")).is_err());
     }
     /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
     /// arg-builder helpers in isolation: the remaining-deps install must use

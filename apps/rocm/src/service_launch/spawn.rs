@@ -7,9 +7,11 @@
 //! [`ManagedSpawn`], and the serialized spawn transaction itself.
 
 use super::launch_transaction::{
-    ManagedPortDecision, ManagedReuseRefusal, abandon_failed_managed_launch,
-    managed_service_reuse_refusal, no_usable_gpu_refusal, resolve_managed_port_in_transaction,
+    ManagedPortDecision, ManagedReuseRefusal, RecordUpdate, abandon_failed_managed_launch,
+    launch_still_owns, managed_service_reuse_refusal, no_usable_gpu_refusal,
+    resolve_managed_port_in_transaction, update_managed_record_on_disk,
 };
+use super::readiness::managed_service_stop_was_requested;
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
 use crate::engine_runtime_select::managed_service_launcher_path;
@@ -21,14 +23,13 @@ use crate::service_hints;
 use crate::services_text::read_optional_tail_lines;
 use crate::{device_policy_name, record_cli_audit_event};
 use anyhow::{Context, Result, bail};
-#[cfg(windows)]
-use rocm_core::process_is_running;
 use rocm_core::{AppPaths, ManagedServiceRecord};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 use std::fs;
 #[cfg(not(windows))]
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 #[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -59,32 +60,190 @@ pub(crate) fn attach_background_stdio(
     Ok(())
 }
 
-/// Windows spawn-liveness check: wait out the startup window, then fail with the
-/// startup log when the child is already gone. The wait and the liveness probe
-/// are injected so a unit test runs the exit-detected path on every platform,
-/// including the Windows lane that actually calls it.
+/// What a child that is already gone before the readiness wait starts means.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupDeath {
+    /// A `rocm services stop` landed inside the startup window and killed the
+    /// child we just spawned. The user is told it was stopped, not that it
+    /// crashed.
+    DeliberateStop,
+    /// Nothing asked for this: the engine died on its own way up.
+    Crash,
+}
+
+/// Which of the two a child that is gone before the readiness wait even starts
+/// is. Reads the stop markers; **writes nothing**.
 ///
-/// # Errors
-/// Fails with the startup-failure detail when `is_running` reports the child dead.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn ensure_spawned_child_survives_startup(
-    child_pid: u32,
-    log_path: &Path,
-    settle: impl FnOnce(),
-    is_running: impl FnOnce(u32) -> bool,
-) -> Result<()> {
-    settle();
-    if is_running(child_pid) {
-        Ok(())
+/// Deliberately no `failed` stamp here, which is the one place this PR does not
+/// apply ROCMAI-541's "mark the state file `failed` on any error exit". An
+/// engine that dies inside the settle window never became ready, so it is the
+/// shape most likely to die again on the next start — and `rocmd`'s recovery
+/// scan restarts a managed `failed` record that carries no stop marker, which a
+/// crash does not. `failed` here would hand recovery an engine that fails every
+/// start. #437 chose `stopped` for exactly this path and pins it in
+/// `@id:serve-managed-engine-dies-at-startup`; the cleanup's
+/// `mark_launch_abandoned` writes it.
+///
+/// The paths that *do* stamp `failed` are the ones where the engine had already
+/// come up and then died — `finalize_managed_launch_readiness`, the attached
+/// `ServerExited` arm, and the restart verdict — which is what serve-67 and
+/// serve-68 exercise. Recovery respawning one of those is the intended
+/// behaviour, not a loop.
+fn settle_startup_death(paths: &AppPaths, service_id: &str) -> StartupDeath {
+    if managed_service_stop_was_requested(paths, service_id) {
+        StartupDeath::DeliberateStop
     } else {
-        bail!("{}", managed_engine_startup_failure_detail("", log_path))
+        StartupDeath::Crash
     }
 }
 
+/// How long a freshly spawned managed engine is watched before it is treated as
+/// started. Long enough to catch an engine that dies on the way up — arguments it
+/// rejects, a runtime it cannot load — and short enough to be invisible next to
+/// the readiness wait that follows. Both platforms use the same budget.
+///
+/// A window, not a guarantee: engines bind their port and load the model later
+/// than this, so a death there passes the check and the launch is reported as
+/// still starting.
+pub(crate) const MANAGED_ENGINE_STARTUP_SETTLE: Duration = Duration::from_millis(200);
+
+/// The error a launch fails with when its engine was seen dead inside
+/// [`MANAGED_ENGINE_STARTUP_SETTLE`].
+///
+/// A type of its own so the launch's cleanup can tell a child *known* to be dead
+/// from one whose state is unknown: a known-dead child is never signalled, since
+/// its pid is free and may already name an unrelated process.
+#[derive(Debug)]
+struct EngineDiedAtStartup(String);
+
+impl std::fmt::Display for EngineDiedAtStartup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EngineDiedAtStartup {}
+
+/// Fail the launch when the startup check saw the engine exit, naming the
+/// engine's own log and carrying a tail of it.
+///
+/// Both platforms report through here — Unix from `Child::try_wait`, Windows
+/// from the exit code the watched detached spawn read through the process
+/// handle `CreateProcessW` returned — so a death at startup reads the same on
+/// each, exit status included. `None` means the engine was still running, or
+/// (on Windows) that its state could not be read, which is treated as running.
+///
+/// `verdict` is consulted only once a death is seen, and decides what the two
+/// state files are left saying (ROCMAI-541). A `rocm services stop` that landed
+/// inside the startup window killed this child, so stamping `failed` over the
+/// stop's own bookkeeping would report a deliberate stop as a crash; anything
+/// else is a crash. The verdict writes nothing — see [`settle_startup_death`]
+/// for why this one path leaves the status to the cleanup — it only decides
+/// which message the user gets. It is a closure so this stays free of
+/// `AppPaths` and keeps its unit test on every platform.
+///
+/// Both arms return [`EngineDiedAtStartup`]: the child is known dead either way,
+/// and that is what stops cleanup signalling a pid that is already free.
+fn fail_if_engine_died_at_startup(
+    startup_exit: Option<ExitStatus>,
+    log_path: &Path,
+    service_id: &str,
+    verdict: impl FnOnce() -> StartupDeath,
+) -> Result<()> {
+    let Some(status) = startup_exit else {
+        return Ok(());
+    };
+    if verdict() == StartupDeath::DeliberateStop {
+        return Err(EngineDiedAtStartup(format!(
+            "managed engine for service `{service_id}` was stopped while it was starting"
+        ))
+        .into());
+    }
+    Err(EngineDiedAtStartup(managed_engine_startup_failure_detail(
+        &format!(" with status {status}"),
+        log_path,
+    ))
+    .into())
+}
+
+/// Put a watched spawn's engine on `record`, unless the watch saw it exit.
+///
+/// The order is the point: the startup check runs *before* the pid is recorded,
+/// so an engine seen dead is never named by the record. Its pid is free, and a
+/// creation time read only after it died would describe whatever process reuses
+/// that pid, so nothing else would stop a later cleanup or stop from signalling
+/// it. A live engine is recorded before anything else can fail, so cleanup knows
+/// to terminate it.
+///
+/// Called on Windows, where the spawn reports the exit itself; kept free of any
+/// platform API so its unit test runs on every lane, the Windows one included.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn adopt_watched_engine_spawn(
+    record: &mut ManagedServiceRecord,
+    pid: u32,
+    startup_exit: Option<ExitStatus>,
+    service_id: &str,
+    verdict: impl FnOnce() -> StartupDeath,
+) -> Result<u32> {
+    fail_if_engine_died_at_startup(startup_exit, &record.log_path, service_id, verdict)?;
+    record.record_engine_identity(pid);
+    Ok(pid)
+}
+
+/// Whether `error` is a launch failure for an engine seen dead at startup.
+fn engine_died_at_startup(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<EngineDiedAtStartup>().is_some()
+}
+
+/// Read a watched detached spawn's early exit as an `ExitStatus`.
+///
+/// `GetExitCodeProcess` yields a bare `u32`, which is what
+/// `ExitStatusExt::from_raw` takes on Windows.
+#[cfg(windows)]
+fn managed_startup_exit(spawn: &rocm_core::DetachedSpawn) -> Option<ExitStatus> {
+    use std::os::windows::process::ExitStatusExt as _;
+
+    spawn.early_exit_code.map(ExitStatus::from_raw)
+}
+
+/// Whether the E2E-only switch that makes the managed engine die during startup
+/// is armed, so the black-box suite can assert what a user sees when it does.
+///
+/// Read in the parent, which spawns the engine, so nothing test-only reaches
+/// the child's own code path. The child is the real `rocm` binary, really
+/// spawned and really dead — only its arguments are swapped for ones the CLI
+/// rejects, so the launch takes the path a broken engine takes.
+///
+/// Armed by [`rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV`], which the
+/// E2E suite names too.
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) fn scripted_managed_engine_startup_failure() -> bool {
+    std::env::var_os(rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV).is_some()
+}
+
+/// Release builds do not enable `e2e-test-hooks`, so the switch does not exist
+/// there and no environment variable can arm it.
+#[cfg(not(feature = "e2e-test-hooks"))]
+pub(crate) const fn scripted_managed_engine_startup_failure() -> bool {
+    false
+}
+
+/// Arguments that make the spawned `rocm` exit at once with a non-zero status.
+/// Used only under [`scripted_managed_engine_startup_failure`].
+///
+/// An unrecognised *flag*, deliberately: clap rejects it with exit code 2 before
+/// any work. An unrecognised subcommand would not do — the CLI falls back to
+/// natural-language request parsing for those and exits 0.
+#[cfg(feature = "e2e-test-hooks")]
+fn managed_engine_startup_failure_args() -> Vec<String> {
+    vec!["--e2e-managed-engine-startup-failure".to_owned()]
+}
+
 /// `status_clause` is a pre-formatted fragment inserted right after "exited
-/// immediately" (e.g. `" with status exit status: 1"` on Unix, where a real
-/// `ExitStatus` is available; empty on Windows, where the liveness check
-/// below only has a yes/no answer, not an exit code).
+/// immediately", e.g. `" with status exit status: 1"`. The launch passes one on
+/// both platforms: the exit status comes from `Child::try_wait` on Unix and from
+/// the exit code the watched Windows spawn read through the process handle. It
+/// may be empty for a caller that has no status to name.
 pub(crate) fn managed_engine_startup_failure_detail(
     status_clause: &str,
     log_path: &Path,
@@ -150,6 +309,12 @@ pub(super) enum ManagedSpawn {
     Spawned {
         record: Box<ManagedServiceRecord>,
         child_pid: u32,
+        /// Carries the spawned `Child` (Unix) or bare pid (Windows) onward so
+        /// callers can confirm the child's *real* exit later — via
+        /// `try_wait()` on Unix, not just a `kill(pid, 0)` probe that also
+        /// succeeds for a zombie this process has not reaped yet (ROCMAI-541;
+        /// see `rocm_core::ManagedChildLiveness`'s doc comment).
+        liveness: rocm_core::ManagedChildLiveness,
     },
 }
 
@@ -362,16 +527,23 @@ pub(super) fn spawn_managed_engine_child(
         #[cfg(not(windows))]
         None,
     ) {
-        Ok(child_pid) => Ok(ManagedSpawn::Spawned {
+        Ok((child_pid, liveness)) => Ok(ManagedSpawn::Spawned {
             record: Box::new(record),
             child_pid,
+            liveness,
         }),
         Err(error) => {
             // The single cleanup choke point for every failure path below the
             // record's first write: `record.engine_pid` tells it whether a child
-            // ever ran, so a pre-spawn failure deletes everything and a post-spawn
-            // one keeps the record and log (marked `status = "stopped"`) instead.
-            abandon_failed_managed_launch(paths, &record);
+            // ever ran, so a pre-spawn failure deletes everything and a
+            // post-spawn one keeps the record and log instead. It marks that
+            // kept record `stopped` only while the record is still live — one a
+            // crash path already stamped `failed` is deliberately left `failed`
+            // rather than relabelled as an abandoned launch. See
+            // `abandon_launch_record` in `launch_transaction.rs`.
+            //
+            // An engine seen dead at startup is not signalled: its pid is free.
+            abandon_failed_managed_launch(paths, &record, engine_died_at_startup(&error));
             Err(error)
         }
     }
@@ -391,6 +563,23 @@ fn test_spawn_hook() -> Option<std::rc::Rc<SpawnOverride<'static>>> {
     TEST_SPAWN_HOOK.with(|hook| hook.borrow().clone())
 }
 
+/// The stand-in engine behind [`super::readiness::e2e_simulate_startup_exit`]:
+/// a shell that appends to the launch's own log and exits during startup.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+fn simulated_startup_exit_spawner(log_path: &Path) -> Box<SpawnOverride<'static>> {
+    let log_path = log_path.to_path_buf();
+    Box::new(move |_command| {
+        let log = fs::OpenOptions::new().append(true).open(&log_path)?;
+        let stderr = log.try_clone()?;
+        ProcessCommand::new("sh")
+            .args(["-c", super::readiness::SIMULATED_STARTUP_EXIT_SCRIPT])
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(stderr)
+            .spawn()
+    })
+}
+
 #[cfg(not(windows))]
 type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> + 'a;
 
@@ -400,7 +589,9 @@ type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process:
 ///
 /// Split out of [`spawn_managed_engine_child`] so that *every* failure below the
 /// record's first write is funnelled through one cleanup path before the
-/// launch lock is released. Returns the child pid.
+/// launch lock is released. Returns the child pid, and the retained child
+/// handle the caller's readiness check needs to tell a dead child from a slow
+/// one (see [`rocm_core::ManagedChildLiveness`]).
 #[allow(clippy::too_many_arguments)]
 fn launch_managed_engine_child_locked(
     paths: &AppPaths,
@@ -419,7 +610,7 @@ fn launch_managed_engine_child_locked(
     // (i.e. released) at the exact point production would spawn the child,
     // without needing to fake or intercept the real spawn mechanics.
     #[cfg(not(windows))] spawn_override: Option<&SpawnOverride<'_>>,
-) -> Result<u32> {
+) -> Result<(u32, rocm_core::ManagedChildLiveness)> {
     let port = record.port;
     if let Some(parent) = record.engine_state_path.parent() {
         fs::create_dir_all(parent)
@@ -443,6 +634,14 @@ fn launch_managed_engine_child_locked(
         &record.engine_state_path,
         Some(&record.log_path),
     )?;
+    // E2E-only: swap in arguments the child rejects at once, so the launch below
+    // observes a real engine that really died during startup.
+    #[cfg(feature = "e2e-test-hooks")]
+    let serve_args = if scripted_managed_engine_startup_failure() {
+        managed_engine_startup_failure_args()
+    } else {
+        serve_args
+    };
     let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
     // Hand the child the *path* to the endpoint key file (stored for a public bind
     // or a `--require-api-key` launch) via the environment. A path — not the secret value — is what the detached-spawn
@@ -482,30 +681,48 @@ fn launch_managed_engine_child_locked(
     debug_assert_eq!(lease.port(), port);
     lease.release();
     #[cfg(windows)]
-    let child_pid = {
+    let (child_pid, liveness) = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
         let mut env_refs = app_path_env_var_refs(&env_values);
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        let child_pid = rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?;
-        // Set before the immediate-exit check below, so a bail! here still leaves
-        // `record.engine_pid` telling cleanup that a child was spawned. The
-        // start-time token is captured here too, while the child is certainly
-        // ours: cleanup binds its kill to it rather than to whatever owns the
-        // pid by then.
-        record.record_engine_identity(child_pid);
-        ensure_spawned_child_survives_startup(
-            child_pid,
+        // Watched through the process handle `CreateProcessW` returned, before
+        // it is closed: re-checking the pid afterwards could find a different
+        // process that reused it, and report a dead engine as running (#437).
+        //
+        // Through the *with-log* variant (ROCMAI-541), mirroring the Unix
+        // branch's `attach_background_stdio` below: a plain detached spawn
+        // leaves the child's output — including the error chain a failing
+        // `__engine-serve-http` prints to stderr — reaching nothing, so the log
+        // would stop at the engine's last explicit progress write and neither
+        // `rocm serve --verbose` nor `rocm services logs` could show why it
+        // died. The watch and the log are independent; this needs both.
+        let spawn = rocm_core::spawn_detached_with_log_watching_startup(
+            &current_exe,
+            &serve_args,
+            &env_refs,
             &record.log_path,
-            || thread::sleep(Duration::from_millis(200)),
-            process_is_running,
+            MANAGED_ENGINE_STARTUP_SETTLE,
+        )
+        .context("failed to launch managed engine process")?;
+        adopt_watched_engine_spawn(
+            record,
+            spawn.pid,
+            managed_startup_exit(&spawn),
+            service_id,
+            || settle_startup_death(paths, service_id),
         )?;
-        child_pid
+        // The watch above is one-shot: it answers for the settle window only.
+        // The readiness wait that follows needs a live view of the same child,
+        // which is what `ManagedChildLiveness` carries (ROCMAI-541).
+        (
+            spawn.pid,
+            rocm_core::ManagedChildLiveness::from_pid(spawn.pid),
+        )
     };
     #[cfg(not(windows))]
-    let child_pid = {
+    let (child_pid, liveness) = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
         attach_background_stdio(&mut command, Some(&record.log_path))?;
@@ -521,6 +738,11 @@ fn launch_managed_engine_child_locked(
         let hook = test_spawn_hook();
         #[cfg(all(test, not(windows)))]
         let spawn_override = spawn_override.or(hook.as_deref());
+        #[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+        let stand_in = super::readiness::e2e_simulate_startup_exit()
+            .then(|| simulated_startup_exit_spawner(&record.log_path));
+        #[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+        let spawn_override = spawn_override.or(stand_in.as_deref());
         let mut child = match spawn_override {
             Some(spawn) => spawn(&mut command),
             None => command.spawn(),
@@ -533,21 +755,35 @@ fn launch_managed_engine_child_locked(
         // ours: cleanup binds its kill to it rather than to whatever owns the
         // pid by then.
         record.record_engine_identity(child_pid);
-        thread::sleep(Duration::from_millis(200));
-        if let Some(status) = child
+        thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
+        let startup_exit = child
             .try_wait()
-            .context("failed to check managed engine startup state")?
-        {
-            bail!(
-                "{}",
-                managed_engine_startup_failure_detail(
-                    &format!(" with status {status}"),
-                    &record.log_path
-                )
-            );
-        }
-        child_pid
+            .context("failed to check managed engine startup state")?;
+        fail_if_engine_died_at_startup(startup_exit, &record.log_path, service_id, || {
+            settle_startup_death(paths, service_id)
+        })?;
+        (
+            child_pid,
+            rocm_core::ManagedChildLiveness::from_child(child),
+        )
     };
+    publish_spawned_engine(paths, service_id, record, child_pid).map(|pid| (pid, liveness))
+}
+
+/// Put a spawned engine on the launch's record as `running`, as the last step of
+/// the launch, or fail it when a stop or removal has settled the claim since.
+///
+/// A failure leaves `record.engine_pid` naming the child, which is what
+/// `abandon_failed_managed_launch` terminates; that is how the failure's own
+/// "the failed launch terminates it" comes true. Shared by both platforms and
+/// kept apart from the spawn so a test can drive it with a real child on every
+/// lane, Windows included.
+fn publish_spawned_engine(
+    paths: &AppPaths,
+    service_id: &str,
+    record: &mut ManagedServiceRecord,
+    child_pid: u32,
+) -> Result<u32> {
     // The child is both roles until the engine state file names a separate
     // server process. Each role gets its own token, captured while the child is
     // alive: a stop pairs every recorded PID with its own token, and the two
@@ -555,15 +791,51 @@ fn launch_managed_engine_child_locked(
     // engine PID recorded without one could only be signalled blind.
     // The engine's token was already captured right after the spawn (so cleanup
     // can bind to it); re-capturing here could replace it with a later owner's.
-    record.record_supervisor_identity(child_pid);
-    record.status = "running".to_owned();
-    if let Err(error) = record.write() {
-        // Cleanup is the caller's job now: `record.engine_pid` (set above) is
-        // already enough for `abandon_failed_managed_launch` to terminate this
-        // child, so there is nothing left for this inner path to do beyond
-        // surfacing the error.
-        return Err(error.context("failed to publish the managed service record"));
-    }
+    //
+    // Applied to the record as it is on disk, and only while it is still the
+    // claim this launch wrote: a `rocm services stop` or `remove` does not take
+    // the launch lock, so it can settle the claim while the child is spawned.
+    // Writing the held copy back would revive that service as `running`.
+    //
+    // A stop still in flight counts too: `rocm services stop` writes its marker
+    // before it signals anything, and having read the claim, which names no
+    // process, it would never signal the engine published over it
+    // (`live_and_no_stop_requested`). Refusing leaves the engine to the failed
+    // launch's cleanup, and the stop then settles a record that names nothing.
+    //
+    // Only the fields this launch learned after its claim are applied: the engine
+    // and supervisor identities and the `running` status. Everything else is
+    // taken from the record on disk, which is the claim unless somebody wrote
+    // since — and a write that left the claim this launch's must survive the
+    // publish. So a field the launch sets on `record` after the claim write has
+    // to be added here, or it is dropped when `record` is replaced by what was
+    // published; `the_publish_applies_the_launch_s_own_fields_over_the_record_on_disk`
+    // pins which fields those are.
+    //
+    // On any error here cleanup is the caller's job: `record.engine_pid` (set
+    // above) is enough for `abandon_failed_managed_launch` to terminate this
+    // child, which nothing on record names when the claim was taken away.
+    let (engine_pid, engine_start_ticks) = (record.engine_pid, record.engine_start_ticks);
+    let published = update_managed_record_on_disk(
+        paths,
+        service_id,
+        |current| launch_still_owns(current, record),
+        |current| {
+            current.engine_pid = engine_pid;
+            current.engine_start_ticks = engine_start_ticks;
+            current.record_supervisor_identity(child_pid);
+            current.status = "running".to_owned();
+        },
+    )
+    .context("failed to publish the managed service record")?;
+    let RecordUpdate::Written(published) = published else {
+        bail!(
+            "managed service `{service_id}` was stopped or removed, or a stop was requested \
+             for it, while it was launching, so the engine it started (pid {child_pid}) is not \
+             recorded on it; the failed launch terminates it"
+        );
+    };
+    *record = *published;
 
     Ok(child_pid)
 }
@@ -573,32 +845,218 @@ mod tests {
     use super::*;
     use crate::managed_service_status::load_managed_services;
     use crate::service_launch::launch_transaction::live_managed_services;
-    #[cfg(not(windows))]
     use crate::service_launch::test_support::sleeper_test_name;
     use crate::service_launch::test_support::write_live_service_record;
     use crate::tests::test_paths;
     use rocm_core::DEFAULT_LOCAL_HOST;
+
+    /// An `ExitStatus` for `code`, built the way each platform's startup
+    /// check gets one: `try_wait` on Unix, `GetExitCodeProcess` on Windows.
+    fn exit_status(code: u8) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(i32::from(code) << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(u32::from(code))
+        }
+    }
 
     #[test]
     fn a_child_that_exited_during_the_startup_window_is_reported_with_its_log() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let log = dir.path().join("engine.log");
         fs::write(&log, "boom: engine could not start\n")?;
-        let settled = std::cell::Cell::new(false);
-        let error = ensure_spawned_child_survives_startup(
-            4242,
-            &log,
-            || settled.set(true),
-            |pid| {
-                assert_eq!(pid, 4242);
-                assert!(settled.get(), "liveness must be probed after the wait");
-                false
-            },
-        )
+        let error = fail_if_engine_died_at_startup(Some(exit_status(2)), &log, "svc", || {
+            StartupDeath::Crash
+        })
         .expect_err("a dead child must fail the launch");
-        assert!(settled.get(), "the startup window must elapse first");
-        assert!(format!("{error:#}").contains("boom"), "{error:#}");
-        ensure_spawned_child_survives_startup(4242, &log, || {}, |_| true)?;
+        let message = format!("{error:#}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(message.contains(&log.display().to_string()), "{message}");
+        // The exit status is named on both platforms, not only where a `Child`
+        // is at hand.
+        let status_clause = format!(" with status {}", exit_status(2));
+        assert!(message.contains(&status_clause), "{message}");
+        // Typed, so cleanup knows not to signal a pid that is already free.
+        assert!(engine_died_at_startup(&error));
+        fail_if_engine_died_at_startup(None, &log, "svc", || {
+            unreachable!("a live child must not be judged")
+        })?;
+        assert!(!engine_died_at_startup(&anyhow::anyhow!(
+            "some other launch failure"
+        )));
+
+        // ROCMAI-541: a stop that landed inside the window is not a crash, and
+        // must not be reported as one -- but it is still a dead child, so it
+        // stays typed as such and its pid is never signalled.
+        let stopped = fail_if_engine_died_at_startup(Some(exit_status(2)), &log, "svc-x", || {
+            StartupDeath::DeliberateStop
+        })
+        .expect_err("a stopped child still fails the launch");
+        let stopped_message = format!("{stopped:#}");
+        assert!(
+            stopped_message.contains("was stopped while it was starting"),
+            "{stopped_message}"
+        );
+        assert!(
+            !stopped_message.contains("boom"),
+            "a stop must not be reported with the crash log: {stopped_message}"
+        );
+        assert!(engine_died_at_startup(&stopped));
+        Ok(())
+    }
+
+    /// A child lost in the startup window is told apart from one a stop killed,
+    /// and **neither writes a status**.
+    ///
+    /// This is the one path where this PR does not apply ROCMAI-541's "mark the
+    /// state file `failed` on any error exit": an engine that died inside the
+    /// settle window never became ready, and `rocmd`'s recovery restarts a
+    /// `failed` record carrying no stop marker — which a crash does not carry —
+    /// so `failed` here would hand recovery an engine that fails every start.
+    /// #437 settled this path on `stopped`, written by the cleanup's
+    /// `mark_launch_abandoned`, and pins it end to end in
+    /// `@id:serve-managed-engine-dies-at-startup`.
+    ///
+    /// What the verdict still decides is what the user is *told*: a stop that
+    /// landed in the window reports a stop, not a crash. Both arms are asserted,
+    /// because a check that only looked at the crash arm would pass if
+    /// `settle_startup_death` stopped consulting the stop marker at all. The
+    /// no-write half is asserted too, so a reinstated `failed` stamp here turns
+    /// this red rather than only the e2e lane.
+    #[test]
+    fn a_child_lost_in_the_startup_window_is_told_apart_from_a_stop_and_writes_nothing()
+    -> Result<()> {
+        for (stop_requested, expected) in [
+            (false, StartupDeath::Crash),
+            (true, StartupDeath::DeliberateStop),
+        ] {
+            let (root, paths) = test_paths(&format!("startup-death-{stop_requested}"));
+            paths.ensure()?;
+            let service_id = "svc-startup-death";
+            let mut record =
+                write_live_service_record(&paths, service_id, "model/one", 9123, "starting")?;
+            if stop_requested {
+                record.stop_requested_unix_ms = Some(1);
+                record.write()?;
+            }
+
+            let verdict = settle_startup_death(&paths, service_id);
+
+            assert_eq!(verdict, expected, "stop_requested={stop_requested}");
+            let manifest = fs::read_to_string(&record.manifest_path)?;
+            assert!(
+                !manifest.contains("\"failed\""),
+                "the startup verdict must not stamp the manifest: {manifest}"
+            );
+            let engine_state = fs::read_to_string(&record.engine_state_path).unwrap_or_default();
+            assert!(
+                !engine_state.contains("\"failed\""),
+                "nor the engine state file: {engine_state}"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+        Ok(())
+    }
+
+    /// A child that dies inside the startup window leaves a record that is
+    /// `stopped` and not live, and an engine state file that does not claim a
+    /// crash.
+    ///
+    /// The test above calls [`settle_startup_death`] directly, so it stops one
+    /// frame short of the on-disk result. This drives a child that really is
+    /// spawned and really is gone again through the whole call and asserts the
+    /// **final** state, which is the only place the two files can be seen to
+    /// disagree.
+    ///
+    /// `stopped` is #437's rule for this path and the reason is recovery:
+    /// `rocmd` restarts a managed `failed` record that carries no stop marker,
+    /// and an engine that died on the way up is the shape most likely to die
+    /// again on the next start. The verdict here therefore writes nothing, and
+    /// the cleanup's `mark_launch_abandoned` supplies `stopped`. Both files are
+    /// asserted together, because a `failed` stamp reinstated in
+    /// `settle_startup_death` would leave them disagreeing —
+    /// `refresh_from_engine_state` does not re-read an engine state file behind
+    /// a `stopped` manifest, so the pair would never reconcile.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_startup_window_death_leaves_a_stopped_record_both_files_agree_on() -> Result<()> {
+        let (root, paths) = test_paths("startup-crash-survives-cleanup");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let service_id = "lemonade-startup-crash-cleanup";
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        // A child that really is spawned and really is gone again before the
+        // post-spawn window elapses — the production shape of the defect, and
+        // the reason the record reaches the `Err` arm with `engine_pid` set.
+        TEST_SPAWN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(std::rc::Rc::new(|_command| {
+                ProcessCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg("exit 3")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            }));
+        });
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            service_id,
+            "qwen",
+            &resolve,
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Auto,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        TEST_SPAWN_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        let error = result.err().expect("a child that exited fails the launch");
+        let manifest = ManagedServiceRecord::read_manifest(&paths, service_id)
+            .expect("the dead launch keeps its record for `rocm services`/`rocm logs`");
+        let engine_state = fs::read_to_string(&manifest.engine_state_path).unwrap_or_default();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            manifest.status, "stopped",
+            "a death in the startup window must not be handed to rocmd recovery: {error:#}"
+        );
+        assert!(
+            !engine_state.contains("\"failed\""),
+            "and the engine state file must not disagree with it: {engine_state}"
+        );
+        assert!(
+            !manifest.is_live(),
+            "a failed launch must stop reserving its port"
+        );
         Ok(())
     }
 
@@ -1004,19 +1462,25 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_spawn_past_the_first_write_terminates_the_child_and_keeps_an_abandoned_record()
+    fn an_engine_that_dies_at_startup_keeps_an_abandoned_record_and_is_never_signalled()
     -> Result<()> {
         // Drives the real call site's *post*-spawn cleanup branch, which
         // neither `abandoned_launch_*` test reaches (they call
         // `abandon_failed_managed_launch` directly). An engine name this
         // binary does not build in makes the real spawned child (a second
         // `rocm` process) exit almost immediately via
-        // `run_builtin_engine_serve_http`'s `other => bail!(...)` arm, after
-        // `launch_managed_engine_child_locked` has already set
-        // `record.engine_pid` — so cleanup must terminate (already-dead) the
-        // child, keep the record and log for inspection, mark the record
-        // `stopped` (a `failed` one would be respawned by rocmd recovery), and
-        // clear only the endpoint key.
+        // `run_builtin_engine_serve_http`'s `other => bail!(...)` arm. The
+        // startup check sees it exit (`try_wait` on Unix, the watched spawn's
+        // exit code on Windows), after `launch_managed_engine_child_locked` has
+        // already set `record.engine_pid` — so cleanup must keep the record and
+        // log for inspection, keep the `failed` its own crash path recorded
+        // (this used to be forced to `stopped` to keep rocmd recovery from
+        // respawning it; whether a `failed` record should be a recovery
+        // candidate is the open question this PR's "Known limitations" records,
+        // and the assertion below pins what it does today, not what it should
+        // do), clear only the endpoint key, and never signal the engine: its
+        // pid is free. This drives the real mapping from the startup check's
+        // error to that cleanup, on every platform.
         //
         // The child always dies near-instantly, but `spawn_managed_engine_child`
         // only reports that within a fixed startup-check window. On a loaded or
@@ -1103,13 +1567,24 @@ mod tests {
         );
         let persisted =
             persisted.expect("a post-spawn failure must leave the record on disk, not delete it");
-        // `stopped`, not `failed`: rocmd's recovery restarts a `failed` record
-        // without a stop marker, which would respawn a launch the CLI just
-        // reported as failed (pinned on the rocmd side by
-        // `abandoned_launch_record_is_not_a_recovery_candidate`).
+        // `stopped`, and the engine state file must agree with it.
+        //
+        // The startup verdict writes nothing (see `settle_startup_death`): a
+        // child that died inside the settle window never became ready, and
+        // `rocmd`'s recovery restarts a managed `failed` record carrying no
+        // stop marker, which a crash does not. #437 settled this path on
+        // `stopped` for that reason and pins it end to end in
+        // `@id:serve-managed-engine-dies-at-startup`.
+        //
+        // The paths that *do* leave `failed` standing are the ones where the
+        // engine had already come up — `readiness::settle_exited_service`, the
+        // attached `ServerExited` arm, `service_control::settle_restart_startup_death`
+        // — which is what ROCMAI-541's own serve-67/68 exercise. Recovery
+        // respawning one of those is intended; respawning an engine that never
+        // started is a loop.
         assert_eq!(
             persisted.status, "stopped",
-            "a post-spawn failure must mark the record abandoned, not leave it stuck"
+            "a death inside the startup window must not be handed to rocmd recovery"
         );
         assert_eq!(
             key, None,
@@ -1119,7 +1594,58 @@ mod tests {
             live.is_empty(),
             "an abandoned record must not still reserve its port"
         );
+        assert_eq!(
+            persisted.engine_pid, None,
+            "the record must not name an engine seen dead: its pid is free"
+        );
+        let audit = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
         let _ = fs::remove_dir_all(root);
+        assert!(
+            !audit.contains("managed_service_launch_cleanup"),
+            "cleanup must not signal an engine the startup check saw die:\n{audit}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_watched_spawn_seen_dead_is_never_put_on_record() -> Result<()> {
+        // The Windows ordering, on every lane: the startup check runs before
+        // the pid is recorded, so an engine seen dead is never named.
+        let dir = tempfile::tempdir()?;
+        let (_root, paths) = test_paths("adopt-watched-spawn");
+        let mut record = write_live_service_record(
+            &paths,
+            "lemonade-adopt-watched",
+            "adopt-watched-model",
+            11_499,
+            "starting",
+        )?;
+        record.engine_pid = None;
+        record.log_path = dir.path().join("engine.log");
+        fs::write(&record.log_path, "engine: bad flag\n")?;
+
+        let error =
+            adopt_watched_engine_spawn(&mut record, 4242, Some(exit_status(2)), "svc", || {
+                StartupDeath::Crash
+            })
+            .expect_err("an engine seen dead must fail the launch");
+        assert!(engine_died_at_startup(&error), "{error:#}");
+        assert_eq!(
+            record.engine_pid, None,
+            "a dead engine's pid was put on record"
+        );
+
+        assert_eq!(
+            adopt_watched_engine_spawn(&mut record, std::process::id(), None, "svc", || {
+                unreachable!("a live engine must not be judged")
+            })?,
+            std::process::id()
+        );
+        assert_eq!(
+            record.engine_pid,
+            Some(std::process::id()),
+            "a live engine must be on record before anything else can fail"
+        );
         Ok(())
     }
 
@@ -1311,7 +1837,7 @@ mod tests {
             None,
             Some(spawn_override),
         );
-        if let Ok(child_pid) = result.as_ref() {
+        if let Ok((child_pid, _)) = result.as_ref() {
             let _ = rocm_core::terminate_process(*child_pid);
         }
         let _ = fs::remove_dir_all(root);
@@ -1321,6 +1847,388 @@ mod tests {
             "the port must already be bindable (released) by the time the child is spawned"
         );
         result?;
+        Ok(())
+    }
+
+    /// A launch's claim written to disk, with the engine answer and port lease
+    /// `launch_managed_engine_child_locked` takes, for tests driving it through
+    /// the injected spawn.
+    #[cfg(not(windows))]
+    fn claimed_launch(
+        paths: &AppPaths,
+        service_id: &str,
+    ) -> Result<(
+        ManagedServiceRecord,
+        ResolveModelResponse,
+        rocm_core::LoopbackPortLease,
+    )> {
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
+        let lease = rocm_core::lease_loopback_port(port)?;
+        let record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        Ok((record, resolve, lease))
+    }
+
+    /// The sleeper child the injected spawn starts in place of an engine.
+    #[cfg(not(windows))]
+    fn spawn_sleeper() -> io::Result<std::process::Child> {
+        ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .arg(sleeper_test_name())
+            .arg("--exact")
+            .arg("--ignored")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    }
+
+    /// What another command did to the claim while the engine spawned, for
+    /// [`publish_refused_and_cleaned_up`].
+    #[derive(Clone, Copy, Debug)]
+    enum ConcurrentWrite {
+        /// `rocm services stop` finished: the marker and `stopped`.
+        SettledStop,
+        /// `rocm services stop` has written its marker and not yet `stopped`:
+        /// the record still reads live.
+        InFlightStop,
+        /// `rocm services remove` deleted the record.
+        Removal,
+    }
+
+    /// The step after the spawn, on every platform and so on the Windows gate:
+    /// a stop (settled or still in flight) or a removal made while the engine
+    /// spawned fails the publish and is kept as it is, and the cleanup the
+    /// failure promises ("the failed launch terminates it") terminates the real
+    /// child through the same routine a stop uses — a tree kill on Windows.
+    #[test]
+    fn a_publish_refused_by_a_stop_leaves_the_stop_and_the_cleanup_ends_the_engine() -> Result<()> {
+        for concurrent in [ConcurrentWrite::SettledStop, ConcurrentWrite::InFlightStop] {
+            let (after, child_pid, error, exited) = publish_refused_and_cleaned_up(concurrent)?;
+            let after = after.expect("a stopped record is kept");
+            assert!(
+                error.contains("while it was launching, so the engine it started")
+                    && error.contains(&format!("(pid {child_pid})"))
+                    && error.contains("the failed launch terminates it"),
+                "{concurrent:?}: {error}"
+            );
+            assert!(
+                exited,
+                "{concurrent:?}: the engine the failure says is terminated is still running"
+            );
+            let expected_status = match concurrent {
+                ConcurrentWrite::InFlightStop => "starting",
+                _ => "stopped",
+            };
+            assert_eq!(
+                after.status, expected_status,
+                "{concurrent:?}: the stop was overwritten"
+            );
+            assert_eq!(
+                after.stop_requested_unix_ms,
+                Some(4_244),
+                "{concurrent:?}: the stop marker was erased"
+            );
+            assert_eq!(
+                after.engine_pid, None,
+                "{concurrent:?}: the refused engine was put on record"
+            );
+        }
+        Ok(())
+    }
+
+    /// The `RecordUpdate::Gone` half of the same guarded publish: a record
+    /// `rocm services remove` deleted while the engine spawned is not
+    /// re-created, and the engine is terminated all the same.
+    #[test]
+    fn a_publish_refused_by_a_removal_does_not_recreate_the_record() -> Result<()> {
+        let (after, child_pid, error, exited) =
+            publish_refused_and_cleaned_up(ConcurrentWrite::Removal)?;
+        assert!(
+            error.contains("while it was launching, so the engine it started")
+                && error.contains(&format!("(pid {child_pid})")),
+            "{error}"
+        );
+        assert!(
+            exited,
+            "the engine the failure says is terminated is still running"
+        );
+        assert!(
+            after.is_none(),
+            "the removed record was re-created: {after:?}"
+        );
+        Ok(())
+    }
+
+    /// Claim a record, start a real child as the engine, apply `concurrent` to
+    /// the record on disk, then run the publish and, as
+    /// `spawn_managed_engine_child` does on its error, the failed launch's
+    /// cleanup. Returns the record left on disk (`None` when there is none), the
+    /// child's pid, the publish error and whether the child exited.
+    fn publish_refused_and_cleaned_up(
+        concurrent: ConcurrentWrite,
+    ) -> Result<(Option<ManagedServiceRecord>, u32, String, bool)> {
+        let (root, paths) = test_paths(&format!("publish-refused-{concurrent:?}"));
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-publish-refused",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11_489,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+        // `std::process` paths spelled out: this module imports `Command` and
+        // `Stdio` only off Windows, and this test runs on Windows too.
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg(sleeper_test_name())
+            .arg("--ignored")
+            .arg("--test-threads=1")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let child_pid = child.id();
+        // As both platforms do before the publish: the engine is on the held
+        // record with its token, so cleanup knows what to terminate.
+        record.record_engine_identity(child_pid);
+        // Neither `rocm services stop` nor `remove` takes the launch lock.
+        match concurrent {
+            ConcurrentWrite::Removal => fs::remove_file(&record.manifest_path)?,
+            ConcurrentWrite::SettledStop | ConcurrentWrite::InFlightStop => {
+                let mut stopping = ManagedServiceRecord::read_manifest(&paths, &record.service_id)?;
+                stopping.stop_requested_unix_ms = Some(4_244);
+                if matches!(concurrent, ConcurrentWrite::SettledStop) {
+                    stopping.status = "stopped".to_owned();
+                }
+                stopping.write()?;
+            }
+        }
+
+        let result =
+            publish_spawned_engine(&paths, &record.service_id.clone(), &mut record, child_pid);
+        // Computed as `spawn_managed_engine_child` computes it, so the test
+        // follows production if the publish ever reports a startup death.
+        let child_known_dead = result.as_ref().err().is_some_and(engine_died_at_startup);
+        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+        abandon_failed_managed_launch(&paths, &record, child_known_dead);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let after = record
+            .manifest_path
+            .exists()
+            .then(|| ManagedServiceRecord::read_manifest(&paths, &record.service_id))
+            .transpose();
+        let _ = fs::remove_dir_all(root);
+        let error = error.expect("a publish over a stop or a removal must fail");
+        Ok((after?, child_pid, error, exited))
+    }
+
+    /// The publish writes the launch's own fields onto the record as it is on
+    /// disk, not the copy the launch holds: a write made since the claim that
+    /// left it the launch's (here a restart count; a stop marker would make the
+    /// publish refuse, see `a_publish_refused_by_a_stop_*`) survives, and the published record differs from the claim in
+    /// exactly the engine and supervisor identities and the status. The held
+    /// copy is replaced by what was published, so the two agree.
+    #[test]
+    #[cfg(not(windows))]
+    fn the_publish_applies_the_launch_s_own_fields_over_the_record_on_disk() -> Result<()> {
+        let (root, paths) = test_paths("launch-publish-fields");
+        let (mut record, resolve, lease) = claimed_launch(&paths, "lemonade-publish-fields")?;
+        let manifest_paths = paths.clone();
+        let service_id = record.service_id.clone();
+        let spawn_override: &dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> =
+            &|_command| {
+                let mut marked = ManagedServiceRecord::read_manifest(&manifest_paths, &service_id)
+                    .expect("claim on disk");
+                marked.restart_count = 4_243;
+                marked.write().expect("write the restart count");
+                spawn_sleeper()
+            };
+        let claim = serde_json::to_value(&record)?;
+
+        let result = launch_managed_engine_child_locked(
+            &paths,
+            &mut record,
+            lease,
+            "lemonade",
+            "lemonade-publish-fields",
+            &resolve,
+            "127.0.0.1",
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            Some(spawn_override),
+        );
+        if let Some(pid) = record.engine_pid {
+            let _ = rocm_core::terminate_process(pid);
+        }
+        let on_disk = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+        let _ = fs::remove_dir_all(root);
+        let (child_pid, _liveness) = result?;
+        let on_disk = serde_json::to_value(on_disk?)?;
+
+        let mut expected = claim;
+        expected["restart_count"] = serde_json::json!(4_243);
+        expected["engine_pid"] = serde_json::json!(child_pid);
+        expected["supervisor_pid"] = serde_json::json!(child_pid);
+        expected["engine_start_ticks"] = on_disk["engine_start_ticks"].clone();
+        expected["supervisor_start_ticks"] = on_disk["supervisor_start_ticks"].clone();
+        expected["status"] = serde_json::json!("running");
+        assert_eq!(
+            on_disk, expected,
+            "the publish changed a field it does not own"
+        );
+        assert_eq!(
+            serde_json::to_value(&record)?,
+            on_disk,
+            "the held copy disagrees"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_stop_settled_while_the_engine_spawns_is_kept_and_the_engine_terminated() -> Result<()> {
+        let (root, paths) = test_paths("launch-stopped-during-spawn");
+        let (mut record, resolve, lease) = claimed_launch(&paths, "lemonade-stopped-during-spawn")?;
+        let manifest_paths = paths.clone();
+        let service_id = record.service_id.clone();
+        let spawn_override: &dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> =
+            &|_command| {
+                // `rocm services stop` settles the claim while the child is
+                // being spawned; it takes no launch lock.
+                let mut stopped = ManagedServiceRecord::read_manifest(&manifest_paths, &service_id)
+                    .expect("claim on disk");
+                stopped.stop_requested_unix_ms = Some(4_242);
+                stopped.status = "stopped".to_owned();
+                stopped.write().expect("write stop");
+                ProcessCommand::new(std::env::current_exe().expect("test binary"))
+                    .arg(sleeper_test_name())
+                    .arg("--exact")
+                    .arg("--ignored")
+                    .env("ROCM_TEST_SLEEPER_CHILD", "1")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            };
+
+        let result = launch_managed_engine_child_locked(
+            &paths,
+            &mut record,
+            lease,
+            "lemonade",
+            "lemonade-stopped-during-spawn",
+            &resolve,
+            "127.0.0.1",
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            Some(spawn_override),
+        );
+        let child_pid = record.engine_pid.expect("the child is known to cleanup");
+        let error = match result {
+            Ok((pid, _liveness)) => {
+                let _ = rocm_core::terminate_process(pid);
+                let _ = fs::remove_dir_all(&root);
+                panic!("a launch whose record was stopped must not report success");
+            }
+            Err(error) => error,
+        };
+        // What `spawn_managed_engine_child` does with that error.
+        abandon_failed_managed_launch(&paths, &record, engine_died_at_startup(&error));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while super::super::readiness::service_pid_is_alive(child_pid)
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let child_alive = super::super::readiness::service_pid_is_alive(child_pid);
+        if child_alive {
+            let _ = rocm_core::terminate_process(child_pid);
+        }
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+        let _ = fs::remove_dir_all(root);
+        let after = after?;
+        assert!(
+            error
+                .to_string()
+                .contains("while it was launching, so the engine it started"),
+            "{error:#}"
+        );
+        assert_eq!(after.status, "stopped", "the stop was overwritten");
+        assert_eq!(
+            after.stop_requested_unix_ms,
+            Some(4_242),
+            "the stop marker was erased"
+        );
+        assert_eq!(
+            after.supervisor_pid, 0,
+            "the unrecorded child was put on record"
+        );
+        assert!(
+            !child_alive,
+            "the engine nothing records must be terminated"
+        );
         Ok(())
     }
 }

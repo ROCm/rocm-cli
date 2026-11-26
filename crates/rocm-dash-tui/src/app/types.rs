@@ -143,6 +143,10 @@ pub struct ResolvedArgs {
     /// serves still warns (see dash-29). See
     /// `registry_probe::ManagedRegistryProbe`.
     pub managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
+    /// Launch-time managed Lemonade installation verdict from the bin's built-in
+    /// Detect method. None means unavailable/unknown, never not installed.
+    /// Separate from live external-serving telemetry and GPU system metadata.
+    pub lemonade_managed_installed: Option<bool>,
 }
 
 impl ResolvedArgs {
@@ -184,7 +188,8 @@ impl ConnState {
     /// True for the Windows in-process collector (see
     /// `client::connect_and_run`'s `#[cfg(windows)]` arm), which tags its
     /// `daemon_version` this way since there's no real `rocmdashd` behind
-    /// it — and so no instance registry it could ever populate.
+    /// it — its instances come only from the managed-service registry
+    /// (`AppState::set_managed_instances`), never from discovery.
     pub fn is_in_process(&self) -> bool {
         matches!(self, Self::Connected { version, .. } if version.starts_with(Self::IN_PROCESS_PREFIX))
     }
@@ -300,6 +305,47 @@ pub enum ChatConsent {
     Accepted,
     /// User declined — chat stays off until re-enabled.
     Declined,
+}
+
+/// Whether the managed instance backing the chat endpoint can answer a request.
+///
+/// Only meaningful for a loopback endpoint served by an instance this dashboard
+/// can see. Every other endpoint — a cloud gateway, a local engine nobody
+/// registered — reports [`Serving`](Self::Serving), so the liveness rule can
+/// never block a backend it has no visibility into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatEndpointHealth {
+    /// Answering, or not an endpoint whose health we can observe.
+    Serving,
+    /// Registered but still coming up — a request is worth waiting on.
+    Starting,
+    /// Stopped, or gone from the registry entirely.
+    Stopped,
+    /// Registered and reporting a failure.
+    Failed,
+}
+
+impl ChatEndpointHealth {
+    /// The sentence shown while a request waits on this endpoint, or `None`
+    /// when it is serving and the plain spinner applies.
+    pub const fn wait_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Serving => None,
+            Self::Starting => Some("the model is still starting up — hang tight"),
+            Self::Stopped => Some("the endpoint has stopped — restart the service to chat"),
+            Self::Failed => Some("the endpoint reported an error — check the service logs"),
+        }
+    }
+
+    /// Whether a message must be refused rather than sent.
+    ///
+    /// `Starting` still sends: it is the one state the endpoint is expected to
+    /// leave on its own, and refusing there would turn a wait into an error.
+    /// The other two are known not to answer, so sending only buys a transport
+    /// error the user cannot act on.
+    pub const fn blocks_send(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
 }
 
 /// Inputs `handle_key` needs to interpret keys on the Chat tab without holding

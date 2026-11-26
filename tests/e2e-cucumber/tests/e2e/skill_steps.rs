@@ -13,9 +13,12 @@
 //! `reference.md` is read as the EXPECTED-value fixture. That is a deliberate,
 //! narrow exception to the suite's black-box rule: nothing is imported from the
 //! rocm-cli codebase — a documentation artifact is read as test data, and that
-//! artifact is the thing under test. `SKILL.md` is read too, for two
-//! sentences: `skill-07` reads the catalog contract version Phase 0 requires,
-//! and `tests/skill_reference.rs` reads the "The other N ... print-only" count.
+//! artifact is the thing under test. `SKILL.md` is read too, for a few fixture
+//! sentences: `skill-07` reads the catalog contract version Phase 0 requires.
+//! The phrases those sentences are read at are in `e2e_cucumber::skill_anchors`,
+//! and the module doc of `tests/skill_reference.rs` names the test that reads each.
+//! `skill-08` reads one of the skill's eval replays (`evals/fixtures/`), the
+//! recorded `rocm fix` output an agent is graded against, as its expected value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -155,7 +158,7 @@ fn skill_md_path() -> PathBuf {
 
 /// The phrase `SKILL.md` uses to declare the contract it requires, followed by
 /// the version number: "requires `contract_version` 1 or higher".
-const REQUIRED_CONTRACT_PHRASE: &str = "requires `contract_version` ";
+const REQUIRED_CONTRACT_PHRASE: &str = e2e_cucumber::skill_anchors::REQUIRED_CONTRACT;
 
 /// The catalog contract version `SKILL.md` says it requires, if it says so.
 ///
@@ -170,8 +173,8 @@ fn declared_contract_minimum(skill_md: &str) -> Option<u64> {
 ///
 /// Rows look like:
 /// `| `fix-1-arch` | linux/windows/wsl | <mode> | <signal> | print-only |`
-/// Only rows whose first cell is a backticked `fix-*` id are taken, which skips
-/// the header, the separator, and the exit-code table further up the file.
+/// Only rows whose first cell is a backticked catalog id are taken, which skips
+/// the header and the separator.
 fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
     let mut out = BTreeMap::new();
     for line in md.lines() {
@@ -461,12 +464,12 @@ fn documented_verdicts(md: &str) -> BTreeSet<String> {
 
 /// The subset of Framework routing the reference attributes to the **CLI**.
 ///
-/// The section names two different things: trackers the *skill* hands over from
-/// its own table (Lemonade, Ollama, LM Studio — the host probe cannot detect
-/// them), and the targets `route_when_no_match` actually returns. Checking the
-/// CLI's route against the union of both lets a documented-but-dead CLI target
-/// pass silently, which is how the removed lemonade / ollama / lm-studio arms
-/// stayed in the document. So the CLI is held to its own list.
+/// The section lists the targets `route_when_no_match` actually returns; the
+/// trackers the *skill* hands over itself (Lemonade, Ollama, LM Studio — the
+/// host probe cannot detect them) live in `SKILL.md`. Checking the CLI's route
+/// against a union of both would let a documented-but-dead CLI target pass
+/// silently, which is how the removed lemonade / ollama / lm-studio arms stayed
+/// in the document. So the CLI is held to its own list.
 fn documented_cli_routes(md: &str) -> BTreeMap<String, Option<String>> {
     let mut out = BTreeMap::new();
     let mut inside = false;
@@ -639,10 +642,10 @@ async fn assert_same_auto_set(world: &mut E2eWorld) {
             offered.marker
         );
     }
-    // The reference says it twice — marker cells above, per-host prose below —
-    // and the loop only checked the cells. A rename applied to the table and
-    // the CLI together would leave the prose stale, and the prose is what an
-    // agent reads before it decides whether to offer to run a fix.
+    // The reference says it twice — per-host bullets above the table and marker
+    // cells in it — and the loop only checked the cells. A rename applied to the
+    // table and the CLI together would leave the bullets stale, so they are
+    // checked too, which keeps them from drifting away from the table.
     let prose = documented_auto_prose_for(reference(world), &platform);
     let offered: BTreeSet<String> = cli
         .iter()
@@ -717,9 +720,10 @@ async fn assert_documented_fields_present(world: &mut E2eWorld) {
     // routing scenario covers that branch. What must hold is that anything
     // offered is fully readable by an agent following the skill.
     //
-    // The individual fields of a `fix` plan are NOT checked here. The reference
-    // does not spell them out, so there is no documented claim to compare
-    // against — that is a serialization shape, and `crates/rocm-core` owns it.
+    // The individual fields of a `fix` plan are NOT checked here. The ones
+    // `SKILL.md` names are checked against the serialised `Fix` by
+    // `tests/skill_reference.rs`, with no `rocm` binary needed; the shape itself
+    // is a serialization detail that `crates/rocm-core` owns.
     for cause in matched {
         let absent: Vec<&String> = per_cause
             .iter()
@@ -744,8 +748,8 @@ async fn assert_thresholds(world: &mut E2eWorld) {
             .unwrap_or_else(|| panic!("diagnose JSON has no numeric '{field}'"));
         assert_eq!(
             actual, *expected,
-            "{field} is {actual}, but reference.md states {expected} — and the skill's \
-             workflow text reasons about that number when it grades a cause"
+            "{field} is {actual}, but reference.md states {expected} — and the skill \
+             names this field when it grades a cause"
         );
     }
 }
@@ -894,9 +898,188 @@ async fn assert_required_contract_is_published(world: &mut E2eWorld) {
         required == published,
         "The CLI now publishes catalog contract version {published}, but SKILL.md still \
          requires {required}. A raised contract version means the catalog removed or \
-         changed something. Check the entry ids, the auto-applicable set and the exit \
-         codes in SKILL.md and reference.md against the new catalog, then raise the \
+         changed something. Check the entry ids, the fix classes and the field names \
+         in SKILL.md and reference.md, and the `exit_codes` names in SKILL.md, \
+         against the new catalog, then raise the \
          number in SKILL.md. Raise it only after a release publishes that contract, \
          because the installer Phase 0 offers installs the release channel."
+    );
+}
+
+// ── skill-08: the apply replay ─────────────────────────────────────
+
+/// The eval case whose replay answers `rocm fix <id> --dry-run` and the bare
+/// `rocm fix <id>`, under `skills/rocm-doctor/evals/fixtures/`.
+const APPLY_CASE: &str = "rocm-apply-auto-fix-needs-consent";
+
+/// What one command printed, or what the replay says it prints.
+#[derive(Debug)]
+pub struct Printed {
+    stdout: String,
+    stderr: String,
+    rc: i32,
+}
+
+/// The replay skill-08 reads, and what the real `rocm fix` printed for the same
+/// two commands.
+#[derive(Debug)]
+pub struct ApplyReplay {
+    fix_id: String,
+    replayed_dry_run: Printed,
+    replayed_bare: Printed,
+    dry_run: Option<Printed>,
+    bare: Option<Printed>,
+}
+
+fn apply_replay_path() -> PathBuf {
+    reference_md_path()
+        .with_file_name("evals")
+        .join("fixtures")
+        .join(APPLY_CASE)
+        .join("replies.json")
+}
+
+fn replayed(apply: &serde_json::Value, which: &str) -> Printed {
+    let reply = &apply[which];
+    Printed {
+        stdout: reply["stdout"]
+            .as_str()
+            .expect("a replayed stdout")
+            .to_owned(),
+        stderr: reply["stderr"]
+            .as_str()
+            .expect("a replayed stderr")
+            .to_owned(),
+        rc: reply["rc"]
+            .as_i64()
+            .and_then(|rc| i32::try_from(rc).ok())
+            .expect("a replayed exit code"),
+    }
+}
+
+/// The `Will run:` line fix-4's runner prints for the scenario's user, run
+/// through the stand-in `sudo` because the scenario is never root (see
+/// `diagnose_steps::plant_render_group_helpers`). The replay leaves it out on
+/// purpose: it names whoever generated it.
+fn will_run_line() -> String {
+    format!(
+        "Will run: sudo usermod -a -G render,video {}\n",
+        super::diagnose_steps::RENDER_GROUP_USER
+    )
+}
+
+/// `replay` with the `Will run:` line put back where the CLI prints it: right
+/// after the blank line that ends the plan. The plan holds no blank line of its
+/// own, so the first one ends it; `the_plan_preamble_is_the_plan_and_one_blank_line`
+/// (`crates/rocm-core/src/fix/render.rs`) holds that for `plan_preamble`.
+fn with_will_run_line(replay: &str) -> String {
+    let (plan, after) = replay.split_once("\n\n").unwrap_or_else(|| {
+        panic!("the replayed stdout has no blank line after the plan: {replay:?}")
+    });
+    format!("{plan}\n\n{}{after}", will_run_line())
+}
+
+#[given("the fix the skill's evals replay an agent applying")]
+async fn load_apply_replay(world: &mut E2eWorld) {
+    let path = apply_replay_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let replies: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()));
+    let apply = &replies["apply"];
+    let fix_id = apply["fix_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{} replays no `rocm fix`", path.display()))
+        .to_owned();
+    world.skill_apply = Some(ApplyReplay {
+        fix_id,
+        replayed_dry_run: replayed(apply, "dry_run"),
+        replayed_bare: replayed(apply, "bare"),
+        dry_run: None,
+        bare: None,
+    });
+}
+
+#[given("a machine where carrying out that fix would only be recorded")]
+async fn plant_recording_helpers(world: &mut E2eWorld) {
+    let fix_id = &world.skill_apply.as_ref().expect("no replay loaded").fix_id;
+    // The stand-ins are for fix-4's helpers; for any other fix they would not
+    // stand between the CLI and the machine.
+    assert_eq!(
+        fix_id,
+        super::diagnose_steps::COMMAND_FAILURE_FIX_ID,
+        "the replay is of a fix whose helpers this scenario has no stand-ins for"
+    );
+    // The stand-ins only record and succeed; neither command should reach them.
+    super::diagnose_steps::plant_render_group_helpers(world, "exit 0");
+}
+
+#[when("an agent previews that fix and then asks for it without the user's agreement")]
+async fn agent_previews_then_applies_without_agreement(world: &mut E2eWorld) {
+    let fix_id = world
+        .skill_apply
+        .as_ref()
+        .expect("no replay loaded")
+        .fix_id
+        .clone();
+    // No `--yes` on the second, and the harness gives the CLI no terminal, so it
+    // is refused the way it is in an agent's shell.
+    //
+    // A scenario command takes the planted `PATH` and `USER` with it
+    // (`scenario_command` in `e2e.rs`), so the second run gets them back: asked
+    // without them it would be a different machine, whose own user and `sudo` the
+    // "Will run:" line and the refusal would name.
+    let planted = world.command_env.clone();
+    let mut run = |args: &[&str]| {
+        world.command_env = planted.clone();
+        let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, args);
+        Printed { stdout, stderr, rc }
+    };
+    let dry_run = run(&["fix", &fix_id, "--dry-run"]);
+    let bare = run(&["fix", &fix_id]);
+    let apply = world.skill_apply.as_mut().expect("no replay loaded");
+    apply.dry_run = Some(dry_run);
+    apply.bare = Some(bare);
+}
+
+#[then("each reply the evals replay is what the CLI printed, less the line naming the user")]
+async fn assert_replay_is_what_the_cli_printed(world: &mut E2eWorld) {
+    let apply = world.skill_apply.as_ref().expect("no replay loaded");
+    let path = apply_replay_path();
+    for (command, replay, real) in [
+        (
+            "--dry-run",
+            &apply.replayed_dry_run,
+            apply.dry_run.as_ref().expect("no dry run made"),
+        ),
+        (
+            "with no --yes",
+            &apply.replayed_bare,
+            apply.bare.as_ref().expect("no bare run made"),
+        ),
+    ] {
+        let hint = format!(
+            "`rocm fix {} {command}` no longer prints what {} replays. If the CLI changed \
+             on purpose, run `cargo xtask eval-fixtures` and read the diff",
+            apply.fix_id,
+            path.display()
+        );
+        assert_eq!(
+            real.stdout,
+            with_will_run_line(&replay.stdout),
+            "{hint} (stdout)"
+        );
+        assert_eq!(real.stderr, replay.stderr, "{hint} (stderr)");
+        assert_eq!(real.rc, replay.rc, "{hint} (exit code)");
+    }
+}
+
+#[then("the fix changed nothing")]
+async fn assert_fix_changed_nothing(world: &mut E2eWorld) {
+    let log = super::diagnose_steps::render_group_helper_log(world);
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !log.exists(),
+        "neither a preview nor a refused fix may run its helper, yet it was asked:\n{calls}"
     );
 }

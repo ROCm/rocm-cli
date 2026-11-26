@@ -18,10 +18,13 @@ mod catalog;
 mod chat_import_contract;
 mod coverage;
 mod crate_edges;
+mod cross_crate_reads;
 mod dash_text_edit_contract;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
+mod e2e_prewarm_vision;
+mod e2e_queue_import;
 mod e2e_report;
 mod engine_stdio_client_contract;
 mod env_mutation_contract;
@@ -42,6 +45,7 @@ mod rocm_releases;
 #[cfg(test)]
 mod rust_source;
 mod signing;
+mod smoke;
 mod tpn;
 mod verify_commits;
 mod verify_pinned_keys;
@@ -103,9 +107,11 @@ pub(crate) enum Command {
     /// must also mark it `readonly`), and a slot whose canonical key is not
     /// published yet must be empty.
     VerifyPinnedKeys,
-    /// Print the workspace crates affected by a git range (changed crates plus
-    /// their transitive dependents) as `cargo` package-selection flags, so CI
-    /// can build/test only what a change can reach instead of `--workspace`.
+    /// Print the workspace crates affected by a git range (changed crates, the
+    /// crates whose tests read a changed file from outside their own
+    /// directory, and their transitive dependents) as `cargo`
+    /// package-selection flags, so CI can build/test only what a change can
+    /// reach instead of `--workspace`.
     ///
     /// Output is `--workspace` (fall back to the full workspace — used whenever a
     /// change can't be confined to specific crates, e.g. `Cargo.lock` or the
@@ -126,8 +132,9 @@ pub(crate) enum Command {
     ///
     /// The step runs over the whole workspace whenever the affected crates
     /// cannot be determined, and prints why. It is skipped only when the
-    /// selection is known and has nothing for the step to check. CI always
-    /// checks the whole workspace.
+    /// selection is known and has nothing for the step to check. CI's Windows
+    /// debug job (for any Rust change), the merge queue and `main` check the
+    /// whole workspace.
     ///
     /// A step that already passed on this exact tree (same cargo command,
     /// toolchain and environment, clean working tree) is skipped, and a pass is
@@ -310,13 +317,19 @@ pub(crate) enum Command {
             conflicts_with_all = ["version", "release_label"]
         )]
         build_date: Option<String>,
-        /// Pin the pre-warmed SDK to one of the official release list's three
-        /// most recent versions (see `rocm_releases`), for the self-hosted
-        /// sdk_version matrix. `current` tracks the channel's latest, same as
-        /// omitting `--version`/`--build-date` entirely.
+        /// Pin the pre-warmed SDK to one of the three newest final releases
+        /// listed on the release channel's package indexes (see
+        /// `rocm_releases`), for the self-hosted sdk_version matrix. `current` tracks the channel's latest, same as
+        /// omitting `--version`/`--build-date` entirely. When
+        /// `E2E_RELEASE_PINS` holds the JSON `release-pins` printed, `n-1`/`n-2`
+        /// use those versions instead of reading the indexes again.
         #[arg(long, conflicts_with_all = ["version", "build_date"])]
         release_label: Option<rocm_releases::ReleaseLabel>,
     },
+    /// Print, as one JSON object, the versions `n-1` and `n-2` resolve to on the
+    /// release channel's package indexes right now. The E2E workflow's `changes`
+    /// job runs it once and hands the result to every sdk_version leg.
+    ReleasePins,
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
     /// stdout for `$GITHUB_STEP_SUMMARY`.
@@ -330,6 +343,12 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Bring a finished run of the shared GPU queue into the nightly's E2E
+    /// report: write each lane's reports where `e2e-report` reads them, named
+    /// for the lane and for whether the queue blocks on it, and write a status
+    /// section for the top of the support matrix. With `--absent`, import
+    /// nothing and say why. See docs/nightly-on-the-queue.md.
+    E2eQueueImport(e2e_queue_import::Args),
     /// Count received Doctor reports from an export of the report mailbox.
     ///
     /// Reads `.eml` files (one message each) and raw `.json` report bodies,
@@ -382,6 +401,26 @@ pub(crate) enum Command {
         /// Path to write the mechanical verdict + status table markdown.
         #[arg(long)]
         table_out: PathBuf,
+    },
+    /// Run the local no-fallback smoke gate: build, then drive the built
+    /// `rocm`, `rocmd` and engine binaries against a throwaway state root and
+    /// assert their first-run output — chiefly that every GPU-required path
+    /// fails loudly rather than falling back to CPU.
+    Smoke {
+        /// Build profile to build and smoke. `debug` builds the whole workspace
+        /// with all targets; `release` builds only the four binaries the gate
+        /// runs.
+        #[arg(long, value_enum, default_value_t = smoke::Profile::Debug)]
+        profile: smoke::Profile,
+        /// Smoke binaries that are already built instead of building first.
+        #[arg(long)]
+        skip_build: bool,
+        /// Target directory to build into and to find the binaries in, under its
+        /// profile subdirectory. Relative paths resolve against the workspace
+        /// root. Defaults to `CARGO_TARGET_DIR`, or `target` under the workspace
+        /// root; either way the build is given the same directory explicitly.
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
     },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
@@ -461,7 +500,10 @@ fn run() -> Result<()> {
             release_label,
         } => {
             let resolved_version = match release_label {
-                Some(label) => label.pin().map(str::to_owned),
+                Some(label) => match rocm_releases::pins_from_env()? {
+                    Some(pins) => label.pin_from(&pins)?,
+                    None => label.pin()?,
+                },
                 None => version,
             };
             e2e_prewarm::run(
@@ -472,10 +514,17 @@ fn run() -> Result<()> {
                 build_date.as_deref(),
             )?;
         }
+        Command::ReleasePins => {
+            println!(
+                "{}",
+                serde_json::to_string(&rocm_releases::resolve_pins()?)?
+            );
+        }
         Command::E2eReport {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::E2eQueueImport(args) => e2e_queue_import::run(&args)?,
         Command::ReportRollup(args) => report_rollup::run(&args)?,
         Command::ReleaseReadiness {
             since_tag,
@@ -494,6 +543,11 @@ fn run() -> Result<()> {
             &out,
             &table_out,
         )?,
+        Command::Smoke {
+            profile,
+            skip_build,
+            target_dir,
+        } => smoke::run(profile, skip_build, target_dir)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

@@ -60,8 +60,8 @@ pub(super) fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagn
         summary: "Reinstall the framework from a wheel index that includes this GPU's gfx target. Use HSA_OVERRIDE_GFX_VERSION ONLY as a temporary workaround when no native wheel exists.".to_owned(),
         commands: vec![
             "# Recommended: a PyTorch ROCm nightly, which often carries kernels a".to_owned(),
-            "# release has not shipped yet. Pick the nightly for the ROCm major you".to_owned(),
-            "# have, not an older one.".to_owned(),
+            "# release has not shipped yet. Pick the nightly for the ROCm X.Y release".to_owned(),
+            "# you have, not an older one.".to_owned(),
             "pip uninstall -y torch torchvision torchaudio".to_owned(),
             "pip install --pre torch torchvision torchaudio \\\n  --index-url https://download.pytorch.org/whl/nightly/rocm7.14".to_owned(),
             "# llama.cpp: rebuild with AMDGPU_TARGETS set to this GPU's gfx.".to_owned(),
@@ -265,9 +265,16 @@ pub(super) fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis 
     } else {
         Fix {
             summary: format!("Add {bin_dir} to PATH for this shell and persist in your shell rc."),
+            // The line `rocm fix` appends, from the one function that builds
+            // it (`path_export_line` in `fix/catalog.rs`).
             commands: vec![
-                format!("export PATH={bin_dir}:$PATH"),
-                format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
+                crate::fix::path_export_line(&bin_dir),
+                format!(
+                    "echo '{}' >> ~/.bashrc",
+                    crate::fix::path_export_line(&bin_dir)
+                ),
+                "# Under zsh use ~/.zshrc; `rocm fix fix-6-path` picks the file for you."
+                    .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
             // The `rocm fix` catalog's Linux line. `rocminfo` lives in the bin
@@ -299,14 +306,14 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
         &e.rocm_version
     };
 
-    let fw_major = major_version(fw_rocm);
-    let sys_major = major_version(sys_rocm);
+    let fw_release = release_line(fw_rocm);
+    let sys_release = release_line(sys_rocm);
     // Only meaningful when the framework resolves its HIP from the system. A
     // managed runtime's torch loads it from a sibling `_rocm_sdk_core` package
-    // inside the runtime, so its HIP major is free to differ from the system's
+    // inside the runtime, so its HIP release is free to differ from the system's
     // on a completely healthy host — and "reinstall torch" would be wrong there.
     let framework_uses_system_rocm = e.framework_source != "managed-runtime";
-    if let (Some(fw), Some(sys)) = (&fw_major, &sys_major)
+    if let (Some(fw), Some(sys)) = (&fw_release, &sys_release)
         && fw != sys
         && framework_uses_system_rocm
     {
@@ -326,12 +333,12 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
     }
     let fix = if windows {
         Fix {
-            summary: "Reinstall the framework against the HIP SDK major you have installed (or install the HIP SDK major the wheel needs).".to_owned(),
+            summary: "Reinstall the framework against the HIP SDK X.Y release you have installed (or install the HIP SDK X.Y release the wheel needs).".to_owned(),
             commands: vec![
                 "pip uninstall -y torch torchvision torchaudio".to_owned(),
                 "# TheRock publishes Windows ROCm wheels per HIP SDK release:".to_owned(),
                 "#   https://github.com/ROCm/TheRock".to_owned(),
-                "# Match the wheel index to the HIP SDK major you have on disk.".to_owned(),
+                "# Match the wheel index to the HIP SDK X.Y release you have on disk.".to_owned(),
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
@@ -340,10 +347,10 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
         }
     } else {
         Fix {
-            summary: "Reinstall the framework from the wheel index that matches the system ROCm major (or upgrade the system ROCm to match the wheel).".to_owned(),
+            summary: "Reinstall the framework from the wheel index that matches the system ROCm X.Y release (or upgrade the system ROCm to match the wheel).".to_owned(),
             commands: vec![
                 "pip uninstall -y torch torchvision torchaudio".to_owned(),
-                "# Install the index for the ROCm major `rocm examine` reports:".to_owned(),
+                "# Install the index for the ROCm X.Y release `rocm examine` reports:".to_owned(),
                 "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14".to_owned(),
                 "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:".to_owned(),
                 "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0".to_owned(),
@@ -357,15 +364,30 @@ pub(super) fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Dia
     };
     finalize(
         "fix-8-wheel-rocm",
-        "Framework wheel built for a different ROCm major than the system",
+        "Framework wheel built for a different ROCm X.Y release than the system",
         score,
         evidence,
         fix,
     )
 }
 
-/// Extract `X.Y` from a version-ish string.
-fn major_version(s: &str) -> Option<String> {
+/// Extract the `X.Y` release line from a version-ish string: `6.4` from
+/// `hip=6.4.43482` or `6.4.1`.
+///
+/// `check_8` compares this, not the bare major, on purpose: ROCm PyTorch wheels
+/// are built and indexed per `X.Y` (`whl/rocm6.4`), so a torch built for 6.3
+/// beside a system 6.4 is a mismatch even though both are ROCm 6. The patch
+/// level is dropped because the wheel index does not carry it.
+///
+/// Returns `None` when the string has no minor, e.g. a framework that reports
+/// only `hip=7`. `check_8` then skips the version comparison and scores on the
+/// symptom alone, as it did before this function was renamed from
+/// `major_version`; the regex is unchanged.
+///
+/// Unlike `report.rs`'s `major_minor`, which reads only a leading all-digit
+/// `X[.Y]` and keeps a bare major, this takes the first `X.Y` anywhere in the
+/// string and returns `None` when there is no minor.
+fn release_line(s: &str) -> Option<String> {
     let re = Regex::new(r"(\d+)\.(\d+)").ok()?;
     let caps = re.captures(s)?;
     Some(format!("{}.{}", &caps[1], &caps[2]))
@@ -425,36 +447,39 @@ pub(super) fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Dia
     let note = format!(
         "{note} Without --device-index, `rocm fix` only prints this query and makes no change."
     );
-    let fix = if e.os_family == "windows" {
-        Fix {
-            summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
-            commands: vec![
-                "# Confirm which index is the dGPU (hipInfo.exe output order):".to_owned(),
-                "& \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name|gcnArchName\"".to_owned(),
-                "# Then persist HIP_VISIBLE_DEVICES in the User environment:".to_owned(),
-                "setx HIP_VISIBLE_DEVICES 1".to_owned(),
-                "# `setx` only takes effect in NEW shells; reopen the terminal.".to_owned(),
-            ],
-            fix_id: "fix-9-igpu-dgpu".to_owned(),
-            verify: "powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','1','Process'); python -c 'import torch; print(torch.cuda.device_count())'\"".to_owned(),
-            notes: vec![note],
-            ..Fix::default()
-        }
+    // The query, the change and the verify line are the catalog's own
+    // (`IGPU_*` in `fix/catalog.rs`), which the runner prints too. The index is
+    // a placeholder: which device is the discrete GPU is the user's to read off
+    // the query, and `rocm fix` needs it as `--device-index`.
+    let (summary, query_comment, query, pin) = if e.os_family == "windows" {
+        (
+            "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.",
+            "# Confirm which index is the dGPU (hipInfo.exe output order):",
+            crate::fix::IGPU_QUERY_WINDOWS,
+            crate::fix::IGPU_PIN_WINDOWS,
+        )
     } else {
-        Fix {
-            summary: "Pin the runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
-            commands: vec![
-                "# Confirm which index is the dGPU (`rocminfo` output order):".to_owned(),
-                "rocminfo | grep -E 'Agent |gfx|Marketing'".to_owned(),
-                "# Then pin HIP to the dGPU (typically index 1 when an APU is index 0):".to_owned(),
-                "export HIP_VISIBLE_DEVICES=1".to_owned(),
-                "# Persist in your shell rc or your launch script.".to_owned(),
-            ],
-            fix_id: "fix-9-igpu-dgpu".to_owned(),
-            verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![note],
-            ..Fix::default()
-        }
+        (
+            "Pin the runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.",
+            "# Confirm which index is the dGPU (`rocminfo` output order):",
+            crate::fix::IGPU_QUERY_LINUX,
+            crate::fix::IGPU_PIN_LINUX,
+        )
+    };
+    let fix = Fix {
+        summary: summary.to_owned(),
+        commands: vec![
+            query_comment.to_owned(),
+            query.to_owned(),
+            "# Then pin the runtime to it, with its index in place of <dGPU-index>".to_owned(),
+            "# (`rocm fix fix-9-igpu-dgpu --device-index N` persists it for you):".to_owned(),
+            pin.to_owned(),
+            "# The change only reaches NEW shells; open one before the verify line.".to_owned(),
+        ],
+        fix_id: "fix-9-igpu-dgpu".to_owned(),
+        verify: crate::fix::IGPU_VERIFY.to_owned(),
+        notes: vec![note],
+        ..Fix::default()
     };
     finalize(
         "fix-9-igpu-dgpu",
@@ -546,6 +571,8 @@ pub(super) fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) 
 mod tests {
     use super::*;
     use crate::diagnose::test_support::{igpu_dgpu_host, linux_base, wsl_base};
+    #[cfg(unix)]
+    use crate::diagnose::test_support::{run_in_sh, stub_bin_dir};
     use crate::diagnose::{
         DiagnoseReport, HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH, Route, diagnose, render_report_text,
     };
@@ -553,9 +580,9 @@ mod tests {
     use crate::fix::{OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, torch_rocm_indexes_named_in};
     use crate::rocm_install::discover_rocm_installs_in;
 
-    /// A host whose framework HIP major differs from its system ROCm: torch on
-    /// HIP 7, a system ROCm 6 beside it.
-    fn hip_major_differs_from_system_rocm(framework_source: &str) -> Examination {
+    /// A host whose framework HIP release differs from its system ROCm: torch on
+    /// HIP 7.14, a system ROCm 6.4 beside it.
+    fn hip_release_differs_from_system_rocm(framework_source: &str) -> Examination {
         Examination {
             framework: "pytorch".to_owned(),
             framework_rocm_version: "hip=7.14.60850".to_owned(),
@@ -567,13 +594,14 @@ mod tests {
 
     /// A remedy has to be able to resolve the mismatch that produced it.
     ///
-    /// `check_8` fires when the framework's HIP major differs from the system
-    /// ROCm major, and tells the user to pick the wheel index matching their
+    /// `check_8` fires when the framework's HIP `X.Y` release differs from the
+    /// system ROCm's, and tells the user to pick the wheel index matching their
     /// system. If every index it names is older than any ROCm this CLI installs,
     /// there is nothing to pick: following the instruction installs a torch for
-    /// a major the machine does not have, and this same check fires again on the
-    /// result. A remedy that re-creates its own precondition is worse than none,
-    /// because the user has spent a reinstall to arrive back where they started.
+    /// a ROCm release older than any this CLI installs, so its `X.Y` cannot match
+    /// the system's, and this same check fires again on the result. A remedy that
+    /// re-creates its own precondition is worse than none, because the user has
+    /// spent a reinstall to arrive back where they started.
     #[test]
     fn the_wheel_mismatch_remedy_can_resolve_the_mismatch_it_reports() {
         let machine = Examination {
@@ -619,12 +647,12 @@ mod tests {
     fn a_managed_runtimes_hip_is_not_measured_against_the_system_rocm() {
         // A managed runtime's torch loads HIP from a sibling `_rocm_sdk_core`
         // package inside the runtime, never from the system install, so the two
-        // majors are free to differ on a perfectly healthy host. Before
+        // releases are free to differ on a perfectly healthy host. Before
         // `examine` probed the runtime this could not fire, because the field it
         // reads was always empty; now that it is populated, the comparison has
         // to be told when it is meaningless -- or fixing the probe would hand
         // every such host a spurious "reinstall torch".
-        let managed = diagnose(&hip_major_differs_from_system_rocm("managed-runtime"), "");
+        let managed = diagnose(&hip_release_differs_from_system_rocm("managed-runtime"), "");
         assert!(
             !managed.matched.iter().any(|d| d.id == "fix-8-wheel-rocm"),
             "a managed runtime must not be told to reinstall torch: {:?}",
@@ -638,17 +666,90 @@ mod tests {
         // The same host, same versions, with torch coming from the ambient
         // interpreter: there the comparison is exactly right, and the checker
         // must keep its full strength.
-        let ambient = diagnose(&hip_major_differs_from_system_rocm("path"), "");
+        let ambient = diagnose(&hip_release_differs_from_system_rocm("path"), "");
         let finding = ambient
             .matched
             .iter()
             .find(|d| d.id == "fix-8-wheel-rocm")
-            .expect("an ambient torch built against a different ROCm major is a real mismatch");
+            .expect("an ambient torch built against a different ROCm release is a real mismatch");
         assert!(
             finding.score >= MIN_SCORE_FOR_MATCH,
             "the version evidence alone has to establish it: {}",
             finding.score
         );
+    }
+
+    /// `check_8` compares the `X.Y` release line, because that is how ROCm
+    /// PyTorch wheels are indexed (`whl/rocm6.4`). Its title once said "ROCm
+    /// major" over this same comparison, so this pins both the comparison and
+    /// that neither title names the major again.
+    #[test]
+    fn the_wheel_mismatch_compares_the_x_y_release_and_says_so() {
+        let host = |framework_rocm_version: &str| Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: framework_rocm_version.to_owned(),
+            framework_source: "path".to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            ..linux_base()
+        };
+
+        // Same major, different minor: a mismatch.
+        let minor = check_8_wheel_rocm_mismatch(&host("hip=6.3.42131"), "");
+        assert_eq!(
+            minor.evidence,
+            vec!["Framework links HIP 6.3 but system ROCm is 6.4".to_owned()],
+            "a 6.3 torch beside a 6.4 system is built for another wheel index"
+        );
+        assert!(minor.score >= MIN_SCORE_FOR_MATCH, "{}", minor.score);
+
+        // Same X.Y, different patch: the same wheel index, so no mismatch.
+        let patch = check_8_wheel_rocm_mismatch(&host("hip=6.4.43482"), "");
+        assert_eq!(patch.score, 0, "{:?}", patch.evidence);
+
+        // No minor to compare: the comparison is skipped, not read as a mismatch.
+        let no_minor = check_8_wheel_rocm_mismatch(&host("hip=7"), "");
+        assert_eq!(no_minor.score, 0, "{:?}", no_minor.evidence);
+
+        let catalog_title = crate::fix::catalog_manifest()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "fix-8-wheel-rocm")
+            .map(|entry| entry.title)
+            .expect("fix-8-wheel-rocm is in the recipe catalog");
+        for title in [minor.title.as_str(), catalog_title.as_str()] {
+            assert!(
+                title.contains("X.Y") && !title.contains("major"),
+                "the title must name what is compared: {title}"
+            );
+        }
+    }
+
+    /// The symptom diagnose-67 uses raises fix-8 from its keywords alone, on
+    /// every platform family the check is registered for, whatever the host's
+    /// own ROCm: `libamdhip64.so` scores 50 and the loader failure 25, and the
+    /// version comparison can only add to that. This is what lets the scenario
+    /// run untagged on every lane.
+    #[test]
+    fn a_library_load_error_alone_raises_the_wheel_mismatch_on_every_family() {
+        let symptom = "libamdhip64.so.6: cannot open shared object file";
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        for host in [linux_base(), windows, wsl_base()] {
+            let report = diagnose(&host, symptom);
+            let finding = report
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-8-wheel-rocm")
+                .unwrap_or_else(|| panic!("no fix-8 on {}: {report:?}", host.os_family));
+            assert!(
+                finding.score >= MIN_SCORE_FOR_MATCH,
+                "{}: {}",
+                host.os_family,
+                finding.score
+            );
+        }
     }
 
     #[test]
@@ -820,6 +921,7 @@ mod tests {
             },
             out_of_scope: None,
             model: None,
+            provenance: None,
         };
         let out = render_report_text(&report, 5);
         assert!(
@@ -1129,60 +1231,83 @@ mod tests {
         );
     }
 
-    /// The Windows `Fix` for fix-9, which only `rocm diagnose` prints: its verify
-    /// differs from the catalog's because it has to run in PowerShell.
-    fn windows_igpu_fix() -> Fix {
-        check_9_igpu_dgpu_collision(&igpu_dgpu_host("windows"), "torch crashes with a segfault")
-            .fix
-            .expect("an APU beside a discrete GPU on Windows gets a fix")
+    /// The lines of `commands` a shell runs: comments dropped.
+    fn executable(commands: &[String]) -> Vec<&str> {
+        commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .collect()
     }
 
-    /// Runs on every host. The Windows fix-9 verify sets `HIP_VISIBLE_DEVICES`
-    /// to `1` for the process, then runs one single-quoted python program, all
-    /// in one double-quoted `-Command` argument.
-    /// `the_igpu_verify_pins_the_variable_it_names` runs it, on Windows.
+    /// The lines of the catalog's fix-9 recipe under its `# <os> ...` heading,
+    /// comments dropped.
+    fn catalog_igpu_lines(os: &str) -> Vec<&'static str> {
+        let (_, _, run) = crate::fix::recipe_verify_notes_and_run_commands("fix-9-igpu-dgpu")
+            .expect("fix-9-igpu-dgpu is in the recipe catalog");
+        // Two lines per OS, Linux first, as the recipe lists them.
+        let start = if os == "windows" { 2 } else { 0 };
+        run[start..start + 2].to_vec()
+    }
+
+    /// fix-9's plan is one plan: the query and the change `rocm diagnose`
+    /// prints on each OS are the catalog recipe's lines for that OS, and the
+    /// verify line is the catalog's. The runner prints the same query and
+    /// writes the same change with the index filled in (both read the
+    /// `IGPU_*` constants in `fix/catalog.rs`; its tests pin the filled-in
+    /// lines). The diagnosis used to print `HIP_VISIBLE_DEVICES=1`, an index
+    /// it cannot know.
     #[test]
-    fn the_windows_igpu_verify_is_one_quoted_powershell_argument() {
-        let verify = windows_igpu_fix().verify;
-        let body = verify
-            .strip_prefix("powershell -NoProfile -Command \"")
-            .and_then(|rest| rest.strip_suffix('"'))
-            .unwrap_or_else(|| panic!("not a quoted `powershell -Command` argument: {verify}"));
-        assert!(
-            !body.contains('"'),
-            "an inner quote ends the argument: {body}"
-        );
-        assert!(
-            body.starts_with("[Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','1','Process'); python -c '"),
-            "{body}"
-        );
+    fn the_igpu_plan_diagnose_prints_is_the_catalogs() {
+        let (catalog_verify, _, _) =
+            crate::fix::recipe_verify_notes_and_run_commands("fix-9-igpu-dgpu")
+                .expect("fix-9-igpu-dgpu is in the recipe catalog");
+        for os in ["linux", "windows"] {
+            let fix = check_9_igpu_dgpu_collision(&igpu_dgpu_host(os), "")
+                .fix
+                .expect("an APU beside a discrete GPU gets a fix");
+            assert_eq!(executable(&fix.commands), catalog_igpu_lines(os), "{os}");
+            assert_eq!(fix.verify, catalog_verify, "{os}");
+            assert!(
+                fix.commands
+                    .iter()
+                    .all(|c| !c.contains("HIP_VISIBLE_DEVICES=1")
+                        && !c.contains("HIP_VISIBLE_DEVICES 1")),
+                "{os}: no index is known before the user reads one off the query: {:?}",
+                fix.commands
+            );
+        }
     }
 
-    /// Runs the fix-9 Windows verify line in cmd and in Windows PowerShell with
-    /// a stand-in `torch` module first on `PYTHONPATH`. The module's
-    /// `cuda.device_count()` returns what `HIP_VISIBLE_DEVICES` holds, so the
-    /// line, unchanged, prints `1` only if it set that variable, to that value,
-    /// before python started. The variable is removed from the child's
-    /// environment first, so a value left on the host cannot satisfy it. Python
-    /// is on PATH on the Windows CI hosts. Only compiled on Windows.
+    /// Runs fix-9's verify line in cmd and in Windows PowerShell with a
+    /// stand-in `torch` module first on `PYTHONPATH`, whose
+    /// `cuda.device_count()` returns what `HIP_VISIBLE_DEVICES` holds. The
+    /// line reads the value the change persisted: with the variable set to `1`
+    /// for the child, as a new shell after the change would have it, the line
+    /// prints `1` and the device name, in both shells. Python is on PATH on the
+    /// Windows CI hosts. Only compiled on Windows.
     #[cfg(windows)]
     #[test]
-    fn the_igpu_verify_pins_the_variable_it_names() {
-        let verify = windows_igpu_fix().verify;
+    fn the_igpu_verify_reads_the_variable_the_change_persisted() {
+        let verify = check_9_igpu_dgpu_collision(&igpu_dgpu_host("windows"), "")
+            .fix
+            .expect("an APU beside a discrete GPU on Windows gets a fix")
+            .verify;
         let dir = std::env::temp_dir().join(format!("rocm igpu torch {}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the stand-in module directory is created");
         std::fs::write(
             dir.join("torch.py"),
             "import os\n\nclass cuda:\n    @staticmethod\n    def device_count():\n        \
-             return os.environ.get('HIP_VISIBLE_DEVICES', 'UNSET')\n",
+             return os.environ.get('HIP_VISIBLE_DEVICES', 'UNSET')\n\n    \
+             @staticmethod\n    def get_device_name(index):\n        return 'dGPU'\n",
         )
         .expect("the stand-in torch is written");
         let python_path = dir.to_string_lossy().into_owned();
         let runs = crate::fix::run_typed_in_cmd_and_powershell(
             &verify,
             &[
-                ("HIP_VISIBLE_DEVICES", None),
+                ("HIP_VISIBLE_DEVICES", Some("1")),
                 ("PYTHONPATH", Some(python_path.as_str())),
             ],
         );
@@ -1200,7 +1325,43 @@ mod tests {
                 stderr.trim().is_empty(),
                 "{shell} wrote to stderr: {stderr}"
             );
-            assert_eq!(stdout.trim(), "1", "{shell}, stderr: {stderr}");
+            assert_eq!(stdout.trim(), "1 dGPU", "{shell}, stderr: {stderr}");
+        }
+    }
+
+    /// fix-6's Linux plan is the line `rocm fix fix-6-path` appends to the
+    /// shell rc file: the diagnosis prints `path_export_line` (in
+    /// `fix/catalog.rs`), which the runner appends, for the install the
+    /// examination found, and for the conventional `/opt/rocm` its `echo` line
+    /// is the catalog recipe's. The diagnosis used to print the line unquoted,
+    /// which the runner never wrote.
+    #[test]
+    fn the_path_fix_plan_diagnose_prints_is_the_one_fix_appends() {
+        let (_, _, catalog_run) = crate::fix::recipe_verify_notes_and_run_commands("fix-6-path")
+            .expect("fix-6-path is in the recipe catalog");
+        for (rocm_path, bin_dir) in [
+            ("/opt/rocm", "/opt/rocm/bin"),
+            ("/opt/rocm-6.4.1", "/opt/rocm-6.4.1/bin"),
+        ] {
+            let fix = check_6_path_missing(
+                &Examination {
+                    os_family: "linux".to_owned(),
+                    rocm_path: rocm_path.to_owned(),
+                    ..Examination::default()
+                },
+                "rocminfo: command not found",
+            )
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+            let export = crate::fix::path_export_line(bin_dir);
+            assert_eq!(
+                executable(&fix.commands),
+                [export.clone(), format!("echo '{export}' >> ~/.bashrc")],
+                "{rocm_path}"
+            );
+            if rocm_path == "/opt/rocm" {
+                assert_eq!(executable(&fix.commands)[1], catalog_run[0]);
+            }
         }
     }
 
@@ -1326,43 +1487,6 @@ mod tests {
             "{}",
             linux.verify
         );
-    }
-
-    /// Writes each `(name, script)` as an executable in a new directory, to be
-    /// the whole `PATH` of a shell that runs a Linux verify line.
-    #[cfg(unix)]
-    fn stub_bin_dir(stubs: &[(&str, &str)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("the stub directory is created");
-        for (name, script) in stubs {
-            let path = dir.path().join(name);
-            crate::fake_executable::write_fake_executable(&path, format!("#!/bin/sh\n{script}\n"))
-                .expect("a stub is planted");
-        }
-        dir
-    }
-
-    /// Runs one printed line in `/bin/sh` whose `PATH` is only `bin` and whose
-    /// environment is only `PATH` and `env`. Returns whether it exited 0, and
-    /// its stdout and stderr.
-    #[cfg(unix)]
-    fn run_in_sh(
-        line: &str,
-        bin: &std::path::Path,
-        env: &[(&str, &str)],
-    ) -> (bool, String, String) {
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(line)
-            .env_clear()
-            .env("PATH", bin)
-            .envs(env.iter().copied())
-            .output()
-            .expect("/bin/sh runs");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
     }
 
     /// The fix-6 line `rocm diagnose` prints on Linux, run on a runtime-only

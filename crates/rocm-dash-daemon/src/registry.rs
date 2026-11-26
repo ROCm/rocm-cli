@@ -23,12 +23,15 @@
 //! (`EngineKind::default_port`, `docker.rs`, `lemonade.rs`) remain only as a
 //! fallback for *unmanaged/external* discovery.
 //!
-//! **Co-located scope (known limitation):** scrape targets carry only a port;
-//! the runner's vLLM collector scrapes `opts.vllm_metrics_host` (default
-//! `127.0.0.1`), so `record.host` is honored only for the co-located daemon
-//! (the same assumption the Docker-discovery path already makes). A managed
-//! service on a non-loopback host is surfaced but its metrics are scraped at the
-//! local address. Per-host scrape targeting is tracked as a D7 follow-up.
+//! **Lifecycle ownership:** only this registry seam marks discovered services
+//! as managed. External protocol and container discovery remain read-only;
+//! instance ids and engine markers are not evidence of lifecycle ownership.
+//!
+//! **Host scope:** managed Lemonade telemetry honors `record.host` and port.
+//! The vLLM collector still scrapes `opts.vllm_metrics_host` (default
+//! `127.0.0.1`) at the record's port, so a non-loopback vLLM service is surfaced
+//! but its metrics use the configured collector host. External Lemonade
+//! discovery uses its own configured host and port.
 //!
 //! **A registry that cannot be read in full (trade-off):** a record file that
 //! exists but cannot be opened (a root-owned file left by `sudo rocm serve`, a
@@ -57,9 +60,10 @@ use serde::Deserialize;
 
 /// Minimal read-only view of a rocm-cli `ManagedServiceRecord` on disk.
 ///
-/// Mirrors the stable subset the scrape seam needs; unknown fields (manifest paths,
-/// pids, recipe json, …) are ignored. Every field defaults so partial/older
-/// records still parse.
+/// Mirrors the stable subset the scrape seam needs; the engine and supervisor
+/// pids (with their start times) are kept to match GPU processes by ancestry;
+/// unknown fields (manifest paths, recipe json, …) are ignored. Every field
+/// defaults so partial/older records still parse.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceRecord {
     #[serde(default)]
@@ -86,8 +90,44 @@ pub struct ServiceRecord {
     /// joins it to GPU power and VRAM.
     #[serde(default)]
     pub gpu_indices: Vec<u32>,
+    /// The launcher process rocm-cli recorded for the service.
+    #[serde(default)]
+    pub supervisor_pid: u32,
+    /// Kernel start time of the supervisor, which tells it from a recycled PID.
+    #[serde(default)]
+    pub supervisor_start_ticks: Option<u64>,
+    /// The engine server process, once the supervisor has seen it.
+    #[serde(default)]
+    pub engine_pid: Option<u32>,
+    /// Kernel start time of the engine server process.
+    #[serde(default)]
+    pub engine_start_ticks: Option<u64>,
     #[serde(default)]
     pub created_at_unix_ms: u128,
+}
+
+impl ServiceRecord {
+    /// The recorded processes whose descendants are this service's GPU
+    /// processes: the engine server and its launcher. Either can be absent on
+    /// an old or half-written record, and a PID that is zero (not recorded) or
+    /// 1 (init, an ancestor of everything) is never a root, since it would claim
+    /// processes that belong to no service.
+    pub fn ancestry_roots(&self) -> Vec<rocm_dash_collectors::ancestry::Root> {
+        let root = |pid: u32, start_ticks| rocm_dash_collectors::ancestry::Root {
+            pid,
+            start_ticks,
+            owner: self.service_id.clone(),
+        };
+        let usable = |pid: u32| pid >= rocm_dash_collectors::ancestry::MIN_ROOT_PID;
+        let mut roots = Vec::new();
+        if let Some(pid) = self.engine_pid.filter(|p| usable(*p)) {
+            roots.push(root(pid, self.engine_start_ticks));
+        }
+        if usable(self.supervisor_pid) {
+            roots.push(root(self.supervisor_pid, self.supervisor_start_ticks));
+        }
+        roots
+    }
 }
 
 /// Service statuses worth scraping.
@@ -313,6 +353,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         record.model_ref.clone()
     };
     Some(DiscoveredService {
+        managed: true,
         container_id: record.service_id.clone(),
         container_name: record.service_id.clone(),
         model_name,
@@ -340,6 +381,8 @@ pub struct ManagedDiscovery {
     pub svcs: Vec<DiscoveredService>,
     pub seen: HashSet<String>,
     pub non_vllm: HashSet<String>,
+    /// Read-only Lemonade telemetry targets at registry-owned endpoints.
+    pub lemonade: Vec<ManagedLemonadeTarget>,
     /// How many records were skipped because they are no longer running
     /// (`failed`/`stopped`/unrecognized status). These are dropped from the
     /// scrape set on purpose - polling a dead port is pointless - but they are
@@ -349,6 +392,90 @@ pub struct ManagedDiscovery {
     /// A live record with no bound port is NOT counted: it is skipped for a
     /// different reason and is not a past attempt.
     pub past_attempts: usize,
+    /// Ancestry roots of every live service surfaced, so a GPU process can be
+    /// attributed to the managed service it belongs to.
+    pub roots: Vec<rocm_dash_collectors::ancestry::Root>,
+    /// Ids of records that were read in this pass and found no longer running.
+    /// A partial read keeps what it did not see; it must still drop the roots
+    /// of a service it saw stop, or a dead service's PID would stay matchable.
+    pub retired: HashSet<String>,
+}
+
+/// A managed Lemonade endpoint, including both display and canonical names so
+/// a CLI alias does not prevent safe last-request attribution.
+#[derive(Debug, Clone)]
+pub struct ManagedLemonadeTarget {
+    pub service_id: String,
+    pub host: String,
+    pub port: u16,
+    pub model_ref: String,
+    pub canonical_model_id: String,
+}
+
+/// The loopback families a bind host is reachable through. `::` is a
+/// dual-stack wildcard (both loopbacks); `::1` is IPv6-only; `localhost`,
+/// empty, `127.0.0.1` and `0.0.0.0` are IPv4-only. No DNS is resolved.
+enum HostReach {
+    Loopback { v4: bool, v6: bool },
+    Other(String),
+}
+
+fn normalized_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn host_reach(host: &str) -> HostReach {
+    let host = normalized_host(host);
+    match host.as_str() {
+        "" | "localhost" | "127.0.0.1" | "0.0.0.0" => HostReach::Loopback {
+            v4: true,
+            v6: false,
+        },
+        "::" => HostReach::Loopback { v4: true, v6: true },
+        "::1" => HostReach::Loopback {
+            v4: false,
+            v6: true,
+        },
+        _ => HostReach::Other(host),
+    }
+}
+
+/// Whether two co-located HTTP bindings address the same service. Wildcard
+/// binds are reachable through loopback (`::` through both families); unrelated
+/// remote hosts are not aliases.
+pub fn endpoints_match(left_host: &str, left_port: u16, right_host: &str, right_port: u16) -> bool {
+    if left_port != right_port {
+        return false;
+    }
+    match (host_reach(left_host), host_reach(right_host)) {
+        (HostReach::Loopback { v4: l4, v6: l6 }, HostReach::Loopback { v4: r4, v6: r6 }) => {
+            (l4 && r4) || (l6 && r6)
+        }
+        (HostReach::Other(left), HostReach::Other(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The host a collector should dial for a registry bind host: wildcards are not
+/// valid destinations on every platform, so `::` is reached through `::1`.
+pub fn scrape_host(host: &str) -> String {
+    match normalized_host(host).as_str() {
+        "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "::1" => "::1".to_string(),
+        host => host.to_string(),
+    }
+}
+
+/// Whether a collector cached for `cached_host` may serve `target_host`.
+///
+/// `endpoints_match` is deliberately non-transitive (`::` covers `127.0.0.1`), so
+/// a match alone is not enough: the cached collector dials a fixed address, and
+/// reusing it for a target in another address family probes the wrong listener.
+pub fn cached_collector_reusable(cached_host: &str, target_host: &str) -> bool {
+    scrape_host(cached_host) == scrape_host(target_host)
 }
 
 /// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
@@ -356,10 +483,9 @@ pub struct ManagedDiscovery {
 /// Non-scrapeable records (bad status / port 0) are dropped; vLLM-engine services flow to the
 /// Prometheus scrape, others are flagged in `non_vllm`.
 ///
-/// NOTE: gen_tps for managed **non-vLLM** engines (e.g. Lemonade) is not yet
-/// wired — they appear in the dashboard but are excluded from the vLLM scrape
-/// and not routed to a per-engine collector here. vLLM (the Phase-2 acceptance
-/// target) is fully wired. Non-vLLM managed scraping is a D7 follow-up.
+/// Managed Lemonade endpoints are routed to the existing Lemonade collector.
+/// Servers without that protocol (including direct llama-server) keep their
+/// registry row, with throughput unavailable rather than fabricated.
 pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery {
     let mut out = ManagedDiscovery::default();
     for record in records {
@@ -368,10 +494,29 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
             // live record with no bound port. Only the first is a past attempt.
             if !is_scrapeable_status(&record.status) {
                 out.past_attempts += 1;
+                out.retired.insert(record.service_id.clone());
             }
             continue;
         };
+        if engine_kind_for(record) == Some(EngineKind::Lemonade) {
+            // Keep a `::` bind as `::`: it is dual-stack, which only
+            // `endpoints_match` can see. The runner dials it via `scrape_host`.
+            let host = match record.host.trim() {
+                "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
+                "[::]" => "::".to_string(),
+                "[::1]" => "::1".to_string(),
+                host => host.to_string(),
+            };
+            out.lemonade.push(ManagedLemonadeTarget {
+                service_id: svc.container_id.clone(),
+                host,
+                port: record.port,
+                model_ref: record.model_ref.clone(),
+                canonical_model_id: record.canonical_model_id.clone(),
+            });
+        }
         out.seen.insert(svc.container_id.clone());
+        out.roots.extend(record.ancestry_roots());
         if engine_kind_for(record) != Some(EngineKind::Vllm) {
             out.non_vllm.insert(svc.container_id.clone());
         }
@@ -387,6 +532,82 @@ mod tests {
     use rocm_dash_core::observation::GenerationObservationTracker;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn endpoint_matching_does_not_conflate_distinct_ports_hosts_or_ip_families() {
+        let same = [
+            ("localhost", "127.0.0.1"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("", "127.0.0.1"),
+            ("[::]", "::1"),
+            ("::", "::1"),
+            ("::", "127.0.0.1"),
+            ("[::]", "localhost"),
+            ("::", "0.0.0.0"),
+            ("::", "::"),
+            ("::1", "[::1]"),
+            ("Remote.Example", "remote.example"),
+        ];
+        for (l, r) in same {
+            assert!(endpoints_match(l, 13305, r, 13305), "{l} ~ {r}");
+            assert!(endpoints_match(r, 13305, l, 13305), "{r} ~ {l}");
+        }
+        let distinct = [
+            ("::1", "127.0.0.1"),
+            ("::1", "localhost"),
+            ("::1", "0.0.0.0"),
+            ("::1", ""),
+            ("::", "remote.example"),
+            ("127.0.0.1", "remote.example"),
+            ("remote.example", "other.example"),
+        ];
+        for (l, r) in distinct {
+            assert!(!endpoints_match(l, 13305, r, 13305), "{l} !~ {r}");
+            assert!(!endpoints_match(r, 13305, l, 13305), "{r} !~ {l}");
+        }
+        assert!(!endpoints_match("::", 13306, "::", 13305));
+        assert!(!endpoints_match("127.0.0.1", 13306, "127.0.0.1", 13305));
+    }
+
+    #[test]
+    fn cached_collector_is_reused_only_when_it_dials_the_same_host() {
+        // Same dialed address: reuse across spelling differences.
+        for (cached, target) in [
+            ("127.0.0.1", "localhost"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::]"),
+            ("::1", "::"),
+            ("remote.example", "remote.example"),
+        ] {
+            assert!(
+                cached_collector_reusable(cached, target),
+                "{cached} -> {target}"
+            );
+        }
+        // `endpoints_match` accepts these, but the cached collector would dial
+        // the other address family.
+        for (cached, target) in [("::", "127.0.0.1"), ("127.0.0.1", "::"), ("::", "0.0.0.0")] {
+            assert!(endpoints_match(cached, 13305, target, 13305));
+            assert!(
+                !cached_collector_reusable(cached, target),
+                "{cached} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_stack_bind_keeps_its_host_and_is_dialed_through_ipv6_loopback() {
+        let record: ServiceRecord = serde_json::from_str(
+            r#"{"service_id":"s","engine":"lemonade","model_ref":"m","host":"::","port":13305,"status":"ready"}"#,
+        )
+        .unwrap();
+        let disc = discover_managed_services(&[record]);
+        assert_eq!(disc.lemonade[0].host, "::");
+        assert_eq!(scrape_host("::"), "::1");
+        assert_eq!(scrape_host("[::]"), "::1");
+        assert_eq!(scrape_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(scrape_host("10.0.0.5"), "10.0.0.5");
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
@@ -738,6 +959,7 @@ mod tests {
         .unwrap();
         let records = load_service_records(&dir);
         let svc = discovered_from_record(&records[0]).expect("live record converts");
+        assert!(svc.managed, "registry discovery proves lifecycle ownership");
         assert_eq!(svc.port, Some(8123));
         assert_eq!(svc.container_id, "svc-hot");
         assert_eq!(svc.model_name, "meta-llama/Llama-3.1-8B");
@@ -782,6 +1004,104 @@ mod tests {
                 .unwrap_or_else(|| panic!("status {status:?} must be scrapeable"));
             assert_eq!(svc.status, expected, "status {status:?}");
         }
+    }
+
+    #[test]
+    fn ancestry_roots_come_from_the_recorded_engine_and_supervisor() {
+        let with = record_json("svc", "vllm", 8000, "ready", 1).replace(
+            r#""supervisor_pid": 4242,"#,
+            r#""supervisor_pid": 4242, "supervisor_start_ticks": 11, "engine_pid": 4300, "engine_start_ticks": 22,"#,
+        );
+        let rec: ServiceRecord = serde_json::from_str(&with).unwrap();
+        let roots = rec.ancestry_roots();
+        let got: Vec<_> = roots.iter().map(|r| (r.pid, r.start_ticks)).collect();
+        assert_eq!(got, vec![(4300, Some(22)), (4242, Some(11))]);
+        assert!(roots.iter().all(|r| r.owner == "svc"));
+        // An old record: no engine yet, no start times. The supervisor alone.
+        let old: ServiceRecord =
+            serde_json::from_str(&record_json("svc", "vllm", 8000, "ready", 1)).unwrap();
+        let got: Vec<_> = old
+            .ancestry_roots()
+            .iter()
+            .map(|r| (r.pid, r.start_ticks))
+            .collect();
+        assert_eq!(got, vec![(4242, None)]);
+        // Zero is "not recorded" and 1 is init: neither is ever a root, or it
+        // would own every process on the host.
+        for bad in [0, 1] {
+            let json = format!(
+                r#"{{"service_id":"z","engine":"vllm","port":1,"status":"ready","supervisor_pid":{bad},"engine_pid":{bad}}}"#
+            );
+            let rec: ServiceRecord = serde_json::from_str(&json).unwrap();
+            assert!(
+                rec.ancestry_roots().is_empty(),
+                "pid {bad} must not be a root"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_pids_survive_the_producer_to_daemon_serde_handoff() {
+        // Same contract as the startup-phase test above, for the pid fields the
+        // ancestry join reads: serialize the producer's real type and read it
+        // back as ours, so a rename or retype on either side fails here.
+        use rocm_core::{AppPaths, ManagedServiceRecord};
+
+        let root = PathBuf::from("/tmp/rocm-xcrate-pids");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let mut produced = ManagedServiceRecord::new(
+            &paths,
+            "svc-pids",
+            "vllm",
+            "M/pids",
+            "M/pids",
+            "127.0.0.1",
+            8000,
+            "serve",
+            4242,
+            None,
+            None,
+            None,
+        );
+        produced.status = "ready".to_owned();
+        produced.supervisor_start_ticks = Some(111);
+        produced.engine_pid = Some(4300);
+        produced.engine_start_ticks = Some(222);
+
+        let json = serde_json::to_string(&produced).expect("producer record serializes");
+        let consumed: ServiceRecord =
+            serde_json::from_str(&json).expect("daemon record deserializes the producer's JSON");
+        let got: Vec<_> = consumed
+            .ancestry_roots()
+            .iter()
+            .map(|r| (r.pid, r.start_ticks, r.owner.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (4300, Some(222), "svc-pids".to_string()),
+                (4242, Some(111), "svc-pids".to_string()),
+            ],
+            "engine and supervisor pids and start times must cross the serde handoff by name"
+        );
+    }
+
+    #[test]
+    fn discover_managed_services_collects_roots_only_for_live_services() {
+        let live = record_json("live", "vllm", 8000, "ready", 1);
+        let dead = record_json("dead", "vllm", 8001, "stopped", 1).replace("4242", "5252");
+        let recs: Vec<ServiceRecord> = [live, dead]
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect();
+        let disc = discover_managed_services(&recs);
+        let owners: Vec<_> = disc.roots.iter().map(|r| r.owner.as_str()).collect();
+        assert_eq!(owners, vec!["live"], "a stopped service owns nothing");
+        assert!(disc.retired.contains("dead") && !disc.retired.contains("live"));
     }
 
     #[test]

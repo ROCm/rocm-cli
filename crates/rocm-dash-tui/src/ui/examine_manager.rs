@@ -38,11 +38,13 @@ use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval_scrolled,
+    scrolled,
 };
 use crate::ui::exec::resolve_exe;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// The `rocm examine` job.
 const EXAMINE_JOB: &str = "examine";
@@ -72,9 +74,6 @@ const KNOWN_REPORT_SCHEMA: u64 = 1;
 pub const REPORT_SENDER_NOTICE: &str = "If you send the mail, it goes from your own mail account \
                                         and carries your address. The report itself names no \
                                         user, host, or file path.";
-
-/// Rows a PgUp or PgDn moves the approval body.
-const APPROVAL_PAGE: u16 = 5;
 
 /// What the overlay knows about the last report preview.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -162,7 +161,7 @@ pub fn on_key(
             }
             ConsoleOutcome::Unhandled => {
                 let terminal = jobs.job(&job_id).is_none_or(JobState::is_terminal);
-                match key.code {
+                match shortcut_key(key.code) {
                     // `r` re-runs the examine after its own terminal result.
                     KeyCode::Char('r') if terminal && job_id == EXAMINE_JOB => {
                         d.active_job = None;
@@ -181,7 +180,7 @@ pub fn on_key(
     }
 
     // 3) The intro card.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *examine = None,
         KeyCode::Enter | KeyCode::Char('r') => return run_examine(d, jobs),
         KeyCode::Char('p') => return run_report_preview(d, jobs),
@@ -189,21 +188,6 @@ pub fn on_key(
         _ => {}
     }
     Vec::new()
-}
-
-/// Where a key moves the approval body, or `None` when it is not a scroll key.
-/// PgUp and PgDn move a page, Home and End jump. Up and Down stay with the
-/// buttons.
-fn scrolled(current: u16, max: u16, key: KeyCode) -> Option<u16> {
-    match key {
-        KeyCode::PageDown => Some(current.saturating_add(APPROVAL_PAGE).min(max)),
-        // The stored offset can sit past `max` after the dialog grew, since only
-        // the draw clamps it. Clamp first, so one PgUp is always one page.
-        KeyCode::PageUp => Some(current.min(max).saturating_sub(APPROVAL_PAGE)),
-        KeyCode::Home => Some(0),
-        KeyCode::End => Some(max),
-        _ => None,
-    }
 }
 
 /// Judge the finished preview. Only a job that exited 0 and printed a JSON
@@ -474,7 +458,8 @@ pub fn draw_examine_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
+    use crate::ui::approval::APPROVAL_PAGE;
     use crossterm::event::KeyCode;
 
     #[test]
@@ -527,6 +512,39 @@ mod tests {
         let fx = on_key(&mut d, &mut jobs, key(KeyCode::Char('r')));
         assert_eq!(fx.len(), 1);
         assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some("examine"));
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        // The intro card.
+        let mut jobs = State::default();
+        let mut d = Some(ExamineManagerState::default());
+        on_key(&mut d, &mut jobs, caps('R'));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some(EXAMINE_JOB));
+        let mut d = Some(ExamineManagerState::default());
+        on_key(&mut d, &mut jobs, caps('P'));
+        assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some(REPORT_JOB));
+        let mut d = Some(ExamineManagerState::default());
+        on_key(&mut d, &mut jobs, caps('Q'));
+        assert!(d.is_none(), "Q must close the overlay");
+        let (mut d, mut jobs) = previewed(PREPARED, 0);
+        on_key(&mut d, &mut jobs, caps('S'));
+        assert!(
+            d.as_ref().unwrap().approval.is_some(),
+            "S must stage the send"
+        );
+
+        // The console after a terminal examine result: `R` re-runs it and `P`
+        // prepares a report.
+        for (letter, expected) in [('R', EXAMINE_JOB), ('P', REPORT_JOB)] {
+            let mut d = Some(ExamineManagerState::default());
+            let mut jobs = State::default();
+            on_key(&mut d, &mut jobs, key(KeyCode::Enter));
+            finish(&mut jobs, EXAMINE_JOB, &[], 0);
+            let fx = on_key(&mut d, &mut jobs, caps(letter));
+            assert_eq!(fx.len(), 1, "{letter} must start a job from the console");
+            assert_eq!(d.as_ref().unwrap().active_job.as_deref(), Some(expected));
+        }
     }
 
     #[test]

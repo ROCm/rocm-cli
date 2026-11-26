@@ -25,11 +25,25 @@
 //! `summary` of the host that only the `rocm` binary can build, so the replay
 //! leaves `summary` out; the skill reads `status` and `has_amd_gpu` and nothing in it.
 //!
-//! Two things are not rendered. What an OLDER CLI printed was recorded once from a
-//! real older binary and is committed under `recorded/`. And the current CLI's
-//! `--version` line is fixed text ([`CURRENT_VERSION`]): it is not the real
-//! `rocm --version` format, and carries a marker that only the replay prints, so
-//! an eval can tell that the agent met the replay. Nothing in the skill reads it.
+//! A case may also name an `apply` fix id, which makes the stub answer `rocm fix <id>`
+//! with `--dry-run` and with no flag. The fix must be one rocm-core models the
+//! preview of (only fix-4: another runner prints its own lines around the plan),
+//! `auto` on the host's platform (`wsl` for the WSL host, else `linux`), and the
+//! case's symptom and host must make the replayed diagnosis match it, or the
+//! generator fails (a fix the agent could not be pointed at has nothing to replay).
+//! Both stdouts come from rocm-core ([`rocm_core::fix_preview_text`]): the plan, its
+//! layout and the dry-run notice, so they carry the command's wording. Only the
+//! `Will run:` line the runner adds is not there, because it names the user and the
+//! machine. A rocm-core unit test holds that preview to the runner's own output,
+//! and the e2e scenario skill-08 holds the committed replay to the real command.
+//! The refusal's exit code and message are the CLI's own constants
+//! ([`rocm_core::fix_exit`], [`rocm_core::NON_INTERACTIVE_REFUSAL`]).
+//!
+//! Some replies are not rendered from the catalog. What an OLDER CLI printed was
+//! recorded once from a real older binary and is committed under `recorded/`. The
+//! current CLI's `--version` line is fixed text ([`CURRENT_VERSION`]) that carries a
+//! marker only the replay prints, so an eval can tell that the agent met the replay;
+//! nothing in the skill reads it. The failure message of `examine` is fixed text too.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,8 +70,8 @@ const EXAMINATION: &str = "tests/remote-ssh/examination.json";
 const EVALS_FILE: &str = "skills/rocm-doctor/evals/evals.json";
 /// What the current-CLI replay prints for `--version`. Fixed text, so a rebuild
 /// never makes a recording differ. The parenthesised marker is what the
-/// `rocm-current-cli-carries-on` eval pins in `logs_contain`; the real
-/// `rocm --version` prints `rocm <version>` and the skill does not read it.
+/// `rocm-current-cli-carries-on` eval pins in `logs_contain`; no real build
+/// prints that marker, and the skill does not read the version string.
 const CURRENT_VERSION: &str = "rocm-cli 0.1.0 (recorded for evals)\n";
 /// An older CLI rejects `--json` with a usage error, and clap's usage-error code is 2.
 const USAGE_ERROR_RC: i32 = 2;
@@ -68,6 +82,16 @@ const USAGE_ERROR_RC: i32 = 2;
 const EXAMINE_FAILS_STDERR: &str = "error: failed to read the host (recorded for evals)\n";
 /// A genuine inability to examine propagates as an error, which exits 1.
 const EXAMINE_FAILS_RC: i32 = 1;
+/// The platform family a replayed host is, which is what `rocm fix` reports for it:
+/// the plan's class and argument are per platform. The WSL host is `wsl` there, not
+/// `linux`, so a fix that applies on Linux only is not applicable on it.
+fn replayed_os(host: Option<Host>) -> &'static str {
+    if host == Some(Host::WslHostGpuHidden) {
+        "wsl"
+    } else {
+        "linux"
+    }
+}
 
 /// The part of the dataset this module reads: which prompt each case id has.
 #[derive(Debug, Deserialize)]
@@ -98,6 +122,11 @@ struct Case {
     /// case without one gets no examine reply, and the stub refuses the command.
     #[serde(default)]
     host: Option<Host>,
+    /// A fix id the case's agent is expected to preview and apply. The stub then
+    /// answers `rocm fix <id>` with `--dry-run` and with no flag, and never with
+    /// `--yes`, so an agent that applies before the user said OK meets a refusal.
+    #[serde(default)]
+    apply: Option<String>,
 }
 
 /// The host a replayed `rocm examine --json` describes. Each is the recorded
@@ -114,6 +143,10 @@ enum Host {
     AmdFound,
     /// `rocm examine` itself fails and exits non-zero.
     ExamineFails,
+    /// Linux with an AMD GPU found, inside a Docker container whose
+    /// `/dev/shm` is the 64 MiB default. Two entries then score from host
+    /// state alone, whatever the symptom is.
+    ContainerSmallShm,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +187,18 @@ struct Replies {
     /// case without one is recorded exactly as it was before this existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     examine_json: Option<Reply>,
+    /// Only for a case that names an `apply` fix id, for the same reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply: Option<Apply>,
+}
+
+/// What the stub answers for `rocm fix <fix_id>`: the preview, and the refusal a
+/// shell with no terminal gets when `--yes` is missing.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct Apply {
+    fix_id: String,
+    dry_run: Reply,
+    bare: Reply,
 }
 
 /// Regenerate (or, with `check`, verify) the committed fixtures.
@@ -209,19 +254,32 @@ fn load_examination(root: &Path) -> Result<rocm_core::Examination> {
         .with_context(|| format!("{} is not a valid examination", path.display()))
 }
 
-/// The recorded examination, edited to be the machine `host` names. Only the
-/// fields the host implies change, and `status` is recomputed from them by the
-/// probe's own rule, never typed.
+/// The recorded examination, edited to be the machine `host` names. The host sets
+/// the fields it implies whatever the recording held, and `status` is recomputed
+/// from them by the probe's own rule, never typed.
 fn examination_for(base: &rocm_core::Examination, host: Host) -> rocm_core::Examination {
     let mut examination = base.clone();
+    // Every host states each field `compute_status` and the replay depend on, so
+    // what comes out never depends on what the recorded examination happened to
+    // hold for it. `os_family` and `probe_failures` count: a recording captured
+    // with a failed probe would otherwise turn `amd-found` into `degraded`. So do
+    // the container and `/dev/shm` fields the diagnosis reads: a recording made in
+    // a container would otherwise put every host in one.
+    examination.os_family = "linux".to_owned();
+    examination.probe_failures = Vec::new();
+    examination.is_wsl = host == Host::WslHostGpuHidden;
+    examination.wsl = None;
+    let amd_found = matches!(host, Host::AmdFound | Host::ContainerSmallShm);
+    examination.has_amd_gpu = amd_found;
+    examination.has_discrete_amd = amd_found;
+    examination.gpus = Vec::new();
+    examination.in_container = false;
+    examination.container_kind = String::new();
+    examination.shm_total_bytes = None;
+    examination.shm_available_bytes = None;
     match host {
-        Host::NoAmdGpu | Host::ExamineFails => {
-            examination.is_wsl = false;
-            examination.has_amd_gpu = false;
-        }
+        Host::NoAmdGpu | Host::ExamineFails => {}
         Host::WslHostGpuHidden => {
-            examination.is_wsl = true;
-            examination.has_amd_gpu = false;
             // A WSL2 distro whose Windows host exposes a GPU to it (`/dev/dxg`,
             // DXCore) but not an AMD one, so nothing ROCm-side is installed. Typed,
             // not probed: the probe fills this from the distro it runs in.
@@ -233,17 +291,23 @@ fn examination_for(base: &rocm_core::Examination, host: Host) -> rocm_core::Exam
                 ..rocm_core::examine::WslFacts::default()
             });
         }
-        Host::AmdFound => {
-            examination.is_wsl = false;
-            examination.has_amd_gpu = true;
-            examination.has_discrete_amd = true;
+        Host::AmdFound | Host::ContainerSmallShm => {
+            // `pci_id` is what the Linux probe reads: the bus address that starts
+            // the `lspci` line.
             examination.gpus = vec![rocm_core::examine::Gpu {
                 name: "AMD Radeon RX 7900 XTX".to_owned(),
                 gfx_target: "gfx1100".to_owned(),
-                pci_id: "1002:744c".to_owned(),
+                pci_id: "0000:c3:00.0".to_owned(),
                 is_apu: Some(false),
                 is_amd: true,
             }];
+            if host == Host::ContainerSmallShm {
+                const DEFAULT_SHM_BYTES: u64 = 64 * 1024 * 1024;
+                examination.in_container = true;
+                examination.container_kind = "docker".to_owned();
+                examination.shm_total_bytes = Some(DEFAULT_SHM_BYTES);
+                examination.shm_available_bytes = Some(DEFAULT_SHM_BYTES);
+            }
         }
     }
     examination.status = examination.compute_status();
@@ -256,8 +320,9 @@ fn replies_for(root: &Path, case: &Case, recorded: &rocm_core::Examination) -> R
         .host
         .map_or_else(|| recorded.clone(), |host| examination_for(recorded, host));
     let report = rocm_core::run_diagnose(examination, &case.symptom);
+    // The same rendering `rocm diagnose --json` prints, ASCII on the wire.
     let diagnose_json = Reply::ok(
-        serde_json::to_string_pretty(&report).context("failed to render the diagnosis")? + "\n",
+        rocm_core::render_diagnose_json(&report).context("failed to render the diagnosis")? + "\n",
     );
     let diagnose_text = Reply::ok(rocm_core::render_diagnose_text(&report, 5));
     let (version, fix_json) = match case.cli {
@@ -290,12 +355,52 @@ fn replies_for(root: &Path, case: &Case, recorded: &rocm_core::Examination) -> R
                 + "\n",
         )),
     };
+    let apply = case
+        .apply
+        .as_deref()
+        .map(|fix_id| apply_for(fix_id, replayed_os(case.host), &report))
+        .transpose()?;
     Ok(Replies {
         version,
         fix_json,
         diagnose_json,
         diagnose_text,
         examine_json,
+        apply,
+    })
+}
+
+/// What the stub answers for `rocm fix <fix_id>` in the case's replay, on the platform
+/// `os`. Both stdouts are the CLI's own, from [`rocm_core::fix_preview_text`], so
+/// neither the plan's wording nor the layout around it can drift from the command's;
+/// that function models only fix-4's runner (fix-6 prints a `Plan:` block of its own,
+/// for one). The fix must also be `auto` on `os`. And the replayed diagnosis must
+/// match the fix, that is list it at or above `min_score_for_match`, or the agent has
+/// no way to be pointed at its id.
+fn apply_for(fix_id: &str, os: &str, report: &rocm_core::DiagnoseReport) -> Result<Apply> {
+    if rocm_core::fix_plan_text(fix_id, os).is_none() {
+        bail!("the catalog has no fix {fix_id:?}");
+    }
+    let preview = rocm_core::fix_preview_text(fix_id, os).with_context(|| {
+        format!("rocm-core models the preview of a fix whose runner it can render, and {fix_id:?} is not one")
+    })?;
+    if rocm_core::fix::class_on(fix_id, os) != Some(rocm_core::fix::FixClass::Auto) {
+        bail!("the apply replay models only a fix that is `auto` on {os}, and {fix_id:?} is not");
+    }
+    if !report.matched.iter().any(|m| {
+        m.score >= report.min_score_for_match
+            && m.fix.as_ref().is_some_and(|fix| fix.fix_id == fix_id)
+    }) {
+        bail!("the replayed diagnosis carries no match for {fix_id:?} that clears the threshold");
+    }
+    Ok(Apply {
+        fix_id: fix_id.to_owned(),
+        dry_run: Reply::ok(preview.dry_run),
+        bare: Reply {
+            stdout: preview.refused,
+            stderr: format!("{}\n", rocm_core::NON_INTERACTIVE_REFUSAL),
+            rc: rocm_core::fix_exit::DECLINED,
+        },
     })
 }
 
@@ -489,24 +594,113 @@ mod tests {
                 }
                 Host::NoAmdGpu => ("no-amd-gpu", false),
                 Host::WslHostGpuHidden => ("wsl", false),
-                Host::AmdFound => ("ok", true),
+                Host::AmdFound | Host::ContainerSmallShm => ("ok", true),
             };
             let value: serde_json::Value =
                 serde_json::from_str(&examine.stdout).expect("an examination is JSON");
             assert_eq!(value["status"], status, "{}", case.id);
             assert_eq!(value["has_amd_gpu"], has_amd_gpu, "{}", case.id);
-            // The status in the file is what the probe's own rule says for the
-            // edited fields, not text typed beside them.
-            let examination = examination_for(&recorded, host);
-            assert_eq!(examination.status, examination.compute_status());
         }
         for host in [
             Host::NoAmdGpu,
             Host::WslHostGpuHidden,
             Host::AmdFound,
             Host::ExamineFails,
+            Host::ContainerSmallShm,
         ] {
             assert!(seen.contains(&host), "no case replays the host {host:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_does_not_depend_on_what_the_recorded_examination_held() {
+        /// What one host must come out as, whatever the base held.
+        struct Expected {
+            host: Host,
+            is_wsl: bool,
+            has_amd_gpu: bool,
+            gpus: usize,
+            wsl_facts: bool,
+            status: &'static str,
+            /// The `/dev/shm` allowance in bytes: only the container host measures one.
+            shm_bytes: Option<u64>,
+        }
+
+        // A base that says the opposite of every host, so a host that forgot to
+        // state a field would show the base's value instead of its own. The
+        // recorded examination alone cannot tell: it already is a Linux host with
+        // no AMD GPU, so emptying the `NoAmdGpu` arm changed nothing there.
+        let root = paths::workspace_root().expect("workspace root");
+        let mut hostile = load_examination(&root).expect("examination");
+        hostile.is_wsl = true;
+        hostile.has_amd_gpu = true;
+        hostile.has_discrete_amd = true;
+        hostile.gpus = vec![rocm_core::examine::Gpu::default()];
+        hostile.wsl = Some(rocm_core::examine::WslFacts::default());
+        // `compute_status` reads these two as well, so the base disagrees on them.
+        hostile.os_family = "other".to_owned();
+        hostile.probe_failures = vec!["lspci missing".to_owned()];
+        hostile.status = "degraded".to_owned();
+        // A recording made in a container with a measured `/dev/shm`.
+        hostile.in_container = true;
+        hostile.container_kind = "podman".to_owned();
+        hostile.shm_total_bytes = Some(1);
+        hostile.shm_available_bytes = Some(1);
+
+        let expected = |host, is_wsl, has_amd_gpu, gpus, wsl_facts, status, shm_bytes| Expected {
+            host,
+            is_wsl,
+            has_amd_gpu,
+            gpus,
+            wsl_facts,
+            status,
+            shm_bytes,
+        };
+        for want in [
+            expected(Host::NoAmdGpu, false, false, 0, false, "no-amd-gpu", None),
+            // Shares an arm with `NoAmdGpu` today; listed so a later split of that
+            // arm is still pinned.
+            expected(
+                Host::ExamineFails,
+                false,
+                false,
+                0,
+                false,
+                "no-amd-gpu",
+                None,
+            ),
+            expected(Host::WslHostGpuHidden, true, false, 0, true, "wsl", None),
+            expected(Host::AmdFound, false, true, 1, false, "ok", None),
+            expected(
+                Host::ContainerSmallShm,
+                false,
+                true,
+                1,
+                false,
+                "ok",
+                Some(64 * 1024 * 1024),
+            ),
+        ] {
+            let host = want.host;
+            let examination = examination_for(&hostile, host);
+            assert_eq!(examination.is_wsl, want.is_wsl, "{host:?}");
+            assert_eq!(examination.has_amd_gpu, want.has_amd_gpu, "{host:?}");
+            assert_eq!(examination.has_discrete_amd, want.has_amd_gpu, "{host:?}");
+            assert_eq!(examination.gpus.len(), want.gpus, "{host:?}");
+            assert_eq!(examination.wsl.is_some(), want.wsl_facts, "{host:?}");
+            assert_eq!(examination.os_family, "linux", "{host:?}");
+            assert!(examination.probe_failures.is_empty(), "{host:?}");
+            assert_eq!(examination.status, want.status, "{host:?}");
+            // Only the container host is in a container, with the default allowance.
+            let in_container = want.shm_bytes.is_some();
+            assert_eq!(examination.in_container, in_container, "{host:?}");
+            assert_eq!(
+                examination.container_kind,
+                if in_container { "docker" } else { "" },
+                "{host:?}"
+            );
+            assert_eq!(examination.shm_total_bytes, want.shm_bytes, "{host:?}");
+            assert_eq!(examination.shm_available_bytes, want.shm_bytes, "{host:?}");
         }
     }
 
@@ -637,6 +831,345 @@ mod tests {
             "the skill gates on `has_match`"
         );
         assert!(report.get("route_when_no_match").is_some());
+    }
+
+    /// What the replayed diagnosis of one case says.
+    struct Replayed {
+        has_match: bool,
+        /// Ranked `(id, score, fix class, symptom_matched)`.
+        matches: Vec<(String, u64, String, bool)>,
+        threshold: u64,
+        /// The score from which a match is high confidence.
+        high_threshold: u64,
+        /// Where `route_when_no_match` points.
+        route_target: String,
+        /// The preview the stub gives for the case's `apply` fix, if it names one.
+        apply_plan: Option<String>,
+    }
+
+    fn replayed(case_id: &str) -> Replayed {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        let case = cases(&root)
+            .into_iter()
+            .find(|case| case.id == case_id)
+            .unwrap_or_else(|| panic!("no case {case_id}"));
+        let replies = replies_for(&root, &case, &examination).expect("replies");
+        let report: serde_json::Value =
+            serde_json::from_str(&replies.diagnose_json.stdout).expect("diagnosis is JSON");
+        let matches = report["matched"]
+            .as_array()
+            .expect("matched is a list")
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_str().expect("id").to_owned(),
+                    m["score"].as_u64().expect("score"),
+                    m["fix"]["class"].as_str().expect("class").to_owned(),
+                    m["symptom_matched"].as_bool().expect("symptom_matched"),
+                )
+            })
+            .collect();
+        Replayed {
+            has_match: report["has_match"].as_bool().expect("has_match"),
+            matches,
+            threshold: report["min_score_for_match"].as_u64().expect("threshold"),
+            high_threshold: report["high_confidence_threshold"]
+                .as_u64()
+                .expect("high threshold"),
+            route_target: report["route_when_no_match"]["target"]
+                .as_str()
+                .expect("route target")
+                .to_owned(),
+            apply_plan: replies.apply.map(|apply| apply.dry_run.stdout),
+        }
+    }
+
+    /// The judged cases rest on what their replayed diagnosis holds: a case that
+    /// grades "the agent did not act on a sub-threshold match" is void if the
+    /// recording stops containing one, and the dataset's notes say so in prose
+    /// nothing else checks. This pins each such premise.
+    #[test]
+    fn the_premise_a_judged_case_rests_on_is_what_its_replay_records() {
+        // The failing app is not on the host, so nothing was established.
+        for id in [
+            "rocm-lemonade-routes-upstream",
+            "rocm-serve-failure-routes-to-this-project",
+            "rocm-ollama-routes-upstream",
+            "rocm-lm-studio-routes-upstream",
+        ] {
+            let r = replayed(id);
+            assert!(!r.has_match, "{id}: the replay must establish no cause");
+            assert!(r.matches.is_empty(), "{id}: nothing is listed either");
+            // The tracker the diagnosis hands back is never the app's own, which
+            // is what lets these cases tell the skill's routing from `route_when_no_match`.
+            assert_eq!(r.route_target, "rocm-core", "{id}");
+        }
+
+        // `has_match` false while `matched` is not empty: the trap an agent gating
+        // on emptiness falls into. The route is the ROCm core tracker although the
+        // prompt names PyTorch, which is what the case's routing item turns on.
+        let r = replayed("rocm-current-cli-carries-on");
+        assert!(!r.has_match);
+        assert!(
+            !r.matches.is_empty(),
+            "a sub-threshold match must be listed"
+        );
+        assert_eq!(r.route_target, "rocm-core");
+
+        // A vLLM failure described in words matches neither vLLM entry, which score
+        // only the symptom text, so the case's agent has nothing to route on until it
+        // has asked for the error line.
+        let r = replayed("rocm-vllm-failure-in-words-asks-for-the-error-line");
+        assert!(!r.has_match);
+        assert!(
+            r.matches
+                .iter()
+                .all(|m| m.0 != "fix-16-vllm-oom" && m.0 != "fix-17-torch-dlpack"),
+            "{:?}",
+            r.matches
+        );
+        assert_eq!(r.route_target, "rocm-core");
+
+        // The vLLM import error is a match, but a likely one, not a high-confidence one:
+        // the case grades "likely rather than certain".
+        let r = replayed("rocm-vllm-import-error");
+        assert!(r.has_match);
+        assert_eq!(r.matches[0].0, "fix-17-torch-dlpack");
+        assert!(
+            (r.threshold..r.high_threshold).contains(&r.matches[0].1),
+            "{:?}",
+            r.matches[0]
+        );
+        // The vLLM out-of-memory error is the matched cause, and print-only.
+        let r = replayed("rocm-vllm-oom-at-startup");
+        assert!(r.has_match);
+        assert_eq!(r.matches[0].0, "fix-16-vllm-oom");
+        assert_eq!(r.matches[0].2, "print-only");
+
+        // An `auto` entry is the cause, so the apply step is reached.
+        let r = replayed("rocm-apply-auto-fix-needs-consent");
+        assert!(r.has_match);
+        assert_eq!(r.matches[0].0, "fix-4-render-group");
+        assert_eq!(r.matches[0].2, "auto");
+        assert!(
+            r.matches[0].3,
+            "the paste named the failure `fix-4` explains"
+        );
+        // Two of the case's expected items (log out and back in, what happens when
+        // `sudo` runs with no input) rest on these flags, which show in the plan the
+        // stub prints.
+        let plan = r.apply_plan.expect("the case names a fix to apply");
+        assert!(plan.contains("requires sudo"), "{plan}");
+        assert!(plan.contains("requires re-login"), "{plan}");
+        assert!(!plan.contains("requires reboot"), "{plan}");
+        // A host-only entry outranks the one that explains the paste, and both
+        // clear the threshold.
+        let r = replayed("rocm-match-does-not-explain-the-paste");
+        assert!(r.has_match);
+        assert_eq!(r.matches[0].0, "fix-19-shm-too-small");
+        // 60 for the measured allowance plus 10 only inside a container
+        // (`check_19_shm_too_small`), so a host that lost its container flag
+        // scores 60 and no longer tells the case's story.
+        assert_eq!(r.matches[0].1, 70, "the shared-memory entry in a container");
+        let container = r
+            .matches
+            .iter()
+            .find(|m| m.0 == "fix-10-container")
+            .expect("a container entry is listed");
+        assert!(container.1 < r.threshold, "and it is below the threshold");
+        let torch = r
+            .matches
+            .iter()
+            .find(|m| m.0 == "fix-17-torch-dlpack")
+            .expect("the entry explaining the paste is listed");
+        assert!(
+            torch.1 < r.matches[0].1,
+            "it ranks below the host-only entry"
+        );
+        assert!(torch.1 >= r.threshold, "it clears the threshold");
+        // The CLI says which entry the pasted text contributed to: step 2 reads it.
+        assert!(
+            !r.matches[0].3,
+            "the host-only entry is `symptom_matched` false"
+        );
+        assert!(
+            torch.3,
+            "the entry explaining the paste is `symptom_matched` true"
+        );
+
+        // Everything that clears the threshold comes from host state: the
+        // complaint is mentioned by nothing, and the route is ROCm core.
+        let r = replayed("rocm-host-only-match-is-not-the-cause");
+        assert!(r.has_match);
+        let cleared: Vec<&str> = r
+            .matches
+            .iter()
+            .filter(|m| m.1 >= r.threshold)
+            .map(|m| m.0.as_str())
+            .collect();
+        assert_eq!(cleared, ["fix-19-shm-too-small"]);
+        assert_eq!(r.route_target, "rocm-core");
+        // Nothing the diagnosis lists came from the complaint's words.
+        assert!(r.matches.iter().all(|m| !m.3), "{:?}", r.matches);
+    }
+
+    #[test]
+    fn an_apply_replay_needs_the_replayed_diagnosis_to_match_the_fix() {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        // On this host a match clears the threshold (`fix-19-shm-too-small`), so a
+        // diagnosis that matches something is not enough: it has to be the asked-for
+        // fix, and `fix-4-render-group` is not matched here.
+        let host = examination_for(&examination, Host::ContainerSmallShm);
+        let report = rocm_core::run_diagnose(&host, "ImportError: libtorch_cuda.so");
+        assert!(
+            report.has_match,
+            "the premise: a match cleared the threshold"
+        );
+        assert!(
+            report.matched.iter().all(|m| m
+                .fix
+                .as_ref()
+                .is_none_or(|f| f.fix_id != "fix-4-render-group")),
+            "the premise: fix-4 is not in this diagnosis"
+        );
+        let message = format!(
+            "{:#}",
+            apply_for("fix-4-render-group", "linux", &report)
+                .expect_err("a fix the diagnosis does not match is refused")
+        );
+        assert!(message.contains("carries no match"), "{message}");
+    }
+
+    #[test]
+    fn an_apply_replay_is_the_preview_rocm_core_gives() {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        let case = cases(&root)
+            .into_iter()
+            .find(|case| case.apply.is_some())
+            .expect("a case names a fix to apply");
+        let apply = replies_for(&root, &case, &examination)
+            .expect("replies")
+            .apply
+            .expect("an `apply` case replays the fix commands");
+        let os = replayed_os(case.host);
+        let preview = rocm_core::fix_preview_text(&apply.fix_id, os).expect("the preview");
+        assert_eq!(apply.dry_run.stdout, preview.dry_run);
+        assert_eq!(apply.bare.stdout, preview.refused);
+        // Both are rocm-core's, not a second rendering here, and the plan opens them.
+        let plan = rocm_core::fix_plan_text(&apply.fix_id, os).expect("the plan");
+        assert!(apply.dry_run.stdout.starts_with(&plan));
+        for line in [
+            "Fix:        ",
+            "OS scope:   ",
+            "Rationale:  ",
+            "Commands:",
+            "Flags:      ",
+            "Verify:     ",
+        ] {
+            assert!(plan.contains(line), "{plan}");
+        }
+    }
+
+    #[test]
+    fn an_apply_replay_needs_the_fix_to_clear_the_threshold_not_just_be_listed() {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        // This paste lists `fix-4-render-group` below `min_score_for_match`.
+        let report = rocm_core::run_diagnose(&examination, "/dev/kfd: Permission denied");
+        assert!(
+            !report.has_match,
+            "the premise: nothing cleared the threshold"
+        );
+        assert!(
+            report.matched.iter().any(|m| m
+                .fix
+                .as_ref()
+                .is_some_and(|f| f.fix_id == "fix-4-render-group")),
+            "the premise: the fix is listed"
+        );
+        let message = format!(
+            "{:#}",
+            apply_for("fix-4-render-group", "linux", &report)
+                .expect_err("a listed but sub-threshold fix is refused")
+        );
+        assert!(message.contains("clears the threshold"), "{message}");
+    }
+
+    #[test]
+    fn an_apply_replay_names_an_unknown_fix_and_refuses_one_the_platform_lacks() {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        let report = rocm_core::run_diagnose(&examination, "hipErrorNoBinaryForGpu");
+        let message = format!(
+            "{:#}",
+            apply_for("fix-0-nope", "linux", &report).expect_err("an unknown fix is refused")
+        );
+        assert!(message.contains("the catalog has no fix"), "{message}");
+        // `fix-4-render-group` is `auto` on Linux only, and the WSL host is `wsl`.
+        let message = format!(
+            "{:#}",
+            apply_for(
+                "fix-4-render-group",
+                replayed_os(Some(Host::WslHostGpuHidden)),
+                &report
+            )
+            .expect_err("a fix that does not apply on WSL is refused")
+        );
+        assert!(message.contains("`auto` on wsl"), "{message}");
+    }
+
+    #[test]
+    fn an_apply_replay_is_refused_for_a_fix_whose_preview_rocm_core_does_not_model() {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        let host = examination_for(&examination, Host::ContainerSmallShm);
+        let report = rocm_core::run_diagnose(&host, "ImportError: libtorch_cuda.so");
+        // `fix-6-path` is `auto` on Linux and prints its own `Plan:` block;
+        // `fix-19-shm-too-small` is in this diagnosis and is print-only.
+        for fix_id in ["fix-6-path", "fix-19-shm-too-small"] {
+            let message = format!(
+                "{:#}",
+                apply_for(fix_id, "linux", &report).expect_err("another fix is refused")
+            );
+            assert!(
+                message.contains("models the preview of a fix whose runner it can render"),
+                "{fix_id}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_apply_case_replays_the_plan_the_catalog_gives_and_the_refusal_of_a_shell_with_no_terminal()
+     {
+        let root = paths::workspace_root().expect("workspace root");
+        let examination = load_examination(&root).expect("examination");
+        let case = cases(&root)
+            .into_iter()
+            .find(|case| case.apply.is_some())
+            .expect("a case names a fix to apply");
+        let apply = replies_for(&root, &case, &examination)
+            .expect("replies")
+            .apply
+            .expect("an `apply` case replays the fix commands");
+        let title = rocm_core::catalog_manifest()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == apply.fix_id)
+            .expect("the catalog has the fix")
+            .title;
+        assert!(apply.dry_run.stdout.contains(&title));
+        assert!(apply.dry_run.stdout.contains(rocm_core::DRY_RUN_NOTICE));
+        assert_eq!(apply.dry_run.rc, rocm_core::fix_exit::OK);
+        assert!(apply.bare.stdout.contains(&title));
+        assert!(!apply.bare.stdout.contains(rocm_core::DRY_RUN_NOTICE));
+        assert_eq!(apply.bare.rc, rocm_core::fix_exit::DECLINED);
+        assert_eq!(
+            apply.bare.stderr,
+            format!("{}\n", rocm_core::NON_INTERACTIVE_REFUSAL)
+        );
     }
 
     #[test]
@@ -771,9 +1304,10 @@ mod tests {
         assert!(problems.is_empty(), "{problems:#?}");
     }
 
-    #[test]
-    fn a_pin_the_skill_text_quotes_is_caught() {
-        let (_tmp, root) = scratch();
+    /// A scratch copy that `pin_problems` can read: generated replays, and the skill
+    /// text it compares the pins with. It starts clean.
+    fn scratch_for_pins() -> (tempfile::TempDir, PathBuf) {
+        let (tmp, root) = scratch();
         generate(&root).expect("generate");
         let real = paths::workspace_root().expect("workspace root");
         for file in SKILL_TEXT {
@@ -782,6 +1316,53 @@ mod tests {
             fs::copy(real.join(file), &to).expect("copy");
         }
         assert!(pin_problems(&root).is_empty(), "the copy starts clean");
+        (tmp, root)
+    }
+
+    /// Set the `logs_contain` pins of one case in the scratch copy of the dataset.
+    fn set_pins(root: &Path, case_id: &str, pins: &[&str]) {
+        edit_evals(root, |text| {
+            let mut evals: serde_json::Value = serde_json::from_str(&text).expect("json");
+            let eval = evals["evaluations"]
+                .as_array_mut()
+                .and_then(|all| all.iter_mut().find(|e| e["id"] == case_id))
+                .expect("the case is in the dataset");
+            eval["logs_contain"] = serde_json::json!(pins);
+            serde_json::to_string_pretty(&evals).expect("json")
+        });
+    }
+
+    #[test]
+    fn a_replayed_case_that_pins_nothing_is_caught() {
+        let (_tmp, root) = scratch_for_pins();
+        set_pins(&root, "rocm-current-cli-carries-on", &[]);
+        let problems = pin_problems(&root);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p == "rocm-current-cli-carries-on pins nothing"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_pin_the_replay_does_not_print_is_caught() {
+        let (_tmp, root) = scratch_for_pins();
+        set_pins(
+            &root,
+            "rocm-current-cli-carries-on",
+            &["text no replay prints"],
+        );
+        let problems = pin_problems(&root);
+        assert!(
+            problems.iter().any(|p| p.contains("is not in its replay")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_pin_the_skill_text_quotes_is_caught() {
+        let (_tmp, root) = scratch_for_pins();
         // A later skill edit that quotes a pin, in a different case.
         let mut skill = fs::OpenOptions::new()
             .append(true)
@@ -812,8 +1393,8 @@ mod tests {
         // `hooks.py` is what keeps the recorded `rocm` from running anything but a
         // replay, so its tests (replay, refusal, PATH and temp-dir cleanup) run
         // with the rest of this crate. Python is on every lane that runs `cargo
-        // test` in CI (the smoke steps need it), so on CI a missing Python is a
-        // failure; on a machine without one the test says so and stops.
+        // test` in CI, so on CI a missing Python is a failure; on a machine
+        // without one the test says so and stops.
         let Some(python) = python() else {
             assert!(
                 std::env::var_os("CI").is_none(),

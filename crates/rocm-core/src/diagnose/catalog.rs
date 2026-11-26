@@ -5,10 +5,9 @@
 //! The catalog: which check runs on which platform family, in what order, and how
 //! the family is resolved from an [`Examination`].
 
-use super::Diagnosis;
 use super::engine::{
     check_16_vllm_oom, check_17_torch_dlpack_cuda_variant, check_18_comgr_conflict,
-    check_19_shm_too_small,
+    check_19_shm_too_small, check_23_vllm_extension_load,
 };
 use super::host::{
     check_1_arch_not_in_wheel, check_2_hsa_override_unneeded, check_6_path_missing,
@@ -28,6 +27,7 @@ use super::wsl::{
     check_wsl_4_rocdxg_not_linked, check_wsl_5_distro_too_old, check_wsl_6_host_driver_too_old,
     check_wsl_7_wsl1,
 };
+use super::{Diagnosis, MIN_SCORE_FOR_MATCH, SymptomEngine};
 use crate::examine::Examination;
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,9 @@ use crate::examine::Examination;
 // A new checker goes in the child module for the platform it applies to, at the
 // END of that module's checkers, and its `CHECKERS` entry goes at the END of the
 // table below: ties between equal scores keep catalog order, so an entry
-// inserted earlier would change which finding ranks first. A checker that runs
+// inserted earlier would change which finding ranks first. Its entry also
+// names a `Precedence`: `GPU_PATH` only when the finding means the process has
+// no working path to the GPU at all, `OTHER` otherwise. A checker that runs
 // on more than one platform goes in `host.rs` (host configuration) or
 // `engine.rs` (engine runtime) instead. Inserting one between an existing
 // function and the doc comment above it silently rebinds that comment to the new
@@ -45,8 +47,72 @@ use crate::examine::Examination;
 // left with none. That compiles, and clippy, rustfmt and every test pass.
 // ---------------------------------------------------------------------------
 
-/// A checker plus the OS families it applies to.
-type Checker = (fn(&Examination, &str) -> Diagnosis, &'static [&'static str]);
+/// How a checker reads its input.
+#[derive(Clone, Copy)]
+enum Check {
+    /// The examination and the symptom text: every entry but the
+    /// engine-specific ones.
+    Text(fn(&Examination, &str) -> Diagnosis),
+    /// Also the engine the user said the symptom came from, for an entry that
+    /// otherwise has to find the engine's name in the text. The first field is
+    /// the engine the entry reads; [`reads_engine_here`] answers from it.
+    WithEngine(
+        SymptomEngine,
+        fn(&Examination, &str, Option<SymptomEngine>) -> Diagnosis,
+    ),
+}
+
+impl Check {
+    fn run(self, e: &Examination, symptom: &str, engine: Option<SymptomEngine>) -> Diagnosis {
+        match self {
+            Self::Text(check) => check(e, symptom),
+            Self::WithEngine(_, check) => check(e, symptom, engine),
+        }
+    }
+}
+
+/// Whether any entry that runs on `e`'s platform reads `engine`: whether naming
+/// it with `rocm diagnose --engine` can change anything there.
+///
+/// Read from the same table, and filtered on the same platform family, as
+/// [`run_all_checks`], so the text report's line about the named engine is
+/// computed from the decision that ran rather than from a list of operating
+/// systems kept beside it. False on a platform the catalog does not cover at
+/// all, where nothing runs.
+pub(super) fn reads_engine_here(e: &Examination, engine: SymptomEngine) -> bool {
+    let family = platform_family(e);
+    CHECKERS.iter().any(|(check, applicable, _)| {
+        applicable.contains(&family)
+            && matches!(check, Check::WithEngine(read, _) if *read == engine)
+    })
+}
+
+/// Where a finding ranks among the others that cleared the match threshold.
+///
+/// Declared once per catalog entry, in [`CHECKERS`], so where an entry ranks is
+/// a decision written beside it rather than an accident of how its score
+/// happens to compare with another entry's. Ordered: a smaller value ranks
+/// first. [`run_all_checks`] sorts on this, then on score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Precedence {
+    /// The process has no working path to the GPU: no device node, no kernel
+    /// or host driver serving it, no permission to open it, or (on WSL2) no
+    /// runtime bridge from ROCm to the host driver. Until that is fixed no
+    /// other finding can be tested, so it ranks ahead of every finding about
+    /// what runs on top of the GPU, such as a small `/dev/shm` or an engine's
+    /// out-of-memory error, whatever their scores.
+    GpuPath,
+    /// Everything else, ranked by score.
+    Other,
+}
+
+/// [`Precedence::GpuPath`], as a [`CHECKERS`] row names it.
+const GPU_PATH: Precedence = Precedence::GpuPath;
+/// [`Precedence::Other`], as a [`CHECKERS`] row names it.
+const OTHER: Precedence = Precedence::Other;
+
+/// A checker, the OS families it applies to, and where its finding ranks.
+type Checker = (Check, &'static [&'static str], Precedence);
 
 // The `wsl` entries below run on less evidence than on bare metal: WSL collects
 // no GPU topology (`gpus` is empty, because the probes that fill it read KFD and
@@ -59,57 +125,137 @@ type Checker = (fn(&Examination, &str) -> Diagnosis, &'static [&'static str]);
 // a check may miss a real fault, never that it invents one. Pinned by
 // `the_shared_checks_under_report_on_wsl_rather_than_over_report`.
 const CHECKERS: &[Checker] = &[
-    (check_1_arch_not_in_wheel, &["linux", "windows", "wsl"]),
-    (check_2_hsa_override_unneeded, &["linux", "windows", "wsl"]),
-    (check_3_rocm_kernel_unsupported, &["linux"]),
-    (check_4_render_group, &["linux"]),
-    (check_5_amdgpu_blacklisted, &["linux"]),
-    (check_6_path_missing, &["linux", "windows", "wsl"]),
-    (check_7_stale_repos, &["linux"]),
-    (check_8_wheel_rocm_mismatch, &["linux", "windows", "wsl"]),
+    (
+        Check::Text(check_1_arch_not_in_wheel),
+        &["linux", "windows", "wsl"],
+        OTHER,
+    ),
+    (
+        Check::Text(check_2_hsa_override_unneeded),
+        &["linux", "windows", "wsl"],
+        OTHER,
+    ),
+    (
+        Check::Text(check_3_rocm_kernel_unsupported),
+        &["linux"],
+        GPU_PATH,
+    ),
+    (Check::Text(check_4_render_group), &["linux"], GPU_PATH),
+    (
+        Check::Text(check_5_amdgpu_blacklisted),
+        &["linux"],
+        GPU_PATH,
+    ),
+    (
+        Check::Text(check_6_path_missing),
+        &["linux", "windows", "wsl"],
+        OTHER,
+    ),
+    (Check::Text(check_7_stale_repos), &["linux"], OTHER),
+    (
+        Check::Text(check_8_wheel_rocm_mismatch),
+        &["linux", "windows", "wsl"],
+        OTHER,
+    ),
     // Not "wsl": WSL2 exposes no per-device topology to collide over.
-    (check_9_igpu_dgpu_collision, &["linux", "windows"]),
-    (check_10_container_devices, &["linux"]),
-    (check_11_iommu_hang, &["linux"]),
-    (check_12_repo_native_broken, &["linux"]),
-    (check_13_hip_sdk_missing, &["windows"]),
-    (check_14_adrenalin_too_old, &["windows"]),
-    (check_15_msvc_redist, &["windows"]),
-    (check_16_vllm_oom, &["linux", "wsl"]),
+    (
+        Check::Text(check_9_igpu_dgpu_collision),
+        &["linux", "windows"],
+        OTHER,
+    ),
+    (
+        Check::Text(check_10_container_devices),
+        &["linux"],
+        GPU_PATH,
+    ),
+    (Check::Text(check_11_iommu_hang), &["linux"], OTHER),
+    (Check::Text(check_12_repo_native_broken), &["linux"], OTHER),
+    (Check::Text(check_13_hip_sdk_missing), &["windows"], OTHER),
+    (
+        Check::Text(check_14_adrenalin_too_old),
+        &["windows"],
+        GPU_PATH,
+    ),
+    (Check::Text(check_15_msvc_redist), &["windows"], OTHER),
+    (
+        Check::WithEngine(SymptomEngine::Vllm, check_16_vllm_oom),
+        &["linux", "wsl"],
+        OTHER,
+    ),
     // Linux and WSL2: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
     // gated off native Windows but runs on WSL2. The engine's startup-failure
     // hint fires on both, so the entry it points at must be reachable on both.
     // 17 rather than 16 because the vLLM out-of-memory entry above already
     // holds 16; the number is a stable handle, so the two do not get to share
     // one.
-    (check_17_torch_dlpack_cuda_variant, &["linux", "wsl"]),
-    (check_wsl_1_gpu_not_exposed, WSL_ONLY),
-    (check_wsl_2_dxcore_missing, WSL_ONLY),
-    (check_wsl_3_rocdxg_missing, WSL_ONLY),
-    (check_wsl_4_rocdxg_not_linked, WSL_ONLY),
-    (check_wsl_5_distro_too_old, WSL_ONLY),
-    (check_wsl_6_host_driver_too_old, WSL_ONLY),
-    (check_wsl_7_wsl1, WSL_ONLY),
+    (
+        Check::Text(check_17_torch_dlpack_cuda_variant),
+        &["linux", "wsl"],
+        OTHER,
+    ),
+    (Check::Text(check_wsl_1_gpu_not_exposed), WSL_ONLY, GPU_PATH),
+    (Check::Text(check_wsl_2_dxcore_missing), WSL_ONLY, GPU_PATH),
+    (Check::Text(check_wsl_3_rocdxg_missing), WSL_ONLY, GPU_PATH),
+    (
+        Check::Text(check_wsl_4_rocdxg_not_linked),
+        WSL_ONLY,
+        GPU_PATH,
+    ),
+    (Check::Text(check_wsl_5_distro_too_old), WSL_ONLY, OTHER),
+    (
+        Check::Text(check_wsl_6_host_driver_too_old),
+        WSL_ONLY,
+        GPU_PATH,
+    ),
+    (Check::Text(check_wsl_7_wsl1), WSL_ONLY, GPU_PATH),
     // Both families, opting in explicitly as the platform split requires. Which
     // copy of a library the loader picks is not a question about the amdgpu
     // module or the Windows host driver -- a wheel copy and a system copy
     // collide on WSL2 exactly as they do on bare metal. Windows is deferred
     // until this has proved the approach.
-    (check_18_comgr_conflict, &["linux", "wsl"]),
+    (
+        Check::Text(check_18_comgr_conflict),
+        &["linux", "wsl"],
+        OTHER,
+    ),
     // Both families, for the same reason. The shortage has nothing to do with
-    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs -- and WSL2 ships the
-    // same 64 MB default a container does, so leaving this tagged `linux` alone
-    // would silence it on one of the two platforms most likely to have it.
-    (check_19_shm_too_small, &["linux", "wsl"]),
+    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs. WSL2 normally gives
+    // it half the VM's memory, but a container inside the distro, a VM given
+    // little memory or a remount can still leave it short, so leaving this
+    // tagged `linux` alone would silence a real shortage there.
+    (
+        Check::Text(check_19_shm_too_small),
+        &["linux", "wsl"],
+        OTHER,
+    ),
     // Not "wsl": WSL2 reports no GPU topology (`gpus` is empty), so this check
     // has nothing to read there and would never fire.
-    (check_20_gpu_unsupported_by_rocm, &["linux", "windows"]),
+    (
+        Check::Text(check_20_gpu_unsupported_by_rocm),
+        &["linux", "windows"],
+        OTHER,
+    ),
     // Windows only: the runtime is read from the Windows System32 folder. A WSL
     // distro is examined as a distro, so it has no such runtime to read.
-    (check_21_msvc_redist_outdated, &["windows"]),
+    (
+        Check::Text(check_21_msvc_redist_outdated),
+        &["windows"],
+        OTHER,
+    ),
     // Windows only: the driver date comes from the Windows display adapter.
     // WSL2 reads the host driver through its own entries.
-    (check_22_display_driver_old, &["windows"]),
+    (
+        Check::Text(check_22_display_driver_old),
+        &["windows"],
+        OTHER,
+    ),
+    // Linux and WSL2, like the other vLLM entries: the engine runs on both and
+    // its startup-failure hint points here on both.
+    (
+        Check::Text(check_23_vllm_extension_load),
+        &["linux", "wsl"],
+        OTHER,
+    ),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -138,19 +284,45 @@ pub(super) const fn platform_family(e: &Examination) -> &str {
     e.os_family.as_str()
 }
 
-/// Run every applicable checker, drop zero-score results, sort by score
-/// descending (stable, so ties keep catalog order).
-pub(super) fn run_all_checks(e: &Examination, symptom: &str) -> Vec<Diagnosis> {
+/// Run every applicable checker, drop zero-score results, and rank the rest.
+///
+/// The findings that cleared [`MIN_SCORE_FOR_MATCH`] come first, ordered by
+/// their entry's [`Precedence`] and then by score descending; the ones below it
+/// follow, by score descending. The sort is stable, so ties keep catalog
+/// order.
+///
+/// Precedence counts only at or above the threshold. Several entries open with
+/// a base score for a situation that is merely potentially relevant (being in a
+/// container, missing a group), and below the threshold nothing was
+/// established, so a weak [`Precedence::GpuPath`] signal must not climb over a
+/// finding that was. Every entry below the threshold scores less than every
+/// entry above it, so ranking them by score alone keeps them after all the
+/// matches.
+pub(super) fn run_all_checks(
+    e: &Examination,
+    symptom: &str,
+    engine: Option<SymptomEngine>,
+) -> Vec<Diagnosis> {
     let family = platform_family(e);
-    let mut results: Vec<Diagnosis> = CHECKERS
+    let mut results: Vec<(Precedence, Diagnosis)> = CHECKERS
         .iter()
-        .filter(|(_, applicable)| applicable.contains(&family))
-        .map(|(check, _)| check(e, symptom))
-        .filter(|d| d.score > 0)
+        .filter(|(_, applicable, _)| applicable.contains(&family))
+        .map(|(check, _, precedence)| (*precedence, check.run(e, symptom, engine)))
+        .filter(|(_, d)| d.score > 0)
         .collect();
-    // Stable sort by score descending: ties keep catalog order.
-    results.sort_by_key(|d| std::cmp::Reverse(d.score));
-    results
+    results.sort_by_key(|(precedence, d)| rank_key(*precedence, d.score));
+    results.into_iter().map(|(_, d)| d).collect()
+}
+
+/// The key [`run_all_checks`] sorts on: precedence for a finding at or above
+/// [`MIN_SCORE_FOR_MATCH`] and none below it, then score descending.
+const fn rank_key(precedence: Precedence, score: i32) -> (Precedence, std::cmp::Reverse<i32>) {
+    let precedence = if score >= MIN_SCORE_FOR_MATCH {
+        precedence
+    } else {
+        Precedence::Other
+    };
+    (precedence, std::cmp::Reverse(score))
 }
 
 /// Whether any catalog entry at all applies to this platform.
@@ -158,7 +330,7 @@ fn catalog_covers(e: &Examination) -> bool {
     let family = platform_family(e);
     CHECKERS
         .iter()
-        .any(|(_, applicable)| applicable.contains(&family))
+        .any(|(_, applicable, _)| applicable.contains(&family))
 }
 
 /// Fill each finding's applicability from the catalog, for the operating system
@@ -186,6 +358,14 @@ pub(super) fn take_applicability_from_the_catalog(
         // An entry the catalog does not list for this OS keeps the default:
         // the CLI will not act on it here, which is exactly what the OS gate in
         // `fix::apply` would tell the user.
+        if fix.unavailable_here {
+            // `rocm fix` refuses this one on this host (exit 3), so the catalog's
+            // `Auto` would promise a run that never happens.
+            fix.class = crate::fix::FixClass::DiagnoseOnly;
+            fix.auto_applicable = false;
+            fix.needs = None;
+            continue;
+        }
         let class = crate::fix::class_on(&fix.fix_id, platform_family).unwrap_or_default();
         fix.class = class;
         fix.auto_applicable = class.applies_itself();
@@ -213,10 +393,14 @@ mod tests {
     use super::*;
     use crate::diagnose::engine::VLLM_OOM_CANONICAL_SYMPTOM;
     use crate::diagnose::test_support::{
-        igpu_dgpu_host, linux_base, windows_driver_exam, wsl_base,
+        NON_ASCII_PASTE, every_engine, host_of_family, igpu_dgpu_host, linux_base,
+        windows_driver_exam, wsl_base,
     };
     use crate::diagnose::windows::DISPLAY_DRIVER_OLD_SCORE;
-    use crate::diagnose::{MIN_SCORE_FOR_MATCH, diagnose, render_report_text};
+    use crate::diagnose::{
+        HIGH_CONFIDENCE, MIN_SCORE_FOR_MATCH, diagnose, diagnose_with_engine, render_report_json,
+        render_report_text,
+    };
     use crate::examine::Gpu;
 
     /// A pasted HIP-loading error still opens fix-13 when no AMD GPU was
@@ -267,12 +451,15 @@ mod tests {
     /// Every diagnosis must agree with the fix catalog about whether the CLI
     /// can apply the fix itself.
     ///
-    /// An agent following the rocm-doctor skill branches on `auto_applicable`
-    /// from `diagnose --json` to decide whether to offer to run `rocm fix` or
-    /// merely print the plan, while `fix::apply` dispatches on `RECIPES`. The
-    /// two are written in different files and nothing but this test holds them
-    /// together, so a drift makes the CLI contradict itself: it would advertise
-    /// a fix as one it can run and then refuse, or the reverse.
+    /// An agent following the rocm-doctor skill reads `fix.class` from
+    /// `diagnose --json` (`auto_applicable` is derived from it) to decide whether
+    /// `rocm fix` carries the fix out or merely prints the plan, while
+    /// `fix::apply` dispatches on `RECIPES`. `take_applicability_from_the_catalog`
+    /// derives `fix.class` and `fix.auto_applicable` from the catalog's class,
+    /// which is what keeps them in step. This test asserts only the
+    /// `auto_applicable` half, against the catalog's `applies_itself()` (true for
+    /// `auto` alone), so a diagnosis that bypassed the derivation would advertise
+    /// a fix as one the CLI can run and then refuse, or the reverse, and fail here.
     ///
     /// Both OS families are exercised because the checkers build their `Fix`
     /// per-OS and only one branch is taken per run, so a Linux-only test would
@@ -330,6 +517,51 @@ mod tests {
         }
     }
 
+    /// The engine a `Check::WithEngine` entry declares is the engine it reads.
+    ///
+    /// `reads_engine_here` answers the text report's "changed nothing" line
+    /// from that declaration alone, so a declaration that disagreed with the
+    /// checker would make the line lie. For every such entry, on every
+    /// platform family it applies to, and for every engine variant: a paste
+    /// that only the declared engine can claim (a torch out-of-memory error
+    /// naming no engine) must change the entry's verdict when exactly the
+    /// declared engine is named, and must not change it for any other.
+    #[test]
+    fn every_engine_reading_entry_reads_the_engine_it_declares() {
+        const NEEDS_THE_ENGINE: &str =
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB";
+        let mut checked = 0;
+        for (check, applicable, _) in CHECKERS {
+            let Check::WithEngine(declared, _) = check else {
+                continue;
+            };
+            for family in *applicable {
+                let host = host_of_family(family);
+                let unnamed = check.run(&host, NEEDS_THE_ENGINE, None);
+                for engine in every_engine() {
+                    let named = check.run(&host, NEEDS_THE_ENGINE, Some(engine));
+                    let changed =
+                        (named.score, &named.evidence) != (unnamed.score, &unnamed.evidence);
+                    assert_eq!(
+                        changed,
+                        engine == *declared,
+                        "{} on {family}: declares {declared:?}, but naming {engine:?} {} its \
+                         verdict ({} -> {})",
+                        unnamed.id,
+                        if changed { "changed" } else { "did not change" },
+                        unnamed.score,
+                        named.score
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no Check::WithEngine entry was checked, so a mis-declared engine would go unseen"
+        );
+    }
+
     /// ROCMAI-543: every string `rocm diagnose` can put on a redirectable
     /// stream has to be plain ASCII, or a Windows console on the OEM code page
     /// (437) renders UTF-8 punctuation as mojibake like `ΓÇö`.
@@ -339,62 +571,107 @@ mod tests {
     /// check added later is covered the day it lands and no single sentence
     /// needs a pinned copy here -- a test that restates the constant it checks
     /// protects very little. Both surfaces are asserted because both are
-    /// redirectable: the rendered text report, and the `--json` payload, which
-    /// `serde_json` emits as raw UTF-8 rather than `\u` escapes.
+    /// redirectable: the rendered text report, and the `--json` payload as the
+    /// CLI prints it ([`render_report_json`]).
     ///
     /// Two of this fix's conversions sit on branches a default `Examination`
     /// never reaches -- the dGPU/APU pairing in `check_9_igpu_dgpu_collision`
     /// and `check_16_vllm_oom`'s "does not fit" wording -- so the corpus lights
     /// them deliberately and the coverage guard at the end fails if it stops.
+    ///
+    /// The `--engine` rows paste text this crate did not write: an accented
+    /// path, a box-drawing character and an emoji. `provenance.symptom` repeats
+    /// it verbatim, so the JSON is ASCII only because the CLI escapes it, and
+    /// the text report is ASCII only because nothing in it echoes the paste.
     #[test]
     fn every_message_the_diagnose_catalog_can_emit_is_ascii() {
-        let corpus: Vec<(&str, Examination, &str)> = vec![
-            ("linux, no symptom", linux_base(), ""),
-            ("wsl, no symptom", wsl_base(), ""),
+        let no_engine = None;
+        let vllm = Some(SymptomEngine::Vllm);
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let corpus: Vec<(&str, Examination, &str, Option<SymptomEngine>)> = vec![
+            ("linux, no symptom", linux_base(), "", no_engine),
+            ("wsl, no symptom", wsl_base(), "", no_engine),
             (
                 "linux apu+dgpu, crash",
                 igpu_dgpu_host("linux"),
                 "torch crashes with a segfault",
+                no_engine,
             ),
             (
                 "windows apu+dgpu, crash",
                 igpu_dgpu_host("windows"),
                 "torch crashes with a segfault",
+                no_engine,
             ),
-            ("linux vllm oom", linux_base(), VLLM_OOM_CANONICAL_SYMPTOM),
-            ("wsl vllm oom", wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM),
+            (
+                "linux vllm oom",
+                linux_base(),
+                VLLM_OOM_CANONICAL_SYMPTOM,
+                no_engine,
+            ),
+            (
+                "wsl vllm oom",
+                wsl_base(),
+                VLLM_OOM_CANONICAL_SYMPTOM,
+                no_engine,
+            ),
+            (
+                "linux, non-ASCII paste, --engine",
+                linux_base(),
+                NON_ASCII_PASTE,
+                vllm,
+            ),
+            (
+                "wsl, non-ASCII paste, --engine",
+                wsl_base(),
+                NON_ASCII_PASTE,
+                vllm,
+            ),
+            (
+                "windows, non-ASCII paste, --engine",
+                windows,
+                NON_ASCII_PASTE,
+                vllm,
+            ),
         ];
 
         let mut everything_seen = String::new();
-        for (label, examination, symptom) in &corpus {
+        for (label, examination, symptom, engine) in &corpus {
             // Every catalog entry, not only the ones that scored high enough to
             // be reported on this host: a message is still shipped text when the
             // host it describes is not the one under test.
-            for (check, _) in CHECKERS {
-                let diagnosis = check(examination, symptom);
+            for (check, _, _) in CHECKERS {
+                let diagnosis = check.run(examination, symptom, *engine);
                 let json = serde_json::to_string(&diagnosis).expect("a Diagnosis serializes");
                 assert!(
                     json.is_ascii(),
-                    "{label}: diagnosis `{}` carries non-ASCII punctuation, which renders as \
+                    "{label}: diagnosis `{}` carries non-ASCII text, which renders as \
                      mojibake on a Windows console using the OEM code page (ROCMAI-543): {json}",
                     diagnosis.id
                 );
                 everything_seen.push_str(&json);
             }
 
-            let report = diagnose(examination, symptom);
+            let report = diagnose_with_engine(examination, symptom, *engine);
             let text = render_report_text(&report, report.matched.len());
             assert!(
                 text.is_ascii(),
                 "{label}: `rocm diagnose` text output must be ASCII-only (ROCMAI-543):\n{text}"
             );
-            let json = serde_json::to_string(&report).expect("a DiagnoseReport serializes");
+            let json = render_report_json(&report).expect("the report renders");
             assert!(
                 json.is_ascii(),
                 "{label}: `rocm diagnose --json` output must be ASCII-only (ROCMAI-543): {json}"
             );
             everything_seen.push_str(&text);
         }
+        assert!(
+            everything_seen.contains("Engine: vllm (named with --engine; no entry"),
+            "the corpus no longer reaches the --engine rows, so the escaping is unguarded"
+        );
 
         // An invariant test that quietly stops reaching the branches it was
         // written for passes for the wrong reason. These markers sit beside the
@@ -407,6 +684,174 @@ mod tests {
         assert!(
             everything_seen.contains("reservation will not help"),
             "the corpus no longer reaches check_16's does-not-fit wording, so it is unguarded"
+        );
+    }
+
+    /// A docker container on WSL2 started without `/dev/dxg`, with the
+    /// container default of 64 MiB of `/dev/shm`: the host ROCMAI-785 was
+    /// reported on.
+    fn docker_on_wsl_without_the_gpu() -> Examination {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").dxg_device = false;
+        e.in_container = true;
+        e.container_kind = "docker".to_owned();
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        e
+    }
+
+    /// The ids of `report.matched`, in report order, with their scores.
+    fn ranking(report: &crate::diagnose::DiagnoseReport) -> Vec<(&str, i32)> {
+        report
+            .matched
+            .iter()
+            .map(|d| (d.id.as_str(), d.score))
+            .collect()
+    }
+
+    /// ROCMAI-785: without `/dev/dxg` nothing in the container can reach the
+    /// GPU, so that finding ranks first even though the shared-memory one
+    /// scores higher, and the closing line names it.
+    #[test]
+    fn in_a_docker_container_on_wsl_without_a_gpu_the_missing_device_ranks_first() {
+        let report = diagnose(&docker_on_wsl_without_the_gpu(), "");
+        let ranked = ranking(&report);
+        assert_eq!(
+            ranked.first().map(|(id, _)| *id),
+            Some("fix-wsl-1-gpu-not-exposed"),
+            "{ranked:?}"
+        );
+        let missing_gpu = report.matched[0].score;
+        let shm = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-19-shm-too-small")
+            .expect("the 64 MiB /dev/shm is still reported");
+        assert!(
+            shm.score > missing_gpu,
+            "the fixture must keep the shared-memory finding the higher score, or this \
+             test no longer shows the order is decided by more than score: {ranked:?}"
+        );
+
+        let text = render_report_text(&report, 20);
+        assert!(
+            text.starts_with("#1 (fix-wsl-1-gpu-not-exposed)"),
+            "the text lists the same order:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "When you are ready, run `rocm fix fix-wsl-1-gpu-not-exposed` (the top-ranked cause)"
+            ),
+            "the closing line names the cause ranked first:\n{text}"
+        );
+        assert!(
+            !text.contains("rocm fix fix-19-shm-too-small` (the"),
+            "and not the shared-memory finding:\n{text}"
+        );
+    }
+
+    /// The same host with a vLLM out-of-memory error pasted. That entry clears
+    /// HIGH_CONFIDENCE and the missing device does not, and the closing line
+    /// still follows the ranking instead of jumping to the HIGH row below it.
+    #[test]
+    fn a_high_confidence_workload_finding_does_not_take_the_closing_line_from_a_missing_gpu() {
+        let report = diagnose(&docker_on_wsl_without_the_gpu(), VLLM_OOM_CANONICAL_SYMPTOM);
+        let ranked = ranking(&report);
+        assert_eq!(
+            report.matched[0].id, "fix-wsl-1-gpu-not-exposed",
+            "{ranked:?}"
+        );
+        assert!(
+            report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-16-vllm-oom" && d.score >= HIGH_CONFIDENCE),
+            "the fixture must keep the out-of-memory finding at HIGH_CONFIDENCE: {ranked:?}"
+        );
+        assert!(report.matched[0].score < HIGH_CONFIDENCE, "{ranked:?}");
+
+        let text = render_report_text(&report, 20);
+        assert!(
+            !text.contains("Next step: run `rocm fix fix-16-vllm-oom`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The top-ranked cause is below the HIGH_CONFIDENCE threshold."),
+            "{text}"
+        );
+        assert!(
+            text.contains("run `rocm fix fix-wsl-1-gpu-not-exposed` (the top-ranked cause)"),
+            "{text}"
+        );
+    }
+
+    /// Precedence counts only once a finding clears the match threshold. A
+    /// container that can see `/dev/kfd` but no render node scores
+    /// `fix-10-container` at 45, below it, and that weak signal stays under the
+    /// established shared-memory finding.
+    #[test]
+    fn a_weak_gpu_path_signal_does_not_climb_over_an_established_finding() {
+        let mut e = linux_base();
+        e.in_container = true;
+        e.container_kind = "docker".to_owned();
+        e.kfd = Some(crate::examine::Device {
+            path: "/dev/kfd".to_owned(),
+            exists: true,
+            user_can_write: Some(true),
+            ..crate::examine::Device::default()
+        });
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        let report = diagnose(&e, "");
+        let ranked = ranking(&report);
+        assert_eq!(
+            ranked,
+            [("fix-19-shm-too-small", 70), ("fix-10-container", 45)],
+            "{ranked:?}"
+        );
+        let text = render_report_text(&report, 20);
+        assert!(
+            text.contains("run `rocm fix fix-19-shm-too-small` (the top-ranked cause)"),
+            "{text}"
+        );
+    }
+
+    /// The threshold itself counts as established: a [`Precedence::GpuPath`]
+    /// finding scoring exactly [`MIN_SCORE_FOR_MATCH`] keeps its precedence,
+    /// and one point less loses it. Several entries open at exactly that base
+    /// score, so `>` in place of `>=` would silently demote them.
+    #[test]
+    fn precedence_applies_from_the_match_threshold_and_not_below_it() {
+        assert!(
+            rank_key(Precedence::GpuPath, MIN_SCORE_FOR_MATCH)
+                < rank_key(Precedence::Other, MIN_SCORE_FOR_MATCH + 40)
+        );
+        assert!(
+            rank_key(Precedence::GpuPath, MIN_SCORE_FOR_MATCH - 1)
+                > rank_key(Precedence::Other, MIN_SCORE_FOR_MATCH)
+        );
+    }
+
+    /// On bare-metal Linux a container started without `/dev/kfd` already
+    /// outranked the shared-memory finding on score; it still ranks first, and
+    /// at HIGH_CONFIDENCE the closing line is the plain next step.
+    #[test]
+    fn a_linux_container_without_dev_kfd_still_ranks_first() {
+        let mut e = linux_base();
+        e.in_container = true;
+        e.container_kind = "docker".to_owned();
+        e.kfd = Some(crate::examine::Device {
+            path: "/dev/kfd".to_owned(),
+            exists: false,
+            ..crate::examine::Device::default()
+        });
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        let report = diagnose(&e, "");
+        let ranked = ranking(&report);
+        assert_eq!(report.matched[0].id, "fix-10-container", "{ranked:?}");
+        assert!(ranked.iter().any(|(id, _)| *id == "fix-19-shm-too-small"));
+        let text = render_report_text(&report, 20);
+        assert!(
+            text.contains("Next step: run `rocm fix fix-10-container`."),
+            "{text}"
         );
     }
 
@@ -585,8 +1030,8 @@ mod tests {
         // a `DIAGNOSE-ONLY` member of the same catalog, so `rocm fix` answers
         // for it on both platforms its checker is registered for, and the
         // `apply with:` line diagnose prints for it is live like every other.
-        for (check, families) in CHECKERS {
-            let id = check(&Examination::default(), "").id;
+        for (check, families, _) in CHECKERS {
+            let id = check.run(&Examination::default(), "", None).id;
             let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
                 panic!(
                     "checker id `{id}` has no recipe in the fix catalog, so the \
@@ -603,9 +1048,76 @@ mod tests {
         }
     }
 
+    /// The entries `diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`
+    /// holds to one plan: their diagnosis prints the catalog's command lines,
+    /// verify line and notes verbatim.
+    const SAME_PLAN_IDS: &[&str] = &[
+        "fix-16-vllm-oom",
+        "fix-15-msvc-redist",
+        "fix-21-msvc-redist-outdated",
+        "info-20-gpu-no-rocm-support",
+        "fix-13-hip-sdk-missing",
+        "fix-14-adrenalin-too-old",
+        crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID,
+        "fix-23-vllm-extension-load",
+    ];
+
+    /// The entries whose plan depends on the host, so their diagnosis cannot
+    /// print the catalog's lines verbatim, each with why and the test that
+    /// holds `rocm diagnose` and `rocm fix` to one plan for it. Reviewed: an
+    /// entry joins only with such a test.
+    const HOST_DEPENDENT_PLANS: &[(&str, &str)] = &[
+        (
+            "fix-2-unset-override",
+            "the diagnosis prints the lines for its own OS; the Windows clear line is the \
+             catalog's, the runner reads both env scopes first, and \
+             `the_override_fix_verify_matches_the_catalog_copy` holds the Linux verify line",
+        ),
+        (
+            "fix-4-render-group",
+            "the groups are the host's; both sides resolve them with `render_group_targets`, \
+             held by `the_render_group_plan_diagnose_prints_is_the_one_fix_runs`",
+        ),
+        (
+            "fix-6-path",
+            "the bin directory is the host's install; the Linux line is `path_export_line`, \
+             held by `the_path_fix_plan_diagnose_prints_is_the_one_fix_appends`, and the \
+             Windows line is the paste twin of `path_export_windows`",
+        ),
+        (
+            "fix-9-igpu-dgpu",
+            "the device index is the user's; the diagnosis prints the catalog's lines for its \
+             OS with the index as a placeholder, held by \
+             `the_igpu_plan_diagnose_prints_is_the_catalogs`",
+        ),
+    ];
+
+    /// Every entry `rocm fix` carries out somewhere is one whose diagnosis is
+    /// held to the catalog: either verbatim (`SAME_PLAN_IDS`) or through the
+    /// test its `HOST_DEPENDENT_PLANS` row names. A new acting entry fails
+    /// here until it is put on one of the two lists.
+    #[test]
+    fn every_entry_rocm_fix_carries_out_is_held_to_one_plan() {
+        for id in crate::fix::acting_fix_ids() {
+            assert!(
+                SAME_PLAN_IDS.contains(&id)
+                    || HOST_DEPENDENT_PLANS.iter().any(|(listed, _)| *listed == id),
+                "`{id}` acts on the machine, so the plan `rocm diagnose` prints for it has \
+                 to be held to the one `rocm fix` runs: add it to SAME_PLAN_IDS, or to \
+                 HOST_DEPENDENT_PLANS with the test that holds it"
+            );
+        }
+        for (id, _) in HOST_DEPENDENT_PLANS {
+            assert!(
+                crate::fix::acting_fix_ids().contains(id),
+                "`{id}` no longer acts on the machine; take it off HOST_DEPENDENT_PLANS"
+            );
+        }
+    }
+
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
+        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20, fix-22 and fix-23 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -627,6 +1139,7 @@ mod tests {
                 ..Examination::default()
             },
             VLLM_OOM_CANONICAL_SYMPTOM,
+            None,
         );
         let msvc = check_15_msvc_redist(
             &Examination {
@@ -678,7 +1191,14 @@ mod tests {
         // yet a user meets both of its copies, so it is held to the same guard.
         let display_driver_old =
             check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
-        for diag in [
+        let extension_load = check_23_vllm_extension_load(
+            &Examination {
+                os_family: "linux".to_owned(),
+                ..Examination::default()
+            },
+            crate::diagnose::VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+        );
+        let diagnoses = [
             vllm_oom,
             msvc,
             msvc_outdated,
@@ -686,7 +1206,14 @@ mod tests {
             hip_sdk_missing,
             adrenalin_old,
             display_driver_old,
-        ] {
+            extension_load,
+        ];
+        assert_eq!(
+            diagnoses.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            SAME_PLAN_IDS,
+            "SAME_PLAN_IDS names the entries this test compares"
+        );
+        for diag in diagnoses {
             if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
                 assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);
             } else {
@@ -731,8 +1258,8 @@ mod tests {
     /// Like that test it pins the text only. Nothing here runs a command in a
     /// shell. The Windows-only tests named on `fails_in_windows_powershell` in
     /// `fix/catalog.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
-    /// and `the_igpu_verify_pins_the_variable_it_names` runs fix-9's, all on
-    /// Windows.
+    /// and `the_igpu_verify_reads_the_variable_the_change_persisted` runs
+    /// fix-9's, all on Windows.
     #[test]
     fn windows_diagnosis_remediation_passes_the_powershell_text_rule() {
         // Host state that wakes the checkers which answer from the machine and
@@ -760,11 +1287,11 @@ mod tests {
                        HSA_OVERRIDE_GFX_VERSION vcruntime140_1.dll amdhip64_6.dll was not found \
                        hipblas.dll driver too old";
         let mut seen: Vec<String> = Vec::new();
-        for (check, families) in CHECKERS {
+        for (check, families, _) in CHECKERS {
             if !families.contains(&"windows") {
                 continue;
             }
-            let Some(fix) = check(&e, symptom).fix else {
+            let Some(fix) = check.run(&e, symptom, None).fix else {
                 continue;
             };
             let printed = fix

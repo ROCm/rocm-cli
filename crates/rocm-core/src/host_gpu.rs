@@ -14,7 +14,11 @@
 //!
 //! The probes live in child modules: `capture` (optional-command capture),
 //! `os_facts` (kernel, distro, CPU and RAM), `linux` (sysfs, KFD and DRM),
-//! `gpu_visibility` (which GPUs this process may use), `windows_inventory` (the
+//! `gpu_visibility` (which GPUs this process may use), `unified_memory` (the
+//! pool an APU's engine allocates a model from, which is neither its VRAM
+//! carve-out nor installed RAM), `vulkan` (whether a model can run through
+//! Vulkan on this host: ICD manifests, the Windows Khronos registry and
+//! `vulkaninfo`, classified into `VulkanStatus`), `windows_inventory` (the
 //! Windows display-adapter inventory), `wsl` (WSL detection and the Windows host
 //! driver as seen from the guest), `render` (the `rocm examine` text of an
 //! `ExamineSummary`), `diagnostics` (the GPU detection diagnostics text) and
@@ -54,6 +58,8 @@ mod gpu_visibility;
 pub(crate) mod linux;
 mod os_facts;
 mod render;
+mod unified_memory;
+mod vulkan;
 mod windows_inventory;
 mod wsl;
 
@@ -71,8 +77,15 @@ use linux::detect_linux_amdgpu_driver_version;
 use linux::detect_linux_primary_gpu_name;
 pub(crate) use linux::detect_linux_sysfs_gfx_target;
 pub use linux::is_amdgpu_device;
+pub(crate) use linux::pci_bus_device_function;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) use linux::{KfdGpuNode, kfd_gpu_nodes_in};
+pub use unified_memory::detect_host_unified_memory_gib;
+pub use vulkan::{
+    VulkanDevice, VulkanEvidence, VulkanStatus, VulkanSupport, amd_icd_driver_label,
+    classify_vulkan_support, detect_vulkan_support, icd_driver_label, icd_is_gpu_driver,
+    parse_vulkaninfo_summary, parse_windows_vulkan_icd_listing, windows_icds_from_capture,
+};
 pub(crate) use windows_inventory::detect_windows_amd_driver_info;
 #[cfg(test)]
 use windows_inventory::parse_windows_examine_inventory;
@@ -83,12 +96,13 @@ use windows_inventory::{
 };
 #[cfg(target_os = "linux")]
 use wsl::detect_wsl_windows_display_probe_text;
+pub use wsl::ldconfig_cache;
 #[cfg(test)]
 use wsl::local_windows_host_driver_probe;
 pub use wsl::{WSL_ROCDXG_READY, WslHostDriverProbe, is_wsl_host};
 pub(crate) use wsl::{
     detect_local_windows_host_driver, detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel,
-    ldconfig_cache, ldconfig_lists_librocdxg,
+    ldconfig_lists_librocdxg,
 };
 use wsl::{detect_wsl_windows_display_gfx_target_fast, wsl_driver_summary};
 
@@ -133,12 +147,29 @@ pub struct ExamineSummary {
     pub compatible_therock_family: Option<String>,
     #[serde(default)]
     pub detected_therock_family: Option<String>,
+    /// What the Vulkan probe found, when it could run.
+    ///
+    /// `#[serde(default)]` is load-bearing in the *reverse* direction: `rocm
+    /// remote doctor` deserializes summaries produced by other hosts, which may
+    /// be running a build from before this field existed. `None` means "not
+    /// probed", which [`ExamineSummary::vulkan_status`] maps to
+    /// [`VulkanStatus::Unknown`] — never to "no Vulkan".
+    #[serde(default)]
+    pub vulkan: Option<VulkanSupport>,
     pub driver: DriverSummary,
     pub legacy_rocm: LegacyRocmSummary,
     #[serde(default)]
     pub wsl: Option<WslSummary>,
     pub managed_runtime_count: usize,
     pub managed_service_count: usize,
+    /// Managed runtimes' own `librocdxg.so.1` that the runtime's HSA runtime does
+    /// not load on this WSL host, because it opens `librocdxg.so` and the wheel
+    /// ships no such file (or the file is a dangling link), so it takes the host's
+    /// copy instead. Empty off WSL and when every runtime's copy is reachable. See
+    /// [`crate::runtime_rocdxg`]. Absent from output written before the field
+    /// existed, hence the default.
+    #[serde(default)]
+    pub unlinked_runtime_librocdxg: Vec<PathBuf>,
     pub model_cache_entries: usize,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
@@ -170,7 +201,7 @@ pub struct WslSummary {
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
     /// `librocdxg.so` is in the same `lib` directory as a `libhsa-runtime64`,
-    /// which finds it through its own `$ORIGIN` runpath with no cache entry and
+    /// which finds it through its own `$ORIGIN` search path with no cache entry and
     /// no `LD_LIBRARY_PATH`. Absent from output written before the field
     /// existed, hence the default.
     #[serde(default)]
@@ -238,22 +269,36 @@ impl ExamineSummary {
         Self::gather_scoped(true, Some(&examination.kernel_release))
     }
 
-    /// The host summary without the Windows driver version and date, for a
-    /// caller that reads neither. On an AMD Windows host that skips the
-    /// PowerShell video-controller query `gather` adds for them; the GPU
-    /// target, CPU, RAM and every other field are the same.
+    /// The host summary without the probes that spawn a process purely to
+    /// describe the host, for a caller that reads none of their fields: the
+    /// Windows driver version and date, and the Vulkan probe.
+    ///
+    /// On an AMD Windows host that skips the PowerShell video-controller query
+    /// `gather` adds for the driver facts, and on every platform it skips the
+    /// `vulkaninfo` (or Windows registry) read behind [`vulkan`](Self::vulkan),
+    /// which is left `None` — "not probed", which
+    /// [`vulkan_status`](Self::vulkan_status) maps to [`VulkanStatus::Unknown`]
+    /// and never to "no Vulkan". The GPU target, CPU, RAM and every other field
+    /// are the same.
     pub fn gather_without_driver_facts() -> Result<Self> {
         Self::gather_scoped(false, None)
     }
 
-    fn gather_scoped(driver_facts: bool, examined_kernel: Option<&str>) -> Result<Self> {
+    /// `host_probes` buys the fields that cost a spawned process to describe
+    /// the host — the Windows driver facts and the Vulkan probe. It is not a
+    /// detail of either one: a caller that wants neither must pay for neither,
+    /// which is what [`gather_without_driver_facts`](Self::gather_without_driver_facts)
+    /// is for.
+    fn gather_scoped(host_probes: bool, examined_kernel: Option<&str>) -> Result<Self> {
         let paths = AppPaths::discover()?;
-        let windows_inventory = if driver_facts {
+        let windows_inventory = if host_probes {
             detect_windows_examine_inventory_with_driver_facts()
         } else {
             detect_windows_examine_inventory()
         };
         let wsl = detect_wsl_summary();
+        let unlinked_runtime_librocdxg =
+            crate::runtime_rocdxg::unlinked_managed_runtime_copies(wsl.is_some(), &paths);
         let detected_gfx_target = detect_examine_gfx_target_fast(windows_inventory.as_ref());
         let compatible_therock_family = detected_gfx_target
             .as_deref()
@@ -284,6 +329,7 @@ impl ExamineSummary {
             detected_gfx_target,
             compatible_therock_family,
             detected_therock_family,
+            vulkan: host_probes.then(detect_vulkan_support),
             driver: detect_driver_summary_with_windows_inventory(
                 windows_inventory.as_ref(),
                 wsl.as_ref(),
@@ -294,6 +340,7 @@ impl ExamineSummary {
                 &paths.data_dir.join("runtimes").join("registry"),
             ),
             managed_service_count: count_json_files(&paths.services_dir()),
+            unlinked_runtime_librocdxg,
             model_cache_entries: count_dir_entries(&paths.data_dir.join("models")),
             config_dir: paths.config_dir,
             data_dir: paths.data_dir,
@@ -433,6 +480,16 @@ pub fn detect_gpu_driver_version() -> Option<String> {
     None
 }
 
+/// The [`DriverSummary::status`] word for a Windows host whose AMD display
+/// driver was read.
+///
+/// Written once because it is also a *fact about the Vulkan driver*: on Windows
+/// the display driver installs the Vulkan ICD, so `render.rs` cross-checks this
+/// word before advising an unconfirmed-Vulkan host to install one. Only
+/// [`windows_driver_summary`] produces it, which is what makes matching on it a
+/// Windows-only test.
+pub(super) const AMD_DISPLAY_DRIVER_DETECTED: &str = "amd_display_driver_detected";
+
 fn windows_driver_summary(
     detail: Option<String>,
     windows: Option<crate::windows_driver::WindowsDriverInfo>,
@@ -440,7 +497,7 @@ fn windows_driver_summary(
     DriverSummary {
         policy: "windows_validate_only".to_owned(),
         status: if detail.is_some() {
-            "amd_display_driver_detected".to_owned()
+            AMD_DISPLAY_DRIVER_DETECTED.to_owned()
         } else {
             "not_detected".to_owned()
         },
@@ -465,6 +522,139 @@ fn count_dir_entries(dir: &Path) -> usize {
 
 pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
     detect_host_gpu_summary_fast(paths)
+}
+
+/// The GPU name an engine may record at launch for a service pinned to
+/// `gpu_indices`, for the `device:` row `rocm serve` and `rocm services list`
+/// print (ROCMAI-550).
+///
+/// `None` whenever the name cannot be attributed to the *pinned* device, which
+/// is most of what this function is for. Every name probe on this host —
+/// [`detect_host_gpu_summary`] on Linux, the Windows display inventory — answers
+/// for the host's primary/preferred adapter, not for an ordinal. On a multi-GPU
+/// host that would print `gpu 1 (<name of GPU 0>)`: a row that looks specific
+/// and is wrong, which is worse than the bare `gpu 1` it replaced. So the name
+/// is reported only when the host has exactly **one** AMD GPU, where "the
+/// primary one" and "the pinned one" cannot differ.
+///
+/// The three built-in engines all call this instead of probing themselves, so
+/// the rule lives in one place and `engines/aim` (which records no ordinal at
+/// all) is held to it as well.
+///
+/// Why not map the ordinal to a device properly: the ordinals in `gpu_indices`
+/// are HIP ordinals *after* the visibility mask
+/// ([`usable_amd_gpu_indices`]), so ordinal 0 under `ROCR_VISIBLE_DEVICES=1`
+/// is the host's second card. Attributing a name would mean enumerating
+/// devices in HIP order and re-applying that mask, and neither KFD topology
+/// nodes nor DRM cards carry a marketing name — so it is a real probe to build
+/// and one no lane here can verify (none of the CI hosts has two AMD GPUs).
+/// Until that exists, a mask in effect is treated exactly like a second GPU:
+/// no name.
+#[must_use]
+pub fn pinned_gpu_name(gpu_indices: &[u32]) -> Option<String> {
+    // One Windows display-inventory read per call, shared by the two questions
+    // that need it. Both the count and the name come from the same `pnputil` /
+    // CIM query, and asking twice meant two PowerShell/WMI probes on the serve
+    // launch path. The read is eager rather than lazy only on the platform that
+    // uses it: off Windows nothing is probed here at all, and on Windows the
+    // count already needed it before any of the decisions below could run.
+    //
+    // The cost, stated rather than implied: this
+    // deduplicates *within* a call and is **not** cached across calls. Each
+    // engine's `write_running_state` calls it, and that runs more than once per
+    // launch (`starting`, then `running`), so a Windows launch pays that many
+    // PowerShell/CIM probes. It is on the launch path only — no request path
+    // reaches it — which is why the cost is accepted rather than cached: a
+    // cache would have to be invalidated on GPU hotplug to stay correct, and no
+    // caller is hot enough to earn that. Unverified on Windows; nothing
+    // available to this change can build the MSVC target.
+    let windows_inventory = runtime_is_windows()
+        .then(detect_windows_examine_inventory)
+        .flatten();
+    gpu_name_for_single_gpu_host(
+        gpu_indices,
+        amd_gpu_count_for_naming(windows_inventory.as_ref()),
+        gpu_visibility_mask_in_effect(),
+        || host_primary_gpu_name(windows_inventory.as_ref()),
+    )
+}
+
+/// The decision [`pinned_gpu_name`] makes, with the host probes lifted out.
+///
+/// Split out because every input here is a host fact a unit test cannot plant
+/// (a second GPU, a Windows display inventory), while the rule itself — "a name
+/// only when nothing else on this host could be the one that was pinned" — is
+/// the whole point and is exactly what a regression would silently undo.
+fn gpu_name_for_single_gpu_host<F>(
+    gpu_indices: &[u32],
+    present_amd_gpus: Option<usize>,
+    mask_in_effect: bool,
+    name: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    // A pinned ordinal other than 0 cannot be the only GPU on the host, so it
+    // is already outside what the probes can attribute. Checked separately from
+    // the count so a disagreement between the two (a `--gpu 1` that got past
+    // validation on a host now reporting one GPU) also declines to name.
+    if gpu_indices.iter().any(|&index| index != 0) {
+        return None;
+    }
+    if mask_in_effect || present_amd_gpus != Some(1) {
+        return None;
+    }
+    name()
+}
+
+/// How many AMD GPUs this host presents, for [`pinned_gpu_name`]'s
+/// "could this name belong to another card?" test. `None` when it cannot be
+/// established, which declines the name rather than guessing.
+///
+/// `windows_inventory` is the display listing the caller already read, or
+/// `None` off Windows (and when the listing failed); see [`pinned_gpu_name`]
+/// for why it is passed in rather than read here.
+fn amd_gpu_count_for_naming(windows_inventory: Option<&WindowsExamineInventory>) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        if !runtime_is_windows() {
+            // WSL2 exposes no per-device topology; the ROCm-over-dxg path
+            // reaches a single device, which is what `usable_amd_gpu_indices`
+            // reports there too.
+            if is_wsl_host() {
+                return Some(1);
+            }
+            return gpu_visibility::combine_amd_gpu_counts(
+                linux::linux_kfd_gpu_node_count(),
+                linux::linux_drm_amdgpu_card_count(),
+            );
+        }
+    }
+    windows_inventory.map(WindowsExamineInventory::amd_display_count)
+}
+
+/// The host's primary/preferred AMD GPU name — correct only on a host with one
+/// AMD GPU, which is why [`pinned_gpu_name`] is the only caller.
+fn host_primary_gpu_name(windows_inventory: Option<&WindowsExamineInventory>) -> Option<String> {
+    if runtime_is_windows() {
+        return windows_inventory.and_then(WindowsExamineInventory::amd_display_name);
+    }
+    detect_host_gpu_summary(None).name
+}
+
+/// Whether a GPU visibility mask is narrowing what the engine can see, so a
+/// HIP ordinal no longer indexes the host's own device order.
+#[cfg(target_os = "linux")]
+fn gpu_visibility_mask_in_effect() -> bool {
+    gpu_visibility::visibility_mask_in_effect()
+}
+
+/// Platform stub: the mask readers are Linux-only (see
+/// [`visibility_mask_from_env`]), so nothing here can observe a mask. A mask
+/// reader for another platform must extend this rather than leave it `false`.
+#[cfg(not(target_os = "linux"))]
+const fn gpu_visibility_mask_in_effect() -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -592,6 +782,21 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm remote doctor` and the daemon read an `ExamineSummary` another build
+    /// wrote; one from before `unlinked_runtime_librocdxg` existed must still load.
+    #[test]
+    fn a_summary_written_before_the_runtime_librocdxg_field_still_loads() {
+        let mut value = serde_json::to_value(windows_summary_with_driver(None)).expect("serialise");
+        let removed = value
+            .as_object_mut()
+            .expect("an object")
+            .remove("unlinked_runtime_librocdxg");
+        assert!(removed.is_some(), "the field is serialised today");
+
+        let loaded: ExamineSummary = serde_json::from_value(value).expect("old summary loads");
+        assert!(loaded.unlinked_runtime_librocdxg.is_empty());
+    }
+
     pub(super) fn windows_summary_with_driver(
         info: Option<crate::windows_driver::WindowsDriverInfo>,
     ) -> ExamineSummary {
@@ -607,6 +812,7 @@ mod tests {
             detected_gfx_target: None,
             compatible_therock_family: None,
             detected_therock_family: None,
+            vulkan: None,
             driver: windows_driver_summary(
                 Some("AMD Radeon(TM) Graphics driver 30.0.13014.8".to_owned()),
                 info,
@@ -620,6 +826,7 @@ mod tests {
             wsl: None,
             managed_runtime_count: 0,
             managed_service_count: 0,
+            unlinked_runtime_librocdxg: Vec::new(),
             model_cache_entries: 0,
             config_dir: PathBuf::from("config"),
             data_dir: PathBuf::from("data"),
@@ -681,11 +888,12 @@ mod tests {
         }
     }
 
-    /// `gather_without_driver_facts` is `gather` minus the driver version and
-    /// date: the GPU target a caller reads is the same, and it never carries a
-    /// driver record the full summary lacks. That it starts no PowerShell query
-    /// for them is the `the_startup_paths_do_not_start_the_driver_fact_query`
-    /// test, which counts the sources the same scope runs.
+    /// `gather_without_driver_facts` is `gather` minus the fields that cost a
+    /// spawned process: the GPU target a caller reads is the same, and it never
+    /// carries a driver record the full summary lacks. That it starts no
+    /// PowerShell query for them is the
+    /// `the_startup_paths_do_not_start_the_driver_fact_query` test, which counts
+    /// the sources the same scope runs.
     #[test]
     fn the_summary_without_driver_facts_keeps_the_gpu_target() {
         let full = ExamineSummary::gather().expect("full summary");
@@ -701,6 +909,29 @@ mod tests {
             "{:?} vs {:?}",
             lean.driver.windows,
             full.driver.windows
+        );
+    }
+
+    /// The lean scope must not run the Vulkan probe. This is the assertion, not
+    /// a timing measurement: the probe spawns `vulkaninfo` on Linux and starts
+    /// PowerShell on Windows, and the whole point of this scope is that a caller
+    /// reading only the GPU target does not pay for a process it will not read.
+    ///
+    /// Restoring `vulkan: Some(detect_vulkan_support())` in `gather_scoped`
+    /// fails this. `None` is not a loss of information: it is the "not probed"
+    /// value the field documents, which `vulkan_status` reports as `Unknown`
+    /// rather than as an absence of Vulkan.
+    #[test]
+    fn the_summary_without_driver_facts_does_not_probe_vulkan() {
+        let lean = ExamineSummary::gather_without_driver_facts().expect("lean summary");
+        assert_eq!(
+            lean.vulkan, None,
+            "the lean scope probed Vulkan; it must stay out of the cheap paths"
+        );
+        assert_eq!(
+            lean.vulkan_status(),
+            VulkanStatus::Unknown,
+            "an unprobed host must read as Unknown, never as having no Vulkan"
         );
     }
 
@@ -802,6 +1033,82 @@ mod tests {
             assert!(!rendered.contains("driver_age:"), "{rendered}");
             assert!(!rendered.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
         }
+    }
+
+    #[test]
+    fn a_second_gpu_on_the_host_withholds_the_name() {
+        let mut probed = false;
+        let name = gpu_name_for_single_gpu_host(&[1], Some(2), false, || {
+            probed = true;
+            Some("AMD Instinct MI300X".to_owned())
+        });
+        assert_eq!(name, None);
+        assert!(
+            !probed,
+            "a name that cannot be attributed must not be probed"
+        );
+
+        // Ordinal 0 on that same host is no safer: the probe answers for the
+        // host's primary adapter, which the mask/enumeration order need not
+        // agree with.
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[0], Some(2), false, || Some("AMD".to_owned())),
+            None
+        );
+    }
+
+    /// The ordinal guard on its own, with the host count agreeing there is one
+    /// GPU — the disagreement its doc comment names (a `--gpu 1` that got past
+    /// validation on a host now reporting a single card).
+    ///
+    /// Every other case here supplies a count that already declines, so
+    /// deleting the ordinal branch left the whole suite green. This is the
+    /// only call that reaches it.
+    #[test]
+    fn a_pinned_ordinal_the_host_count_contradicts_withholds_the_name() {
+        let mut probed = false;
+        let name = gpu_name_for_single_gpu_host(&[1], Some(1), false, || {
+            probed = true;
+            Some("AMD Instinct MI300X".to_owned())
+        });
+        assert_eq!(name, None);
+        assert!(
+            !probed,
+            "an ordinal the host's own count contradicts must not be probed"
+        );
+    }
+
+    #[test]
+    fn a_single_unmasked_gpu_is_named() {
+        for indices in [&[][..], &[0][..]] {
+            assert_eq!(
+                gpu_name_for_single_gpu_host(indices, Some(1), false, || Some(
+                    "AMD Radeon Graphics".to_owned()
+                )),
+                Some("AMD Radeon Graphics".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn a_visibility_mask_withholds_the_name() {
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[0], Some(1), true, || Some("AMD".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_gpu_count_withholds_the_name() {
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[0], None, false, || Some("AMD".to_owned())),
+            None
+        );
+        // And a host with no AMD GPU at all has nothing to name.
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[], Some(0), false, || Some("AMD".to_owned())),
+            None
+        );
     }
 
     /// The summary takes the examination's kernel release on Linux without a

@@ -22,6 +22,9 @@ pub(crate) struct AimImageMetadata {
     pub accelerator_type: Option<String>,
     pub pytorch_rocm_arch: Vec<String>,
     pub canonical_name: Option<String>,
+    /// Every `KEY=VALUE` entry of the image's `Env`, for values a launch has
+    /// to extend rather than replace (`PYTHONPATH`, `AIM_ENGINE_ARGS`).
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Normalizes a user- or catalog-supplied image reference so the registry
@@ -139,8 +142,20 @@ pub(crate) fn fetch_image_metadata(image_ref: &str) -> Result<AimImageMetadata> 
 /// Metadata from the local daemon's copy of the image, or `None` if the image
 /// isn't present locally.
 pub(crate) fn local_image_metadata(image_ref: &str) -> Option<AimImageMetadata> {
-    let config = crate::docker::image_config(image_ref).ok().flatten()?;
-    Some(parse_image_config(&config))
+    read_local_image_metadata(image_ref).ok()
+}
+
+/// [`local_image_metadata`], saying why it could not be read: `docker image
+/// inspect` failed to run, or answered without a config it could parse.
+pub(crate) fn read_local_image_metadata(image_ref: &str) -> Result<AimImageMetadata> {
+    // `null` is what inspect prints for an image with no config at all, which
+    // tells a keyed launch no more about the image's env than no answer does.
+    let config = crate::docker::image_config(image_ref)?
+        .filter(|config| !config.is_null())
+        .with_context(|| {
+            format!("`docker image inspect {image_ref}` returned no readable `.Config`")
+        })?;
+    Ok(parse_image_config(&config))
 }
 
 /// Parses an image `Config` object (`{"Env": [...], "Labels": {...}}`), the
@@ -156,6 +171,7 @@ fn parse_image_config(config: &Value) -> AimImageMetadata {
         .unwrap_or_default();
     for entry in env_entries {
         if let Some((key, value)) = entry.split_once('=') {
+            metadata.env.insert(key.to_owned(), value.to_owned());
             match key {
                 "AIM_ACCELERATOR_TYPE" => metadata.accelerator_type = Some(value.to_owned()),
                 "PYTORCH_ROCM_ARCH" => {
@@ -290,6 +306,10 @@ mod tests {
         assert_eq!(
             metadata.canonical_name.as_deref(),
             Some("Llama-3.2-1B-Instruct")
+        );
+        assert_eq!(
+            metadata.env.get("PATH").map(String::as_str),
+            Some("/usr/bin")
         );
     }
 }

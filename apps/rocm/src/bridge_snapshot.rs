@@ -28,19 +28,26 @@ use rocm_core::{
 };
 
 use crate::engine_inventory;
+use crate::examine_report_text::engine_inventory_note;
 use crate::managed_service_status::load_managed_services;
 
 pub(crate) fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
+    // Hoisted out of the struct literal so the engine rows can be told what this
+    // host actually supports. The probe is already paid for: `gpu_support_level`
+    // takes exactly the two fields this summary already carries, so the engine
+    // list costs no detection the snapshot was not doing anyway.
+    let examine = ExamineSummary::gather()?;
+    let gpu_support_level = rocm_core::gpu_support_level_for_examine(&examine);
     Ok(CodexBridgeSnapshot {
         protocol: "rocmd-codex-bridge-v0".to_owned(),
         generated_at_unix_ms: rocm_core::unix_time_millis(),
-        examine: ExamineSummary::gather()?,
+        examine,
         gpu: build_codex_bridge_gpu_snapshot(&config),
         config,
         automation_runtime: AutomationRuntimeState::load(paths)?,
         recent_automation_events: load_recent_automation_events(paths, 32)?,
-        engines: builtin_codex_bridge_engine_inventory(),
+        engines: builtin_codex_bridge_engine_inventory(gpu_support_level),
         services: load_managed_services(paths)?,
     })
 }
@@ -63,7 +70,22 @@ pub(crate) fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBr
     }
 }
 
-pub(crate) fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
+/// The engine catalogue in the codex-bridge snapshot and the bridge's `engines`
+/// tool, built from [`engine_inventory`] with lemonade's note replaced
+/// by `lemonade_engine_note` for the given support level.
+///
+/// It takes the level rather than reading the static row because the stale
+/// "with ROCm llama.cpp backend" claim is exactly what ROCMAI-550 exists to
+/// remove, and this is a user-facing surface like the other two: a bridge
+/// client renders `summary` to the operator.
+///
+/// Only `summary` moves. The field set, its names and `installed_binary: true`
+/// beside it are untouched, so the bridge's JSON shape is the same; what
+/// changes is that one string stops asserting ROCm support on a host that has
+/// none.
+pub(crate) fn builtin_codex_bridge_engine_inventory(
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> Vec<CodexBridgeEngine> {
     let default_engine = default_engine_for_platform();
     let binary_path = daemon_binary_path()
         .ok()
@@ -72,7 +94,13 @@ pub(crate) fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> 
         .iter()
         .map(|(id, summary)| CodexBridgeEngine {
             id: (*id).to_owned(),
-            summary: (*summary).to_owned(),
+            summary: engine_inventory_note(
+                id,
+                summary,
+                gpu_support_level,
+                crate::examine_report_text::InventorySurface::Standalone,
+            )
+            .to_owned(),
             default_for_platform: *id == default_engine,
             installed_binary: true,
             binary_path: binary_path.clone(),

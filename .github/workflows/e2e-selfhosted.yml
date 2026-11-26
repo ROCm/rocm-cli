@@ -9,11 +9,20 @@ name: E2E self-hosted
 # THIS workflow's supersession, never the required checks in ci.yml. Only
 # pull_request runs are superseded (see `concurrency:` below).
 #
+# Per-PR scope: a pull request runs one Linux GPU target, gfx942, as two checks
+# (`e2e-gpu-queue`, the primary, on an MI325X of the shared GPU queue, and
+# `e2e-gpu`, the second, on a self-hosted MI300X runner; vLLM is the effective
+# engine on both, and no other target here runs it) and one Windows GPU pool (the Strix Halo pool:
+# `e2e-gpu-strix-windows` and `e2e-wsl`). The Strix
+# Ubuntu lane keeps its push / dispatch triggers; it does not start on
+# pull_request or merge_group. There is no W7900 lane here: W7900 is covered only
+# by the scheduled queue nightly's `w7900-dual` lane (docs/nightly-on-the-queue.md),
+# not on push, release/** or dispatch.
+#
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
-# because of `continue-on-error`, which is `false` on every lane but
-# one, so a real hardware regression shows red instead of always green. The
-# exception is `e2e-gpu-w7900`, `true` only while that hardware is proven out. PRs #334, #335 and #343 all
+# because of `continue-on-error`, which is `false` on every lane, so a real
+# hardware regression shows red instead of always green. PRs #334, #335 and #343 all
 # landed while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the
 # merge_group ref, which a required check under ALLGREEN would have blocked;
 # renaming a lane is therefore safe.
@@ -29,8 +38,18 @@ on:
     # branch-push trigger).
     branches: [main, "release/**"]
   # Mirror ci.yml: run on PRs against ANY base branch so a stacked PR still gets
-  # the GPU lanes. Affected-crate/heavy selection diffs against github.base_ref.
+  # the GPU lanes. The `serve` gate comes from the pull request's changed files
+  # (see .github/actions/classify-changes), whatever its base branch.
   pull_request:
+    # `closed` (merge OR close) joins the PR's concurrency group below, so it
+    # supersedes that PR's earlier run. It runs only the no-op `pr-closed` job;
+    # every GPU lane skips because `changes` skips. This frees runners only where
+    # the cancel completes: a job queued for a runner that is not picking it up
+    # (a lane whose runner is busy) may not finish cancelling, so this
+    # does NOT clear such queued runs. Where the MI300X job is the one that
+    # reaches its runner, its stale-run guard ends it and `cancel-stale-run`
+    # cancels the run (same-repo PRs only); the Strix lanes carry no guard.
+    types: [opened, synchronize, reopened, closed]
   merge_group:
     branches: [main]
     types: [checks_requested]
@@ -44,7 +63,7 @@ on:
         type: choice
         default: all
         # Each value also selectable on its own; `all` covers every lane below.
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl, w7900]
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
@@ -87,92 +106,48 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Trimmed copy of ci.yml's `changes` job: cross-workflow `needs` is impossible,
-  # so this workflow computes its own `heavy` gate to avoid running the expensive
-  # GPU lanes on a doc-only PR. Off pull_request (push/merge_group) heavy is
+  # This workflow's own `changes` job (cross-workflow `needs` is impossible),
+  # classifying paths through the same .github/actions/classify-changes action
+  # as ci.yml, so the two cannot disagree about what a change touches. The GPU
+  # lanes gate on `serve`, so a doc-only PR does not run them. Off pull_request
+  # (push/merge_group/dispatch), and on a pull request that changes a file
+  # neither a category nor the action's `inert` list names, every category is
   # forced true, matching ci.yml.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
+    # Skipped on `closed`, and with it every lane and `e2e-report`: the lanes gate
+    # on `needs.changes.result == 'success'`, the report on
+    # `needs.changes.outputs.serve`, which is empty for a skipped job.
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
-      # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
-      # full matrix (every lane but MI300X, which skips merge_group) and its
+      # The string 'true' or 'false'; consumers compare `== 'true'`. Narrow
+      # GPU-serve gate; forced true off-PR so the merge queue runs the
+      # full matrix (every lane but MI300X and Strix Ubuntu, which skip
+      # merge_group) and its
       # required checks are never starved.
-      serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
-      # ROCMAI-430: the three most recent rows of the official release list
-      # (rocm.docs.amd.com/en/latest/release/versions.html, see
+      serve: ${{ steps.classify.outputs.serve == 'true' }}
+      # ROCMAI-430: the three newest final releases on the release channel's
+      # package indexes (resolved at run time, see
       # xtask/src/rocm_releases.rs), fanned out ONLY on a release-branch push —
       # everywhere else (PR, merge queue, manual dispatch) this stays a
       # single-element `current` matrix, same cost as before this existed.
       sdk_version_matrix: ${{ steps.sdk_matrix.outputs.matrix }}
+      # The versions n-1/n-2 resolve to, read once here so every leg of the run
+      # pins the same ones even if a release is published meanwhile. `{}` when
+      # the matrix is only `current`.
+      sdk_pins: ${{ steps.sdk_pins.outputs.pins }}
     steps:
+      # The local action below is read from the checked-out workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Filter changed paths (pull requests only)
-        id: filter
-        if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        with:
-          filters: |
-            # Same `heavy` set as ci.yml: anything that can affect the E2E suite.
-            heavy:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              - 'scripts/**'
-              - 'xtask/**'
-              - 'engines/**'
-              - '**/*.py'
-              - '**/*.sh'
-              - '**/*.ps1'
-              - '**/*.feature'
-              - 'tests/e2e-cucumber/**'
-              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
-              # rocm_doctor_skill.feature scenarios parse its catalog table and
-              # compare it to `rocm fix`. A skill-only edit must therefore run
-              # this job too, same as ci.yml's `heavy` filter.
-              - 'skills/**'
-              - 'install*'
-              - 'docs/keys/**'
-              - '.github/workflows/**'
-            # The real-GPU serve matrix (e2e-gpu*). Narrower than `heavy`: only
-            # paths that can change serve BEHAVIOUR or the GPU E2E harness — NOT a
-            # blanket `**/*.rs`. Compile coverage for every crate already runs on
-            # ci.yml's always-on build/test lanes, so a dash-only or unrelated-
-            # crate Rust PR need not fire the heavy serve matrix. Err toward
-            # inclusion — Cargo.lock, the toolchain, and the workflow itself are
-            # broad safety nets so a transitive-dep or CI change still runs the
-            # matrix. (Excluded on purpose: crates/rocm-dash-* — they build into
-            # `rocm` but cannot change serve behaviour.)
-            serve:
-              - 'engines/**'
-              - 'crates/rocm-core/**'
-              - 'crates/rocm-engine-protocol/**'
-              - 'apps/rocm/**'
-              - 'apps/rocmd/**'
-              - 'tests/e2e-cucumber/**'
-              - 'crates/e2e-report/**'
-              - 'xtask/**'
-              - '**/*.feature'
-              - 'scripts/**'
-              # Root manifest only (NOT `**/Cargo.toml` — that would re-include
-              # the excluded dash crates): `[workspace.dependencies]` edits here
-              # can change a serving crate's deps without touching Cargo.lock.
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              - '.github/workflows/**'
-
-      - name: Force full run off pull requests
-        id: all
-        if: github.event_name != 'pull_request'
-        run: echo "forced=true" >> "$GITHUB_OUTPUT"
+      - name: Classify changed paths
+        id: classify
+        uses: ./.github/actions/classify-changes
 
       - name: Compute sdk_version matrix (ROCMAI-430)
         id: sdk_matrix
@@ -183,15 +158,53 @@ jobs:
             echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve n-1/n-2 pins once (ROCMAI-430)
+        id: sdk_pins
+        env:
+          SDK_MATRIX: ${{ steps.sdk_matrix.outputs.matrix }}
+        run: |
+          if [[ "${SDK_MATRIX}" == *n-1* ]]; then
+            echo "pins=$(cargo xtask release-pins)" >> "$GITHUB_OUTPUT"
+          else
+            echo 'pins={}' >> "$GITHUB_OUTPUT"
+          fi
+
+  # Exists only to start a run in the PR's concurrency group when the PR is
+  # merged or closed: that run cancels the PR's older run. A GPU job of that run
+  # which is queued for a runner that is not picking it up may not finish
+  # cancelling (observed on queued runs). A same-repo PR's run whose MI300X job
+  # reaches its runner is then cancelled by `e2e-gpu`'s stale-run guard and
+  # `cancel-stale-run`.
+  pr-closed:
+    name: Supersede runs of a closed PR
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: echo "PR closed; its earlier E2E runs are superseded by this run."
+
   e2e-gpu:
     name: E2E tests (MI300X, ${{ matrix.sdk_version }})
     timeout-minutes: 90
     # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
     # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
     # on gfx1151 — red on the WSL host, and (worse) a silent pass published as
-    # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
+    # an MI300X report, which the consolidated grid renders as MI300X.
+    #
+    # On a pull request this lane is the second gfx942 check: the first is the
+    # queue run of `e2e-gpu-queue` below, which does not wait for one of these
+    # runners. This lane is kept for the runners' own coverage (their runtime and
+    # cache). Where the queue lane takes the pull request, a lane that ran and
+    # failed still fails `E2E consolidated report (self-hosted)` through
+    # `mi300x-gate.sh`; one that never got a runner is absent, not failed.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
+    # Read by `cancel-stale-run`. `e2e-report` cannot read it (it reaches this
+    # lane through `e2e-gpu-settled`), so a stale run also uploads an
+    # `mi300x-stale-run` marker, which the gfx942 check reads as an absent lane.
+    outputs:
+      stale: ${{ steps.stale.outputs.stale }}
     strategy:
       fail-fast: false
       # n-1/n-2 (ROCMAI-430) only fan out on a release-branch push — see the
@@ -199,7 +212,7 @@ jobs:
       # single-element `["current"]` matrix, so the ordinary PR/merge-queue path
       # runs exactly one job, unchanged from before this matrix existed.
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself, and this check isn't in the required list (see the
     # file header), so a broken build here still can't block a merge; ci.yml's
@@ -221,7 +234,18 @@ jobs:
           && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
       )
     continue-on-error: false
+    # Job-level, so it replaces the workflow's `contents: read`: that is
+    # restated. `pull-requests: read` is for the stale-run guard's PR lookup.
+    # No write scope: this job builds and runs PR code on a persistent runner,
+    # and untrusted code and a write-scoped token do not share a job here (the
+    # cancel lives in `cancel-stale-run`, which runs none).
+    permissions:
+      contents: read
+      pull-requests: read
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       # Bound serve readiness below the 35-min job cap so a serve that never comes
       # ready fails the scenario with a real error instead of hanging until the
       # job is cancelled. 300s is ample for a real MI300X vLLM cold-start;
@@ -233,7 +257,63 @@ jobs:
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
     steps:
+      # Stale-run guard: a run whose PR was closed or merged, or whose head has
+      # moved on, has no use for the MI300X. `concurrency` cancels superseded
+      # runs, but a job already waiting for a self-hosted runner does not always
+      # leave the queue (see `pr-closed`), so the job checks the PR the moment it
+      # gets a runner, before the ~45 min of build + serve work, and ends without
+      # running anything. It only reads and records `stale`; `cancel-stale-run`
+      # (a hosted job, no checkout) then cancels the run.
+      #
+      # This has to be a step: a job-level `if` is evaluated before the job is
+      # queued, when the PR may still be open and current, and cannot be
+      # re-evaluated later. Every later step but the marker's is gated on
+      # `steps.stale.outputs` so the job ends without running them, and without
+      # failing; the marker steps run only when stale, and tell the gfx942 check
+      # in `e2e-report` that this is not a lane that ran without a report.
+      #
+      # Fails open: if the PR cannot be read (or `gh` is missing), the job runs
+      # as before. One assumption: any API head that differs from the event's
+      # counts as newer. A read that lags a fresh push could show an older head
+      # and wrongly end a current run (and, for a same-repo PR, cancel it); that
+      # costs the run's non-blocking lanes (the cancel ends the whole run), which a
+      # re-run recovers, so it is accepted.
+      - name: Skip a stale run (closed PR or superseded head)
+        id: stale
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! command -v gh >/dev/null; then
+            echo "::warning::gh is not installed on this runner; the stale-run guard did not run"
+            exit 0
+          fi
+          if ! pr=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" \
+            --jq '[.state, .head.sha] | @tsv'); then
+            echo "::warning::could not read PR #${PR_NUMBER}; running the job unchecked"
+            exit 0
+          fi
+          IFS=$'\t' read -r state head_sha <<<"$pr"
+          if [ -z "$state" ] || [ -z "$head_sha" ]; then
+            echo "::warning::PR #${PR_NUMBER} came back without a state or head sha; running the job unchecked"
+            exit 0
+          fi
+          if [ "$state" = closed ]; then
+            reason="PR #${PR_NUMBER} is closed"
+          elif [ "$head_sha" != "$EVENT_HEAD_SHA" ]; then
+            reason="PR #${PR_NUMBER} head moved from ${EVENT_HEAD_SHA} to ${head_sha}"
+          else
+            exit 0
+          fi
+          echo "stale=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::${reason}; skipping this job"
+          echo "- :no_entry_sign: \`e2e-gpu\` skipped itself: ${reason}" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.stale.outputs.stale != 'true'
         with:
           persist-credentials: false
 
@@ -244,6 +324,7 @@ jobs:
       # also names an E2E root — see the exposure documented in
       # scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
+        if: steps.stale.outputs.stale != 'true'
         run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
@@ -256,6 +337,7 @@ jobs:
       # floor stays for the case the process gate cannot see: a non-E2E tenant
       # exhausting a shared host. See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        if: steps.stale.outputs.stale != 'true'
         env:
           GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
@@ -267,6 +349,7 @@ jobs:
       # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
       # the local target.
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        if: steps.stale.outputs.stale != 'true'
         with:
           cache: false
 
@@ -276,6 +359,7 @@ jobs:
       # the checkout's parent — untouched by git clean and persistent between jobs
       # on a self-hosted runner), so cargo rebuilds incrementally.
       - name: Run E2E tests on GPU hardware
+        if: steps.stale.outputs.stale != 'true'
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           # Share heavy immutable artifacts (TheRock runtimes ~3.3GB, HF weights,
@@ -392,6 +476,7 @@ jobs:
           fi
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps, not one templated `name:` (ROCMAI-430):
@@ -399,26 +484,295 @@ jobs:
       # literally, so a GH-expression-computed name would be invisible to it. The
       # `current` leg's name is UNCHANGED from before this matrix existed — it's
       # also what a single-element (non-release-branch) matrix always uploads.
+      # `e2e-gpu-selfhosted-report`, not `e2e-gpu-report`: that name is the pull
+      # request gate's (`e2e-gpu-queue`), whose queue run is the MI325X lane for
+      # pull requests; this one, on the self-hosted runners, shows beside it as
+      # "MI300X (self-hosted)".
       - name: Upload E2E report (current)
-        if: always() && matrix.sdk_version == 'current'
+        if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-gpu-report
+          name: e2e-gpu-selfhosted-report
           path: tests/e2e-cucumber/results/
 
       - name: Upload E2E report (n-1)
-        if: always() && matrix.sdk_version == 'n-1'
+        if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'n-1'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-n-1-report
           path: tests/e2e-cucumber/results/
 
       - name: Upload E2E report (n-2)
-        if: always() && matrix.sdk_version == 'n-2'
+        if: always() && steps.stale.outputs.stale != 'true' && matrix.sdk_version == 'n-2'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-gpu-n-2-report
           path: tests/e2e-cucumber/results/
+
+      # `e2e-report` no longer reads this job's `stale` output (it reads the lane
+      # through `e2e-gpu-settled`, which carries only a result), so a run that
+      # skipped itself as stale says so in an artifact, one per attempt: the MI300X
+      # check reads it as an absent lane rather than one that ran and exported
+      # nothing. (Unlike the lanes' reports, these steps run only when stale.)
+      # The name has no matrix leg: the guard runs on a pull request only, where
+      # the matrix is the single leg `current`, so two legs cannot collide.
+      - name: Record that this run skipped itself as stale
+        if: always() && steps.stale.outputs.stale == 'true'
+        run: echo stale > "${RUNNER_TEMP}/mi300x-stale-run"
+
+      - name: Upload the stale-run marker
+        if: always() && steps.stale.outputs.stale == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mi300x-stale-run-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mi300x-stale-run
+          if-no-files-found: error
+
+  # Cancels a run `e2e-gpu` found stale. A separate job, on a GitHub-hosted
+  # runner with no checkout, so the `actions: write` token never shares a job
+  # with PR code (`e2e-gpu` runs it on a persistent runner). It is the internal
+  # half of this workflow's split: only a same-repo PR is sent a cancel. A fork
+  # PR (external; GitHub holds its self-hosted lanes for approval where the
+  # repository setting requires it, and gives it a read-only token) just has
+  # `e2e-gpu`'s steps skipped. Cancelling the whole run frees the PR's
+  # concurrency group and stops its other stale lanes; the MI300X itself was
+  # already freed when `e2e-gpu` skipped itself. A failed cancel (e.g. a token
+  # without `actions: write`) is tolerated. `e2e-report` is gated on `always()`,
+  # so it still runs after the cancel, but its missing-report check is gated on
+  # `!cancelled()` and is skipped in a cancelled run. The `mi300x-stale-run`
+  # marker's exemption is therefore for runs that are not cancelled: a fork PR (no
+  # cancel is sent), or a cancel that fails or loses a race with the check.
+  cancel-stale-run:
+    name: Cancel a stale run
+    needs: [e2e-gpu]
+    if: >-
+      always()
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && needs.e2e-gpu.outputs.stale == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run cancel "$GITHUB_RUN_ID" || echo "::warning::could not cancel run ${GITHUB_RUN_ID}; its other lanes keep running"
+
+  # The queue lane of a pull request: an MI325X (gfx942, the MI300X's target) on
+  # the shared GPU queue instead of a self-hosted runner that has to be free
+  # (docs/nightly-on-the-queue.md). It dispatches queue-pr-run.yml on main with
+  # the PR's branch, waits for that run, and publishes its release-channel report
+  # as `e2e-gpu-report`. The consolidated grid labels that artifact "MI300X" (an
+  # MI325X lane probes as `mi300x`, and nightly's self-hosted MI300X lane shares
+  # the name), so the cell reads MI300X though the queue ran it on an MI325X. The
+  # queue run is the primary gfx942 check; `e2e-gpu` above, on a real MI300X, is
+  # the second. This job runs on a GitHub-hosted runner and holds no queue
+  # credential: dispatching needs `actions: write`, nothing more.
+  #
+  # Only a pull request from this repository: a fork's token cannot dispatch, and
+  # the queue only checks out branches of this repository. A run the queue does
+  # not take (too many going, or the nightly's window) fails this job, with the
+  # queue's reason, rather than passing: a missing report is never green.
+  e2e-gpu-queue:
+    name: E2E tests (MI325X, queue)
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API and copies files
+    # The queue run's own limit is 286 min; the dispatch and the download add
+    # 10 min: 296. A GitHub-hosted job ends at 360 min whatever is set here.
+    timeout-minutes: 296
+    needs: [changes]
+    permissions:
+      actions: write
+    # Set when the queue refused for the nightly window: a skip of this job, not a
+    # failure. The gfx942 check in `e2e-report` still needs a self-hosted pass then:
+    # a skipped lane is never a pass.
+    outputs:
+      skipped: ${{ steps.queue.outputs.skipped }}
+    # No `always()`: a job that keeps its condition true through a cancellation
+    # is not cancelled, and a superseded push must stop this job from polling.
+    if: >-
+      needs.changes.result == 'success'
+      && needs.changes.outputs.serve == 'true'
+      && github.event_name == 'pull_request'
+      && github.event.action != 'closed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      QUEUE_PR_GATE: ${{ vars.QUEUE_PR_GATE }}
+    steps:
+      - name: Run on the queue
+        id: queue
+        run: |
+          set -euo pipefail
+          # The switch for the queue side: the gate does nothing until the
+          # repository variable QUEUE_PR_GATE is `true`, which is set once the queue
+          # side (the runner's allow-list and the pull request run kind) is
+          # deployed. Without it, a merge of queue-pr-run.yml ahead of the queue
+          # side would turn every pull request's gfx942 check red unless the
+          # self-hosted lane passes: a switched-off lane is a skipped one.
+          if [ "${QUEUE_PR_GATE:-}" != true ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the queue lane is switched off: the repository variable QUEUE_PR_GATE is not true"
+            echo "The queue lane is switched off until the queue side is deployed: set the repository variable QUEUE_PR_GATE to true." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # The branch name is the PR author's: checked before it goes anywhere.
+          if ! [[ "$HEAD_REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]]; then
+            echo "::error::the branch name is not one the queue takes: it must start with a letter, a digit or an underscore, hold only letters, digits and . _ / -, and be at most 200 characters"
+            exit 1
+          fi
+          # A dispatch runs the workflow as it is on main. The pull request that
+          # adds queue-pr-run.yml cannot dispatch it until it is merged: that is a
+          # skip, said so, not a failure. It is a skip only when the branch itself
+          # carries the file; a file gone from main and from the branch (renamed or
+          # removed) stays red, as does any other error from either check. Drop
+          # this once queue-pr-run.yml is on main.
+          if ! out=$(gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=main" --jq .name 2>&1); then
+            if [[ "$out" == *"HTTP 404"* ]] &&
+              gh api "repos/${GH_REPO}/contents/.github/workflows/queue-pr-run.yml?ref=${HEAD_REF}" --jq .name > /dev/null 2>&1; then
+              echo "skipped=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::queue-pr-run.yml is not on main yet: the queue lane cannot run"
+              echo "The queue lane does not run: this branch adds queue-pr-run.yml and a dispatch uses main's copy." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::queue-pr-run.yml is not on main, or main could not be checked: ${out}"
+            exit 1
+          fi
+          caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh workflow run queue-pr-run.yml --ref main -f "branch=${HEAD_REF}" -f "caller=${caller}"
+          # The run is not listed at once: the step that cancels it looks for it
+          # when this job ends before the id was found, but only after a dispatch.
+          touch "${RUNNER_TEMP}/queue-dispatched"
+
+          # The dispatch does not say which run it started; the run's title names
+          # this job, so look for that.
+          run_id=""
+          for _ in $(seq 1 36); do
+            # A failed call is asked again, not the end of the job.
+            run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+              --limit 50 --json databaseId,displayTitle |
+              jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::the dispatched queue run did not appear within 3 minutes"
+            exit 1
+          fi
+          url="https://github.com/${GH_REPO}/actions/runs/${run_id}"
+          echo "queue run: ${url}"
+          # Kept for the step that cancels the run if this job is.
+          echo "$run_id" > "${RUNNER_TEMP}/queue-run-id"
+          echo "### gfx942 on the queue" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run: ${url}" >> "$GITHUB_STEP_SUMMARY"
+
+          # Polled once a minute, not `gh run watch`, which polls every few
+          # seconds against this job's token. The job's own timeout bounds this,
+          # and a call that fails (a 502, a rate limit) is asked again.
+          failures=0
+          while true; do
+            if status=$(gh run view "$run_id" --json status --jq .status); then
+              failures=0
+            else
+              status=""
+              failures=$((failures + 1))
+              # A run that cannot be read (deleted, a token problem) would
+              # otherwise hold this job to its timeout.
+              if [ "$failures" -ge 10 ]; then
+                echo "::error::could not read the queue run's status ${failures} times in a row"
+                exit 1
+              fi
+            fi
+            [ "$status" = completed ] && break
+            sleep 60
+          done
+          # The run has finished: a failed call is asked again, a few times and
+          # a while apart, so two API errors in a row do not turn a passing run red.
+          conclusion=unknown
+          for attempt in 1 2 3 4 5; do
+            conclusion=$(gh run view "$run_id" --json conclusion --jq .conclusion) && [ -n "$conclusion" ] && break
+            conclusion=unknown
+            sleep $((attempt * 10))
+          done
+          echo "queue run concluded: ${conclusion}"
+
+          # What the run published: the lanes' files, one directory per lane,
+          # each with a directory per channel. Only the MI325X lane's release
+          # channel is the report of this job.
+          mkdir -p queue-results report
+          gh run download "$run_id" --name queue-pr-run-results --dir queue-results ||
+            echo "::warning::the queue run published no results"
+          # The nightly's window is by design, not a fault: the lane is skipped
+          # for this push, said in the summary, and the job ends green with no
+          # report, which the consolidated report reads as skipped. Any other
+          # refusal stays red.
+          if [ -f queue-results/refused.txt ] && [[ "$(head -n 1 queue-results/refused.txt)" == nightly:* ]]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the queue lane does not run for this push: the nightly window"
+            echo "The queue lane will not run for this push: the queue side keeps its GPUs for the nightly while the nightly's window lasts. Re-run this job once the window has passed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -f queue-results/refused.txt ]; then
+            echo "::error::the queue did not take the run: $(head -n 1 queue-results/refused.txt)"
+            echo "The queue did not take the run: $(head -n 1 queue-results/refused.txt)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          results=queue-results/mi325x/release/results
+          # The queue side moves its pull request lane from mi300x to mi325x when
+          # it is redeployed, which may come before or after this change: take
+          # the lane it published. Drop the fallback once it runs mi325x.
+          [ -f "${results}/report.json" ] || results=queue-results/mi300x/release/results
+          if [ -f "${results}/report.json" ]; then
+            cp -R "${results}/." report/
+          else
+            echo "::error::the queue run left no MI325X (or, until the queue side moves, MI300X) release report (it ${conclusion}); it may be incomplete, which is capacity, not a failing test"
+            echo "No MI325X (or MI300X) release report: the run ${conclusion}. Incomplete lanes are capacity, not a failing test; see the run above." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # A failing suite fails the queue run, and the report above shows
+          # which scenarios; the job follows the run's verdict.
+          [ "$conclusion" = success ]
+
+      # A push that supersedes this one cancels the job, and a job that fails
+      # after the dispatch (the run never appeared in the list) ends too; either
+      # would otherwise leave its queue run holding the runner it waits on: cancel
+      # that run too. Cancelling a run that has finished is harmless. The queue
+      # side's lanes are left to their own budgets.
+      - name: Cancel the queue run this job started
+        if: failure() || cancelled()
+        run: |
+          run_id=""
+          [ -f "${RUNNER_TEMP}/queue-run-id" ] && run_id=$(cat "${RUNNER_TEMP}/queue-run-id")
+          # The run was dispatched but its id was not found yet: look for it by the
+          # same title, as long as the main step would have (a run is not listed
+          # at once). Nothing was dispatched without the marker: nothing to look for.
+          if [ -z "$run_id" ] && [ -f "${RUNNER_TEMP}/queue-dispatched" ]; then
+            caller="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            for _ in $(seq 1 36); do
+              run_id=$(gh run list --workflow queue-pr-run.yml --event workflow_dispatch \
+                --limit 50 --json databaseId,displayTitle |
+                jq -r --arg c "caller ${caller};" '[.[] | select(.displayTitle | contains($c))][0].databaseId // empty') || run_id=""
+              [ -n "$run_id" ] && break
+              sleep 5
+            done
+          fi
+          [ -n "$run_id" ] || exit 0
+          gh run cancel "$run_id" || true
+
+      # A report is uploaded whatever the verdict, as the self-hosted lane's is:
+      # a failing run's report is what the consolidated grid is for.
+      - name: Upload E2E report
+        if: always() && hashFiles('report/report.json') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-gpu-report
+          path: report/
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
   # Dispatch ephemeral pool, opt-in only via the `devlab-dispatch` label (see
@@ -439,18 +793,28 @@ jobs:
     # this replaced, and a run took 26m54s against the old 35min cap (run
     # 34489547654) versus 18-19m on a warm static host — keep the same headroom
     # ratio the 35 was chosen for.
-    # An include_nightly dispatch also runs the AIM serve scenarios (serve-26/27,
-    # @nightly, up to 1200s readiness each on a cold pull) and the large-model
-    # serve, which cannot fit the per-PR 45min budget.
-    timeout-minutes: ${{ inputs.include_nightly && 105 || 45 }}
+    # An include_nightly dispatch also runs the AIM serve scenarios
+    # (serve-26/27/63, @nightly, up to 1200s readiness each on a cold pull) and
+    # the large-model serve, which cannot fit the 45min budget of an ordinary
+    # push run.
+    timeout-minutes: ${{ inputs.include_nightly && 125 || 45 }}
     runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
+    # Not on pull_request: a PR gets one Linux GPU target (gfx942, the only
+    # per-PR target where vLLM runs, as `e2e-gpu-queue` and `e2e-gpu`) and one Windows
+    # pool (Strix Halo). Not on
+    # merge_group either: over 7 days 35% of its merge-queue jobs (98 of 281) were
+    # cancelled at the 45 min cap, and the queue does not wait for this
+    # non-required check. Still runs on push (main, release/**), dispatch and
+    # nightly (nightly.yml, e2e-gpu-nightly-strix, same pool labels).
     if: >-
       always()
       && needs.changes.result == 'success'
       && (
         (github.event_name != 'workflow_dispatch'
+          && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
           && needs.changes.outputs.serve == 'true')
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
@@ -462,8 +826,8 @@ jobs:
         channel: [release, nightly]
         # See `e2e-gpu` (ROCMAI-430): layered alongside the pre-existing
         # `channel` dimension above, not replacing it — this lane is the only
-        # per-PR job with two independent matrix axes.
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        # job with two independent matrix axes.
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
         # The nightly channel only carries the latest (pre-)release builds, so
         # it cannot resolve the n-1/n-2 released versions the matrix pins
         # (`rocm install sdk` fails with "no mutually compatible TheRock ...
@@ -475,6 +839,9 @@ jobs:
           - channel: nightly
             sdk_version: n-2
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       # A pool host can be busy with other CI work between GPU preflight and
       # the TUI checks, so a frame that renders well inside the 30s default on
@@ -484,8 +851,6 @@ jobs:
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -573,6 +938,7 @@ jobs:
         env:
           MATRIX_CHANNEL: ${{ matrix.channel }}
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # Three mutually-exclusive steps per the `sdk_version` leg, same as
@@ -618,7 +984,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-windows.
     if: >-
       always()
@@ -631,6 +997,9 @@ jobs:
       )
     continue-on-error: false
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       # A pool host can be busy with other CI work between GPU preflight and
       # the TUI checks, so a frame that renders well inside the 30s default on
       # an idle runner can miss it. Raise the wait budget rather than let that
@@ -693,8 +1062,10 @@ jobs:
       # available so a wedged/held GPU fails fast instead of hanging to the cap.
       # BEST-EFFORT because the Windows ROCm GPU query tool isn't verified here —
       # if no rocm-smi is found we WARN and continue rather than false-fail a
-      # working runner. When rocm-smi IS present we poll free memory the same way
-      # as the Linux jobs and fail only after the ceiling.
+      # working runner; the harness's E2E_EXPECT_GPU=1 check is the backstop
+      # that fails the lane if `rocm examine` reports no usable GPU at all.
+      # When rocm-smi IS present we poll free memory the same way as the Linux
+      # jobs and fail only after the ceiling.
       #
       # WHAT THIS DOES NOT CATCH, and the Linux lanes now do. This is a
       # free-memory floor ONLY. A fixed 8 GiB against a whole ~62 GiB gfx1151
@@ -915,6 +1286,7 @@ jobs:
           }
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       - name: Upload E2E report (current)
@@ -966,10 +1338,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+        sdk_version: ${{ fromJSON(needs.changes.result == 'skipped' && '["current"]' || needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
-    # `serve` like the sibling lanes rather than the broader `heavy`: the
-    # consolidated report gates on `serve` too, so a heavy-but-not-serve change
+    # `serve` like the sibling lanes rather than on the classify-changes
+    # action's broader `heavy` category: the consolidated report gates on
+    # `serve` too, so a change that matches `heavy` but not `serve`
     # would otherwise run this lane and then discard its artifact unreported.
     if: >-
       always()
@@ -982,6 +1355,13 @@ jobs:
       )
     continue-on-error: false
     env:
+      # Declared GPU-less on purpose: the distro is left without ROCm's WSL
+      # driver bridge (see the "NO librocdxg provisioning step" note below), so
+      # the probe finds no usable GPU and @requires-gpu scenarios are not
+      # applicable. The harness reports that rather than failing on it; set "1"
+      # here if this lane ever provisions a GPU. Forwarded into the guest via
+      # WSLENV in the run step.
+      E2E_EXPECT_GPU: "0"
       # wsl.exe emits UTF-16 by default; without this its own error/status text
       # comes back mangled ("T h e   f i l e   c a n n o t ...") when captured
       # through PowerShell, which is exactly what a genuine wsl.exe error looks
@@ -1258,12 +1638,14 @@ jobs:
       # today: @requires-gpu scenarios already resolve to skip here, since
       # `rocm-smi` is absent too (see the GPU preflight below). If this lane
       # ever needs a real GPU, provision it through the CLI as a separate,
-      # explicitly-not-under-test step rather than restoring the old script.
+      # explicitly-not-under-test step rather than restoring the old script,
+      # and flip the job's E2E_EXPECT_GPU to "1".
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
-      # rocm-smi is a reported condition, not a job failure: the capability probe
-      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # rocm-smi is a reported condition, not a job failure: the lane declares
+      # E2E_EXPECT_GPU=0, so the harness reports @requires-gpu scenarios as not
+      # applicable instead of failing on them, and the rest still runs. A
       # GPU that IS present but stays held fails the job, since that would
       # corrupt the serve scenarios' results — though "held" means less here
       # than on the native lanes: this body keeps only the free-memory floor and
@@ -1285,7 +1667,7 @@ jobs:
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
-            echo "::warning::rocm-smi not found in this WSL distro — GPU scenarios will resolve to skip"
+            echo "::warning::rocm-smi not found in this WSL distro — expected on this lane (E2E_EXPECT_GPU=0); @requires-gpu scenarios are not applicable"
             exit 0
           fi
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
@@ -1385,7 +1767,7 @@ jobs:
             sleep 5
           done
           if [ "$saw_vram" -eq 0 ]; then
-            echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
+            echo "::warning::rocm-smi reported no VRAM figures under WSL — this lane declares no GPU (E2E_EXPECT_GPU=0); @requires-gpu scenarios are not applicable"
             exit 0
           fi
           if [ "$unmeasurable" -eq 1 ]; then
@@ -1442,7 +1824,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:GITHUB_EVENT_INPUTS_NAME_FILTER'
+          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF:MATRIX_SDK_VERSION:E2E_RELEASE_PINS:GITHUB_EVENT_INPUTS_NAME_FILTER'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1490,6 +1872,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         env:
           MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
+          E2E_RELEASE_PINS: ${{ needs.changes.outputs.sdk_pins }}
           GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
 
       # actions/upload-artifact runs on the Windows host, not inside the WSL
@@ -1560,144 +1943,112 @@ jobs:
           path: tests/e2e-cucumber/results/
           if-no-files-found: error
 
-  e2e-gpu-w7900:
-    name: E2E tests (W7900, ${{ matrix.sdk_version }})
-    # 90min: matches every other Linux GPU lane — same collapsed suite. The card
-    # is smaller than the Instinct parts, so do not tighten this below their cap.
-    timeout-minutes: 90
-    # `w7900` names the hardware rather than reusing the generic `amd-gpu`:
-    # GitHub matches a job to any runner whose labels are a superset, so a shared
-    # label would let this workstation card pick up Instinct-targeted work and
-    # vice versa.
-    runs-on: [self-hosted, linux, w7900]
+  # GitHub has no queue timeout: `timeout-minutes` counts from the moment a
+  # runner takes the job, so an `e2e-gpu` queued on a runner pool at 0 replicas
+  # sits there for up to 24 hours and holds back every job that `needs` it,
+  # `e2e-report` included. The pull request's gfx942 requirement is met by the
+  # queue lane OR this one (see `e2e-report`), so the report must not wait on a
+  # lane that never gets a runner. This job stands in for `e2e-gpu` in the
+  # report's `needs`: it polls this run's job list and settles once every
+  # `e2e-gpu` leg has finished or can be given up on (still queued after
+  # QUEUE_DEADLINE_MINUTES, or unfinished after HARD_DEADLINE_MINUTES). A leg that
+  # started is waited for, so a lane that runs still lands in the report. A leg
+  # given up on is `abandoned`, which the gfx942 decision reads as absent.
+  # .github/scripts/settle-e2e-lanes.sh holds the logic, as for the nightly; the
+  # legs are listed by display name and a contract test checks the list against
+  # the lane. Only the MI300X lane is read through here: the other self-hosted
+  # lanes stay directly in the report's `needs`, as before.
+  e2e-gpu-settled:
+    name: E2E MI300X self-hosted lane settled (queue deadline)
+    runs-on: ubuntu-24.04 # one LTS: only polls the GitHub API
+    # HARD_DEADLINE_MINUTES + slack; the script stops itself at the hard
+    # deadline, before this cap.
+    timeout-minutes: 390
     needs: [changes]
-    strategy:
-      fail-fast: false
-      matrix:
-        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      lane_results: ${{ steps.settle.outputs.lane_results }}
+      abandoned_count: ${{ steps.settle.outputs.abandoned_count }}
+    # The report's own condition: it settles the lane the report reads.
     if: >-
       always()
-      && needs.changes.result == 'success'
-      && (
-        (github.event_name != 'workflow_dispatch'
-          && needs.changes.outputs.serve == 'true')
-        || (github.event_name == 'workflow_dispatch'
-          && (inputs.platform == 'all' || inputs.platform == 'w7900'))
-      )
-    # Non-blocking while this hardware is proven out, as the MI350P lane is.
-    # Flip to `false` once it has a track record — that is what the older lanes
-    # run with, so a real regression on this silicon shows red instead of
-    # always green.
-    continue-on-error: true
-    env:
-      E2E_SERVE_TIMEOUT_SECS: "300"
-      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Full serve matrix at the merge-queue gate.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      && (needs.changes.outputs.serve == 'true'
+        || github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Reclaim the GPU before running: a serve leaked by a killed or
-      # timed-out prior run (its Drop teardown never executed) keeps an engine
-      # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees: a manual /workload serve is matched only if its command line
-      # also names an E2E root — see the exposure documented in
-      # scripts/reclaim-gpu.sh.
-      - name: Reclaim GPU from stray E2E processes
-        run: bash scripts/reclaim-gpu.sh
-
-      # Bounded wait, as in e2e-gpu, then an assertion that no leaked E2E engine
-      # process survives. One card per job, so rocm-smi sees exactly the GPU this
-      # lane runs on. The floor stays at the shared 16 GiB default, which is a
-      # flat constant rather than a proportion of capacity: it only has to be
-      # high enough to catch a leftover serve still holding the card, and low
-      # enough that a clean host passes on the first poll. e2e-gpu uses the same
-      # 16 GiB against a very different VRAM size for exactly that reason — do
-      # NOT scale it down for a smaller part. On a 48GB card that floor only
-      # trips past ~32 GiB held, so the floor alone would miss a leftover serve
-      # holding less; the process gate is what catches it (#446). The floor is
-      # kept for the case the process gate cannot see: a non-E2E tenant
-      # exhausting the host. See .github/scripts/gpu-preflight.sh.
-      - name: GPU preflight (bounded wait for an available GPU)
+      - name: Wait for the MI300X self-hosted lane to finish or time out in the queue
+        id: settle
         env:
-          GPU_PREFLIGHT_MIN_FREE_GIB: 16
-        run: |
-          bash .github/scripts/gpu-preflight.sh
+          GH_TOKEN: ${{ github.token }}
+          # A leg still queued this long after it was created is given up on:
+          # long enough for a runner pool to scale up from zero, short enough
+          # that the report does not sit on a lane with no runner.
+          # On a pull request the queue lane takes (the condition of
+          # `MI300X_REQUIRED` in the report) it is the primary gfx942 check, so a
+          # leg with no runner for 30 minutes is given up on. Any other run (a push,
+          # release or dispatch, or a fork or dependabot pull request, which the
+          # queue lane skips) has this lane as its only gfx942 signal, so a pool
+          # that is merely busy gets hours (it waited a day before this job).
+          QUEUE_DEADLINE_MINUTES: ${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && '30' || '240' }}
+          # A leg that started is waited for, but not past this: the queue
+          # deadline plus the lane's timeout-minutes (90) plus slack.
+          HARD_DEADLINE_MINUTES: ${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && '125' || '360' }}
+          # The lane's timeout-minutes; the script refuses a queue deadline
+          # that, plus this, would pass the hard deadline.
+          LANE_RUN_MINUTES: "90"
+          # The consolidated report's gfx942 check reads only `e2e-gpu` (the
+          # pull-request leg): the release-branch n-1/n-2 legs are settled here so
+          # the run ends, and each shows as its own check, but they are not part of
+          # the gfx942 requirement.
+          LANES: |
+            e2e-gpu=E2E tests (MI300X, current)
+            e2e-gpu-n-1=E2E tests (MI300X, n-1)
+            e2e-gpu-n-2=E2E tests (MI300X, n-2)
+        run: bash .github/scripts/settle-e2e-lanes.sh
 
-      # cache: false for the same reason as e2e-gpu — the build cache is kept in
-      # CARGO_TARGET_DIR on the work volume, not in GitHub's cache service.
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-        with:
-          cache: false
-
-      - name: Run E2E tests on W7900
-        run: |
-          # $RUNNER_WORKSPACE is on a volume that outlives any single job, so the
-          # cargo target dir and the shared caches are still warm on the next one.
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same mount as the runtimes it populates, so uv hardlinks into them
-          # instead of copying, and inside the directory the runner's uv-cache-gc
-          # initContainer bounds — see the e2e-gpu lane for both mechanisms and
-          # why a cache one level deeper keeps the links but loses the floor.
-          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
-          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          # Pre-warm one shared runtime in place before the suite. Not an
-          # optimization — `install sdk` bakes absolute paths into the runtime
-          # manifest, so installing anywhere temporary breaks every later serve.
-          # See e2e-gpu for the full rationale.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
-          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
-
-          # See the e2e-gpu lane for why the e2e-test-hooks feature is the
-          # floor a pre-built binary must carry (xtask builds a superset).
-          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
-          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
-          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
-
-          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
-          # the channel index has moved on — the tree is a cache, not a one-shot.
-          # See the e2e-gpu lane and `xtask e2e-prewarm`.
-          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
-              --release-label "${MATRIX_SDK_VERSION}"
-
-          # Optional scenario-name filter for a scoped manual dispatch — a cheap
-          # way to exercise this lane against a single scenario without the full suite.
-          NAME_FILTER="${GITHUB_EVENT_INPUTS_NAME_FILTER}"
-          if [ -n "$NAME_FILTER" ]; then
-            echo "name filter active: $NAME_FILTER"
-            cargo xtask e2e -- --name "$NAME_FILTER"
-          else
-            cargo xtask e2e
-          fi
+  # Ends the run when `e2e-gpu-settled` gave up on a leg, on any event: a job queued on a
+  # runner pool with no runner cannot be cancelled on its own and would keep the
+  # run, and its check, pending for a day. It runs after the report and every
+  # other lane, which is why it needs them all but `e2e-gpu` itself (it cannot
+  # wait for the job it ends); the queue lane and the report are done by then.
+  # It also runs when the settle job itself failed or was cancelled, as the
+  # nightly's does: a job killed by its own timeout reports `cancelled`, and
+  # nothing else bounds the wait then. The force-cancel ends this job's own run, so
+  # this job shows as cancelled, like the abandoned leg.
+  cancel-abandoned-mi300x-lane:
+    name: Cancel the MI300X self-hosted lane that never got a runner
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    needs:
+      - e2e-gpu-settled
+      - e2e-gpu-queue
+      - e2e-gpu-strix-ubuntu
+      - e2e-gpu-strix-windows
+      - e2e-wsl
+      - e2e-report
+    if: ${{ always() && (needs.e2e-gpu-settled.result == 'failure' || needs.e2e-gpu-settled.result == 'cancelled' || (needs.e2e-gpu-settled.outputs.abandoned_count != '' && needs.e2e-gpu-settled.outputs.abandoned_count != '0')) }}
+    steps:
+      - name: Cancel the run's unfinished lanes
         env:
-          MATRIX_SDK_VERSION: ${{ matrix.sdk_version }}
-          GITHUB_EVENT_INPUTS_NAME_FILTER: ${{ github.event.inputs.name_filter }}
-
-      - name: Upload E2E report (current)
-        if: always() && matrix.sdk_version == 'current'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-report
-          path: tests/e2e-cucumber/results/
-
-      - name: Upload E2E report (n-1)
-        if: always() && matrix.sdk_version == 'n-1'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-n-1-report
-          path: tests/e2e-cucumber/results/
-
-      - name: Upload E2E report (n-2)
-        if: always() && matrix.sdk_version == 'n-2'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-n-2-report
-          path: tests/e2e-cucumber/results/
+          GH_TOKEN: ${{ github.token }}
+        # Tolerated, as `cancel-stale-run` does: a pull request that cannot cancel
+        # (a read-only token on a dependabot or fork run) is left as it was before
+        # this job, with a warning, not turned red.
+        run: |
+          # A force-cancel, not a plain cancel: a leg whose `if` is `always()` (the
+          # lane's) survives a plain cancel, and a plain cancel from here would end
+          # THIS step too (a step with no `if` does not run on after a cancel), so
+          # nothing after it would run. A force-cancel ignores `if`, and every other
+          # job has finished (this job needs them).
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/force-cancel" ||
+            echo "::warning::could not cancel run ${GITHUB_RUN_ID}; the MI300X self-hosted leg stays queued"
 
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
@@ -1713,17 +2064,20 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # `e2e-gpu` is read through `e2e-gpu-settled`, not listed here: a lane queued
+    # on a pool with no runner would hold this report for up to 24 hours.
     needs:
       - changes
-      - e2e-gpu
+      - e2e-gpu-settled
+      - e2e-gpu-queue
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
       - e2e-wsl
-      - e2e-gpu-w7900
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
-    # produced. On dispatch `serve` is unset, so also run when the trigger was
-    # manual; `always()` still lets it collect partial/failed tiers.
+    # produced. `changes` forces `serve` on for a dispatch; the dispatch clause
+    # also runs the report when `changes` itself failed and left `serve` empty.
+    # `always()` still lets it collect partial/failed tiers.
     if: >-
       always()
       && (needs.changes.outputs.serve == 'true'
@@ -1765,7 +2119,9 @@ jobs:
       # the reports that arrived, so that lane would drop out of the grid with
       # no row and no FAIL. On a `continue-on-error` lane nothing else is red
       # either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # `skipped`, and not self-skipped as `stale`) must have uploaded its report
+      # artifact. The two gfx942 lanes (the queue's MI325X, the self-hosted MI300X) are not in this list: the step after this
+      # one decides them together. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1787,11 +2143,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu=e2e-gpu-report
             e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
             e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
             e2e-wsl=e2e-gpu-strix-wsl-report
-            e2e-gpu-w7900=e2e-gpu-w7900-report
         run: |
           uploaded=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
@@ -1804,6 +2158,18 @@ jobs:
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
+            # A lane that publishes `stale=true` skipped its uploads by design
+            # and is not a missing report. Only e2e-selfhosted.yml's `e2e-gpu`
+            # stale-run guard publishes it; the line is inert in nightly.yml and
+            # is there because a contract test keeps the two copies of this script
+            # identical. Say so in the summary rather than dropping the lane silently.
+            if [ "$(jq -r --arg job "$job" '.[$job].outputs.stale // ""' <<<"$NEEDS")" = true ]; then
+              echo "- :no_entry_sign: \`$job\` skipped itself as stale; it has no column in the grid above" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            # A lane that said it skipped itself on purpose (the queue's nightly
+            # window) uploads nothing and is not missing.
+            [ "$(jq -r --arg job "$job" '.[$job].outputs.skipped // ""' <<<"$NEEDS")" = true ] && continue
             IFS=',' read -ra wanted <<<"$artifacts"
             for artifact in "${wanted[@]}"; do
               if ! grep -qxF "$artifact" <<<"$uploaded"; then
@@ -1814,6 +2180,43 @@ jobs:
             done
           done <<<"$LANE_REPORTS"
           exit "$missing"
+
+      # The gfx942 lanes are not in LANE_REPORTS above: on a pull request gfx942
+      # is met by the queue lane (`e2e-gpu-queue`, the primary) OR the self-hosted
+      # one (`e2e-gpu`, a bonus), so a missing report from one is not an error
+      # while the other passed. .github/scripts/mi300x-gate.sh holds the rule:
+      # gfx942 counts as passed only when a lane passed WITH an exported report;
+      # a lane that was cancelled, skipped or never got a runner is absent, not
+      # failed; a lane that ran and failed still fails; and with no passing report
+      # from either lane the check fails. It reads `e2e-gpu` through
+      # `e2e-gpu-settled`, which gives up on a lane that never gets a runner.
+      # Required only where the queue lane takes the pull request (same
+      # repository, not dependabot, `serve` true), the conditions of
+      # `e2e-gpu-queue`'s own `if`; anywhere else (a push, a dispatch, a fork) there
+      # is no either-or, and a lane that ran without a report is the only failure.
+      - name: Check the gfx942 requirement (queue or self-hosted)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MI300X_REQUIRED: ${{ github.event_name == 'pull_request' && needs.changes.outputs.serve == 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
+          QUEUE_RESULT: ${{ needs.e2e-gpu-queue.result }}
+          QUEUE_SKIPPED: ${{ needs.e2e-gpu-queue.outputs.skipped }}
+          QUEUE_ARTIFACT: e2e-gpu-report
+          SELFHOSTED_RESULT: ${{ fromJSON(needs.e2e-gpu-settled.outputs.lane_results || '{}').e2e-gpu.result }}
+          SELFHOSTED_ARTIFACT: e2e-gpu-selfhosted-report
+          # Per attempt: the artifact list holds every attempt's, and a re-run
+          # must not read an earlier attempt's stale marker.
+          STALE_ARTIFACT: mi300x-stale-run-${{ github.run_attempt }}
+          SETTLE_RESULT: ${{ needs.e2e-gpu-settled.result }}
+        run: |
+          ARTIFACTS=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name') || {
+            echo "::error::could not list this run's artifacts, so the gfx942 lanes were not checked"
+            exit 1
+          }
+          export ARTIFACTS
+          bash .github/scripts/mi300x-gate.sh
 
       - name: Upload consolidated report
         if: always()

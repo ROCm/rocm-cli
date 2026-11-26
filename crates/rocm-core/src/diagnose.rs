@@ -16,14 +16,14 @@
 //! stay behaviorally identical.
 //!
 //! This file keeps the public types, the two score thresholds, [`diagnose`]
-//! itself and the two `vllm_*_symptom_is_diagnosable` classifiers that run the
+//! itself and the `vllm_*_symptom_is_diagnosable` classifiers that run the
 //! whole catalog. The rest is in child modules: `catalog` holds the `CHECKERS` table,
 //! `scoring` the keyword tables and scoring helpers, `report` the routing and the
 //! text report, and `linux`, `windows`, `wsl`, `host` and `engine` the checks.
 
 use crate::examine::Examination;
 use catalog::{
-    platform_family, run_all_checks, take_applicability_from_the_catalog,
+    platform_family, reads_engine_here, run_all_checks, take_applicability_from_the_catalog,
     uncovered_platform_message,
 };
 use engine::scores_on_every_engine_host;
@@ -41,15 +41,73 @@ mod test_support;
 mod windows;
 mod wsl;
 
-pub use engine::{VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM};
+pub use engine::{
+    VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
+    VLLM_OOM_CANONICAL_SYMPTOM,
+};
 pub use linux::{AMDGPU_MISSING_EVIDENCE, dkms_driver_plan_is_supported};
-pub use report::{render_report_text, upstream_route};
+pub use report::{
+    SYMPTOM_DID_NOT_CONTRIBUTE_NOTE, render_report_json, render_report_text, upstream_route,
+};
 
 /// At/above this score a diagnosis is treated as a real match.
 pub const MIN_SCORE_FOR_MATCH: i32 = 50;
 
 /// At/above this score the agent may propose the fix immediately.
 pub const HIGH_CONFIDENCE: i32 = 75;
+
+/// The engine a `--symptom` came from, when the user says so.
+///
+/// Engine-specific catalog entries must not claim a generic framework error for
+/// their engine, so they look for the engine's name in the pasted text (see
+/// `check_16_vllm_oom`). A paste that is the engine's own error line often does
+/// not carry the name, and editing the user's text to add one -- what the
+/// rocm-doctor skill tells an agent to do today, with a `vllm: ` prefix --
+/// changes what the user said. Naming the engine instead states where the text
+/// came from and leaves the text alone; the skill is to move to `--engine` in a
+/// later change.
+///
+/// Only the engines the catalog tells apart are listed: naming one changes
+/// matching, so a value that changed nothing would read as if it had been
+/// taken into account. The serialized names are the ones `rocm serve --engine`
+/// takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymptomEngine {
+    /// The vLLM serving engine.
+    Vllm,
+}
+
+impl SymptomEngine {
+    /// The name `--engine` takes and the JSON report records.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vllm => "vllm",
+        }
+    }
+}
+
+/// Where a diagnosed symptom came from: the engine the user named, and the
+/// text they passed, exactly as given.
+///
+/// Recorded so a reader of the report can see that the engine was stated by
+/// the user rather than found in the text, and that the text was not edited
+/// to make it match.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymptomProvenance {
+    pub engine: SymptomEngine,
+    pub symptom: String,
+    /// Whether an entry that ran on the examined platform reads `engine`, that
+    /// is, whether naming it could change anything. The text report says so
+    /// when it could not (native Windows has no vLLM entry today), so the flag
+    /// is not silently ignored.
+    ///
+    /// Not serialized, so it adds nothing to the JSON report; `None` for a report
+    /// read back from JSON, where it is not known.
+    #[serde(skip)]
+    pub read_here: Option<bool>,
+}
 
 /// A proposed remediation for a [`Diagnosis`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +139,12 @@ pub struct Fix {
     pub needs: Option<String>,
     pub notes: Vec<String>,
     pub verify: String,
+    /// The host cannot take this fix as it stands, so `rocm fix <fix_id>` will
+    /// say why and change nothing (fix-4 when no group can be named). Not
+    /// serialized: it only steers `take_applicability_from_the_catalog`, which
+    /// then reports the class and `auto_applicable` the CLI will honour.
+    #[serde(skip)]
+    pub unavailable_here: bool,
 }
 
 /// A single scored match against the failure-mode catalog.
@@ -91,6 +155,25 @@ pub struct Diagnosis {
     pub score: i32,
     pub evidence: Vec<String>,
     pub fix: Option<Fix>,
+    /// Whether the symptom text the user supplied contributed to this entry.
+    ///
+    /// `true` when, without the symptom, this entry would have a different score
+    /// or different evidence, or would not be listed at all; `false` when it
+    /// comes from the examined host's state alone. A host-state finding can
+    /// outrank the entry the symptom added to, so a reader asking "did the text
+    /// I pasted contribute to this entry?" reads this rather than the ranking.
+    ///
+    /// It records a contribution, not a verdict that the entry explains the
+    /// error: any keyword hit counts, however weak. Read `score` and `evidence`
+    /// for how much the text added.
+    ///
+    /// Always serialized, and `false` when no symptom was given: nothing was
+    /// pasted, so nothing in it contributed. Omitting it in that case would make
+    /// "no symptom" indistinguishable from "a CLI too old to report this field".
+    /// `#[serde(default)]` so a payload written before the field existed still
+    /// deserializes. Set by [`diagnose`], never by a checker.
+    #[serde(default)]
+    pub symptom_matched: bool,
 }
 
 /// Where to send a report when no catalog entry matches.
@@ -103,7 +186,11 @@ pub struct Route {
 /// The full diagnosis output (mirrors `diagnose.py --json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnoseReport {
-    /// All nonzero-score diagnoses, highest score first.
+    /// All nonzero-score diagnoses, ranked: those that cleared
+    /// [`MIN_SCORE_FOR_MATCH`] first, a finding that the process has no working
+    /// path to the GPU ahead of the others, each group by score descending; then
+    /// the rest by score descending. `run_all_checks` in `diagnose/catalog.rs`
+    /// sorts it, from each entry's `Precedence` there.
     ///
     /// Every checker that fired at all lands here, including ones scoring below
     /// [`MIN_SCORE_FOR_MATCH`] — so a non-empty `matched` does NOT mean a cause
@@ -147,6 +234,15 @@ pub struct DiagnoseReport {
     /// driver is also misconfigured is two findings, not one.
     #[serde(default)]
     pub model: Option<crate::model_readiness::ModelReadiness>,
+    /// The engine the symptom came from and the symptom itself, verbatim, when
+    /// the caller named an engine (`rocm diagnose --engine`).
+    ///
+    /// Absent otherwise, so a report diagnosed without an engine is unchanged.
+    /// Additive and optional: a consumer that does not know the field ignores
+    /// it, and `#[serde(default)]` lets a payload written before it existed
+    /// still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SymptomProvenance>,
 }
 
 /// Whether any diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
@@ -179,7 +275,9 @@ impl DiagnoseReport {
 /// being printed as a runnable lookalike of the user's error.
 #[must_use]
 pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
-    scores_on_every_engine_host(symptom, "fix-16-vllm-oom", run_all_checks)
+    scores_on_every_engine_host(symptom, "fix-16-vllm-oom", |e, s| {
+        run_all_checks(e, s, None)
+    })
 }
 
 /// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the engine-startup
@@ -197,19 +295,92 @@ pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
 /// name a command that finds nothing.
 #[must_use]
 pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
-    scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", run_all_checks)
+    scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", |e, s| {
+        run_all_checks(e, s, None)
+    })
+}
+
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for a vLLM compiled
+/// extension that failed to load, on every host family the vLLM engine runs on.
+///
+/// The engine's hint for that failure calls this the way the import hint calls
+/// [`vllm_import_symptom_is_diagnosable`], and falls back to
+/// [`VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM`] when the user's line does not pass.
+#[must_use]
+pub fn vllm_extension_load_symptom_is_diagnosable(symptom: &str) -> bool {
+    scores_on_every_engine_host(symptom, "fix-23-vllm-extension-load", |e, s| {
+        run_all_checks(e, s, None)
+    })
+}
+
+/// Set [`Diagnosis::symptom_matched`] on every entry in `matched`.
+///
+/// Decided by running the same catalog again on the same machine with no
+/// symptom and comparing, rather than by each checker reporting what it read.
+/// Checkers fold the symptom in several ways (keyword tables, single patterns,
+/// a keyword whose own weight is replaced by a fixed one, a symptom that lifts a
+/// negative host score above zero), and a flag each of them had to set by hand
+/// is one a new checker can forget. The comparison asks the question itself:
+/// would this entry look the same without the text? Evidence is compared as
+/// well as the score because a score is capped at 100, so a keyword hit on an
+/// entry already at the cap changes its evidence and not its number.
+///
+/// The checkers are pure functions of the examination and the symptom, so the
+/// second run reads no more of the machine than the first.
+fn mark_symptom_contribution(matched: &mut [Diagnosis], e: &Examination, symptom: &str) {
+    if symptom.is_empty() {
+        return;
+    }
+    // No symptom, so no engine either: with nothing pasted the engine has
+    // nothing to read, and the run must be the host-only baseline.
+    let host_only = run_all_checks(e, "", None);
+    for d in matched {
+        d.symptom_matched = contributed(d, &host_only);
+    }
+}
+
+/// Whether the symptom contributed to `d`, given `host_only`, the same catalog
+/// run on the same host with no symptom.
+///
+/// It did when `d` is absent from that run, or present with a different score
+/// or different evidence. Either difference alone is enough: a keyword hit on
+/// an entry already at the 100 cap changes only its evidence.
+fn contributed(d: &Diagnosis, host_only: &[Diagnosis]) -> bool {
+    host_only
+        .iter()
+        .find(|h| h.id == d.id)
+        .is_none_or(|h| h.score != d.score || h.evidence != d.evidence)
 }
 
 /// Diagnose an examination against the closed catalog.
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
+    diagnose_with_engine(e, symptom, None)
+}
+
+/// [`diagnose`], with the engine the symptom came from when the user named it.
+///
+/// `engine` changes only what an engine-specific entry may score: with
+/// [`SymptomEngine::Vllm`], every non-blank line of `symptom` counts as
+/// vLLM's, as if each of those lines carried the word `vllm` (a blank line is
+/// dropped, where a prefix would keep it; it scores nothing either way). The
+/// symptom itself is never
+/// edited, and it is recorded verbatim in [`DiagnoseReport::provenance`]
+/// beside the engine.
+#[must_use]
+pub fn diagnose_with_engine(
+    e: &Examination,
+    symptom: &str,
+    engine: Option<SymptomEngine>,
+) -> DiagnoseReport {
     // WSL2 used to be short-circuited here as out of scope. It is a real platform
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
     //
-    // `fix-16-vllm-oom` and `fix-17-torch-dlpack` opt into `wsl` in CHECKERS for
-    // that reason: they are keyword-only checks whose failure modes are just as
-    // real under WSL2, so they still answer there alongside the WSL entries.
+    // `fix-16-vllm-oom`, `fix-17-torch-dlpack` and `fix-23-vllm-extension-load`
+    // opt into `wsl` in CHECKERS for that reason: they are keyword-only checks
+    // whose failure modes are just as real under WSL2, so they still answer
+    // there alongside the WSL entries.
     //
     // `out_of_scope` still exists, for the platforms that genuinely have no
     // entries. That case used to fall through to an empty catalog and report "no
@@ -219,9 +390,17 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     let mut matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
-        run_all_checks(e, symptom)
+        run_all_checks(e, symptom, engine)
     };
+    mark_symptom_contribution(&mut matched, e, symptom);
     take_applicability_from_the_catalog(&mut matched, platform_family(e));
+    // An out-of-scope platform ran nothing, so nothing read the engine either.
+    let engine_read_here = |engine| out_of_scope.is_none() && reads_engine_here(e, engine);
+    let provenance = engine.map(|engine| SymptomProvenance {
+        engine,
+        symptom: symptom.to_owned(),
+        read_here: Some(engine_read_here(engine)),
+    });
     DiagnoseReport {
         has_match: any_cleared_threshold(&matched),
         matched,
@@ -230,6 +409,7 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         route_when_no_match: route_when_no_match(e),
         out_of_scope,
         model: None,
+        provenance,
     }
 }
 
@@ -451,6 +631,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_vllm_extension_load_symptom_is_diagnosable() {
+        // The engine always falls back to this constant for the extension-load
+        // hint, so it has to clear the threshold on Linux and on WSL2.
+        assert!(vllm_extension_load_symptom_is_diagnosable(
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+        ));
+        // And it has to stay a valid single-quoted shell argument.
+        assert!(crate::quotable_in_single_quotes(
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM
+        ));
+        // The import failure's symptom belongs to its own entry, not to this one.
+        assert!(!vllm_extension_load_symptom_is_diagnosable(
+            VLLM_IMPORT_CANONICAL_SYMPTOM
+        ));
+        assert!(!vllm_extension_load_symptom_is_diagnosable(
+            "an ordinary failure"
+        ));
+    }
+
+    #[test]
     fn the_engine_host_guard_requires_the_entry_to_score_on_every_host_family() {
         // A registry stand-in: `listed_on` says which hosts list the entry.
         fn registry(
@@ -506,5 +706,168 @@ mod tests {
         assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
         // And a bare framework mention the engine would reject is not diagnosable.
         assert!(!vllm_oom_symptom_is_diagnosable("vllm: out of memory"));
+    }
+
+    /// The entry with `id` in `report`, or a panic naming what was listed.
+    fn entry<'a>(report: &'a DiagnoseReport, id: &str) -> &'a Diagnosis {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{id} was not listed: {:?}",
+                    report
+                        .matched
+                        .iter()
+                        .map(|d| (&d.id, d.score))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn with_gpu_override() -> Examination {
+        let mut e = linux_base();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        e
+    }
+
+    const ISA_PASTE: &str = "hipErrorNoBinaryForGpu: HSA_STATUS_ERROR_INVALID_ISA";
+
+    /// The case the field exists for: a finding about the machine sits beside
+    /// the entry the paste scores, and the paste contributed to only one of them.
+    #[test]
+    fn a_host_state_finding_is_not_credited_to_a_paste_about_something_else() {
+        let report = diagnose(&with_gpu_override(), ISA_PASTE);
+
+        let host = entry(&report, "fix-2-unset-override");
+        assert!(
+            !host.symptom_matched,
+            "the override finding comes from the environment alone: {host:?}"
+        );
+        let pasted = entry(&report, "fix-1-arch");
+        assert!(
+            pasted.symptom_matched,
+            "the ISA entry is scored from the paste: {pasted:?}"
+        );
+
+        // And both answers reach the document a consumer reads.
+        let json = serde_json::to_value(&report).unwrap();
+        let field = |id: &str| {
+            json["matched"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == id)
+                .map(|d| d["symptom_matched"].clone())
+        };
+        assert_eq!(field("fix-2-unset-override"), Some(false.into()));
+        assert_eq!(field("fix-1-arch"), Some(true.into()));
+    }
+
+    #[test]
+    fn a_paste_that_raises_a_host_finding_is_credited() {
+        // The override alone scores 30; a page fault in the paste adds to it.
+        let report = diagnose(&with_gpu_override(), "memory access page fault");
+        let raised = entry(&report, "fix-2-unset-override");
+        assert!(
+            raised.score > 30,
+            "the paste must have raised it: {raised:?}"
+        );
+        assert!(raised.symptom_matched, "{raised:?}");
+    }
+
+    #[test]
+    fn a_paste_that_lifts_an_entry_the_host_alone_ruled_out_is_credited() {
+        // The framework already carries this GPU's target, which pulls the
+        // arch entry below zero on its own, so it is not listed without the
+        // paste at all. With it, the entry is listed, and only because of it.
+        let mut e = linux_base();
+        e.gpus = vec![crate::examine::Gpu {
+            gfx_target: "gfx1100".to_owned(),
+            is_amd: true,
+            ..crate::examine::Gpu::default()
+        }];
+        e.framework_arch_list = vec!["gfx1100".to_owned()];
+        assert!(
+            diagnose(&e, "")
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-1-arch"),
+            "the premise: without the paste this entry is not listed"
+        );
+        let report = diagnose(&e, ISA_PASTE);
+        assert!(entry(&report, "fix-1-arch").symptom_matched);
+    }
+
+    #[test]
+    fn with_no_symptom_every_entry_says_so_and_the_field_is_still_written() {
+        for symptom in ["", "   "] {
+            let report = diagnose(&with_gpu_override(), symptom);
+            assert!(
+                !report.matched.is_empty(),
+                "this test is pointless unless something was listed"
+            );
+            assert!(
+                report.matched.iter().all(|d| !d.symptom_matched),
+                "nothing was pasted for {symptom:?}, so nothing in it contributed: {:?}",
+                report.matched
+            );
+            let json = serde_json::to_value(&report).unwrap();
+            for d in json["matched"].as_array().unwrap() {
+                assert_eq!(
+                    d.get("symptom_matched"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "the field is written, not omitted, when no symptom was given: {d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_payload_written_before_the_field_existed_still_reads() {
+        let old =
+            r#"{"id":"fix-2-unset-override","title":"t","score":30,"evidence":[],"fix":null}"#;
+        let d: Diagnosis = serde_json::from_str(old).expect("an older payload deserializes");
+        assert!(!d.symptom_matched);
+    }
+
+    fn finding(id: &str, score: i32, evidence: &[&str]) -> Diagnosis {
+        Diagnosis {
+            id: id.to_owned(),
+            score,
+            evidence: evidence.iter().map(|&e| e.to_owned()).collect(),
+            ..Diagnosis::default()
+        }
+    }
+
+    /// The three ways the symptom can show in an entry, one at a time, so each
+    /// half of the comparison has a case that only it decides.
+    #[test]
+    fn contribution_is_any_difference_from_the_run_without_the_symptom() {
+        let host_only = [finding("fix-a", 30, &["host fact"])];
+
+        // Same entry, same evidence, higher score: the score alone differs.
+        assert!(contributed(
+            &finding("fix-a", 55, &["host fact"]),
+            &host_only
+        ));
+        // Same score, extra evidence: what a keyword hit does to an entry
+        // already at the 100 cap. The evidence alone differs.
+        assert!(contributed(
+            &finding("fix-a", 30, &["host fact", "error mentions X"]),
+            &host_only
+        ));
+        // Not listed at all without the symptom.
+        assert!(contributed(
+            &finding("fix-b", 50, &["error mentions Y"]),
+            &host_only
+        ));
+        // Identical to the run without it: nothing contributed.
+        assert!(!contributed(
+            &finding("fix-a", 30, &["host fact"]),
+            &host_only
+        ));
     }
 }

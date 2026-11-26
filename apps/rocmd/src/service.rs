@@ -124,7 +124,28 @@ pub(crate) fn stop_managed_service_via(
     // stop's alone.
     if all_stopped {
         record.status = "stopped".to_owned();
-        record.stop_requested_unix_ms = None;
+        // Moved, not dropped — the same move `rocm services stop` makes on its
+        // confirmed path, and for the same reason. Since
+        // `managed_service_stop_was_requested` stopped accepting
+        // `status == "stopped"` as proof (a liveness reconciliation writes that
+        // for a record whose pids are merely gone), this marker is the *only*
+        // evidence a death was asked for. Clearing it here left a daemon- or
+        // `rocm dash`-initiated stop with no evidence at all, so it read as a
+        // crash and was stamped `failed` — the exact symptom ROCMAI-541 exists
+        // to remove, reintroduced through the one stop path that is not
+        // `rocm services stop`.
+        //
+        // Guarded, like the identical move in `service_control.rs` and
+        // `managed_service_status.rs`: a concurrent listing's liveness refresh
+        // may have settled this stop first. `.take()` on an already-emptied
+        // field yields `None`, and assigning that over a `settled_stop_unix_ms`
+        // the refresh had just written correctly erases the only durable
+        // evidence the death was asked for, leaving both fields unset — which
+        // reads as a crash. That is this change's own defect, reachable through
+        // the one stop path its table did not name.
+        if let Some(requested) = record.stop_requested_unix_ms.take() {
+            record.settled_stop_unix_ms = Some(requested);
+        }
         // Recorded PIDs go stale the instant their processes exit, and a stale
         // PID is exactly what the identity check exists to catch — so do not
         // leave one behind for the next stop to find. The same call
@@ -147,7 +168,7 @@ pub(crate) fn stop_managed_service_via(
         record.stop_requested_unix_ms = Some(requested_at);
     }
     record.write()?;
-    // Drop the 0600 endpoint key file with the service, rather than stranding a
+    // Drop the owner-only endpoint key file with the service, rather than stranding a
     // plaintext secret on disk for something that is no longer running.
     // Best-effort and idempotent: a missing key file is not an error, so a
     // loopback service that never had one, and a repeated stop, both pass
@@ -159,9 +180,8 @@ pub(crate) fn stop_managed_service_via(
     // that is otherwise fine, with no way to re-mint it. The marker written
     // above defers the cleanup instead; see there for who performs it.
     if all_stopped {
-        let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
-            paths, service_id,
-        ));
+        // With any staged copy a store killed before publishing left beside it.
+        rocm_engine_protocol::remove_endpoint_key_files(paths, service_id);
     }
     Ok(json!({
         "service": record,
@@ -236,12 +256,17 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
         fs::write(&key_path, "secret-key")?;
         assert!(key_path.exists());
+        // What a `rocm` store killed between staging and publishing leaves: a
+        // second copy of the key, named by the shared atomic writer.
+        let staged =
+            rocm_core::atomic_write::stage_owner_only_file_unpublished(&key_path, b"secret-key")?;
 
         let result = stop_managed_service(&paths, service_id);
         // Observe the real filesystem state before the blanket temp-dir cleanup,
         // otherwise remove_dir_all would delete the key file and mask a missing
         // production cleanup (the regression this test guards).
         let key_removed = !key_path.exists();
+        let staged_removed = !staged.exists();
         fs::remove_dir_all(root).ok();
 
         let value = result?;
@@ -253,6 +278,7 @@ mod tests {
             Some("stopped")
         );
         assert!(key_removed, "endpoint key file must be removed after stop");
+        assert!(staged_removed, "a staged copy of the key must go with it");
         Ok(())
     }
 
@@ -635,6 +661,23 @@ mod tests {
             reloaded.stop_requested_unix_ms, None,
             "a confirmed stop must clear the deferred-cleanup marker"
         );
+        // Cleared, but not lost: it moves to `settled_stop_unix_ms`, which is
+        // the only evidence left that this death was asked for.
+        // `managed_service_stop_was_requested` no longer accepts
+        // `status == "stopped"` as proof, because a liveness reconciliation
+        // writes that for a record whose pids are merely gone — so a daemon or
+        // `rocm dash` stop that dropped the marker here would be read as a
+        // crash and stamped `failed`. `rocm services stop` makes the same move;
+        // the two paths have to agree or one of them reports every stop as a
+        // crash.
+        // Presence, not the planted value: the stop re-stamps
+        // `stop_requested_unix_ms` with its own `requested_at` before
+        // signalling anything, so what lands here is that timestamp rather
+        // than the `Some(1)` seeded above.
+        assert!(
+            reloaded.settled_stop_unix_ms.is_some(),
+            "the marker must be moved, not dropped, or this stop reads as a crash"
+        );
         Ok(())
     }
 
@@ -948,6 +991,18 @@ mod tests {
             let reloaded = reloaded?;
             assert_eq!(reloaded.status, "stopped", "{status}");
             assert_eq!(reloaded.stop_requested_unix_ms, None, "{status}");
+            // The field the guarded marker move exists to protect. An empty
+            // `stop_requested_unix_ms` here means a concurrent listing settled
+            // this stop first; an unguarded `take()`-and-assign writes that
+            // `None` over the `settled_stop_unix_ms` the listing had just
+            // written, leaving both unset — which reads as a crash. Without
+            // this assertion the unguarded form, which did ship earlier in this
+            // PR before being caught, passes every test in this file unchanged.
+            assert!(
+                reloaded.settled_stop_unix_ms.is_some(),
+                "{status}: the stop's durable evidence must survive a listing \
+                 that consumed the live marker first"
+            );
             assert!(key_removed, "{status}");
         }
         Ok(())

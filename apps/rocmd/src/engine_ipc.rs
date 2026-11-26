@@ -193,6 +193,10 @@ const fn stdio_options<'a>(
         app_paths: Some(paths),
         env_root: None,
         endpoint_key_file,
+        // `None` here means "this loopback service needs no key", not "this
+        // child may not see one" — these are the daemon's own children, and
+        // clearing would change what they inherit.
+        withhold_inherited_key_file: false,
         request_progress: false,
         forward_stderr: false,
         note_failing_exit_after_answer: true,
@@ -416,10 +420,7 @@ mod tests {
         const STOPPED: &str = r#"{"ok":true,"data":{"stopped":true}}"#;
 
         fn healthcheck_envelope() -> EngineRequestEnvelope {
-            EngineRequestEnvelope {
-                method: EngineMethod::Healthcheck,
-                payload: json!({"service_id": SERVICE_ID}),
-            }
+            EngineRequestEnvelope::new(EngineMethod::Healthcheck, json!({"service_id": SERVICE_ID}))
         }
 
         fn request(engine: &FakeEngine, paths: &AppPaths) -> Result<Value> {
@@ -446,7 +447,11 @@ mod tests {
             assert_eq!(engine.argv(), ["__engine-stdio", "vllm"]);
             assert_eq!(
                 engine.stdin(),
-                "{\"method\":\"healthcheck\",\"payload\":{\"service_id\":\"svc-stdio-child\"}}\n"
+                format!(
+                    "{{\"protocol_version\":\"{}\",\"method\":\"healthcheck\",\
+                     \"payload\":{{\"service_id\":\"svc-stdio-child\"}}}}\n",
+                    rocm_engine_protocol::ENGINE_PROTOCOL_VERSION
+                )
             );
         }
 
@@ -528,7 +533,9 @@ mod tests {
                 FakeEngine::new("rocmd-garbage", true, "printf 'not json'\necho oops >&2");
             assert_eq!(
                 request(&garbage, &paths).unwrap_err().to_string(),
-                "failed to parse engine response envelope; stderr: oops"
+                "failed to parse engine response envelope: the engine's stdout is not JSON \
+                 (expected ident at line 1 column 2), starting with `not json` (an engine \
+                 writes only its JSON answer to stdout; logs go to stderr); stderr: oops"
             );
         }
 
@@ -552,10 +559,8 @@ mod tests {
                 let engine = FakeEngine::new("rocmd-sigpipe", false, "exit 3");
                 // Larger than a pipe buffer, so the write reaches the closed read end.
                 let big = "x".repeat(1 << 20);
-                let envelope = EngineRequestEnvelope {
-                    method: EngineMethod::Healthcheck,
-                    payload: json!({ "blob": big }),
-                };
+                let envelope =
+                    EngineRequestEnvelope::new(EngineMethod::Healthcheck, json!({ "blob": big }));
                 let result = engine_request_via::<Value>(
                     engine.path(),
                     &paths,

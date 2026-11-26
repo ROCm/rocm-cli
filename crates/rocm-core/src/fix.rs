@@ -16,10 +16,14 @@
 //! place.
 //!
 //! This file is the module root. The exit codes, [`FixOptions`] and [`FixClass`]
-//! live in `fix/options.rs`, and the consent decision, the timeouts and the
-//! `fail!` helper in `fix/consent.rs`; the names are re-exported from here, so
-//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving. The
-//! runners, one per auto-applicable fix, are in `fix/runners.rs`. The closed
+//! live in `fix/options.rs` and are re-exported from here, so
+//! `crate::fix::exit` and `rocm_core::fix::FixClass` keep resolving.
+//! `fix/consent.rs` holds the consent decision, the timeouts, the `fail!`
+//! helper, and the one way a runner runs a host command and reports how it
+//! ended (`run_step`, `Step`, `CheckIn`, `StepFailure`, `read_failure`). The
+//! runners, one per auto-applicable fix, are in `fix/runners.rs`, and the
+//! groups fix-4 names, decided for `rocm diagnose` and `rocm fix` alike, in
+//! `fix/render_group.rs`. The closed
 //! catalog (`RECIPES`, `FixRecipe`, the lookups by fix-id and the test-only
 //! oracles) is in `fix/catalog.rs`, its rendering in `fix/render.rs` and its
 //! published JSON contract in `fix/manifest.rs`. What stays here is the
@@ -30,6 +34,7 @@ mod consent;
 mod manifest;
 mod options;
 mod render;
+mod render_group;
 mod runners;
 
 use catalog::{FixRecipe, find_recipe};
@@ -39,22 +44,31 @@ use render::{
 };
 use std::io::Write;
 
-pub(crate) use catalog::{COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, is_catalog_id};
+pub(crate) use catalog::{
+    COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, IGPU_PIN_LINUX, IGPU_PIN_WINDOWS, IGPU_QUERY_LINUX,
+    IGPU_QUERY_WINDOWS, IGPU_VERIFY, RENDER_GROUP_VERIFY, is_catalog_id, path_export_line,
+};
 pub use catalog::{class_on, needs_on};
+pub use consent::{DRY_RUN_NOTICE, NON_INTERACTIVE_REFUSAL};
 pub use manifest::{
     CATALOG_CONTRACT_VERSION, CatalogManifest, ManifestEntry, ManifestPlatform, catalog_manifest,
     catalog_manifest_json,
 };
 pub use options::{FixClass, FixOptions, exit};
 pub(crate) use render::format_flags;
-pub use render::list_recipes;
+pub use render::{fix_plan_text, list_recipes};
+pub(crate) use render_group::{
+    DEVICE_STAT_FORMAT, PlanReader, getent_answered, getent_args, no_target_reason,
+    parse_device_stat, parse_getent_group, render_group_targets, usermod_args,
+};
+pub use runners::{FixPreview, fix_preview_text};
 // The catalog's test-only oracles, which the `diagnose` module holds its own copies of
 // a recipe to.
 #[cfg(test)]
 pub(crate) use catalog::{
-    OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, assert_engine_shell_boundary_is_labelled,
+    OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, acting_fix_ids, assert_engine_shell_boundary_is_labelled,
     assert_needs_reboot_matches_the_catalog, assert_plan_matches_the_catalog_copy,
-    fails_in_windows_powershell, recipe_applies_on, recipe_linux_verify,
+    fails_in_windows_powershell, recipe_applies_on, recipe_linux_verify, recipe_rationale,
     recipe_verify_notes_and_run_commands, torch_rocm_indexes_named_in,
 };
 #[cfg(all(test, windows))]
@@ -64,7 +78,7 @@ pub(crate) use catalog::{ShellRun, run_typed_in_cmd_and_powershell};
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
-        fail!("Unknown fix-id: {fix_id}");
+        fail!("{} {fix_id}", exit::UNKNOWN_ID_PREFIX);
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
@@ -89,14 +103,17 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 /// [`Plan::Unfixable`] from [`Plan::PrintSteps`], and the difference matters —
 /// the second tells the user to copy commands, which an unfixable entry does not
 /// have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `PartialEq`: `Run` carries a function pointer, whose comparison is not
+// meaningful. Tests match on the variant instead.
+#[derive(Debug, Clone, Copy)]
 enum Plan {
     /// The entry does not apply on the running OS.
     WrongMachine,
     /// No reliable fix exists. Name the problem and change nothing.
     Unfixable,
-    /// Hand off to the recipe's runner.
-    Run,
+    /// Hand off to the recipe's runner, carried here so [`act_on`] cannot
+    /// reach this arm without one.
+    Run(fn(&FixOptions) -> i32),
     /// The catalog says the CLI carries this out, and nothing can.
     MissingRunner,
     /// Print the steps for the user to carry out.
@@ -116,8 +133,8 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
     // real work to do there -- it reads the live value and scans five rc files
     // to name the ones that set it. Gating the runner on the class would throw
     // that away and print a generic "copy the commands above" in its place.
-    if recipe.runner.is_some() {
-        return Plan::Run;
+    if let Some(runner) = recipe.runner {
+        return Plan::Run(runner);
     }
     if platform.class.applies_itself() {
         return Plan::MissingRunner;
@@ -135,8 +152,8 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
 /// branch before that, and still covers any class the catalog later empties.
 #[must_use]
 fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
+    // The plan and the blank line after it (`plan_preamble`).
     print_recipe(recipe);
-    println!();
 
     // Exhaustive on purpose. An arm removed here is a compile error rather than
     // a silent fall-through to the next branch, which is how a disabled guard
@@ -159,13 +176,12 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
             println!("The explanation above is the whole of what is known about it.");
             exit::OK
         }
-        Plan::Run => recipe
-            .runner
-            .expect("plan_of returns Run only when a runner is present")(opts),
+        Plan::Run(runner) => runner(opts),
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
             // carry it out with -> INTERNAL, not FAILED (which is reserved for
-            // "attempted, and the command failed"). Held by
+            // "attempted, and a command or the read it planned from failed").
+            // Held by
             // `a_recipe_that_acts_has_a_runner`.
             fail!("Internal error: a recipe the catalog says is applied here has no runner.");
             exit::INTERNAL
@@ -239,15 +255,16 @@ mod tests {
         // an assertion on the code would survive the unfixable arm being
         // disabled, and the user would be told to copy commands that do not
         // exist. This is the part that only holds while the arm is reached.
-        assert_eq!(
-            plan_of(&unfixable_recipe(FixClass::DiagnoseOnly)),
-            Plan::Unfixable,
+        assert!(
+            matches!(
+                plan_of(&unfixable_recipe(FixClass::DiagnoseOnly)),
+                Plan::Unfixable
+            ),
             "DIAGNOSE-ONLY must not fall through to the print-the-steps path"
         );
         for actionable in [FixClass::Auto, FixClass::NeedsArgument, FixClass::PrintOnly] {
-            assert_ne!(
-                plan_of(&unfixable_recipe(actionable)),
-                Plan::Unfixable,
+            assert!(
+                !matches!(plan_of(&unfixable_recipe(actionable)), Plan::Unfixable),
                 "{actionable:?} has something to offer and must not be treated as unfixable"
             );
         }
@@ -278,6 +295,26 @@ mod tests {
             act_on(&elsewhere, &opts),
             3,
             "a recipe that does not apply here is a wrong-machine result, whatever its class"
+        );
+    }
+
+    /// The published `internal` description: a recipe the catalog says the CLI
+    /// carries out here, with no runner to carry it out, is the CLI's own fault
+    /// and exits with the code published as `internal`, not `failed`.
+    /// `a_recipe_that_acts_has_a_runner` keeps the real catalog off this path;
+    /// this drives the path itself with a synthetic recipe.
+    #[test]
+    fn a_recipe_the_catalog_says_is_applied_with_no_runner_exits_internal() {
+        // `Auto` is the class that says the CLI applies the fix itself
+        // (`FixClass::applies_itself`); a runner-less `NeedsArgument` entry only
+        // prints steps, so it is not this path.
+        let recipe = unfixable_recipe(FixClass::Auto);
+        let plan = plan_of(&recipe);
+        assert!(matches!(plan, Plan::MissingRunner), "{plan:?}");
+        assert_eq!(
+            act_on(&recipe, &FixOptions::default()),
+            exit::INTERNAL,
+            "an AUTO entry with no runner must exit with the code published as internal"
         );
     }
 
@@ -817,12 +854,13 @@ mod tests {
         // covers `fix.rs` and every file in `fix/`. The list below is held to
         // the directory, so a child added without being listed fails the test
         // rather than silently going unscanned.
-        let children: [(&str, &str); 6] = [
+        let children: [(&str, &str); 7] = [
             ("catalog.rs", include_str!("fix/catalog.rs")),
             ("consent.rs", include_str!("fix/consent.rs")),
             ("manifest.rs", include_str!("fix/manifest.rs")),
             ("options.rs", include_str!("fix/options.rs")),
             ("render.rs", include_str!("fix/render.rs")),
+            ("render_group.rs", include_str!("fix/render_group.rs")),
             ("runners.rs", include_str!("fix/runners.rs")),
         ];
         let mut on_disk: Vec<String> =
@@ -858,10 +896,12 @@ mod tests {
             "apply",
             "act_on",
             "run_render_group",
+            "render_group_with",
             "run_unset_override",
             "run_unset_override_linux",
             "report_persistent_override",
             "run_unset_override_windows",
+            "unset_override_windows_with",
             "report_and_clear_override_windows",
             "run_path_export",
             "run_path_export_linux",
@@ -871,6 +911,7 @@ mod tests {
             "run_hip_visible_devices_linux",
             "pin_device_in_rc_file",
             "run_hip_visible_devices_windows",
+            "hip_visible_devices_windows",
         ] {
             assert!(
                 scan.checked.iter().any(|name| name == runner),

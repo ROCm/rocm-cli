@@ -70,13 +70,85 @@ ok() {
   printf '%s\n' "${C_OK}::${C_RESET} $*"
 }
 
+# Width to draw a download progress bar at, or empty when no bar should be
+# drawn. curl sizes its bar from COLUMNS whenever that variable parses to a
+# sane number, in preference to asking the terminal, and then draws a line
+# exactly that wide. A COLUMNS left over from a wider window, routine when a
+# terminal is resized after the shell starts, therefore makes every refresh run
+# past the right margin and wrap; the carriage return ending each frame then
+# returns to the start of the wrapped row rather than the bar's, so each redraw
+# paints a row lower and one download arrives as a stack of partial bars with
+# its percentage torn across two rows. Measuring the terminal here and passing
+# that width down puts the real one back in charge, and reserving the last
+# column keeps the line clear of the margin if the measurement is off by one.
+progress_bar_width() {
+  width=""
+  if command -v stty >/dev/null 2>&1; then
+    # fd 2 is what fetch() gates the bar on, and the only descriptor still
+    # attached to the terminal under `curl ... | sh`, where stdin is the pipe.
+    width="$(stty size <&2 2>/dev/null | awk '{print $2}')"
+  fi
+  # A terminal whose window size was never set (a freshly opened pty, say)
+  # reports 0. That means "unmeasured", not "extremely narrow", so fall through
+  # to the other sources rather than treating it as a width and dropping the
+  # bar that curl would otherwise have drawn at its own default.
+  [ "${width}" = "0" ] && width=""
+  if [ -z "${width}" ] && command -v tput >/dev/null 2>&1; then
+    # Read fd 2 here too: tput otherwise sizes from its own stdin, which under
+    # `curl ... | sh` is the pipe, making ncurses report its 80-column default
+    # instead of the terminal. COLUMNS is blanked because ncurses consults it
+    # first, and would hand back the stale value this function exists to escape.
+    width="$(COLUMNS='' tput cols <&2 2>/dev/null || true)"
+  fi
+  [ "${width}" = "0" ] && width=""
+  if [ -z "${width}" ]; then
+    width="${COLUMNS:-80}"
+  fi
+  case "${width}" in
+    "" | *[!0-9]*) width=80 ;;
+    *) : ;;
+  esac
+  # Strip leading zeros. A zero-padded value such as 080 passes the digit check
+  # above but is an octal literal to POSIX arithmetic, which dash rejects
+  # outright ("Illegal number: 080"). bash's 10# prefix would force base 10 but
+  # is not POSIX, and dash rejects that too, so do it by hand.
+  while :; do
+    case "${width}" in
+      0[0-9]*) width="${width#0}" ;;
+      *) break ;;
+    esac
+  done
+  # A bare 0 reaching here came from the environment rather than a measurement,
+  # so treat it as unmeasured like the terminal sources above.
+  [ "${width}" = "0" ] && width=80
+  # curl ignores a COLUMNS of 20 or less and sizes the bar itself, which would
+  # reintroduce the overrun this function exists to prevent. Report no width so
+  # the caller downloads quietly instead.
+  if [ "${width}" -le 21 ]; then
+    return 0
+  fi
+  printf '%s\n' "$((width - 1))"
+}
+
+# Set once the narrow-terminal notice below has been printed, so three
+# downloads do not repeat it.
+narrow_terminal_reported=0
+
 fetch() {
   url="$1"
   output="$2"
   failure_message="${3:-failed to download ${url}}"
   if command -v curl >/dev/null 2>&1; then
+    bar_width=""
     if [ -t 2 ]; then
-      curl -fL --progress-bar "${url}" -o "${output}" || {
+      bar_width="$(progress_bar_width)"
+      if [ -z "${bar_width}" ] && [ "${narrow_terminal_reported}" -eq 0 ]; then
+        info "terminal too narrow for a progress bar, downloading quietly"
+        narrow_terminal_reported=1
+      fi
+    fi
+    if [ -n "${bar_width}" ]; then
+      COLUMNS="${bar_width}" curl -fL --progress-bar "${url}" -o "${output}" || {
         rm -f "${output}"
         fail "${failure_message}"
       }
@@ -88,7 +160,12 @@ fetch() {
     fi
   elif command -v wget >/dev/null 2>&1; then
     if [ -t 2 ]; then
-      wget --show-progress -O "${output}" "${url}" || {
+      # --show-progress alone leaves wget's full request logging in place, so
+      # the bar is interleaved with resolver and redirect chatter. -nv drops
+      # that chatter and keeps the bar, which wget already holds inside the
+      # terminal width. Not -q, which would also swallow wget's reason for a
+      # failure and leave only this script's generic message.
+      wget -nv --show-progress -O "${output}" "${url}" || {
         rm -f "${output}"
         fail "${failure_message}"
       }
@@ -103,12 +180,16 @@ fetch() {
   fi
 }
 
-# Pinned production release signing public keys (trust roots). These stay empty
-# until the repository owner publishes production keys (see docs/release-trust.md,
-# "Remaining Owner Step"). While empty, release installs keep the opt-in behavior
-# below: a signature is verified only when a key is supplied via the env vars or
-# ROCM_CLI_REQUIRE_SIGNATURE=1. Once populated, release-channel installs verify
-# signatures by default with these keys as trust roots. Two slots support
+# Pinned production release signing public keys (trust roots). The CURRENT slot
+# holds the published release key, whose canonical copy is
+# docs/keys/rocm-cli-release-current-public.pem; the NEXT slot stays "" until a
+# rotation key is published. resolve_public_keys falls back to these keys
+# whenever ROCM_CLI_SIGNING_PUBLIC_KEY_PATH and ROCM_CLI_SIGNING_PUBLIC_KEY_PEM
+# are unset, so while a release key is pinned every install on any channel
+# except a pr-<number> channel verifies the detached signature and a missing
+# .sig sidecar fails it, whether ROCM_CLI_REQUIRE_SIGNATURE is unset or 0. A
+# pr-<number> channel installs an unsigned CI bundle and empties this list. A key supplied through those env
+# vars replaces these keys rather than adding to them. Two slots support
 # zero-downtime key rotation: a release signed with either the current or the
 # pre-staged next key verifies, so the next key is trusted before its first use.
 PINNED_RELEASE_PUBLIC_KEY_CURRENT="-----BEGIN PUBLIC KEY-----
@@ -556,7 +637,31 @@ if [ -n "${LOCAL_ARCHIVE}" ] && [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
   fail "ROCM_CLI_ARCHIVE and ROCM_CLI_DOWNLOAD_ONLY are mutually exclusive"
 fi
 
+# `pr-<number>` installs the bundle CI built for that pull request, which is a
+# workflow artifact rather than a release asset: see fetch_pr_bundle below.
+PR_NUMBER=""
 case "${CHANNEL}" in
+  pr-*)
+    PR_NUMBER="${CHANNEL#pr-}"
+    case "${PR_NUMBER}" in
+      ''|*[!0-9]*) fail "invalid channel: ${CHANNEL} (a pull request channel is pr-<number>, for example pr-1234)" ;;
+      *) ;;
+    esac
+    [ -z "${LOCAL_ARCHIVE}" ] || fail "ROCM_CLI_ARCHIVE cannot be combined with the ${CHANNEL} channel"
+    [ -z "${ROCM_CLI_DOWNLOAD_BASE:-}" ] || fail "ROCM_CLI_DOWNLOAD_BASE cannot be combined with the ${CHANNEL} channel: the build comes from CI, not from release assets"
+    # An unsigned bundle exported for another machine could not be installed
+    # there: ROCM_CLI_ARCHIVE refuses this channel, and the release channels
+    # demand a signature it does not have.
+    [ "${DOWNLOAD_ONLY}" -eq 0 ] || fail "ROCM_CLI_DOWNLOAD_ONLY cannot be combined with the ${CHANNEL} channel: a pull request build is unsigned, so it cannot be installed from a download"
+    ;;
+  *) ;;
+esac
+
+case "${CHANNEL}" in
+  pr-*)
+    asset_base="rocm-cli-pr-${platform_os}-${platform_arch}.tar.gz"
+    release_path=""
+    ;;
   nightly)
     asset_base="rocm-cli-nightly-${platform_os}-${platform_arch}.tar.gz"
     release_path="releases/download/nightly"
@@ -588,11 +693,63 @@ archive_path="${tmp_dir}/${asset_base}"
 sha_path="${archive_path}.sha256"
 sig_path="${archive_path}.sig"
 
+# Resolve pull request ${PR_NUMBER} to the CI artifact built from its current
+# head, download it, and point LOCAL_ARCHIVE at the bundle inside, so the checks
+# and the install below run exactly as they do for any archive on disk.
+#
+# Artifacts are not public downloads, so this needs the GitHub CLI signed in
+# (or GH_TOKEN set). The newest CI run for the head commit that still has its
+# artifact wins. A run whose later jobs failed still uploads one, so the run's
+# result is printed rather than required. gh reads nothing from stdin, which
+# under `curl | sh` is the rest of this script.
+fetch_pr_bundle() {
+  need_cmd gh
+  pr_artifact="rocm-cli-pr-${platform_os}-${platform_arch}"
+  pr_head="$(gh pr view "${PR_NUMBER}" -R "${REPO}" --json headRefOid --jq .headRefOid < /dev/null)" \
+    || fail "could not look up pull request #${PR_NUMBER} in ${REPO} (is gh signed in? try: gh auth login)"
+  [ -n "${pr_head}" ] || fail "pull request #${PR_NUMBER} has no head commit"
+  pr_short="$(printf '%.7s' "${pr_head}")"
+  pr_runs="$(gh api "repos/${REPO}/actions/runs?head_sha=${pr_head}&event=pull_request&per_page=100" \
+    --jq '.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | "\(.id) \(.status) \(.conclusion // "-")"' < /dev/null)" \
+    || fail "could not list CI runs for pull request #${PR_NUMBER}"
+  [ -n "${pr_runs}" ] || fail "no CI run found for pull request #${PR_NUMBER} at ${pr_short}; CI may not have started (a first-time contributor's run waits for approval)"
+  pr_run=""
+  pr_run_state=""
+  while read -r run_id run_status run_conclusion; do
+    [ -n "${run_id}" ] || continue
+    live="$(gh api "repos/${REPO}/actions/runs/${run_id}/artifacts?name=${pr_artifact}" \
+      --jq '[.artifacts[] | select(.expired | not)] | length' < /dev/null)" || {
+      live=0
+      info "note: could not list the artifacts of CI run ${run_id}; trying the next run"
+    }
+    if [ "${live:-0}" -gt 0 ]; then
+      pr_run="${run_id}"
+      pr_run_state="${run_status}/${run_conclusion}"
+      break
+    fi
+  done <<EOF_RUNS
+${pr_runs}
+EOF_RUNS
+  [ -n "${pr_run}" ] || fail "no downloadable ${pr_artifact} build for pull request #${PR_NUMBER} at ${pr_short}; builds are kept for 7 days and only made for changes that touch code, so push a commit or re-run CI"
+  info "pull request: #${PR_NUMBER} at ${pr_short}"
+  info "CI run: ${pr_run} (${pr_run_state})"
+  info "note: this is an unreviewed, unsigned build of the pull request; only its checksum is verified"
+  pr_dir="${tmp_dir}/pr-artifact"
+  mkdir -p "${pr_dir}"
+  gh run download "${pr_run}" -R "${REPO}" -n "${pr_artifact}" -D "${pr_dir}" < /dev/null \
+    || fail "failed to download the ${pr_artifact} artifact from run ${pr_run}"
+  LOCAL_ARCHIVE="${pr_dir}/${asset_base}"
+}
+
 step "rocm-cli installer"
 info "repo: ${REPO}"
 info "channel: ${CHANNEL}"
 info "platform: ${platform_os}-${platform_arch}"
-if [ -n "${LOCAL_ARCHIVE}" ]; then
+if [ -n "${PR_NUMBER}" ]; then
+  info "install_dir: ${INSTALL_DIR}"
+  fetch_pr_bundle
+  info "archive: ${LOCAL_ARCHIVE}"
+elif [ -n "${LOCAL_ARCHIVE}" ]; then
   info "archive: ${LOCAL_ARCHIVE}"
 elif [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
   info "download_only: ${DOWNLOAD_DIR}"
@@ -621,25 +778,46 @@ actual="$(sha256_file "${archive_path}")"
 [ "${expected}" = "${actual}" ] || fail "checksum verification failed"
 
 public_keys="$(resolve_public_keys)"
+# CI does not sign pull request bundles, so the pinned release keys do not
+# apply to them: a key is used only when one was named explicitly or a
+# signature was required, and then the missing .sig fails the install.
+if [ -n "${PR_NUMBER}" ] && [ -z "${ROCM_CLI_SIGNING_PUBLIC_KEY_PATH:-}" ] && [ -z "${ROCM_CLI_SIGNING_PUBLIC_KEY_PEM:-}" ]; then
+  public_keys=""
+fi
 
 require_sig=0
 if truthy "${ROCM_CLI_REQUIRE_SIGNATURE:-0}"; then
   require_sig=1
 fi
-# Production default: once release trust roots are pinned, release-channel
-# installs always verify. An unset or 0 ROCM_CLI_REQUIRE_SIGNATURE does not lower
-# this floor; use ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/PEM to point at an alternate
-# key (e.g. a private mirror) instead.
+# This floor changes no outcome while a release key is pinned:
+# resolve_public_keys then always returns a key, and that alone makes the check
+# below verify. If both pinned slots were emptied, has_pinned_release_keys is
+# false and the floor does not fire either, so a release install with no key
+# supplied would skip verification, unless ROCM_CLI_REQUIRE_SIGNATURE=1, which
+# makes it fail for want of a key. The floor is left as it is on purpose: making
+# a release install fail when no key resolves is tracked as ROCMAI-960. Use
+# ROCM_CLI_SIGNING_PUBLIC_KEY_PATH/PEM to point at an alternate key (e.g. a
+# private mirror).
 if [ "${CHANNEL}" = "release" ] && has_pinned_release_keys; then
   require_sig=1
 fi
 
 if [ "${require_sig}" -eq 1 ] || [ -n "${public_keys}" ]; then
-  [ -n "${public_keys}" ] || fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
+  if [ -z "${public_keys}" ]; then
+    # Only a pull request channel gets here with a signature required and no
+    # key by design; naming a key would send the user to a second failure,
+    # since CI never signs these bundles.
+    [ -z "${PR_NUMBER}" ] || fail "a signature cannot be required for the ${CHANNEL} channel: CI does not sign pull request builds"
+    fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
+  fi
   if [ -n "${LOCAL_ARCHIVE}" ]; then
     # A locally-supplied archive has no URL to fall back on: the signature had to
     # travel with it. Refusing here is the point -- an artifact delivered out of
     # band is precisely the one whose provenance cannot be assumed.
+    if [ -n "${PR_NUMBER}" ]; then
+      # The bundle sits in a temporary directory; name the artifact file, not that path.
+      [ -f "${sig_path}" ] || fail "required signature sidecar is missing from the pull request artifact: ${asset_base}.sig"
+    fi
     [ -f "${sig_path}" ] || fail "required signature sidecar is missing: ${LOCAL_ARCHIVE}.sig"
   else
     fetch "${sig_url}" "${sig_path}" "required signature sidecar is missing or unavailable: ${sig_url}"

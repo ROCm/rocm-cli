@@ -640,6 +640,13 @@ fn split_shell_list(text: &str) -> Vec<String> {
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
+            // `<<` starts a heredoc, a redirection, not a `<placeholder>`:
+            // taken whole, so neither `<` opens one.
+            '<' if next == Some('<') => {
+                current.push_str("<<");
+                index += 2;
+                continue;
+            }
             // `<` opens a placeholder only at a word start and before a
             // non-space: ` < file` is a redirection.
             '<' if at_word_start && next.is_some_and(|c| !c.is_whitespace()) => closers.push('>'),
@@ -677,7 +684,7 @@ pub(crate) fn command_parts(raw: &str) -> Vec<String> {
         }
         let mut command = command.to_owned();
         for marker in [
-            " >> ", " > ", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
+            " >> ", " > ", " <<", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
         ] {
             if let Some(position) = command.find(marker) {
                 command.truncate(position);
@@ -1129,6 +1136,12 @@ pub(crate) fn verdict(argv: &[String]) -> Verdict {
 /// and an entry whose text no longer occurs fails
 /// `exclusions_still_match_something`.
 const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
+    // Loop bodies whose subcommand and value are variables.
+    (
+        "docs/manual-testing.md",
+        "rocm config $w[0] $value | Out-Null",
+        "PowerShell loop body; the setters and values it runs are spelled out in the array above it",
+    ),
     // Prose that happens to begin with the program name.
     (
         "crates/rocm-core/src/diagnose/engine.rs",
@@ -1290,6 +1303,30 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "docs/manual-testing.md",
         "rocm services prune --any-age --older-than-hours 0",
         "the doc's expected result is that the parser rejects this combination",
+    ),
+    (
+        "docs/manual-testing.md",
+        "rocm fix --no-such-option; echo $?",
+        "the doc's expected result is that the parser rejects the unknown option \
+         with exit 2, the code the catalog publishes for an unknown fix-id",
+    ),
+    // The `device:` row's value (ROCMAI-550). Every engine reports the backend
+    // it selected as `<backend> [gpu <n>] [(<name>)]` -- `vulkan (AMD Radeon
+    // Graphics)`, `rocm gpu 1 (AMD Instinct MI300X)` -- so the ROCm half of
+    // that value reads as a `rocm` invocation to this scan while naming no
+    // command at all. The engines no longer need an entry each: they build the
+    // string through `rocm_engine_protocol::format_reported_device` rather
+    // than holding a `"rocm gpu ..."` literal. These are the two docs that
+    // quote the format back.
+    (
+        "README.md",
+        "rocm gpu 0 (AMD Instinct MI300X)",
+        "an example `device:` value in the deployment-summary description, not a command",
+    ),
+    (
+        "docs/manual-testing.md",
+        "rocm gpu 0 (AMD Instinct MI300X)",
+        "the `device:` value the tester is told to expect, not a command to run",
     ),
 ];
 
@@ -1723,9 +1760,7 @@ fn service_action_retry_advice_parses_for_generated_ids() {
             let error = run_approved_service_action(&paths, tool, &id, false)
                 .expect_err("an action without --yes is refused")
                 .to_string();
-            let advised = error
-                .lines()
-                .find_map(|line| line.strip_prefix("Try: "))
+            let advised = rocm_core::recovery_hint::try_command(&error)
                 .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
             let argv = split_words(advised);
             assert_eq!(
@@ -1903,9 +1938,7 @@ fn runtime_restart_retry_advice_parses_and_clears_the_refusal() {
             let error = ensure_runtime_service_restart_approved(&refused)
                 .expect_err("--restart-services without --yes is refused")
                 .to_string();
-            let advised = error
-                .lines()
-                .find_map(|line| line.strip_prefix("Try: "))
+            let advised = rocm_core::recovery_hint::try_command(&error)
                 .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
             let retry = split_words(advised);
             assert_eq!(
@@ -1929,6 +1962,190 @@ fn runtime_restart_retry_advice_parses_and_clears_the_refusal() {
         ["activate", "rollback"],
         "the subcommands taking --restart-services changed; check the hint covers them"
     );
+}
+
+/// `argv` parsed as a `rocm uninstall` command line: the options the dispatch
+/// builds from it, and whether the hidden `--force` was given. Every field is
+/// named, so a new flag fails to compile here until it is mapped.
+fn uninstall_invocation(argv: &[String]) -> (crate::uninstall_plan::UninstallOptions, bool) {
+    use super::Command;
+    let matches = cli_command()
+        .try_get_matches_from(argv)
+        .unwrap_or_else(|error| panic!("{argv:?} does not parse: {error}"));
+    match Cli::from_arg_matches(&matches).map(|cli| cli.command) {
+        Ok(Some(Command::Uninstall {
+            yes,
+            dry_run,
+            keep_binaries,
+            keep_config,
+            keep_data,
+            keep_cache,
+            force_dev_binaries,
+            force,
+        })) => (
+            crate::uninstall_plan::UninstallOptions {
+                yes,
+                dry_run,
+                keep_binaries,
+                keep_config,
+                keep_data,
+                keep_cache,
+                force_dev_binaries,
+            },
+            force.is_some(),
+        ),
+        other => panic!("{argv:?} is not `rocm uninstall`: {other:?}"),
+    }
+}
+
+/// Every `rocm uninstall` command line built from its on/off flags other than
+/// `--yes`, each subset in declaration order. The flags are read from the clap
+/// tree and checked against the list the advice builder repeats, so a new flag
+/// fails here until `uninstall_command_line` repeats it too.
+fn uninstall_flag_subsets() -> Vec<Vec<String>> {
+    let root = cli_command();
+    let uninstall = root
+        .find_subcommand("uninstall")
+        .expect("`rocm uninstall` exists");
+    let flags: Vec<&str> = uninstall
+        .get_arguments()
+        .filter(|arg| matches!(arg.get_action(), clap::ArgAction::SetTrue))
+        .filter_map(clap::Arg::get_long)
+        .filter(|long| *long != "yes")
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            "dry-run",
+            "keep-binaries",
+            "keep-config",
+            "keep-data",
+            "keep-cache",
+            "force-dev-binaries"
+        ],
+        "`rocm uninstall`'s flags changed; make `uninstall_command_line` repeat the new one"
+    );
+    (0..1_u32 << flags.len())
+        .map(|mask| {
+            let mut argv = vec!["rocm".to_owned(), "uninstall".to_owned()];
+            for (bit, flag) in flags.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    argv.push(format!("--{flag}"));
+                }
+            }
+            argv
+        })
+        .collect()
+}
+
+/// The `Try:` line a `rocm uninstall` refused for want of `--yes` ends with,
+/// checked through the real refusal for every combination of its flags. It must
+/// parse, name the same uninstall with `--yes` added (so it removes what the
+/// refused run listed, and nothing it kept), and pass the gate that refused.
+#[test]
+fn uninstall_refusal_advice_parses_and_clears_the_refusal() {
+    use crate::uninstall::approval;
+
+    for argv in uninstall_flag_subsets() {
+        let (options, force) = uninstall_invocation(&argv);
+        assert!(!force);
+        assert_eq!(
+            approval(&options, || true).ok(),
+            Some(false),
+            "at a terminal {argv:?} still asks"
+        );
+        let refusal = format!(
+            "{:#}",
+            approval(&options, || false).expect_err("no --yes and no terminal is refused")
+        );
+        assert!(
+            refusal.starts_with("uninstall requires --yes outside an interactive terminal\n"),
+            "{refusal}"
+        );
+        let advised = rocm_core::recovery_hint::try_command(&refusal)
+            .unwrap_or_else(|| panic!("no `Try:` advice ends: {refusal}"));
+        let retry = split_words(advised);
+        assert_eq!(
+            verdict(&retry),
+            Verdict::Parses,
+            "advice {advised:?} after {argv:?} does not parse"
+        );
+        let mut expected = argv.clone();
+        expected.push("--yes".into());
+        assert_eq!(
+            retry, expected,
+            "the advice must repeat what the user ran, with the approval added"
+        );
+        let (retried, force) = uninstall_invocation(&retry);
+        assert!(!force);
+        assert_eq!(
+            retried,
+            crate::uninstall_plan::UninstallOptions {
+                yes: true,
+                ..options
+            }
+        );
+        assert_eq!(
+            approval(&retried, || false).ok(),
+            Some(true),
+            "following {advised:?} clears the refusal"
+        );
+    }
+}
+
+/// The `Try:` line `rocm uninstall --force` is refused with, for every
+/// combination of the real flags beside it: the same uninstall with `--yes` in
+/// place of `--force`, which parses, is not refused as `--force` was, and
+/// passes the `--yes` gate. It names `--force-dev-binaries` only when the user
+/// passed it.
+#[test]
+fn uninstall_force_advice_parses_and_clears_the_refusal() {
+    use crate::uninstall::{approval, reject_force};
+
+    for kept in uninstall_flag_subsets() {
+        let mut argv = kept.clone();
+        argv.push("--force".into());
+        let (options, force) = uninstall_invocation(&argv);
+        assert!(force);
+        let refusal = format!(
+            "{:#}",
+            reject_force(force, &options).expect_err("--force is refused")
+        );
+        assert!(
+            refusal.starts_with("`--force` is not an option of `rocm uninstall`; use `--yes`"),
+            "{refusal}"
+        );
+        let advised = rocm_core::recovery_hint::try_command(&refusal)
+            .unwrap_or_else(|| panic!("no `Try:` advice ends: {refusal}"));
+        let retry = split_words(advised);
+        assert_eq!(
+            verdict(&retry),
+            Verdict::Parses,
+            "advice {advised:?} after {argv:?} does not parse"
+        );
+        let mut expected = kept.clone();
+        expected.push("--yes".into());
+        assert_eq!(
+            retry, expected,
+            "the advice must be what the user ran, with --yes for --force"
+        );
+        assert_eq!(
+            advised.contains("--force-dev-binaries"),
+            kept.iter().any(|flag| flag == "--force-dev-binaries"),
+            "{advised}"
+        );
+        let (retried, force) = uninstall_invocation(&retry);
+        assert!(!force, "{advised:?} must not pass --force again");
+        assert_eq!(
+            retried,
+            crate::uninstall_plan::UninstallOptions {
+                yes: true,
+                ..options
+            }
+        );
+        reject_force(force, &retried).expect("the advice is not refused as --force was");
+        assert_eq!(approval(&retried, || false).ok(), Some(true));
+    }
 }
 
 #[test]
@@ -2107,6 +2324,50 @@ fn every_command_in_a_shell_list_is_checked() {
         command_parts("rocm serve <a | b> [--x | --y] && rocm examine"),
         vec!["rocm serve <a | b> [--x | --y]", "rocm examine"]
     );
+}
+
+/// A heredoc is a redirection like ` < file`: `rocm diagnose --symptom-file -
+/// <<'EOF'` hands the command a paste on standard input, so the `<<` and its
+/// delimiter are not arguments.
+#[test]
+fn a_heredoc_ends_the_command() {
+    for raw in [
+        "rocm diagnose --symptom-file - <<'EOF'",
+        "rocm diagnose --symptom-file - <<\"EOF\"",
+        "rocm diagnose --symptom-file - << EOF",
+        "rocm diagnose --symptom-file - <<EOF",
+        // A here-string (`<<<`) ends it the same way.
+        "rocm diagnose --symptom-file - <<< \"text\"",
+        "rocm diagnose --symptom-file - <<<text",
+    ] {
+        assert_eq!(
+            command_parts(raw),
+            vec!["rocm diagnose --symptom-file -"],
+            "{raw}"
+        );
+        assert!(
+            findings(&[fixture(raw, Surface::CommandLine)]).is_empty(),
+            "{raw}"
+        );
+    }
+    // A heredoc's `<<` is not a `<placeholder>`, so a command after it in the
+    // same list is still split off and checked.
+    for raw in [
+        "rocm diagnose --symptom-file - <<'EOF' && rocm frobnicate --x",
+        "rocm diagnose --symptom-file - <<EOF; rocm frobnicate --x",
+        "rocm diagnose --symptom-file - << EOF || rocm frobnicate --x",
+        // A here-string (`<<<`) is a redirection too.
+        "rocm diagnose --symptom-file - <<< \"text\" && rocm frobnicate --x",
+    ] {
+        assert_eq!(
+            command_parts(raw),
+            vec!["rocm diagnose --symptom-file -", "rocm frobnicate --x"],
+            "{raw}"
+        );
+        let found = findings(&[fixture(raw, Surface::CommandLine)]);
+        assert_eq!(found.len(), 1, "{raw}: {}", render_findings(&found));
+        assert_eq!(found[0].argv[1], "frobnicate", "{raw}");
+    }
 }
 
 /// Prose may follow a command after an em dash, an en dash or an arrow

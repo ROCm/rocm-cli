@@ -8,7 +8,7 @@
 //! screen, and clean exit — which the piped-`Command` steps structurally cannot.
 
 use cucumber::{given, then, when};
-use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
+use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions, chat_message_text};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
@@ -17,6 +17,9 @@ use crate::e2e::tui_driver::{QUIT_CONFIRM_MARKER, TermSignal, TuiSession, defaul
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
+/// What the user types to ask the managed model to start a server, and the
+/// trigger the scripted mock answers with a `launch_server` tool call.
+const START_SERVER_PROMPT: &str = "please start a model server";
 
 /// The services overlay's own panel title, drawn by `draw_services_manager` on
 /// the overlay's border row. It is on screen exactly while the overlay is, so
@@ -100,6 +103,330 @@ async fn wait_for_all_markers(tui: &mut TuiSession, what: &str, markers: &[&str]
     .await
 }
 
+// This is a protocol contract journey: CLI, embedded daemon and TUI are real;
+// the HTTP service is a named protocol fixture, not GPU inference.
+const PROTOCOL_MODELS: [&str; 2] = ["Protocol-Qwen-4B", "Protocol-Phi-3B"];
+
+#[given("an external Lemonade server has two models loaded")]
+async fn external_lemonade_protocol(world: &mut E2eWorld) {
+    let server = e2e_cucumber::lemonade_protocol::LemonadeProtocolServer::start(&PROTOCOL_MODELS);
+    configure_lemonade_discovery(world, server.port());
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    assert!(
+        !root.join("data/services").exists(),
+        "no managed service may be planted"
+    );
+    world.lemonade_protocol = Some(server);
+}
+
+fn configure_lemonade_discovery(world: &E2eWorld, port: u16) {
+    // Discovery is off by default in the isolated config (see
+    // `disable_lemonade_discovery_by_default`), so these scenarios turn it on
+    // explicitly. `lemonade_host` is omitted to exercise its serde default.
+    // Socket isolation comes from the PTY driver's HOME/XDG environment.
+    write_dashboard_config(
+        world,
+        serde_json::json!({
+            "dashboard": { "daemon": { "enable_lemonade": true, "lemonade_port": port,
+                "discovery_tick_secs": 0.1, "instance_tick_secs": 0.1 } }
+        }),
+    );
+}
+
+#[given("the dashboard watches only managed services")]
+async fn dashboard_managed_only(world: &mut E2eWorld) {
+    // An unrelated live endpoint on the default port must not supply the
+    // model or external-running status in this real managed-service journey.
+    write_dashboard_config(
+        world,
+        serde_json::json!({"dashboard": {"daemon": {"enable_lemonade": false}}}),
+    );
+}
+
+/// Keep a dashboard that is not testing Lemonade discovery away from any real
+/// Lemonade server on the default port. Call before every dashboard spawn.
+fn disable_lemonade_discovery_by_default(world: &E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    let path = dir.join("config.json");
+    let existing = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let config = e2e_cucumber::dash_screen::with_lemonade_discovery_default_off(existing);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&config).expect("serialize config"),
+    )
+    .expect("write config");
+}
+
+fn write_dashboard_config(world: &E2eWorld, config: serde_json::Value) {
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    let path = dir.join("config.json");
+    // An earlier step may have written the active runtime here; keep it.
+    let existing = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let merged = e2e_cucumber::dash_screen::merge_dashboard_daemon_config(existing, &config);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&merged).expect("serialize config"),
+    )
+    .expect("write config");
+}
+
+#[then("both loaded models are displayed with throughput shown as unknown")]
+async fn external_models_visible(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "both protocol models, with unknown unattributable throughput",
+            |screen| {
+                PROTOCOL_MODELS.iter().all(|model| {
+                    screen
+                        .lines()
+                        .any(|line| protocol_tps_cell(line, model) == Some("—"))
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("external models should be discovered");
+}
+
+fn protocol_tps_cell<'a>(line: &'a str, model: &str) -> Option<&'a str> {
+    let mut cells = line.split_whitespace().skip_while(|cell| *cell != model);
+    cells.next()?;
+    cells.next()
+}
+
+#[when("the external Lemonade server unloads its second model")]
+async fn external_single_model(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&PROTOCOL_MODELS[..1]);
+}
+
+#[then("only the first model is displayed, with its throughput")]
+async fn external_single_model_rate(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "single protocol model with unambiguous last-request throughput",
+            |screen| {
+                !screen.contains(PROTOCOL_MODELS[1])
+                    && screen
+                        .lines()
+                        .any(|line| protocol_tps_cell(line, PROTOCOL_MODELS[0]) == Some("38"))
+                    // The rate is the last completed request's, and the screen says so.
+                    && screen.contains("last req tok/s")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("single loaded model owns endpoint stats");
+}
+
+#[when("the external Lemonade server unloads every model")]
+async fn external_unload(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&[]);
+}
+
+#[then("no loaded model is displayed and none are reported as discovered")]
+async fn external_models_absent(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "unloaded external models disappear",
+            |screen| {
+                PROTOCOL_MODELS.iter().all(|m| !screen.contains(m))
+                    && screen.contains("no serving models discovered")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("stale external models must disappear");
+}
+
+#[when("the external Lemonade server loads both models again")]
+async fn external_reload(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&PROTOCOL_MODELS);
+}
+
+#[when("the external Lemonade server stops responding")]
+async fn external_unreachable(world: &mut E2eWorld) {
+    drop(world.lemonade_protocol.take());
+}
+
+#[then("the external server received no lifecycle request and no managed record exists")]
+async fn external_server_untouched(world: &mut E2eWorld) {
+    // What this proves: the fixture recorded only observational requests (the
+    // stray-request check below) and the registry holds no record. The health
+    // read is a sanity check that the fixture still answers; the fixture is an
+    // in-process thread the dashboard cannot stop, so it is not evidence of
+    // anything on its own.
+    let fixture = world.lemonade_protocol.as_ref().expect("fixture");
+    let response = reqwest::get(format!("{}/api/v1/health", fixture.base_url()))
+        .await
+        .expect("dashboard quit must leave external service alive");
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.expect("health JSON");
+    assert_eq!(body["status"], "ok");
+    // The dashboard may only observe: any load, unload, stop or other request
+    // reaching the external server would be a lifecycle action on a service it
+    // does not own.
+    assert_eq!(
+        fixture.stray_requests(),
+        Vec::<String>::new(),
+        "the dashboard sent a non-observational request to the external server"
+    );
+    assert_eq!(
+        body["all_models_loaded"].as_array().expect("models").len(),
+        2
+    );
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("root")
+        .path()
+        .join("data/services");
+    assert!(
+        !services.exists()
+            || std::fs::read_dir(services)
+                .expect("services")
+                .next()
+                .is_none(),
+        "discovery must not adopt an external fixture as a managed service"
+    );
+}
+
+#[when("the user selects engine status in the Serving view")]
+async fn engine_status_pane(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_detail_size().expect("enlarge dashboard");
+    tui.send_until("3", "● Serving", default_timeout())
+        .await
+        .expect("Serving view");
+    tui.send("gj").expect("select Engines action");
+}
+
+#[then("Lemonade is shown as externally running without a managed installation")]
+async fn external_installation_truth(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "external versus managed engine state",
+            |screen| {
+                screen.contains("Lemonade — externally running")
+                    && screen.contains("Managed runtime — not installed")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("engine status must distinguish external service and managed install");
+}
+
+#[then("Lemonade returns to the managed installation status without external availability")]
+async fn external_availability_cleared(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "unreachable endpoint no longer counts as external availability",
+            |screen| {
+                screen.contains("Lemonade — managed runtime not installed")
+                    && !screen.contains("Lemonade — externally running")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("engine status must return to managed inventory after endpoint loss");
+}
+
+#[then("the real managed Lemonade model is displayed")]
+async fn real_lemonade_visible(world: &mut E2eWorld) {
+    // The preceding real inference assertion identifies this scenario's model.
+    // Direct llama-server need not expose Lemonade stats: missing throughput is
+    // truthful and must not cause us to invent a rate to satisfy this journey.
+    //
+    // Anchored to a full Observe instances row (the model cell followed by the
+    // TOK/S .. KV% cells), not to the name appearing anywhere on screen, so a
+    // stray mention elsewhere cannot satisfy it. The dashboard watches only
+    // managed services in this scenario, so that row is the registry-owned one.
+    // The row carries neither status nor port; the next steps read those from
+    // the instance detail.
+    session(world)
+        .wait_for_screen_where(
+            "an Observe row for the managed Lemonade model",
+            |screen| {
+                screen.lines().any(|line| {
+                    e2e_cucumber::dash_screen::observe_row_cells(line, "Qwen3-0.6B").is_some()
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("dashboard must display this scenario's real served model");
+}
+
+#[then("the managed model's instance detail shows it ready on the port it was served on")]
+async fn real_lemonade_detail_ready(world: &mut E2eWorld) {
+    let endpoint = world
+        .endpoint
+        .clone()
+        .expect("the serve step sets an endpoint");
+    let port = e2e_cucumber::dash_screen::endpoint_port(&endpoint)
+        .unwrap_or_else(|| panic!("no port in served endpoint {endpoint}"));
+    session(world)
+        .wait_for_screen_where(
+            "instance detail showing the model READY on the served port",
+            |screen| {
+                e2e_cucumber::dash_screen::instance_detail_matches(
+                    screen,
+                    "Qwen3-0.6B",
+                    "READY",
+                    &port,
+                )
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("instance detail must show Qwen3-0.6B READY on port {port}: {e}")
+        });
+}
+
+#[when("the user closes instance detail")]
+async fn close_instance_detail(world: &mut E2eWorld) {
+    // Esc closes the popup, but with no popup open it opens the menu. So send
+    // it once and wait for the popup to be gone.
+    let tui = session(world);
+    tui.send("\x1b")
+        .unwrap_or_else(|e| panic!("failed to send Esc: {e}"));
+    tui.wait_for_screen_where(
+        "instance detail closed",
+        |screen| !screen.contains("Instance · "),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("instance detail did not close: {e}"));
+}
+
+#[then("Lemonade is shown as a managed runtime installation")]
+async fn real_lemonade_installed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Lemonade — managed runtime installed", default_timeout())
+        .await
+        .expect("managed engine Detect evidence must reach dashboard");
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("interactive chat uses an offline assistant")]
@@ -149,6 +476,61 @@ async fn managed_model_with_metrics(world: &mut E2eWorld) {
 #[given("a running managed model is available locally")]
 async fn running_managed_model(world: &mut E2eWorld) {
     setup_managed_model(world, ServiceRecordOptions::default(), false).await;
+}
+
+/// The figures the refused completion reports, and the way the Chat tab groups
+/// them for a reader. Held as both forms rather than derived: this crate does
+/// not depend on the TUI, so reimplementing the grouping here would only check
+/// the reimplementation. `assert_context_overflow_explained` ties the two
+/// together, so they cannot drift apart silently.
+const OVERFLOW_PROMPT_TOKENS: u64 = 53_820;
+const OVERFLOW_CONTEXT_TOKENS: u64 = 32_768;
+const OVERFLOW_COUNTS_AS_SHOWN: &str = "(53,820 of 32,768 tokens)";
+
+#[given("a running managed model that refuses a request larger than its context window")]
+async fn managed_model_refusing_context_overflow(world: &mut E2eWorld) {
+    let model = "TestModel/E2E-1B";
+    let mock = MockServer::start_refusing_as_context_overflow(
+        model,
+        OVERFLOW_PROMPT_TOKENS,
+        OVERFLOW_CONTEXT_TOKENS,
+    )
+    .await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(model.to_string());
+    world.mock = Some(mock);
+    // Planted with the "inference was verified" latch, as a scripted mock is:
+    // without it the CLI's readiness check sends its own `Say ok.` completion,
+    // which this server refuses too, so the model would be demoted before the
+    // user's own turn is ever sent and the scenario would be about discovery.
+    world.register_mock_service_with(ServiceRecordOptions {
+        inference_verified: true,
+        ..ServiceRecordOptions::default()
+    });
+}
+
+#[given(
+    "a running managed model answers a request to start a server with a tool call carrying two sets of arguments"
+)]
+async fn managed_model_with_two_argument_sets(world: &mut E2eWorld) {
+    // The outer arguments are what an approval card built from the call shows;
+    // the nested ones name a different model and port. Which one a card or a
+    // replay reads is the whole question, so they differ in every field.
+    let model = "TestModel/E2E-1B";
+    let mock = MockServer::start_with_tool_call(
+        model,
+        START_SERVER_PROMPT,
+        "launch_server",
+        serde_json::json!({
+            "model": "TestModel/Shown-1B",
+            "arguments": { "model": "TestModel/Other-1B", "port": 8123 },
+        }),
+    )
+    .await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(model.to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(ServiceRecordOptions::default());
 }
 
 /// Re-point "e2e-mock"'s `supervisor_pid`/`engine_pid` at a disposable `sleep`
@@ -208,6 +590,7 @@ async fn replay_missing_recording(world: &mut E2eWorld) {
     ));
     let _ = std::fs::remove_file(&missing);
     let path = missing.to_string_lossy().to_string();
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn(world, &["dash", "--replay", &path])
         .unwrap_or_else(|e| panic!("failed to spawn dash under a pty: {e}"));
     world.tui = Some(session);
@@ -217,6 +600,7 @@ async fn replay_missing_recording(world: &mut E2eWorld) {
 async fn open_dashboard_demo(world: &mut E2eWorld) {
     // `--demo` replays a deterministic synthetic session, so the dashboard
     // populates with no GPU and no daemon — a stable, mock-tier target.
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn(world, &["dash", "--demo"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
     world.tui = Some(session);
@@ -402,6 +786,7 @@ fn replay_recorded_snapshots_with_host(
     std::fs::write(&recording, recording_text)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
     let path = recording.to_string_lossy().to_string();
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn(world, &["dash", "--replay", &path])
         .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
     world.tui = Some(session);
@@ -424,11 +809,14 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
 }
 
 /// One recorded instance per lifecycle state the Services manager colors. The
-/// model name carries the state so the scenario can find each row by it.
+/// model name carries the state so the scenario can find each row by it. Each is
+/// recorded as managed, because the Services manager lists only instances the
+/// daemon marked as registry-owned (a recording without the field replays as
+/// unmanaged and would leave the overlay empty).
 fn recorded_instance(id: &str, model: &str, status_json: &str) -> String {
     format!(
         concat!(
-            r#"{{"container_id":"{id}","container_name":"vllm-{id}","status":{status},"#,
+            r#"{{"container_id":"{id}","container_name":"vllm-{id}","managed":true,"status":{status},"#,
             r#""model_name":"{model}","gpu_ids":["0"],"tensor_parallel_size":1,"#,
             r#""vram_used_mb":0,"vram_total_mb":0,"gen_tps":null,"launch_args":[],"env_vars":{{}}}}"#,
         ),
@@ -511,6 +899,7 @@ async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
             child.display()
         )
     });
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn_in(world, &["dash", "--demo"], &root)
         .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", root.display()));
     world.tui = Some(session);
@@ -555,6 +944,7 @@ async fn open_dashboard_in_whitespace_named_folder(world: &mut E2eWorld) {
             cwd.display()
         )
     });
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn_in(world, &["dash", "--demo"], &cwd)
         .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", cwd.display()));
     world.tui = Some(session);
@@ -567,6 +957,10 @@ async fn open_chat(world: &mut E2eWorld) {
     } else {
         &["chat"]
     };
+    // `rocm chat` starts the embedded daemon too, and discovery is on by default.
+    if world.isolated_root.is_some() {
+        disable_lemonade_discovery_by_default(world);
+    }
     let session = TuiSession::spawn(world, args)
         .unwrap_or_else(|e| panic!("failed to open interactive chat: {e}"));
     world.tui = Some(session);
@@ -590,6 +984,7 @@ async fn machine_with_no_gpu(world: &mut E2eWorld) {
 
 #[when("the user opens the dashboard")]
 async fn open_dashboard(world: &mut E2eWorld) {
+    disable_lemonade_discovery_by_default(world);
     let tui = TuiSession::spawn(world, &["dash"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
     world.tui = Some(tui);
@@ -599,6 +994,7 @@ async fn open_dashboard(world: &mut E2eWorld) {
 async fn open_launcher(world: &mut E2eWorld) {
     // Bare `rocm` (no subcommand) opens the launcher front door under an
     // interactive terminal — the PTY slave satisfies `interactive_terminal()`.
+    disable_lemonade_discovery_by_default(world);
     let tui = TuiSession::spawn(world, &[])
         .unwrap_or_else(|e| panic!("failed to open the launcher: {e}"));
     world.tui = Some(tui);
@@ -654,6 +1050,104 @@ async fn open_services_overlay(world: &mut E2eWorld) {
     tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
+}
+
+#[then("the Services overlay has no managed servers")]
+async fn external_services_are_read_only(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(
+            "No managed services. Start one with `rocm serve <model> --managed`.",
+            default_timeout(),
+        )
+        .await
+        .expect("discovered external models must not become lifecycle targets");
+}
+
+#[then("the Services overlay lists the managed model with its port")]
+async fn services_overlay_lists_managed_model(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let port =
+        e2e_cucumber::dash_screen::endpoint_port(world.endpoint.as_deref().expect("no endpoint"))
+            .expect("endpoint has a port");
+    let port_cell = format!(":{port}");
+    session(world)
+        .wait_for_screen_where(
+            "a Services row for the managed model and its port",
+            |screen| {
+                !screen.contains("No managed services.")
+                    && screen
+                        .lines()
+                        .any(|line| line.contains(&model) && line.contains(&port_cell))
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the managed service is not listed in the overlay: {e}"));
+}
+
+#[when("the user asks to stop the listed service")]
+async fn user_stages_stop(world: &mut E2eWorld) {
+    // Sent once: the key stages an approval, and a second copy would land on the
+    // approval prompt rather than the list.
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to send the stop key: {e}"));
+}
+
+#[then("a stop approval prompt names the managed model and its port")]
+async fn stop_approval_is_shown(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let port =
+        e2e_cucumber::dash_screen::endpoint_port(world.endpoint.as_deref().expect("no endpoint"))
+            .expect("endpoint has a port");
+    let detail = format!("model: {model}   port: {port}");
+    session(world)
+        .wait_for_screen_where(
+            "a stop approval for the managed service",
+            |screen| {
+                screen.contains("Review: stop service")
+                    && screen.contains("Approve (y)")
+                    && screen.contains(&detail)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("no stop approval prompt appeared: {e}"));
+}
+
+#[when("the user declines the approval prompt")]
+async fn user_declines_approval(world: &mut E2eWorld) {
+    // Esc declines without confirming. The prompt itself going away is the
+    // proof the key was read; the overlay list stays open behind it.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to decline the approval: {e}"));
+    tui.wait_until_gone("Review: stop service", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the approval prompt did not close: {e}"));
+}
+
+#[when("the user attempts to stop and restart the external models")]
+async fn external_lifecycle_keys_do_nothing(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("sr").expect("attempt stop and restart");
+    // One Escape closes the list only if neither key staged an approval or a
+    // lifecycle console. In either modal, it dismisses that modal instead and
+    // leaves the Services overlay open, which the next step then catches.
+    tui.send("\u{1b}").expect("close Services list");
+}
+
+#[then("the Services overlay closes without an approval prompt or job")]
+async fn external_lifecycle_keys_left_no_modal(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .expect("external lifecycle keys must not stage approval or launch a job");
+}
+
+#[then("both loaded models are still displayed")]
+async fn external_models_still_visible(world: &mut E2eWorld) {
+    external_models_visible(world).await;
 }
 
 #[then("the overlay reports the record that is no longer running")]
@@ -759,6 +1253,76 @@ async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
     // actually gates on the post-resize render.
 }
 
+#[when("the user shrinks the terminal to a short window")]
+async fn shrink_to_a_short_window(world: &mut E2eWorld) {
+    // ROCMAI-1050: the same geometry `shrink_below_menu_logo_layout` uses, under
+    // a name that does not speak of the Esc menu — this is also the height at
+    // which the quit prompt cut the stop command off its own remediation
+    // bullet. Only resizes; the `Then` steps after it gate on a post-resize
+    // frame.
+    session(world)
+        .use_short_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+}
+
+#[when("the user shrinks the terminal below the Esc menu's logo layout")]
+async fn shrink_below_menu_logo_layout(world: &mut E2eWorld) {
+    // ROCMAI-1042: at this height the Esc menu's modal is too short for the
+    // ROCm wordmark plus its three rows, which used to make `ui::menu` return
+    // without drawing anything — an empty bordered box with a live selection
+    // behind it. This step only resizes; the `Then` below is what gates on a
+    // post-resize frame, for the reason `shrink_until_detail_overflows`
+    // spells out.
+    session(world)
+        .use_short_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+}
+
+/// Wait for `label` to be drawn as the Esc menu's *selected* row — the cursor
+/// (`"▸ "`, `ui/menu.rs`) immediately followed by the whole label.
+///
+/// Asserting the cursor and the label together is what makes this evidence
+/// about ROCMAI-1042 rather than about the word being somewhere on screen:
+/// the empty-modal bug left the selection live behind a blank box, and the
+/// width floor this PR adds is there so the selected row is never truncated.
+/// The box at this geometry is only tall enough for two of the three rows, so
+/// "every row is on screen" would be wrong here — which row the *selection* is
+/// on is the thing that has to hold at every size.
+async fn menu_selection_is(world: &mut E2eWorld, label: &str) {
+    let wanted = format!("▸ {label}");
+    wait_for_frame(
+        session(world),
+        "the selected dashboard menu row",
+        |screen| {
+            if screen.contains(&wanted) {
+                Vec::new()
+            } else {
+                vec![wanted.clone()]
+            }
+        },
+    )
+    .await;
+}
+
+#[then("the dashboard menu shows Options as the selected action")]
+async fn dashboard_menu_selects_options(world: &mut E2eWorld) {
+    menu_selection_is(world, "Options").await;
+}
+
+#[when("the user moves the dashboard menu selection down")]
+async fn move_dashboard_menu_selection_down(world: &mut E2eWorld) {
+    // `j` is `KeyAction::MenuMove` down, the same key
+    // `select_quit_from_dashboard_menu` walks with.
+    session(world)
+        .send("j")
+        .unwrap_or_else(|e| panic!("failed to move the dashboard menu selection: {e}"));
+}
+
+#[then("the dashboard menu shows Help as the selected action")]
+async fn dashboard_menu_selects_help(world: &mut E2eWorld) {
+    menu_selection_is(world, "Help").await;
+}
+
 #[when("the user opens the services manager")]
 async fn open_services_manager(world: &mut E2eWorld) {
     // Bound to `s` only on the Observe tab (`OpenServices`) — a manager opened
@@ -766,6 +1330,15 @@ async fn open_services_manager(world: &mut E2eWorld) {
     // `should_pane_back_out`'s doc comment calls out as needing Esc to close it.
     session(world)
         .send("s")
+        .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
+}
+
+#[when("the user opens the services manager with Caps Lock on")]
+async fn open_services_manager_caps_lock(world: &mut E2eWorld) {
+    // A PTY cannot toggle Caps Lock; `S` is the byte the terminal sends for
+    // `s` with it on.
+    session(world)
+        .send("S")
         .unwrap_or_else(|e| panic!("failed to open the services manager: {e}"));
 }
 
@@ -1176,6 +1749,19 @@ async fn send_managed_model_message(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
 }
 
+#[when("the user asks the managed model to start a model server")]
+async fn ask_managed_model_to_start_server(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    // Consent already focused the input; see `send_managed_model_message`.
+    tui.send(START_SERVER_PROMPT)
+        .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
+}
+
 #[when("the user sends a message about GPU health")]
 async fn send_gpu_message(world: &mut E2eWorld) {
     let tui = session(world);
@@ -1251,6 +1837,416 @@ async fn quit_tui(world: &mut E2eWorld, surface: &str) {
 #[when("the user quits the dashboard")]
 async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
+}
+
+#[when("the user quits the dashboard with Caps Lock on")]
+async fn quit_dashboard_caps_lock(world: &mut E2eWorld) {
+    // Sent once, not resent like `quit_and_wait` does: the previous step waited
+    // for the idle Observe frame, so nothing transient can swallow the key.
+    // Demo data never serves a model (`AppState::has_live_instance`), so no
+    // quit-confirm prompt opens.
+    session(world)
+        .send_once_and_wait("Q", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard did not quit on Q: {e}"));
+}
+
+// ── Two dashboards at once (dash-56) ───────────────────────────────
+
+/// Wait until `tui`'s header says it is connected to a telemetry daemon.
+///
+/// The header carries the socket path and is cut off before "rocm daemon" at
+/// the default 80-column pty, so the terminal is widened first. Match
+/// "· rocm daemon" rather than "connected", which "disconnected" contains.
+async fn wait_until_connected(tui: &mut TuiSession, which: &str) {
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge {which}: {e}"));
+    tui.wait_for_screen_where(
+        "the connected header",
+        |screen| screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{which} is not connected to a telemetry daemon: {e}"));
+}
+
+const fn second_session(world: &mut E2eWorld) -> &mut TuiSession {
+    world
+        .second_tui
+        .as_mut()
+        .expect("no second dashboard is open for this scenario")
+}
+
+#[then("the dashboard is connected to its telemetry daemon")]
+async fn dashboard_connected(world: &mut E2eWorld) {
+    wait_until_connected(session(world), "the dashboard").await;
+}
+
+/// Same isolated environment as the first, so the same socket path: the
+/// second dashboard finds the first one's daemon there.
+#[when("the user opens a second dashboard")]
+async fn open_second_dashboard(world: &mut E2eWorld) {
+    let tui = TuiSession::spawn(world, &["dash"])
+        .unwrap_or_else(|e| panic!("failed to open a second dashboard: {e}"));
+    world.second_tui = Some(tui);
+}
+
+#[then("the second dashboard is connected to its telemetry daemon")]
+async fn second_dashboard_connected(world: &mut E2eWorld) {
+    wait_until_connected(second_session(world), "the second dashboard").await;
+}
+
+/// Records how many connections the client log holds first, so the surviving
+/// dashboard's reconnection can be told from the connection it already had.
+/// Both dashboards are connected by now, but the log is written through a
+/// non-blocking appender, so the second one's line may not be in the file
+/// yet; wait for both lines first, or that line arriving late would pass for
+/// the reconnection.
+#[when("the user quits the first dashboard")]
+async fn quit_first_dashboard(world: &mut E2eWorld) {
+    let log_dir = world.app_paths().client_log_dir();
+    wait_for_log_lines(
+        &log_dir,
+        CLIENT_CONNECTED,
+        2,
+        "both dashboards' connections before the first one quits",
+    )
+    .await;
+    world.dash_connections_before_quit =
+        Some(client_log(&log_dir).matches(CLIENT_CONNECTED).count());
+    quit_tui(world, "the first dashboard").await;
+}
+
+/// Everything the dashboards of this scenario wrote to the client log in
+/// `log_dir`. Every `rocm` process of the scenario appends to the same daily
+/// file.
+fn client_log(log_dir: &std::path::Path) -> String {
+    std::fs::read_dir(log_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The line the TUI client logs (with its `rocm_dash_tui::client` target)
+/// once per connection to a telemetry daemon, in
+/// `crates/rocm-dash-tui/src/client.rs`; this crate cannot import it, so the
+/// text is copied. Change them together.
+const CLIENT_CONNECTED: &str = "rocm_dash_tui::client: connected";
+
+/// Wait until the client log in `log_dir` holds at least `count` lines
+/// containing `needle`.
+async fn wait_for_log_lines(log_dir: &std::path::Path, needle: &str, count: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + default_timeout();
+    loop {
+        let seen = client_log(log_dir).matches(needle).count();
+        if seen >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: the client log holds {seen} of the {count} `{needle}` lines expected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Where `rocm dash` puts its telemetry socket under the scenario's
+/// environment: `rocmdashd.sock` directly in `XDG_RUNTIME_DIR` (see `pty_env`).
+fn telemetry_socket_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("runtime")
+        .join("rocmdashd.sock")
+}
+
+/// What the file at the socket path holds, so the scenario can tell the very
+/// same file is still there.
+const NOT_A_SOCKET_CONTENTS: &str = "not a socket: leave me alone\n";
+
+#[given("a file that is not a socket sits where the dashboard's telemetry socket goes")]
+async fn file_at_telemetry_socket_path(world: &mut E2eWorld) {
+    let path = telemetry_socket_path(world);
+    std::fs::create_dir_all(path.parent().expect("socket path has a parent"))
+        .expect("failed to create the runtime dir");
+    std::fs::write(&path, NOT_A_SOCKET_CONTENTS).expect("failed to plant the file");
+}
+
+/// `text` with all whitespace removed: a long report line wraps across
+/// screen rows, possibly at a space, so both sides of a match are squashed.
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// [`squash`] for text still inside a panel, where the border characters of
+/// each row would otherwise land in the middle of a wrapped sentence.
+fn squash_frame(screen: &str) -> String {
+    squash(&e2e_cucumber::dash_screen::strip_box_drawing(screen))
+}
+
+/// Read once the dashboard has exited: the report goes to the terminal the
+/// dashboard gave back, so it is on the main screen. A long line wraps across
+/// rows, possibly at a space, so whitespace is dropped from both sides before
+/// matching.
+///
+/// The fixed text matched here is copied from the producer, because this
+/// crate does not depend on `rocm` or `rocm-dash-daemon`: the tail of
+/// `REPORT_COULD_NOT_START` from "telemetry daemon", `REPORT_LOG_LINE` without
+/// its leading `rocm: `, and the fragment "could not serve its socket" of
+/// `KEEPER_WARNING`, all in `apps/rocm/src/dash_daemon.rs`, plus all of
+/// `NOT_A_SOCKET` in `crates/rocm-dash-daemon/src/server.rs`. Change them
+/// together.
+#[then("the dashboard reports that its telemetry daemon could not use that file")]
+async fn dashboard_reports_unusable_socket(world: &mut E2eWorld) {
+    let path = telemetry_socket_path(world).display().to_string();
+    let screen = session(world).drain_final_screen().await;
+    let shown = squash(&screen);
+    assert!(
+        shown.contains(&squash(&format!(
+            "telemetry daemon could not start: {path} exists and is not a socket"
+        ))),
+        "expected the dashboard to say it could not start because {path} is not a \
+         socket, got:\n{screen}"
+    );
+    // The report names the log only when the warning was recorded there, so
+    // check the log really holds it.
+    let log_dir = world.app_paths().client_log_dir();
+    assert!(
+        shown.contains(&squash(&format!(
+            "each failed attempt is logged in the files under {}",
+            log_dir.display()
+        ))),
+        "expected the report to name {}, got:\n{screen}",
+        log_dir.display()
+    );
+    let logged = client_log(&log_dir);
+    assert!(
+        logged.contains("could not serve its socket") && logged.contains(&path),
+        "the log the report points at holds no warning about {path}"
+    );
+}
+
+// ── A daemon that stopped serving (dash-59) ───────────────────────
+
+/// Undo [`socket_directory_becomes_unreadable`], best effort, from the world's
+/// teardown, so the isolated root can be removed.
+#[cfg(unix)]
+pub(crate) fn restore_telemetry_socket_dir_permissions(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join("runtime");
+    if dir.is_dir() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// The directory the telemetry socket sits in stops being readable: the
+/// daemon serving it can no longer check its socket, and no client can reach
+/// it. Root ignores directory permissions, hence `@requires-dir-permissions`.
+#[when("the folder holding the dashboard's telemetry socket stops being readable")]
+async fn socket_directory_becomes_unreadable(world: &mut E2eWorld) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = telemetry_socket_path(world)
+            .parent()
+            .expect("the socket path has a parent")
+            .to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+            .unwrap_or_else(|e| panic!("failed to make {} unreadable: {e}", dir.display()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = world;
+        panic!("dash-59 is Linux only (@requires-os:linux): no telemetry socket here");
+    }
+}
+
+/// A serving daemon gives its path up after five unreadable checks two
+/// seconds apart, and its keeper then logs the failure (`KEEPER_WARNING` in
+/// `apps/rocm/src/dash_daemon.rs`; its fragment "could not serve its socket"
+/// is copied here, as for dash-57).
+#[when("the dashboard stays open until its telemetry daemon stops serving")]
+async fn stay_open_until_daemon_stops_serving(world: &mut E2eWorld) {
+    wait_for_log_lines(
+        &world.app_paths().client_log_dir(),
+        "could not serve its socket",
+        1,
+        "the telemetry daemon did not stop serving",
+    )
+    .await;
+}
+
+#[then("the dashboard shows it is disconnected from its telemetry daemon")]
+async fn dashboard_shows_disconnected(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen_where(
+        "the disconnected header",
+        |screen| screen.contains("disconnected") && !screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dashboard does not show it is disconnected: {e}"));
+}
+
+/// Matches the tail of `REPORT_STOPPED_SERVING` (`apps/rocm/src/dash_daemon.rs`)
+/// from "telemetry daemon", copied as for dash-57. What follows it is the
+/// error of the daemon's last attempt, which names the socket path.
+#[then("the dashboard reports that its telemetry daemon stopped serving")]
+async fn dashboard_reports_daemon_stopped_serving(world: &mut E2eWorld) {
+    let path = telemetry_socket_path(world).display().to_string();
+    let screen = session(world).drain_final_screen().await;
+    let shown = squash(&screen);
+    let opening = squash("telemetry daemon stopped serving:");
+    let Some((_, report)) = shown.split_once(&opening) else {
+        panic!("expected the dashboard to say its telemetry daemon stopped serving, got:\n{screen}")
+    };
+    assert!(
+        report.contains(&squash(&path)),
+        "expected the report to name {path}, got:\n{screen}"
+    );
+    assert!(
+        !shown.contains(&squash("telemetry daemon could not start:")),
+        "a daemon that served must not be reported as unable to start:\n{screen}"
+    );
+}
+
+#[then("that file is left in place")]
+async fn file_left_in_place(world: &mut E2eWorld) {
+    let path = telemetry_socket_path(world);
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} is gone: {e}", path.display()));
+    assert_eq!(contents, NOT_A_SOCKET_CONTENTS, "the file was changed");
+}
+
+/// The first dashboard ran the daemon, so its exit drops the second one's
+/// connection, and the header the second one showed before that still reads
+/// connected: a check of the header alone could pass on that stale frame. The
+/// disconnected header in between is no reliable marker either -- it is on
+/// screen for as little as the client's first 250 ms reconnect wait, which
+/// can be over before this step starts. So the step first waits for the
+/// client log to record one more connection than it held when the first
+/// dashboard was quit -- the surviving dashboard connecting to the daemon
+/// that took over, the only daemon left -- and then for the connected header.
+#[then("the second dashboard is connected to its telemetry daemon again")]
+async fn second_dashboard_connected_again(world: &mut E2eWorld) {
+    let before = world
+        .dash_connections_before_quit
+        .expect("the first dashboard was not quit by this scenario");
+    wait_for_log_lines(
+        &world.app_paths().client_log_dir(),
+        CLIENT_CONNECTED,
+        before + 1,
+        "the second dashboard did not connect again",
+    )
+    .await;
+    wait_until_connected(second_session(world), "the second dashboard").await;
+}
+
+// ── Benchmark results across a hand-off (dash-58) ─────────────────
+
+/// The cells of the benchmark results dash-58 records: names nothing else on
+/// the dashboard shows.
+const RECORDED_BENCH_CELLS: [&str; 2] = ["handoff-a", "handoff-b"];
+
+/// Writes them to the benchmark CSV the telemetry daemon reads by default,
+/// `bench/results.csv` under the data directory (the file `rocm bench load`
+/// writes).
+#[given("two benchmark results have been recorded")]
+async fn two_benchmark_results_recorded(world: &mut E2eWorld) {
+    let csv = world.app_paths().data_dir.join("bench").join("results.csv");
+    std::fs::create_dir_all(csv.parent().expect("the CSV path has a parent"))
+        .expect("failed to create the bench directory");
+    let rows = RECORDED_BENCH_CELLS
+        .map(|cell| format!("{cell},1,e2e-model\n"))
+        .concat();
+    std::fs::write(&csv, format!("cell,run,model\n{rows}"))
+        .expect("failed to record the benchmark results");
+}
+
+#[when("the user opens the Observe view of the second dashboard")]
+async fn open_observe_view_of_second(world: &mut E2eWorld) {
+    second_session(world)
+        .send_until("4", "● Observe", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the second dashboard did not open Observe: {e}"));
+}
+
+/// The total in the Bench rows table's title, `Bench rows · N total`.
+fn bench_rows_total(screen: &str) -> Option<usize> {
+    let (_, rest) = screen.split_once("Bench rows · ")?;
+    rest.split_once(" total")?.0.trim().parse().ok()
+}
+
+/// How long the list must keep showing exactly the recorded rows once it
+/// has: rows sent twice arrive within milliseconds of the first copy.
+const BENCH_ROWS_SETTLE: Duration = Duration::from_secs(1);
+
+/// Wait until `daemons` telemetry daemons have read the recorded results
+/// (each logs `bench rows broadcast` once when it reads them, in
+/// `crates/rocm-dash-daemon/src/runner.rs`; copied, as above), then until the
+/// second dashboard's Bench table lists exactly those rows, and require it to
+/// keep listing exactly those for [`BENCH_ROWS_SETTLE`].
+async fn assert_second_lists_recorded_rows_once(world: &mut E2eWorld, daemons: usize) {
+    wait_for_log_lines(
+        &world.app_paths().client_log_dir(),
+        "bench rows broadcast",
+        daemons,
+        "the telemetry daemon did not read the recorded benchmark results",
+    )
+    .await;
+    let recorded = RECORDED_BENCH_CELLS.len();
+    let tui = second_session(world);
+    tui.use_tall_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the second dashboard: {e}"));
+    tui.wait_for_screen_where(
+        "the Bench table lists the recorded results",
+        |screen| {
+            bench_rows_total(screen) == Some(recorded)
+                && RECORDED_BENCH_CELLS
+                    .iter()
+                    .all(|cell| screen.contains(cell))
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the second dashboard does not list the recorded results: {e}"));
+    let settled = tokio::time::Instant::now() + BENCH_ROWS_SETTLE;
+    while tokio::time::Instant::now() < settled {
+        let screen = tui.screen_text();
+        let total = bench_rows_total(&screen);
+        assert!(
+            total.is_none_or(|total| total == recorded),
+            "the second dashboard lists {total:?} benchmark rows, expected each of the \
+             {recorded} recorded once:\n{screen}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let screen = tui.screen_text();
+    assert_eq!(
+        bench_rows_total(&screen),
+        Some(recorded),
+        "the Bench table must end listing the recorded results:\n{screen}"
+    );
+}
+
+#[then("the second dashboard lists each recorded benchmark result once")]
+async fn second_lists_each_result_once(world: &mut E2eWorld) {
+    assert_second_lists_recorded_rows_once(world, 1).await;
+}
+
+/// After the hand-off a second daemon has read the results file from the
+/// start and sent every row again.
+#[then("the second dashboard still lists each recorded benchmark result once")]
+async fn second_still_lists_each_result_once(world: &mut E2eWorld) {
+    assert_second_lists_recorded_rows_once(world, 2).await;
 }
 
 /// Send the plain quit gesture and nothing else — unlike `quit_dashboard`,
@@ -1345,6 +2341,32 @@ async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
                     .collect::<Vec<_>>()
                     .join(" ")
                     .contains(expected)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// ROCMAI-1050's overflow half: growing the popup cannot save every body, so a
+/// body that still does not fit has to advertise itself instead of being cut
+/// silently — which is the original defect, not a lesser version of it.
+///
+/// The notice and the key names are asserted together on purpose. A notice
+/// that named no keys would leave the user exactly as stuck as the silent cut,
+/// and the keys alone would not say there was anything below. Matched on the
+/// whitespace-collapsed screen because the row is padded out to the popup's
+/// width. It cannot wrap: the footer is an unwrapped `Paragraph` in a one-row
+/// constraint, so a row too long for the popup is clipped instead. At this
+/// geometry the tail is clipped, but "PgUp/PgDn" sits inside that boundary.
+#[then("the quit prompt says there is more to read and names the keys that scroll it")]
+async fn quit_confirm_announces_more_to_read(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the quit prompt says \"More to read\" and names PgUp/PgDn",
+            |screen| {
+                let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+                flat.contains("More to read") && flat.contains("PgUp/PgDn")
             },
             default_timeout(),
         )
@@ -1593,6 +2615,66 @@ async fn open_dashboard_from_launcher(world: &mut E2eWorld) {
     tui.wait_for_screen("Updates", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the dashboard did not open from the launcher: {e}"));
+}
+
+/// The launcher's "Serve a model" row (`LauncherChoice::Serve`, index 1 of
+/// `ui::launcher::ROWS`, after "Set up this system"), which routes to
+/// `run_focused(Focus::Serve)` — a focused host, not the full dashboard.
+///
+/// The form's own panel title is also "Serve a model", the same words as the
+/// menu row that opens it, so the title cannot tell the two screens apart.
+/// `[ Launch ]` can: it is the form's launch button and the front door never
+/// draws it.
+#[when("the user chooses to serve a model from the launcher")]
+async fn open_serve_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the front door before sending keys, same rationale as
+    // `open_dashboard_from_launcher`.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // Serve has no single-key shortcut like `d` (`OpenDashboard`'s): it is the
+    // 2nd row, one move down from the default (Set up) selection, then `Enter`
+    // (`choice_for(sel)`).
+    tui.send("j")
+        .unwrap_or_else(|e| panic!("failed to select Serve in the launcher: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open the serve flow from the launcher: {e}"));
+    tui.wait_for_screen("[ Launch ]", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve form did not open from the launcher: {e}"));
+}
+
+/// The focused host is asserted by what only it draws: `ui::draw_focused`'s
+/// single footer hint, whose whole point is that this window returns to the
+/// launcher menu rather than to a tab shell. The full dashboard draws its tab
+/// legend there instead — so a regression that routed this row into the
+/// dashboard (or that opened the form over a tab shell) fails here rather than
+/// passing on the form alone, which both routes show.
+#[then("the serve form is shown in a window that offers the way back to the menu")]
+async fn focused_serve_window_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Esc  back to menu", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the serve form did not open as a focused window — if the form is \
+                 showing but this footer is not, the launcher's Serve row stopped \
+                 routing to `run_focused`: {e}"
+            )
+        });
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("[ Launch ]"),
+        "the focused window is not showing the serve form:\n{screen}"
+    );
+    // "Updates" is the marker `open_dashboard_from_launcher` waits for to prove
+    // the FULL dashboard opened, so its absence is what distinguishes the two
+    // routes from the same menu.
+    assert!(
+        !screen.contains("Updates"),
+        "the Serve row opened the full dashboard instead of a focused window:\n{screen}"
+    );
 }
 
 #[when("the user quits back to the launcher")]
@@ -1952,12 +3034,146 @@ async fn tool_call_shown_declined(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the declined-tool-call message did not appear: {e}"));
 }
 
+#[then("the model is told the tool call was refused")]
+async fn model_told_tool_call_refused(world: &mut E2eWorld) {
+    // The client reports a tool's outcome back to the model in a `tool`
+    // message on its next request. That message is the CLI's own account of
+    // what it did with the call, so it is asserted here, not the canned reply.
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request_where(default_timeout(), |body| {
+            body.get("messages")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+                })
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the model was never sent the tool call's outcome: {e}"));
+    let outcome = body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+        .map(|m| chat_message_text(m.get("content").unwrap_or(&serde_json::Value::Null)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        outcome.contains("nested `arguments`") && !outcome.contains("surfaced_for_approval"),
+        "the tool call should have been refused for its nested arguments, \
+         not surfaced for approval; the model was told:\n{outcome}"
+    );
+}
+
+#[then("no tool approval prompt is displayed")]
+async fn no_approval_prompt_displayed(world: &mut E2eWorld) {
+    // The model's reply to the refusal is the last thing this turn renders, so
+    // once it is on screen any approval prompt the call raised would be too.
+    // The dialog's title prefix and approve button are the strings the dash
+    // draws in `rocm_dash_tui::ui::approval` (`draw_approval_inner`,
+    // `buttons_line`); its test
+    // `an_approval_dialog_shows_its_review_title_and_approve_button` pins them
+    // there, so a rename fails that test instead of passing this check.
+    let tui = session(world);
+    tui.wait_for_screen("mock response for testing", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the model's reply to the refusal did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        !screen.contains("Approve (y)") && !screen.contains("Review: "),
+        "an approval prompt was shown for a refused tool call:\n{screen}"
+    );
+}
+
 #[then("the managed model's response is displayed")]
 async fn managed_model_response_displayed(world: &mut E2eWorld) {
     session(world)
         .wait_for_screen("mock response for testing", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the managed model's response did not appear: {e}"));
+}
+
+/// The sentence the Chat tab shows in place of a provider's context-overflow
+/// body, copied from `context_overflow_message` in
+/// `crates/rocm-dash-tui/src/app/chat_runtime.rs` because this crate does not
+/// depend on the TUI. Change them together. Squashed before matching: it wraps
+/// across transcript rows, possibly at a space (see [`squash`]).
+const CONTEXT_OVERFLOW_SENTENCE: &str = "This request is larger than the model's context window";
+const CONTEXT_OVERFLOW_CAUSES: &str =
+    "The assistant's built-in instructions and any long ROCm check result both count toward it.";
+const CONTEXT_OVERFLOW_REMEDY: &str = "use a model served with a larger context";
+
+/// The provider's own wire detail, which the transcript used to show verbatim
+/// and must not show now. Deliberately not `400`, which a port or a byte count
+/// elsewhere on screen could supply.
+const PROVIDER_WIRE_DETAIL: [&str; 4] = [
+    "exceed_context_size_error",
+    "n_prompt_tokens",
+    "n_ctx",
+    "HttpError",
+];
+
+#[then(
+    "the user is told the request is larger than the model's context window and what counts toward it"
+)]
+async fn assert_context_overflow_explained(world: &mut E2eWorld) {
+    assert_eq!(
+        OVERFLOW_COUNTS_AS_SHOWN.replace(',', ""),
+        format!("({OVERFLOW_PROMPT_TOKENS} of {OVERFLOW_CONTEXT_TOKENS} tokens)"),
+        "the counts asserted on screen must be the ones the mock refuses with"
+    );
+    let markers = [
+        squash(CONTEXT_OVERFLOW_SENTENCE),
+        squash(OVERFLOW_COUNTS_AS_SHOWN),
+        squash(CONTEXT_OVERFLOW_CAUSES),
+        squash(CONTEXT_OVERFLOW_REMEDY),
+    ];
+    let tui = session(world);
+    wait_for_frame(tui, "the context-overflow explanation", move |screen| {
+        let squashed = squash_frame(screen);
+        markers
+            .iter()
+            .filter(|marker| !squashed.contains(marker.as_str()))
+            .map(|marker| format!("{marker:?}"))
+            .collect()
+    })
+    .await;
+}
+
+#[then("none of the provider's wire detail is shown")]
+async fn assert_no_provider_wire_detail(world: &mut E2eWorld) {
+    // Waits for the tail of the same explanation rather than reading the
+    // screen directly: a negative assertion is only as strong as the frame is
+    // complete, and the frame this returns is one the whole sentence -- which
+    // is where the wire detail used to sit -- was drawn into. See
+    // `wait_for_frame`. The wait itself is already satisfied by the step above.
+    let tui = session(world);
+    let frame = wait_for_frame(
+        tui,
+        "a complete frame carrying the context-overflow explanation",
+        |screen| {
+            let marker = squash(CONTEXT_OVERFLOW_REMEDY);
+            if squash_frame(screen).contains(&marker) {
+                Vec::new()
+            } else {
+                vec![format!("{marker:?}")]
+            }
+        },
+    )
+    .await;
+    // Squashed, so a token the panel wrapped across two rows is still caught:
+    // read raw, `n_prompt_tokens` broken over a border would pass this.
+    let squashed = squash_frame(&frame);
+    for noise in PROVIDER_WIRE_DETAIL {
+        assert!(
+            !squashed.contains(&squash(noise)),
+            "`{noise}` leaked into the transcript:\n{frame}"
+        );
+    }
 }
 
 #[then("the mock received the typed prompt")]
@@ -2016,8 +3232,10 @@ async fn recorded_chat_messages(world: &mut E2eWorld) -> Vec<String> {
                 .is_some_and(|messages| {
                     messages.iter().any(|m| {
                         m.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                            && message_text(m.get("content").unwrap_or(&serde_json::Value::Null))
-                                .contains(MANAGED_MODEL_PROMPT)
+                            && chat_message_text(
+                                m.get("content").unwrap_or(&serde_json::Value::Null),
+                            )
+                            .contains(MANAGED_MODEL_PROMPT)
                     })
                 })
         })
@@ -2028,30 +3246,8 @@ async fn recorded_chat_messages(world: &mut E2eWorld) -> Vec<String> {
         .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"))
         .iter()
         .filter_map(|m| m.get("content"))
-        .map(message_text)
+        .map(chat_message_text)
         .collect()
-}
-
-/// The text of one OpenAI-format message. `content` is a bare string on the
-/// turns the TUI builds, but an array of typed parts on the system message the
-/// chat client emits — read both, or the grounding looks absent when it is
-/// simply wrapped.
-fn message_text(content: &serde_json::Value) -> String {
-    content.as_str().map_or_else(
-        || {
-            content
-                .as_array()
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default()
-        },
-        str::to_owned,
-    )
 }
 
 /// The single line of the sent prompt that opens with `label`, or a failure
@@ -2605,7 +3801,26 @@ fn assert_tui_opened(world: &E2eWorld) {
 
 #[then("the dashboard exits successfully")]
 async fn dashboard_exited(world: &mut E2eWorld) {
+    assert_exited_cleanly(world, "the dashboard");
+}
+
+#[then("the first dashboard exits successfully")]
+async fn first_dashboard_exited(world: &mut E2eWorld) {
+    assert_exited_cleanly(world, "the first dashboard");
+}
+
+/// Reads the exit code the quit recorded, rather than relying on the `When`
+/// step having succeeded, so a `Then` that says the dashboard exited
+/// successfully holds that outcome itself.
+fn assert_exited_cleanly(world: &mut E2eWorld, which: &str) {
     assert_tui_opened(world);
+    let tui = session(world);
+    assert!(tui.is_finished(), "{which} is still running");
+    assert_eq!(
+        tui.observed_exit_code(),
+        Some(0),
+        "{which} did not exit successfully"
+    );
 }
 
 /// Assert the exit code stashed by the terminating `When` step. Shared by the

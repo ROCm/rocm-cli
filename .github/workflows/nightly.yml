@@ -4,6 +4,22 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      skip_build:
+        description: >-
+          Skip building and publishing the nightly release and run only the E2E
+          lanes, the consolidated report and the readiness jobs. For testing a
+          change to those jobs from a branch without publishing a release.
+        type: boolean
+        default: false
+      queue_deadline_minutes:
+        description: >-
+          How long an E2E lane may wait for a runner before the run gives up on
+          it (default 60). Lower it to try the give-up path from a branch
+          quickly. Whole minutes, at most 120: a larger value is refused, because
+          a lane that started just inside it could outlast the hard deadline.
+        type: string
+        default: "60"
 
 permissions:
   contents: read
@@ -75,7 +91,17 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          SKIP_BUILD: ${{ inputs.skip_build }}
         run: |
+          # Every job that builds or publishes a release is gated on this
+          # output, so skipping here is what keeps a branch dispatch from
+          # publishing.
+          if [ "${SKIP_BUILD}" = "true" ]; then
+            echo "commits=0" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "skip_build was set — not building or publishing a nightly"
+            exit 0
+          fi
           LAST=$(gh release view nightly --json createdAt --jq .createdAt 2>/dev/null || echo "1970-01-01T00:00:00Z")
           COMMITS=$(git log --since="${LAST}" --oneline | wc -l)
           echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
@@ -404,7 +430,8 @@ jobs:
   # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job (minus its PR-only
+  # stale-run guard) but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
@@ -416,6 +443,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
       E2E_INCLUDE_NIGHTLY: "1"
       # Serve-readiness floor; a `@serve-timeout` tag lengthens it for the large
@@ -506,285 +536,35 @@ jobs:
           name: e2e-gpu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
-  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, shared uv
-  # cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
-  # the report crate asserts the nightly lanes publish the same platforms as the
-  # per-PR lanes.
-  e2e-gpu-nightly-rad3:
-    name: E2E tests (rad3 R9700, incl. nightly-only)
-    timeout-minutes: 90
-    runs-on: [self-hosted, linux, r9700]
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        channel: [release, nightly]
-    env:
-      E2E_INCLUDE_NIGHTLY: "1"
-      E2E_SERVE_TIMEOUT_SECS: "300"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Reclaim the GPU before running: a serve leaked by a killed or
-      # timed-out prior run (its Drop teardown never executed) keeps an engine
-      # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees: a manual /workload serve is matched only if its command line
-      # also names an E2E root — see the exposure documented in
-      # scripts/reclaim-gpu.sh.
-      - name: Reclaim GPU from stray E2E processes
-        run: bash scripts/reclaim-gpu.sh
-
-      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
-      # process survives. The floor stays at the shared 16 GiB default, a flat
-      # constant rather than a proportion of capacity — high enough to catch a
-      # leftover serve, low enough that a clean pod passes on the first poll; do
-      # NOT scale it down for a smaller part. On a 32GB card it still only trips
-      # past 16 GiB held, so the floor alone would miss a leftover serve holding
-      # less than that; the process gate is what catches it (#446). Same as the
-      # per-PR rad3 lane. See .github/scripts/gpu-preflight.sh.
-      - name: GPU preflight (bounded wait for an available GPU)
-        env:
-          GPU_PREFLIGHT_MIN_FREE_GIB: 16
-        run: |
-          bash .github/scripts/gpu-preflight.sh
-
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-        with:
-          cache: false
-
-      - name: Run full E2E on rad3 (incl. nightly-only)
-        run: |
-          # $RUNNER_WORKSPACE is on the runner-work PVC, which survives the pod
-          # being scaled away, so the cargo target dir and shared caches stay warm.
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same mount as the runtimes it populates, so uv hardlinks into them
-          # instead of copying, and inside the uv-cache-gc initContainer's floor
-          # (see e2e-selfhosted.yml e2e-gpu).
-          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
-          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
-          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
-
-          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature is the floor a pre-built binary must carry
-          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
-          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
-          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
-          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
-
-          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
-          # the channel index has published a newer runtime — the tree is a cache,
-          # not a one-shot. See `xtask e2e-prewarm` (EAI-8057).
-          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
-
-          cargo xtask e2e
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-rad3-${{ matrix.channel }}-report
-          path: tests/e2e-cucumber/results/
-
-  e2e-gpu-nightly-mi350p:
-    name: E2E tests (MI350P, incl. nightly-only)
-    timeout-minutes: 90
-    runs-on: [self-hosted, linux, mi350p]
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        channel: [release, nightly]
-    env:
-      E2E_INCLUDE_NIGHTLY: "1"
-      E2E_SERVE_TIMEOUT_SECS: "300"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Reclaim the GPU before running: a serve leaked by a killed or
-      # timed-out prior run (its Drop teardown never executed) keeps an engine
-      # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees: a manual /workload serve is matched only if its command line
-      # also names an E2E root — see the exposure documented in
-      # scripts/reclaim-gpu.sh.
-      - name: Reclaim GPU from stray E2E processes
-        run: bash scripts/reclaim-gpu.sh
-
-      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
-      # process survives. Floor matches the per-PR MI350P lane and the other
-      # Instinct lane — low enough that a clean pod passes on the first poll,
-      # and against a pool this size it only trips near exhaustion, so the
-      # process gate is what actually catches a leftover serve (#446). See
-      # .github/scripts/gpu-preflight.sh.
-      - name: GPU preflight (bounded wait for an available GPU)
-        env:
-          GPU_PREFLIGHT_MIN_FREE_GIB: 16
-        run: |
-          bash .github/scripts/gpu-preflight.sh
-
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-        with:
-          cache: false
-
-      - name: Run full E2E on MI350P (incl. nightly-only)
-        run: |
-          # $RUNNER_WORKSPACE is on a volume that survives the runner being scaled
-          # away, so the cargo target dir and shared caches stay warm.
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same mount as the runtimes it populates, so uv hardlinks into them
-          # instead of copying, and inside the uv-cache-gc initContainer's floor
-          # (see e2e-selfhosted.yml e2e-gpu).
-          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
-          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
-          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
-
-          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature is the floor a pre-built binary must carry
-          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
-          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
-          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
-          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
-
-          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
-          # the channel index has published a newer runtime — the tree is a cache,
-          # not a one-shot. See `xtask e2e-prewarm`.
-          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
-
-          cargo xtask e2e
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-mi350p-${{ matrix.channel }}-report
-          path: tests/e2e-cucumber/results/
-
-  # W7900 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-w7900 lane
-  # in e2e-selfhosted.yml (w7900 label, shared uv cache, GPU preflight), with
-  # @nightly scenarios enabled. Keep the two in step: the report crate asserts
-  # the nightly lanes publish the same platforms as the per-PR lanes.
-  e2e-gpu-nightly-w7900:
-    name: E2E tests (W7900, incl. nightly-only)
-    timeout-minutes: 90
-    runs-on: [self-hosted, linux, w7900]
-    strategy:
-      fail-fast: false
-      matrix:
-        channel: [release, nightly]
-    continue-on-error: true
-    env:
-      E2E_INCLUDE_NIGHTLY: "1"
-      E2E_SERVE_TIMEOUT_SECS: "300"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Reclaim the GPU before running: a serve leaked by a killed or
-      # timed-out prior run (its Drop teardown never executed) keeps an engine
-      # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees: a manual /workload serve is matched only if its command line
-      # also names an E2E root — see the exposure documented in
-      # scripts/reclaim-gpu.sh.
-      - name: Reclaim GPU from stray E2E processes
-        run: bash scripts/reclaim-gpu.sh
-
-      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
-      # process survives. The floor stays at the shared 16 GiB default, which is
-      # a flat constant rather than a proportion of capacity: it only has to be
-      # high enough to catch a leftover serve still holding the card, and low
-      # enough that a clean host passes on the first poll. Same as the per-PR
-      # W7900 lane — do NOT scale it down for a smaller part. On a 48GB card it
-      # only trips past ~32 GiB held, so the process gate is what catches a
-      # leftover serve holding less (#446). See .github/scripts/gpu-preflight.sh.
-      - name: GPU preflight (bounded wait for an available GPU)
-        env:
-          GPU_PREFLIGHT_MIN_FREE_GIB: 16
-        run: |
-          bash .github/scripts/gpu-preflight.sh
-
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
-        with:
-          cache: false
-
-      - name: Run full E2E on W7900 (incl. nightly-only)
-        run: |
-          # $RUNNER_WORKSPACE is on a volume that outlives any single job, so the
-          # cargo target dir and shared caches stay warm.
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same mount as the runtimes it populates, so uv hardlinks into them
-          # instead of copying, and inside the uv-cache-gc initContainer's floor
-          # (see e2e-selfhosted.yml e2e-gpu).
-          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
-          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
-          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
-
-          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
-          # e2e-test-hooks feature is the floor a pre-built binary must carry
-          # (xtask builds a superset: it also enables e2e-oom-fault-injection).
-          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
-          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
-          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
-
-          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
-          # the channel index has published a newer runtime — the tree is a cache,
-          # not a one-shot. See `xtask e2e-prewarm`.
-          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
-
-          cargo xtask e2e
-
-      - name: Upload E2E report
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-gpu-w7900-${{ matrix.channel }}-report
-          path: tests/e2e-cucumber/results/
-
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
   # runner's storage and runtime setup aligned with e2e-selfhosted.yml's proven
   # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
-    # 120: serve-26/27 (AIM, @nightly) add up to 2 x 1200s readiness waits when
-    # this host has Docker; on a host without it they skip and cost nothing.
-    # Whether it has Docker is unconfirmed: nothing in this job installs or checks
-    # it, so the "Report whether Docker is reachable" step logs the answer. If it
-    # does not, no nightly lane runs AIM serve and a pool-based one is needed.
-    timeout-minutes: 120
-    # `native` disambiguates this runner from any host that might carry a bare
-    # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
-    # before the WSL lanes moved to the ephemeral pool) -- the paths below
-    # exist only on the native host, whether or not that other runner remains
-    # registered.
-    runs-on: [self-hosted, linux, strix-halo, native]
+    # 140: serve-26/27/63 (AIM, @nightly) add up to 3 x 1200s readiness waits
+    # (each container downloads its checkpoint afresh: none is cached between
+    # scenarios); on a host without Docker they skip and cost nothing. The
+    # "Report whether Docker is reachable" step logs the answer each run.
+    # serve-27 once failed here (rocm-cli#1058) and now runs expect-pass, with
+    # no row in expectations.toml.
+    timeout-minutes: 140
+    # The DevLab Dispatch pool, identical to the e2e-gpu-strix-ubuntu lane in
+    # e2e-selfhosted.yml, which runs on push and dispatch but not on pull_request
+    # or merge_group (pinned by workflow_contract.rs). This lane used to target
+    # the static `native` host, which is offline: every nightly sat queued until
+    # the 12h run cap and the lane never ran. Pool hosts are cold,
+    # so there are no host-specific HOME or cache-dir overrides.
+    runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         channel: [release, nightly]
     env:
-      HOME: /home/ubuntu/actions-runner/e2e-home
-      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
-      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
-      TMPDIR: /home/ubuntu/actions-runner/tmp
-      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
@@ -793,11 +573,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
-        run: |
-          mkdir -p "$HOME" "$TMPDIR" "$PIP_CACHE_DIR"
-          echo "prepared"
-          bash scripts/reclaim-gpu.sh
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
       # process survives. gfx1151 shares system memory, so the floor is smaller
@@ -815,20 +592,20 @@ jobs:
 
       - name: Ensure Rust toolchain
         run: |
-          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # serve-26/27 (AIM) need Docker reachable on this host; without it they skip
+      # serve-26/27/63 (AIM) need Docker reachable on this host; without it they skip
       # silently. Say which it is, so a nightly that never ran them is visible.
       - name: Report whether Docker is reachable (AIM serve scenarios need it)
         run: |
           if docker info >/dev/null 2>&1; then
-            echo "docker reachable: serve-26/27 (AIM) can run on this host"
+            echo "docker reachable: serve-26/27/63 (AIM) can run on this host"
           else
-            echo "::warning::docker is not reachable on this host: serve-26/27 (AIM) will skip"
+            echo "::warning::docker is not reachable on this host: serve-26/27/63 (AIM) will skip"
           fi
 
       - name: Run E2E tests on Strix Halo (incl. nightly-only)
@@ -875,6 +652,9 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # GPU lane: the E2E harness fails if its probe finds no usable AMD GPU
+      # or no GPU scenario runs (see tests/e2e-cucumber/README.md).
+      E2E_EXPECT_GPU: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
@@ -1142,6 +922,13 @@ jobs:
       matrix:
         channel: [release, nightly]
     env:
+      # Declared GPU-less on purpose: the distro is left without ROCm's WSL
+      # driver bridge (see the "NO librocdxg provisioning step" note below), so
+      # the probe finds no usable GPU and @requires-gpu scenarios are not
+      # applicable. The harness reports that rather than failing on it; set "1"
+      # here if this lane ever provisions a GPU. Forwarded into the guest via
+      # WSLENV in the run step.
+      E2E_EXPECT_GPU: "0"
       # wsl.exe emits UTF-16 by default; without this its own error/status text
       # comes back mangled when captured through PowerShell. Matches the
       # ubuntu/WSL composite action's own env.
@@ -1341,8 +1128,9 @@ jobs:
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
-      # rocm-smi is a reported condition, not a job failure: the capability probe
-      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # rocm-smi is a reported condition, not a job failure: the lane declares
+      # E2E_EXPECT_GPU=0, so the harness reports @requires-gpu scenarios as not
+      # applicable instead of failing on them, and the rest still runs. A
       # GPU that IS present but stays held fails the job, since that would
       # corrupt the serve scenarios' results.
       #
@@ -1363,7 +1151,7 @@ jobs:
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
-            echo "::warning::rocm-smi not found in this WSL distro — GPU scenarios will resolve to skip"
+            echo "::warning::rocm-smi not found in this WSL distro — expected on this lane (E2E_EXPECT_GPU=0); @requires-gpu scenarios are not applicable"
             exit 0
           fi
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
@@ -1463,7 +1251,7 @@ jobs:
             sleep 5
           done
           if [ "$saw_vram" -eq 0 ]; then
-            echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
+            echo "::warning::rocm-smi reported no VRAM figures under WSL — this lane declares no GPU (E2E_EXPECT_GPU=0); @requires-gpu scenarios are not applicable"
             exit 0
           fi
           if [ "$unmeasurable" -eq 1 ]; then
@@ -1514,7 +1302,7 @@ jobs:
         shell: powershell
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
+          $env:WSLENV = 'E2E_EXPECT_GPU:E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1583,8 +1371,64 @@ jobs:
           # a failed step there does not turn the lane's check red. Only the
           # WSL lanes need this guard: every other lane writes report.json
           # directly in-job, with no guest-to-host copy step that can fail on
-          # its own.
+          # its own. A harness preflight refusal is not one of those:
+          # `run_suite` in tests/e2e-cucumber/tests/e2e.rs creates report.json
+          # empty before it calls `lane_verdict::preflight`, and the
+          # `if: always()` copy-out above carries it to the host, so it uploads
+          # fine and the missing-report check does not catch it; its EMPTY row
+          # in the report is the signal (a post-run lane failure shows as a
+          # FAIL row with lane_failure).
           if-no-files-found: error
+
+  # GitHub has no queue timeout: `timeout-minutes` counts from the moment a
+  # runner takes the job, so a lane whose pool is offline sat queued for the full
+  # 24 hours and held the report and readiness jobs (which `needs` every lane)
+  # back with it. This job stands in for the lanes in those `needs`: it polls
+  # this run's job list and settles once every lane leg has finished or can be
+  # given up on -- a leg still queued after QUEUE_DEADLINE_MINUTES (unless a
+  # sibling leg of its lane started), or one unfinished after
+  # HARD_DEADLINE_MINUTES. Legs that started are waited for, so a slow lane
+  # still lands in the report. The report then covers whatever
+  # finished, and the lanes given up on show as gaps (see lane_results).
+  # .github/scripts/settle-e2e-lanes.sh holds the logic; the lanes are listed
+  # here by display name, and a contract test checks the list against the jobs.
+  e2e-lanes-settled:
+    name: E2E lanes settled (queue deadline)
+    runs-on: ubuntu-24.04 # one LTS: only polls the GitHub API
+    # HARD_DEADLINE_MINUTES + slack; the script stops itself at the hard
+    # deadline, before this cap.
+    timeout-minutes: 270
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      lane_results: ${{ steps.settle.outputs.lane_results }}
+      abandoned_count: ${{ steps.settle.outputs.abandoned_count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Wait for the E2E lanes to finish or time out in the queue
+        id: settle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A schedule run has no inputs, so it takes the default. A leg still
+          # queued this long after the run started is given up on.
+          QUEUE_DEADLINE_MINUTES: ${{ inputs.queue_deadline_minutes || '60' }}
+          # A leg that started is waited for, but not past this: the queue
+          # deadline plus the longest lane's timeout-minutes (140) plus slack.
+          HARD_DEADLINE_MINUTES: "240"
+          # The longest lane's timeout-minutes. The script refuses a queue
+          # deadline that, plus this, would pass the hard deadline, so a
+          # dispatch input cannot abandon a lane that is still running.
+          LANE_RUN_MINUTES: "140"
+          LANES: |
+            e2e-gpu-nightly=E2E tests (MI300X, incl. nightly-only)
+            e2e-gpu-nightly-strix=E2E tests (Strix Halo, incl. nightly-only)
+            e2e-gpu-nightly-strix-windows=E2E tests (Strix Halo, Windows, incl. nightly-only)
+            e2e-wsl-nightly=E2E tests (Strix Halo, WSL2, incl. nightly-only)
+        run: bash .github/scripts/settle-e2e-lanes.sh
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
   # nightly meant opening every artifact and comparing them by hand — on the
@@ -1601,14 +1445,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    # Not the lanes themselves: a lane whose runner pool never answers would hold
+    # this job for 24 hours. e2e-lanes-settled waits for them with a queue
+    # deadline instead, and hands over their results in `lane_results`.
     needs:
-      - e2e-gpu-nightly
-      - e2e-gpu-nightly-rad3
-      - e2e-gpu-nightly-mi350p
-      - e2e-gpu-nightly-w7900
-      - e2e-gpu-nightly-strix
-      - e2e-gpu-nightly-strix-windows
-      - e2e-wsl-nightly
+      - e2e-lanes-settled
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
     # filter to consult on a schedule, and the lanes are `continue-on-error`, so
     # a failed lane must still be reported. A nightly that broke is precisely
@@ -1639,20 +1480,196 @@ jobs:
           pattern: '*-report'
           path: e2e-artifacts
 
+      # The shared GPU queue's nightly (docs/nightly-on-the-queue.md) runs R9700,
+      # MI350P, W7900 and the Instinct lanes of the queue's fleet on its own
+      # schedule, and its results are published as one `queue-run-results`
+      # artifact of that run, not as `*-report` artifacts of this one. So fetch
+      # the newest such artifact of a run on main that finished, and started, in
+      # the last 24 hours (a run still going, or one from an earlier night, is
+      # not today's), and the job log of that run, which is the only place the
+      # queue prints which branch it tested and which lanes it blocks on. The
+      # artifact is found by its name, not through the workflow that makes it:
+      # that workflow runs on a runner no other workflow may name or depend on.
+      # A conclusion of `failure` is no reason to skip it: a red lane fails the
+      # queue's run and the artifact is still uploaded. This step never fails the
+      # job and never stops the report: when there is nothing to import it
+      # records why, and the next step says so at the top of the page instead of
+      # leaving the queue's GPUs out without a word.
+      - name: Fetch the latest queue results
+        continue-on-error: true
+        # Bounds the whole step: each log read has its own timeout, but a run of
+        # many jobs on a stalled storage hop would still outlast the job's.
+        # One job's log read can take attempts x (--max-time + pause), so a cap
+        # below that cuts the fetch off inside the retries it exists to allow
+        # and the queue lanes go missing from the report; and the cap must leave
+        # the report job's own cap room for the steps after it. Both are held by
+        # nightly_queue_fetch_timeout_outlasts_one_jobs_retry_budget in
+        # xtask/src/workflow_contract.rs, which reads the budget from this script.
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p queue-results
+          absent() {
+            echo "$1" > queue-results/absent.txt
+            echo "::warning::No queue lanes in this report: $1"
+            exit 0
+          }
+          repo_id=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id) ||
+            absent "the repository could not be read"
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          # Newest first: a run asked to test another branch (a `queue-run.yml`
+          # dispatch runs main's workflow too) must not hide an older run of main.
+          candidates=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=queue-run-results&per_page=50" |
+            jq -r --arg since "$since" --argjson repo "$repo_id" '
+              [.artifacts[]
+               | select(.expired == false)
+               | select(.workflow_run.head_branch == "main" and .workflow_run.head_repository_id == $repo)
+               | select(.created_at >= $since)]
+              | sort_by(.created_at) | reverse | .[:5][] | .workflow_run.id') ||
+            absent "the queue results could not be listed"
+          [ -n "$candidates" ] ||
+            absent "no queue run on main finished in the last 24 hours (a run still going is not imported)"
+          found=""
+          # Every rejection says why, on the run's own line: the step used to
+          # end in one warning that did not distinguish a run still going from
+          # a log that could not be read (run 44002836099 was rejected with
+          # no way to tell which).
+          skipped() { echo "::notice::queue run ${candidate} not imported: $1"; }
+          # The job log is a redirect to blob storage, and a failure of that
+          # hop is worth another try before the run is given up on. Read it with
+          # curl, not `gh api`: newer gh refuses a response holding terminal
+          # escape sequences ("pass --allow-escape-sequences"), which every
+          # job log does, so every log read failed and run 44002836099 was
+          # rejected as unreadable. curl follows the redirect and sends the token
+          # only to api.github.com.
+          fetch_job_log() {
+            local job="$1" attempt
+            for attempt in 1 2 3; do
+              curl -fsSL --connect-timeout 15 --max-time 120 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > queue-results/job.log.part && return 0
+              echo "::notice::queue run ${candidate}: reading the log of job ${job} failed (attempt ${attempt} of 3)"
+              sleep 5
+            done
+            return 1
+          }
+          for candidate in $candidates; do
+            rm -rf queue-results/results queue-results/job.log
+            # A run that started a day ago is not tonight's.
+            run_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}" --jq '[.status, .run_started_at] | @tsv') || {
+              skipped "the run could not be read"
+              continue
+            }
+            # A finished run only, red or green: a run still going has a
+            # partial job log.
+            if [ "${run_info%%$'\t'*}" != "completed" ]; then
+              skipped "its status is '${run_info%%$'\t'*}', not completed"
+              continue
+            fi
+            started="${run_info#*$'\t'}"
+            started_at=$(date -u -d "$started" +%s 2>/dev/null) || {
+              skipped "its start time '${started}' could not be read"
+              continue
+            }
+            if [ "$started_at" -lt "$(date -u -d '24 hours ago' +%s)" ]; then
+              skipped "it started at ${started}, more than 24 hours ago"
+              continue
+            fi
+            gh run download "$candidate" --repo "$GITHUB_REPOSITORY" --name queue-run-results --dir queue-results/results || {
+              skipped "its queue-run-results artifact could not be downloaded"
+              continue
+            }
+            # The log names the branch the run tested and which lanes the queue
+            # blocks on; a run that tested another branch is skipped, not the end
+            # of the search. `e2e-queue-import` checks the log again.
+            # The run may have several jobs: scan them all for the one that
+            # prints the lane matrix.
+            jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate}/jobs?per_page=100" --jq '.jobs[].id') || {
+              skipped "its jobs could not be listed"
+              continue
+            }
+            : > queue-results/job.log
+            unreadable=0
+            for job in $jobs; do
+              if ! fetch_job_log "$job"; then
+                unreadable=$((unreadable + 1))
+                continue
+              fi
+              if grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log.part; then
+                mv queue-results/job.log.part queue-results/job.log
+                break
+              fi
+            done
+            rm -f queue-results/job.log.part
+            if ! grep -aqE 'rocm-cli main at [0-9a-f]{40}' queue-results/job.log; then
+              skipped "none of its $(wc -w <<<"$jobs") job log(s) names the tested branch ('rocm-cli main at <sha>'); ${unreadable} could not be read"
+              continue
+            fi
+            found="$candidate"
+            echo "$started" > queue-results/started.txt
+            break
+          done
+          if [ -z "$found" ]; then
+            rm -rf queue-results/results queue-results/job.log
+            absent "none of the newest queue runs of the last 24 hours tested main with a readable log and results (the notices above say why each was not imported)"
+          fi
+          echo "$found" > queue-results/run-id.txt
+
+      # Turn the run's lanes into reports of this job's own kind, and write the
+      # status section for the top of the matrix (`cargo xtask e2e-queue-import`).
+      # A lane the queue marks advisory is labelled so and does not count towards
+      # the release-readiness verdict; a blocking lane with no result does.
+      - name: Add the queue lanes to the report
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p queue-results
+          if [ -s queue-results/run-id.txt ] && [ -d queue-results/results ]; then
+            run_id=$(cat queue-results/run-id.txt)
+            args=(--queue-dir queue-results/results
+              --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+              --run-started "$(cat queue-results/started.txt 2>/dev/null)")
+            [ -f queue-results/job.log ] && args+=(--log queue-results/job.log)
+          else
+            args=(--absent "$(cat queue-results/absent.txt 2>/dev/null || echo 'fetching the queue results did not complete')")
+          fi
+          cargo xtask e2e-queue-import "${args[@]}" \
+            --artifacts-dir e2e-artifacts \
+            --section-out queue-results/queue-lanes.md || {
+            # Half an import is worse than none, and none is said at the top of the page.
+            rm -rf e2e-artifacts/e2e-queue-* queue-results/queue-lanes.md
+            echo "::warning::The queue lanes could not be added to the report."
+            cargo xtask e2e-queue-import --absent "the queue lanes could not be imported" \
+              --artifacts-dir e2e-artifacts --section-out queue-results/queue-lanes.md || true
+          }
+
+      # The queue lanes' status leads the page. The matrix keeps its own first
+      # table, the one `release-readiness` reads its verdict from.
       - name: Build consolidated report + step summary
         run: |
           mkdir -p consolidated
           cargo xtask e2e-report \
             --artifacts-dir e2e-artifacts \
             --html-out consolidated/index.html > consolidated/support-matrix.md
+          if [ -f queue-results/queue-lanes.md ]; then
+            cat queue-results/queue-lanes.md consolidated/support-matrix.md > "$RUNNER_TEMP/with-queue.md"
+            mv "$RUNNER_TEMP/with-queue.md" consolidated/support-matrix.md
+          fi
           cat consolidated/support-matrix.md >> "$GITHUB_STEP_SUMMARY"
 
-      # A lane that dies before writing report.json (preflight, build, a crash
-      # before results exist) uploads nothing, and `discover()` can only render
-      # the reports that arrived, so that lane would drop out of the grid with
-      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
-      # either. So check it here: every lane that ran (any `needs` result but
-      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # A lane that dies before writing report.json (the GPU preflight step, a
+      # build failure, a crash before results exist) uploads nothing. The
+      # harness's own preflight refusal is different: `run_suite` in
+      # tests/e2e-cucumber/tests/e2e.rs creates report.json empty before it
+      # calls `lane_verdict::preflight`, and each lane's `if: always()` upload
+      # step publishes it, so it shows as an EMPTY row (a post-run lane failure
+      # as a FAIL row with lane_failure), not as missing. `discover()` can only
+      # render the reports that arrived, so a lane that uploads nothing would
+      # drop out of the grid with no row and no FAIL. On a `continue-on-error`
+      # lane nothing else is red either. So check it here: every lane that ran
+      # (any `needs` result but `skipped`, and not self-skipped as `stale`)
+      # must have uploaded its report artifact. This reads the run's
       # artifact list rather than e2e-artifacts/, because download-artifact
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
@@ -1671,12 +1688,11 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
-          NEEDS: ${{ toJSON(needs) }}
+          # Shaped like the `needs` context: lane job id -> {result}, with
+          # `abandoned` for a lane that never got a runner.
+          NEEDS: ${{ needs.e2e-lanes-settled.outputs.lane_results }}
           LANE_REPORTS: |
             e2e-gpu-nightly=e2e-gpu-release-report,e2e-gpu-nightly-report
-            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report,e2e-gpu-rad3-nightly-report
-            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report,e2e-gpu-mi350p-nightly-report
-            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report,e2e-gpu-w7900-nightly-report
             e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
             e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report,e2e-gpu-strix-windows-nightly-report
             e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report,e2e-gpu-strix-wsl-nightly-report
@@ -1692,6 +1708,18 @@ jobs:
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
+            # A lane that publishes `stale=true` skipped its uploads by design
+            # and is not a missing report. Only e2e-selfhosted.yml's `e2e-gpu`
+            # stale-run guard publishes it; the line is inert in nightly.yml and
+            # is there because a contract test keeps the two copies of this script
+            # identical. Say so in the summary rather than dropping the lane silently.
+            if [ "$(jq -r --arg job "$job" '.[$job].outputs.stale // ""' <<<"$NEEDS")" = true ]; then
+              echo "- :no_entry_sign: \`$job\` skipped itself as stale; it has no column in the grid above" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            # A lane that said it skipped itself on purpose (the queue's nightly
+            # window) uploads nothing and is not missing.
+            [ "$(jq -r --arg job "$job" '.[$job].outputs.skipped // ""' <<<"$NEEDS")" = true ] && continue
             IFS=',' read -ra wanted <<<"$artifacts"
             for artifact in "${wanted[@]}"; do
               if ! grep -qxF "$artifact" <<<"$uploaded"; then
@@ -1715,6 +1743,13 @@ jobs:
   # overwritten each night; the run link, commit and date in its header say
   # which run it came from. Main-branch runs only, so a dispatch from another
   # branch cannot overwrite the page, and never from an empty or cancelled run.
+  # A report job that FAILED still publishes: it fails when a lane ran and
+  # uploaded no report, which is a broken nightly, and that is when the grid is
+  # most worth reading (run 44029433287 skipped the page for exactly that). The
+  # grid guard in the step below keeps a degenerate report off the page, and the
+  # report job uploads `consolidated/` whatever its own result. A report job
+  # that failed before writing it (checkout, toolchain) leaves nothing to
+  # download, so this job fails at the download instead of publishing.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
     runs-on: ubuntu-24.04 # one LTS: publishing only
@@ -1722,7 +1757,7 @@ jobs:
     permissions:
       contents: write
     needs: e2e-report-nightly
-    if: ${{ !cancelled() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && (needs.e2e-report-nightly.result == 'success' || needs.e2e-report-nightly.result == 'failure') && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
     concurrency:
       group: publish-e2e-wiki
       cancel-in-progress: false
@@ -1931,11 +1966,11 @@ jobs:
           path: release-readiness/narrative.md
           if-no-files-found: ignore
 
-  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
-  # but unlike that job this one also runs (and publishes an explicit
-  # "evidence unavailable" notice) when release-readiness-nightly fails
-  # outright, rather than just skipping and leaving the wiki showing
-  # whatever verdict the last successful run left there.
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki.
+  # Like that job it also runs when its upstream failed, and this one then
+  # publishes an explicit "evidence unavailable" notice when
+  # release-readiness-nightly fails outright, rather than leaving the wiki
+  # showing whatever verdict the last successful run left there.
   publish-release-readiness-wiki:
     name: Publish release readiness to wiki
     runs-on: ubuntu-24.04 # one LTS: facts, narrative and publishing only
@@ -2051,3 +2086,38 @@ jobs:
           git add "$page"
           git commit -m "Update release readiness from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD
+
+  # Ends the run once everything that can report has. A lane given up on above is
+  # still queued, so without this the run would stay pending until GitHub's 24h
+  # limit even though its reports are out. Cancelling is safe here only because
+  # it runs after every other job: `needs` below lists them all, so what is
+  # cancelled is the stragglers, never a job that is still producing a report.
+  # It also runs when the settle job itself failed or was cancelled: nothing else
+  # bounds the wait then, and the report and readiness jobs have already run on
+  # whatever finished. `cancelled` is how GitHub reports a job killed by its own
+  # timeout-minutes, and the settle script fails itself well before that when the
+  # job list stays unreadable, so this is the backstop for a hung call. If the
+  # whole run was cancelled instead, ending it again changes nothing.
+  cancel-abandoned-e2e-lanes:
+    name: Cancel E2E lanes that never got a runner
+    runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    needs:
+      - nightly
+      - windows-nightly
+      - publish-nightly
+      - cleanup-staging-nightly
+      - e2e-lanes-settled
+      - e2e-report-nightly
+      - publish-e2e-wiki
+      - release-readiness-nightly
+      - release-readiness-narrative
+      - publish-release-readiness-wiki
+    if: ${{ always() && (needs.e2e-lanes-settled.result == 'failure' || needs.e2e-lanes-settled.result == 'cancelled' || (needs.e2e-lanes-settled.outputs.abandoned_count != '' && needs.e2e-lanes-settled.outputs.abandoned_count != '0')) }}
+    steps:
+      - name: Cancel the run's unfinished lanes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"

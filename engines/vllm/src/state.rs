@@ -34,7 +34,19 @@ pub(crate) struct ServiceFiles {
 pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let files = service_files(&request.service_id)?;
-    let state = read_service_state(&files.state_path).ok();
+    healthcheck_service_at(&files.state_path)
+}
+
+/// [`healthcheck_service`] against an explicit state path.
+///
+/// Split out the way `engines/lemonade`'s `healthcheck_service_at` already is:
+/// [`service_files`] resolves through the caller's real `AppPaths`, so the RPC
+/// handler itself could not be driven from a test, and the `device` it answers
+/// with was only covered by calling [`reported_device`] directly — a test that
+/// stays green if this handler stops consulting it at all (see
+/// `healthcheck_rpc_answers_with_the_device_the_state_file_describes`).
+pub(crate) fn healthcheck_service_at(state_path: &Path) -> Result<HealthcheckResponse> {
+    let state = read_service_state(state_path).ok();
     let endpoint_url = state.as_ref().and_then(endpoint_url_from_state);
     let model_ref = state
         .as_ref()
@@ -51,7 +63,7 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
     let ready = listed
         && endpoint_url.as_deref().is_some_and(|endpoint| {
             inference_verified(
-                &files.state_path,
+                state_path,
                 state.as_ref(),
                 endpoint,
                 model_ref.as_deref().unwrap_or_default(),
@@ -61,17 +73,41 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
         .as_ref()
         .and_then(|value| value_string(value, "status"))
         .unwrap_or_else(|| "unknown".to_owned());
-    let device = if state.is_some() {
-        "rocm_gpu"
-    } else {
-        "unknown"
+    let device = match state.as_ref() {
+        Some(state) => reported_device(state),
+        None => "unknown".to_owned(),
     };
     Ok(HealthcheckResponse::for_readiness(
         listed,
         ready,
         &state_status,
-        device,
+        &device,
     ))
+}
+
+/// The device string reported once state exists for the service.
+///
+/// vLLM only ever runs on ROCm here (`device_policy` is pinned to
+/// `gpu_required` at launch), so the backend half is fixed — but the shape has
+/// to match what `engines/lemonade` reports, because
+/// `rocm serve`'s `device:` row and `rocm services list` print whichever engine
+/// answered verbatim. It used to be the literal `"rocm_gpu"`, so the same row
+/// read `rocm_gpu` for vLLM and `vulkan gpu 0` for Lemonade, and neither
+/// README.md nor `docs/manual-testing.md` described the former. Both halves are
+/// now formatted by [`rocm_engine_protocol::format_reported_device`], shared
+/// with Lemonade, which is also what keeps an unpinned launch from rendering a
+/// dangling `rocm gpu`.
+///
+/// The ordinal comes from
+/// [`rocm_engine_protocol::first_gpu_index_from_state`] for the same reason:
+/// this engine and Lemonade read the same `gpu_indices` key out of state files
+/// of the same shape, and had byte-identical private copies of that read.
+fn reported_device(state: &Value) -> String {
+    rocm_engine_protocol::format_reported_device(
+        "rocm",
+        rocm_engine_protocol::first_gpu_index_from_state(state),
+        value_string(state, "gpu_name").as_deref(),
+    )
 }
 
 pub(crate) fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
@@ -150,6 +186,19 @@ pub(crate) fn write_running_state(
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": "gpu_required",
+            // Recorded so `healthcheck_service` can report the GPU this service
+            // was actually pinned to, in the same shape `engines/lemonade`
+            // reports. Introspection only, like the rest of this file — never
+            // read back to relaunch.
+            "gpu_indices": request.gpu_indices,
+            // The name of the GPU this service was pinned to, so the `device:`
+            // row names a device and not only a backend (ROCMAI-550). Captured
+            // once here rather than probed per healthcheck, because `rocm
+            // services list` healthchecks every ready service on its render
+            // path. `rocm_core::pinned_gpu_name` answers `null` when the host
+            // probe cannot be attributed to the pinned ordinal, so the row
+            // falls back to `rocm gpu <n>` rather than naming another card.
+            "gpu_name": rocm_core::pinned_gpu_name(&request.gpu_indices),
             "runtime_id": runtime.runtime_id,
             "requested_runtime_id": request.runtime_id,
             "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),
@@ -168,16 +217,18 @@ pub(crate) fn write_running_state(
     )
 }
 
+/// Stamps a terminal status, patching the file under the state directory's
+/// lock ([`rocm_core::merge_json_state_file`]) rather than reading it and
+/// writing it back unlocked — so it cannot drop a key the inference latch or
+/// `rocmd`'s Anthropic-endpoint publish recorded in between.
 pub(crate) fn write_terminal_state(state_path: &Path, status: &str) -> Result<()> {
-    let mut state = read_service_state(state_path).unwrap_or_else(|_| json!({}));
-    if let Some(object) = state.as_object_mut() {
-        object.insert("status".to_owned(), Value::String(status.to_owned()));
-        object.insert(
-            "stopped_at_unix_ms".to_owned(),
-            Value::from(current_unix_millis() as u64),
-        );
-    }
-    write_state(state_path, &state)
+    rocm_core::merge_json_state_file(
+        state_path,
+        &json!({
+            "status": status,
+            "stopped_at_unix_ms": current_unix_millis() as u64,
+        }),
+    )
 }
 
 pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
@@ -186,23 +237,20 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-/// Serializes `value` to `path` as pretty JSON, creating the parent directory
-/// if needed. The low-level primitive [`write_running_state`] and
-/// [`write_terminal_state`] both go through — it is not the only way this
-/// module's state files are written: inference-verification latches go
-/// through `rocm_core::merge_json_state_file` instead (see
-/// [`inference_verified`]), which patches the file directly rather than
-/// routing through here.
+/// Replace the service's state file whole, under the state directory's lock
+/// and published atomically ([`rocm_core::write_json_state_file`]).
+///
+/// [`write_running_state`] is the only caller; the terminal status is a patch
+/// ([`write_terminal_state`]). It used to be a lock-free `fs::write`, which is
+/// a problem this PR's own change made reachable: the document being written
+/// now includes a host GPU probe (`rocm_core::pinned_gpu_name`, up to seconds
+/// on Windows), and `rocmd`'s Anthropic-proxy thread — a thread of *this*
+/// process — publishes its endpoint into the same file in that window. Going
+/// through `write_json_state_file` both orders this against every merge and
+/// carries that publication through the rewrite, as `engines/lemonade`'s
+/// `write_state` does.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(value).context("failed to serialize vLLM state")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
+    rocm_core::write_json_state_file(path, value)
 }
 
 pub(crate) fn endpoint_url(host: &str, port: u16) -> String {
@@ -703,5 +751,100 @@ mod tests {
     #[test]
     fn identity_from_state_without_pid_is_none() {
         assert!(identity_from_state(&json!({ "status": "running" })).is_none());
+    }
+
+    /// The `device:` row `rocm serve` and `rocm services list` print comes
+    /// straight from this string, so vLLM has to speak the same shape
+    /// `engines/lemonade` does. It used to be the literal `"rocm_gpu"`, which
+    /// is the format README.md and `docs/manual-testing.md` never described and
+    /// which made one row disagree with itself across engines.
+    #[test]
+    fn reported_device_matches_the_shape_lemonade_reports() {
+        assert_eq!(
+            reported_device(&json!({ "gpu_indices": [1], "gpu_name": "AMD Instinct MI300X" })),
+            "rocm gpu 1 (AMD Instinct MI300X)"
+        );
+        assert_eq!(
+            reported_device(&json!({ "gpu_indices": [1] })),
+            "rocm gpu 1"
+        );
+        // No pinned ordinal recorded: the backend is still reported truthfully,
+        // exactly as `engines/lemonade`'s `reported_device(None, "rocm")` does,
+        // and without the dangling `gpu` noun that names no device.
+        assert_eq!(reported_device(&json!({ "status": "running" })), "rocm");
+        assert_eq!(reported_device(&json!({ "gpu_indices": [] })), "rocm");
+        assert_eq!(
+            reported_device(&json!({ "gpu_name": "AMD Instinct MI300X" })),
+            "rocm (AMD Instinct MI300X)"
+        );
+    }
+
+    /// The `device` the Healthcheck RPC *itself* answers with, not the private
+    /// formatter it is supposed to call.
+    ///
+    /// Every other device test in the three engines calls `reported_device`
+    /// directly, so reverting this handler's `Some(state) => reported_device`
+    /// wiring to the old hardcoded literal kept the whole suite green. This
+    /// drives the handler.
+    ///
+    /// The planted state carries no endpoint, so no HTTP probe is made and
+    /// `listed`/`ready` are false — which is the point: this engine reports
+    /// the device as soon as it has state, independently of readiness (unlike
+    /// `engines/lemonade`, see `apps/rocm/src/engine_ipc.rs`'s
+    /// `device_worth_reporting`).
+    #[test]
+    fn healthcheck_rpc_answers_with_the_device_the_state_file_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-rpc.json");
+        write_state(
+            &path,
+            &json!({
+                "status": "running",
+                "gpu_indices": [3],
+                "gpu_name": "AMD Instinct MI300X",
+            }),
+        )
+        .unwrap();
+
+        let response = healthcheck_service_at(&path).unwrap();
+        assert_eq!(response.device, "rocm gpu 3 (AMD Instinct MI300X)");
+        assert_eq!(response.status, "running");
+        assert!(!response.model_loaded);
+
+        // And a service with no state on disk is the `"unknown"` the CLI
+        // filters out rather than prints.
+        let response = healthcheck_service_at(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(response.device, "unknown");
+    }
+
+    /// The post-spawn whole-file rewrite must not drop the Anthropic endpoint
+    /// a sibling thread of this same process published moments earlier.
+    ///
+    /// `rocm`'s `run_builtin_engine_serve_http` runs `rocmd`'s Anthropic proxy
+    /// as a thread of the process running this adapter, and ROCMAI-550 put a
+    /// host GPU probe (seconds, on Windows) inside the rewrite — wide enough
+    /// for the publish to land inside it. Routing [`write_state`] through
+    /// `rocm_core::write_json_state_file` is what carries it through; putting
+    /// the raw `fs::write` back drops the key and fails this.
+    #[test]
+    fn a_running_state_write_keeps_the_anthropic_endpoint_this_process_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-anthropic.json");
+        rocm_core::publish_anthropic_endpoint(
+            &path,
+            "http://127.0.0.1:9932",
+            rocm_core::AnthropicEndpointMode::Proxy,
+        )
+        .unwrap();
+
+        write_state(&path, &json!({ "status": "running", "gpu_indices": [0] })).unwrap();
+
+        let state = read_service_state(&path).unwrap();
+        assert_eq!(
+            value_string(&state, rocm_core::ANTHROPIC_ENDPOINT_URL_STATE_KEY).as_deref(),
+            Some("http://127.0.0.1:9932"),
+            "the whole-file rewrite dropped the endpoint the proxy thread \
+             published: {state}"
+        );
     }
 }

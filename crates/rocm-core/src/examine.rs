@@ -41,10 +41,17 @@ use host_env::{
 pub(crate) use host_env::{probe_cpu_windows_with, record_cpu};
 pub(crate) use library_copies::comgr_matches_runtime;
 use library_copies::probe_comgr;
-use linux_driver::{probe_devices, probe_modules, probe_secure_boot, probe_user};
-pub use linux_gpus::gfx_is_apu_family;
+use linux_driver::{
+    probe_device_groups, probe_devices, probe_modules, probe_secure_boot, probe_user,
+};
 use linux_gpus::{
     GpuProbeSources, probe_gpus_after_lspci, probe_gpus_lspci, summarise_gpu_categories,
+};
+pub use linux_gpus::{KERNEL_TOPOLOGY_GPU_NAME, gfx_is_apu_family};
+#[cfg(any(test, feature = "test-support"))]
+pub use linux_gpus::{
+    TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103,
+    TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING,
 };
 use rocm_install_probe::probe_rocm_install;
 pub(crate) use windows::parse_dotted_version;
@@ -54,8 +61,12 @@ use windows::{
 use wsl::probe_wsl;
 pub use wsl::{parse_wsl_distro_list, probe_wsl_distro_from_host};
 
-/// A single GPU as enumerated by `lspci`/`rocminfo` (Linux) or the display
-/// inventory (Windows).
+/// A single GPU, as the examination enumerated it.
+///
+/// On Linux from `lspci`, the kernel's KFD topology (or its sysfs fallback)
+/// and `rocminfo`; on Windows from the display inventory. `is_apu` is `None`
+/// when nothing said which package it is; see `examine::linux_gpus`'s
+/// `apu_verdict_from_target` for the Linux rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Gpu {
     pub name: String,
@@ -86,8 +97,8 @@ pub struct Device {
 /// The oldest distro release the WSL path supports.
 ///
 /// Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / `GLIBCXX_3.4.32` floor
-/// every published Lemonade embeddable is linked against, so the engine cannot
-/// start there. See `docs/wsl.md`.
+/// the pinned Lemonade embeddable is linked against (newer Lemonade releases
+/// need more), so the engine cannot start there. See `docs/wsl.md`.
 pub const WSL_MIN_UBUNTU: (u32, u32) = (24, 4);
 
 /// WSL2-specific machine state. `None` on every other platform.
@@ -124,7 +135,7 @@ pub struct WslFacts {
     #[serde(default)]
     pub librocdxg_on_ld_library_path: bool,
     /// Whether `librocdxg.so` is in the same `lib` directory as a
-    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` runpath. A
+    /// `libhsa-runtime64`, which finds it through its own `$ORIGIN` search path. A
     /// TheRock tarball is laid out this way and is never in the linker cache.
     /// Unlike `LD_LIBRARY_PATH` this is a fact about files, so the `--distro` probe
     /// can ask it from outside the distribution.
@@ -298,6 +309,17 @@ pub struct Examination {
     pub user_groups: Vec<String>,
     pub in_render_group: Option<bool>,
     pub in_video_group: Option<bool>,
+    /// Which of the groups the render-group fix can name exist in the host's
+    /// group database, as `getent group` answered for the group that owns
+    /// `/dev/kfd`, `render` and `video` (`fix::render_group`'s
+    /// `lookup_candidates`). `rocm diagnose` names only these in the `usermod`
+    /// line it prints, through the resolver `rocm fix` uses too.
+    ///
+    /// `None` when the database was not read: off Linux, when `getent` did not
+    /// answer, and in an examination from a CLI that predates the field, which
+    /// `#[serde(default)]` keeps readable for `rocm remote doctor`.
+    #[serde(default)]
+    pub groups_on_host: Option<Vec<String>>,
 
     // ROCm install (Linux)
     pub rocm_version: String,
@@ -468,6 +490,7 @@ impl Default for Examination {
             user_groups: Vec::new(),
             in_render_group: None,
             in_video_group: None,
+            groups_on_host: None,
             rocm_version: String::new(),
             rocm_install_method: String::new(),
             rocm_path: String::new(),
@@ -601,8 +624,9 @@ impl Examination {
             probe_env(&mut e);
             probe_container(&mut e);
             probe_framework(&mut e, framework, interpreter);
-            // WSL2 ships the same 64 MB default a container does, so this is one
-            // of the platforms where the shortage is most likely to be real.
+            // WSL2 normally gives /dev/shm half the VM's memory, but a container
+            // inside the distro, a small VM or a remount can still leave it
+            // short, and the checker reads the measured size.
             probe_shared_memory(&mut e);
             // A wheel copy and a system copy collide on WSL2 exactly as they do
             // on bare metal, so skipping the search here would leave a WSL user
@@ -620,6 +644,7 @@ impl Examination {
             probe_modules(&mut e);
             probe_user(&mut e);
             probe_devices(&mut e);
+            probe_device_groups(&mut e);
             probe_secure_boot(&mut e);
             probe_rocm_install(&mut e);
             probe_env(&mut e);
@@ -776,6 +801,10 @@ mod tests {
             "user_groups",
             "in_render_group",
             "in_video_group",
+            // CLI addition beyond examine.py, added deliberately: which of the
+            // groups the render-group fix can name exist, so the `usermod` line
+            // `diagnose` prints never names a group the host does not have.
+            "groups_on_host",
             "rocm_version",
             "rocm_install_method",
             "rocm_path",

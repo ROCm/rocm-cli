@@ -29,6 +29,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// Engine catalog — names + descriptions mirror `apps/rocm` `engine_inventory()`.
 /// Kept TUI-local (a stable, small list) so this layer needs no `rocm-core` dep.
@@ -144,7 +145,7 @@ pub fn on_key(
     }
 
     // 3) List navigation + action requests.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *engines = None,
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
             em.selected = em.selected.saturating_sub(1);
@@ -300,7 +301,7 @@ pub fn draw_engine_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crossterm::event::KeyCode;
 
     #[test]
@@ -335,6 +336,31 @@ mod tests {
             on_key(&mut em, &mut jobs, key(KeyCode::Up));
         }
         assert_eq!(em.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        let mut jobs = State::default();
+        for (letter, expected) in [
+            ('U', EngineAction::Use),
+            ('I', EngineAction::Install),
+            ('R', EngineAction::Reinstall),
+        ] {
+            let mut em = Some(EngineManagerState::default());
+            on_key(&mut em, &mut jobs, caps(letter));
+            let pending = em.as_ref().unwrap().approval.as_ref();
+            assert!(
+                pending.is_some_and(|p| p.action == expected),
+                "Caps Lock {letter} must stage {expected:?}"
+            );
+        }
+        let mut em = Some(EngineManagerState::default());
+        on_key(&mut em, &mut jobs, caps('J'));
+        assert_eq!(em.as_ref().unwrap().selected, 1, "J must move down");
+        on_key(&mut em, &mut jobs, caps('K'));
+        assert_eq!(em.as_ref().unwrap().selected, 0, "K must move up");
+        on_key(&mut em, &mut jobs, caps('Q'));
+        assert!(em.is_none(), "Q must close the overlay");
     }
 
     #[test]

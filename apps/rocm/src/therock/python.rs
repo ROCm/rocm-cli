@@ -115,6 +115,52 @@ fn current_platform_wheel_tags() -> Result<Vec<String>> {
     Ok(vec![platform_tag.to_owned(), "any".to_owned()])
 }
 
+/// [`ensure_uv_venv`], marking `install_root` as ROCm CLI's own when this
+/// call is what created it. An SDK `--prefix` becomes the data folder
+/// `rocm uninstall` later judges; a folder that already existed is not
+/// marked, since ROCm CLI did not make it.
+///
+/// The folder is created here, by [`rocm_core::create_marked_root`], before
+/// `uv venv` runs: its `create_dir` fails when anything is already there, so
+/// a folder someone else makes at any moment before is never marked. `uv venv`
+/// then fills the folder, which holds only the marker
+/// ([`ensure_uv_venv`] passes `--allow-existing` for exactly that case).
+pub(super) fn ensure_marked_uv_venv(
+    paths: &AppPaths,
+    uv: &Path,
+    python_launcher: &Path,
+    install_root: &Path,
+) -> Result<()> {
+    let marker = install_root.join(rocm_core::ROCM_CLI_ROOT_MARKER);
+    // Decided BEFORE `ensure_uv_venv`, which may remove and recreate the
+    // folder (an incompatible venv is rebuilt) and so lose the marker: a
+    // folder ROCm CLI had already marked is marked again.
+    let was_marked = marker.is_file();
+    if !install_root.exists() {
+        rocm_core::create_marked_root(install_root)?;
+    }
+    let ours = was_marked || marker.is_file();
+    ensure_uv_venv(paths, uv, python_launcher, install_root)?;
+    if ours && !marker.is_file() {
+        rocm_core::mark_root(install_root);
+    }
+    Ok(())
+}
+
+/// Whether `install_root` holds ROCm CLI's marker and nothing else: the state
+/// [`ensure_marked_uv_venv`] leaves a folder in before `uv venv` fills it. Any
+/// other existing folder is still refused by `uv venv` itself, so a venv is
+/// never written over files that were already there.
+fn holds_only_the_marker(install_root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(install_root) else {
+        return false;
+    };
+    let names: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect();
+    names.len() == 1 && names[0] == rocm_core::ROCM_CLI_ROOT_MARKER
+}
+
 pub(super) fn ensure_uv_venv(
     paths: &AppPaths,
     uv: &Path,
@@ -150,7 +196,10 @@ pub(super) fn ensure_uv_venv(
             )
         })?;
     }
-    let args = uv_venv_args(python_launcher, install_root);
+    let mut args = uv_venv_args(python_launcher, install_root);
+    if holds_only_the_marker(install_root) {
+        args.push("--allow-existing".to_owned());
+    }
     run_command_with_env(
         uv,
         args.iter()
@@ -215,7 +264,14 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
 /// `config.json` for the managed-Python step, failing with what was left
 /// alone and how to recover (the advice comes from [`RocmCliConfig::load`]).
 fn load_config_for_managed_python(paths: &AppPaths) -> Result<RocmCliConfig> {
-    RocmCliConfig::load(paths).with_context(|| {
+    managed_python_config_context(RocmCliConfig::load(paths), paths)
+}
+
+fn managed_python_config_context(
+    loaded: Result<RocmCliConfig>,
+    paths: &AppPaths,
+) -> Result<RocmCliConfig> {
+    loaded.with_context(|| {
         format!(
             "cannot record the managed Python in {} because that file cannot be read; it was \
              left unchanged",
@@ -234,8 +290,13 @@ fn load_config_for_managed_python(paths: &AppPaths) -> Result<RocmCliConfig> {
 /// new runtime loads it strictly). `ensure_managed_python` checks the file
 /// before it downloads anything, so this only fails there when the file
 /// changed meanwhile.
+///
+/// The file is loaded again here, under the config lock, rather than reusing
+/// the copy checked before the download: saving that copy would undo whatever
+/// another command saved while uv and Python were fetched.
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
-    let mut config = load_config_for_managed_python(paths)?;
+    let lock = RocmCliConfig::lock(paths)?;
+    let mut config = managed_python_config_context(lock.load(), paths)?;
     config.tools.insert(
         "python".to_owned(),
         ManagedToolConfig {
@@ -243,7 +304,7 @@ fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
             managed: true,
         },
     );
-    config.save(paths)
+    lock.save(&config)
 }
 
 fn managed_python_bootstrap_disabled() -> bool {
@@ -275,11 +336,12 @@ pub(super) struct PythonRequirement {
 /// Keyed on the layout rather than on a resolved ROCm version because the
 /// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
 /// wheels using the interpreter's own tags, so the resolved version is not
-/// available yet. The layout is an honest stand-in only when it was decided
-/// from an explicit stable pin (`next_layout_requested`); a fresh install with
-/// no pin, or a nightly build-date/prerelease pin, needs
-/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
-/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+/// available yet. For a request routed to the next layout (`layout_serving`:
+/// no pin, a stable ROCm 10+ pin, or a nightly built since the next layout began)
+/// the layout is an honest stand-in. A pin routed to the canonical stream can
+/// still resolve a ROCm 10+ build there (the earlier nightly stream carries ROCm
+/// 10 alphas), so [`canonical_auto_select_needs_next_python`] checks that feed's
+/// own listing for a build at or past [`THEROCK_NEXT_MIN_MAJOR`].
 ///
 /// [`canonical_auto_select_needs_next_python`]: super::canonical_auto_select_needs_next_python
 /// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR
@@ -1179,6 +1241,15 @@ echo Python 3.12.10
         let script = format!(
             r#"#!/bin/sh
 if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
+  # Like `uv venv`: an existing folder is refused unless --allow-existing.
+  if [ -e "$4" ] && [ "$5" != "--allow-existing" ]; then
+    echo "A directory already exists at: $4" >&2
+    exit 2
+  fi
+  # Records whether ROCm CLI's marker was already in place when it ran.
+  if [ -f "$4/.rocm-cli-root" ]; then
+    /bin/mkdir -p "$4" && : > "$4/.marked-before-uv"
+  fi
   /bin/mkdir -p "$4/bin"
   /bin/cat > "$4/bin/python" <<PY
 #!/bin/sh
@@ -2851,9 +2922,11 @@ exit 1
     }
 
     /// A config.json that reads fine but cannot be saved: its folder is made
-    /// read-only, so the save cannot create its temp file. Both paths must
-    /// report that the interpreter was not recorded, rather than finish as if
-    /// it had been. Skipped where the folder stays writable (running as root).
+    /// read-only, so the save cannot create its temp file. The config lock file
+    /// is created first, so the lock still opens and it is the save that fails,
+    /// not the lock. Both paths must report that the interpreter was not
+    /// recorded, rather than finish as if it had been. Skipped where the folder
+    /// stays writable (running as root).
     #[cfg(unix)]
     #[test]
     fn ensure_managed_python_fails_when_the_record_cannot_be_saved() -> Result<()> {
@@ -2886,6 +2959,7 @@ exit 1
             }
             plant_fake_uv(&paths, &python, &root.join("uv.log"))?;
             RocmCliConfig::default().save(&paths)?;
+            drop(RocmCliConfig::lock(&paths)?);
             fs::set_permissions(&paths.config_dir, fs::Permissions::from_mode(0o555))?;
             let probe = paths.config_dir.join("probe");
             if fs::write(&probe, b"").is_ok() {
@@ -2903,11 +2977,103 @@ exit 1
             let Err(error) = result else {
                 panic!("reuse={reuse}: an unsaved record must fail the step");
             };
+            let message = format!("{error:#}");
             assert!(
-                format!("{error:#}").contains("config.json"),
-                "reuse={reuse}: {error:#}"
+                message.contains(&format!(
+                    "failed to write {}",
+                    paths.config_path().display()
+                )) && !message.contains("lock file"),
+                "reuse={reuse}: the save, not the lock, must be what failed: {message}"
             );
         }
         Ok(())
+    }
+
+    /// The SDK folder an install creates is marked as ROCm CLI's own, and the
+    /// marker is already in place when `uv venv` runs, so there is no moment
+    /// in which a folder someone else made could be taken for ROCm CLI's. A
+    /// folder that was already there is not marked: a stale venv being
+    /// rebuilt, or an empty folder made just before, which `uv venv` refuses
+    /// as it always has.
+    #[test]
+    #[cfg(unix)]
+    fn a_created_install_root_is_marked_and_an_existing_one_is_not() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-marked-venv-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let python_launcher =
+            write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
+        let uv = write_fake_uv_creating_venv(&root, "uv", "cp314", "Python 3.14.5").unwrap();
+
+        let fresh = root.join("prefix");
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &fresh).unwrap();
+        let fresh_marked_before_uv = fresh.join(".marked-before-uv").is_file();
+        let someone_elses = root.join("someone-elses");
+        fs::create_dir_all(&someone_elses).unwrap();
+        let someone_elses_result =
+            ensure_marked_uv_venv(&paths, &uv, &python_launcher, &someone_elses);
+        let someone_elses_marked = someone_elses.join(rocm_core::ROCM_CLI_ROOT_MARKER).exists();
+        let someone_elses_filled = venv_python_path(&someone_elses).exists();
+        let existing = root.join("existing");
+        fs::create_dir_all(existing.join("bin")).unwrap();
+        write_fake_python_reporting(&existing.join("bin"), "python", "cp312", "Python 3.12.10")
+            .unwrap();
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &existing).unwrap();
+
+        // A stale venv ROCm CLI had already marked is rebuilt (removed and
+        // recreated) and must keep its marker.
+        let rebuilt = root.join("rebuilt");
+        fs::create_dir_all(rebuilt.join("bin")).unwrap();
+        write_fake_python_reporting(&rebuilt.join("bin"), "python", "cp312", "Python 3.12.10")
+            .unwrap();
+        fs::write(rebuilt.join(rocm_core::ROCM_CLI_ROOT_MARKER), b"").unwrap();
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &rebuilt).unwrap();
+        let rebuilt_python = wheel_compatibility_for_python(&venv_python_path(&rebuilt))
+            .map(|compat| compat.python_tag);
+
+        let fresh_marked = fresh.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        let existing_marked = existing.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        let rebuilt_marked = rebuilt.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        fs::remove_dir_all(root).ok();
+        assert!(
+            fresh_marked,
+            "the install folder this install created is not marked"
+        );
+        assert!(
+            fresh_marked_before_uv,
+            "the marker was not in place when `uv venv` ran"
+        );
+        assert!(!existing_marked, "a folder that already existed was marked");
+        assert!(
+            someone_elses_result.is_err(),
+            "`uv venv` was let into a folder ROCm CLI did not make"
+        );
+        assert!(
+            !someone_elses_marked,
+            "a folder made by someone else was marked"
+        );
+        assert!(
+            !someone_elses_filled,
+            "a venv was written into someone else's folder"
+        );
+        assert_eq!(
+            rebuilt_python.ok().as_deref(),
+            Some("cp314"),
+            "the stale venv was not rebuilt, so this case proves nothing"
+        );
+        assert!(
+            rebuilt_marked,
+            "rebuilding a marked venv dropped its marker"
+        );
     }
 }

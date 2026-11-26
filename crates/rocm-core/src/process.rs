@@ -33,15 +33,37 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessW, DETACHED_PROCESS, GetExitCodeProcess, INFINITE, OpenProcess,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CreateProcessW, DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
     WaitForSingleObject,
 };
 
 mod bounded;
 pub use bounded::run_with_timeout;
 pub(crate) use bounded::{MAX_QUOTED_OUTPUT_CHARS, run_bounded};
+
+/// Outcome of a detached Windows spawn that was briefly watched for an early exit.
+///
+/// The observation runs while the process handle returned by `CreateProcessW` is
+/// still open, so a reported exit code is always the exit code of the process that
+/// was just spawned. Re-opening the process by PID after the fact could not offer
+/// that guarantee — Windows recycles PIDs, so by then the PID may name an
+/// unrelated process.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetachedSpawn {
+    /// PID of the spawned process.
+    pub pid: u32,
+    /// `Some(code)` if the process exited at any point within the observation
+    /// window — known as soon as it exits, since the wait returns then rather
+    /// than at the end of the window — and `None` if it was still running when
+    /// the window ran out. `None` is also reported if the wait failed or the
+    /// exit code could not be read, which degrades to the unwatched behaviour
+    /// rather than inventing a failure.
+    pub early_exit_code: Option<u32>,
+}
 
 #[cfg(windows)]
 pub fn spawn_detached_no_inherit(
@@ -56,6 +78,38 @@ pub fn spawn_detached_no_inherit(
         DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
         false,
         None,
+        None,
+    )
+    .map(|spawn| spawn.pid)
+}
+
+/// As [`spawn_detached_no_inherit`], but watches the new process for up to
+/// `settle` before returning, so the caller can tell "started" apart from
+/// "started and died immediately".
+///
+/// Creation flags and handle inheritance are identical to
+/// [`spawn_detached_no_inherit`]: the child stays fully detached and outlives this
+/// process. The wait is bounded and delays the caller by at most `settle` — less
+/// when the child exits sooner; it is not a join.
+///
+/// This exists because the detached spawn primitives hand back a bare PID rather
+/// than a `std::process::Child`, so a caller has no equivalent of `try_wait()` to
+/// notice a child that failed during startup.
+#[cfg(windows)]
+pub fn spawn_detached_no_inherit_watching_startup(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    settle: Duration,
+) -> Result<DetachedSpawn> {
+    spawn_windows_no_inherit(
+        program,
+        args,
+        env_overrides,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        false,
+        None,
+        Some(settle),
     )
 }
 
@@ -72,17 +126,77 @@ pub fn spawn_hidden_console_no_inherit(
         CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
         true,
         None,
+        None,
+    )
+    .map(|spawn| spawn.pid)
+}
+
+/// Detached background spawn whose stdout/stderr land in `log_path`.
+///
+/// The managed-engine spawn (ROCMAI-541). Identical in creation flags to
+/// [`spawn_detached_no_inherit`] — no console, own process group, outlives this
+/// process — and differs only in attaching the child's output to the service
+/// log, which is what [`spawn_detached_no_inherit`] loses. Deliberately NOT
+/// [`spawn_hidden_console_with_log`]: that one creates a console
+/// (`CREATE_NEW_CONSOLE`) and so pays for a `conhost` per engine, which a
+/// detached background service has no use for.
+///
+/// Handing `CreateProcessW` std handles forces `bInheritHandles`, which would
+/// otherwise give the child every inheritable handle this process holds. The
+/// two log handles are confined to themselves with an explicit
+/// [`InheritedHandleList`]; a detached engine that outlives `rocm serve` must
+/// not keep its caller's pipes open.
+#[cfg(windows)]
+pub fn spawn_detached_with_log_watching_startup(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    log_path: &Path,
+    settle: Duration,
+) -> Result<DetachedSpawn> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        false,
+        log_path,
+        Some(settle),
     )
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
 pub fn spawn_hidden_console_with_log(
     program: &Path,
     args: &[String],
     env_overrides: &[(&str, &Path)],
     log_path: &Path,
 ) -> Result<u32> {
+    spawn_windows_with_log(
+        program,
+        args,
+        env_overrides,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+        true,
+        log_path,
+        None,
+    )
+    .map(|spawn| spawn.pid)
+}
+
+/// Duplicate `log_path` into inheritable stdout/stderr handles and spawn with
+/// them, closing this process's copies whether or not the spawn succeeded.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn spawn_windows_with_log(
+    program: &Path,
+    args: &[String],
+    env_overrides: &[(&str, &Path)],
+    creation_flags: u32,
+    hide_window: bool,
+    log_path: &Path,
+    settle: Option<Duration>,
+) -> Result<DetachedSpawn> {
     use std::os::windows::io::AsRawHandle;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{
@@ -138,9 +252,10 @@ pub fn spawn_hidden_console_with_log(
         program,
         args,
         env_overrides,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        true,
+        creation_flags,
+        hide_window,
         Some((stdout_handle, stderr_handle)),
+        settle,
     );
     unsafe {
         CloseHandle(stdout_handle);
@@ -182,6 +297,12 @@ pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
     }
 }
 
+/// Request termination of `pid`: `SIGTERM` on Unix, `TerminateProcess` on Windows.
+///
+/// It neither waits for the process to exit nor escalates, so on Unix a process
+/// that ignores `SIGTERM` keeps running, and a `wait` on it afterwards can block
+/// forever. To stop a process and know it is gone, use
+/// [`crate::terminate_verified`].
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 pub fn terminate_process(pid: u32) -> Result<()> {
@@ -207,6 +328,12 @@ pub fn terminate_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Request termination of `pid`: `SIGTERM` on Unix, `TerminateProcess` on Windows.
+///
+/// It neither waits for the process to exit nor escalates, so on Unix a process
+/// that ignores `SIGTERM` keeps running, and a `wait` on it afterwards can block
+/// forever. To stop a process and know it is gone, use
+/// [`crate::terminate_verified`].
 #[cfg(not(windows))]
 #[allow(unsafe_code)] // libc FFI
 pub fn terminate_process(pid: u32) -> Result<()> {
@@ -226,6 +353,11 @@ pub fn terminate_process(pid: u32) -> Result<()> {
 /// launcher PID leaves those workers reparented to init, where they keep the
 /// model resident and the device memory pinned. Walking the descendant tree and
 /// signalling each process avoids that leak.
+///
+/// Like [`terminate_process`], this only sends the request: it does not wait
+/// for the processes to exit and does not escalate to `SIGKILL`. Use
+/// [`crate::terminate_verified`] with [`crate::KillScope::Tree`] to stop a tree
+/// and know it is gone.
 #[cfg(not(windows))]
 #[allow(unsafe_code)] // libc FFI
 pub fn terminate_process_tree(pid: u32) -> Result<()> {
@@ -348,7 +480,8 @@ fn read_parent_pid(pid: u32) -> Option<u32> {
 /// Terminate `pid` together with every transitive child process.
 ///
 /// The Windows implementation falls back to terminating the single process; the
-/// engines that rely on descendant cleanup are Unix-only.
+/// engines that rely on descendant cleanup are Unix-only. It does not wait for
+/// the process to exit; see [`crate::terminate_verified`].
 #[cfg(windows)]
 pub fn terminate_process_tree(pid: u32) -> Result<()> {
     terminate_process(pid)
@@ -654,11 +787,30 @@ impl FileLock {
     /// Fails when the lock file cannot be created/locked, or when another
     /// holder keeps it for the whole timeout.
     pub fn acquire_bounded(path: impl Into<PathBuf>, timeout: Duration) -> Result<Self> {
+        let path = path.into();
+        match Self::try_acquire_within(&path, timeout)? {
+            Some(lock) => Ok(lock),
+            None => bail!(
+                "timed out after {timeout:?} waiting for the lock at {path}; another \
+                 `rocm serve` launch or `rocmd` recovery is mid-transaction. Retry in a \
+                 moment, and check `rocm services` for a stuck launch.",
+                path = path.display()
+            ),
+        }
+    }
+
+    /// Like [`Self::acquire_bounded`], but `Ok(None)` once `timeout` has
+    /// elapsed with another holder still in place, so the caller words the
+    /// timeout for its own lock.
+    ///
+    /// # Errors
+    /// Fails when the lock file cannot be created or locked.
+    pub fn try_acquire_within(path: impl Into<PathBuf>, timeout: Duration) -> Result<Option<Self>> {
         let (file, path) = Self::open(path.into())?;
         let deadline = Instant::now() + timeout;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Self { file, path }),
+                Ok(()) => return Ok(Some(Self { file, path })),
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(error)) => {
                     return Err(anyhow::Error::new(error)
@@ -667,19 +819,15 @@ impl FileLock {
             }
             let now = Instant::now();
             if now >= deadline {
-                bail!(
-                    "timed out after {timeout:?} waiting for the lock at {path}; another \
-                     `rocm serve` launch or `rocmd` recovery is mid-transaction. Retry in a \
-                     moment, and check `rocm services` for a stuck launch.",
-                    path = path.display()
-                );
+                return Ok(None);
             }
             thread::sleep(FILE_LOCK_BOUNDED_POLL.min(deadline - now));
         }
     }
 }
 
-/// Polling interval used while waiting on [`FileLock::acquire_bounded`].
+/// Polling interval used while waiting on [`FileLock::acquire_bounded`] and
+/// [`FileLock::try_acquire_within`].
 const FILE_LOCK_BOUNDED_POLL: Duration = Duration::from_millis(25);
 
 /// Total time `rocmd`'s automatic recovery waits for the launch lock.
@@ -879,7 +1027,8 @@ fn spawn_windows_no_inherit(
         windows_sys::Win32::Foundation::HANDLE,
         windows_sys::Win32::Foundation::HANDLE,
     )>,
-) -> Result<u32> {
+    settle: Option<Duration>,
+) -> Result<DetachedSpawn> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::CloseHandle;
 
@@ -901,6 +1050,29 @@ fn spawn_windows_no_inherit(
         startup_info.hStdOutput = stdout_handle;
         startup_info.hStdError = stderr_handle;
     }
+    // `bInheritHandles` is all-or-nothing, so the two log handles cannot be
+    // passed without an explicit list naming them: the child would otherwise
+    // inherit every inheritable handle this process holds. See
+    // `InheritedHandleList`.
+    let mut inherited = std_handles
+        .map(|handles| InheritedHandleList::for_handles(&<[_; 2]>::from(handles)))
+        .transpose()?;
+    let mut startup_info_ex = STARTUPINFOEXW {
+        StartupInfo: startup_info,
+        lpAttributeList: inherited
+            .as_mut()
+            .map_or_else(null_mut, InheritedHandleList::as_ptr),
+    };
+    startup_info_ex.StartupInfo.cb = if inherited.is_some() {
+        std::mem::size_of::<STARTUPINFOEXW>() as u32
+    } else {
+        std::mem::size_of::<STARTUPINFOW>() as u32
+    };
+    let creation_flags = if inherited.is_some() {
+        creation_flags | EXTENDED_STARTUPINFO_PRESENT
+    } else {
+        creation_flags
+    };
     let mut process_info = PROCESS_INFORMATION::default();
     let created = unsafe {
         CreateProcessW(
@@ -912,10 +1084,11 @@ fn spawn_windows_no_inherit(
             creation_flags,
             environment.as_mut_ptr().cast(),
             null(),
-            &raw const startup_info,
+            (&raw const startup_info_ex).cast::<STARTUPINFOW>(),
             &raw mut process_info,
         )
     };
+    drop(inherited);
     if created == 0 {
         bail!(
             "failed to launch detached process {}: {}",
@@ -923,11 +1096,163 @@ fn spawn_windows_no_inherit(
             std::io::Error::last_os_error()
         );
     }
+    // Observe the child *before* the handle is closed. Waiting on this handle is
+    // race-free; re-opening the process later by PID would not be, since Windows
+    // recycles PIDs and the PID could by then belong to something else.
+    let early_exit_code =
+        settle.and_then(|settle| unsafe { observe_early_exit(process_info.hProcess, settle) });
     unsafe {
         CloseHandle(process_info.hThread);
         CloseHandle(process_info.hProcess);
     }
-    Ok(process_info.dwProcessId)
+    Ok(DetachedSpawn {
+        pid: process_info.dwProcessId,
+        early_exit_code,
+    })
+}
+
+/// The `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that confines a spawn's inheritance
+/// to the handles it was actually given.
+///
+/// `CreateProcessW` takes one `bInheritHandles` flag for the whole process, so
+/// handing it std handles otherwise lets the child inherit *every* inheritable
+/// handle this process holds. For a detached child that outlives us that is not
+/// merely untidy: `rocm serve` is itself usually spawned with its stdout on a
+/// pipe, and that handle arrives here inheritable, so the engine would hold the
+/// write end open after `rocm serve` returned and whoever was reading that pipe
+/// would never see EOF. ROCMAI-541's Windows e2e lane hung for the full 45-minute
+/// job timeout on exactly that, in `serve-02`.
+///
+/// The list must outlive the `CreateProcessW` call and is freed on drop. Every
+/// handle in it must be inheritable and distinct; the two the caller passes are
+/// separate `DuplicateHandle` results, so they are.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+struct InheritedHandleList {
+    buffer: Vec<u8>,
+    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+impl InheritedHandleList {
+    fn for_handles(handles: &[windows_sys::Win32::Foundation::HANDLE]) -> Result<Self> {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+        };
+
+        let mut size: usize = 0;
+        // The sizing call is *expected* to fail with ERROR_INSUFFICIENT_BUFFER;
+        // `size` is the output that matters.
+        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &raw mut size) };
+        if size == 0 {
+            bail!(
+                "failed to size the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Held as a plain buffer until the initialize call succeeds, so the
+        // `Drop` that calls `DeleteProcThreadAttributeList` only ever exists
+        // for a list that really was initialized.
+        let mut buffer = vec![0u8; size];
+        let attributes = buffer.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &raw mut size) } == 0 {
+            bail!(
+                "failed to initialize the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut list = Self {
+            buffer,
+            handles: handles.to_vec(),
+        };
+        let handle_bytes = std::mem::size_of_val(list.handles.as_slice());
+        let handle_ptr = list.handles.as_ptr().cast();
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handle_ptr,
+                handle_bytes,
+                null_mut(),
+                null(),
+            )
+        } == 0
+        {
+            // `list`'s own drop frees what was just initialized.
+            bail!(
+                "failed to set the inherited-handle list: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(list)
+    }
+
+    const fn as_ptr(
+        &mut self,
+    ) -> windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.buffer.as_mut_ptr().cast()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+impl Drop for InheritedHandleList {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList;
+
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+    }
+}
+
+/// Wait up to `settle` for `process` to exit, reporting its exit code if it did.
+///
+/// Returns `None` both when the process is still running and when the wait or
+/// the exit-code read failed, so a failed query degrades to "assume it is alive"
+/// rather than reporting a startup failure that may not have happened
+/// (`observe_early_exit_reads_a_failed_wait_or_query_as_still_running` drives
+/// both failures).
+///
+/// # Safety
+///
+/// `process` must not be closed for the duration of the call, and this function
+/// does not close it. Any other value is memory-safe: a handle that is not
+/// waitable fails the wait, and a process handle without a query right fails
+/// the exit-code read, both of which return `None`. The only caller passes the
+/// `hProcess` that `CreateProcessW` just returned, which carries full access
+/// (`PROCESS_ALL_ACCESS`), so the rights the two calls need are always present:
+/// `SYNCHRONIZE` for `WaitForSingleObject`, and `PROCESS_QUERY_LIMITED_INFORMATION`
+/// (or the broader `PROCESS_QUERY_INFORMATION`) for `GetExitCodeProcess`.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+unsafe fn observe_early_exit(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    settle: Duration,
+) -> Option<u32> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+
+    if unsafe { WaitForSingleObject(process, wait_timeout_millis(settle)) } != WAIT_OBJECT_0 {
+        return None;
+    }
+    let mut exit_code: u32 = 0;
+    if unsafe { GetExitCodeProcess(process, &raw mut exit_code) } == 0 {
+        return None;
+    }
+    Some(exit_code)
+}
+
+/// Clamp a wait budget to the `u32` milliseconds `WaitForSingleObject` takes,
+/// never yielding `INFINITE`.
+///
+/// `INFINITE` is `u32::MAX`, so a saturating conversion of a long duration would
+/// silently turn a bounded startup check into one that blocks until the child
+/// exits. Cap one millisecond below it instead.
+#[cfg(any(windows, test))]
+fn wait_timeout_millis(budget: Duration) -> u32 {
+    const LONGEST_FINITE_WAIT_MS: u128 = (u32::MAX - 1) as u128;
+    budget.as_millis().min(LONGEST_FINITE_WAIT_MS) as u32
 }
 
 #[cfg(windows)]
@@ -1013,6 +1338,81 @@ mod tree_properties;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROCMAI-541, and the only check that runs on the platform the bug was
+    /// reported on: a detached child's stdout AND stderr must both reach the
+    /// log file the caller named.
+    ///
+    /// `spawn_detached_no_inherit` attaches neither, which is what lost a
+    /// failing `__engine-serve-http`'s reason on Windows. Nothing else in the
+    /// suite covers that: the liveness test is Unix-only, and the
+    /// scripted-engine e2e scenarios run on the Linux no-GPU lane, where the
+    /// Unix `attach_background_stdio` branch does the attaching and this code
+    /// never executes.
+    ///
+    /// stderr matters more than stdout here — an engine's final error chain is
+    /// printed there — so both streams are asserted, not just the easy one.
+    #[cfg(windows)]
+    #[test]
+    fn a_detached_child_writes_both_streams_into_the_log() {
+        const OUT_MARKER: &str = "rocmai541-stdout-reached-the-log";
+        const ERR_MARKER: &str = "rocmai541-stderr-reached-the-log";
+
+        // Plain pid, no thread id: `ThreadId`'s Debug form is `ThreadId(2)`, and
+        // `quote_windows_arg` only quotes an argument containing whitespace or a
+        // quote — so a path carrying cmd's own metacharacters reaches it bare and
+        // `(` ends the token early. Only this test uses this name, so the pid
+        // alone keeps it unique.
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-detached-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the fixture dir");
+
+        // A .bat rather than `cmd /c "echo a & echo b 1>&2"`: `CreateProcessW`
+        // cannot run a .bat directly, but handing cmd a single path argument
+        // sidesteps cmd's quoting rules entirely, which an inline compound
+        // command would otherwise have to survive.
+        let script = dir.join("emit.bat");
+        fs::write(
+            &script,
+            format!("@echo off\r\necho {OUT_MARKER}\r\necho {ERR_MARKER} 1>&2\r\n"),
+        )
+        .expect("write the fixture script");
+        let log_path = dir.join("service.log");
+
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        // Zero settle: this test is about the log attachment, not the startup
+        // watch, and a child that is meant to exit immediately must not be
+        // reported as having died inside the window.
+        let pid = spawn_detached_with_log_watching_startup(
+            Path::new(&comspec),
+            &["/c".to_owned(), script.to_string_lossy().into_owned()],
+            &[],
+            &log_path,
+            std::time::Duration::from_millis(0),
+        )
+        .expect("spawn the detached child")
+        .pid;
+
+        let exit_code = wait_for_process_exit(pid).expect("wait for the detached child");
+        let log = fs::read(&log_path).map_or_else(
+            |error| panic!("failed to read {}: {error}", log_path.display()),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(exit_code, 0, "fixture child failed; log was:\n{log}");
+        assert!(
+            log.contains(OUT_MARKER),
+            "the child's stdout never reached the log:\n{log}"
+        );
+        assert!(
+            log.contains(ERR_MARKER),
+            "the child's stderr never reached the log, which is the half that \
+             carries an engine's error chain:\n{log}"
+        );
+    }
     use crate::test_support::workspace_test_artifact_dir;
     use std::process::Stdio;
 
@@ -1279,6 +1679,121 @@ mod tests {
             status.success(),
             "a separate process must bind the port immediately after the lease is released"
         );
+    }
+
+    #[test]
+    fn wait_timeout_millis_keeps_the_startup_wait_bounded() {
+        assert_eq!(wait_timeout_millis(Duration::from_millis(200)), 200);
+        assert_eq!(wait_timeout_millis(Duration::ZERO), 0);
+        // Sub-millisecond budgets truncate to a poll rather than rounding up.
+        assert_eq!(wait_timeout_millis(Duration::from_micros(900)), 0);
+        // A budget past the `u32` millisecond range must never land on
+        // `INFINITE` (`u32::MAX`), which would block until the child exits.
+        let huge = wait_timeout_millis(Duration::from_secs(u64::from(u32::MAX)));
+        assert_eq!(huge, u32::MAX - 1);
+        assert_ne!(huge, u32::MAX);
+    }
+
+    /// Watching a detached spawn must surface a child that died during startup.
+    /// Only meaningful on Windows: the detached spawn primitives return a bare
+    /// PID there, so this wait is the only chance to notice the exit.
+    ///
+    /// It also pins what `DetachedSpawn::early_exit_code` documents: the exit is
+    /// reported when it happens, not when the window runs out. The window is far
+    /// longer than `cmd /C exit` takes, so a wait that sat it out fails the
+    /// elapsed-time check rather than passing slowly.
+    #[cfg(windows)]
+    #[test]
+    fn watched_detached_spawn_reports_a_child_that_exits_immediately() {
+        let window = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        // Each token is a separate argument so the assembled command line needs no
+        // quoting, keeping `cmd.exe`'s quote-stripping rules out of the test.
+        let spawn = spawn_detached_no_inherit_watching_startup(
+            &test_system32_tool("cmd.exe"),
+            &["/C".to_owned(), "exit".to_owned(), "7".to_owned()],
+            &[],
+            window,
+        )
+        .expect("spawn should succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(spawn.early_exit_code, Some(7));
+        assert_ne!(spawn.pid, 0);
+        assert!(
+            elapsed < window / 2,
+            "the exit must be reported as soon as the child exits, not at the end of \
+             the {window:?} window (took {elapsed:?})"
+        );
+    }
+
+    /// The converse: a child that is still running must not be reported as a
+    /// startup failure, or every successful launch would be rejected.
+    #[cfg(windows)]
+    #[test]
+    fn watched_detached_spawn_does_not_report_a_child_that_keeps_running() {
+        // `ping` against localhost is the dependency-free Windows sleep, and ~9s
+        // outlasts the 200 ms observation window by well over an order of
+        // magnitude. Spawned directly rather than through `cmd /C` so the
+        // returned PID is the process the test has to clean up: on Windows
+        // `terminate_process_tree` is plain `terminate_process`, so an
+        // intermediate shell would leave `ping` orphaned.
+        let spawn = spawn_detached_no_inherit_watching_startup(
+            &test_system32_tool("ping.exe"),
+            &["-n".to_owned(), "10".to_owned(), "127.0.0.1".to_owned()],
+            &[],
+            Duration::from_millis(200),
+        )
+        .expect("spawn should succeed");
+        // Clean up before asserting, so a failing assertion cannot leak the child.
+        let early_exit_code = spawn.early_exit_code;
+        let was_running = process_is_running(spawn.pid);
+        let _ = terminate_process(spawn.pid);
+        assert_eq!(early_exit_code, None);
+        assert!(was_running);
+    }
+
+    /// The third outcome: a wait or exit-code read that fails is reported as
+    /// "still running" (`None`), never as an exit. Neither failure can be forced
+    /// on the full-access handle `CreateProcessW` returns, so each is driven with
+    /// a handle that makes that one call fail.
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)] // Win32 FFI: drives `observe_early_exit` with handles it must survive
+    fn observe_early_exit_reads_a_failed_wait_or_query_as_still_running() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+        // The wait fails: a null handle is not a waitable object, so
+        // `WaitForSingleObject` returns `WAIT_FAILED`.
+        let wait_failed =
+            unsafe { observe_early_exit(std::ptr::null_mut(), Duration::from_millis(50)) };
+        assert_eq!(wait_failed, None);
+
+        // The read fails: a process that has exited, opened with `SYNCHRONIZE`
+        // only. The wait sees it signalled, and `GetExitCodeProcess`, which
+        // needs a query right, is denied. `exited` is kept until the end so
+        // its own handle keeps the process object, and so its pid, alive.
+        let mut exited = std::process::Command::new(test_system32_tool("cmd.exe"))
+            .args(["/C", "exit", "7"])
+            .spawn()
+            .expect("spawn should succeed");
+        exited.wait().expect("the child exits");
+        let synchronize_only = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, exited.id()) };
+        assert!(!synchronize_only.is_null(), "OpenProcess failed");
+        let query_failed =
+            unsafe { observe_early_exit(synchronize_only, Duration::from_millis(50)) };
+        unsafe { CloseHandle(synchronize_only) };
+        drop(exited);
+        assert_eq!(query_failed, None);
+    }
+
+    /// `CreateProcessW` is called with an explicit application name, so it does
+    /// no `PATH` search — the program has to be a full path.
+    #[cfg(windows)]
+    fn test_system32_tool(exe: &str) -> PathBuf {
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+            .join("System32")
+            .join(exe)
     }
 
     #[test]

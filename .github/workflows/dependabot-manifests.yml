@@ -83,9 +83,12 @@ jobs:
           path: ~/.cargo/bin/cargo-about
           key: ${{ runner.os }}-ubuntu-24.04-cargo-about-0.9.1
 
+      # `--force` for the reason ci.yml's third-party-notices job gives at its
+      # own Install cargo-about step: rust-cache can leave a cargo-about in
+      # ~/.cargo/bin when the `Cache cargo-about` key misses.
       - name: Install cargo-about
         if: steps.cache-cargo-about.outputs.cache-hit != 'true'
-        run: cargo install cargo-about@0.9.1 --locked --features cli
+        run: cargo install cargo-about@0.9.1 --locked --features cli --force
 
       - name: Regenerate
         id: regen

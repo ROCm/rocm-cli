@@ -62,7 +62,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 shlex = "2"
 # xtask's module-size check parses each source file with it. `printing` is what
 # `Spanned` needs.
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "printing"] }
 # `linux-tmpfs` makes tmpfs mounts visible to the free-space preflight, so a
 # cache or install root under a tmpfs `/tmp` (the Fedora and Arch default)
 # reports its real size instead of being invisible. `linux-netdevs` is
@@ -88,6 +88,16 @@ unsafe_code = "deny"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+
+# Restriction lints, opted in individually (the group as a whole is not meant
+# to be enabled). A panic in production code turns a recoverable condition into
+# a crash; tests may still unwrap and expect (see clippy.toml). Compiled-in data,
+# or a value whose type cannot fail, with no error path to return through keeps
+# `#[expect(clippy::expect_used, reason = ..)]` naming the test that exercises it;
+# everything else returns an error or takes a fallback. See docs/testing.md.
+unwrap_used = "warn"
+expect_used = "warn"
+# `shadow_unrelated` is deliberately not enabled: it needs its own decision.
 
 # Documented allow-list: high-noise / low-value lints whose findings would force
 # large, mechanical, or risky churn for little benefit on this codebase. Each is

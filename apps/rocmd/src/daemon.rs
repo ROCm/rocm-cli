@@ -209,7 +209,13 @@ pub(crate) async fn run_daemon_with(
             // the tick arm: while another process holds the lock (up to
             // `hooks.lock_wait`) the webhook and shutdown arms below stay
             // pollable. It is polled with try-lock, so no thread is parked either.
-            attempt = async { exit_attempt.as_mut().expect("guarded by the arm condition").await }, if exit_attempt.is_some() => {
+            attempt = async {
+                match exit_attempt.as_mut() {
+                    Some(wait) => wait.await,
+                    // Unreachable: the arm condition admits only `Some`.
+                    None => std::future::pending().await,
+                }
+            }, if exit_attempt.is_some() => {
                 exit_attempt = None;
                 // `None`: the lock stayed held for the whole bounded wait. Stay
                 // up; the next tick decides again.
@@ -444,11 +450,39 @@ fn build_runtime_state(
 
 #[cfg(unix)]
 async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    shutdown_on(
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+        &mut io::stderr(),
+    )
+    .await;
+}
+
+/// Resolves on `ctrl_c`, or on SIGTERM when `term` registered a handler for it.
+/// A failed registration is reported on `err` and leaves Ctrl+C as the only way
+/// to stop, rather than taking the daemon down.
+#[cfg(unix)]
+async fn shutdown_on(
+    term: io::Result<tokio::signal::unix::Signal>,
+    ctrl_c: impl Future<Output = ()>,
+    err: &mut impl Write,
+) {
+    match term {
+        Ok(mut term) => {
+            tokio::select! {
+                () = ctrl_c => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "could not register a SIGTERM handler, stopping on Ctrl+C only: {error}"
+            );
+            ctrl_c.await;
+        }
     }
 }
 
@@ -462,6 +496,65 @@ mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
     use std::thread;
+
+    /// A SIGTERM handler that cannot be registered is reported, and the daemon
+    /// still stops on Ctrl+C instead of panicking or never stopping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_sigterm_registration_warns_and_still_stops_on_ctrl_c() {
+        let ctrl_c = tokio::sync::Notify::new();
+        let mut err = Vec::new();
+        {
+            let shutdown = shutdown_on(
+                Err(io::Error::other("registration refused")),
+                ctrl_c.notified(),
+                &mut err,
+            );
+            tokio::pin!(shutdown);
+
+            let before_ctrl_c =
+                tokio::time::timeout(Duration::from_millis(50), shutdown.as_mut()).await;
+            assert!(before_ctrl_c.is_err(), "stopped before Ctrl+C arrived");
+
+            ctrl_c.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .expect("Ctrl+C did not stop the daemon");
+        }
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "could not register a SIGTERM handler, stopping on Ctrl+C only: registration refused\n"
+        );
+    }
+
+    /// A registered signal stops the daemon without Ctrl+C. The test uses SIGUSR1
+    /// rather than SIGTERM, since other tests in this binary run the daemon with
+    /// its real SIGTERM handler and would stop on a SIGTERM raised here; the arm
+    /// under test is the same for any registered signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(unsafe_code)] // libc::raise, to deliver the signal to this process
+    async fn a_registered_signal_stops_the_daemon_without_ctrl_c() {
+        // Registered before the raise, so the signal is handled rather than
+        // taking its default action.
+        let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1());
+        let mut err = Vec::new();
+        {
+            let shutdown = shutdown_on(term, std::future::pending(), &mut err);
+            tokio::pin!(shutdown);
+
+            let before_signal =
+                tokio::time::timeout(Duration::from_millis(50), shutdown.as_mut()).await;
+            assert!(before_signal.is_err(), "stopped before the signal arrived");
+
+            // SAFETY: raising a signal this process has a handler for is always safe.
+            assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .expect("the registered signal did not stop the daemon");
+        }
+        assert!(err.is_empty(), "a registered signal warns about nothing");
+    }
 
     #[tokio::test]
     async fn local_webhook_requires_enabled_automation_loop() {

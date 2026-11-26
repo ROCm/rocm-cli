@@ -88,11 +88,11 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
     quit_confirm_body_with(state, &snapshot)
 }
 
-/// Body text for the quit-confirm prompt: name the models still serving
-/// (mirroring the serving rows of the Serving tab's "Running now" listing in
-/// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
-/// styled spans; that listing also shows starting services, which this gate
-/// deliberately does not count), and how to stop each one that this host's own registry
+/// Body text for the quit-confirm prompt: name every model still serving,
+/// managed or not (the Serving tab's "Managed running" listing in
+/// `tabs::pane::live_lines`'s `OpenServices` arm is managed-only, and also shows
+/// starting services, which this gate deliberately does not count, so this
+/// listing can be longer or shorter than it), and how to stop each one that this host's own registry
 /// manages (a live read, passed in as `snapshot` so the caller controls how
 /// many times the registry is actually read — see `quit_confirm_request`) —
 /// not a blanket command, since a Docker- or Lemonade-discovered instance
@@ -140,11 +140,10 @@ pub(super) fn quit_confirm_body_with(
     let mut body = Vec::new();
     if total == 0 {
         // `total == 0` here only because `nothing_is_currently_being_served_with`
-        // returned `false` above: either the startup-race fallback (issue
-        // #145) is active — the daemon's first snapshot hasn't landed yet —
-        // or the connection never will succeed at all (Windows: the
-        // dashboard-embedded daemon client's connect path is unix-only, so
-        // `instances` stays empty for the whole session). `instances` can't
+        // returned `false` above: the startup-race fallback (issue #145) is
+        // active — the daemon's first snapshot hasn't landed yet, or (Windows,
+        // which has no daemon and refills `instances` from the registry each
+        // tick) a service was registered since the last tick. `instances` can't
         // name anything in either case, but the live registry read
         // (`managed_ids`) needs no daemon snapshot — it is this host's own
         // `rocm serve` registry, read straight off disk — so it can still
@@ -190,10 +189,10 @@ pub(super) fn quit_confirm_body_with(
         // `values()` happened to yield, so the listing is at least stable
         // across renders. `s` does not focus "the Nth instance named here":
         // `quit_confirm_open_services_key` always focuses the FIRST managed,
-        // still-serving row in `service_rows`' own order, which can include
-        // an unmanaged (Docker/Lemonade) entry this listing also shows ahead
-        // of it — so the row `s` focuses need not be the Nth line printed
-        // below.
+        // still-serving row in `service_rows`' own order, and `service_rows`
+        // lists managed services only — so the row `s` focuses need not be the
+        // Nth line printed below, because this listing can also show an
+        // unmanaged (Docker/Lemonade) entry that the overlay does not.
         let mut sorted: Vec<_> = running().collect();
         sorted.sort_by(|a, b| a.container_id.cmp(&b.container_id));
         for i in sorted.into_iter().take(5) {
@@ -245,14 +244,337 @@ mod tests {
 
     use crate::ui::draw;
 
+    /// A dashboard with one managed model serving, so `q` opens the prompt with
+    /// its full body: the bullet, the stop command under it, the trailer, and
+    /// the `Press s` hint.
+    fn serving_dashboard() -> AppState {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                model_name: "Qwen2.5-7B".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+        state.open_quit_confirm();
+        state
+    }
+
+    /// [`serving_dashboard`] with `extra` further managed instances, so the
+    /// prompt's body is long enough to exceed the old flat-70%-capped-at-24
+    /// popup at a chosen height.
+    ///
+    /// The one-instance fixture cannot show the height growth at all: its body
+    /// fits inside the old baseline even at 14 rows, so "it fits" is true with
+    /// the growth removed and the fit assertion proves nothing. Each extra
+    /// instance adds its own `rocm services stop <id> --yes` line.
+    fn serving_dashboard_with(extra: usize) -> AppState {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        let mut ids: Vec<String> = vec!["svc-managed".to_owned()];
+        ids.extend((0..extra).map(|i| format!("svc-managed-{i}")));
+        for id in &ids {
+            state.instances.insert(
+                id.clone(),
+                Instance {
+                    container_id: id.clone(),
+                    model_name: "Qwen2.5-7B".to_string(),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        with_registry_probe(&mut state, true, &refs);
+        state.open_quit_confirm();
+        state
+    }
+
+    /// Paint the whole dashboard at `rows` high and flatten it, the way a user
+    /// reads the screen rather than the way the body is built.
+    fn painted_at(state: &mut AppState, rows: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(120, rows)).unwrap();
+        term.draw(|f| draw(f, state)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// Scenario 1. The reported geometry (ROCMAI-1050): twelve rows used to
+    /// paint the "stop it first:" bullet and cut the command directly under it,
+    /// so the prompt named a remedy it did not show. The popup now spends the
+    /// rows that the flat 70% height left idle on a screen this short.
+    #[test]
+    fn a_short_terminal_still_shows_the_command_that_stops_the_model() {
+        let mut state = serving_dashboard();
+        let painted = painted_at(&mut state, 12);
+        assert!(
+            painted.contains("Qwen2.5-7B"),
+            "the model still serving must be named: {painted}"
+        );
+        assert!(
+            painted.contains("rocm services stop svc-managed --yes"),
+            "the command that stops it must be on screen, not below the fold: {painted}"
+        );
+    }
+
+    /// Scenario 2. Whatever is still too tall to fit must announce itself —
+    /// silent truncation is the defect, and a body that merely fits less is
+    /// still a body the user cannot tell is incomplete.
+    #[test]
+    fn a_body_that_still_overflows_says_so_and_names_the_keys() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        // Six serving models: five bullets with their own stop commands plus
+        // the overflow line, far past what a short screen can hold.
+        for n in 0..6 {
+            let id = format!("svc-{n}");
+            state.instances.insert(
+                id.clone(),
+                Instance {
+                    container_id: id,
+                    model_name: format!("model-{n}"),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        let ids: Vec<String> = (0..6).map(|n| format!("svc-{n}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        with_registry_probe(&mut state, true, &refs);
+        state.open_quit_confirm();
+
+        let painted = painted_at(&mut state, 14);
+        assert!(
+            painted.contains("More to read"),
+            "an overflowing body must say there is more: {painted}"
+        );
+        assert!(
+            painted.contains("PgUp/PgDn"),
+            "and must name the keys that reveal it: {painted}"
+        );
+    }
+
+    /// Scenario 3. The rest of the body is reachable, and the decision stays on
+    /// screen while the user reads — a prompt that scrolls its buttons away
+    /// would trade one trap for another.
+    #[test]
+    fn paging_reveals_the_rest_while_the_choices_stay_on_screen() {
+        use crossterm::event::KeyCode;
+        let mut state = serving_dashboard();
+        // One draw first, so the dialog has reported how far it can scroll.
+        let first = painted_at(&mut state, 10);
+        assert!(
+            state.quit_confirm_max_scroll.get() > 0,
+            "this geometry must actually overflow, or the test proves nothing: {first}"
+        );
+
+        assert!(state.quit_confirm_scroll_key(KeyCode::End));
+        let scrolled_to_end = painted_at(&mut state, 10);
+        assert!(
+            scrolled_to_end.contains("may still be running"),
+            "the trailer below the fold must become readable: {scrolled_to_end}"
+        );
+        assert!(
+            scrolled_to_end.contains("Approve (y)") && scrolled_to_end.contains("Deny (n)"),
+            "both choices must stay visible while reading: {scrolled_to_end}"
+        );
+
+        assert!(state.quit_confirm_scroll_key(KeyCode::Home));
+        assert_eq!(state.quit_confirm_scroll, 0, "Home must return to the top");
+    }
+
+    /// Scenario 5. A reopened prompt opens on its first line. `open_quit_confirm`'s
+    /// two reset lines are the only thing that clears the offset: `close_overlays`
+    /// leaves both fields alone, which this test pins on the way through so the
+    /// reset is shown to be load-bearing rather than assumed to be. Every other
+    /// test opens the prompt while the offset is already `0`, so deleting the
+    /// reset passes all of them.
+    #[test]
+    fn reopening_the_prompt_starts_it_back_at_the_first_line() {
+        use crossterm::event::KeyCode;
+        let mut state = serving_dashboard();
+        let first = painted_at(&mut state, 10);
+        assert!(
+            state.quit_confirm_max_scroll.get() > 0,
+            "premise: this geometry must overflow, or there is no offset to carry: {first}"
+        );
+        assert!(state.quit_confirm_scroll_key(KeyCode::End));
+        assert!(
+            state.quit_confirm_scroll > 0,
+            "premise: the prompt must sit off its first line before it is closed"
+        );
+
+        let still_scrolled = state.quit_confirm_scroll;
+        assert_eq!(
+            state.resolve_quit_confirm_key(KeyCode::Char('n')),
+            Some(false),
+            "premise: Deny must close the prompt and let the caller continue"
+        );
+        assert_eq!(
+            state.quit_confirm_scroll, still_scrolled,
+            "closing does not clear the offset -- if it ever does, this test stops \
+             proving anything about the reopen and must be rewritten, not deleted"
+        );
+
+        state.open_quit_confirm();
+
+        assert_eq!(
+            state.quit_confirm_scroll, 0,
+            "a reopened prompt opens on the bullet naming what is still serving"
+        );
+        assert_eq!(
+            state.quit_confirm_max_scroll.get(),
+            0,
+            "and its bound is re-measured by the next draw, not inherited"
+        );
+    }
+
+    /// Scenario 4. The scroll keys must not be read as an answer. Paging is the
+    /// one interaction a user performs *before* deciding, so a PgDn that quit
+    /// the dashboard would be the worst possible misfire.
+    #[test]
+    fn paging_through_the_prompt_never_answers_it() {
+        use crossterm::event::KeyCode;
+        let mut state = serving_dashboard();
+        painted_at(&mut state, 10);
+
+        // Asserting only "no verdict" would be vacuous: before ROCMAI-1050
+        // there was no scroll handling at all, so these keys fell through
+        // `approval_key`'s `_ => (choice, None)` and produced exactly this.
+        // The premise is therefore pinned first -- the prompt must have
+        // somewhere to scroll -- and each key is then required to *move* as
+        // well as to stay silent. A `quit_confirm_scroll_key` that handled
+        // nothing would satisfy the old assertions and fail these.
+        assert!(
+            state.quit_confirm_max_scroll.get() > 0,
+            "premise: at this height the body must overflow, or paging is a no-op \
+             and this test proves nothing"
+        );
+
+        for code in [KeyCode::PageDown, KeyCode::End] {
+            state.quit_confirm_scroll = 0;
+            assert_eq!(
+                state.resolve_quit_confirm_key(code),
+                None,
+                "{code:?} must resolve no verdict"
+            );
+            assert!(
+                state.quit_confirm.is_some(),
+                "{code:?} must leave the prompt open awaiting an answer"
+            );
+            assert!(
+                state.quit_confirm_scroll > 0,
+                "{code:?} must scroll the body, not fall through unhandled"
+            );
+        }
+
+        for code in [KeyCode::PageUp, KeyCode::Home] {
+            state.quit_confirm_scroll = state.quit_confirm_max_scroll.get();
+            assert_eq!(
+                state.resolve_quit_confirm_key(code),
+                None,
+                "{code:?} must resolve no verdict"
+            );
+            assert!(
+                state.quit_confirm.is_some(),
+                "{code:?} must leave the prompt open awaiting an answer"
+            );
+            assert!(
+                state.quit_confirm_scroll < state.quit_confirm_max_scroll.get(),
+                "{code:?} must scroll the body back, not fall through unhandled"
+            );
+        }
+    }
+
+    /// Scenario 5. A body that fits must not advertise scrolling, mirroring the
+    /// examine report's own `a_report_that_fits_shows_no_scroll_hint`.
+    #[test]
+    fn a_prompt_that_fits_offers_no_scrolling() {
+        // Seven managed instances and 24 rows, both chosen from a measurement
+        // rather than picked: this body needs ~21 rows (it still overflows at
+        // 20), and the pre-ROCMAI-1050 popup here was min(70% of 24, 24) = 16.
+        // So it fits ONLY because of the height growth. The one-instance body
+        // at 40 rows, which this test used before, fit under the old baseline
+        // even at 14 rows -- every assertion held with the growth deleted, so
+        // the test could not tell the new sizing from the old.
+        let mut state = serving_dashboard_with(6);
+        let painted = painted_at(&mut state, 24);
+        assert!(
+            painted.contains("rocm services stop svc-managed --yes"),
+            "the whole body must be on screen at this height: {painted}"
+        );
+        assert!(
+            !painted.contains("More to read"),
+            "a body that fits needs no hint: {painted}"
+        );
+        assert_eq!(
+            state.quit_confirm_max_scroll.get(),
+            0,
+            "nothing to scroll when everything fits"
+        );
+    }
+
+    /// The growth is bounded. A roomy screen keeps the geometry this dialog had
+    /// before ROCMAI-1050, so the ten manager flows sharing it are untouched
+    /// there — the extra rows are only ever taken from what the flat 70% left
+    /// idle on a screen too short to use it.
+    ///
+    /// Asserted through what the user can see rather than through the sizing
+    /// arithmetic: with the body far longer than any allowed height, the rows
+    /// on screen are `total - max_scroll`, so a dialog that had grown past the
+    /// 24-row cap would show more of them. Re-deriving the cap here instead
+    /// would pass for any geometry the code happened to produce.
+    #[test]
+    fn a_roomy_screen_keeps_the_dialog_at_its_old_size() {
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest, draw_approval_scrolled};
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 24 rows of popup, less its two border rows and the two footer rows,
+        // is the 20-row body the old geometry gave every tall screen.
+        const ROWS_AT_THE_CAP: usize = 20;
+
+        let total = 200usize;
+        let req = ApprovalRequest::new(
+            "Long body",
+            (0..total).map(|i| format!("line {i}")).collect(),
+        );
+        let theme = Theme::from_name("default-dark");
+
+        for height in [40u16, 60, 120] {
+            let mut term = Terminal::new(TestBackend::new(140, height)).unwrap();
+            let mut max = 0;
+            term.draw(|f| {
+                max = draw_approval_scrolled(f, f.area(), &req, ApprovalChoice::Approve, 0, &theme);
+            })
+            .unwrap();
+            let visible = total - usize::from(max);
+            assert_eq!(
+                visible, ROWS_AT_THE_CAP,
+                "on a {height}-row screen the dialog must still show {ROWS_AT_THE_CAP} body \
+                 rows, as it did before the short-screen growth was added"
+            );
+        }
+    }
+
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
-        // On a host whose daemon client never sends an instance snapshot
-        // (Windows — it connects and streams live GPU/CPU/memory every tick,
-        // but has no `rocmdashd` socket to source an instance list from, so
-        // `has_received_snapshot` never flips for the whole session),
-        // `instances` never fills, so without this the quit prompt
+        // Before `instances` has been filled (the daemon's first snapshot
+        // has not landed, or on Windows the registry gained a service since
+        // the last registry poll), `has_received_snapshot` is false and
+        // `instances` is empty, so without this the quit prompt
         // could only ever print the generic "a model was serving" sentence —
         // no model name (expected: `instances` is the only source for that),
         // but also no stop command and no id, even though the live registry
@@ -379,6 +701,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -411,6 +734,41 @@ mod tests {
         assert_eq!(launcher.title, dashboard.title);
     }
 
+    /// Just started: the registry names the instance but the broadcast has not
+    /// marked it managed yet. The prompt must not offer `s` (the Services overlay
+    /// has no row for it); it still prints the command that stops it.
+    #[test]
+    fn quit_confirm_request_does_not_offer_s_for_an_instance_the_broadcast_has_not_marked_managed()
+    {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-new".to_string(),
+            Instance {
+                container_id: "svc-new".to_string(),
+                model_name: "m".to_string(),
+                managed: false,
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-new"]);
+        let request = quit_confirm_request(&state, true);
+        assert!(
+            !request.body.iter().any(|l| l.contains("Press s")),
+            "{:?}",
+            request.body
+        );
+        assert!(
+            request
+                .body
+                .iter()
+                .any(|l| l.contains("rocm services stop svc-new --yes")),
+            "{:?}",
+            request.body
+        );
+    }
+
     #[test]
     fn quit_confirm_request_offers_the_stop_hint_only_for_the_dashboard_with_something_stoppable() {
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
@@ -419,6 +777,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -481,6 +840,7 @@ mod tests {
             "svc-managed".to_string(),
             Instance {
                 container_id: "svc-managed".to_string(),
+                managed: true,
                 model_name: "Qwen2.5-7B".to_string(),
                 status: InstanceStatus::Running,
                 ..Default::default()
@@ -563,8 +923,8 @@ mod tests {
         // `values()` happens to yield. This does not mean `s`
         // (`AppState::quit_confirm_open_services_key`) focuses the Nth
         // bullet printed here: it always focuses the FIRST managed,
-        // still-serving row in `service_rows`' own order, which can include
-        // an unmanaged entry this listing also shows.
+        // still-serving row in `service_rows`' own order, and `service_rows`
+        // lists managed services only.
         // `quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line`
         // inserts ids (`svc-0`..`svc-5`) that already sort the same way
         // whether by id or insertion order, so it can't catch a regression

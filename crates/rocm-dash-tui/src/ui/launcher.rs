@@ -24,6 +24,7 @@ use rocm_dash_core::metrics::InstanceStatus;
 use crate::app::AppState;
 use crate::ui::format;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// Where a selected launcher row leads. The runtime maps these to the existing
 /// dash entry points.
@@ -157,13 +158,16 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
         // `false`: the launcher has no live Services overlay to jump to
         // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
         // it must not advertise the `s` hint the dashboard's copy does.
-        crate::ui::approval::draw_approval(
-            f,
-            area,
-            &crate::ui::quit_confirm_request(state, false),
-            choice,
-            theme,
-        );
+        state
+            .quit_confirm_max_scroll
+            .set(crate::ui::approval::draw_approval_scrolled(
+                f,
+                area,
+                &crate::ui::quit_confirm_request(state, false),
+                choice,
+                state.quit_confirm_scroll,
+                theme,
+            ));
     }
 }
 
@@ -321,10 +325,15 @@ fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
         .iter()
         .map(|inst| inst.container_id.clone())
         .collect();
+    // No `instances` here: that field feeds the Windows registry poller
+    // (`app::event_loop::spawn_managed_registry_poller`), which reads the
+    // bin-injected live probe rather than this static one, and the launcher
+    // fills `state.instances` directly on the next line anyway.
     state.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
         ManagedRegistrySnapshot {
             has_live_service,
             managed_ids,
+            ..Default::default()
         },
     )));
     state.instances = serving
@@ -433,7 +442,7 @@ fn handle_launcher_key(state: &mut AppState, sel: &mut usize, code: KeyCode) -> 
             Some(false) | None => LauncherKeyOutcome::Continue,
         };
     }
-    match code {
+    match shortcut_key(code) {
         KeyCode::Char('q') | KeyCode::Esc => {
             if crate::app::request_quit(state) {
                 LauncherKeyOutcome::Exit(None)
@@ -879,6 +888,7 @@ mod tests {
             "vllm-1".into(),
             Instance {
                 container_id: "vllm-1".into(),
+                managed: true,
                 status: InstanceStatus::Running,
                 ..Default::default()
             },
@@ -892,6 +902,7 @@ mod tests {
             ManagedRegistrySnapshot {
                 has_live_service: true,
                 managed_ids: std::collections::HashSet::from(["vllm-1".to_string()]),
+                ..Default::default()
             },
         )));
         s.open_quit_confirm();
@@ -910,6 +921,150 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8] {
             let _ = render(&s, 0, 60, h);
         }
+    }
+
+    /// The `row N of M` the overflow notice states: `N` is the **last** body row
+    /// on screen (`scroll + visible`, capped at the total), so it is driven by
+    /// the scroll offset the call site passes down. Returns `(N, M)`.
+    fn visible_row(screen: &str) -> Option<(u16, u16)> {
+        let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        let tail = flat.split("row ").nth(1)?;
+        let mut parts = tail.split(' ');
+        let last_shown = parts.next()?.parse().ok()?;
+        let total = parts.nth(1)?.parse().ok()?;
+        Some((last_shown, total))
+    }
+
+    /// ROCMAI-1050 at the launcher's own `draw_approval_scrolled` call site.
+    ///
+    /// Every other regression test for the height growth and the overflow
+    /// notice renders through `ui::draw`, the dashboard's call site. The key
+    /// routing is shared (`resolve_quit_confirm_key`), but this call site has
+    /// its own few lines of render glue — the `&quit_confirm_request(...)`,
+    /// the scroll it passes down and the `max_scroll` it writes back — and a
+    /// transposed argument there would not necessarily fail to compile. The
+    /// pre-existing test next to this one renders at a roomy 24 rows and then
+    /// only checks that short sizes do not panic, which a silently cut body
+    /// would also satisfy.
+    ///
+    /// Both directions are asserted. At twelve rows the body must still reach
+    /// the user *and* say there is more; at twenty-four it must not claim
+    /// there is more when everything fits, which is what a notice wired to
+    /// fire unconditionally would do.
+    ///
+    /// The scroll is actually driven rather than left at zero, because while
+    /// both fields hold `0` any mix-up renders byte-identically -- rendering
+    /// twice at the top proves nothing.
+    ///
+    /// Which mix-up is reachable here matters, and an earlier version of this
+    /// comment named one that is not. `draw` takes `&AppState`, and
+    /// `quit_confirm_scroll` is a plain field while `quit_confirm_max_scroll`
+    /// is a `Cell`, so a full transposition -- writing the result into the
+    /// plain field -- does not compile without widening the signature. The
+    /// swap that *does* compile is reading `quit_confirm_max_scroll.get()` as
+    /// the scroll input while still writing the result back into the `Cell`.
+    ///
+    /// That one is why `after > before` is not enough. `max_scroll` is by
+    /// definition the offset at which the last body row is the last row, so
+    /// the buggy render lands at the very bottom -- which also advances the
+    /// reported position, and a "did it move" check passes. The offset is
+    /// therefore pinned exactly: one PgDn must land one page down, not at the
+    /// end. For those two to be different offsets the overflow has to exceed
+    /// one page, i.e. `max_scroll > APPROVAL_PAGE`, which is asserted as a
+    /// premise below. Adding instances does not buy it -- the request body
+    /// caps at 13 rows however many are serving -- so it comes from the
+    /// terminal height: 10 rows, not the 12 the roomy arm contrasts against.
+    ///
+    /// Mutation-checked by making that swap at the call site: the render then
+    /// lands at the bottom (6 -> 13) instead of one page down (6 -> 11) and
+    /// the equality fires. A plain `after > before` passes on that mutation,
+    /// which is the whole reason this asserts the exact offset.
+    #[test]
+    fn launcher_quit_prompt_on_a_short_terminal_shows_its_body_and_says_there_is_more() {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = base();
+        // Enough serving instances that the body cannot fit a short window:
+        // each contributes its own "stop it first" bullet and command line.
+        for i in 0..7 {
+            s.instances.insert(
+                format!("vllm-{i}"),
+                Instance {
+                    container_id: format!("vllm-{i}"),
+                    managed: true,
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: (0..7).map(|i| format!("vllm-{i}")).collect(),
+                ..Default::default()
+            },
+        )));
+        s.open_quit_confirm();
+
+        let short = render(&s, 0, 100, 10);
+        assert!(
+            short.contains("rocm services stop vllm-0 --yes"),
+            "the remediation must still reach the user on a short terminal, not be cut: {short:?}"
+        );
+        assert!(
+            short.contains("More to read") && short.contains("PgUp/PgDn"),
+            "and the body that does not fit must say so and name the keys: {short:?}"
+        );
+
+        // That render wrote `max_scroll` back through the `Cell`, and the body
+        // is still at the top -- so the two fields are equal-by-accident at 0.
+        let max_scroll = s.quit_confirm_max_scroll.get();
+        assert!(
+            max_scroll > crate::ui::approval::APPROVAL_PAGE,
+            "premise: the body must be taller than one page, or landing one page \
+             down and landing at the bottom are the same offset and the swap this \
+             test exists for is invisible (max_scroll {max_scroll}): {short:?}"
+        );
+        assert_eq!(
+            s.quit_confirm_scroll, 0,
+            "premise: the body starts at the top"
+        );
+
+        // Page down so the two hold DIFFERENT values; only now would reading
+        // the wrong one at the call site change what is drawn.
+        assert!(
+            s.quit_confirm_scroll_key(crossterm::event::KeyCode::PageDown),
+            "PgDn must move a body that overflows"
+        );
+        assert_eq!(
+            s.quit_confirm_scroll,
+            crate::ui::approval::APPROVAL_PAGE,
+            "premise: one PgDn is one page from the top"
+        );
+
+        let scrolled = render(&s, 0, 100, 10);
+        let (before, total) =
+            visible_row(&short).expect("the notice states a row before scrolling");
+        let (after, _) = visible_row(&scrolled).expect("and after");
+        assert_eq!(
+            after,
+            before + crate::ui::approval::APPROVAL_PAGE,
+            "paging must move this call site's window exactly one page \
+             ({before} -> {after}); landing anywhere else means the offset it \
+             renders is not the one the key handler moved:\n\
+             before: {short:?}\nafter: {scrolled:?}"
+        );
+        assert!(
+            after < total,
+            "and must not land at the bottom, which is where reading `max_scroll` \
+             as the scroll input would land ({after} of {total})"
+        );
+
+        let roomy = render(&s, 0, 100, 24);
+        assert!(
+            !roomy.contains("More to read"),
+            "a body that fits must not claim there is more to read: {roomy:?}"
+        );
     }
 
     #[test]
@@ -1052,5 +1207,21 @@ mod tests {
             s.quit_confirm.is_some(),
             "`d` is not a verdict key — the prompt must still be open"
         );
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_launcher_shortcuts() {
+        let mut s = launcher_state("default-dark", vec![]);
+        let mut sel = 0usize;
+        handle_launcher_key(&mut s, &mut sel, KeyCode::Char('J'));
+        assert_eq!(sel, 1, "J must move down");
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('D')),
+            LauncherKeyOutcome::Exit(Some(LauncherChoice::OpenDashboard))
+        ));
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('Q')),
+            LauncherKeyOutcome::Exit(None)
+        ));
     }
 }

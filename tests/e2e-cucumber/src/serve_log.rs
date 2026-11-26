@@ -27,6 +27,21 @@
 //!   deleted with the scenario.
 
 use std::path::Path;
+use std::time::Duration;
+
+/// Extra time the `rocm serve` process gets beyond the model readiness timeout.
+///
+/// The CLI's own readiness wait starts only after its pre-launch work (backend
+/// and weights fetch), while the harness clock starts at spawn. Bounding the
+/// process by the bare timeout would kill it first and lose the CLI's own
+/// diagnostic in a slow cold start. The margin still bounds a stuck serve.
+pub const SERVE_CLI_MARGIN_SECS: u64 = 300;
+
+/// How long to let a `rocm serve` process run: the readiness timeout plus
+/// [`SERVE_CLI_MARGIN_SECS`]. Model readiness polling keeps the plain timeout.
+pub const fn serve_cli_budget(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.saturating_add(SERVE_CLI_MARGIN_SECS))
+}
 
 /// How many trailing lines of a stalled service's log to quote in a failure.
 const DEFAULT_TAIL_LINES: usize = 40;
@@ -127,9 +142,11 @@ pub fn service_log_tail(serve_stdout: &str) -> String {
 }
 
 /// A filename-safe form of a scenario name: lowercase, non-alphanumerics folded
-/// to single dashes. Only ever used to LABEL a file whose uniqueness comes from
-/// the service id already in its name, so collisions here cost nothing.
-fn slugify(name: &str) -> String {
+/// to single dashes. Different names can fold to the same slug. Where the
+/// filename also carries the service id (the serve archive) that id keeps the
+/// files apart; where the slug is the whole name (the Lemonade runtime
+/// evidence), a repeated or colliding scenario name overwrites the earlier file.
+pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
@@ -348,10 +365,20 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ARCHIVED_LOG_BYTES, ServeAttempt, archive_service_log, engine_from_serve_args,
-        parse_log_path, read_clamped, read_clamped_file, reported_engine, serve_attempt_report,
-        service_log_tail, slugify, tail_lines,
+        MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
+        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_engine,
+        serve_attempt_report, serve_cli_budget, service_log_tail, slugify, tail_lines,
     };
+
+    #[test]
+    fn cli_budget_outlasts_the_readiness_timeout_by_a_bounded_margin() {
+        for timeout in [90, 2400] {
+            let budget = serve_cli_budget(timeout).as_secs();
+            assert!(budget > timeout, "the CLI must outlive the readiness wait");
+            assert_eq!(budget, timeout + SERVE_CLI_MARGIN_SECS);
+        }
+        assert_eq!(serve_cli_budget(u64::MAX).as_secs(), u64::MAX);
+    }
 
     const SERVE_PLAN: &str = "\
 serve plan

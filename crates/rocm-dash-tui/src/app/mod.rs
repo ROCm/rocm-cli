@@ -60,7 +60,7 @@ mod update_check;
 pub(crate) use actions::request_quit;
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub use event_loop::run;
-pub use terminal::spawn_termination_watcher;
+pub use terminal::{PreExitHookGuard, set_pre_exit_hook, spawn_termination_watcher};
 pub(crate) use terminal::{
     SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer, restore_terminal,
     shutdown_claimed_on,
@@ -74,9 +74,9 @@ pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
 #[cfg(test)]
 pub(crate) use terminal::restore_after_session;
 pub use types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, MENU_ITEMS, MenuItem,
-    Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction, ReplayState, ResolvedArgs,
-    ScrollTarget, UpdateStatus, format_mmss,
+    ActiveTab, ChatConsent, ChatEndpointHealth, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus,
+    MENU_ITEMS, MenuItem, Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction,
+    ReplayState, ResolvedArgs, ScrollTarget, UpdateStatus, format_mmss,
 };
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
@@ -92,8 +92,9 @@ pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolReq
 /// history before the oldest samples start falling off the left.
 pub const HISTORY_CAP: usize = 600;
 
-/// How many benchmark rows to keep client-side for the bench panel.
-pub const BENCH_CAP: usize = 200;
+/// How many benchmark rows to keep client-side for the bench panel: the same
+/// cap the daemon replays on subscribe, so clearing on reconnect loses nothing.
+pub const BENCH_CAP: usize = rocm_dash_core::bench_schema::BENCH_HISTORY_CAP;
 
 pub struct AppState {
     pub connect: String,
@@ -196,6 +197,19 @@ pub struct AppState {
     pub chat_llm: Option<crate::llm::LlmConfig>,
     /// One-time consent gate for using the detected endpoint.
     pub chat_consent: ChatConsent,
+    /// Whether a managed instance has ever been seen serving the chat
+    /// endpoint's loopback port.
+    ///
+    /// Stopping a service removes its record, so the instance does not turn
+    /// `Stopped` — it vanishes (`Event::InstanceGone`). An absent instance is
+    /// therefore ambiguous on its own: it means "stopped" only for an endpoint
+    /// we once saw registered, and "never ours to watch" for a local engine
+    /// started outside the dashboard. This remembers which.
+    ///
+    /// Deliberately a flag rather than a container id: a service restarted on
+    /// the same port gets a fresh id, and matching by port lets the endpoint
+    /// recover on its own instead of pinning a dead one.
+    pub(crate) chat_endpoint_managed: bool,
     /// A locally-detected chat endpoint awaiting the user's use/save/dismiss
     /// choice (the in-TUI "detect a local engine" flow). `None` normally.
     pub chat_detect_offer: Option<crate::llm::LlmConfig>,
@@ -249,6 +263,8 @@ pub struct AppState {
     /// that actually exits the process. See the field doc on
     /// `ResolvedArgs::launcher_hosted` and `actions::request_quit`.
     pub(crate) launcher_hosted: bool,
+    /// Managed installation inventory captured at launch; not endpoint liveness.
+    pub lemonade_managed_installed: Option<bool>,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -327,6 +343,18 @@ pub struct AppState {
     /// `Some` ⇒ the confirm-before-quit prompt is open and owns keyboard
     /// focus, the same way `approval` does.
     pub(crate) quit_confirm: Option<crate::ui::approval::ApprovalChoice>,
+    /// Rows the quit-confirm body is scrolled down. A short terminal can leave
+    /// the prompt taller than the screen even after it claims every row it can
+    /// (`ui::approval`), and the remediation it hides is the command that stops
+    /// the model — so the body scrolls rather than being silently cut.
+    pub(crate) quit_confirm_scroll: u16,
+    /// Last-measured upper bound for `quit_confirm_scroll`, written back by the
+    /// renderer each frame — only the draw knows how many rows the body
+    /// actually needed. A [`Cell`] rather than a plain `u16` because the
+    /// launcher renders this same prompt from a `&AppState`
+    /// (`ui::launcher::draw`), the way `examine_manager` holds its own
+    /// approval's bound.
+    pub(crate) quit_confirm_max_scroll: std::cell::Cell<u16>,
     /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
     pub(crate) active_provider: ChatProvider,
     /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
@@ -405,6 +433,7 @@ impl AppState {
             chat_follow: true,
             chat_llm: None,
             chat_consent: ChatConsent::Unavailable,
+            chat_endpoint_managed: false,
             chat_detect_offer: None,
             chat_detecting: false,
             chat_detect_dispatch: false,
@@ -416,6 +445,7 @@ impl AppState {
             services_past_attempts: 0,
             managed_registry_probe: None,
             launcher_hosted: false,
+            lemonade_managed_installed: None,
             last_body_area: None,
             last_tab_bar_area: None,
             last_header_badge: None,
@@ -444,6 +474,8 @@ impl AppState {
             plan_request: None,
             approval: None,
             quit_confirm: None,
+            quit_confirm_scroll: 0,
+            quit_confirm_max_scroll: std::cell::Cell::new(0),
             active_provider: ChatProvider::default(),
             provider_switch: None,
             update_status: UpdateStatus::Unknown,
@@ -600,6 +632,7 @@ impl AppState {
             self.instances
                 .insert(inst.container_id.clone(), inst.clone());
         }
+        self.refresh_chat_endpoint_health();
         self.push_history_and_latest(snap);
     }
 
@@ -608,12 +641,33 @@ impl AppState {
     /// charts/history exactly like a real snapshot, but deliberately leaves
     /// `instances` and `has_received_snapshot` untouched. The Windows
     /// in-process ticker (`client.rs`) always sends an empty `instances`
-    /// stand-in (no instance-registry daemon exists there yet), so treating
-    /// it as authoritative the way `push_snapshot` does would permanently
-    /// blind the issue #145 quit-confirm prompt to models actually being
-    /// served — see `has_live_instance_with`'s Windows note.
+    /// stand-in (it has no daemon to discover them), so treating it as
+    /// authoritative the way `push_snapshot` does would blind the issue #145
+    /// quit-confirm prompt to models actually being served — see
+    /// `has_live_instance_with`'s Windows note. Instances arrive separately,
+    /// from the managed-service registry, through
+    /// [`set_managed_instances`](Self::set_managed_instances).
     pub(crate) fn push_host_gpu_snapshot(&mut self, snap: Snapshot) {
         self.push_history_and_latest(snap);
+    }
+
+    /// Replace `instances` with the managed services the registry poller
+    /// (`event_loop::spawn_managed_registry_poller`, Windows only) last read,
+    /// delivered as `ClientMsg::ManagedInstances`. `has_received_snapshot`
+    /// stays untouched, so the issue #145 quit-confirm gate keeps reading the
+    /// registry live too.
+    ///
+    /// The map is refilled in place rather than rebuilt: a fresh `HashMap`
+    /// gets a fresh random hasher, so the iteration order — which picks the
+    /// Home tile's model — would change on every poll.
+    pub(crate) fn set_managed_instances(&mut self, live: Vec<rocm_dash_core::metrics::Instance>) {
+        self.instances.clear();
+        self.instances.extend(
+            live.into_iter()
+                .map(|inst| (inst.container_id.clone(), inst)),
+        );
+        self.refresh_chat_endpoint_health();
+        self.clamp_selectors();
     }
 
     /// Shared tail of [`push_snapshot`](Self::push_snapshot) and
@@ -632,6 +686,7 @@ impl AppState {
 
     fn upsert_instance(&mut self, inst: Instance) {
         self.instances.insert(inst.container_id.clone(), inst);
+        self.refresh_chat_endpoint_health();
         self.clamp_selectors();
     }
 
@@ -647,6 +702,20 @@ impl AppState {
             }
             self.bench_rows.push_back(r);
         }
+        self.clamp_selectors();
+    }
+
+    /// A connection to a daemon was (re-)established.
+    ///
+    /// A daemon sends a new client its benchmark history when it subscribes,
+    /// and a daemon that has just taken over from one that stopped re-reads
+    /// the whole benchmark CSV, so rows this dashboard already holds would
+    /// arrive again. The list starts over from what the daemon sends. Chart
+    /// history is kept (the daemon's replay of its recent snapshots is
+    /// appended to it, as before).
+    pub(crate) fn on_connected(&mut self, host: String, version: String) {
+        self.conn = ConnState::Connected { host, version };
+        self.bench_rows.clear();
         self.clamp_selectors();
     }
 
@@ -730,6 +799,111 @@ mod tests {
             "host/GPU metrics must still land for charts/history"
         );
         assert_eq!(s.history.len(), 1);
+    }
+
+    /// Windows has no daemon to discover instances, so the registry poller's
+    /// list is what fills `instances`: a served model appears when the poll
+    /// reports it and drops off once a later poll no longer does.
+    #[test]
+    fn set_managed_instances_follows_the_polled_registry_list() {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        // `managed: true` is not decoration. The poller builds these through
+        // `merge_instance`, which copies `managed` from the registry record,
+        // and `discover_managed_services` only ever emits `managed: true`, so
+        // a polled instance is always managed. Hand-building it with
+        // `..Default::default()` alone would leave the field `false` — a shape
+        // the poller cannot produce — and `has_stoppable_managed_instance_with`
+        // screens on exactly that field (`is_listed_service`), because the
+        // Services overlay `s` jumps to lists only managed rows.
+        let served = Instance {
+            container_id: "lemonade-qwen".to_string(),
+            model_name: "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M".to_string(),
+            status: InstanceStatus::Ready,
+            port: Some(11436),
+            managed: true,
+            ..Default::default()
+        };
+        let mut s = st();
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: std::iter::once(served.container_id.clone()).collect(),
+                instances: vec![served.clone()],
+            },
+        )));
+
+        s.set_managed_instances(vec![served.clone()]);
+
+        assert_eq!(s.instances.len(), 1);
+        let inst = &s.instances["lemonade-qwen"];
+        assert_eq!(inst.model_name, served.model_name);
+        assert_eq!(inst.port, Some(11436));
+        assert!(
+            !s.has_received_snapshot,
+            "the registry poll must not flip has_received_snapshot"
+        );
+        let snap = s.live_registry_snapshot();
+        assert!(s.has_live_instance_with(&snap));
+        assert!(
+            s.has_stoppable_managed_instance_with(&snap),
+            "a registry-sourced instance must be offered for stopping on quit"
+        );
+
+        // Shrink the list out from under a selection that points past the new
+        // end. `instance_sel` has to be nonzero first, or the clamp inside
+        // `set_managed_instances` is unobservable — with the selector already
+        // at its default 0 the call could be dropped entirely and every
+        // assertion below would still hold.
+        let second = Instance {
+            container_id: "lemonade-llama".to_string(),
+            status: InstanceStatus::Ready,
+            port: Some(11437),
+            ..Default::default()
+        };
+        s.set_managed_instances(vec![served, second]);
+        s.instance_sel = 1;
+
+        s.set_managed_instances(Vec::new());
+
+        assert!(
+            s.instances.is_empty(),
+            "a service the registry no longer reports must drop off"
+        );
+        assert_eq!(
+            s.instance_sel, 0,
+            "the row selection must be clamped to the shrunken list, not left \
+             pointing past its end"
+        );
+    }
+
+    /// The Home tile shows the first serving instance in `instances`'
+    /// iteration order, so applying the same registry contents poll after
+    /// poll must not reorder them — otherwise the tile alternates models.
+    #[test]
+    fn set_managed_instances_keeps_instance_order_stable_across_polls() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        let polled = || -> Vec<Instance> {
+            (0..8)
+                .map(|n| Instance {
+                    container_id: format!("svc-{n}"),
+                    status: InstanceStatus::Ready,
+                    port: Some(11_400 + n),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let mut s = st();
+
+        s.set_managed_instances(polled());
+        let first: Vec<String> = s.instances.keys().cloned().collect();
+        for _ in 0..5 {
+            s.set_managed_instances(polled());
+            let again: Vec<String> = s.instances.keys().cloned().collect();
+            assert_eq!(again, first, "instance order changed between polls");
+        }
     }
 
     #[test]
@@ -890,6 +1064,37 @@ mod tests {
         assert!(s.latest.is_none());
         assert!(s.bench_rows.is_empty());
         assert!(s.instances.is_empty());
+    }
+
+    /// A dashboard that reconnects -- to the same daemon, or to the one that
+    /// took over when the previous one stopped -- is sent the benchmark rows
+    /// it already holds again, and must hold each of them once.
+    #[test]
+    fn benchmark_rows_are_held_once_across_a_reconnect() {
+        let rows: Vec<BenchmarkRow> = (0..3)
+            .map(|i| BenchmarkRow {
+                cell: format!("c{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let mut s = st();
+        s.on_connected("host".into(), "1".into());
+        s.apply_event(Event::BenchmarkRowsAppended { rows: rows.clone() });
+        s.bench_sel = 2;
+        s.conn = ConnState::Disconnected {
+            reason: "closed".into(),
+        };
+
+        s.on_connected("host".into(), "1".into());
+        assert_eq!(
+            s.bench_sel, 0,
+            "the selection must not point past the cleared list"
+        );
+        s.apply_event(Event::BenchmarkRowsAppended { rows });
+
+        let held: Vec<_> = s.bench_rows.iter().map(|r| r.cell.clone()).collect();
+        assert_eq!(held, ["c0", "c1", "c2"], "each row must be held once");
+        assert!(matches!(s.conn, ConnState::Connected { .. }));
     }
 
     #[test]

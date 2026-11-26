@@ -22,6 +22,11 @@
 #                  both (default "release nightly")
 #   E2E_LANE_WORK  where the build and runtimes go (default /var/tmp/e2e-lane)
 #   LANE_OUT       where reported files go (default /out)
+#   E2E_EXPECT_GPU whether the lane has a GPU (default 1: every queue lane is
+#                  given one); the suite fails rather than passing with every
+#                  GPU scenario skipped. Set but empty, it leaves the lane
+#                  undeclared, which switches that check off. See
+#                  tests/e2e-cucumber/README.md.
 
 set -euo pipefail
 
@@ -30,7 +35,16 @@ out="${LANE_OUT:-/out}"
 work="${E2E_LANE_WORK:-/var/tmp/e2e-lane}"
 channels="${E2E_CHANNELS:-release nightly}"
 
+# The lane fetches only the host's crates, so a build target set from outside
+# would need crates it skips and meet the network without a retry. Refused
+# before anything is installed. This covers the environment variable only.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+  echo "CARGO_BUILD_TARGET is set; unset it: the lane fetches only the host's crates" >&2
+  exit 1
+fi
+
 export E2E_INCLUDE_NIGHTLY="${E2E_INCLUDE_NIGHTLY-1}"
+export E2E_EXPECT_GPU="${E2E_EXPECT_GPU-1}"
 export E2E_SERVE_TIMEOUT_SECS="${E2E_SERVE_TIMEOUT_SECS:-300}"
 
 # The channels are checked before anything is built, so a typo costs nothing.
@@ -70,29 +84,77 @@ save_results() {
   fi
 }
 
+# A lane that exits non-zero after this point leaves a note of how it ended in
+# `${out}/lane-status.txt`, so a failure that stops the script before the channel
+# loop, or a channel that fails, still leaves something to read. The argument and channel checks above
+# run first and write nothing. `lane.log` is the harness's, not written here.
+# The lane's status stays the one it was ending with (the trap does not exit); a
+# failed write only warns. A signal sent to the script itself writes no note:
+# bash reports no status to the trap then.
+channels_failed=""
+# shellcheck disable=SC2329 # run by the EXIT trap, which shellcheck cannot follow
+lane_end() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${rc}" -ne 0 ]]; then
+    {
+      mkdir -p "${out}" &&
+        {
+          echo "status=${rc}"
+          echo "channels_failed=${channels_failed# }"
+        } >"${out}/lane-status.txt" &&
+        sync
+    } 2>/dev/null ||
+      echo "warning: could not write ${out}/lane-status.txt" >&2
+  fi
+}
+trap lane_end EXIT
+
 # One tree on one filesystem: uv only hardlinks out of its cache into a runtime
 # on the same mount, and copies every file otherwise (see e2e-selfhosted.yml).
 mkdir -p "${work}"
 export CARGO_TARGET_DIR="${work}/target"
 export E2E_SHARED_CACHE_DIR="${work}/shared"
 export E2E_SHARED_UV_CACHE_DIR="${work}/uv-cache"
-# What a cold Ubuntu build needs, as the WSL lane in e2e-selfhosted.yml
-# installs it; the ROCm dev images carry a compiler but not these. The update is
-# retried as there: a mirror mid-sync fails it for a few minutes.
-if ! command -v pkg-config >/dev/null || [[ ! -e /usr/include/sys/capability.h ]]; then
-  for attempt in 1 2 3 4; do
-    if apt-get update -qq; then
-      break
+# A command that reaches the network, run again when it fails: a mirror
+# mid-sync, a dropped connection, a node whose route out is down for a minute.
+# A lane starts cold, so each of these steps stands in front of the whole suite
+# and one failed fetch would cost the lane its night. For fetches only: a build
+# or a test that fails is not run again. A failure that will not change (a 404,
+# a lockfile out of date) is retried too, and costs the delays before the lane
+# fails with the command's own status.
+#   retry <attempts> <seconds between attempts> <command...>
+retry() {
+  local attempts="$1" delay="$2" attempt status
+  shift 2
+  for ((attempt = 1; ; attempt++)); do
+    status=0
+    "$@" || status=$?
+    if [[ "${status}" -eq 0 ]]; then
+      return 0
     fi
-    if [[ "${attempt}" -eq 4 ]]; then
-      echo "apt-get update failed after ${attempt} attempts" >&2
-      exit 1
+    if [[ "${attempt}" -ge "${attempts}" ]]; then
+      echo "$* failed after ${attempt} attempts (status ${status})" >&2
+      return "${status}"
     fi
-    echo "apt-get update failed (attempt ${attempt}); retrying in 60s" >&2
-    sleep 60
+    echo "$* failed (attempt ${attempt}, status ${status}); retrying in ${delay}s" >&2
+    sleep "${delay}"
   done
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    pkg-config build-essential libcap-dev >/dev/null
+}
+
+# What a cold Ubuntu build needs, as the WSL lane in e2e-selfhosted.yml
+# installs it; the ROCm dev images carry a compiler but not these. The update and
+# the install are retried together: a mirror mid-sync fails either for a few
+# minutes, and an install that fails on a pool that moved since the update needs
+# fresh lists.
+# shellcheck disable=SC2329 # run by `retry`, which shellcheck cannot follow
+apt_get_update_and_install() {
+  apt-get update -qq &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      pkg-config build-essential libcap-dev >/dev/null
+}
+if ! command -v pkg-config >/dev/null || [[ ! -e /usr/include/sys/capability.h ]]; then
+  retry 4 60 apt_get_update_and_install
 fi
 
 if ! command -v cargo >/dev/null; then
@@ -115,7 +177,10 @@ if ! command -v cargo >/dev/null; then
       ;;
   esac
   rustup_init="${work}/rustup-init"
-  curl --proto '=https' --tlsv1.2 -sSf -o "${rustup_init}" \
+  # Bounded in time as well: a stalled connection is no failure for `retry` to
+  # act on.
+  retry 4 15 curl --proto '=https' --tlsv1.2 -sSf -o "${rustup_init}" \
+    --connect-timeout 30 --max-time 300 \
     "https://static.rust-lang.org/rustup/archive/${rustup_version}/${rustup_triple}/rustup-init"
   if ! echo "${rustup_sha256}  ${rustup_init}" | sha256sum -c --quiet -; then
     echo "rustup-init ${rustup_version} does not match its recorded SHA-256" >&2
@@ -131,6 +196,25 @@ fi
 
 bash .github/scripts/gpu-preflight.sh
 preflight_done=0
+
+# The two fetches in front of the build, each retried on its own. The first cargo
+# call in this checkout downloads the toolchain rust-toolchain.toml names: that
+# relies on rustup's proxy installing it on first call, and is a no-op where
+# cargo is not rustup-managed. Then the crates are fetched, so the build below
+# does not meet the network. Only the host's are: the build, the pre-warm and
+# the suite all run on the host (see the CARGO_BUILD_TARGET check at the top).
+retry 4 30 cargo --version
+# Captured first, so a cargo that fails here aborts the lane with its own error.
+cargo_info="$(cargo -vV)"
+host=""
+while read -r key value; do
+  if [[ "${key}" == "host:" ]]; then host="${value}"; fi
+done <<<"${cargo_info}"
+if [[ -z "${host}" ]]; then
+  echo "cargo did not report its host triple" >&2
+  exit 1
+fi
+retry 4 30 cargo fetch --locked --target "${host}"
 
 # The e2e-test-hooks feature must match what `cargo xtask e2e` builds for
 # itself; see the e2e-gpu job in e2e-selfhosted.yml.
@@ -171,6 +255,7 @@ for channel in ${channels}; do
   run_channel "${channel}" || rc=$?
   save_results "${channel}"
   if [[ "${rc}" -ne 0 ]]; then
+    channels_failed+=" ${channel}"
     echo "channel ${channel} failed (status ${rc})" >&2
     [[ "${status}" -ne 0 ]] || status="${rc}"
   fi

@@ -75,7 +75,13 @@ Feature: Interactive dashboard
     When the user opens the dashboard
     And the user opens the Observe view
     Then the managed model is displayed
-    When the user quits the dashboard
+    When the user opens the managed services overlay
+    Then the Services overlay lists the managed model with its port
+    When the user asks to stop the listed service
+    Then a stop approval prompt names the managed model and its port
+    When the user declines the approval prompt
+    And the user closes the managed services overlay
+    And the user quits the dashboard
     Then the dashboard exits successfully
 
 
@@ -909,4 +915,311 @@ Feature: Interactive dashboard
     When the user opens the Observe view
     Then the CPU graph and the per-core strip sit side by side
     When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  Scenario: dash-52 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
+    Given a managed runtime is active
+    And the dashboard watches only managed services
+    And a GGUF model is being served on lemonade
+    Then the model responds to inference requests
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the real managed Lemonade model is displayed
+    When the user opens instance detail
+    Then the managed model's instance detail shows it ready on the port it was served on
+    When the user closes instance detail
+    And the user selects engine status in the Serving view
+    Then Lemonade is shown as a managed runtime installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the model responds to inference requests
+
+  @id:dash-lemonade-external-protocol-discovery @requires-os:linux
+  Scenario: dash-53 - External Lemonade protocol discovery displays every loaded model without adopting the service
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the user opens the managed services overlay
+    Then the Services overlay has no managed servers
+    When the user attempts to stop and restart the external models
+    Then the Services overlay closes without an approval prompt or job
+    And both loaded models are still displayed
+    And the external server received no lifecycle request and no managed record exists
+    When the user selects engine status in the Serving view
+    Then Lemonade is shown as externally running without a managed installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the external server received no lifecycle request and no managed record exists
+
+  @id:dash-lemonade-external-protocol-transitions @requires-os:linux
+  Scenario: dash-54 - External Lemonade protocol models disappear on unload, return on reload, and disappear again when the server stops responding
+    Given an external Lemonade server has two models loaded
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both loaded models are displayed with throughput shown as unknown
+    When the external Lemonade server unloads its second model
+    Then only the first model is displayed, with its throughput
+    When the external Lemonade server unloads every model
+    Then no loaded model is displayed and none are reported as discovered
+    When the external Lemonade server loads both models again
+    Then both loaded models are displayed with throughput shown as unknown
+    And the external server received no lifecycle request and no managed record exists
+    When the external Lemonade server stops responding
+    Then no loaded model is displayed and none are reported as discovered
+    When the user selects engine status in the Serving view
+    Then Lemonade returns to the managed installation status without external availability
+
+  # ROCMAI-1042: on a short terminal the Esc menu drew its bordered modal and
+  # nothing inside it — the wordmark plus all three rows did not fit, and the
+  # only guard was all-or-nothing. The selection stayed live behind the empty
+  # box, so ↑/↓ and Enter still worked on rows nobody could see.
+  #
+  # dash-34 already opens this menu, but only at the default geometry, where
+  # the logo layout fits and the bug is invisible. The unit sweep beside
+  # `ui/menu.rs` covers every height against the layout functions; this is the
+  # one place the real event loop, the real SIGWINCH resize and the real
+  # terminal are in the picture, which is where the empty box was actually
+  # seen.
+  #
+  # The box at this size holds two of the three rows, so what is asserted is
+  # the SELECTED row — drawn with its cursor and its whole label, before and
+  # after a move. That covers both halves of the fix: the fallback draws
+  # instead of returning, and its width floor keeps what it draws legible.
+  @id:dash-esc-menu-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-55 - The Esc menu still shows its selected action on a terminal too short for the logo
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user shrinks the terminal below the Esc menu's logo layout
+    And the user presses Escape
+    Then the dashboard menu shows Options as the selected action
+    When the user moves the dashboard menu selection down
+    Then the dashboard menu shows Help as the selected action
+    When the user presses Escape
+    Then the dashboard menu is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # Every live dashboard of a user shares one telemetry socket, and the daemon
+  # behind it runs inside whichever dashboard got there first. Closing that
+  # dashboard used to strand every other open one on "disconnected" until it
+  # was restarted; now a dashboard that is still open takes the daemon over
+  # and reconnects. Runs on the same simulated GPU-less host as dash-37, so
+  # the outcome does not depend on the runner's hardware. Unix only: there is
+  # no daemon socket on Windows.
+  @id:dash-second-session-survives-first-closing @requires-os:linux
+  Scenario: dash-56 - Closing one dashboard leaves another open dashboard connected
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the user opens a second dashboard
+    Then the second dashboard is connected to its telemetry daemon
+    When the user quits the first dashboard
+    Then the first dashboard exits successfully
+    And the second dashboard is connected to its telemetry daemon again
+
+  # A dashboard whose telemetry daemon cannot start says so once it closes,
+  # on the terminal it gives back, rather than inside the dashboard where the
+  # message would be drawn over. Something that is not a socket at the socket
+  # path is one such case: the daemon refuses to replace it, and the dashboard
+  # must say which path and why, and leave it alone. Same simulated GPU-less
+  # host as dash-37; Unix only, as there is no daemon socket on Windows.
+  @id:dash-reports-unusable-telemetry-socket-on-exit @requires-os:linux
+  Scenario: dash-57 - A dashboard whose telemetry daemon could not start says why after it closes
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # A daemon that takes over from one that stopped reads the benchmark results
+  # file from the start and sends a dashboard that connects to it every row
+  # again, so a dashboard that stays open through the hand-off must not add
+  # those rows to the ones it already lists. Same simulated GPU-less host as
+  # dash-37; Unix only, as there is no daemon socket on Windows.
+  @id:dash-handoff-lists-each-benchmark-result-once @requires-os:linux
+  Scenario: dash-58 - A dashboard that stays open through a hand-off lists each benchmark result once
+    Given a machine with no GPU
+    And two benchmark results have been recorded
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the user opens a second dashboard
+    And the user opens the Observe view of the second dashboard
+    Then the second dashboard lists each recorded benchmark result once
+    When the user quits the first dashboard
+    Then the first dashboard exits successfully
+    And the second dashboard is connected to its telemetry daemon again
+    And the second dashboard still lists each recorded benchmark result once
+
+  # A daemon that served and then stopped for good is reported as having
+  # stopped serving, not as unable to start. Its socket's directory becoming
+  # unreadable is one way: the daemon can no longer check that the path is its
+  # own and gives it up, and no client can reach it any more. A directory
+  # permission does not bind root, so `@requires-dir-permissions` skips this
+  # where the suite runs as root. Same simulated GPU-less host as dash-37.
+  @id:dash-reports-telemetry-daemon-that-stopped-serving @requires-os:linux @requires-dir-permissions
+  Scenario: dash-59 - A dashboard whose telemetry daemon stopped serving says so after it closes
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the folder holding the dashboard's telemetry socket stops being readable
+    And the dashboard stays open until its telemetry daemon stops serving
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the dashboard reports that its telemetry daemon stopped serving
+
+  # The same report when the dashboard is ended with Ctrl-C instead of quit.
+  # A typed Ctrl-C, like a SIGINT or SIGTERM, ends the process inside the
+  # dashboard, so nothing after it in `rocm dash` runs; the report is printed
+  # from that exit path instead, once the terminal is restored. Same setup as
+  # dash-57; the dashboard is drawn (and so in raw mode, where Ctrl-C is a key)
+  # before the keystroke is sent.
+  @id:dash-reports-unusable-telemetry-socket-on-ctrl-c @requires-os:linux
+  Scenario: dash-60 - A dashboard ended with Ctrl-C still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The same report when the dashboard is ended by a SIGTERM (a supervisor
+  # stopping it): the signal watcher ends the process inside the dashboard and
+  # prints the report from there, as for dash-60. Same setup as dash-57.
+  @id:dash-reports-unusable-telemetry-socket-on-sigterm @requires-os:linux
+  Scenario: dash-61 - A dashboard ended by a SIGTERM still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the dashboard receives a SIGTERM
+    Then the dashboard exits from the signal with code 143
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The same for an externally delivered SIGINT (`kill -INT`), which takes the
+  # signal watcher's path, not the typed Ctrl-C of dash-60. Same setup as
+  # dash-57.
+  @id:dash-reports-unusable-telemetry-socket-on-sigint @requires-os:linux
+  Scenario: dash-62 - A dashboard ended by a SIGINT still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the dashboard receives a SIGINT
+    Then the dashboard exits from the signal with code 130
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The launcher's "Serve a model" row opens a FOCUSED HOST — the serve form as
+  # the only thing in a window with no tab shell and no background
+  # (`run_focused`, `app/focus.rs`), which is a different route from every
+  # dash-45..dash-49 scenario above: those all open the full dashboard with
+  # demo data and reach the same form through the Observe tab's `w`. Nothing
+  # covered the launcher route, so the focused host's own close policy — the
+  # `q`/Esc gate in `focused_close_key_blocked` and the
+  # `focused_should_exit` ejection that hands control back to the menu — was
+  # only ever asserted by unit tests against the helpers.
+  #
+  # KNOWN GAP, and it is a real one rather than a covered case: this scenario
+  # does NOT reach the half of that policy that only shows up while a launch
+  # job is actually RUNNING in the console (Esc raising the leave
+  # confirmation, and approving it stopping the launch). It opens the form and
+  # backs straight out, so it passes whether or not that behaviour works.
+  # Reaching a running console means really spawning `rocm serve`, which on
+  # the no-GPU lane this scenario runs on is refused in well under a second
+  # (`serve-13`), so the console would already be terminal by the time a
+  # keystroke landed — and no step in this harness drives a launch through
+  # the wizard's console even on the GPU lane (dash-52 serves its model from
+  # a fixture, not from the form). So no lane, gated or not, can currently
+  # drive it. AGENTS.md's e2e rule lists three ways out — an existing
+  # scenario, a gated lane, or a purely internal change — and none of them is
+  # this one, so the rule is left UNDISCHARGED rather than satisfied. The
+  # behaviour is covered a level down, in `ui/serve_wizard.rs`'s
+  # `focused_host_leave_says_it_stops_the_launch_and_actually_stops_it`, which
+  # asserts the rendered wording and the job's fate in one test — which that
+  # same rule says is not a substitute. Closing this needs harness work to
+  # drive a launch through the form on a GPU lane.
+  #
+  # What is asserted here is the route and the window it opens in: the form
+  # arrives with the focused host's own "Esc  back to menu" footer (drawn by
+  # `ui::draw_focused`, which the full dashboard never draws), and Esc at the
+  # form's root really does return to the front door rather than quitting the
+  # process.
+  @id:dash-launcher-serve-row-opens-a-focused-window @requires-os:linux
+  Scenario: dash-63 - Serving a model from the launcher opens the form in its own window and Escape returns to the menu
+    When the user opens the launcher
+    And the user chooses to serve a model from the launcher
+    Then the serve form is shown in a window that offers the way back to the menu
+    When the user presses Escape
+    Then the launcher front door is displayed
+    When the user quits the launcher
+    Then the launcher exits successfully
+
+
+  # ROCMAI-1050: at a short window height the prompt painted the
+  # "<model> — stop it first:" bullet and cut the command on the line directly
+  # beneath it, with nothing on screen saying anything had been dropped — the
+  # dashboard named a remedy it did not show. `dash-26` pins the same
+  # assertion at the default geometry; this is the short-window case, which is
+  # where the line was actually lost.
+  @id:dash-quit-confirm-survives-a-short-terminal @requires-os:linux
+  Scenario: dash-64 - The quit prompt still shows the stop command on a short terminal
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
+
+  # ROCMAI-1050's other half, and the one dash-64 cannot reach. Growing the
+  # popup only fixes the bodies that now fit; a body that still does not fit
+  # must SAY so and name the keys that move it, or a silent cut is
+  # indistinguishable from the original bug — the dashboard naming a remedy it
+  # does not show. Two served models at twelve rows is past what even the grown
+  # popup holds, so this is the overflow case on real geometry rather than a
+  # fabricated one. The unit test
+  # `a_body_that_still_overflows_says_so_and_names_the_keys`
+  # pins the same rule against a synthetic body; this proves a user can actually
+  # reach it.
+  @id:dash-quit-confirm-overflow-names-its-keys @requires-os:linux
+  Scenario: dash-65 - A quit prompt too tall for the window says so and names the keys that scroll it
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When another managed model is served
+    Then the other managed model is displayed
+    When the user shrinks the terminal to a short window
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt says there is more to read and names the keys that scroll it
+    When the user declines the quit prompt
+    And the user quits the dashboard
+
+  # ROCMAI-1288: with Caps Lock on, the terminal sends the uppercase letter, and
+  # the letter shortcuts matched only the lowercase one, so `S` did not open the
+  # services manager and `Q` did not quit. A PTY cannot toggle Caps Lock; the
+  # steps send the uppercase byte, which is what the terminal delivers with it on.
+  @id:dash-caps-lock-letter-shortcuts @requires-os:linux
+  Scenario: dash-66 - Letter shortcuts still work with Caps Lock on
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the services manager with Caps Lock on
+    Then the services manager is displayed
+    When the user presses Escape
+    Then the services manager is closed
+    When the user quits the dashboard with Caps Lock on
     Then the dashboard exits successfully

@@ -32,6 +32,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::shortcut_key;
 
 /// A flattened background-check entry for the list. Mirrors the bin's
 /// `BuiltinWatcherSpec` (+ enabled/mode from config) with no `rocm-core` dep.
@@ -132,7 +133,7 @@ pub fn on_key(
     }
 
     // 3) List navigation + actions.
-    match key.code {
+    match shortcut_key(key.code) {
         KeyCode::Esc | KeyCode::Char('q') => *am = None,
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
             a.selected = a.selected.saturating_sub(1);
@@ -340,7 +341,7 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::test_support::press as key;
+    use crate::app::test_support::{caps, press as key};
     use crossterm::event::KeyCode;
 
     fn automations() -> Vec<AutomationSummary> {
@@ -475,6 +476,26 @@ mod tests {
         on_key(&mut am, &[], &mut jobs, key(KeyCode::Char('l')));
         on_key(&mut am, &[], &mut jobs, key(KeyCode::Char('q')));
         assert!(am.is_none());
+    }
+
+    #[test]
+    fn caps_lock_letters_trigger_the_same_shortcuts() {
+        let ws = automations();
+        let mut jobs = State::default();
+        let mut am = Some(AutomationsManagerState::default());
+        on_key(&mut am, &ws, &mut jobs, caps('J'));
+        assert_eq!(am.as_ref().unwrap().selected, 1, "J must move down");
+        on_key(&mut am, &ws, &mut jobs, caps('K'));
+        assert_eq!(am.as_ref().unwrap().selected, 0, "K must move up");
+        on_key(&mut am, &ws, &mut jobs, caps('Q'));
+        assert!(am.is_none(), "Q must close the overlay");
+        let mut am = Some(AutomationsManagerState::default());
+        on_key(&mut am, &ws, &mut jobs, caps('L'));
+        assert_eq!(
+            am.as_ref().unwrap().active_job.as_deref(),
+            Some("automations-list"),
+            "L must refresh"
+        );
     }
 
     #[test]

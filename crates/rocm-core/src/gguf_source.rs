@@ -500,11 +500,16 @@ impl LiveGgufSource {
         }
     }
 
-    /// The same source with a shorter total budget, so a test can show the
-    /// reader is bound by the deadline `open` sets rather than by a fresh one.
-    #[cfg(test)]
+    /// The same source with a different total budget.
+    ///
+    /// [`TOTAL_BUDGET`] is sized for a command the user ran to get this answer
+    /// and is waiting on. A caller reading a header as a best-effort step in
+    /// front of something else — where failing costs nothing but the better
+    /// answer — wants a far shorter one, so that an unreachable hub cannot hold
+    /// its real work for two minutes. Tests also use it to show the reader is
+    /// bound by the deadline `open` sets rather than by a fresh one.
     #[must_use]
-    const fn with_budget(mut self, budget: Duration) -> Self {
+    pub const fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
         self
     }
@@ -579,14 +584,11 @@ impl LiveGgufSource {
 
 /// Whether a file name from a repository listing may be requested and shown: no
 /// empty, `.` or `..` path segment, and no character that changes how a terminal
-/// shows the text around it: the predicates in `terminal` decide which, so this
-/// and the other untrusted text the CLI prints are held to one set.
+/// shows the text around it, or that it does not show at all:
+/// `terminal::is_display_altering` decides which.
 fn is_safe_listed_name(name: &str) -> bool {
     !name.is_empty()
-        && !name.chars().any(|c| {
-            crate::terminal::is_control_or_format(c)
-                || crate::terminal::is_control_or_line_separator(c)
-        })
+        && !name.chars().any(crate::terminal::is_display_altering)
         && name
             .split('/')
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
@@ -1052,6 +1054,11 @@ mod tests {
             "m-Q4_K_M\u{2064}.gguf",
             "m-Q4\u{00AD}_K_M.gguf",
             "m-Q4_K_M\u{E0041}.gguf",
+            // Invisible but outside `Cf`, which the shared predicate adds:
+            // a Hangul filler draws as blank space, a variation selector draws
+            // nothing.
+            "m-Q4_K_M\u{3164}.gguf",
+            "m-Q4_K_M\u{FE0F}.gguf",
         ] {
             assert!(!is_safe_listed_name(name), "{name:?}");
         }

@@ -4,16 +4,23 @@
 
 //! The checks on the engine runtime that run on Linux and WSL2: the vLLM
 //! out-of-memory and import failures, a second copy of the code object manager,
-//! and a `/dev/shm` too small for a serving workload, with the two canonical
-//! symptom strings the vLLM engine falls back to. The classifiers the engine
-//! calls (`vllm_oom_symptom_is_diagnosable` and its import sibling) run the whole
-//! catalog, so they live in the module root rather than here.
+//! a `/dev/shm` too small for a serving workload, and a vLLM compiled extension
+//! that failed to load, with the canonical symptom strings the vLLM engine
+//! falls back to. The classifiers the engine calls
+//! (`vllm_oom_symptom_is_diagnosable` and its siblings) run the whole catalog,
+//! so they live in the module root rather than here.
 
 use super::scoring::{
     KEYWORDS_COMGR_CONFLICT, KEYWORDS_SHM_TOO_SMALL, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT,
-    KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, zero,
+    KEYWORDS_VLLM_OOM, finalize, keyword_score, keyword_score_collapsing_overlaps, symptom_matches,
+    vllm_extension_load_keywords, zero,
 };
-use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH};
+// Only `check_23_vllm_extension_load`'s tests reach for the whole table; the
+// check itself goes through `vllm_extension_load_keywords`, which is what
+// applies the anchor rule.
+#[cfg(test)]
+use super::scoring::KEYWORDS_VLLM_EXTENSION_LOAD;
+use super::{Diagnosis, Fix, MIN_SCORE_FOR_MATCH, SymptomEngine};
 use crate::examine::Examination;
 use regex::Regex;
 
@@ -34,6 +41,9 @@ use regex::Regex;
 /// `matched` but can never carry a verdict, and it can no longer lend its anchor
 /// to an OOM elsewhere in the paste. It stays an anchor because the flag is
 /// vLLM-specific, and because a real vLLM OOM often names it on the failing line.
+/// None of this applies when the user names vLLM with `rocm diagnose --engine`:
+/// every non-blank line is then vLLM's by their account, and the anchor plays
+/// no part.
 const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 
 /// A canonical vLLM-OOM `--symptom` string guaranteed to clear
@@ -52,7 +62,8 @@ const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
 
 /// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
-/// `gpu_memory_utilization`), joined by newlines — the only text
+/// `gpu_memory_utilization`), joined by newlines — or every non-blank line when
+/// the user named vLLM as the engine (`engine`, below). That is the only text
 /// [`check_16_vllm_oom`] is allowed to score.
 ///
 /// Co-occurrence anywhere in a pasted log is too loose -- a stray `vllm` mention
@@ -114,13 +125,29 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// silently stops diagnosing it (measured: 95 → 0).
 ///
 /// `\r\n` yields an empty segment, which carries no anchor and is dropped.
-fn vllm_anchored_lines(symptom: &str) -> String {
+///
+/// `engine` is the engine the user said the paste came from. With
+/// [`SymptomEngine::Vllm`] the whole paste is vLLM's by the user's own
+/// account, so every non-blank rendered line counts as anchored, as if the
+/// user had written `vllm` at the start of each of those lines, without
+/// editing their text. Blank lines are dropped, where a prefix would keep them;
+/// a blank line scores nothing either way, so the verdict is the same.
+/// The split still applies then, so a pattern cannot straddle two rendered
+/// lines either way.
+fn vllm_anchored_lines(symptom: &str, engine: Option<SymptomEngine>) -> String {
     let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
         return String::new();
     };
+    let stated_vllm = engine == Some(SymptomEngine::Vllm);
     crate::terminal::rendered_lines(symptom)
         .into_iter()
-        .filter(|line| anchor.is_match(&line.to_lowercase()))
+        .filter(|line| {
+            if stated_vllm {
+                !line.trim().is_empty()
+            } else {
+                anchor.is_match(&line.to_lowercase())
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -129,15 +156,27 @@ fn vllm_anchored_lines(symptom: &str) -> String {
 /// per-GPU VRAM or tenancy fields, so nothing structural can corroborate this —
 /// the user must pass the error via `--symptom`, or arrive from the serve
 /// failure note that points here. `e` is therefore unused.
-pub(super) fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
-    // Score the anchored lines only, never the whole paste. The anchor is the
-    // *only* thing separating this failure mode from any other framework's
-    // PyTorch/HIP OOM, so a boolean gate over the whole symptom is not enough:
-    // keyword hits from unanchored lines would still count at full weight. Any
-    // future change here must keep the scored text restricted to anchored lines.
-    let anchored = vllm_anchored_lines(symptom);
+///
+/// `engine` is the engine the user named with `rocm diagnose --engine`. Naming
+/// vLLM stands in for the anchor on every non-blank line (see
+/// [`vllm_anchored_lines`]).
+pub(super) fn check_16_vllm_oom(
+    _e: &Examination,
+    symptom: &str,
+    engine: Option<SymptomEngine>,
+) -> Diagnosis {
+    // Score the anchored lines only, never the whole paste -- unless the user
+    // named vLLM with `--engine`, when every non-blank line is vLLM's by their
+    // account and all of them are scored. Otherwise the anchor is the *only* thing
+    // separating this failure mode from any other framework's PyTorch/HIP OOM,
+    // so a boolean gate over the whole symptom is not enough: keyword hits from
+    // unanchored lines would still count at full weight. Any future change here
+    // must keep the scored text restricted to anchored lines whenever the user
+    // did not name the engine.
+    let anchored = vllm_anchored_lines(symptom, engine);
     if anchored.is_empty() {
-        // No vLLM anchor anywhere: don't attribute a bare framework OOM to vLLM.
+        // No vLLM anchor anywhere, and the user did not say the paste was
+        // vLLM's: don't attribute a bare framework OOM to vLLM.
         return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
     }
     let (score, evidence) = keyword_score_collapsing_overlaps(&anchored, KEYWORDS_VLLM_OOM);
@@ -433,9 +472,12 @@ pub(super) fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str
 /// The shared-memory allowance below which a serving workload is in trouble.
 ///
 /// Chosen to separate the failure from the healthy majority rather than to
-/// describe what a workload wants. A container's default is 64 MB; an ordinary
-/// Linux host gives `/dev/shm` half its RAM, clearing this on anything with 2 GB
-/// or more. WSL2 ships the same 64 MB default a container does.
+/// describe what a workload wants. An ordinary Linux host, and WSL2 inside its
+/// VM, gives `/dev/shm` half the memory the kernel reports as `MemTotal`; a
+/// container's default is 64 MB. So this fires when `MemTotal` is under 2 GiB
+/// (the kernel keeps part of what it is given, so a machine or VM given about
+/// 2 GB or less is below that), inside a container, or after a remount shrinks
+/// it.
 ///
 /// This deliberately under-reports. A container given 2 GB is still short for a
 /// large model and will not be flagged here. That is the right way to be wrong:
@@ -531,11 +573,141 @@ pub(super) fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosi
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+/// A canonical `--symptom` string for a vLLM compiled extension that failed to
+/// load.
+///
+/// Guaranteed to clear [`MIN_SCORE_FOR_MATCH`] against
+/// [`KEYWORDS_VLLM_EXTENSION_LOAD`](super::scoring::KEYWORDS_VLLM_EXTENSION_LOAD).
+///
+/// The real line quotes the namespace and the op name, and a `'` cannot sit
+/// inside a single-quoted shell argument, so the engine's hint always falls back
+/// to this. It is the real line with those quotes removed.
+///
+/// The leading `vllm:` is load-bearing, not decoration. The `_OpNamespace` shape
+/// is only scored behind [`VLLM_EXTENSION_ANCHOR_PATTERN`], and the real line's
+/// own anchor is its `(EngineCore pid=…)` prefix, which this stripped-down
+/// rendering does not carry — without the token the command the engine prints
+/// for the user to paste would report nothing. It is spelled with no quote
+/// characters for the same reason the rest of the string is: this constant
+/// exists precisely because a `'` cannot sit inside a single-quoted shell
+/// argument (`canonical_vllm_extension_load_symptom_is_diagnosable` asserts
+/// both halves).
+pub const VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM: &str =
+    "vllm: AttributeError: _OpNamespace _C object has no attribute get_cuda_view_from_cpu_tensor";
+
+/// A required anchor before the `_OpNamespace` keyword in
+/// [`KEYWORDS_VLLM_EXTENSION_LOAD`](super::scoring::KEYWORDS_VLLM_EXTENSION_LOAD)
+/// is scored at all.
+///
+/// `_C` is the ordinary name for a compiled extension across the whole PyTorch
+/// ecosystem — torchvision, xformers, bitsandbytes, apex, detectron2 and mmcv
+/// all ship one, and all raise the identical
+/// `AttributeError: '_OpNamespace' '_C' object has no attribute '<op>'` when
+/// theirs fails to load. Without an anchor that single line cleared
+/// [`MIN_SCORE_FOR_MATCH`] by itself, so `rocm diagnose --symptom` handed any of
+/// them vLLM's plan. The entries beyond that one need no anchor: each either
+/// spells `vllm` in its own pattern or is sub-threshold on its own (see
+/// [`vllm_extension_load_keywords`]).
+///
+/// **This is gated over the whole symptom, unlike [`check_16_vllm_oom`], which
+/// scores only [`vllm_anchored_lines`].** The difference is in what is being
+/// anchored. There the keywords are generic OOM text that another framework
+/// emits verbatim, so a stray `vllm` elsewhere in a paste is enough to
+/// misattribute a `llama.cpp` OOM, and the anchor has to hold line by line.
+/// Here the keyword is a specific namespace shape, and in a genuine report
+/// vLLM's identity is on *neighbouring* frames (`vllm/_custom_ops.py`), never on
+/// the `AttributeError` line itself — a per-line rule zeroes the real failure
+/// and stops diagnosing it. The cost of the looser rule is bounded in the same
+/// direction: another framework's `_C` error pasted inside a log that also names
+/// vLLM can still reach this entry, which is a far rarer paste than the bare
+/// error this now rejects.
+///
+/// The module names are anchors in their own right (`_rocm_C`, `_moe_C`,
+/// `_C_cache_ops`, `_C_stable_libtorch` are vLLM's and nobody else's), and so is
+/// `EngineCore`, vLLM's own process name — which is what admits the real log
+/// line, whose only vLLM token is that prefix. `_C` alone is deliberately absent.
+///
+/// `\b` on the module-name alternatives so each matches a whole token rather
+/// than a prefix of a longer one: without it `_rocm_c` also matched
+/// `_rocm_config`, which is nobody's vLLM extension.
+///
+/// `get_cuda_view_from_cpu_tensor` is an anchor in its own right. It is an op
+/// that `vllm._C_stable_libtorch` registers and nothing else does, so a paste
+/// naming it is identified as vLLM's even with no `vllm` token anywhere. It
+/// also has to be one: the scorer sums the top TWO keyword weights, so leaving
+/// it in the unanchored slice let it pair with the generic
+/// `GLIBC_2.NN not found` entry (30 + 30 = 60) and clear the 50-point threshold
+/// with nothing vLLM-specific present. Moving it here closes that, and
+/// `an_unanchored_paste_cannot_reach_the_threshold_by_summing` keeps it closed.
+const VLLM_EXTENSION_ANCHOR_PATTERN: &str = r"vllm|enginecore|get_cuda_view_from_cpu_tensor|\b_rocm_c\b|\b_moe_c\b|\b_c_cache_ops\b|\b_c_stable_libtorch\b";
+
+/// A vLLM compiled extension failed to load, so an op it registers is missing
+/// from `torch.ops` (ROCMAI-1058).
+///
+/// Keyword-only, for the reason [`check_17_torch_dlpack_cuda_variant`] gives:
+/// the deciding facts (which extension failed, and why) live in the managed
+/// runtime and in the engine's log, not in the `Examination`.
+///
+/// The failure surfaces far from its cause. vLLM imports some extensions inside
+/// a `try` that only logs a warning, so the engine starts, and dies only when an
+/// op that extension registers is first called. The plan therefore starts by
+/// importing every extension by hand, which turns the warning back into the
+/// loader's own error, and acts on what that error names.
+pub(super) fn check_23_vllm_extension_load(_e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-23-vllm-extension-load";
+    const TITLE: &str = "vLLM compiled extension failed to load, so an op it registers is missing";
+
+    // Which keywords may be scored depends on whether anything in the paste
+    // identifies vLLM; see `VLLM_EXTENSION_ANCHOR_PATTERN` for why the gate
+    // selects a subset of the table rather than refusing to score at all. The
+    // weak signals stay scoreable either way, so a bare glibc error still
+    // surfaces as the sub-threshold noise it is instead of disappearing.
+    let anchored = symptom_matches(symptom, VLLM_EXTENSION_ANCHOR_PATTERN);
+    let (score, evidence) = keyword_score(symptom, vllm_extension_load_keywords(anchored));
+    if score <= 0 {
+        return zero(ID, TITLE);
+    }
+    let fix = Fix {
+        summary: "Import vLLM's compiled extensions by hand in the engine's environment to get the loader's own error, then act on what it names: a glibc older than the wheel needs, or a missing system library.".to_owned(),
+        commands: vec![
+            "# --- step 1 of 3, in YOUR shell ---".to_owned(),
+            "# Opens an INTERACTIVE subshell with the engine's environment active,".to_owned(),
+            "# and does not return until you leave it. Run this line on its own.".to_owned(),
+            "rocm engines shell vllm".to_owned(),
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---".to_owned(),
+            "# Import every vLLM op library. The first one that fails raises the".to_owned(),
+            "# loader's error, which vLLM itself only logged as a warning.".to_owned(),
+            "python -c \"import importlib, pathlib, torch, vllm; [importlib.import_module('vllm.' + p.name.split('.')[0]) for p in sorted(pathlib.Path(vllm.__file__).parent.glob('_*.so'))]; print('every vllm extension loads')\"".to_owned(),
+            "# The C library version this host has:".to_owned(),
+            "ldd --version | head -n 1".to_owned(),
+            "# Then leave the subshell:".to_owned(),
+            "exit".to_owned(),
+            "# --- step 3 of 3, back in YOUR OWN shell ---".to_owned(),
+            "# If the error says version `GLIBC_2.NN' not found, the wheel was built".to_owned(),
+            "# against a newer glibc than this host has. Run the engine on a distro".to_owned(),
+            "# whose glibc is at least 2.NN (Ubuntu 24.04 ships 2.39), on the host,".to_owned(),
+            "# in a container or in a WSL distro.".to_owned(),
+            "# If it says a library cannot be opened, install the distro package".to_owned(),
+            "# that provides that library.".to_owned(),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "rocm serve <model> --engine vllm".to_owned(),
+        notes: vec![
+            "vLLM logs the cause near the top of the startup log, as a warning that starts with `Failed to import from vllm.`, and carries on. The AttributeError comes later, from the first call to an op that extension registers.".to_owned(),
+            "Reinstalling the engine fetches the same wheel, built against the same glibc, so it does not fix a glibc version error.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diagnose::test_support::{linux_base, wsl_base};
-    use crate::diagnose::{DiagnoseReport, HIGH_CONFIDENCE, diagnose};
+    use crate::diagnose::{
+        DiagnoseReport, HIGH_CONFIDENCE, diagnose, diagnose_with_engine, render_report_text,
+    };
 
     fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
         report
@@ -546,9 +718,9 @@ mod tests {
 
     #[test]
     fn a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs() {
-        // The container default, which is also what WSL2 ships. The point of the
-        // entry is that it fires on machine state alone: the crash this prevents
-        // never names shared memory, so a user who pasted it would get nothing.
+        // The container default. The point of the entry is that it fires on
+        // machine state alone: the crash this prevents never names shared
+        // memory, so a user who pasted it would get nothing.
         let mut e = linux_base();
         e.shm_total_bytes = Some(64 * 1024 * 1024);
         e.shm_available_bytes = Some(64 * 1024 * 1024);
@@ -768,6 +940,64 @@ mod tests {
             "8 GiB is what the catalog itself tells users to ask for"
         );
     }
+
+    #[test]
+    fn on_wsl2_the_shm_finding_follows_the_measured_allowance_not_a_container_default() {
+        // WSL2 mounts /dev/shm as a tmpfs with no size= option, so it gets the
+        // kernel default of half the VM's memory: 24 GiB on a 48 GiB VM. It is
+        // short only when it has been shrunk -- a small VM, a remount, or a
+        // container inside the distro -- and the checker reads the measured size,
+        // so the reason `rocm fix` prints has to say the same thing.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let wsl_with = |total: u64| {
+            let mut e = wsl_base();
+            e.shm_total_bytes = Some(total);
+            e.shm_available_bytes = Some(total);
+            diagnose(&e, "")
+        };
+
+        assert!(
+            shm_finding(&wsl_with(24 * GIB)).is_none(),
+            "a WSL2 distro with its usual allowance has nothing to report"
+        );
+        assert!(
+            shm_finding(&wsl_with(GIB / 2)).is_some(),
+            "a shrunk allowance must still be reported on WSL2; the scope stays \
+             [\"linux\", \"wsl\"]"
+        );
+
+        let rationale =
+            crate::fix::recipe_rationale("fix-19-shm-too-small").expect("fix-19 is in the catalog");
+        // A wording pin: it proves what the rationale says, not that it is
+        // true. The reason's only statement about WSL2 has to be the pinned
+        // sentence -- it contains `FIX_19_WSL2_SENTENCE`, and mentions WSL
+        // nowhere else. What shows the sentence true: "half the VM's memory" is
+        // measured on a real distro by the Given of e2e scenario diagnose-88, "a
+        // WSL machine whose shared memory is the usual half of its memory" (df
+        // against /proc/meminfo); "can still be short" is shown by the 0.5 GiB
+        // assertion above and by
+        // `a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs`.
+        // Rewording the rationale means updating `FIX_19_WSL2_SENTENCE` here and
+        // its copy in tests/e2e-cucumber/tests/e2e/diagnose_steps.rs.
+        assert!(
+            rationale.contains(FIX_19_WSL2_SENTENCE),
+            "the reason's only statement about WSL2 has to be the pinned one, half \
+             the VM's memory:\n{FIX_19_WSL2_SENTENCE}\n\n{rationale}"
+        );
+        assert_eq!(
+            rationale.to_lowercase().matches("wsl").count(),
+            FIX_19_WSL2_SENTENCE.to_lowercase().matches("wsl").count(),
+            "the reason's only statement about WSL2 has to be the pinned one, half \
+             the VM's memory; it mentions WSL elsewhere too:\n{rationale}"
+        );
+    }
+
+    /// The sentence of fix-19's rationale that says what WSL2 gives `/dev/shm`.
+    /// A pin, duplicated as `FIX_19_WSL2_SENTENCE` in
+    /// tests/e2e-cucumber/tests/e2e/diagnose_steps.rs; change both together.
+    const FIX_19_WSL2_SENTENCE: &str = "WSL2 normally gives /dev/shm half the VM's memory, \
+        but it can still be short there inside a container, in a VM given little memory, or \
+        after a remount.";
 
     #[test]
     fn a_healthy_managed_installation_raises_no_report() {
@@ -1212,6 +1442,301 @@ mod tests {
         assert!(!report.has_match());
     }
 
+    /// The scored part of a report: which entries matched, how strongly, and on
+    /// what evidence. Everything a caller acts on, without the provenance.
+    fn verdict(report: &DiagnoseReport) -> Vec<(String, i32, Vec<String>)> {
+        report
+            .matched
+            .iter()
+            .map(|d| (d.id.clone(), d.score, d.evidence.clone()))
+            .collect()
+    }
+
+    /// ROCMAI-955: naming the engine is the replacement for the `vllm: ` prefix
+    /// the rocm-doctor skill tells an agent to write into the user's paste (the
+    /// skill moves to `--engine` in a later change). It has to match exactly as
+    /// the prefixed text does, on both families vLLM runs on, while the
+    /// unprefixed paste on its own still does not match.
+    #[test]
+    fn naming_vllm_matches_the_paste_as_the_vllm_prefix_did() {
+        let paste = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB";
+        for host in [linux_base(), wsl_base()] {
+            let named = diagnose_with_engine(&host, paste, Some(SymptomEngine::Vllm));
+            let prefixed = diagnose(&host, &format!("vllm: {paste}"));
+            assert_eq!(verdict(&named), verdict(&prefixed));
+            assert_eq!(named.has_match, prefixed.has_match);
+            let oom = named
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-16-vllm-oom")
+                .expect("naming vLLM must reach the vLLM OOM entry");
+            assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+            assert!(
+                diagnose(&host, paste)
+                    .matched
+                    .iter()
+                    .all(|d| d.id != "fix-16-vllm-oom"),
+                "without the engine the bare paste must still not be attributed to vLLM"
+            );
+        }
+    }
+
+    /// A pasted log, not one line: with vLLM named, every non-blank line is
+    /// vLLM's, so the result is that of `vllm` written on each of them -- not
+    /// only on the first, which is all a prefix on the paste ever anchored.
+    #[test]
+    fn naming_vllm_anchors_every_line_of_a_multi_line_paste() {
+        let lines = [
+            "INFO 11-11 10:00:00 Loading model weights took 14.9 GiB",
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        ];
+        let named =
+            diagnose_with_engine(&linux_base(), &lines.join("\n"), Some(SymptomEngine::Vllm));
+        let every_line_prefixed = diagnose(
+            &linux_base(),
+            &lines
+                .iter()
+                .map(|line| format!("vllm: {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert_eq!(verdict(&named), verdict(&every_line_prefixed));
+        assert!(
+            named
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-16-vllm-oom" && d.score >= HIGH_CONFIDENCE)
+        );
+    }
+
+    /// Naming the engine is provenance for the vLLM entry only: an unrelated
+    /// failure is diagnosed exactly as without it, and on native Windows, where
+    /// the vLLM engine does not run, it still produces no vLLM verdict.
+    #[test]
+    fn naming_vllm_changes_nothing_but_the_vllm_entry() {
+        let isa = "HSA_STATUS_ERROR_INVALID_ISA";
+        assert_eq!(
+            verdict(&diagnose_with_engine(
+                &linux_base(),
+                isa,
+                Some(SymptomEngine::Vllm)
+            )),
+            verdict(&diagnose(&linux_base(), isa))
+        );
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let oom = "torch.OutOfMemoryError: HIP out of memory";
+        let named = diagnose_with_engine(&windows, oom, Some(SymptomEngine::Vllm));
+        assert!(named.matched.iter().all(|d| d.id != "fix-16-vllm-oom"));
+        assert_eq!(verdict(&named), verdict(&diagnose(&windows, oom)));
+    }
+
+    /// The report says which engine the user named and carries the symptom
+    /// byte for byte -- control bytes and all -- and says nothing of either
+    /// when no engine was named, so a report without one gains no field.
+    #[test]
+    fn the_report_records_the_named_engine_and_the_symptom_verbatim() {
+        let paste = "  torch.OutOfMemoryError: HIP out of memory\r\n\u{1b}[31mTried\u{1b}[0m  ";
+        let named = diagnose_with_engine(&linux_base(), paste, Some(SymptomEngine::Vllm));
+        let json = serde_json::to_value(&named).expect("a report serializes");
+        assert_eq!(json["provenance"]["engine"], "vllm");
+        assert_eq!(json["provenance"]["symptom"], paste);
+
+        let unnamed = serde_json::to_value(diagnose(&linux_base(), paste)).unwrap();
+        assert!(
+            unnamed.get("provenance").is_none(),
+            "a report with no engine named must not grow the field: {unnamed}"
+        );
+    }
+
+    /// ROCMAI-955 review: the `--json` the CLI prints is ASCII on the wire, yet
+    /// the paste in it is the paste, exactly. A JSON parser reading the escaped
+    /// document back gets the original bytes; nothing was stripped or
+    /// transliterated. And a document with nothing to escape is byte-for-byte
+    /// what plain pretty `serde_json` would have printed.
+    #[test]
+    fn a_non_ascii_paste_round_trips_through_the_json_exactly() {
+        use crate::diagnose::render_report_json;
+        use crate::diagnose::test_support::NON_ASCII_PASTE;
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        for host in [linux_base(), wsl_base(), windows] {
+            let report = diagnose_with_engine(&host, NON_ASCII_PASTE, Some(SymptomEngine::Vllm));
+            let json = render_report_json(&report).expect("the report renders");
+            assert!(json.is_ascii(), "{json}");
+            // The emoji is beyond the Basic Multilingual Plane, so it travels
+            // as a UTF-16 surrogate pair, the form every JSON parser accepts.
+            let backslash = char::from(92_u8);
+            let surrogate_pair = format!("{backslash}ud83d{backslash}udd25");
+            assert!(json.contains(&surrogate_pair), "{json}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("the escaped document is valid JSON");
+            assert_eq!(
+                parsed["provenance"]["symptom"].as_str().map(str::as_bytes),
+                Some(NON_ASCII_PASTE.as_bytes()),
+                "the paste must come back byte for byte"
+            );
+            assert_eq!(
+                serde_json::from_str::<DiagnoseReport>(&json)
+                    .expect("it reads back as a report")
+                    .provenance
+                    .map(|p| p.symptom),
+                Some(NON_ASCII_PASTE.to_owned())
+            );
+        }
+
+        let ascii_only = diagnose(&linux_base(), "torch.OutOfMemoryError");
+        assert_eq!(
+            render_report_json(&ascii_only).expect("the report renders"),
+            serde_json::to_string_pretty(&ascii_only).unwrap(),
+            "escaping must not change a document that has nothing to escape"
+        );
+    }
+
+    /// `SymptomEngine::name()` (what the text report prints) and the serde name
+    /// (what `provenance.engine` holds) are one contract, for every variant.
+    /// `every_engine` is checked against the enum by an exhaustive `match`, so
+    /// a new variant fails to compile until it is listed there.
+    #[test]
+    fn every_engine_name_is_its_serialized_name() {
+        for engine in crate::diagnose::test_support::every_engine() {
+            assert_eq!(
+                serde_json::to_value(engine).expect("an engine serializes"),
+                serde_json::Value::from(engine.name()),
+                "{engine:?}"
+            );
+        }
+    }
+
+    /// The text report opens with the engine `--engine` named, and on a
+    /// platform where no entry reads it (native Windows, and a platform the
+    /// catalog does not cover) says the flag changed nothing. The line is
+    /// checked against the behaviour it describes: where it says nothing
+    /// changed, the diagnosis equals the one without the flag, and where it
+    /// says the symptom was read as vLLM's, a vLLM paste does differ. Read as,
+    /// not matched as: an unrelated or empty paste is read the same way and
+    /// matches nothing for vLLM, which the last rows pin.
+    #[test]
+    fn the_text_report_says_which_engine_was_named_and_whether_it_counted() {
+        let oom = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB";
+        let windows = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let uncovered = Examination {
+            os_family: "freebsd".to_owned(),
+            ..Examination::default()
+        };
+        let nothing_changed = "no entry for vllm exists on this OS, so the flag changed nothing";
+        for (label, host, read) in [
+            ("linux", linux_base(), true),
+            ("wsl", wsl_base(), true),
+            ("windows", windows, false),
+            ("uncovered", uncovered, false),
+        ] {
+            let named = diagnose_with_engine(&host, oom, Some(SymptomEngine::Vllm));
+            let text = render_report_text(&named, 5);
+            let first = text.lines().next().unwrap_or_default();
+            assert!(
+                first.starts_with("Engine: vllm (named with --engine;"),
+                "{label}: the text report must open with the named engine:\n{text}"
+            );
+            assert_eq!(
+                first.contains(nothing_changed),
+                !read,
+                "{label}: wrong claim about whether the flag counted: {first}"
+            );
+            assert_eq!(
+                verdict(&named) == verdict(&diagnose(&host, oom)),
+                !read,
+                "{label}: the line must agree with what the flag did to the diagnosis"
+            );
+            // The line is added above the report and takes nothing from it:
+            // the per-cause `source:` notes and everything else render as they
+            // would for the same diagnosis with no engine line.
+            let without_line = DiagnoseReport {
+                provenance: None,
+                ..named.clone()
+            };
+            assert_eq!(
+                text.strip_prefix(first)
+                    .and_then(|rest| rest.strip_prefix("\n\n")),
+                Some(render_report_text(&without_line, 5).as_str()),
+                "{label}: the engine line must sit above the report and change nothing in it"
+            );
+        }
+        // A Linux host with a host-state finding (both GPU groups missing) that
+        // the paste does not touch: the `source:` note marks that cause, and
+        // sits in the same report as the engine line.
+        let mut groups_missing = linux_base();
+        groups_missing.in_render_group = Some(false);
+        groups_missing.in_video_group = Some(false);
+        let linux_text = render_report_text(
+            &diagnose_with_engine(&groups_missing, oom, Some(SymptomEngine::Vllm)),
+            50,
+        );
+        assert!(
+            linux_text.starts_with("Engine: vllm")
+                && linux_text.contains(crate::diagnose::SYMPTOM_DID_NOT_CONTRIBUTE_NOTE),
+            "the engine line and the per-cause source note must both appear:\n{linux_text}"
+        );
+
+        assert!(
+            !render_report_text(&diagnose(&linux_base(), oom), 5).contains("Engine:"),
+            "no engine named, no line"
+        );
+
+        // The missing row of the matrix: the engine is named on a host whose
+        // catalog reads it, but nothing for vLLM is in the paste. The line says
+        // how the symptom was read, which is still true, and claims no match --
+        // and the report holds no vLLM cause beside it.
+        let read_line = "Engine: vllm (named with --engine; every non-blank line of the symptom \
+                         was read as vllm's).";
+        for (label, paste) in [
+            (
+                "unrelated paste",
+                "Traceback (most recent call last):\n  File \"train.py\", line 3, in <module>\n\
+                 ZeroDivisionError: division by zero",
+            ),
+            ("empty paste", ""),
+        ] {
+            let named = diagnose_with_engine(&linux_base(), paste, Some(SymptomEngine::Vllm));
+            let text = render_report_text(&named, 50);
+            assert_eq!(text.lines().next(), Some(read_line), "{label}:\n{text}");
+            assert!(
+                named.matched.iter().all(|d| d.id != "fix-16-vllm-oom")
+                    && !text.contains("fix-16-vllm-oom"),
+                "{label}: nothing for vLLM is in the paste, so no vLLM cause may be reported \
+                 beside the line:\n{text}"
+            );
+        }
+
+        // The line adds nothing to the JSON report: `provenance` holds exactly the
+        // engine and the symptom, and a report read back from it does not know
+        // whether the engine was read, so it claims neither.
+        let json = serde_json::to_value(diagnose_with_engine(
+            &linux_base(),
+            oom,
+            Some(SymptomEngine::Vllm),
+        ))
+        .expect("a report serializes");
+        let keys: Vec<&String> = json["provenance"]
+            .as_object()
+            .expect("provenance is an object")
+            .keys()
+            .collect();
+        assert_eq!(keys, ["engine", "symptom"]);
+        let read_back: DiagnoseReport = serde_json::from_value(json).expect("it reads back");
+        assert_eq!(
+            render_report_text(&read_back, 5).lines().next(),
+            Some("Engine: vllm (named with --engine).")
+        );
+    }
+
     #[test]
     fn torch_oom_class_alone_is_not_a_vllm_match() {
         // `outofmemory` is nested inside the exception class name. It must not
@@ -1259,6 +1784,13 @@ mod tests {
 
     #[test]
     fn vllm_oom_keyword_diagnosis_is_available_on_wsl() {
+        // A bare `is_wsl` host has no WSL facts, so it also reads as having no
+        // /dev/dxg: fix-wsl-1 fires and, as a GPU the process cannot reach,
+        // ranks first (ROCMAI-785, pinned in `catalog.rs`). What this test is
+        // about is that the out-of-memory entry runs on WSL at all, so it asks
+        // for the entry rather than for the top row; the top row on a healthy
+        // WSL host is
+        // `a_genuine_vllm_oom_match_on_wsl_is_surfaced_not_routed_out_of_scope`.
         let mut e = linux_base();
         e.is_wsl = true;
         let report = diagnose(
@@ -1267,7 +1799,12 @@ mod tests {
         );
         assert!(report.out_of_scope.is_none());
         assert!(report.has_match());
-        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the out-of-memory entry runs on WSL");
+        assert!(oom.score >= MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
     }
 
     #[test]
@@ -1600,5 +2137,250 @@ mod tests {
         assert!(report.out_of_scope.is_none());
         assert!(report.has_match());
         assert_eq!(report.matched[0].id, "fix-17-torch-dlpack");
+    }
+
+    /// The lines the reported failure (ROCMAI-1058) actually wrote, with the
+    /// runtime path shortened. The first is the warning vLLM logs when the
+    /// extension fails to import, the second the error the engine dies on, and
+    /// the third what importing the extension by hand prints.
+    const EXTENSION_IMPORT_WARNING: &str = "WARNING 11-16 11:48:27 [rocm.py:53] Failed to import \
+         from vllm._C_stable_libtorch with ImportError(\"/lib/x86_64-linux-gnu/libc.so.6: version \
+         `GLIBC_2.38' not found (required by /opt/rt/site-packages/vllm/_C_stable_libtorch.abi3.so)\")";
+    const EXTENSION_OP_MISSING: &str = "(EngineCore pid=629513) ERROR 11-16 11:48:44 \
+         [core.py:1374] AttributeError: '_OpNamespace' '_C' object has no attribute \
+         'get_cuda_view_from_cpu_tensor'";
+    const EXTENSION_IMPORT_BY_HAND: &str = "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version \
+         `GLIBC_2.38' not found (required by /opt/rt/site-packages/vllm/_C_stable_libtorch.abi3.so)";
+
+    #[test]
+    fn a_vllm_extension_that_failed_to_load_is_the_top_match_on_every_engine_host() {
+        for line in [
+            EXTENSION_IMPORT_WARNING,
+            EXTENSION_OP_MISSING,
+            EXTENSION_IMPORT_BY_HAND,
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+        ] {
+            for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+                let report = diagnose(&host, line);
+                let top = &report.matched[0];
+                assert_eq!(
+                    top.id, "fix-23-vllm-extension-load",
+                    "{family}: {line}\n{:?}",
+                    report.matched
+                );
+                assert!(
+                    top.score >= MIN_SCORE_FOR_MATCH,
+                    "{family}: score was {} for {line}",
+                    top.score
+                );
+                assert!(report.has_match(), "{family}: {line}");
+                let fix = top.fix.as_ref().expect("the finding must carry a plan");
+                assert!(!fix.auto_applicable, "fix-23 must be print-only");
+            }
+        }
+    }
+
+    #[test]
+    fn the_extension_load_canonical_symptom_scores_on_the_op_namespace_line() {
+        // Ties the constant the engine prints to the pattern that scores it, so
+        // rewording either one cannot leave the printed command matching on the
+        // op name alone.
+        let (score, evidence) = keyword_score(
+            VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+            KEYWORDS_VLLM_EXTENSION_LOAD,
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH, "score was {score}");
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.contains("missing from torch.ops")),
+            "the namespace line itself has to carry the match: {evidence:?}"
+        );
+        // ...and that keyword is only scored behind the anchor, so the constant
+        // has to carry a vLLM token of its own. The real line's anchor is its
+        // `(EngineCore pid=…)` prefix, which this stripped-down rendering drops.
+        assert!(
+            symptom_matches(
+                VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM,
+                VLLM_EXTENSION_ANCHOR_PATTERN
+            ),
+            "the printed command would find nothing without an anchor: \
+             {VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM}"
+        );
+    }
+
+    #[test]
+    fn op_namespace_errors_from_other_libraries_do_not_match() {
+        // torch's own namespaces are not vLLM's op libraries, and unrelated
+        // failures must not be read as this entry.
+        for line in [
+            "AttributeError: '_OpNamespace' '_c10d_functional' object has no attribute 'foo'",
+            "AttributeError: '_OpNamespace' 'aten' object has no attribute 'foo'",
+            "AttributeError: 'NoneType' object has no attribute 'shape'",
+            "an ordinary failure",
+            "RuntimeError: Engine core initialization failed. See root cause above.",
+        ] {
+            let report = diagnose(&linux_base(), line);
+            assert!(
+                report
+                    .matched
+                    .iter()
+                    .all(|d| d.id != "fix-23-vllm-extension-load" || d.score < MIN_SCORE_FOR_MATCH),
+                "{line}: {:?}",
+                report.matched
+            );
+        }
+        // Each of vLLM's own namespaces is, read in a vLLM traceback. The frame
+        // above the error is where vLLM's name actually sits in a real report,
+        // and it is what supplies the anchor; the namespace spelling is still
+        // what this loop varies, so breaking the namespace pattern fails here.
+        for ns in ["_C", "_rocm_C", "_moe_C", "_C_cache_ops"] {
+            let line = format!(
+                "  File \"/opt/rt/site-packages/vllm/_custom_ops.py\", line 42, in \
+                 reshape_and_cache\nAttributeError: '_OpNamespace' '{ns}' object has no \
+                 attribute 'op'"
+            );
+            assert_eq!(
+                diagnose(&linux_base(), &line).matched[0].id,
+                "fix-23-vllm-extension-load",
+                "{ns}"
+            );
+        }
+    }
+
+    /// The same `_C` error, with and without anything that says vLLM. These two
+    /// are a pair on purpose: the first alone would pass if the entry simply
+    /// stopped firing, and the second alone would pass if the anchor were
+    /// dropped. Both together pin the anchor itself.
+    const BARE_OP_NAMESPACE_ERROR: &str =
+        "AttributeError: '_OpNamespace' '_C' object has no attribute 'roi_align'";
+
+    #[test]
+    fn an_op_namespace_error_with_no_vllm_context_is_not_this_entry() {
+        // `_C` is what torchvision, xformers, bitsandbytes, apex, detectron2 and
+        // mmcv all call their compiled extension, and each raises this exact
+        // line when theirs fails to load. Unanchored, the 50-point namespace
+        // keyword cleared the match threshold by itself, so `rocm diagnose
+        // --symptom` handed any of them vLLM's plan.
+        for line in [
+            BARE_OP_NAMESPACE_ERROR,
+            "AttributeError: '_OpNamespace' '_xformers_C' object has no attribute 'efficient_attention_forward'",
+            "AttributeError: '_OpNamespace' '_bnb_C' object has no attribute 'gemv_4bit_inference'",
+        ] {
+            for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+                let report = diagnose(&host, line);
+                assert!(
+                    report
+                        .matched
+                        .iter()
+                        .all(|d| d.id != "fix-23-vllm-extension-load"
+                            || d.score < MIN_SCORE_FOR_MATCH),
+                    "{family}: {line}\n{:?}",
+                    report.matched
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_op_namespace_error_inside_a_vllm_traceback_still_is() {
+        // The other half of the pair: the anchor must not cost the real report
+        // its diagnosis. In a genuine traceback the `AttributeError` line itself
+        // carries no vLLM token -- vLLM's name is on the neighbouring frames --
+        // which is why this entry gates over the whole symptom and not per line
+        // the way `check_16_vllm_oom` does.
+        let traceback = format!(
+            "  File \"/opt/rt/site-packages/vllm/_custom_ops.py\", line 42, in reshape_and_cache\n\
+                 return torch.ops._C.reshape_and_cache(...)\n\
+             {BARE_OP_NAMESPACE_ERROR}"
+        );
+        for (family, host) in [("linux", linux_base()), ("wsl", wsl_base())] {
+            let report = diagnose(&host, &traceback);
+            assert_eq!(
+                report.matched[0].id, "fix-23-vllm-extension-load",
+                "{family}: {:?}",
+                report.matched
+            );
+            assert!(report.matched[0].score >= MIN_SCORE_FOR_MATCH, "{family}");
+        }
+        // `EngineCore` is vLLM's own process name, and on the real log line it
+        // is the *only* vLLM token there is. Dropping it from the anchor set
+        // would silently stop diagnosing the report this entry was written for.
+        // The score, not just the id: an unanchored paste still *lists* fix-23
+        // as sub-threshold noise, so asserting the id alone passes with the
+        // anchor broken (measured).
+        let real = &diagnose(&linux_base(), EXTENSION_OP_MISSING).matched[0];
+        assert_eq!(real.id, "fix-23-vllm-extension-load");
+        assert!(
+            real.score >= MIN_SCORE_FOR_MATCH,
+            "the real log line scored {}",
+            real.score
+        );
+    }
+
+    #[test]
+    fn a_glibc_error_alone_stays_below_the_match_threshold() {
+        // Any binary can print one; it is this entry only together with a vLLM
+        // extension.
+        let report = diagnose(
+            &linux_base(),
+            "/usr/bin/foo: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-23-vllm-extension-load")
+            .expect("the glibc keyword registers as a weak signal");
+        assert!(hit.score < MIN_SCORE_FOR_MATCH, "score was {}", hit.score);
+    }
+
+    #[test]
+    fn the_libtorch_cuda_import_failure_still_belongs_to_fix_17() {
+        // The repr-form warning names a vLLM extension too; the missing CUDA
+        // library is the more specific cause and has to keep the top slot.
+        for line in [
+            VLLM_IMPORT_CANONICAL_SYMPTOM,
+            "Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot open shared \
+             object file: No such file or directory')",
+        ] {
+            assert_eq!(
+                diagnose(&linux_base(), line).matched[0].id,
+                "fix-17-torch-dlpack",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extension_load_plan_matches_the_catalog_copy() {
+        let report = diagnose(&linux_base(), VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-23-vllm-extension-load")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+        // The probes run inside the engine's subshell, and the block says so.
+        let open = commands
+            .iter()
+            .position(|c| *c == "rocm engines shell vllm")
+            .expect("the plan opens the engine shell");
+        let leave = commands
+            .iter()
+            .position(|c| *c == "exit")
+            .expect("the plan leaves it");
+        assert!(open < leave);
+        assert!(
+            commands[open..leave]
+                .iter()
+                .any(|c| c.starts_with('#') && c.contains("INSIDE"))
+        );
+        assert!(
+            commands[leave..]
+                .iter()
+                .any(|c| c.starts_with('#') && c.contains("YOUR OWN shell"))
+        );
     }
 }

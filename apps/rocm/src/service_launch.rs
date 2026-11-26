@@ -39,11 +39,15 @@
 //!
 //! - `endpoint_auth`: bind-host validation and the endpoint API key checks.
 //! - `launch_transaction`: the locked port allocation decision, the cleanup of a
-//!   failed launch, and the reuse refusals.
-//! - `spawn`: the detached engine child, its process and stdio plumbing, and
+//!   failed launch, the reuse refusals, and the guarded read-modify-write
+//!   (`update_managed_record_on_disk`) every launch write after the claim goes
+//!   through, so a stop or removal made meanwhile is not overwritten or undone.
+//! - `spawn`: the detached engine child, its process and stdio plumbing, the
+//!   startup check that fails a launch whose engine exits inside the settle
+//!   window (on Windows through the spawn's process handle), and
 //!   `ManagedLaunchReport`.
-//! - `readiness`: waiting on a service, its liveness, and the OOM fault-injection
-//!   seam.
+//! - `readiness`: waiting on a service, its liveness, and the fault-injection
+//!   seam (an OOM launch, or a ready launch).
 //! - `start`: the background launch path and its plain output.
 //! - `helper_autostart`: starting the background automation helper.
 //! - `attach`: the attached run and its log streaming.
@@ -67,16 +71,25 @@ pub(crate) use helper_autostart::{
     ensure_background_helper_running, ensure_background_helper_running_quiet,
 };
 pub(crate) use launch_transaction::{managed_service_reuse_refusal, no_usable_gpu_refusal};
-pub(crate) use readiness::e2e_simulate_oom_launch;
+pub(crate) use readiness::{
+    StopWatch, e2e_simulate_oom_launch, e2e_simulate_startup_exit,
+    managed_engine_exit_failure_detail, managed_service_stop_marker_present,
+    managed_service_stop_was_requested,
+};
+pub(crate) use spawn::scripted_managed_engine_startup_failure;
+// Platform-independent, and named on every target by `serve_device_probe.rs`'s
+// `serve_device_after_launch` — so it must NOT ride along with the
+// `cfg(not(windows))` block below, where a Linux build cannot see it go missing.
+pub(crate) use spawn::ManagedLaunchReport;
 #[cfg(not(windows))]
 pub(crate) use spawn::{
-    attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
-    managed_service_process_command,
+    attach_background_stdio, detach_background_command, managed_service_process_command,
 };
-// The helper is platform-independent, but outside tests nothing on Windows
-// calls it through this path, so a plain re-export there would be unused. The
-// `services_text` log-tail tests call it and are compiled on Windows too.
-#[cfg(all(windows, test))]
+// Platform-independent, and now called on both: `service_control.rs`'s Windows
+// restart branch renders it for a child the liveness probe found already gone,
+// the same way the Unix branch renders it for one `try_wait()` caught. It used
+// to be `#[cfg(all(windows, test))]` here, for the `services_text` log-tail
+// tests, because no Windows production path reached it.
 pub(crate) use spawn::managed_engine_startup_failure_detail;
 pub(crate) use start::{
     print_managed_launch_plain, start_managed_service, wait_begin_client_config,

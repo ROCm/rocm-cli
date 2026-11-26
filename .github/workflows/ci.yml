@@ -77,15 +77,20 @@ env:
 # prompt, legible failure. Raise a value if a job legitimately grows into it.
 jobs:
   # Decide which file categories a change touches so unaffected jobs can skip
-  # their expensive work. Filtering runs ONLY on pull_request; on push and in the
-  # merge queue every category is forced true, so post-merge `main` and queued
-  # PRs always run the full suite. That keeps the skip from ever starving a
-  # required check in the merge queue (a never-produced required check stalls the
-  # queue forever — see the `commit-signatures` note below). Each path-filter
-  # output folds in `.github/workflows/**`, so any change to CI itself triggers a
-  # full run; the `windows` output is not a path filter, but it is true on every
-  # event except a manual dispatch that did not ask for binaries, so a change to CI
-  # always runs the Windows jobs too.
+  # their expensive work. The categories and their path globs live in the
+  # shared .github/actions/classify-changes action, which e2e-selfhosted.yml's
+  # `changes` job uses too. Filtering narrows ONLY a pull_request run; on push
+  # and in the merge queue every category is forced true, so post-merge `main`
+  # and queued PRs always run the full suite. That keeps the skip from ever
+  # starving a required check in the merge queue (a never-produced required
+  # check stalls the queue forever — see the `commit-signatures` note below). A
+  # pull request that changes a file no category names, and that the action's
+  # `inert` list (files no gated job reads) does not name either, is forced to
+  # the full suite too, with a notice naming the file. Every path category includes
+  # `.github/workflows/**` and `.github/actions/**`, so any change to CI itself
+  # triggers a full run; the `windows` output is not a path filter, but it is
+  # true on every event except a manual dispatch that did not ask for binaries,
+  # so a change to CI always runs the Windows jobs too.
   changes:
     runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
     timeout-minutes: 20
@@ -97,167 +102,29 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      # `<filter> || <fallback>`: the filter result on PRs (empty string when the
-      # filter step is skipped off-PR), otherwise the forced 'true'.
-      rust: ${{ steps.filter.outputs.rust || steps.all.outputs.forced }}
-      heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
-      lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
-      tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
-      docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
-      skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
+      # Each is the string 'true' or 'false' (see the action's outputs).
+      # Compared with `== 'true'`, never `||`-chained: the string 'false' is
+      # truthy in an expression.
+      rust: ${{ steps.classify.outputs.rust == 'true' }}
+      heavy: ${{ steps.classify.outputs.heavy == 'true' }}
+      lint: ${{ steps.classify.outputs.lint == 'true' }}
+      tpn: ${{ steps.classify.outputs.tpn == 'true' }}
+      docs: ${{ steps.classify.outputs.docs == 'true' }}
+      skills: ${{ steps.classify.outputs.skills == 'true' }}
       # Whether the Windows jobs run at all: every event except a manual dispatch
       # that did not ask for PR-style binaries. Both Windows work jobs gate on this
       # and the `windows-build-and-test` aggregator derives its expected skip from
       # it, so "skipped on purpose" has one spelling and cannot drift between them.
       windows: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true' }}
     steps:
+      # The local action below is read from the checked-out workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Filter changed paths (pull requests only)
-        id: filter
-        if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        with:
-          filters: |
-            # Rust-only checks (fmt, clippy, coverage).
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              # `cargo xtask eval-fixtures --check` compares these recordings with
-              # what the compiled catalog says, and `cargo test -p xtask` runs the
-              # eval hook's own tests. A hand edit to a recording, to the hook, to
-              # its tests or to the dataset must run them, though no *.rs file moved.
-              - 'skills/rocm-doctor/evals/**'
-              # The examination every replayed diagnosis runs over: an edit to it
-              # changes what `eval-fixtures --check` expects.
-              - 'tests/remote-ssh/examination.json'
-              - 'rust-toolchain*'
-              # clippy runs `cargo xtask manifest --check` against this file;
-              # pinned_tool_versions_match_across_docs_and_workflows (xtask)
-              # also reads its cargo-about pin.
-              - 'MANIFEST.md'
-              # The committed per-crate coverage floors. Listed so that lowering
-              # a floor re-runs the gate that floor controls, instead of being
-              # the one edit the coverage job never sees.
-              - 'coverage-floors.toml'
-              # rocm-deps compiles the pins into constants, so a pin change is a
-              # source change even though no *.rs file moved.
-              - 'runtime-deps.toml'
-              # A proptest saved-failure file is read by the seed guard in xtask
-              # (`cargo xtask affected` adds xtask when one changes). Renaming or
-              # deleting one moves no *.rs file, so without this entry a seed-only
-              # change would skip every rust-gated job.
-              - '**/proptest-regressions/**'
-              # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
-              # this file's hawkeye/cargo-about pins. This entry only gates
-              # whether the rust-flagged jobs run at all; `cargo xtask affected`
-              # treats Markdown as ignorable by default and would otherwise skip
-              # the `Test (nextest)` step for a pin-only edit here (the coverage
-              # job isn't affected-narrowed, so it alone would still catch a
-              # drift, but invisibly). CONTRIBUTING.md is listed in
-              # `forces_full_workspace` (xtask/src/affected.rs) for the same
-              # reason MANIFEST.md already is, so nextest runs too.
-              - 'CONTRIBUTING.md'
-              # hardware_testing_docs_cover_all_self_hosted_platforms (xtask)
-              # reads this file and the one below it; same
-              # `Selection::Empty`/invisible-coverage gap as CONTRIBUTING.md
-              # above, so both are in `forces_full_workspace` too and need the
-              # same rust-filter entry. tests/e2e-cucumber/README.md also
-              # matches `heavy` below, so the Windows lane's full workspace
-              # run backstops this entry on its own; it's listed here anyway
-              # so the Linux `test` job (which is `rust`-gated, not
-              # `heavy`-gated) doesn't silently skip the test that reads it.
-              - 'docs/ci-hardware-testing.md'
-              - 'tests/e2e-cucumber/README.md'
-              # `cargo xtask check-architecture-doc` (clippy job) compares this
-              # module map with the source tree; deleting or rewording an entry
-              # can break it though no *.rs file moved.
-              - 'docs/architecture.md'
-              # license_headers_hook_has_no_file_type_filter (xtask) reads this
-              # file's license-headers hook config; an edit here that reopens the
-              # file-type-filter gap must still run that test on the PR.
-              - '.pre-commit-config.yaml'
-              - '.github/workflows/**'
-            # build-and-test runs cargo AND the python/shell smoke steps plus the
-            # install-lifecycle E2E (`cargo xtask package` + the real installer),
-            # so it depends on the Rust set, the packaging xtask, the lifecycle
-            # feature/steps, and the installer inputs.
-            heavy:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain*'
-              - 'runtime-deps.toml'
-              - 'scripts/**'
-              - 'xtask/**'
-              - 'engines/**'
-              - '**/*.py'
-              - '**/*.sh'
-              - '**/*.ps1'
-              - '**/*.feature'
-              - 'tests/e2e-cucumber/**'
-              # The containerised control-channel lane; its Dockerfile matches
-              # none of the extension globs above.
-              - 'tests/remote-ssh/**'
-              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
-              # rocm_doctor_skill.feature scenarios parse its catalog table and
-              # compare it to `rocm fix`. A skill-only edit must therefore run
-              # the E2E job, which gates on `heavy`.
-              - 'skills/**'
-              - 'install*'
-              # Pinned-key consistency compares docs/keys/* against the installers,
-              # so a canonical-key-only change must trigger the heavy job that runs
-              # `cargo xtask verify-pinned-keys`.
-              - 'docs/keys/**'
-              - '.github/workflows/**'
-            # THIRD_PARTY_NOTICES.txt staleness gate: anything that changes the
-            # dependency tree, the cargo-about config/template, the generator, or
-            # the generated file itself.
-            tpn:
-              - 'Cargo.lock'
-              - '**/Cargo.toml'
-              - 'about.toml'
-              - 'about.hbs'
-              - 'THIRD_PARTY_NOTICES.txt'
-              - 'xtask/**'
-              - '.github/workflows/**'
-            # Python / Shell / PowerShell lint job.
-            lint:
-              - 'scripts/**'
-              - 'engines/**'
-              - '**/*.py'
-              - '**/*.sh'
-              - '**/*.ps1'
-              - 'ruff.toml'
-              - 'PSScriptAnalyzerSettings.psd1'
-              - '.github/workflows/**'
-            # Sphinx docs site: the doc sources themselves, plus README.md,
-            # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
-            # single-source via MyST `{include}` directives, plus the build
-            # config/toolchain pins.
-            docs:
-              - 'docs/rocm-docs/**'
-              - 'README.md'
-              - 'CONTRIBUTING.md'
-              - 'docs/vllm.md'
-              - 'docs/wsl.md'
-              - '.readthedocs.yaml'
-              - '.github/workflows/**'
-
-            # Published Agent Skills, graded by skillscope. The dataset and the
-            # skill's prose are one unit — a prompt can stop matching because the
-            # description changed — so any edit under skills/ re-runs the check.
-            skills:
-              - 'skills/**'
-              - '.github/workflows/**'
-
-      - name: Force full run off pull requests
-        id: all
-        if: github.event_name != 'pull_request'
-        run: echo "forced=true" >> "$GITHUB_OUTPUT"
+      - name: Classify changed paths
+        id: classify
+        uses: ./.github/actions/classify-changes
 
   # Advisory nudge: if a PR references a bug that still has an expected-failure
   # (xfail) row in expectations.toml, remind the author to clear it. Otherwise a
@@ -471,7 +338,7 @@ jobs:
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
-        run: python scripts/smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       - name: Acceptance harness self-tests
         if: needs.changes.outputs.heavy == 'true'
@@ -508,6 +375,10 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/nightly_canary.py --self-test
 
+      - name: Issue triage self-test
+        if: needs.changes.outputs.heavy == 'true'
+        run: python scripts/triage_issue.py --self-test
+
       - name: Pinned key consistency check
         if: needs.changes.outputs.heavy == 'true'
         run: cargo xtask verify-pinned-keys
@@ -518,6 +389,13 @@ jobs:
       - name: Installer fish profile checks
         if: needs.changes.outputs.heavy == 'true'
         run: sh tests/install-sh/run.sh
+
+      # Hermetic: a stub `gh` serves a local bundle, so the `pr-<number>`
+      # channel's choice of CI run, its checksum-only trust and its refusals
+      # are checked without GitHub access.
+      - name: Installer PR channel checks
+        if: needs.changes.outputs.heavy == 'true'
+        run: sh tests/install-sh/pr_channel.sh
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
@@ -530,17 +408,22 @@ jobs:
 
   # Fine-grained test selection (the second half of smarter CI; the path-based
   # job skip is the `changes` job above). Runs cargo's unit + integration tests
-  # for only the crates a change can reach — the changed crates plus their
-  # transitive dependents, computed by `cargo xtask affected` from the workspace
+  # for only the crates a change can reach — the changed crates, the crates
+  # whose tests read a changed file from outside their own directory (any Rust
+  # file adds xtask; README.md, docs/ and skills/ add rocm and xtask; see
+  # CROSS_CRATE_READS in xtask/src/cross_crate_reads.rs), plus their transitive
+  # dependents, computed by `cargo xtask affected` from the workspace
   # dependency graph — instead of the whole workspace.
   #
   # Merge-queue safety: the narrowing happens ONLY on pull_request. On push and
   # in the merge queue the selection is forced to `--workspace`, so post-merge
   # `main` and every queued PR run the full suite — a required check is never
-  # starved and the queue cannot stall. The full Windows suite
-  # (the windows-debug job) also runs the whole workspace on every change, so it
-  # backstops any crate a graph-based selection could miss (e.g. an integration
-  # test that drives another crate only at runtime).
+  # starved and the queue cannot stall. The full Windows suite (the
+  # windows-debug job, which runs when `windows` is true, as it is on every
+  # event but a dispatch that asks for no binaries) also runs the whole
+  # workspace whenever the `heavy` category matches (every Rust change does), so
+  # it backstops any crate a graph-based selection could miss (e.g. an
+  # integration test that drives another crate only at runtime).
   #
   # This job is deliberately left off sccache, unlike the other compile-heavy
   # jobs. On pull requests it compiles a crate subset, and a subset resolves Cargo
@@ -820,7 +703,7 @@ jobs:
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: python .\scripts\smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       # One command per step: pwsh carries on past a failing native command and
       # the step reports only the last command's exit code, so a multi-line
@@ -1019,10 +902,15 @@ jobs:
         # serve-33/serve-34/serve-35 (the native-Windows vLLM refusal for `serve` and
         # `engines install`) are folded in the same way: `@requires-os:windows`,
         # hermetic, and otherwise run only on the optional self-hosted lane.
+        #
+        # runtime-lifecycle-19/20/21 (runtimes installed before and after the ROCm
+        # 10 layout, side by side) are folded in for the same reason: planted
+        # runtimes, no GPU or network, and their Windows paths are what this
+        # lane proves.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
-          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
+          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows,runtime-lifecycle-side-by-side-across-packaging-change,runtime-lifecycle-side-by-side-uninstall-keeps-the-others,runtime-lifecycle-side-by-side-shared-name-refused"
         run: |
           # Derive from CARGO_TARGET_DIR when it is set, falling back to the
           # default target dir, so a future job-level CARGO_TARGET_DIR cannot
@@ -1058,25 +946,34 @@ jobs:
           needs.changes.outputs.heavy == 'true' &&
           (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
         shell: pwsh
+        # The install command is only printed for a pull request: a manually
+        # dispatched build has no number, and the channel needs one.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          @'
+          $summary = @'
           ## Try this PR's build (Windows x86_64)
 
-          Download `rocm-cli-pr-windows-amd64` from this run's **Artifacts**
-          section below, then:
+          '@
+          $install = @'
+          With the [GitHub CLI](https://cli.github.com) signed in
+          (`gh auth login`), install the build of the PR's latest commit:
 
           ```powershell
-          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath pr-artifact   # GitHub's wrapper zip
-          Expand-Archive pr-artifact\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
-          $dest = "$env:LOCALAPPDATA\rocm-cli\bin"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Copy-Item rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocm.exe,rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocmd.exe $dest
-          $env:Path = "$dest;$env:Path"
-          rocm --version
+          $env:ROCM_CLI_CHANNEL = "pr-PR_NUMBER"
+          irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+          Remove-Item Env:ROCM_CLI_CHANNEL   # later installs go back to the release channel
           ```
 
+          '@
+          $artifact = @'
+          You can also download `rocm-cli-pr-windows-amd64` from this run's
+          **Artifacts** section below.
+
           Unsigned build for manual testing only — not for production use.
-          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '@
+          if ($env:PR_NUMBER) { $summary += $install.Replace('PR_NUMBER', $env:PR_NUMBER) }
+          ($summary + $artifact) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Upload PR bundle
         if: >-
@@ -1221,24 +1118,34 @@ jobs:
           cargo xtask package rocm-cli-pr-linux-amd64
 
       - name: Add install instructions to job summary
+        # The install command is only printed for a pull request: a manually
+        # dispatched build has no number, and the channel needs one.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          {
+          cat <<'EOF'
           ## Try this PR's build (Linux x86_64)
 
-          Download `rocm-cli-pr-linux-amd64` from this run's **Artifacts**
-          section below, then:
+          EOF
+          if [ -n "$PR_NUMBER" ]; then
+          sed "s/PR_NUMBER/$PR_NUMBER/" <<'EOF'
+          With the [GitHub CLI](https://cli.github.com) signed in
+          (`gh auth login`), install the build of the PR's latest commit:
 
           ```sh
-          unzip rocm-cli-pr-linux-amd64.zip   # GitHub wraps the artifact in a zip
-          tar -xzf rocm-cli-pr-linux-amd64.tar.gz
-          dest="$HOME/rocm-cli-pr/bin"
-          install -Dm0755 rocm-cli-pr-linux-amd64/bin/rocm rocm-cli-pr-linux-amd64/bin/rocmd -t "$dest"
-          export PATH="$dest:$PATH"
-          rocm --version
+          curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- pr-PR_NUMBER
           ```
+
+          EOF
+          fi
+          cat <<'EOF'
+          You can also download `rocm-cli-pr-linux-amd64` from this run's
+          **Artifacts** section below.
 
           Unsigned build for manual testing only — not for production use.
           EOF
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1255,15 +1162,15 @@ jobs:
     # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
     # `--no-group local-tools` skips the hooks that need a full Rust compile,
     # hawkeye, lychee, PowerShell, or commit-history/signing access — those have
-    # their own jobs (clippy, build-and-test, license-headers, docs-links,
-    # powershell-lint, commit-signatures).
+    # their own jobs (clippy, test, windows-debug, license-headers, docs-links,
+    # powershell-lint, third-party-notices, commit-signatures).
     name: prek (lint / hygiene)
     runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 20
     # Always-on: prek is the cheapest gate (no compile) and its hygiene hooks run
-    # on every file type, so it is relevant to any change — including docs-only
-    # PRs that match no `changes` category. Like license-headers and
-    # commit-signatures, it is not gated.
+    # on every file type, so it is relevant to any change — including one whose
+    # only files are in the `changes` action's `inert` category. Like
+    # license-headers, docs-links and commit-signatures, it is not gated.
     # Exception: a manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
     steps:
@@ -1526,9 +1433,14 @@ jobs:
           # against the image's glibc.
           key: ${{ runner.os }}-ubuntu-24.04-cargo-about-0.9.1
 
+      # `--force`: this step runs when the `Cache cargo-about` key misses, but
+      # the setup-rust-toolchain step's rust-cache (`cache-bin` defaults on) can
+      # leave a cargo-about in ~/.cargo/bin, and without `--force` the install
+      # can then fail with "binary `cargo-about` already exists in
+      # destination". `--force` makes the install idempotent.
       - name: Install cargo-about
         if: needs.changes.outputs.tpn == 'true' && steps.cache-cargo-about.outputs.cache-hit != 'true'
-        run: cargo install cargo-about@0.9.1 --locked --features cli
+        run: cargo install cargo-about@0.9.1 --locked --features cli --force
 
       - name: THIRD_PARTY_NOTICES.txt is current
         if: needs.changes.outputs.tpn == 'true'
@@ -1763,7 +1675,7 @@ jobs:
 
       - name: Check license headers
         run: |
-          "${HAWKEYE_INSTALL_DIR}/hawkeye" check
+          "${HAWKEYE_INSTALL_DIR}/hawkeye" check --fail-on-unknown
 
   docs-links:
     name: Markdown links resolve (lychee)
@@ -1794,8 +1706,9 @@ jobs:
     runs-on: ubuntu-24.04 # one LTS: docs build only, nothing here depends on the image
     timeout-minutes: 20
     needs: [changes]
-    # A manual E2E dispatch only exercises the E2E jobs; skip the rest. Off a
-    # dispatch, `needs.changes` never ran, so short-circuit on event_name first.
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest. `changes`
+    # forces every category on for a dispatch, so `docs` is 'true' there and the
+    # event check is what skips this job.
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.docs == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1868,8 +1781,10 @@ jobs:
   # e2e-gpu-strix-windows). They live there — not here — so a job queued on an
   # offline self-hosted runner (which GitHub cannot cancel) can never hold this
   # workflow's concurrency group and stall its merge-required checks (EAI-7548).
-  # They are non-blocking (continue-on-error) and fork-safe (self-hosted runners
-  # do not execute untrusted fork PRs). See docs/ci-hardware-testing.md.
+  # They are non-blocking (none is a required check) and fork-restricted: GitHub does
+  # not start self-hosted jobs from an external fork's pull_request run without
+  # approval (whether that is every fork run or only a first-time contributor's
+  # is a repository setting). See docs/ci-hardware-testing.md.
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
   #
@@ -1901,12 +1816,21 @@ jobs:
     # mock platform), and the actual work is gated at the STEP level. Gating
     # `heavy` at the job level would SKIP the job on a non-heavy PR, and a required
     # check that is never produced stalls the merge queue. `merge_group` forces
-    # heavy=true, so the mock gate always executes there as a backstop.
+    # heavy=true, so the mock gate always executes there as a backstop. (A
+    # fixed-name job skipped by `if:` still reports its name, as `skipped`, which
+    # branch protection counts as satisfied; a skipped templated matrix job like
+    # this one reports its raw `name:` expression instead, so the required name is
+    # never produced.)
     if: >-
       always()
       && needs.changes.result == 'success'
       && (github.event_name != 'workflow_dispatch'
           || inputs.platform == 'all' || inputs.platform == 'mock')
+    # Whether this lane executed scenarios, published for the consolidated
+    # report so it never downloads artifacts a no-op run did not produce. Both
+    # matrix legs compute the same value from the same inputs.
+    outputs:
+      ran: ${{ steps.gate.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2008,7 +1932,9 @@ jobs:
   # Consolidate the mock (GitHub-hosted) platform's report into the cross-platform
   # report: a platform × tier matrix in the run Summary plus a single merged HTML
   # artifact. `if: always()` so a failing platform still appears; runs on
-  # GitHub-hosted ubuntu (no GPU needed — it only parses report.json).
+  # GitHub-hosted ubuntu (no GPU needed — it parses report.json and reads the run's job list). It is also
+  # a required check, so its last step fails unless the required `E2E tests` job
+  # passed (see that step).
   #
   # The self-hosted GPU platforms are consolidated by e2e-selfhosted.yml's own
   # report job (they moved there so an offline runner can't stall this workflow's
@@ -2016,25 +1942,48 @@ jobs:
   # glob still auto-includes any new GitHub-hosted platform added here.
   e2e-report:
     name: E2E consolidated report
-    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
+    runs-on: ubuntu-24.04 # one LTS: merges report.json files and reads the job list
     # Bound the job (like every E2E job) so a stalled artifact download can't hang
     # a hosted runner indefinitely.
     timeout-minutes: 15
+    # `actions: read` lets the verdict step list this run's jobs. Job-level
+    # permissions replace the workflow-wide set, so contents:read is repeated
+    # for checkout.
+    permissions:
+      contents: read
+      actions: read
+    # `e2e` has to be a need: the verdict step reads that job's conclusion from
+    # the API, which is only final once the job has finished.
     needs:
       - changes
       - e2e
-    # Consolidate whatever ran. On dispatch `heavy` is unset, so also run when the
-    # trigger was manual; `always()` still lets it collect partial/failed tiers.
+    # This is a REQUIRED check, so it must be produced whenever the `e2e` job
+    # is. Branch protection treats a SKIPPED required check as satisfied, so a
+    # clause narrowing this condition stops the check gating anything on the
+    # runs it skips. The condition therefore
+    # mirrors `e2e`'s exactly, and which work happens is decided per step;
+    # `consolidated_e2e_report_cannot_be_skipped_and_carries_the_required_legs_verdict`
+    # in xtask/src/workflow_contract.rs pins both. `always()` is kept so a
+    # failing platform still gets a rendered report.
     if: >-
       always()
-      && (needs.changes.outputs.heavy == 'true'
-        || github.event_name == 'workflow_dispatch')
+      && needs.changes.result == 'success'
+      && (github.event_name != 'workflow_dispatch'
+          || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
+      # The report is only built when the lane executed scenarios (`e2e`'s
+      # `ran` output). The lane is a no-op, and there is nothing to render, when
+      # its gate decides not to run: a pull request touching no heavy path,
+      # `clippy` not succeeding, or `build-and-test` reaching no verdict. The
+      # verdict step at the end does not need the checkout or the toolchain, and
+      # runs either way.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.e2e.outputs.ran == 'true'
         with:
           persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        if: needs.e2e.outputs.ran == 'true'
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -2050,12 +1999,14 @@ jobs:
       # layout is the norm here; `discover()` handles both (labeling the root
       # file from platform.json's slug).
       - name: Download all E2E reports
+        if: needs.e2e.outputs.ran == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: '*-report'
           path: e2e-artifacts
 
       - name: Build consolidated report + step summary
+        if: needs.e2e.outputs.ran == 'true'
         run: |
           mkdir -p consolidated
           cargo xtask e2e-report \
@@ -2063,8 +2014,78 @@ jobs:
             --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload consolidated report
-        if: always()
+        if: always() && needs.e2e.outputs.ran == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-consolidated-report
           path: consolidated/
+
+      # Rendering the report says nothing about whether the scenarios passed: it
+      # succeeds just as happily on a run in which every one failed. This job is
+      # a required check named after the E2E lane, so it carries that lane's
+      # verdict, and it runs last so the report above is still produced for a
+      # failing run. `E2E tests` is a required check too, so a failing lane is
+      # already blocked there; this makes the report an honest second signal and
+      # keeps it gating if `E2E tests` ever leaves the required list. A cancelled
+      # run is not covered: the step is skipped and the job concludes success
+      # (job-level `always()` still starts it), which is not a merge hole while
+      # `E2E tests`, `build-and-test` and `clippy` are required.
+      #
+      # The verdict is the conclusion of the `E2E tests` job, the 24.04 leg that
+      # is the required check, and NOT `needs.e2e.result`: `e2e` is a matrix over
+      # both Ubuntu images and its result aggregates both legs, so a failure on
+      # the 26.04 leg, which is not a required check, would fail this one. The
+      # run's job list is the only place the legs are told apart, so it is read
+      # from the API. REQUIRED_JOB must stay equal to the 24.04 leg's name
+      # (the bare one in `e2e`'s `name:`); xtask's
+      # `consolidated_e2e_report_cannot_be_skipped_and_carries_the_required_legs_verdict`
+      # ties the two, and `e2e_verdict_follows_the_required_leg_and_fails_closed`
+      # runs this script against stubbed job lists and pins its exits.
+      #
+      # It fails CLOSED. A job list that cannot be read, no job of that name
+      # (renamed, or not created), more than one, or any conclusion but
+      # `success` all fail the check: a verdict that could not be established
+      # must not read as a pass. When the lane's gate decides not to run (a pull
+      # request touching no heavy path, a `clippy` that did not succeed, a
+      # `build-and-test` with no verdict) `E2E tests` still runs and concludes
+      # `success` without executing a scenario, exactly as it does for its own
+      # required check, so this reports success there and gates nothing more than
+      # that check does. `!cancelled()` as in the other report job: a superseded
+      # run is not a failure.
+      - name: Require the required E2E tests job to have passed
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED_JOB: E2E tests
+          RAN: ${{ needs.e2e.outputs.ran }}
+        run: |
+          jobs=
+          for attempt in 1 2 3; do
+            jobs=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100") && break
+            jobs=
+            [ "$attempt" -lt 3 ] && sleep "${RETRY_DELAY_SECS:-5}"
+          done
+          if [ -z "$jobs" ]; then
+            echo "::error::could not list this run's jobs, so the '$REQUIRED_JOB' verdict could not be established"
+            exit 1
+          fi
+          conclusions=$(jq -r --arg job "$REQUIRED_JOB" \
+            '.jobs[] | select(.name == $job) | .conclusion // "none"' <<<"$jobs") || {
+            echo "::error::could not read this run's job list, so the '$REQUIRED_JOB' verdict could not be established"
+            exit 1
+          }
+          count=$(grep -c . <<<"$conclusions" || true)
+          if [ "$count" != 1 ]; then
+            echo "::error::expected exactly one job named '$REQUIRED_JOB' in this run, found $count; it was renamed, was not created, or is no longer the only one, so the verdict could not be established"
+            exit 1
+          fi
+          if [ "$conclusions" != success ]; then
+            echo "::error::the required '$REQUIRED_JOB' job concluded '$conclusions'; failing the consolidated report"
+            exit 1
+          fi
+          if [ "$RAN" = true ]; then
+            echo "'$REQUIRED_JOB' concluded success"
+          else
+            echo "'$REQUIRED_JOB' concluded success without running any scenario (see its 'Decide whether to run' step), so there is no report to render"
+          fi
