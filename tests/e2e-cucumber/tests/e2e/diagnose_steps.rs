@@ -6660,7 +6660,7 @@ fn plant_fake_journalctl(world: &E2eWorld, kernel_log: &str) {
 /// `run_rocm_with_scenario_env` takes `command_env` rather than borrowing it, so
 /// a scenario that runs the CLI twice gets the real host on the second run
 /// unless it re-states the fixture. That is not a detail worth discovering from
-/// a mysterious result: without this, the second run of diagnose-96 described
+/// a mysterious result: without this, the second run of diagnose-97 described
 /// the runner instead of the planted APU.
 fn restate_planted_machine_env(world: &mut E2eWorld) {
     world.command_env.push((

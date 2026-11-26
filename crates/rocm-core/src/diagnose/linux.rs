@@ -863,9 +863,16 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
         }
         (Some(mib), None) => {
             score += 25;
+            // Whichever of the two figures is smaller governs, as the
+            // `(Some, Some)` arm above states outright. So "TTM's default
+            // decides instead" is only true when that default is below the
+            // aperture asked for: a conservative `gttsize` under half of RAM
+            // governs itself, and naming TTM there would send the user to
+            // change the wrong thing. Stated as the bound it is.
             evidence.push(format!(
                 "amdgpu.gttsize={mib} (MiB) is set but ttm.pages_limit is not, so TTM's default \
-                 of about half of installed RAM decides instead"
+                 of about half of installed RAM applies as well, and the smaller of the two is \
+                 what the aperture ends up being"
             ));
         }
         (None, Some(pages)) => {
@@ -2515,6 +2522,79 @@ mod tests {
                 .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
             "{:?}",
             report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A paste that only names the two parameters is not a fault report.
+    ///
+    /// `keyword_score` keeps the top two weights and sums them, so two entries
+    /// at 25 reach `MIN_SCORE_FOR_MATCH` exactly. Both of these match the
+    /// output of `cat /proc/cmdline` -- the first command this entry's own plan
+    /// tells the user to run -- so a healthy machine whose owner pasted it
+    /// matched and was handed the GRUB-editing remediation. The same defect
+    /// `KEYWORDS_VLLM_EXTENSION_LOAD` was fixed for, and the same test shape.
+    #[test]
+    fn a_cmdline_paste_alone_cannot_reach_the_threshold_by_summing() {
+        let mut healthy = apu_host();
+        // Consistent pair and a clean log: the structural arms contribute 0, so
+        // whatever is left is the keyword table on its own.
+        healthy.amdgpu_gttsize_mib = Some(98_304);
+        healthy.ttm_pages_limit = Some(25_165_824);
+        let cmdline = "BOOT_IMAGE=/vmlinuz root=/dev/nvme0n1p2 ro quiet splash \
+                       amdgpu.gttsize=98304 ttm.pages_limit=25165824";
+        let finding = check_24_apu_unified_memory(&healthy, cmdline);
+        assert!(
+            finding.score < MIN_SCORE_FOR_MATCH,
+            "a cmdline paste from a healthy machine must not reach a verdict: {finding:?}"
+        );
+        // Beside something that names an actual failure it still carries.
+        let with_failure = format!(
+            "{cmdline}\namdgpu: SVM mapping failed, exceeds resident \
+             system memory limit"
+        );
+        assert!(
+            check_24_apu_unified_memory(&healthy, &with_failure).score >= MIN_SCORE_FOR_MATCH,
+            "the parameters must still add to a real failure report"
+        );
+    }
+
+    /// Each single-parameter arm, on the host it exists for.
+    ///
+    /// Both were driven only by the discrete-host test, which exists to prove
+    /// they score 0 there -- so neither arm's score or wording was pinned on an
+    /// APU. Driving `(Some, None)` with a `gttsize` below half of installed RAM
+    /// is what shows the message had to change: TTM's default does not "decide
+    /// instead" there, because the smaller of the two figures governs and that
+    /// is `gttsize` itself.
+    #[test]
+    fn each_single_parameter_arm_is_pinned_on_the_apu_it_is_for() {
+        // 128 GiB installed, so TTM's default is about 64 GiB; this asks for 32.
+        let mut gttsize_only = apu_host();
+        gttsize_only.amdgpu_gttsize_mib = Some(32_768);
+        let finding = check_24_apu_unified_memory(&gttsize_only, "");
+        assert_eq!(finding.score, 25, "{finding:?}");
+        let evidence = finding
+            .evidence
+            .iter()
+            .find(|line| line.contains("amdgpu.gttsize=32768"))
+            .expect("the arm states what it found");
+        assert!(
+            evidence.contains("the smaller of the two is what the aperture ends up being"),
+            "a gttsize under half of RAM governs itself, so TTM must not be named as deciding: \
+             {evidence}"
+        );
+
+        let mut pages_only = apu_host();
+        pages_only.ttm_pages_limit = Some(8_388_608);
+        let finding = check_24_apu_unified_memory(&pages_only, "");
+        assert_eq!(finding.score, 25, "{finding:?}");
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|line| line.contains("allows at most 32768 MiB")),
+            "the arm has to convert the page limit it found: {:?}",
+            finding.evidence
         );
     }
 
