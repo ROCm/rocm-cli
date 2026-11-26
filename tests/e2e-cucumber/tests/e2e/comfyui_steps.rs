@@ -87,7 +87,7 @@
 //!
 //! `comfyui-14` is the GPU-only EAI-8051 guard: it installs ComfyUI into a real,
 //! isolated managed runtime and asserts the runtime's torch stack is unchanged, no
-//! `nvidia-*` distributions appeared, and the install really added packages. It
+//! `nvidia-*` distributions appeared beyond the runtime's baseline, and the install really added packages. It
 //! reuses `comfyui-03`'s argument-less `comfyui install` When step.
 //!
 //! `comfyui-20` and `comfyui-21` cover a saved record of the ComfyUI
@@ -2411,13 +2411,6 @@ fn installed_distributions(python: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The `nvidia-*` CUDA distributions installed in the interpreter's environment.
-/// A ROCm runtime should have none; ComfyUI's install dragging any in is the
-/// EAI-8051 defect.
-fn nvidia_distributions(python: &Path) -> Vec<String> {
-    nvidia_only(installed_distributions(python))
-}
-
 fn nvidia_only(distributions: Vec<String>) -> Vec<String> {
     distributions
         .into_iter()
@@ -2439,7 +2432,7 @@ async fn setup_isolated_runtime(world: &mut E2eWorld) {
     crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
 }
 
-#[given("the runtime has torch and no CUDA packages")]
+#[given("the runtime has torch")]
 async fn assert_baseline_torch_present(world: &mut E2eWorld) {
     let python = sole_runtime_python(world);
     let stack = torch_stack_versions(&python);
@@ -2450,12 +2443,15 @@ async fn assert_baseline_torch_present(world: &mut E2eWorld) {
         python.display()
     );
     let distributions = installed_distributions(&python);
-    let nvidia = nvidia_only(distributions.clone());
-    assert!(
-        nvidia.is_empty(),
-        "runtime already has nvidia-* distributions before ComfyUI install; premise \
-         absent: {}",
-        nvidia.join(", ")
+    // The runtime's own SDK/engine install may already carry `nvidia-*` wheels on some
+    // hosts (gfx942/gfx950 lanes show 15 before ComfyUI runs, issue #1154), so the
+    // guard measures only what the ComfyUI install adds. Print the baseline so a
+    // lane's artifact shows which runtime held which wheels.
+    eprintln!(
+        "baseline runtime {} has {} distributions; nvidia-* before ComfyUI install: [{}]",
+        python.display(),
+        distributions.len(),
+        nvidia_only(distributions.clone()).join(", ")
     );
     // Record the exact baseline torch stack so the post-install step can require it to
     // be unchanged (see `assert_torch_unchanged`), and the baseline package set so
@@ -2538,10 +2534,25 @@ async fn assert_torch_unchanged(world: &mut E2eWorld) {
 #[then("no nvidia-* packages were added to the runtime")]
 async fn assert_no_nvidia_packages(world: &mut E2eWorld) {
     let python = sole_runtime_python(world);
-    let nvidia = nvidia_distributions(&python);
+    let baseline = world
+        .comfyui_baseline_distributions
+        .as_ref()
+        .expect("no baseline distribution set was captured");
+    let after = installed_distributions(&python);
+    let added = nvidia_added(baseline, &after);
     assert!(
-        nvidia.is_empty(),
-        "ComfyUI install added CUDA nvidia-* distributions to the ROCm runtime: {}",
-        nvidia.join(", ")
+        added.is_empty(),
+        "ComfyUI install added CUDA nvidia-* distributions to the ROCm runtime: {} \
+         (python: {})",
+        added.join(", "),
+        python.display()
     );
+}
+
+/// The `nvidia-*` distributions in `after` that `baseline` did not have.
+fn nvidia_added(baseline: &[String], after: &[String]) -> Vec<String> {
+    nvidia_only(after.to_vec())
+        .into_iter()
+        .filter(|name| !baseline.contains(name))
+        .collect()
 }
