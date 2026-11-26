@@ -2832,8 +2832,8 @@ Expected result, on the APU host:
   reads around 7.7 GiB, that means the small GGUF recipes and none of the
   17 GiB-and-larger ones.
 - The closing note names the narrowing *and* says the memory is shared:
-  `This GPU has no dedicated VRAM, so that is a ceiling on memory it shares with
-  the operating system: how much is free depends on what else is running.`
+  `That figure is a ceiling on memory this GPU shares with the operating system,
+  not memory set aside for it: how much is free depends on what else is running.`
 - Cross-check the figure it narrowed on -- `rocm model --verbose` prints it as
   `reason: shared GPU memory pool N GiB`, on each row that declares a minimum;
   the recipes declaring none say so instead, and the curated listing carries no

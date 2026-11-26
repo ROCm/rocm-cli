@@ -385,7 +385,7 @@ async fn assert_offer_reaches_past_the_carve_out(world: &mut E2eWorld) {
 async fn assert_no_shared_pool_caveat(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     assert!(
-        !output.contains("This GPU has no dedicated VRAM"),
+        !output.contains("ceiling on memory this GPU shares"),
         "this machine's memory is its own, so saying it is shared would be false:\n{output}"
     );
 }
@@ -560,8 +560,8 @@ async fn assert_narrowing_stated(world: &mut E2eWorld) {
 async fn assert_shared_pool_stated(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     assert!(
-        output.contains("This GPU has no dedicated VRAM")
-            && output.contains("shares with the operating system"),
+        output.contains("ceiling on memory this GPU shares with the operating system")
+            && output.contains("not memory set aside for it"),
         "a narrowed shared pool must be named as shared, or the list reads as memory set \
          aside for the model:\n{output}"
     );

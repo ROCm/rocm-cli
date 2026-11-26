@@ -53,6 +53,21 @@ const MODEL_CATALOG_HEADER_PREFIX: &str = "Recommended models";
 /// The first line of the `rocm model --verbose` listing.
 const MODEL_CATALOG_VERBOSE_HEADER: &str = "model recipes";
 
+/// What the figure an integrated GPU was weighed against actually is.
+///
+/// Held here because the unit tests and the e2e steps match it as a literal,
+/// and a sentence spelled out in four places drifts in three of them.
+///
+/// It does not say the GPU "has no dedicated VRAM". Such a part usually does
+/// report some: the BIOS carve-out, which the simulated hosts behind
+/// `model-catalog-10` to `-13` plant as a VRAM counter and which the docs call
+/// a carve-out. The claim that is true, and the one that matters to a reader
+/// deciding whether a narrowed list will hold, is about the figure used: it is
+/// a ceiling on memory shared with the operating system rather than memory set
+/// aside for the model.
+pub(crate) const SHARED_POOL_NOTE: &str = " That figure is a ceiling on memory this GPU shares with the operating system, not memory \
+     set aside for it: how much is free depends on what else is running.";
+
 /// Whether `text` is one of the two `rocm model` listings this module renders.
 ///
 /// Both headers are matched, because the chat tool renders the curated listing
@@ -182,10 +197,10 @@ const MAX_RECOMMENDATIONS_PER_PLATFORM: usize = 3;
 /// They stay reachable: `rocm serve` takes any model, and `rocm model
 /// --verbose` lists every recipe with what it needs. What they do not do is
 /// get *recommended* on the strength of a figure nobody supplied.
-fn recipe_fits_gpu(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: f64) -> bool {
+fn recipe_fits_gpu(recipe: &ModelRecipeRecord, gpu_memory_gib: f64) -> bool {
     recipe
         .min_gpu_mem_gb
-        .is_some_and(|required| aggregate_gpu_vram_gib >= f64::from(required))
+        .is_some_and(|required| gpu_memory_gib >= f64::from(required))
 }
 
 /// The recommendation order within one hardware group: most capable first.
@@ -412,8 +427,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         // unmeasured branch below says nothing about it: no figure was weighed
         // there, so there is no figure to qualify.
         let shared_pool_note = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
-            " This GPU has no dedicated VRAM, so that is a ceiling on memory it shares with the \
-             operating system: how much is free depends on what else is running."
+            SHARED_POOL_NOTE
         } else {
             ""
         };
@@ -939,7 +953,7 @@ fn append_model_fit_lines(
     host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
     paths: Option<&AppPaths>,
 ) {
-    let aggregate_gpu_vram_gib = gpu_memory.map(|gpu| gpu.total_gib);
+    let gpu_memory_gib = gpu_memory.map(|gpu| gpu.total_gib);
     // Name what the figure *is*, not only how large it is. An integrated GPU
     // has no VRAM, so calling its pool that asserts memory private to the card
     // -- the claim `assess_model_readiness` refuses for this very host, forcing
@@ -967,7 +981,7 @@ fn append_model_fit_lines(
                 engine_target
             );
         }
-        Some(required) => match aggregate_gpu_vram_gib {
+        Some(required) => match gpu_memory_gib {
             Some(available) if available >= f64::from(required) => {
                 let _ = writeln!(output, "      gpu_fit: supported");
                 let _ = writeln!(
@@ -985,6 +999,17 @@ fn append_model_fit_lines(
                 // same pair -- and the closing note that carries this everywhere
                 // else in the curated listing has no counterpart in this
                 // renderer.
+                //
+                // The `DEGRADED` half of the sentence is a claim about another
+                // command, so it is held by scenarios that run that command on
+                // a planted APU rather than by this renderer's own tests:
+                // `diagnose-81` on a host whose pool is read, and `diagnose-91`
+                // on one with no VRAM telemetry at all, both require
+                // `rocm diagnose --model` to answer degraded and say the pool is
+                // shared rather than set aside. `diagnose-85` pins the other
+                // side -- a CPU-only recipe is not softened by a pool it never
+                // allocates from -- so the claim cannot be satisfied by always
+                // degrading.
                 if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
                     let _ = writeln!(
                         output,
@@ -1015,7 +1040,7 @@ fn append_model_fit_lines(
                 let _ = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
                     writeln!(
                         output,
-                        "      action: choose a recipe with min_gpu_mem <= {} -- this machine's graphics have no memory of their own, so the pool above is what the system allows them, not a card that can be changed",
+                        "      action: choose a recipe with min_gpu_mem <= {} -- the figure above is the pool this machine allows its integrated graphics, not a card that can be swapped for a larger one",
                         format_gib(available)
                     )
                 } else {
@@ -1026,7 +1051,7 @@ fn append_model_fit_lines(
                         format_gib(f64::from(required))
                     )
                 };
-                append_manual_alternative_lines(output, recipe, aggregate_gpu_vram_gib);
+                append_manual_alternative_lines(output, recipe, gpu_memory_gib);
             }
             None => {
                 let _ = writeln!(output, "      gpu_fit: unknown");
@@ -1056,9 +1081,9 @@ fn append_model_fit_lines(
 fn append_manual_alternative_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory_gib: Option<f64>,
 ) {
-    let alternatives = manual_alternative_recommendations(recipe, aggregate_gpu_vram_gib);
+    let alternatives = manual_alternative_recommendations(recipe, gpu_memory_gib);
     if alternatives.is_empty() {
         let _ = writeln!(output, "      manual_alternatives: <none declared>");
     } else {
@@ -1086,11 +1111,11 @@ fn append_manual_alternative_lines(
 #[allow(dead_code)]
 fn manual_alternative_recommendations(
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory_gib: Option<f64>,
 ) -> Vec<String> {
     let catalog = builtin_model_recipes();
     rocm_core::model_readiness::curated_alternatives(Some(recipe), &catalog, &|candidate| {
-        recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib)
+        recipe_is_manual_fit(candidate, gpu_memory_gib)
     })
     .into_iter()
     .map(|(candidate_ref, candidate)| {
@@ -1120,12 +1145,10 @@ fn manual_alternative_recommendations(
 }
 
 #[allow(dead_code)]
-fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: Option<f64>) -> bool {
+fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, gpu_memory_gib: Option<f64>) -> bool {
     match recipe.min_gpu_mem_gb {
         None => true,
-        Some(required) => {
-            aggregate_gpu_vram_gib.is_some_and(|available| available >= f64::from(required))
-        }
+        Some(required) => gpu_memory_gib.is_some_and(|available| available >= f64::from(required)),
     }
 }
 
@@ -1495,7 +1518,7 @@ mod tests {
     /// discrete majority.
     #[test]
     fn an_integrated_gpu_is_narrowed_on_its_shared_pool_and_told_the_pool_is_shared() {
-        const SHARED_CAVEAT: &str = "This GPU has no dedicated VRAM";
+        const SHARED_CAVEAT: &str = SHARED_POOL_NOTE;
 
         let shared = render_model_registry_text_with_context_and_host(
             None,
@@ -1621,7 +1644,7 @@ mod tests {
     /// not written for.
     #[test]
     fn the_shared_memory_caveat_reaches_the_nothing_fits_and_bare_narrowed_messages() {
-        const SHARED_CAVEAT: &str = "This GPU has no dedicated VRAM";
+        const SHARED_CAVEAT: &str = SHARED_POOL_NOTE;
 
         let minimums = builtin_model_recipes()
             .iter()
@@ -1660,7 +1683,7 @@ mod tests {
         );
         assert!(
             bare.contains(&format!(
-                "Narrowed to what this machine can run. {SHARED_CAVEAT}"
+                "Narrowed to what this machine can run.{SHARED_CAVEAT}"
             )),
             "the bare narrowed message must carry the caveat immediately, with no remainder \
              clause between them: {bare}"
@@ -1679,10 +1702,7 @@ mod tests {
             rendered.contains("could not be read"),
             "an unmeasured host must be told its list is not specific to it: {rendered}"
         );
-        assert!(
-            !rendered.contains("This GPU has no dedicated VRAM"),
-            "{rendered}"
-        );
+        assert!(!rendered.contains(SHARED_POOL_NOTE.trim()), "{rendered}");
         assert!(
             !rendered.contains("Narrowed to what this machine can run"),
             "{rendered}"
