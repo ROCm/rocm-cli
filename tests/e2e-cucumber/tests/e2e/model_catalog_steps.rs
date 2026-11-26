@@ -416,13 +416,13 @@ async fn assert_verbose_names_the_shared_pool(world: &mut E2eWorld) {
 }
 
 /// The remedy printed beside a verdict that did not fit. It used to read "use a
-/// GPU with at least N", which this machine's owner cannot act on: the pool is
-/// what the system allows the graphics, not a card with a slot behind it.
+/// GPU with at least N", which this machine's owner cannot act on: the figure is
+/// the pool the system allows the graphics, not a card with a slot behind it.
 #[then("the remedy it offers is one this machine can act on")]
 async fn assert_remedy_is_actionable(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     assert!(
-        output.contains("not a card that can be changed"),
+        output.contains("not a card that can be swapped for a larger one"),
         "a row that does not fit must offer a remedy this machine can act on:\n{output}"
     );
     assert!(
