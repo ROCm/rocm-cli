@@ -496,9 +496,11 @@ mod tests {
 
     /// The command a refusal names is the same for every action that can print
     /// it — `rocm services restart`, a fresh launch, and the daemon's respawn,
-    /// whose text is the same shared guard's — so each is followed here, from
-    /// the refused state, through the real `rocm serve` front half. A service
-    /// that is recorded, and may still be running, is the next test's.
+    /// whose text is the same shared guard's — so each one's is parsed here by
+    /// the real `rocm` parser, and a fresh launch's is also followed from the
+    /// refused state through the real `rocm serve` front half. A restart's or a
+    /// respawn's is of a recorded service, which a launch under a new id does
+    /// not replace while it still runs, so following it is the next test's.
     #[test]
     fn the_command_a_respawn_refusal_names_clears_the_refusal() -> Result<()> {
         use rocm_core::ServiceStart;

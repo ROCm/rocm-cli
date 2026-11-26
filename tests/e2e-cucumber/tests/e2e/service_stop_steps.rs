@@ -4,8 +4,11 @@
 
 //! Steps for stopping a managed service: `rocm services stop <id> --yes`
 //! (confirmed, and unconfirmed through the `ROCM_E2E_STOP_OUTCOME` seam), and
-//! `rocmd sandbox-tool stop_server`; and for `engine_ipc.feature`, the steps
-//! that run `rocm __engine-stdio vllm` with a request and read its answer.
+//! `rocmd sandbox-tool stop_server`; `rocm services restart --yes` of a server
+//! whose endpoint key is gone, with the refusal it prints, the commands that
+//! refusal names, and the server it leaves as it was; and for
+//! `engine_ipc.feature`, the steps that run `rocm __engine-stdio vllm` with a
+//! request and read its answer.
 //!
 //! Black-box: plants a managed-service record as plain JSON in its own isolated
 //! data dir — the same on-disk shape `rocm serve --managed` writes — then runs
