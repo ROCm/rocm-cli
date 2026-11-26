@@ -4222,9 +4222,9 @@ output (the tests in [fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs) na
 `the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
 and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-15 and fix-21
 also must exit non-zero when their DLL is missing, fix-15 in
-`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
-that only `rocm diagnose` prints
-(`the_igpu_verify_pins_the_variable_it_names` in
+`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs fix-9's line,
+which `rocm diagnose` and `rocm fix` share
+(`the_igpu_verify_reads_the_variable_the_change_persisted` in
 [host.rs](../crates/rocm-core/src/diagnose/host.rs)). These tests are compiled on
 Windows only, so the Linux lanes do not run them, and no Windows scenario covers
 the Windows lines `rocm diagnose` prints: those are held by the text rule
@@ -4290,6 +4290,47 @@ is registered for Linux, Windows and WSL and only adds to that score.
 [host.rs](../crates/rocm-core/src/diagnose/host.rs) holds that for all three
 families.
 
+fix-4's command is one plan as well. Which groups it adds the user to depends on
+the host, so the catalog recipe names them `<kfd-group>,video`, and `rocm
+diagnose` and `rocm fix` resolve them with one function, `render_group_targets` in
+[fix/render_group.rs](../crates/rocm-core/src/fix/render_group.rs): the group that
+owns `/dev/kfd` when it is a group name the host has, else `render` when the host
+has it, then `video` when it is another group the host has. With neither the
+owner nor `render` there is no group to name: the diagnosis prints the reason as
+a comment and no `usermod` line, and `rocm fix` says why and exits 3. The
+diagnosis reads the owner and the groups from the examination
+(`groups_on_host`, which `getent group` fills); `rocm fix` reads them live, and
+stops with exit 4 when `getent` does not answer.
+`the_render_group_plan_diagnose_prints_is_the_one_fix_runs` in
+[fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) holds the two to one
+line over a table of owners (`render`, `video`, `UNKNOWN`, none, a number, a group
+of its own, a missing group) and of the groups the host has, and
+`diagnose-93` asserts it end to end on a simulated device owned by `video`. The
+diagnosis does not offer fix-4 at all when the user can already write `/dev/kfd`,
+unless the pasted error names a permission failure on it
+(`a_writable_kfd_does_not_raise_the_render_group_fix` and
+`a_kfd_permission_symptom_still_raises_it_on_a_writable_device` in
+[linux.rs](../crates/rocm-core/src/diagnose/linux.rs); `diagnose-92` end to end).
+Both scenarios plant `/dev/kfd` under `ROCM_CLI_TEST_HOST_ROOT` and put stand-in
+`stat`, `id` and `getent` ahead of the real ones, so they run on every Linux lane,
+WSL2 included, as `diagnose-40` does:
+
+```bash
+E2E_ONLY_LIFECYCLE=1 E2E_ALSO_RUN_IDS=diagnose-render-group-not-offered-for-a-writable-device,diagnose-and-fix-propose-the-same-groups cargo xtask e2e
+```
+
+Every entry `rocm fix` carries out is held to one plan this way or verbatim:
+`every_entry_rocm_fix_carries_out_is_held_to_one_plan` in
+[diagnose/catalog.rs](../crates/rocm-core/src/diagnose/catalog.rs) fails for an
+acting entry that is on neither its verbatim list nor its reviewed list of
+host-dependent plans, each of which names the test that holds it. fix-9's query,
+change and verify line are the catalog's (`IGPU_*` in
+[fix/catalog.rs](../crates/rocm-core/src/fix/catalog.rs)), with the device index
+left as `<dGPU-index>` (`the_igpu_plan_diagnose_prints_is_the_catalogs` in
+[host.rs](../crates/rocm-core/src/diagnose/host.rs)), and fix-6's Linux line is
+`path_export_line`, the line `rocm fix fix-6-path` appends
+(`the_path_fix_plan_diagnose_prints_is_the_one_fix_appends`).
+
 When a fix's own command does not succeed, `rocm fix` exits 4 and prints one
 line on stderr, built from how the command ended
 (`Step` in [fix/consent.rs](../crates/rocm-core/src/fix/consent.rs)):
@@ -4298,7 +4339,7 @@ line on stderr, built from how the command ended
 |---|---|
 | exited non-zero, or could not be started | it exited `N` (or could not be started), and the change was NOT made |
 | timed out (60s for a change), or was stopped by a signal or a failed wait | it was stopped, the change may or may not have been made, how to check it (`Check with` a shell command on Linux, `Check in PowerShell with` an expression on Windows), and the `rocm fix` command to re-run |
-| a Windows read of the current value did not complete (8s) | it could not read the current value, and nothing was changed; the runner stops before its preview of the change or any prompt, under `--dry-run` too; the catalog entry printed before it still appears |
+| a read of the current value did not complete (8s): a Windows env scope, or fix-4's `getent group` | it could not read the current value, and nothing was changed; the runner stops before its preview of the change or any prompt, under `--dry-run` too; the catalog entry printed before it still appears |
 
 Each row for each runner is unit-tested with an injected command runner in
 [fix/runners.rs](../crates/rocm-core/src/fix/runners.rs) and
@@ -4306,7 +4347,8 @@ Each row for each runner is unit-tested with an injected command runner in
 scenarios in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature)
 run the real binary: `diagnose-15` (fix-4's helper exits 1) and `diagnose-68`
 (it never finishes) stand a fake `sudo` on a restricted `PATH` that records the
-arguments it was given, and assert the line together with the exit code, that
+arguments it was given, beside `stat` and `getent` stand-ins that answer the
+fix's two reads, and assert the line together with the exit code, that
 the helper was asked to add the user to the groups, and that the success line is
 absent. Both are `@requires-os:linux @requires-bare-metal`. `diagnose-68`
 waits out the real one-minute bound; there is no switch to shorten it. The step

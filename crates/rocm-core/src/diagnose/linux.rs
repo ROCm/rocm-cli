@@ -93,6 +93,18 @@ pub(super) fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) ->
 }
 
 pub(super) fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis {
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_KFD_PERMISSION);
+    // The user can already open the device, so group membership is not what
+    // stands between them and the GPU. Only a pasted error that names a
+    // permission failure on the device keeps the entry: then the examination
+    // and the error disagree, and the error is the stronger evidence.
+    if kw_score == 0
+        && e.kfd
+            .as_ref()
+            .is_some_and(|kfd| kfd.exists && kfd.user_can_write == Some(true))
+    {
+        return zero("fix-4-render-group", "User missing render/video group");
+    }
     let mut score = 0;
     let mut evidence = Vec::new();
     if e.in_render_group == Some(false) {
@@ -113,35 +125,26 @@ pub(super) fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis 
             kfd.mode, kfd.owner_group
         ));
     }
-    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_KFD_PERMISSION);
     score += kw_score;
     evidence.extend(kw_ev);
 
     if score <= 0 {
         return zero("fix-4-render-group", "User missing render/video group");
     }
-    // `stat -c %G` prints the literal "UNKNOWN" when the device GID has no
-    // matching group name (common in containers). Treat that the same as an
-    // empty value and fall back to the render group, so the suggested command
-    // never names a group that does not exist.
-    let kfd_group = e
-        .kfd
-        .as_ref()
-        .map(|k| k.owner_group.clone())
-        .filter(|g| !g.is_empty() && !g.eq_ignore_ascii_case("UNKNOWN"))
-        .unwrap_or_else(|| "render".to_owned());
-    let fix = Fix {
-        summary: format!("Add the current user to '{kfd_group}' (and 'video' for safety) and log out/in."),
-        commands: vec![format!("sudo usermod -a -G {kfd_group},video \"$USER\"")],
-        needs_sudo: true,
-        needs_relogin: true,
-        fix_id: "fix-4-render-group".to_owned(),
-        verify: crate::fix::RENDER_GROUP_VERIFY.to_owned(),
-        notes: vec![
-            "Group membership only takes effect after a full re-login (or reboot). `newgrp render` will give the current shell access but not other terminals or services.".to_owned(),
-        ],
-        ..Fix::default()
-    };
+    let owner_group = e.kfd.as_ref().map_or("", |k| k.owner_group.as_str());
+    let mut fix = render_group_plan(owner_group, e.groups_on_host.as_deref());
+    fix.fix_id = "fix-4-render-group".to_owned();
+    // With no group to name there is nothing to run, no re-login to wait for
+    // and nothing to verify: the flags line then says `rocm fix` changes
+    // nothing (it exits 3 with the reason), not that it can run the command.
+    if !fix.unavailable_here {
+        fix.needs_sudo = true;
+        fix.needs_relogin = true;
+        fix.verify = crate::fix::RENDER_GROUP_VERIFY.to_owned();
+        fix.notes = vec![
+            "Group membership only takes effect after a full re-login (or reboot). `newgrp <group>` gives the current shell access but not other terminals or services.".to_owned(),
+        ];
+    }
     finalize(
         "fix-4-render-group",
         "User not in render/video group (or /dev/kfd owned by the other group)",
@@ -149,6 +152,58 @@ pub(super) fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis 
         evidence,
         fix,
     )
+}
+
+/// The summary and the command of fix-4's plan, from the group that owns
+/// `/dev/kfd` and the groups the host's database names (`None` when it was
+/// not read).
+///
+/// The groups come from `crate::fix::render_group_targets` and the arguments
+/// from `crate::fix::usermod_args`, which `rocm fix` builds its own `usermod`
+/// from, so the line printed here is the one the fix runs (held by
+/// `the_render_group_plan_diagnose_prints_is_the_one_fix_runs`). When no
+/// group can be named the plan carries no command, only the reason: a
+/// `usermod` naming a group the host does not have fails, and `stat` prints
+/// `UNKNOWN` for a group it cannot name.
+fn render_group_plan(owner_group: &str, groups_on_host: Option<&[String]>) -> Fix {
+    let targets = crate::fix::render_group_targets(owner_group, |group| {
+        groups_on_host.is_some_and(|known| known.iter().any(|g| g == group))
+    });
+    if targets.is_empty() {
+        let reason = crate::fix::no_target_reason(
+            owner_group,
+            crate::fix::PlanReader::Examination {
+                database_read: groups_on_host.is_some(),
+            },
+        );
+        return Fix {
+            summary: format!(
+                "No group to add the current user to: {reason}. Give the user access to /dev/kfd another way, or create the group, then re-run `rocm diagnose`."
+            ),
+            commands: vec![
+                format!("# {reason}."),
+                "# Check with: ls -l /dev/kfd; getent group render video".to_owned(),
+            ],
+            // Only when the host's groups were read: with `None` the diagnosis
+            // cannot tell, and `rocm fix` reads them live and may well run.
+            unavailable_here: groups_on_host.is_some(),
+            ..Fix::default()
+        };
+    }
+    let groups = targets.join(",");
+    let named = targets
+        .iter()
+        .map(|g| format!("'{g}'"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Fix {
+        summary: format!("Add the current user to {named} and log out/in."),
+        commands: vec![format!(
+            "sudo usermod {}",
+            crate::fix::usermod_args(&groups, "\"$USER\"").join(" ")
+        )],
+        ..Fix::default()
+    }
 }
 
 pub(super) fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
@@ -845,9 +900,12 @@ mod tests {
         // `stat -c %G /dev/kfd` prints "UNKNOWN" when the GID has no group
         // name. That value must not leak into the remediation command, which
         // would otherwise suggest `usermod -a -G UNKNOWN,video` -- a group that
-        // does not exist. Fall back to the render group instead. Exercise both
-        // casings so the case-insensitive guard cannot silently regress to an
-        // exact-match check while this test stays green.
+        // does not exist. Fall back to the render group instead, and only when
+        // the host has one: with no `render` either, there is no group to name
+        // and the plan carries no command at all. Exercise both casings so the
+        // case-insensitive guard cannot silently regress to an exact-match
+        // check while this test stays green.
+        let host_has = |groups: &[&str]| Some(groups.iter().map(|g| (*g).to_owned()).collect());
         for sentinel in ["UNKNOWN", "unknown"] {
             let mut e = linux_base();
             e.in_render_group = Some(false);
@@ -859,6 +917,7 @@ mod tests {
                 user_can_write: Some(false),
                 ..Device::default()
             });
+            e.groups_on_host = host_has(&["render", "video"]);
             let report = diagnose(&e, "");
             let top = &report.matched[0];
             assert_eq!(top.id, "fix-4-render-group");
@@ -873,7 +932,119 @@ mod tests {
                 "summary must not name the bogus {sentinel} group:\n{}",
                 fix.summary
             );
+
+            // The ROCMAI-296 open point: a container whose group database has
+            // no `render` group.
+            e.groups_on_host = host_has(&["video"]);
+            let report = diagnose(&e, "");
+            let fix = report.matched[0].fix.as_ref().expect("fix-4 carries a fix");
+            assert!(
+                fix.commands.iter().all(|c| c.starts_with('#')),
+                "{sentinel} with no render group: nothing may be offered to run: {:?}",
+                fix.commands
+            );
+            assert!(
+                fix.summary
+                    .starts_with("No group to add the current user to:"),
+                "{}",
+                fix.summary
+            );
+            // The flags line must not promise a run: `rocm fix fix-4-render-group`
+            // exits 3 with the reason here and changes nothing (held by
+            // `render_group_with_no_group_to_name_changes_nothing_and_says_why` in fix/runners.rs).
+            assert_eq!(fix.class, crate::fix::FixClass::DiagnoseOnly, "{fix:?}");
+            assert!(!fix.auto_applicable, "{fix:?}");
+            assert!(
+                !fix.needs_sudo && !fix.needs_relogin && fix.verify.is_empty(),
+                "{fix:?}"
+            );
+            let text = crate::diagnose::render_report_text(&report, 5);
+            assert!(
+                !text.contains("rocm fix can run it") && text.contains("will NOT change anything"),
+                "{text}"
+            );
         }
+    }
+
+    /// The examination did not read the host's groups (an older remote CLI):
+    /// the diagnosis cannot say no group exists, so it prints the reason and
+    /// no command but does not claim `rocm fix` changes nothing -- `rocm fix`
+    /// reads the groups live and may run.
+    #[test]
+    fn unread_host_groups_print_no_command_but_leave_the_fix_runnable() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.groups_on_host = None;
+        let report = diagnose(&e, "");
+        let fix = report.matched[0].fix.as_ref().expect("fix-4 carries a fix");
+        assert_eq!(report.matched[0].id, "fix-4-render-group");
+        assert!(fix.commands.iter().all(|c| c.starts_with('#')), "{fix:?}");
+        assert!(!fix.unavailable_here && fix.auto_applicable, "{fix:?}");
+    }
+
+    /// A `/dev/kfd` node the user can write to, owned by a group the user is
+    /// not in.
+    fn writable_kfd_host() -> Examination {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        e.kfd = Some(Device {
+            path: "/dev/kfd".to_owned(),
+            exists: true,
+            mode: "crw-rw-rw-".to_owned(),
+            owner_user: "root".to_owned(),
+            owner_group: "render".to_owned(),
+            user_can_read: Some(true),
+            user_can_write: Some(true),
+        });
+        e.groups_on_host = Some(vec!["render".to_owned(), "video".to_owned()]);
+        e
+    }
+
+    /// ROCMAI-400: the user can already write `/dev/kfd`, so joining a group
+    /// is not what stands between them and the GPU, whatever groups they are
+    /// in. The entry is not offered at all, nor any `usermod`.
+    #[test]
+    fn a_writable_kfd_does_not_raise_the_render_group_fix() {
+        let e = writable_kfd_host();
+        let d = check_4_render_group(&e, "");
+        assert_eq!(d.score, 0, "{:?}", d.evidence);
+        let report = diagnose(&e, "");
+        assert!(
+            !report.matched.iter().any(|d| d.id == "fix-4-render-group"),
+            "{:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+        // The device has to be the reason: the same host with a device the
+        // user cannot write still raises it.
+        let mut locked = writable_kfd_host();
+        if let Some(kfd) = locked.kfd.as_mut() {
+            kfd.mode = "crw-rw----".to_owned();
+            kfd.user_can_write = Some(false);
+        }
+        assert_eq!(check_4_render_group(&locked, "").score, 70);
+    }
+
+    /// The exception to the rule above: an error the user pasted that names a
+    /// permission failure on the device. The examination and the error then
+    /// disagree, and the entry stays, scored as before.
+    #[test]
+    fn a_kfd_permission_symptom_still_raises_it_on_a_writable_device() {
+        let e = writable_kfd_host();
+        let symptom = "RuntimeError: unable to open /dev/kfd";
+        let d = check_4_render_group(&e, symptom);
+        let (kw_score, _) = keyword_score(symptom, KEYWORDS_KFD_PERMISSION);
+        assert!(
+            kw_score > 0,
+            "the symptom has to name a kfd permission failure"
+        );
+        assert_eq!(d.score, (35 + 10 + kw_score).min(100));
+        let fix = d.fix.expect("fix-4 carries a fix");
+        assert_eq!(fix.commands, ["sudo usermod -a -G render,video \"$USER\""]);
     }
 
     #[test]

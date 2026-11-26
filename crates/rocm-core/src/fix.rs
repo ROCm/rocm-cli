@@ -21,7 +21,9 @@
 //! `fix/consent.rs` holds the consent decision, the timeouts, the `fail!`
 //! helper, and the one way a runner runs a host command and reports how it
 //! ended (`run_step`, `Step`, `CheckIn`, `StepFailure`, `read_failure`). The
-//! runners, one per auto-applicable fix, are in `fix/runners.rs`. The closed
+//! runners, one per auto-applicable fix, are in `fix/runners.rs`, and the
+//! groups fix-4 names, decided for `rocm diagnose` and `rocm fix` alike, in
+//! `fix/render_group.rs`. The closed
 //! catalog (`RECIPES`, `FixRecipe`, the lookups by fix-id and the test-only
 //! oracles) is in `fix/catalog.rs`, its rendering in `fix/render.rs` and its
 //! published JSON contract in `fix/manifest.rs`. What stays here is the
@@ -32,6 +34,7 @@ mod consent;
 mod manifest;
 mod options;
 mod render;
+mod render_group;
 mod runners;
 
 use catalog::{FixRecipe, find_recipe};
@@ -42,7 +45,8 @@ use render::{
 use std::io::Write;
 
 pub(crate) use catalog::{
-    COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, RENDER_GROUP_VERIFY, is_catalog_id,
+    COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED, IGPU_PIN_LINUX, IGPU_PIN_WINDOWS, IGPU_QUERY_LINUX,
+    IGPU_QUERY_WINDOWS, IGPU_VERIFY, RENDER_GROUP_VERIFY, is_catalog_id, path_export_line,
 };
 pub use catalog::{class_on, needs_on};
 pub use consent::{DRY_RUN_NOTICE, NON_INTERACTIVE_REFUSAL};
@@ -53,12 +57,16 @@ pub use manifest::{
 pub use options::{FixClass, FixOptions, exit};
 pub(crate) use render::format_flags;
 pub use render::{fix_plan_text, list_recipes};
+pub(crate) use render_group::{
+    DEVICE_STAT_FORMAT, PlanReader, getent_answered, getent_args, no_target_reason,
+    parse_device_stat, parse_getent_group, render_group_targets, usermod_args,
+};
 pub use runners::{FixPreview, fix_preview_text};
 // The catalog's test-only oracles, which the `diagnose` module holds its own copies of
 // a recipe to.
 #[cfg(test)]
 pub(crate) use catalog::{
-    OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, assert_engine_shell_boundary_is_labelled,
+    OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, acting_fix_ids, assert_engine_shell_boundary_is_labelled,
     assert_needs_reboot_matches_the_catalog, assert_plan_matches_the_catalog_copy,
     fails_in_windows_powershell, recipe_applies_on, recipe_linux_verify, recipe_rationale,
     recipe_verify_notes_and_run_commands, torch_rocm_indexes_named_in,
@@ -846,12 +854,13 @@ mod tests {
         // covers `fix.rs` and every file in `fix/`. The list below is held to
         // the directory, so a child added without being listed fails the test
         // rather than silently going unscanned.
-        let children: [(&str, &str); 6] = [
+        let children: [(&str, &str); 7] = [
             ("catalog.rs", include_str!("fix/catalog.rs")),
             ("consent.rs", include_str!("fix/consent.rs")),
             ("manifest.rs", include_str!("fix/manifest.rs")),
             ("options.rs", include_str!("fix/options.rs")),
             ("render.rs", include_str!("fix/render.rs")),
+            ("render_group.rs", include_str!("fix/render_group.rs")),
             ("runners.rs", include_str!("fix/runners.rs")),
         ];
         let mut on_disk: Vec<String> =

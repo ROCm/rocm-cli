@@ -1431,3 +1431,38 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI whether that model would run, in machine-readable form
     Then the memory the answer was reached against is the pool the GPU shares
     And the model is reported as degraded, because the pool is shared rather than set aside
+
+  # A device the user can already read and write is not a group-membership
+  # problem, whatever groups the user is in. The render-group cause only ever
+  # added score for missing groups, so it was offered here, with a closing
+  # "run `rocm fix fix-4-render-group`" directive asking for sudo and a
+  # re-login. A pasted permission error on the device still raises it; that
+  # half is unit tested (`a_kfd_permission_symptom_still_raises_it_on_a_writable_device`
+  # in crates/rocm-core/src/diagnose/linux.rs).
+  #
+  # The host is simulated like diagnose-40's: a `/dev/kfd` planted under the
+  # scenario's own root, and stand-in `stat`, `id` and `getent` ahead of the
+  # real ones, so the device's mode and owner, the user's groups and the groups
+  # the host has are the scenario's on every lane. The Then step first checks
+  # that the CLI's own inspection sees the device as writable by a user in no
+  # GPU group, the state that used to raise the cause. Not `@requires-bare-metal`:
+  # with the planted root a WSL2 lane examines the simulated machine, as it
+  # does in diagnose-40.
+  @id:diagnose-render-group-not-offered-for-a-writable-device @requires-os:linux
+  Scenario: diagnose-92 - A GPU device the user can already open is not diagnosed as a group-membership problem
+    Given a machine whose GPU compute device every user can read and write, with the user in no GPU group
+    When the user asks the CLI to diagnose the machine, in machine-readable form
+    Then adding the user to a GPU group is not offered as a cause
+
+  # `rocm diagnose` printed a `usermod` line built from the device's owning
+  # group (`video,video` here) while `rocm fix fix-4-render-group` ran its own
+  # hard-coded `render,video`, so the user approved one command and got another.
+  # Both now come from one resolver, which names only groups the host has. The
+  # device belongs to `video`, not the usual `render`, which is where the two
+  # used to differ. Simulated as in diagnose-92; the preview runs nothing, and
+  # the stand-in `sudo` and `usermod` would only record and fail if it did.
+  @id:diagnose-and-fix-propose-the-same-groups @requires-os:linux
+  Scenario: diagnose-93 - The diagnosis and the fix it names propose adding the user to the same groups
+    Given a machine whose GPU compute device belongs to the video group, which the user is not in
+    When the user compares the diagnosis with a preview of the fix it names
+    Then both propose adding the user to the device's own group, once, in the same command
