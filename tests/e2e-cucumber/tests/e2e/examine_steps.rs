@@ -524,9 +524,9 @@ async fn assert_install_method_is_current(world: &mut E2eWorld) {
 async fn user_inspects_both_ways(world: &mut E2eWorld) {
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
-    // Both are needed by the comparison step; the human form goes in the stderr
-    // slot rather than adding a World field for one scenario.
-    world.cli_stderr = Some(human);
+    // Both are needed by the comparison step. The human form is a second
+    // command's output, so it goes in `cli_other_output`, not the stderr slot.
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -651,7 +651,7 @@ async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
     // second, so the comparison step can hold the two to each other.
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
-    world.cli_stderr = Some(human);
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -745,7 +745,7 @@ fn human_states(human: &str, label: &str) -> Option<String> {
 #[then("the framework report names the runtime's interpreter")]
 async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -824,7 +824,7 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
 #[then("the machine-readable form states everything the readable one does")]
 async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -851,7 +851,7 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
 async fn assert_json_names_setup_runtime_folder(world: &mut E2eWorld) {
     let planted = planted_setup_runtime_root(world).display().to_string();
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -909,7 +909,7 @@ async fn assert_json_keeps_setup_and_active_apart(world: &mut E2eWorld) {
 #[then("both reports agree on whether this machine has an AMD GPU")]
 async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
@@ -932,7 +932,7 @@ async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
 #[then("both reports agree on whether this platform is in scope")]
 async fn assert_forms_agree_on_platform(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
@@ -2393,7 +2393,10 @@ fn age_expected_from_date(record: &serde_json::Value) -> &'static str {
 )]
 async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
     let json = parsed_json(world);
-    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let text = world
+        .cli_other_output
+        .as_ref()
+        .expect("no readable inspection");
     let record = windows_driver_record(&json).unwrap_or_else(|| {
         panic!("the machine-readable form carries no Windows driver record:\n{json:#}")
     });
@@ -2421,7 +2424,10 @@ async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
 #[then("the inspection calls the driver old only when its date is before 27 July 2023")]
 async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
     let json = parsed_json(world);
-    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let text = world
+        .cli_other_output
+        .as_ref()
+        .expect("no readable inspection");
     let record = windows_driver_record(&json)
         .unwrap_or_else(|| panic!("no Windows driver record in the machine-readable form"));
     let expected = age_expected_from_date(record);
@@ -4546,5 +4552,77 @@ async fn assert_software_renderer_reported(world: &mut E2eWorld) {
         output.contains("no Vulkan GPU driver was found"),
         "a host whose only renderer is the CPU has no GPU backend, and the support \
          line must say so:\n{output}"
+    );
+}
+
+// ── What the help itself promises ──────────────────────────────────
+
+#[when("the user reads the serve examples the help offers")]
+async fn user_reads_serve_examples(world: &mut E2eWorld) {
+    // Both example blocks that name a model: the top-level one a new user meets
+    // first, and `serve`'s own.
+    let (general, _, _) = crate::run_rocm(world, &["help"]);
+    let (serve, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let (listing, _, _) = crate::run_rocm(world, &["model", "--verbose"]);
+    world.cli_output = Some(format!("{general}\n{serve}"));
+    world.cli_other_output = Some(listing);
+}
+
+#[then("every model named there is one the CLI can resolve")]
+async fn assert_example_models_resolve(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    let listing = world.cli_other_output.as_ref().expect("no model listing");
+    let examples = e2e_cucumber::help_text::serve_example_models(help);
+    assert!(
+        !examples.is_empty(),
+        "no `rocm serve <model>` example found in the help:\n{help}"
+    );
+    let known = e2e_cucumber::help_text::known_model_names(listing);
+    assert!(
+        !known.is_empty(),
+        "could not read any model name out of the listing:\n{listing}"
+    );
+    // Two forms are legitimate, and the README documents both: a name the CLI's
+    // own catalog answers to, or an explicit `owner/repo` reference to fetch. The
+    // check accepts either, so it says the example must WORK without dictating
+    // which model it should be.
+    let unresolvable: Vec<&String> = examples
+        .iter()
+        .filter(|model| {
+            !model.contains('/') && !known.iter().any(|name| name.eq_ignore_ascii_case(model))
+        })
+        .collect();
+    assert!(
+        unresolvable.is_empty(),
+        "the help offers {unresolvable:?} as models to serve, but they are neither a name the \
+         model listing knows nor an `owner/repo` reference, so copying the example verbatim \
+         cannot work.\nmodel listing knows: {known:?}"
+    );
+}
+
+#[then("running the CLI with no subcommand is not described as the dashboard command")]
+async fn assert_default_command_described_distinctly(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    // What the help says the dedicated dashboard command does, read from the
+    // help rather than hardcoded so the check follows a rewording of it.
+    let dash = e2e_cucumber::help_text::command_summary(help, "dash")
+        .unwrap_or_else(|| panic!("the help lists no `dash` command:\n{help}"));
+    assert!(
+        dash.to_ascii_lowercase().contains("dashboard"),
+        "expected the help to list a `dash` command that opens the dashboard, but it says \
+         {dash:?}:\n{help}"
+    );
+    // The one sentence describing what the plain command does. Two commands, two
+    // different screens: describing the plain one as the dashboard leaves the
+    // reader unable to tell them apart, and unaware that it opens something else.
+    let sentence = e2e_cucumber::help_text::sentence_containing(help, "with no subcommand")
+        .unwrap_or_else(|| {
+            panic!("the help does not say what running the CLI with no subcommand does:\n{help}")
+        });
+    assert!(
+        !sentence.to_ascii_lowercase().contains("dashboard"),
+        "the help describes running the CLI with no subcommand as opening the dashboard, which \
+         is what it also says `dash` does, and the two are different screens:\n  \
+         default: {sentence}\n  dash:    {dash}"
     );
 }

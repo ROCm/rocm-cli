@@ -1467,6 +1467,25 @@ Feature: Diagnosing failures and listing fixes
     When the user compares the diagnosis with a preview of the fix it names
     Then both propose adding the user to the device's own group, once, in the same command
 
+  # A proposed remedy has to name a group that exists on the machine. When the
+  # device belongs to a group the local group database does not name, `stat`
+  # answers the literal `UNKNOWN`, and the diagnosis used to print that lookup
+  # failure as a group the user could join. Fixed by #302 (EAI-8240): the
+  # lookup failure now falls back to `render`. This guards the fix.
+  #
+  # The device is a plain file under a simulated host root and a stand-in `stat`
+  # answers for it, and a stand-in `getent` holds the machine's group database
+  # (`render` and `video`), so neither the lane's own groups nor its GPU matter:
+  # this runs on every Linux lane, GPU or not -- WSL2
+  # included, as `@requires-os:linux` matches a host whose `os_family` is
+  # `linux` and WSL2's is. Every `rocm` call in the scenario carries the planted
+  # host root.
+  @id:diagnose-commands-name-a-real-group @requires-os:linux
+  Scenario: diagnose-94 - Every group named in a diagnosis is one the machine recognises
+    Given a machine whose GPU device belongs to a group the machine cannot name
+    When the user diagnoses a device-permission failure on that machine
+    Then every group named in the remedy exists on the machine
+
   # ROCMAI-912. An integrated GPU has no VRAM of its own: what it may allocate
   # is capped by `amdgpu.gttsize` (MiB), by `ttm.pages_limit` (4 KiB pages) and
   # by the BIOS carve-out. The two kernel parameters are in different units, so
@@ -1484,7 +1503,7 @@ Feature: Diagnosing failures and listing fixes
   # not have. @requires-os:linux because these are Linux kernel parameters;
   # the catalog scopes the entry to bare-metal Linux for the same reason.
   @id:diagnose-apu-page-limit-caps-the-aperture @requires-os:linux
-  Scenario: diagnose-94 - An integrated GPU whose page limit undercuts its aperture is told which one decides
+  Scenario: diagnose-95 - An integrated GPU whose page limit undercuts its aperture is told which one decides
     Given an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI names the page limit as the ceiling that really applies
@@ -1496,7 +1515,7 @@ Feature: Diagnosing failures and listing fixes
   # clean kernel log, is correctly configured. An entry that fired on the mere
   # presence of the parameters would pass diagnose-89 and fail here.
   @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
-  Scenario: diagnose-95 - An integrated GPU whose two limits agree is not told to change them
+  Scenario: diagnose-96 - An integrated GPU whose two limits agree is not told to change them
     Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then no unified-memory cause is reported for that machine
@@ -1512,7 +1531,7 @@ Feature: Diagnosing failures and listing fixes
   # failure from an earlier run is not there to find. The report must say the
   # recent log was read rather than that the machine never failed.
   @id:diagnose-apu-svm-mapping-failure-is-detected @requires-os:linux
-  Scenario: diagnose-96 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
+  Scenario: diagnose-97 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
     Given an integrated-GPU machine whose kernel log reports an SVM mapping failure
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI reports the kernel's own SVM mapping failure as the cause

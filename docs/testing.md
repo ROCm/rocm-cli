@@ -863,6 +863,11 @@ behaviour wanted, so un-ignoring it is the fix's acceptance test.
 A gap in user-observable CLI behaviour that an e2e scenario covers is tracked
 with an xfail row in `tests/e2e-cucumber/expectations.toml` instead.
 
+Two unit tests in [expectation.rs](../tests/e2e-cucumber/src/expectation.rs)
+keep that file and the feature files agreeing: every row names a scenario that
+exists, and every scenario whose comment says "Expected to FAIL" has a row. The
+[e2e README](../tests/e2e-cucumber/README.md) says where such a comment goes.
+
 ## Lemonade serving and dashboard regressions
 
 The real GPU scenarios `serve-lemonade-inference` and

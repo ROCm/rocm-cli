@@ -376,6 +376,11 @@ impl Expectations {
         self.by_id.get(id).map_or(&[], Vec::as_slice)
     }
 
+    /// Every scenario id this file declares a condition for.
+    pub fn declared_ids(&self) -> impl Iterator<Item = &str> {
+        self.by_id.keys().map(String::as_str)
+    }
+
     /// The shortest `serve_timeout_secs` among the conditions matching this host
     /// for a scenario, if any. A known bug that manifests as a serve which never
     /// becomes ready should fail fast rather than burn the full cold-start window
@@ -2722,6 +2727,351 @@ flaky = true
         assert_eq!(
             m.serve_timeout_override(&anonymous, &cap("strix-ubuntu")),
             None
+        );
+    }
+
+    /// The id each scenario in `text` resolves to, read the way `scenarios_of`
+    /// in `tests/feature_naming.rs` reads them and `ScenarioDecl::from_tags`
+    /// resolves them at runtime: tag lines only, so an `@id:` inside a `#`
+    /// comment cannot vouch for a row, and the last `@id:` above a `Scenario:`
+    /// wins, so a shadowed id names no scenario and cannot hide an orphan row.
+    fn resolved_scenario_ids(text: &str) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut pending_id = None;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('@') {
+                for id in line
+                    .split_whitespace()
+                    .filter_map(|tag| tag.strip_prefix("@id:"))
+                {
+                    pending_id = Some(id.to_owned());
+                }
+            } else if line.starts_with("Scenario:") || line.starts_with("Scenario Outline:") {
+                ids.extend(pending_id.take());
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn a_commented_out_id_does_not_declare_a_scenario() {
+        let ids = resolved_scenario_ids(
+            "  # @id:ghost
+  @requires-os:linux @id:real
+  Scenario: x
+",
+        );
+        assert!(ids.contains("real"), "{ids:?}");
+        assert!(!ids.contains("ghost"), "{ids:?}");
+    }
+
+    #[test]
+    fn a_shadowed_id_does_not_declare_a_scenario() {
+        // Two `@id:` tags on one scenario resolve to the last, as in
+        // `ScenarioDecl::from_tags`; the first names nothing at runtime.
+        let ids = resolved_scenario_ids(
+            "  @id:shadowed
+  @id:winner
+  Scenario: x
+",
+        );
+        assert!(ids.contains("winner"), "{ids:?}");
+        assert!(!ids.contains("shadowed"), "{ids:?}");
+        // An id with no `Scenario:` under it is not a scenario's either.
+        let ids = resolved_scenario_ids(
+            "  @id:dangling
+",
+        );
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    /// Every `.feature` file the suite runs.
+    ///
+    /// `features/` is flat, as `scenarios_of` in `tests/feature_naming.rs` also
+    /// assumes. This refuses to run, rather than quietly cover less, if that
+    /// stops being true: a subdirectory would vanish from every check below.
+    fn feature_files() -> Vec<std::path::PathBuf> {
+        feature_files_in(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("features"))
+    }
+
+    /// The scan itself, split out so the refusals can be driven against a
+    /// temporary tree; against the real `features/` they fire only if someone
+    /// breaks the repository. `feature_files_in` in `tests/feature_naming.rs` is
+    /// its twin and must keep the same shape: a `.feature` file with no stem has
+    /// no extension, so the `Path::extension` test below and a `.feature` suffix
+    /// test would disagree about it.
+    fn feature_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("no features directory") {
+            let path = entry.expect("unreadable features directory entry").path();
+            assert!(
+                !path.is_dir(),
+                "features/ has grown a subdirectory ({}), which this scan does not descend \
+                 into: make it recursive, here and in tests/feature_naming.rs, before moving \
+                 any .feature file into one",
+                path.display()
+            );
+            if path.extension().is_some_and(|ext| ext == "feature") {
+                paths.push(path);
+            }
+        }
+        assert!(
+            !paths.is_empty(),
+            "found no .feature files in {}",
+            dir.display()
+        );
+        paths
+    }
+
+    #[test]
+    fn the_feature_scan_takes_the_flat_files_it_finds() {
+        let dir = tempfile::tempdir().expect("no temp dir");
+        std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+        // No extension, so neither this scan nor its twin takes it.
+        std::fs::write(dir.path().join(".feature"), "not a feature file\n").unwrap();
+        let found = feature_files_in(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("a.feature"), "{found:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "found no .feature files")]
+    fn the_feature_scan_refuses_a_directory_with_no_feature_files() {
+        // A non-`.feature` file on purpose: what is refused is an empty result,
+        // not only an empty directory.
+        let dir = tempfile::tempdir().expect("no temp dir");
+        std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+        let _ = feature_files_in(dir.path());
+    }
+
+    #[test]
+    #[should_panic(expected = "has grown a subdirectory")]
+    fn the_feature_scan_refuses_a_subdirectory_rather_than_skipping_it() {
+        let dir = tempfile::tempdir().expect("no temp dir");
+        std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        let _ = feature_files_in(dir.path());
+    }
+
+    /// A row whose scenario was renamed or deleted never matches anything, so it
+    /// can neither xfail nor go stale: it sits there stating a bug nothing
+    /// measures. Resolution is keyed from the scenario to this file, never the
+    /// other way, so nothing at runtime notices; this does.
+    #[test]
+    fn every_expectation_row_names_a_scenario_that_exists() {
+        let mut scenario_ids = std::collections::BTreeSet::new();
+        for path in feature_files() {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+            scenario_ids.extend(resolved_scenario_ids(&text));
+        }
+        assert!(
+            !scenario_ids.is_empty(),
+            "read no `@id:` tags at all, so this check would pass vacuously"
+        );
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let declared: Vec<&str> = m.declared_ids().collect();
+        assert!(
+            !declared.is_empty(),
+            "expectations.toml declared no rows at all, so this check would pass vacuously"
+        );
+        let orphans: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|id| !scenario_ids.contains(*id))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "expectations.toml declares rows for scenarios that no longer exist: {orphans:?}\n\
+             Delete the row, or fix the id if the scenario was renamed."
+        );
+    }
+
+    /// What one feature file claims about expected failures.
+    struct FailureClaims {
+        /// Scenario ids introduced by a comment block saying "Expected to FAIL".
+        ids: Vec<String>,
+        /// 1-indexed lines whose claim reached no scenario id.
+        unbound: Vec<usize>,
+    }
+
+    /// Scan one feature file for "Expected to FAIL" claims.
+    ///
+    /// A scenario is written comment block, tag line(s), `Scenario:`, and the
+    /// block is contiguous with the tags it introduces, so a blank line ends a
+    /// claim's reach: a file header, or a note in a previous scenario's body,
+    /// describes something other than whatever comes next.
+    ///
+    /// A claim that reaches no id is reported, not dropped. Dropping it is how a
+    /// scenario would leave this check's coverage unnoticed: one blank line
+    /// between the comment and its tag line is enough.
+    ///
+    /// Line-shaped, not a Gherkin parse, and narrower than it looks: it reads
+    /// the phrase only on `#` comment lines (the same phrase on any other line
+    /// is not inspected), and treats `Scenario:`/`Scenario Outline:` as the only
+    /// block terminators, so a claim in a `Background:` block with no blank line
+    /// before the next scenario's tags binds to that scenario. What it
+    /// guarantees is that a `#` claim followed by a blank line, or by no
+    /// scenario id, is reported as unbound.
+    fn claimed_failure_ids(text: &str) -> FailureClaims {
+        let (mut ids, mut unbound) = (Vec::new(), Vec::new());
+        let (mut claim_lines, mut pending_ids): (Vec<usize>, Vec<String>) =
+            (Vec::new(), Vec::new());
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                // Clearing `pending_ids` as well means a blank line between a
+                // tag line and its `Scenario:` drops the ids, and the claim
+                // above them is then reported as unbound.
+                unbound.append(&mut claim_lines);
+                pending_ids.clear();
+            } else if line.starts_with('#') {
+                if line.contains("Expected to FAIL") {
+                    claim_lines.push(index + 1);
+                }
+            } else if line.starts_with('@') {
+                pending_ids.extend(
+                    line.split_whitespace()
+                        .filter_map(|tag| tag.strip_prefix("@id:"))
+                        .map(str::to_owned),
+                );
+            } else if line.starts_with("Scenario:") || line.starts_with("Scenario Outline:") {
+                if !claim_lines.is_empty() {
+                    if pending_ids.is_empty() {
+                        unbound.append(&mut claim_lines);
+                    } else {
+                        ids.extend(pending_ids.iter().cloned());
+                    }
+                }
+                claim_lines.clear();
+                pending_ids.clear();
+            }
+        }
+        unbound.append(&mut claim_lines);
+        FailureClaims { ids, unbound }
+    }
+
+    #[test]
+    fn a_contiguous_comment_block_binds_to_its_scenario() {
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \x20 @id:thing-is-broken\n\
+             \x20 Scenario: f-01 - The thing works\n\
+             \x20   Given a thing\n",
+        );
+        assert_eq!(claims.ids, ["thing-is-broken"]);
+        assert!(claims.unbound.is_empty(), "{:?}", claims.unbound);
+    }
+
+    #[test]
+    fn a_file_header_mentioning_the_phrase_condemns_no_scenario() {
+        let claims = claimed_failure_ids(
+            "# Historical note: f-01 was once Expected to FAIL.\n\
+             \n\
+             Feature: f\n\
+             \n\
+             \x20 @id:thing-works\n\
+             \x20 Scenario: f-01 - The thing works\n",
+        );
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [1]);
+    }
+
+    #[test]
+    fn a_comment_a_blank_line_from_its_tag_is_reported_not_dropped() {
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \n\
+             \x20 @id:thing-is-broken\n\
+             \x20 Scenario: f-01 - The thing works\n",
+        );
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [3]);
+    }
+
+    #[test]
+    fn a_claim_does_not_inherit_a_stale_id_from_across_a_blank_line() {
+        // Pins the `pending_ids.clear()` half of the blank-line arm: without it
+        // `stale-id` would still be pending when the claim below is bound, and
+        // the claim would be attributed to a scenario it says nothing about.
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 @id:stale-id\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \x20 Scenario: f-01 - The thing works\n",
+        );
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [5]);
+    }
+
+    #[test]
+    fn a_claim_dangling_at_end_of_file_is_reported_not_dropped() {
+        // The flush after the loop, which the other cases never reach.
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \x20 @id:thing-is-broken\n",
+        );
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [3]);
+    }
+
+    /// The inverse orphan: a scenario whose comment still says "Expected to
+    /// FAIL" after its row was deleted.
+    ///
+    /// `expectations.toml` owns that state, but the feature files restate it in
+    /// prose, and prose does not move when a row does. When a bug is fixed the
+    /// harness flips correctly and silently, leaving a comment that tells the
+    /// next reader the opposite of what the suite now enforces.
+    #[test]
+    fn every_expected_to_fail_comment_still_has_a_row() {
+        let mut claimed = Vec::new();
+        let mut unbound = Vec::new();
+        for path in feature_files() {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+            let scan = claimed_failure_ids(&text);
+            claimed.extend(scan.ids);
+            unbound.extend(
+                scan.unbound
+                    .into_iter()
+                    .map(|number| format!("{}:{number}", path.display())),
+            );
+        }
+        // A claim that reaches no scenario id means that scenario is outside
+        // this check's coverage; naming the comment's own file and line sends
+        // the reader to it rather than to whatever scenario follows.
+        assert!(
+            unbound.is_empty(),
+            "these lines say 'Expected to FAIL' but bind to no scenario id, so the scenario they \
+             describe is not covered by this check: {unbound:?}\n\
+             A claim reaches only the tag line directly beneath it, with no blank line in \
+             between. Move the comment against its tag line, or reword it if it is not a claim \
+             about a specific scenario."
+        );
+        // `claimed` is not asserted non-empty: a suite with no open known-bug
+        // comment is healthy, so an empty set is legitimate. What keeps the scan
+        // itself honest is the `claimed_failure_ids` tests above.
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let declared: std::collections::BTreeSet<&str> = m.declared_ids().collect();
+        let lying: Vec<&String> = claimed
+            .iter()
+            .filter(|id| !declared.contains(id.as_str()))
+            .collect();
+        assert!(
+            lying.is_empty(),
+            "these scenarios still say 'Expected to FAIL' but have no expectations row, so the \
+             comment asserts the opposite of what the suite enforces: {lying:?}\n\
+             Delete the comment along with the row: the bug it described is fixed, and the \
+             scenario now guards the fix."
         );
     }
 
