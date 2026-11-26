@@ -2447,8 +2447,10 @@ Expected result:
   hundred MiB at best. That is one model on one card, not a bound; a different
   model, GPU or build can land elsewhere. At a size well above what loads, the
   report should say `does not fit` and list what would make it fit.
-- `rocm serve` is unchanged: it takes no context-size option, and the report
-  names llama.cpp's options only as llama.cpp's.
+- `rocm serve` still takes no context-size option, and the report names
+  llama.cpp's options only as llama.cpp's. On an integrated GPU the serve itself
+  does choose a window — see the `Context window:` check below — so the size the
+  report estimated and the size the model is served with need not agree.
 
 Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
 `--context-size`, says a quantization is needed; a repository that does not
@@ -2585,12 +2587,26 @@ Expected result:
   The model's answer should say the output was partial and point at running the
   command in a terminal — it must not present a cut list as a complete one.
 
-- To see the overflow message, point the Chat tab at a model with a very small
-  context (serve one with `--ctx-size 2048`) and ask the same question. The
-  transcript should read `A ROCm check returned more text than this model can
-  read (N of M tokens). Try a more specific question, or a model with a larger
-  context.` — and `rocm-cli.log` should still carry the provider's own body
-  with `exceed_context_size_error` in it.
+- To see the overflow message, point the Chat tab at an endpoint with a very
+  small context (for example a `llama-server --ctx-size 2048` serving any small
+  GGUF) and send any message. The transcript should read `This request is
+  larger than the model's context window (N of M tokens). The assistant's
+  built-in instructions and any long ROCm check result both count toward it.
+  Try a more specific question, or use a model served with a larger context.`
+  — and `rocm-cli.log` should still carry the provider's own body with
+  `exceed_context_size_error` in it.
+
+- To see the context chosen on an integrated GPU (a Ryzen 4000/5000 laptop on
+  Windows, whose Vega iGPU has no ROCm build, is the case it was written for),
+  serve the built-in assistant (`rocm serve Qwen3-4B-Instruct-2507-GGUF`) and
+  read the service log from `rocm services logs <service-id>`. It should show
+  `Context window: N tokens, chosen from the model file and the X GiB of memory
+  this integrated GPU shares with the operating system.` (N a multiple of 256,
+  no more than 32768, and above the roughly 4,400 tokens the Chat tab's own
+  prompt takes), followed by Lemonade's `n_ctx_slot = N` with the same N, not the
+  4096 it picks when it cannot read memory. A plain greeting in the Chat tab
+  should get an answer rather than the overflow message. On a host with a
+  discrete GPU the `Context window:` line must be absent.
 
 ## 17. Serve Smoke Test Failure
 
@@ -2923,7 +2939,7 @@ gone, and `real-cache/keep` is still there.
 
 Needs a machine whose only AMD GPU is integrated — a Strix Halo, Strix Point,
 Phoenix or Rembrandt part. Nothing in CI has one, and the e2e scenarios
-(`diagnose-91` to `diagnose-93`) plant a simulated one, so this is the only
+(`diagnose-92` to `diagnose-94`) plant a simulated one, so this is the only
 check of `fix-24-apu-unified-memory` against real firmware and a real driver.
 
 First, read what the machine has:

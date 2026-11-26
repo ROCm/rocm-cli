@@ -88,12 +88,24 @@ pub(super) fn run_render_group(opts: &FixOptions) -> i32 {
         fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
         return exit::NOT_APPLICABLE;
     }
-    render_group_with(opts, &user, root, run_step, &mut std::io::stderr())
+    render_group_with(
+        opts,
+        &user,
+        root,
+        run_step,
+        |prompt| confirm(prompt, opts.yes),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
 }
 
 /// Does the plan/consent/run work for [`run_render_group`] once the user and
-/// the privilege route are known, with the command runner and the stderr sink
-/// injected so every way `usermod` can end is testable on any host.
+/// the privilege route are known, with the command runner, the consent prompt
+/// and the stdout and stderr sinks injected so every way `usermod` can end, and
+/// every line the runner prints itself, is testable on any host. Two things
+/// still reach the real streams: a child's own output, which `Step::run`
+/// relays, and what `confirm` (which production passes in as `consent`)
+/// writes, its refusal line included.
 ///
 /// A `usermod` stopped by the timeout is reported as such, not as an exit
 /// code: the executor stops only `sudo`, so `usermod` may still finish, and
@@ -103,6 +115,8 @@ fn render_group_with(
     user: &str,
     root: bool,
     mut run: impl FnMut(&str, &[&str], Duration) -> CommandCapture,
+    consent: impl FnOnce(&str) -> bool,
+    out: &mut impl Write,
     err: &mut impl Write,
 ) -> i32 {
     let usermod_args = ["-a", "-G", "render,video", user];
@@ -115,12 +129,12 @@ fn render_group_with(
             std::iter::once("usermod").chain(usermod_args).collect(),
         )
     };
-    println!("Will run: {program} {}", args.join(" "));
+    let _ = writeln!(out, "Will run: {program} {}", args.join(" "));
     if opts.dry_run {
-        println!("{DRY_RUN_NOTICE}");
+        let _ = writeln!(out, "{DRY_RUN_NOTICE}");
         return exit::OK;
     }
-    if !confirm("Add user to render,video groups?", opts.yes) {
+    if !consent("Add user to render,video groups?") {
         return exit::DECLINED;
     }
     let check = format!("id -nG {user}");
@@ -138,11 +152,54 @@ fn render_group_with(
     if let Err(code) = step.run(&mut run, err) {
         return code;
     }
-    println!("Added {user} to render,video.");
-    println!(
+    let _ = writeln!(out, "Added {user} to render,video.");
+    let _ = writeln!(
+        out,
         "IMPORTANT: log out and back in (or reboot) for the membership to take effect in new shells and services. `newgrp render` patches the current shell only."
     );
     exit::OK
+}
+
+/// What `rocm fix <fix_id>` prints on stdout on the platform `os`, less the
+/// `Will run:` line its runner adds, which names the user.
+///
+/// `pub` only so the eval-fixture generator in `xtask` replays this layout
+/// instead of writing its own; hidden from the docs because it is not an API to
+/// build on.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixPreview {
+    /// `rocm fix <fix_id> --dry-run`.
+    pub dry_run: String,
+    /// `rocm fix <fix_id>` with no `--yes`, refused because no terminal can be
+    /// asked: [`NON_INTERACTIVE_REFUSAL`](super::NON_INTERACTIVE_REFUSAL) goes
+    /// to stderr, and stdout is this.
+    pub refused: String,
+}
+
+/// The [`FixPreview`] of `fix_id` on `os`, or `None` for an unknown fix and for
+/// every fix but `fix-4-render-group`, whose runner is the only one this models.
+/// Another runner prints lines of its own around the plan (fix-6 a `Plan:`
+/// block, for one), which this would leave out.
+///
+/// Both start with `plan_preamble` (`fix/render.rs`), the plan and blank line
+/// `act_on` prints through `print_recipe`; after it, the dry run has the line
+/// [`render_group_with`] prints after `Will run:` under `--dry-run`, and the
+/// refusal has nothing, because that runner prints only `Will run:` before
+/// consent is refused. Whether a fix is `auto` on `os` is not checked here.
+/// `the_dry_run_replay_is_the_runner_output_without_its_will_run_line` holds
+/// this to the runner.
+#[doc(hidden)]
+#[must_use]
+pub fn fix_preview_text(fix_id: &str, os: &str) -> Option<FixPreview> {
+    if fix_id != RENDER_GROUP_ID {
+        return None;
+    }
+    let preamble = super::render::plan_preamble(super::catalog::find_recipe(fix_id)?, os);
+    Some(FixPreview {
+        dry_run: format!("{preamble}{DRY_RUN_NOTICE}\n"),
+        refused: preamble,
+    })
 }
 
 /// fix-2: help the user clear HSA_OVERRIDE_GFX_VERSION for future shells.
@@ -1195,7 +1252,15 @@ mod tests {
     fn render_group(write: CommandOutcome) -> (i32, Vec<Vec<String>>, Duration, String) {
         let host = FakeHost::new(unset(), write);
         let mut err = Vec::new();
-        let code = render_group_with(&approved(), "alice", false, host.runner(), &mut err);
+        let code = render_group_with(
+            &approved(),
+            "alice",
+            false,
+            host.runner(),
+            |_| true,
+            &mut Vec::new(),
+            &mut err,
+        );
         let timeout = host
             .writes_with_timeouts()
             .first()
@@ -1214,7 +1279,15 @@ mod tests {
     #[test]
     fn render_group_as_root_runs_usermod_directly() {
         let host = FakeHost::new(unset(), exited(0));
-        let code = render_group_with(&approved(), "alice", true, host.runner(), &mut Vec::new());
+        let code = render_group_with(
+            &approved(),
+            "alice",
+            true,
+            host.runner(),
+            |_| true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(code, exit::OK);
         assert_eq!(host.calls(), [SUDO_USERMOD[1..].to_vec()]);
     }
@@ -1264,9 +1337,85 @@ mod tests {
             dry_run: true,
             ..approved()
         };
-        let code = render_group_with(&opts, "alice", false, host.runner(), &mut Vec::new());
+        let code = render_group_with(
+            &opts,
+            "alice",
+            false,
+            host.runner(),
+            |_| panic!("a dry run asks for no consent"),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(code, exit::OK);
         assert!(host.calls().is_empty());
+    }
+
+    /// The eval replay of fix-4 (`fix_preview_text`) is what the command prints with
+    /// its `Will run:` line taken out: the plan and blank line `act_on` prints
+    /// (`plan_preamble`), then whatever the runner prints after `Will run:`. A
+    /// change to the runner's lines, or to the replay's, fails here, on every
+    /// platform. That `act_on` prints `plan_preamble` before the runner is not
+    /// tested here: both build on that one function by construction, and the
+    /// e2e scenario skill-08 (`rocm_doctor_skill.feature`) compares the real
+    /// command with the committed replay.
+    #[test]
+    fn the_dry_run_replay_is_the_runner_output_without_its_will_run_line() {
+        const WILL_RUN: &str = "Will run: sudo usermod -a -G render,video alice\n";
+        let preview = fix_preview_text(RENDER_GROUP_ID, "linux").expect("fix-4 is modelled");
+        let preamble = super::super::render::plan_preamble(
+            super::super::catalog::find_recipe(RENDER_GROUP_ID).expect("fix-4 is in the catalog"),
+            "linux",
+        );
+
+        // `--dry-run`: `Will run:`, then the notice, and nothing run or asked.
+        let host = FakeHost::new(unset(), exited(0));
+        let mut out = Vec::new();
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+        let code = render_group_with(
+            &opts,
+            "alice",
+            false,
+            host.runner(),
+            |_| panic!("a dry run asks for no consent"),
+            &mut out,
+            &mut Vec::new(),
+        );
+        assert_eq!(code, exit::OK);
+        assert!(host.calls().is_empty());
+        let printed = text(&out);
+        let after = printed
+            .strip_prefix(WILL_RUN)
+            .unwrap_or_else(|| panic!("the runner starts with its Will run line: {printed:?}"));
+        assert_eq!(format!("{preamble}{after}"), preview.dry_run);
+
+        // No `--yes` and consent refused: only `Will run:`, the declined code,
+        // and nothing run.
+        let host = FakeHost::new(unset(), exited(0));
+        let mut out = Vec::new();
+        let code = render_group_with(
+            &FixOptions::default(),
+            "alice",
+            false,
+            host.runner(),
+            |_| false,
+            &mut out,
+            &mut Vec::new(),
+        );
+        assert_eq!(code, exit::DECLINED);
+        assert!(host.calls().is_empty());
+        assert_eq!(text(&out), WILL_RUN);
+        assert_eq!(preview.refused, preamble);
+    }
+
+    #[test]
+    fn only_fix_4_has_a_preview_to_replay() {
+        assert!(fix_preview_text(RENDER_GROUP_ID, "linux").is_some());
+        // fix-6 prints its own `Plan:` block, which the preview would leave out.
+        assert_eq!(fix_preview_text(PATH_ID, "linux"), None);
+        assert_eq!(fix_preview_text("fix-0-nope", "linux"), None);
     }
 
     // fix-2 (Windows) --------------------------------------------------

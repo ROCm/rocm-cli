@@ -20,12 +20,13 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # the table itself stays correct. The "(N failure modes)" count in the catalog
   # heading, SKILL.md's "The other M ... print-only" count and the names SKILL.md
   # lists are checked by the unit-level `tests/skill_reference.rs` instead, whose
-  # module doc lists the SKILL.md sentences that are fixtures (skill-07 reads one
-  # of them).
+  # module doc says which test reads each SKILL.md sentence that is a fixture
+  # (skill-07 reads one of them).
   #
   # The catalog is authoritative in `crates/rocm-core`. When one of these fails,
-  # the CLI is right and the document is what changes: `reference.md`, or
-  # `SKILL.md` for skill-07.
+  # the CLI is right and the document is what changes: `reference.md`,
+  # `SKILL.md` for skill-07, or for skill-08 the eval replay, which
+  # `cargo xtask eval-fixtures` records again.
   #
   # Scope is deliberately narrow: EVERY scenario here compares the CLI against
   # the published document, and nothing else belongs. Claims proven elsewhere
@@ -42,11 +43,14 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # The distinction that earns this feature its place: those tests compare the
   # CLI against expectations written in the test suite, so they catch the CLI
   # drifting. Only these scenarios catch the DOCUMENT drifting, because only
-  # here is a published document itself the expected value: `reference.md`, and
-  # for skill-07 the contract number that `SKILL.md` declares.
+  # here is a published document itself the expected value: `reference.md`,
+  # for skill-07 the contract number that `SKILL.md` declares, and for skill-08
+  # the replay the skill's evals grade an agent against.
   #
-  # Every scenario is a query: no GPU, no serve, no download, no mutation — so
-  # they all run on the blocking mock lane and need no capability tags.
+  # Every scenario changes nothing: no GPU, no serve, no download, no mutation.
+  # Skills 01 to 07 are queries that run on the blocking mock lane with no
+  # capability tags. skill-08 runs `rocm fix` itself, against stand-in helpers,
+  # and only on bare-metal Linux, where that fix applies; its comment says why.
 
   @id:skill-catalog-ids-match-cli
   Scenario: skill-01 - Every remediation the skill documents is one the CLI still offers
@@ -118,3 +122,27 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
     Given the ROCm Doctor skill as it is published
     When a tool asks the CLI for its catalog in machine-readable form
     Then the contract the skill requires is the one the CLI publishes
+
+  # The skill's evals grade an agent that reaches the apply step against a
+  # replay of `rocm fix fix-4-render-group`: the preview, and the refusal an
+  # agent's shell meets without `--yes`. The replay is generated from rocm-core
+  # (`fix_preview_text`), whose unit test holds it to the runner's own lines;
+  # this holds the committed replay to the real command, so the plan, the layout
+  # around it, the refusal and the exit codes cannot drift from what the binary
+  # prints. The replay leaves out the one line that names the user (`Will run:`),
+  # so the comparison puts it back where the CLI prints it.
+  #
+  # The fix's helpers are stand-ins on a PATH that holds nothing else, so the
+  # same `sudo usermod` line is printed on every host and nothing is changed
+  # even if the CLI did run them. `fix-4-render-group` applies on bare-metal
+  # Linux only, so the scenario runs there: on WSL2 the CLI refuses it as the
+  # wrong platform before the runner prints anything. The rocm-core unit test
+  # (`the_dry_run_replay_is_the_runner_output_without_its_will_run_line`) runs
+  # on every lane.
+  @id:skill-apply-replay-is-what-the-cli-prints @requires-os:linux @requires-bare-metal
+  Scenario: skill-08 - The fix replies the skill's evals replay are what the CLI prints
+    Given the fix the skill's evals replay an agent applying
+    And a machine where carrying out that fix would only be recorded
+    When an agent previews that fix and then asks for it without the user's agreement
+    Then each reply the evals replay is what the CLI printed, less the line naming the user
+    And the fix changed nothing

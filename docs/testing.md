@@ -2876,6 +2876,21 @@ cargo test -p rocm --bin rocm tests::an_error
 cargo test -p rocm-dash-tui --lib agent::tools
 ```
 
+A request that does not fit the window the model was served with is explained
+rather than relayed. `chat-24`
+(`chat-context-overflow-is-explained-in-plain-language`) drives the Chat tab
+against a mock endpoint that refuses the way a llama.cpp-backed server does,
+with an `exceed_context_size_error` body, and requires the transcript to name
+the window and what counts toward it while showing none of the provider's wire
+detail. The unit tests beside the message fabricate that body, so nothing
+otherwise held the tab to reaching the rewrite against an endpoint that
+returns one:
+
+```bash
+cargo xtask e2e -- -n "chat-24"
+cargo test -p rocm-dash-tui --lib chat_runtime
+```
+
 Log browser smoke:
 
 ```bash
@@ -6895,21 +6910,31 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   integrated-GPU hardware. The planted pool is far larger than the tiny file, so
   only the "fits" polarity is exercised there.
 
+  `diagnose-91` covers the host none of the others describe: one where nothing
+  reports the GPU's memory at all. That is a Windows laptop whose integrated GPU
+  has no ROCm build, since `amd-smi` ships inside the SDK and an unsupported
+  part has no telemetry to read a carve-out from. Such a host used to be told
+  the memory could not be read, and given a plan whose one step was to run the
+  telemetry it does not have. The pool the GPU shares is a separate counter that
+  is readable anyway, and the kernel topology still names the part, so the
+  scenario plants the same APU with every VRAM counter taken away and requires a
+  verdict against the shared pool rather than that dead end.
+
   The other half of ROCMAI-912 is the advice, not the measurement: the
   `fix-24-apu-unified-memory` catalog entry, which reads `amdgpu.gttsize` and
   `ttm.pages_limit` off `/proc/cmdline` and the amdkfd SVM failures out of the
-  recent kernel log. `diagnose-91`, `diagnose-92` and `diagnose-93`
+  recent kernel log. `diagnose-92`, `diagnose-93` and `diagnose-94`
   (`@requires-os:linux`; these are Linux kernel parameters) extend the same
   planted gfx1151 host with a `/proc/cmdline`, a `/proc/meminfo` reporting
   128 GiB, and a `journalctl` of their own on the CLI's `PATH` - the kernel log
   is obtained by running a command, not by reading a file, so the host-root seam
-  cannot supply it. `diagnose-91` plants a `ttm.pages_limit` a third of what
+  cannot supply it. `diagnose-92` plants a `ttm.pages_limit` a third of what
   `amdgpu.gttsize` asks for and requires the smaller ceiling to be named, a
   consistent pair sized to installed RAM to be offered, and the BIOS carve-out
-  to stay in the notes rather than appear among the commands. `diagnose-92` is
+  to stay in the notes rather than appear among the commands. `diagnose-93` is
   the negative: the same host with a page limit that covers its aperture gets no
   finding, which is what stops the entry firing on the mere presence of the
-  parameters. `diagnose-93` plants the driver's own
+  parameters. `diagnose-94` plants the driver's own
   `SVM mapping failed, exceeds resident system memory limit` line, requires it
   to be reported as a cause, then removes it and requires the report to say the
   recent log was read rather than that the machine never failed. The `kvm_amd`
@@ -6917,7 +6942,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   a detector widened to match the bare word fails
   `an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not` in
   [examine/host_env.rs](../crates/rocm-core/src/examine/host_env.rs) and
-  `diagnose-92` here. **No APU runs this entry on real hardware**: no CI lane
+  `diagnose-93` here. **No APU runs this entry on real hardware**: no CI lane
   and no development machine has one whose `gttsize` and `pages_limit` are set,
   so every check of it is simulated.
 
@@ -7331,18 +7356,24 @@ A case may also name an `apply` fix id, for a case that reaches the apply step. 
 stub then answers `rocm fix <id> --dry-run` (the flag before or after the id) and
 `rocm fix <id>` with no flag, and never `--yes`, so an agent that applies before the
 user said OK meets the stub's refusal and the transcript shows the command. The fix
-must be `fix-4-render-group`, the only one whose layout around the plan the generator
-writes (another `auto` runner, such as fix-6, prints its own `Plan:` block, so naming
-one is refused), and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
+must be `fix-4-render-group`, the only one whose preview rocm-core models (another
+`auto` runner, such as fix-6, prints its own `Plan:` block, so naming one is refused),
+and `auto` on the host's platform (`wsl` for the `wsl-host-gpu-hidden` host, else
 `linux`), and the case's symptom and host must make the replayed
 diagnosis match it, that is list it at or above `min_score_for_match`; otherwise the
-generator fails with "the replayed diagnosis carries no match for ...". The plan is the CLI's own (`rocm_core::fix_plan_text`), so it
-carries the command's wording; only the `Will run:` line the runner adds is not there,
-because it names the user and the machine. The layout around the plan (the blank line,
-then the notice) is written by hand in the generator and checked only against the
-committed replay. The bare command's refusal exit code
-and message, and the dry-run notice, are the CLI's own constants, so they cannot drift
-from the command's.
+generator fails with "the replayed diagnosis carries no match for ...". Both stdouts
+come from rocm-core (`rocm_core::fix_preview_text`, its `FixPreview` in `fix/runners.rs`):
+the plan and the blank line after it, then for `--dry-run` the dry-run notice. The bare
+command's stdout ends at that blank line, because the refusal goes to stderr. Only the
+`Will run:` line the runner adds is not there, because it names the user and the machine. The rocm-core unit test
+`the_dry_run_replay_is_the_runner_output_without_its_will_run_line` holds that preview
+to what the runner prints, on every lane, and the e2e scenario skill-08
+(`@id:skill-apply-replay-is-what-the-cli-prints`) holds the committed replay to the
+real `rocm fix`, with the `Will run:` line put back. skill-08 runs only on bare-metal
+Linux, where fix-4 applies: in CI the Linux lanes run it, the blocking mock `e2e`
+job among them, and the Windows and WSL2 lanes skip it. The bare command's refusal
+exit code and message are the CLI's own constants, so they cannot drift from the
+command's.
 
 To add a case, add an entry to
 [`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the

@@ -67,7 +67,7 @@ const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 /// `$PATH`, so a scenario-controlled `$PATH` (see `command_fails_bin_dir`) can
 /// stand a fake `usermod`/`sudo` in for it, failing or never finishing, without
 /// needing real root or touching real group membership.
-const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
+pub(crate) const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
 /// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
 /// coverage lives here rather than being folded into [`MUTATING_FIX_ID`]'s
@@ -302,7 +302,7 @@ fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
 
 /// Where the fake `usermod`/`sudo` record each call, one `<name> <args>` line
 /// per call. Outside [`command_fails_bin_dir`] so it is not on the CLI's PATH.
-fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
+pub(crate) fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
     world
         .isolated_root
         .as_ref()
@@ -312,7 +312,7 @@ fn render_group_helper_log(world: &E2eWorld) -> std::path::PathBuf {
 }
 
 /// The `$USER` the render-group scenarios run the fix as.
-const RENDER_GROUP_USER: &str = "e2e-test-user";
+pub(crate) const RENDER_GROUP_USER: &str = "e2e-test-user";
 
 /// The line `fix-4-render-group` prints once the user was added. Built from
 /// the same user the scenario sets, and absent from every failure path.
@@ -759,7 +759,7 @@ async fn user_approved_fix_that_never_finishes(world: &mut E2eWorld) {
 /// holding nothing else. Each appends `<name> <args>` to
 /// [`render_group_helper_log`] and then runs `tail`, so a scenario can say
 /// both what the CLI reported and what it asked the helper to do.
-fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
+pub(crate) fn plant_render_group_helpers(world: &mut E2eWorld, tail: &str) {
     let bin_dir = command_fails_bin_dir(world);
     std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
     let log = render_group_helper_log(world);
@@ -5618,14 +5618,17 @@ const SECOND_CARD_APERTURE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// makes the scenario describe the same machine on every lane: with no
 /// `/dev/kfd` under the root, the `amd-smi` pre-flight declines, so the CLI
 /// falls back to these sysfs counters instead of the runner's real telemetry.
-/// `mem_info_vram_used` is planted too, because the fallback drops a card whose
-/// occupancy it cannot read rather than guessing it is empty.
+/// `mem_info_vram_used` is planted beside every VRAM total, because the fallback
+/// drops a card whose occupancy it cannot read rather than guessing it is empty.
 ///
-/// `gtt_total` is `None` for the host whose aperture is unreadable.
+/// `gtt_total` is `None` for the host whose aperture is unreadable, and
+/// `vram_total_bytes` is `None` for the host that reports no VRAM telemetry at
+/// all -- the Linux spelling of a Windows APU with no ROCm build, where
+/// `amd-smi` is not installed and nothing else says how much memory the GPU has.
 fn plant_single_gpu_with_memory(
     world: &mut E2eWorld,
     gfx_target_version: u32,
-    vram_total_bytes: u64,
+    vram_total_bytes: Option<u64>,
     gtt_total_bytes: Option<u64>,
 ) {
     let host = simulated_host_root(world);
@@ -5685,25 +5688,31 @@ fn shared_pool_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
 
 /// Plant one amdgpu DRM card under the simulated host root.
 ///
-/// `mem_info_vram_used` is planted for every card, because the sysfs VRAM
+/// `mem_info_vram_used` is planted beside every VRAM total, because the sysfs
 /// fallback drops a card whose occupancy it cannot read rather than guessing it
-/// is empty. `gtt_total` is `None` for the host whose aperture is unreadable.
+/// is empty -- so a card given a total but no use would read as no card at all,
+/// which is not a shape any scenario here means. `gtt_total` is `None` for the
+/// host whose aperture is unreadable, and `vram_total_bytes` is `None` for the
+/// card that reports no VRAM counters at all.
 fn plant_amd_drm_card(
     world: &E2eWorld,
     card: &str,
-    vram_total_bytes: u64,
+    vram_total_bytes: Option<u64>,
     gtt_total_bytes: Option<u64>,
 ) {
     let device = simulated_host_root(world).join(format!("sys/class/drm/{card}/device"));
     std::fs::create_dir_all(&device).expect("failed to create the planted DRM card");
     // The AMD PCI vendor id, which is what marks this as an amdgpu card.
     std::fs::write(device.join("vendor"), "0x1002\n").expect("failed to plant the vendor id");
-    std::fs::write(
-        device.join("mem_info_vram_total"),
-        format!("{vram_total_bytes}\n"),
-    )
-    .expect("failed to plant the VRAM total");
-    std::fs::write(device.join("mem_info_vram_used"), "0\n").expect("failed to plant the VRAM use");
+    if let Some(vram_total) = vram_total_bytes {
+        std::fs::write(
+            device.join("mem_info_vram_total"),
+            format!("{vram_total}\n"),
+        )
+        .expect("failed to plant the VRAM total");
+        std::fs::write(device.join("mem_info_vram_used"), "0\n")
+            .expect("failed to plant the VRAM use");
+    }
     if let Some(gtt) = gtt_total_bytes {
         std::fs::write(device.join("mem_info_gtt_total"), format!("{gtt}\n"))
             .expect("failed to plant the GTT aperture");
@@ -5755,7 +5764,7 @@ async fn machine_with_a_readable_shared_pool(world: &mut E2eWorld) {
     plant_single_gpu_with_memory(
         world,
         GFX1151_TARGET_VERSION,
-        CARVE_OUT_BYTES,
+        Some(CARVE_OUT_BYTES),
         Some(APERTURE_BYTES),
     );
 }
@@ -5764,7 +5773,22 @@ async fn machine_with_a_readable_shared_pool(world: &mut E2eWorld) {
 async fn machine_with_an_unreadable_shared_pool(world: &mut E2eWorld) {
     // Same machine, minus `mem_info_gtt_total`: the shape an older kernel or a
     // container with no DRM device passed through presents.
-    plant_single_gpu_with_memory(world, GFX1151_TARGET_VERSION, CARVE_OUT_BYTES, None);
+    plant_single_gpu_with_memory(world, GFX1151_TARGET_VERSION, Some(CARVE_OUT_BYTES), None);
+}
+
+#[given("a machine whose only GPU shares system memory and reports no memory telemetry")]
+async fn machine_with_a_shared_pool_and_no_memory_telemetry(world: &mut E2eWorld) {
+    // The same APU and the same readable pool as
+    // `machine_with_a_readable_shared_pool`, with every VRAM counter taken
+    // away and no `amd-smi` planted either, so nothing on this host reports how
+    // much memory the GPU has. That is the Windows shape -- `amd-smi` ships
+    // inside the ROCm SDK, and an integrated GPU with no ROCm build has no SDK
+    // -- spelled on Linux, where the sysfs counters are the only other source.
+    //
+    // The pool the GPU shares is readable without any of that (it is a
+    // different counter), and the kernel topology still names the part, which
+    // is what says the pool is this GPU's to allocate from.
+    plant_single_gpu_with_memory(world, GFX1151_TARGET_VERSION, None, Some(APERTURE_BYTES));
 }
 
 #[given("a machine whose integrated GPU shares system memory beside a second AMD card")]
@@ -5775,7 +5799,7 @@ async fn machine_with_two_amd_cards(world: &mut E2eWorld) {
     plant_single_gpu_with_memory(
         world,
         GFX1151_TARGET_VERSION,
-        CARVE_OUT_BYTES,
+        Some(CARVE_OUT_BYTES),
         Some(APERTURE_BYTES),
     );
     // The second AMD card, with an aperture of its own. A different figure from
@@ -5785,7 +5809,7 @@ async fn machine_with_two_amd_cards(world: &mut E2eWorld) {
     plant_amd_drm_card(
         world,
         "card1",
-        8 * 1024 * 1024 * 1024,
+        Some(8 * 1024 * 1024 * 1024),
         Some(SECOND_CARD_APERTURE_BYTES),
     );
     // And `amd-smi` answering for one GPU, which is what makes this host reach
@@ -5890,7 +5914,7 @@ async fn machine_with_a_discrete_card_and_an_aperture(world: &mut E2eWorld) {
     plant_single_gpu_with_memory(
         world,
         GFX1100_TARGET_VERSION,
-        8 * 1024 * 1024 * 1024,
+        Some(8 * 1024 * 1024 * 1024),
         Some(APERTURE_BYTES),
     );
 }
@@ -5912,6 +5936,34 @@ async fn assert_the_verdict_used_the_shared_pool(world: &mut E2eWorld) {
         gib(APERTURE_BYTES),
         measured,
         gib(CARVE_OUT_BYTES)
+    );
+}
+
+#[then("the memory the answer was reached against is the pool the GPU shares")]
+async fn assert_the_verdict_used_the_shared_pool_without_telemetry(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose is a query and exits 0");
+    let model = model_section(world);
+    // The answer this replaced, asserted as absent by name: a host whose only
+    // remedy was "run `amd-smi` again" on a machine that has no `amd-smi` at
+    // all. A bare check that some figure is present would still pass if the
+    // report carried both.
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "",
+        "the pool is readable without any VRAM telemetry, so this is a measurement -- answering \
+         that the memory could not be read sends the user to run telemetry this host does not \
+         ship: {model:#}"
+    );
+    let measured = measured_gpu_gib(&model).unwrap_or_else(|| {
+        panic!("a readable pool must reach the answer as a figure, not as nothing: {model:#}")
+    });
+    assert!(
+        (measured - gib(APERTURE_BYTES)).abs() < 0.01,
+        "the verdict must be reached against the {} GiB this GPU shares with the operating \
+         system; {measured} GiB came from somewhere else: {model:#}",
+        gib(APERTURE_BYTES)
     );
 }
 
@@ -6368,7 +6420,7 @@ fn plant_unified_memory_apu(world: &mut E2eWorld, cmdline: &str, kernel_log: &st
     plant_single_gpu_with_memory(
         world,
         GFX1151_TARGET_VERSION,
-        CARVE_OUT_BYTES,
+        Some(CARVE_OUT_BYTES),
         Some(APERTURE_BYTES),
     );
 
@@ -6401,7 +6453,7 @@ fn plant_fake_journalctl(world: &E2eWorld, kernel_log: &str) {
 /// `run_rocm_with_scenario_env` takes `command_env` rather than borrowing it, so
 /// a scenario that runs the CLI twice gets the real host on the second run
 /// unless it re-states the fixture. That is not a detail worth discovering from
-/// a mysterious result: without this, the second run of diagnose-93 described
+/// a mysterious result: without this, the second run of diagnose-94 described
 /// the runner instead of the planted APU.
 fn restate_planted_machine_env(world: &mut E2eWorld) {
     world.command_env.push((

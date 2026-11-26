@@ -1406,6 +1406,32 @@ Feature: Diagnosing failures and listing fixes
     Then the cause ranked first is that the GPU is not exposed to the container, above the out-of-memory finding that scores higher
     And the closing advice names that cause, and the CLI accepts the fix it names on that machine
 
+  # The host the pool read exists for, and the one none of diagnose-81 to
+  # diagnose-87 describes: a machine where nothing reports the GPU's memory at
+  # all. That is a Windows laptop whose integrated GPU has no ROCm build --
+  # `amd-smi` ships inside the SDK, so an unsupported part has no telemetry to
+  # read a carve-out from. Such a host used to be told "the GPU memory on this
+  # host could not be read", with a plan whose one step was to run the telemetry
+  # it does not have; every one of those machines got the same dead end.
+  #
+  # The pool the GPU shares is a different counter and is readable without any
+  # of that, and the kernel topology still names the part, which is what says
+  # the pool belongs to a GPU that allocates from it rather than to a discrete
+  # card beside it. So the answer is a verdict against the pool, as on any other
+  # integrated GPU.
+  #
+  # Simulated as the same APU and the same 60 GiB pool diagnose-81 plants, with
+  # every VRAM counter taken away: that is the Linux spelling of the shape, so
+  # it runs on lanes that have no Windows APU. Linux-gated for the reason
+  # diagnose-81 is -- the simulation seam re-roots Linux paths only.
+  @id:diagnose-model-an-apu-with-no-memory-telemetry-is-still-measured @requires-os:linux
+  Scenario: diagnose-91 - An integrated GPU whose memory nothing reports is still judged on the pool it shares
+    Given a machine whose only GPU shares system memory and reports no memory telemetry
+    And a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the memory the answer was reached against is the pool the GPU shares
+    And the model is reported as degraded, because the pool is shared rather than set aside
+
   # ROCMAI-912. An integrated GPU has no VRAM of its own: what it may allocate
   # is capped by `amdgpu.gttsize` (MiB), by `ttm.pages_limit` (4 KiB pages) and
   # by the BIOS carve-out. The two kernel parameters are in different units, so
@@ -1423,7 +1449,7 @@ Feature: Diagnosing failures and listing fixes
   # not have. @requires-os:linux because these are Linux kernel parameters;
   # the catalog scopes the entry to bare-metal Linux for the same reason.
   @id:diagnose-apu-page-limit-caps-the-aperture @requires-os:linux
-  Scenario: diagnose-91 - An integrated GPU whose page limit undercuts its aperture is told which one decides
+  Scenario: diagnose-92 - An integrated GPU whose page limit undercuts its aperture is told which one decides
     Given an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI names the page limit as the ceiling that really applies
@@ -1435,7 +1461,7 @@ Feature: Diagnosing failures and listing fixes
   # clean kernel log, is correctly configured. An entry that fired on the mere
   # presence of the parameters would pass diagnose-89 and fail here.
   @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
-  Scenario: diagnose-92 - An integrated GPU whose two limits agree is not told to change them
+  Scenario: diagnose-93 - An integrated GPU whose two limits agree is not told to change them
     Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then no unified-memory cause is reported for that machine
@@ -1451,7 +1477,7 @@ Feature: Diagnosing failures and listing fixes
   # failure from an earlier run is not there to find. The report must say the
   # recent log was read rather than that the machine never failed.
   @id:diagnose-apu-svm-mapping-failure-is-detected @requires-os:linux
-  Scenario: diagnose-93 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
+  Scenario: diagnose-94 - An SVM mapping failure in the kernel log is reported, and its absence is not over-claimed
     Given an integrated-GPU machine whose kernel log reports an SVM mapping failure
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI reports the kernel's own SVM mapping failure as the cause

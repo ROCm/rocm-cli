@@ -500,6 +500,7 @@ pub(in crate::ui) mod tests {
             chat_max_scroll: 0,
             chat_follow: true,
             chat_llm: None,
+            chat_endpoint_managed: false,
             chat_consent: crate::app::ChatConsent::Unavailable,
             chat_detect_offer: None,
             chat_detecting: false,
