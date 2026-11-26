@@ -272,7 +272,59 @@ mod tests {
             1,
             "the refusal must name exactly one `{prefix}` command: {message}"
         );
-        crate::advised_commands::split_words(spans[0])
+        shlex::split(spans[0]).unwrap_or_else(|| {
+            panic!("the `{prefix}` command in this refusal has unbalanced quoting: {message}")
+        })
+    }
+
+    /// `advised_command` reads back, from the guard's own printed text, exactly
+    /// the host the guard quoted: one `--host` word equal to the recorded host,
+    /// and the port after it, whatever the host needs quoted (an embedded
+    /// apostrophe, `;`, `$`, a space) and for an empty host. This reads the
+    /// printed command with `shlex`, so it runs on every host;
+    /// `the_command_a_refusal_names_reaches_the_recorded_host_through_a_real_shell`
+    /// is the one that runs it through a real `sh`, on unix only.
+    #[test]
+    fn advised_command_reads_back_the_host_the_guard_quoted() {
+        use rocm_core::ServiceStart;
+
+        for host in [
+            "it's",
+            "a;b",
+            "$HOME",
+            "gpu box",
+            "[::1]",
+            "*",
+            "",
+            "gpu-box.example",
+        ] {
+            for start in [
+                ServiceStart::Launch,
+                ServiceStart::Restart,
+                ServiceStart::Respawn,
+            ] {
+                let message = rocm_core::ensure_public_service_has_endpoint_key(
+                    host,
+                    false,
+                    false,
+                    start,
+                    "lemonade-qwen-3000",
+                    8123,
+                )
+                .expect_err("a keyless service on a public host is refused")
+                .to_string();
+                let serve = advised_command(&message, "rocm serve");
+                let at = serve
+                    .iter()
+                    .position(|word| word == "--host")
+                    .unwrap_or_else(|| panic!("{host:?} {start:?}: no --host in {serve:?}"));
+                assert_eq!(
+                    serve[at + 1..],
+                    [host, "--port", "8123", "--allow-public-bind"],
+                    "{host:?} {start:?}: {serve:?}"
+                );
+            }
+        }
     }
 
     /// What the real clap parse makes of an advised `rocm serve` command.
