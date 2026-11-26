@@ -2866,7 +2866,7 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
             }
             "unified_memory_unreadable" => {
                 assert!(
-                    evidence.contains("no dedicated VRAM"),
+                    evidence.contains("shares with the operating system"),
                     "the APU reason has to name the missing dedicated-VRAM pool, or the user \
                      reads it as a fact about the model: {model:#}"
                 );
@@ -6247,7 +6247,7 @@ async fn assert_cpu_only_recipe_is_untouched_by_the_pool(world: &mut E2eWorld) {
     assert!(
         !evidence
             .iter()
-            .any(|line| line.contains("no dedicated VRAM")),
+            .any(|line| line.contains("shares with the operating system")),
         "the report volunteered GPU evidence for a recipe whose engine allocates from system \
          memory: {model:#}"
     );

@@ -853,9 +853,9 @@ pub fn estimate_fit(
             ),
             AcceleratorMemory::UnifiedMemoryUnreadable => (
                 CannotEstimateReason::UnifiedMemoryUnreadable,
-                "this host has no dedicated VRAM, and the figure for the memory pool its engine \
-                 allocates from could not be read here, so there is nothing to compare the \
-                 figures against",
+                "this host's GPU allocates from a pool it shares with the operating system, \
+                 and the figure for that pool could not be read here, so there is nothing to \
+                 compare the figures against",
             ),
             // `Dedicated` and `Unified` both carry a figure, so neither reaches
             // this branch; the arm exists because the match is exhaustive.
@@ -879,8 +879,8 @@ pub fn estimate_fit(
     if memory.is_shared_pool() {
         estimate.available_is_shared_pool = true;
         estimate.notes.push(
-            "this host's integrated GPU has no dedicated VRAM: the memory compared against is \
-             the ceiling on a pool it shares with the operating system, so how much is free \
+            "the memory compared against is the ceiling on a pool this integrated GPU shares \
+             with the operating system, not memory set aside for it, so how much is free \
              depends on what else is running"
                 .to_owned(),
         );
@@ -1736,8 +1736,8 @@ mod tests {
     /// two places, and `model_readiness` prints both in one report -- evidence
     /// bullets first, then the estimate's notes. While they derived the
     /// shared-pool fact separately, an APU got "the GPU with the most dedicated
-    /// VRAM ... has 24576 MiB" a few lines above "this host's integrated GPU
-    /// has no dedicated VRAM". Asserted as a relation between the two renderers
+    /// VRAM ... has 24576 MiB" a few lines above a note calling the same figure
+    /// a shared ceiling. Asserted as a relation between the two renderers
     /// rather than as two literal strings, so rewording either cannot quietly
     /// restore the contradiction.
     #[test]
@@ -1760,7 +1760,7 @@ mod tests {
             let evidence = evidence_lines(&estimate).join("\n");
             let says_dedicated = evidence.contains("dedicated VRAM");
             let notes = estimate.notes.join("\n");
-            let denies_dedicated = notes.contains("no dedicated VRAM");
+            let denies_dedicated = notes.contains("shares with the operating system");
             assert!(
                 !(says_dedicated && denies_dedicated),
                 "shared={shared}: one report called the same figure dedicated VRAM and not \

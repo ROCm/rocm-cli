@@ -233,9 +233,9 @@ fn host_accelerator_memory(
 /// property of the classifier, not of the two call sites.
 ///
 /// The second is the evidence-of-a-GPU argument, below: this reads it off the
-/// two cheap probes rather than off an `Examination`. They agree on every host
-/// where VRAM telemetry exists, because the argument is then not consulted at
-/// all, and on every host where neither says there is a GPU. They can differ on
+/// detected gfx target rather than off an `Examination`. They agree on every
+/// host where VRAM telemetry exists, because the argument is then not consulted
+/// at all, and on every host where neither says there is a GPU. They can differ on
 /// one shape -- a part WSL's `rocm_sees_gpu` positively denies while a gfx
 /// target still names it -- where this would narrow and the diagnosis would not.
 /// No fixture plants that host, so it is argued rather than tested.

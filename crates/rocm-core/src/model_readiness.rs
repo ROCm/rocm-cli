@@ -570,9 +570,9 @@ fn assess(
             readiness.verdict = ModelVerdict::Undetermined;
             readiness.undetermined_reason = Some(UndeterminedReason::UnifiedMemoryUnreadable);
             readiness.evidence.push(format!(
-                "this recipe needs {}, but this host has no dedicated VRAM and the figure for \
-                 the memory pool its engine allocates from could not be read here; there is \
-                 nothing to run today that would change this answer",
+                "this recipe needs {}, but this host's GPU allocates from a pool it shares \
+                 with the operating system and the figure for that pool could not be read here; \
+                 there is nothing to run today that would change this answer",
                 format_gib(required)
             ));
             readiness.fix = None;
@@ -689,9 +689,9 @@ fn assess(
         let was_ready = readiness.verdict == ModelVerdict::Ready;
         readiness.verdict = ModelVerdict::Degraded;
         readiness.evidence.push(
-            "this host's integrated GPU has no dedicated VRAM: that figure is the ceiling on a \
-             pool it shares with the operating system, not memory set aside for the model, so \
-             how much of it is free depends on what else is running"
+            "that figure is the ceiling on a pool this integrated GPU shares with the \
+             operating system, not memory set aside for the model, so how much of it is free \
+             depends on what else is running"
                 .to_owned(),
         );
         if was_ready {
@@ -1671,7 +1671,7 @@ mod tests {
             readiness
                 .evidence
                 .iter()
-                .any(|line| line.contains("no dedicated VRAM")),
+                .any(|line| line.contains("shares with the operating system")),
             "the report has to say why, in terms an APU user can act on: {:?}",
             readiness.evidence
         );
@@ -1860,7 +1860,7 @@ mod tests {
     ///
     /// The shared-pool check is the last thing `assess` does, and it used to
     /// fire on the host alone: any `Ready`/`Degraded` verdict on an APU was
-    /// downgraded, told "this host's integrated GPU has no dedicated VRAM" and
+    /// downgraded, told the figure is a shared ceiling and
     /// handed a plan about freeing memory and serving. For a
     /// `cpu_only` recipe that is a remediation for a device the model does not
     /// touch -- and one attached to evidence no earlier branch put in the
@@ -1937,7 +1937,7 @@ mod tests {
             readiness
                 .evidence
                 .iter()
-                .any(|line| line.contains("no dedicated VRAM")),
+                .any(|line| line.contains("shares with the operating system")),
             "premise: the shared-pool gate must also have fired: {:?}",
             readiness.evidence
         );
@@ -2005,7 +2005,7 @@ mod tests {
         assert!(
             !cpu.evidence
                 .iter()
-                .any(|line| line.contains("no dedicated VRAM")),
+                .any(|line| line.contains("shares with the operating system")),
             "the report volunteered GPU evidence for a `cpu_only` recipe: {:?}",
             cpu.evidence
         );
@@ -2065,7 +2065,7 @@ mod tests {
                 !readiness
                     .evidence
                     .iter()
-                    .any(|line| line.contains("no dedicated VRAM")),
+                    .any(|line| line.contains("shares with the operating system")),
                 "{}: the report claimed the pool was too small for a model it never sized: {:?}",
                 recipe.canonical_model_id,
                 readiness.evidence

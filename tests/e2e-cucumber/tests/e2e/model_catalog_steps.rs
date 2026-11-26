@@ -379,7 +379,7 @@ async fn assert_offer_reaches_past_the_carve_out(world: &mut E2eWorld) {
 
 /// The caveat is false of a discrete card, and the e2e hook builds its host by
 /// hand rather than through the classifier — so without this, flipping that
-/// literal would print "this GPU has no dedicated VRAM" for every forced host
+/// literal would print the shared-pool note for every forced host
 /// with nothing to catch it.
 #[then("the user is not told anything about shared memory")]
 async fn assert_no_shared_pool_caveat(world: &mut E2eWorld) {

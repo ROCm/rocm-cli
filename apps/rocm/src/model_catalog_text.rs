@@ -60,8 +60,10 @@ const MODEL_CATALOG_VERBOSE_HEADER: &str = "model recipes";
 ///
 /// It does not say the GPU "has no dedicated VRAM". Such a part usually does
 /// report some: the BIOS carve-out, which the simulated hosts behind
-/// `model-catalog-10` to `-13` plant as a VRAM counter and which the docs call
-/// a carve-out. The claim that is true, and the one that matters to a reader
+/// `model-catalog-10` and `-13` plant as a VRAM counter and which the docs call
+/// a carve-out. (`model-catalog-12` plants none, which is the other shape this
+/// wording has to stay true on.) The claim that is true, and the one that
+/// matters to a reader
 /// deciding whether a narrowed list will hold, is about the figure used: it is
 /// a ceiling on memory shared with the operating system rather than memory set
 /// aside for the model.
