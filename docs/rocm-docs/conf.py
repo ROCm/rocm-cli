@@ -38,8 +38,8 @@ for _logger_name in ("sphinx.rocm_docs.projects", "sphinx.rocm_docs.theme"):
 # -- Project information ---------------------------------------------------
 
 project = "ROCm CLI"
-# The latest ROCm CLI release. The `latest` site built from main uses this
-# value too (through `html_title` below), so bump it when a release ships,
+# The latest ROCm CLI release. The `latest` site built from the latest docs branch
+# uses this value too (through `html_title` below), so bump it when a release ships,
 # together with the heading in release-notes.md and the row in release.md.
 version = "0.3.0"
 release = version
