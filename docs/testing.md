@@ -7042,8 +7042,21 @@ whose rows past the cap say why they were not read while the connection count
 shows the requests stopped (`diagnose-98`), and a repository holding only a
 projector, answered from the file list alone (`diagnose-99`).
 
+Those four ask in `--json`, and plant no GPU, so on a hosted runner nothing is
+measured, every row of the table reads "not compared", and the two sentences
+only the text report carries — the heading above the table and the plan under
+it — take their other branch. `diagnose-100` is what reaches them.
+It plants a discrete card with 8 GiB of its own beside the fifteen-quantization
+repository and reads the report as a person does: the heading's denominator has
+to be the twelve the cap let it compare rather than the fifteen rows printed,
+and the plan has to offer the largest quantization it *read* that fits, in
+those words, since the files the cap dropped are the large ones and a maximum
+over them would have nothing behind it. It is `@requires-os:linux` for the
+reason `diagnose-81` is — the seam the card is planted through re-roots Linux
+paths only — and otherwise ungated, so the blocking mock lane runs it.
+
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[7-9])'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[7-9]|diagnose-100)'
 ```
 
 ## Doctor Report Preflight

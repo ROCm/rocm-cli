@@ -89,14 +89,29 @@ impl QuantFit {
         self.quantization.as_deref().unwrap_or(&self.file)
     }
 
+    /// The estimate this row carries, whether or not it worked any figures out.
+    fn estimate(&self) -> Option<&ContextEstimate> {
+        match &self.outcome {
+            QuantFitOutcome::Estimated(estimate) => Some(estimate),
+            QuantFitOutcome::NotEstimated { .. } => None,
+        }
+    }
+
     /// The estimate, when this quantization has one with figures in it.
     fn sized(&self) -> Option<&ContextEstimate> {
-        match &self.outcome {
-            QuantFitOutcome::Estimated(estimate) if estimate.total_bytes.is_some() => {
-                Some(estimate)
-            }
-            _ => None,
-        }
+        self.estimate()
+            .filter(|estimate| estimate.total_bytes.is_some())
+    }
+
+    /// Whether this row's figures were put beside a figure for this host's
+    /// memory, whichever way the comparison then came out -- including a row
+    /// that was given no verdict because the formula does not measure its
+    /// layout. The one question [`ContextEstimate::compared_with_memory`] asks,
+    /// asked of a row.
+    #[must_use]
+    pub fn compared_with_memory(&self) -> bool {
+        self.estimate()
+            .is_some_and(ContextEstimate::compared_with_memory)
     }
 
     /// Whether this quantization fits on the host it was sized against.
@@ -132,21 +147,40 @@ impl RepositoryFit {
             .count()
     }
 
-    /// How many were compared with memory this host was measured to have.
+    /// How many were compared with memory this host was measured to have and
+    /// came out of it with a verdict.
     ///
     /// Apart from [`Self::estimated`], because a host whose GPU memory could
     /// not be read still gets every quantization's figures -- but none of them
     /// a verdict, and "0 of 14 fit" would read as a firm no rather than as a
     /// comparison that never happened.
+    ///
+    /// Apart from [`Self::compared_with_memory`], because a row whose layout
+    /// the formula does not measure (mixture-of-experts, state-space, a header
+    /// missing a width) is deliberately given no verdict even though both
+    /// figures are there: its own row says "not compared", so counting it in
+    /// the denominator of "N of M fit" would contradict the table underneath.
     #[must_use]
     pub fn compared(&self) -> usize {
         self.quantizations
             .iter()
             .filter(|quant| {
-                quant
-                    .sized()
-                    .is_some_and(|estimate| estimate.available_gib.is_some())
+                quant.estimate().is_some_and(|estimate| {
+                    estimate.compared_with_memory()
+                        && estimate.outcome != EstimateOutcome::CannotEstimate
+                })
             })
+            .count()
+    }
+
+    /// How many rows have figures of their own beside a figure for this host's
+    /// memory -- the rows a memory reading taken from the wrong device would
+    /// have falsified, whether or not they were given a verdict.
+    #[must_use]
+    pub fn compared_with_memory(&self) -> usize {
+        self.quantizations
+            .iter()
+            .filter(|quant| quant.compared_with_memory())
             .count()
     }
 
@@ -604,6 +638,24 @@ mod tests {
         }
     }
 
+    /// The same file as [`read`], declared a mixture-of-experts model: the
+    /// figures are worked out and the host's memory is read, and `estimate_fit`
+    /// then withholds the verdict because the compute buffer was not measured
+    /// for experts. Both figures present, no verdict -- the shape
+    /// [`RepositoryFit::compared`] must not count.
+    fn read_unjudgeable(name: &str, size: u64) -> QuantProbe {
+        let header = parse_gguf_header(&mut Cursor::new(
+            llama_like(10).u32("llama.expert_count", 4).file(0),
+        ))
+        .unwrap();
+        assert!(header.moe, "premise: the fixture has to be a MoE header");
+        QuantProbe {
+            file: name.to_owned(),
+            size: Some(header.data_offset + size),
+            outcome: QuantProbeOutcome::Read(Box::new(header)),
+        }
+    }
+
     /// A "not in the catalog" answer about `model_ref`, as the readiness check
     /// reaches one.
     fn not_curated(model_ref: &str) -> ModelReadiness {
@@ -1007,6 +1059,73 @@ mod tests {
                 "{memory:?}: {rows}"
             );
         }
+    }
+
+    /// A row the formula will not judge is not one of those compared.
+    ///
+    /// A mixture-of-experts quantization is sized and its figures are put
+    /// beside this host's memory, and `estimate_fit` then withholds the
+    /// verdict: the row itself prints "not compared". Counting it would make
+    /// the heading say two quantizations were compared directly above a table
+    /// saying one of them was not -- so the two counters are separated here,
+    /// and each is pinned to the row text it has to agree with.
+    #[test]
+    fn a_row_the_formula_will_not_judge_is_not_counted_among_those_compared() {
+        let fit = repository_fit(
+            "o/r",
+            RepositoryProbe {
+                quants: vec![
+                    read("m-Q4_K_M.gguf", 4 << 30),
+                    read_unjudgeable("m-Q8_0.gguf", 8 << 30),
+                ],
+                projectors: 0,
+            },
+            &request(),
+            &host(24.0),
+        );
+        let unjudgeable = &fit.quantizations[1];
+        assert_eq!(
+            unjudgeable
+                .sized()
+                .map(|estimate| (estimate.outcome, estimate.cannot_estimate_reason)),
+            Some((
+                EstimateOutcome::CannotEstimate,
+                Some(CannotEstimateReason::UnmeasuredLayout)
+            )),
+            "premise: the second row has to be one with figures and no verdict: {fit:?}"
+        );
+        assert_eq!(fit.estimated(), 2, "both rows carry figures: {fit:?}");
+        assert_eq!(
+            fit.compared_with_memory(),
+            2,
+            "both rows had their total put beside this host's memory: {fit:?}"
+        );
+        assert_eq!(
+            fit.compared(),
+            1,
+            "only the judged row may be counted as compared: {fit:?}"
+        );
+        assert_eq!(fit.fitting(), 1, "{fit:?}");
+        // The row the count has to agree with, in the words it prints.
+        let rows = repository_fit_lines(&fit).join("\n");
+        assert!(
+            rows.contains(
+                "not compared: this model's layout is not one the formula measures, so the \
+                 figure can be too low"
+            ),
+            "{rows}"
+        );
+        // And the heading above that table, which is where the count is read.
+        let mut readiness = not_curated("o/r");
+        apply_repository_fit(&mut readiness, fit);
+        let text = crate::model_readiness::render_model_readiness_text(&readiness);
+        assert!(
+            text.lines().next().is_some_and(|line| line.ends_with(
+                "ESTIMATED: 1 of 1 quantizations fit at 4096 tokens (calibrated on one MI300X, \
+                 not a tested minimum)"
+            )),
+            "{text}"
+        );
     }
 
     /// A repository where no header was read carries no estimate caveat: the

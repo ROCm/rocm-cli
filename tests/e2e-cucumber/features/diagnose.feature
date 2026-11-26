@@ -1492,10 +1492,10 @@ Feature: Diagnosing failures and listing fixes
     And the CLI offers a consistent pair sized to installed RAM, needing sudo and a reboot
     And the BIOS carve-out is given as advice rather than as a command to run
 
-  # The other direction, and the reason diagnose-89 means anything: the same
+  # The other direction, and the reason diagnose-94 means anything: the same
   # planted machine with a page limit that covers its aperture, and the same
   # clean kernel log, is correctly configured. An entry that fired on the mere
-  # presence of the parameters would pass diagnose-89 and fail here.
+  # presence of the parameters would pass diagnose-94 and fail here.
   @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
   Scenario: diagnose-95 - An integrated GPU whose two limits agree is not told to change them
     Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
@@ -1564,3 +1564,32 @@ Feature: Diagnosing failures and listing fixes
     Given a Hugging Face repository that holds only a multimodal projector
     When the user asks the CLI whether that repository would run, in machine-readable form
     Then the CLI says the repository holds no language model, and no header was read
+
+  # The two sentences a person reads off a repository answer, and the only ones
+  # of it a machine never sees: the heading above the table and the plan under
+  # it. diagnose-97 to diagnose-99 ask in `--json`, where no heading is
+  # rendered, and they plant no GPU -- so on a hosted runner nothing is
+  # measured, every row reads "not compared", and both sentences take their
+  # other branch. Neither was reached by any scenario before this one.
+  #
+  # So this plants a discrete card with memory of its own, and asks the
+  # fifteen-quantization repository of diagnose-98 in the form a person reads.
+  # Both halves of the fixture are load-bearing. The card is what makes the
+  # rows comparisons rather than bare requirements, so the heading exists at
+  # all; and the cap leaves three of the fifteen unread, which is what makes
+  # the heading's denominator and the row count different numbers -- a heading
+  # counting rows would say fifteen over a table where three say they were
+  # never read. The same unread rows are why the plan may not say "the largest
+  # that fits": the largest files are the ones the cap dropped, and a maximum
+  # over files this command never saw would be a claim it has no basis for.
+  #
+  # @requires-os:linux for the reason diagnose-81 is: the simulation seam the
+  # card is planted through re-roots Linux paths only. It is otherwise ungated
+  # and runs on the blocking mock lane.
+  @id:diagnose-a-repository-answer-counts-and-plans-from-what-it-compared @requires-os:linux
+  Scenario: diagnose-100 - A repository answer on a machine with measurable memory counts and plans from what it actually compared
+    Given a Hugging Face repository publishing fifteen quantizations
+    And a machine whose only GPU is a discrete card with memory of its own
+    When the user asks the CLI whether that repository would run, and reads the report
+    Then the heading counts the quantizations that were compared, not every row of the table
+    And the plan offers the largest quantization it read that fits, and says that is what it is

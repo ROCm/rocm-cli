@@ -379,6 +379,23 @@ impl ContextEstimate {
             notes: Vec::new(),
         }
     }
+
+    /// Whether this estimate put a figure of its own beside a figure for this
+    /// host's memory, so that there is something a memory reading taken from
+    /// the wrong device could have falsified.
+    ///
+    /// Both halves are needed and neither implies the other, which is why this
+    /// is one predicate rather than a condition written out at each caller.
+    /// [`estimate_fit`] fills `available_gib` from the host when it builds the
+    /// estimate, before it has worked anything out, so a header it then fails
+    /// to size (a split file, say) carries the host's memory with no total
+    /// beside it; and a host whose memory could not be read is sized all the
+    /// same, so that estimate carries `total_bytes` and no `available_gib`.
+    /// Asking only one half calls one of those two a comparison.
+    #[must_use]
+    pub const fn compared_with_memory(&self) -> bool {
+        self.total_bytes.is_some() && self.available_gib.is_some()
+    }
 }
 
 /// The pieces of the total that do not depend on the context size, plus the

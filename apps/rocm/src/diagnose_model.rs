@@ -235,7 +235,7 @@ fn mask_set_where(is_set: impl Fn(&str) -> bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_core::gguf_fit::{ContextEstimate, FitRequest};
+    use rocm_core::gguf_fit::ContextEstimate;
     use rocm_core::model_readiness::{AcceleratorMemory, ModelCatalogSource};
 
     /// The spinner is for a hub read only, and says which read it covers: one
@@ -279,31 +279,49 @@ mod tests {
         assert_eq!(hub_read(&answer(curated)), None, "{curated}");
     }
 
-    /// A readiness whose estimate compared memory, built without a network or a file.
+    /// A readiness whose estimate compared memory, built without a network: the
+    /// header comes from the in-memory [`tiny_gguf`] through [`OneFile`].
+    ///
+    /// Sized for real rather than hand-assembled from
+    /// [`ContextEstimate::unreadable`] with `available_gib` poked in
+    /// afterwards. That shape -- the host's memory with no total beside it --
+    /// is exactly the one `note_unverified_mask` must leave alone, so a fixture
+    /// built that way would have stood for "compared" while being the opposite
+    /// of it, and the test below would have certified the bug.
     fn readiness_with_a_compared_estimate() -> ModelReadiness {
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+            system_ram_gib: Some(64.0),
+        };
+        let registry = rocm_core::builtin_model_recipe_registry();
         let mut readiness = crate::model_fit::assess_model_for_host(
             "some-lab/never-curated-7b:Q4_K_M",
-            &ModelCatalogSource::Unreachable {
-                detail: "not needed here".to_owned(),
-            },
-            &HostFacts {
-                accelerator_memory: AcceleratorMemory::Dedicated(24.0),
-                system_ram_gib: None,
-            },
+            // A reachable catalog that does not carry this reference: that is
+            // what `attach_context_estimate` sizes a GGUF for. An unreachable
+            // catalog leaves a different undetermined reason behind and gets no
+            // estimate at all.
+            &ModelCatalogSource::Available(&registry),
+            &host,
             None,
             None,
         );
-        let mut estimate = ContextEstimate::unreadable(
-            "x.gguf",
-            &FitRequest {
-                context_size: 4096,
-                context_size_defaulted: true,
-                kv_cache_type: KvCacheType::F16,
-            },
-            &anyhow::anyhow!("not read"),
+        // No rows and no mask: the caveat is what each caller applies itself.
+        attach_gguf_estimate_with(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host,
+            &OneFile(tiny_gguf()),
+            None,
+            false,
         );
-        estimate.available_gib = Some(24.0);
-        readiness.estimate = Some(estimate);
+        assert!(
+            readiness
+                .estimate
+                .as_ref()
+                .is_some_and(ContextEstimate::compared_with_memory),
+            "premise: the fixture has to be an estimate that really was compared: {:?}",
+            readiness.estimate
+        );
         readiness
     }
 

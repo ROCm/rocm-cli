@@ -1671,8 +1671,10 @@ That costs one request per quantization, so the read is bounded twice — the
 12 smallest quantizations at most, and the same two-minute budget for the
 whole repository. Anything past either is listed as **not estimated**, with the
 reason, and never guessed; naming that quantization on its own sizes it. The
-header line counts only the quantizations that were compared with this host,
-so it never reports an unread file as one that does not fit. A multimodal
+header line counts only the quantizations this host's memory produced a verdict
+for, so it never reports as "does not fit" a file that was never read, or one
+whose layout the estimate declines to judge — each of those says so on its own
+row instead. A multimodal
 projector is not a language model and is left out, and a repository whose only
 GGUF files are projectors says so rather than showing an empty list.
 

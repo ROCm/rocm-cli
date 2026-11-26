@@ -5494,6 +5494,90 @@ async fn user_asks_about_a_bare_repository(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user asks the CLI whether that repository would run, and reads the report")]
+async fn user_asks_about_a_bare_repository_and_reads_it(world: &mut E2eWorld) {
+    run_model_question(world, &["diagnose", "--model", UNCURATED_MODEL_REF]);
+}
+
+/// A machine whose GPU memory is a figure, so a repository answer compares
+/// rather than only reporting what each quantization needs.
+///
+/// The discrete card [`machine_with_a_discrete_card_and_an_aperture`] plants,
+/// named here for the only thing this scenario asks of it. Without a planted
+/// GPU the hosted runner measures nothing, every row of the table is "not
+/// compared", and the heading and the plan this scenario is about are never
+/// reached.
+#[given("a machine whose only GPU is a discrete card with memory of its own")]
+async fn machine_with_a_discrete_card_that_measures(world: &mut E2eWorld) {
+    plant_single_gpu_with_memory(
+        world,
+        GFX1100_TARGET_VERSION,
+        Some(8 * 1024 * 1024 * 1024),
+        Some(APERTURE_BYTES),
+    );
+}
+
+#[then("the heading counts the quantizations that were compared, not every row of the table")]
+async fn assert_the_heading_counts_what_was_compared(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    let heading = output
+        .lines()
+        .find(|line| line.starts_with(&format!("rocm diagnose --model {UNCURATED_MODEL_REF}: ")))
+        .unwrap_or_else(|| panic!("no model header in:\n{output}"))
+        .to_owned();
+    // The premise the assertion rests on: the repository publishes more
+    // quantizations than one command reads, so a heading counting rows and a
+    // heading counting comparisons cannot both say the same number. Asserted
+    // as the rows actually printed, not as the fixture's own constant.
+    let rows = output
+        .lines()
+        .filter(|line| line.starts_with("     Q") && line.contains("_K"))
+        .count();
+    assert_eq!(
+        rows, REPOSITORY_QUANTIZATION_COUNT,
+        "every quantization has to get a row, read or not:\n{output}"
+    );
+    assert!(
+        heading.ends_with(&format!(
+            "ESTIMATED: {MAX_PROBED_QUANTIZATIONS} of {MAX_PROBED_QUANTIZATIONS} quantizations \
+             fit at 4096 tokens (calibrated on one MI300X, not a tested minimum)"
+        )),
+        "the denominator has to be what was compared, not the {rows} rows listed: {heading}"
+    );
+}
+
+#[then("the plan offers the largest quantization it read that fits, and says that is what it is")]
+async fn assert_the_plan_narrows_to_what_was_read(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    // The largest the cap let it read, which is not the largest the repository
+    // publishes -- which is exactly why the wording may not promise a maximum.
+    let largest_read = format!("Q{:02}_K", MAX_PROBED_QUANTIZATIONS - 1);
+    // The model answer's own plan, not the diagnosis's: the causes ranked above
+    // it carry `plan:` lines of their own, and the first one in the report
+    // belongs to whichever cause ranked first on this host.
+    let (_, model_report) = output
+        .split_once(&format!("rocm diagnose --model {UNCURATED_MODEL_REF}: "))
+        .unwrap_or_else(|| panic!("no model header in:\n{output}"));
+    let plan = model_report
+        .lines()
+        .find(|line| line.starts_with("   plan: "))
+        .unwrap_or_else(|| panic!("no plan under the model answer in:\n{output}"))
+        .to_owned();
+    assert!(
+        plan.contains(&format!(
+            "{largest_read} is the largest of those read that fits"
+        )),
+        "a plan over a repository with unread rows may not claim a maximum over them: {plan}"
+    );
+    assert!(
+        output.contains(&format!(
+            "   verify after fix: rocm diagnose --model {UNCURATED_MODEL_REF}:{largest_read}"
+        )),
+        "the plan has to name the command that produces the breakdown:\n{output}"
+    );
+}
+
 #[then(
     "every quantization is answered in its own right, smallest first, and the projector is not among them"
 )]

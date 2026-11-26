@@ -1174,6 +1174,39 @@ mod tests {
         }
     }
 
+    /// The README spells the cap out as a figure, where `rocm diagnose --help`
+    /// is generated from the constant and `docs/manual-testing.md` points the
+    /// reader at that help. A number copied into prose has nothing holding it
+    /// to [`MAX_PROBED_QUANTIZATIONS`], so this does: raising the cap without
+    /// the README, or editing the README's figure on its own, fails here.
+    #[test]
+    fn the_readme_spells_the_probe_cap_as_the_constant_sets_it() {
+        const PHRASE: &str = " smallest quantizations at most";
+        let readme = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+        )
+        .expect("README.md at the repo root");
+        // One place says it, so there is no second copy for a wrong figure to
+        // hide in, and the assertion below cannot be satisfied by the sentence
+        // it was not meant for.
+        assert_eq!(
+            readme.matches(PHRASE).count(),
+            1,
+            "the README has to say `N{PHRASE}` exactly once"
+        );
+        let expected = format!("{MAX_PROBED_QUANTIZATIONS}{PHRASE}");
+        let at = readme.find(&expected).unwrap_or_else(|| {
+            panic!(
+                "the README does not say `{expected}`; the code reads {MAX_PROBED_QUANTIZATIONS}"
+            )
+        });
+        // `12` must be the whole figure, not the tail of `112`.
+        assert!(
+            !readme[..at].ends_with(|c: char| c.is_ascii_digit()),
+            "the README's figure is longer than {MAX_PROBED_QUANTIZATIONS}"
+        );
+    }
+
     #[test]
     fn a_reference_is_read_as_a_hub_repository_a_path_or_neither() {
         assert_eq!(
