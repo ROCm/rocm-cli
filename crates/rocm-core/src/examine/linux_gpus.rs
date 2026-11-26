@@ -11,60 +11,46 @@ use crate::probe_exec::{MEDIUM, run, which};
 use std::path::Path;
 use std::time::Duration;
 
-/// Marketing-name fragments that identify an AMD APU when `rocminfo` is absent.
-const APU_KEYWORDS: &[&str] = &[
-    "strix halo",
-    "ryzen ai max",
-    "phoenix",
-    "hawk point",
-    "strix point",
-    "krackan",
-    "rembrandt",
-    "raphael",
-    "barcelo",
-    "lucienne",
-    "renoir",
-    "cezanne",
-];
-
-/// Best-effort `(gfx_target, is_apu)` for an AMD marketing name.
+/// Best-effort `(gfx_target, is_apu)` for an AMD marketing name or `lspci`
+/// codename, or `("", false)` when the name resolves no part.
+///
+/// The target comes from the crate's one name table,
+/// [`crate::gfx_target::gfx_target_from_amd_marketing_name`], and the packaging
+/// from classifying that target. `examine` used to keep a second, smaller copy
+/// of that table here, which disagreed with it about Krackan Point (gfx1150
+/// here, gfx1152 there and in the device-id table), plus a list of codename
+/// fragments that answered "APU?" without ever naming a target, so a Renoir
+/// iGPU came back with an empty `gfx_target`.
+///
+/// A name that resolves nothing answers `false`, "not an APU", and that is a
+/// deliberate default for a PCI row rather than a fact. The only consumer that
+/// acts on the verdict is `check_9_igpu_dgpu_collision`, which fires on
+/// `has_apu && has_discrete_amd`:
+///
+/// - reporting an unidentified *discrete* card as "cannot say" would clear
+///   `has_discrete_amd` beside every card the tables do not name -- every RX
+///   5000, Vega 56/64 and Radeon VII -- on exactly the hybrid host that check
+///   exists for;
+/// - reporting an unidentified *integrated* GPU as discrete sets
+///   `has_discrete_amd` on an iGPU-only host, where the check still cannot fire
+///   because `has_apu` is false. The cost is one wrong field in `rocm examine
+///   --json`, and the integrated set is small and named in the table, so an
+///   unresolved row is far more often a discrete card.
+///
+/// The kernel topology, `rocminfo` and `hipInfo` revise this verdict by the
+/// rules tabled at [`apu_verdict_from_target`].
 pub(super) fn classify_amd_marketing_name(name: &str) -> (String, bool) {
-    let mut n = name.to_lowercase();
-    for deco in ["(tm)", "(r)", "(c)", "(\u{2122})"] {
-        n = n.replace(deco, " ");
-    }
-    let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
-    let contains = |needle: &str| n.contains(needle);
-    if contains("ryzen ai max") || contains("strix halo") {
-        return ("gfx1151".to_owned(), true);
-    }
-    if contains("radeon 8050s") || contains("radeon 8060s") || contains("radeon 8045s") {
-        return ("gfx1151".to_owned(), true);
-    }
-    if contains("radeon 880m")
-        || contains("radeon 890m")
-        || contains("strix point")
-        || contains("krackan")
-    {
-        return ("gfx1150".to_owned(), true);
-    }
-    if contains("radeon 780m")
-        || contains("radeon 760m")
-        || contains("radeon 740m")
-        || contains("phoenix")
-        || contains("hawk point")
-    {
-        return ("gfx1103".to_owned(), true);
-    }
-    (String::new(), APU_KEYWORDS.iter().any(|kw| n.contains(kw)))
+    let gfx = crate::gfx_target::gfx_target_from_amd_marketing_name(name).unwrap_or_default();
+    (gfx.to_owned(), gfx_is_apu_family(gfx))
 }
 
 /// Whether a gfx target belongs to an AMD APU family.
 ///
-/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), the
-/// RDNA2 iGPUs gfx1033 / gfx1035 / gfx1036 (Van Gogh, Rembrandt / Yellow Carp,
-/// Raphael), gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
-/// Strix Halo).
+/// APUs: the Vega iGPUs gfx902 / gfx909 (Raven Ridge, Picasso / Raven2) and
+/// gfx90c (Renoir / Lucienne / Cezanne / Barcelo), the RDNA2 iGPUs gfx1033 /
+/// gfx1035 / gfx1036 / gfx1037 (Van Gogh, Rembrandt / Yellow Carp, Raphael,
+/// Mendocino), gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point
+/// / Strix Halo / Krackan Point).
 ///
 /// Their neighbours on both prefixes are *discrete* parts and must not match:
 /// gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) on gfx110x, and gfx1030 /
@@ -94,10 +80,17 @@ pub(super) fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// GPU on the host is integrated.
 pub fn gfx_is_apu_family(gfx: &str) -> bool {
     let g = gfx.to_lowercase();
-    // gfx90c: the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo. Compared
-    // whole (up to a feature suffix) so other gfx90x data-center parts such as
-    // gfx90a stay discrete.
-    if g == "gfx90c" || g.starts_with("gfx90c:") {
+    // The Vega iGPUs: gfx90c in Renoir / Lucienne / Cezanne / Barcelo, and
+    // gfx902 / gfx909 in Raven Ridge and Picasso / Raven2. Compared whole (up to
+    // a feature or generic-target suffix, both of which follow the base
+    // target) so the gfx90x data-center parts beside them -- gfx900,
+    // gfx906, gfx908, gfx90a -- stay discrete. No lookup table produces gfx902
+    // or gfx909: they reach the CLI from KFD's packed `gfx_target_version`
+    // (90002, 90009), through `gfx_target_from_gc_version`.
+    if matches!(
+        g.split([':', '-']).next(),
+        Some("gfx90c" | "gfx902" | "gfx909")
+    ) {
         return true;
     }
     // gfx115x: every Strix part is an APU.
@@ -110,11 +103,12 @@ pub fn gfx_is_apu_family(gfx: &str) -> bool {
     }
     // gfx103x: non-contiguous, unlike gfx110x's threshold. gfx1033/1035/1036
     // are the RDNA2 APUs (Van Gogh variant aside, gfx_target's own PCI-id table
-    // maps them as such); gfx1030/1031/1032/1034 are Navi 21-24 desktop/mobile
-    // discrete cards (RX 6000-series, RX 6500 XT). A plain threshold would get
-    // this family wrong in both directions.
+    // maps them as such), and gfx1037 is Mendocino (Ryzen 7020), which KFD and
+    // DRM ip-discovery report as GC 10.3.7; gfx1030/1031/1032/1034 are Navi
+    // 21-24 desktop/mobile discrete cards (RX 6000-series, RX 6500 XT). A plain
+    // threshold would get this family wrong in both directions.
     if let Some(digit) = gfx_model_digit(&g, "gfx103") {
-        return matches!(digit, 3 | 5 | 6);
+        return matches!(digit, 3 | 5 | 6 | 7);
     }
     false
 }
@@ -137,7 +131,7 @@ fn gfx_model_digit(gfx: &str, prefix: &str) -> Option<u32> {
 /// `rocminfo` or the sysfs fallback — and came back false when neither was
 /// reachable. Verified on an 8-GPU MI300X host, where all eight devices read
 /// `class=0x120000` in sysfs (EAI-8449).
-fn is_lspci_gpu_line(line: &str) -> bool {
+pub(super) fn is_lspci_gpu_line(line: &str) -> bool {
     line.contains("VGA compatible controller")
         || line.contains("3D controller")
         || line.contains("Display controller")
@@ -156,6 +150,17 @@ pub(super) fn probe_gpus_lspci(e: &mut Examination) {
             .push("lspci returned non-zero; PCI enumeration incomplete".to_owned());
         return;
     }
+    apply_lspci_gpus(e, &out);
+}
+
+/// Fold an `lspci -nn -D` listing into the GPU list, against caller-supplied
+/// output.
+///
+/// Split from the process launch for the same reason
+/// [`apply_rocminfo_gpu_agents`] is: what matters is how a row is classified,
+/// and a test that had to run the real `lspci` could only assert it on the
+/// hardware it happened to run on.
+pub(super) fn apply_lspci_gpus(e: &mut Examination, out: &str) {
     for line in out.lines() {
         if !is_lspci_gpu_line(line) {
             continue;
@@ -184,7 +189,17 @@ pub(super) fn probe_gpus_lspci(e: &mut Examination) {
         if !is_amd {
             continue;
         }
-        let (gfx_guess, is_apu_guess) = classify_amd_marketing_name(&name);
+        // `-nn` prints the PCI device id on the line, so ask it first, for the
+        // reason the Windows probe asks the PNP id first: the id names the
+        // ASIC, the marketing string only the brand. It matters most where the
+        // name says nothing at all -- for an id `pci.ids` does not know, `lspci`
+        // prints the bare word "Device".
+        let (gfx_guess, is_apu_guess) = match extract_lspci_device_id(line)
+            .and_then(|device_id| crate::gfx_target::gfx_target_from_amd_pci_device_id(&device_id))
+        {
+            Some(target) => (target.to_owned(), gfx_is_apu_family(target)),
+            None => classify_amd_marketing_name(&name),
+        };
         e.gpus.push(Gpu {
             name,
             gfx_target: gfx_guess,
@@ -195,9 +210,27 @@ pub(super) fn probe_gpus_lspci(e: &mut Examination) {
     }
 }
 
+/// The AMD PCI device id an `lspci -nn` line carries: the four hex digits after
+/// `1002:` in its `[vendor:device]` tag.
+///
+/// Only AMD's vendor id is accepted. The tag is what tells a device id apart
+/// from the other bracketed numbers on the line -- the PCI class (`[0300]`) and
+/// any subsystem text `pci.ids` supplies -- and a number lifted from one of
+/// those would decode to an unrelated part.
+pub(super) fn extract_lspci_device_id(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let start = lower.rfind("[1002:")? + "[1002:".len();
+    let device_id: String = lower[start..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .take(5)
+        .collect();
+    (device_id.len() == 4 && lower[start + 4..].starts_with(']')).then_some(device_id)
+}
+
 /// Pull the marketing name out of an `lspci -nn` line: the text between the
 /// controller-kind `]:` and the trailing `[vendor:device]`.
-fn extract_lspci_name(line: &str) -> String {
+pub(super) fn extract_lspci_name(line: &str) -> String {
     let after_colon = match line.find("]:") {
         Some(idx) => &line[idx + 2..],
         None => match line.find(':') {
@@ -225,23 +258,28 @@ pub const KERNEL_TOPOLOGY_GPU_NAME: &str = "AMD GPU (from kernel topology)";
 /// Test fixture, not production data: the `lspci -nn -D` line scenario
 /// examine-57 plants.
 ///
-/// The examination's name table reads it as gfx1103, an
-/// integrated GPU, which is what lets that scenario show a kernel target
-/// replacing the name table's; the unit test
+/// Its device id (`15c8`, "Phoenix2" in `pci.ids`) is not in the PCI-id
+/// table, so [`apply_lspci_gpus`] falls through to the name table, which
+/// reads it as gfx1103, an integrated GPU. That is what lets that scenario
+/// show a kernel target replacing the name table's. A Phoenix id the PCI-id
+/// table does carry (`15bf`, "Phoenix1") would be resolved by the id and never
+/// reach the name table. The unit test
 /// `the_pci_lines_examine_57_and_58_plant_read_as_their_scenarios_assume`
-/// pins that reading on this very constant. Compiled only for tests and the
+/// runs this very constant through [`apply_lspci_gpus`] and pins both the
+/// reading and the missing id. Compiled only for tests and the
 /// `test-support` feature, which the e2e suite enables from its
 /// `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-support"))]
 pub const TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103: &str = "0000:05:00.0 Display \
-    controller [0380]: Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1 [1002:15bf] (rev c1)";
+    controller [0380]: Advanced Micro Devices, Inc. [AMD/ATI] Phoenix2 [1002:15c8] (rev c1)";
 
 /// Test fixture, not production data: the `lspci -nn -D` line scenario
 /// examine-58 plants.
 ///
-/// Its model name (`Device 7fff`) is one no table knows, so the
-/// name table reads it as no target and not integrated, which is what lets
-/// that scenario show a kernel target filling the gap. Pinned and gated like
+/// Neither its device id (`7fff`) nor its model name (`Device 7fff`) is in a
+/// table, so the scan reads it as no target and not integrated, which is
+/// what lets that scenario show a kernel target filling the gap. Pinned and
+/// gated like
 /// [`TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103`].
 #[cfg(any(test, feature = "test-support"))]
 pub const TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING: &str = "0000:c3:00.0 Display \
@@ -252,9 +290,10 @@ pub const TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING: &str = "0000:c3:0
 ///
 /// A target in an APU family makes the entry integrated. Anything else leaves
 /// the verdict as it was, and an entry with none keeps none: "discrete" is
-/// never concluded from a target, because [`gfx_is_apu_family`] does not list
-/// every APU (gfx902 / gfx909, Raven and Picasso, are not on it), so a target
-/// outside it is not evidence of a discrete card. It must not downgrade an APU
+/// never concluded from a target, because [`gfx_is_apu_family`] lists the APUs
+/// this crate knows, not every APU there is: a target it has not heard of (a
+/// part newer than the list, as gfx902 / gfx909 / gfx1037 were until they were
+/// added) is not evidence of a discrete card. It must not downgrade an APU
 /// codename's `true` either. The kernel offers nothing better: the KFD node
 /// properties carry no documented APU flag, so a kernel-only entry gets this
 /// target rule alone. The ROCm runtime does state the package, in
@@ -277,7 +316,7 @@ pub const TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING: &str = "0000:c3:0
 /// | `rocminfo` | agent matched, flag without `APU`, any other final target | `false` |
 /// | `rocminfo` | agent matched, no `Memory Properties:` line | this function, on the target the entry ends with |
 /// | `rocminfo` | agent listed as a GPU of its own | the same three flag rows on the agent's own target, or this function from `None` when it has no flag |
-fn apu_verdict_from_target(current: Option<bool>, target: &str) -> Option<bool> {
+pub(super) fn apu_verdict_from_target(current: Option<bool>, target: &str) -> Option<bool> {
     if gfx_is_apu_family(target) {
         Some(true)
     } else {
@@ -556,7 +595,7 @@ fn gpu_from_agent(agent: RocminfoGpuAgent) -> Gpu {
 ///   its own, whether or not it states an address: there is nothing to
 ///   confuse it with. Its verdict comes from [`apu_verdict_with_runtime_flag`]
 ///   on its own target.
-fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
+pub(super) fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
     let agents = parse_rocminfo_gpu_agents(out);
     if agents.is_empty() {
         return;
@@ -712,16 +751,16 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination, gfx_target: fn() -> Option<Str
 /// The passes themselves are the real ones; only where they read is injected.
 pub(super) struct GpuProbeSources<'a> {
     /// The KFD topology nodes directory the membership pass reconciles against.
-    kfd_nodes: &'a Path,
+    pub(super) kfd_nodes: &'a Path,
     /// A `rocminfo` reading to fold in, or `None` to run `rocminfo` here.
     ///
     /// `None` is what the host uses; `Some` exists because a test cannot make a
     /// machine with no GPU produce an agent listing, and the placeholder's fate
     /// turns entirely on whether one arrived.
-    rocminfo: Option<&'a str>,
+    pub(super) rocminfo: Option<&'a str>,
     /// How the sysfs fallback learns the gfx target when nothing else named a
     /// card. See [`probe_gpus_sysfs_fallback`] for why it is a function.
-    sysfs_gfx_target: fn() -> Option<String>,
+    pub(super) sysfs_gfx_target: fn() -> Option<String>,
 }
 
 impl<'a> GpuProbeSources<'a> {
@@ -893,19 +932,19 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         let mut gpu = from_pci[index].clone();
         // The node's own target, so an APU+dGPU host labels each card with the
         // target that belongs to it. It fills an empty target and replaces one
-        // the PCI scan guessed from the marketing-name table
-        // (`classify_amd_marketing_name`): the guess is a lookup on a name,
-        // while the node's `gfx_target_version` is the kernel's statement
-        // about this device, and `HSA_OVERRIDE_GFX_VERSION` does not reach it.
-        // Krackan is where the tables disagree: the name table says gfx1150,
-        // the PCI device-id map says gfx1152, and which is right is
-        // unconfirmed (docs/host-probing.md). A node whose version did not parse
-        // to a target has nothing to offer and leaves the entry alone.
+        // the PCI scan looked up (`apply_lspci_gpus`: the device-id table,
+        // else the marketing-name table): either is a lookup this crate
+        // maintains, which can be wrong or stale, while the node's
+        // `gfx_target_version` is the kernel's statement about this device,
+        // and `HSA_OVERRIDE_GFX_VERSION` does not reach it. A node whose
+        // version did not parse to a target has nothing to offer and leaves
+        // the entry alone.
         //
         // The APU verdict, by which of the two it was:
         //
         // - Replacing a guess: the scan derived its verdict together with that
-        //   guess, so the correction replaces both, and the verdict is the
+        //   guess (from its target, or from the name that gave it), so the
+        //   correction replaces both, and the verdict is the
         //   one the node's target gives -- `false` included. This is the only
         //   path that concludes "discrete" from a target, and only because it
         //   is correcting a verdict that came from the same wrong guess.
@@ -1204,11 +1243,11 @@ mod tests {
 
     #[test]
     fn the_kernels_target_fills_or_replaces_the_scans_and_the_verdict_follows_the_rules() {
-        // lspci's target is a lookup on the marketing name; the node's is the
-        // kernel's statement about the device, and an override cannot reach
-        // it. Krackan is where the tables disagree (the name table says
-        // gfx1150, the device-id map gfx1152; which is right is unconfirmed),
-        // so the node is planted with the device-id map's answer.
+        // lspci's target is a table lookup; the node's is the kernel's
+        // statement about the device, and an override cannot reach it. The
+        // Krackan row plants gfx1150, the name table's answer before this
+        // crate's tables converged on gfx1152, as a wrong guess for the node
+        // to correct.
         let entry = |name: &str, gfx: &str, is_apu: bool, pci_id: &str| Gpu {
             name: name.to_owned(),
             gfx_target: gfx.to_owned(),
@@ -1245,8 +1284,8 @@ mod tests {
                     "0000:67:00.0",
                 ),
                 // Filling with a target outside every APU family keeps the
-                // scan's `true` from a codename: gfx909 (Picasso) is an APU
-                // `gfx_is_apu_family` does not list.
+                // scan's `true` from a codename: gfx1170, a part newer than
+                // the list, is a target `gfx_is_apu_family` does not name.
                 entry("AMD Picasso", "", true, "0000:69:00.0"),
                 // ...and an entry with no verdict keeps none: a target outside
                 // the APU families is no claim of discrete.
@@ -1265,7 +1304,7 @@ mod tests {
                 node("0000:66:00.0", ""),
                 node("0000:67:00.0", "gfx1151"),
                 node("0000:68:00.0", "gfx1100"),
-                node("0000:69:00.0", "gfx909"),
+                node("0000:69:00.0", "gfx1170"),
                 node("0000:6b:00.0", "gfx1100"),
                 node("0000:6a:00.0", "gfx1100"),
             ],
@@ -1291,7 +1330,7 @@ mod tests {
             Some(true),
             "a filled APU-family target makes the entry an APU"
         );
-        assert_eq!(at("0000:69:00.0").gfx_target, "gfx909");
+        assert_eq!(at("0000:69:00.0").gfx_target, "gfx1170");
         assert_eq!(
             at("0000:69:00.0").is_apu,
             Some(true),
@@ -1975,6 +2014,286 @@ mod tests {
         summarise_gpu_categories(&mut e);
         assert!(!e.has_apu, "a lone gfx1100 dGPU must not set has_apu");
         assert!(e.has_discrete_amd);
+    }
+
+    /// The Vega and RDNA2 APUs that reach the CLI only as a target synthesised
+    /// from a GC version -- KFD's packed `gfx_target_version` 90002, 90009 and
+    /// 100307 -- and that a prefix rule never reached: Raven Ridge, Picasso /
+    /// Raven2 and Mendocino. Their gfx90x and gfx103x neighbours stay discrete.
+    #[test]
+    fn raven_picasso_and_mendocino_are_apus() {
+        for apu in [
+            "gfx902",
+            "gfx909",
+            "gfx1037",
+            "GFX902",
+            "gfx909:xnack-",
+            "gfx1037:xnack-",
+        ] {
+            assert!(gfx_is_apu_family(apu), "{apu}");
+        }
+        for discrete in ["gfx900", "gfx906", "gfx908", "gfx90a", "gfx1034", "gfx1030"] {
+            assert!(!gfx_is_apu_family(discrete), "{discrete}");
+        }
+    }
+
+    /// The one target rule (`apu_verdict_from_target`): an APU-family target,
+    /// in any spelling `rocminfo`, KFD or `hipInfo` can produce, makes a GPU
+    /// integrated, and every other target -- a discrete one or one nothing here
+    /// classifies -- leaves the verdict it already had, `None` included.
+    #[test]
+    fn the_target_rule_claims_only_an_apu_whatever_the_suffix() {
+        for apu in [
+            "gfx1036",
+            "gfx1036-generic",
+            "gfx90c-generic",
+            "gfx902-generic",
+            "GFX909-generic:xnack-",
+            "gfx1151:xnack-",
+        ] {
+            for current in [None, Some(false), Some(true)] {
+                assert_eq!(apu_verdict_from_target(current, apu), Some(true), "{apu}");
+            }
+        }
+        for other in [
+            "gfx1100",
+            "gfx1100-generic",
+            "GFX942:sramecc+:xnack-",
+            "gfx1170",
+            "",
+        ] {
+            for current in [None, Some(false), Some(true)] {
+                assert_eq!(apu_verdict_from_target(current, other), current, "{other}");
+            }
+        }
+    }
+
+    /// The `lspci -nn` device id comes from AMD's vendor tag and nowhere else.
+    #[test]
+    fn the_lspci_device_id_is_read_from_the_amd_vendor_tag() {
+        assert_eq!(
+            extract_lspci_device_id(
+                "0000:c5:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+                 [AMD/ATI] Krackan Point [Radeon 860M] [1002:1114] (rev c1)"
+            )
+            .as_deref(),
+            Some("1114")
+        );
+        // The class `[0300]` is a four-digit number in brackets too, and an
+        // NVIDIA line carries no AMD tag at all.
+        assert_eq!(
+            extract_lspci_device_id(
+                "0000:01:00.0 VGA compatible controller [0300]: NVIDIA Corporation \
+                 GA102 [GeForce RTX 3090] [10de:2204] (rev a1)"
+            ),
+            None
+        );
+        // A tag that is not exactly four hex digits is not a device id.
+        assert_eq!(extract_lspci_device_id("Device [1002:11141]"), None);
+        assert_eq!(extract_lspci_device_id("Device [1002:111]"), None);
+        assert_eq!(
+            extract_lspci_device_id("no bracketed vendor tag here"),
+            None
+        );
+        // Four hex digits followed by anything but the closing bracket is not
+        // a tag either.
+        assert_eq!(extract_lspci_device_id("Device [1002:1114g]"), None);
+        // The tag is the last `[1002:` on the line: a name that carries an
+        // earlier one does not decide the device.
+        assert_eq!(
+            extract_lspci_device_id(
+                "0000:c5:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+                 [AMD/ATI] Device [1002:73a0] rebadged [1002:1114] (rev c1)"
+            )
+            .as_deref(),
+            Some("1114")
+        );
+    }
+
+    /// `examine` names a GPU from the crate's one name table, codenames
+    /// included, so `lspci`'s codename for an iGPU yields its target rather
+    /// than an "APU, target unknown" guess.
+    ///
+    /// Krackan Point is the case that used to be wrong rather than missing:
+    /// `examine`'s own table called it gfx1150, while the device-id table and
+    /// the 860M/840M it sells as say gfx1152, a different TheRock family.
+    #[test]
+    fn examine_names_a_gpu_by_its_codename_from_the_shared_table() {
+        for (name, target) in [
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Krackan Point",
+                "gfx1152",
+            ),
+            ("Advanced Micro Devices, Inc. [AMD/ATI] Renoir", "gfx90c"),
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Cezanne [Radeon Vega Series]",
+                "gfx90c",
+            ),
+            ("Advanced Micro Devices, Inc. [AMD/ATI] Raphael", "gfx1036"),
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] Mendocino",
+                "gfx1037",
+            ),
+            ("Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1", "gfx1103"),
+            (
+                "Advanced Micro Devices, Inc. [AMD/ATI] VanGogh [AMD Custom GPU 0405]",
+                "gfx1033",
+            ),
+            ("AMD Radeon(TM) 8040S Graphics", "gfx1151"),
+        ] {
+            assert_eq!(
+                classify_amd_marketing_name(name),
+                (target.to_owned(), true),
+                "{name}"
+            );
+        }
+        // Discrete names come from the same table, so they now carry a target.
+        assert_eq!(
+            classify_amd_marketing_name("AMD Radeon RX 7900 XTX"),
+            ("gfx1100".to_owned(), false)
+        );
+    }
+
+    /// Every codename and product-line row this change added to the shared
+    /// name table, each through a name that carries that one pattern and no
+    /// other, so deleting or retargeting any single row fails here.
+    ///
+    /// The `lspci` corpora cannot do this: their rows carry device ids the
+    /// id table answers first, so a codename row behind them is never asked.
+    /// The Phoenix spellings are `pci.ids`' names for device ids 15bf, 15c8,
+    /// 1900 and 1901.
+    #[test]
+    fn each_codename_row_names_its_own_target() {
+        for (name, target) in [
+            ("[AMD/ATI] Strix Halo", "gfx1151"),
+            ("AMD Ryzen AI Max", "gfx1151"),
+            ("[AMD/ATI] Strix Point", "gfx1150"),
+            ("[AMD/ATI] Krackan", "gfx1152"),
+            ("[AMD/ATI] Phoenix", "gfx1103"),
+            ("[AMD/ATI] Phoenix1", "gfx1103"),
+            ("[AMD/ATI] Phoenix2", "gfx1103"),
+            ("[AMD/ATI] Phoenix3", "gfx1103"),
+            ("[AMD/ATI] Phoenix4", "gfx1103"),
+            ("[AMD/ATI] Hawk Point", "gfx1103"),
+            ("[AMD/ATI] Rembrandt", "gfx1035"),
+            ("[AMD/ATI] Mendocino", "gfx1037"),
+            ("[AMD/ATI] Raphael", "gfx1036"),
+            ("[AMD/ATI] VanGogh", "gfx1033"),
+            ("AMD Custom GPU 0405", "gfx1033"),
+            ("[AMD/ATI] Renoir", "gfx90c"),
+            ("[AMD/ATI] Cezanne", "gfx90c"),
+            ("[AMD/ATI] Lucienne", "gfx90c"),
+            ("[AMD/ATI] Barcelo", "gfx90c"),
+        ] {
+            assert_eq!(
+                classify_amd_marketing_name(name),
+                (target.to_owned(), true),
+                "{name}"
+            );
+        }
+    }
+
+    /// The Linux PCI scan prefers the device id to the name, the way the
+    /// Windows probe prefers the PNP id.
+    ///
+    /// The two inputs disagree on purpose: device id `73a0` is Navi 21
+    /// (gfx1030, discrete) while the name is a Strix Halo SKU. No such part
+    /// ships, which is why it is the input -- only a pair that cannot both be
+    /// right pins precedence rather than agreement.
+    #[test]
+    fn lspci_scan_prefers_the_device_id_to_the_name() {
+        let mut e = Examination::default();
+        apply_lspci_gpus(
+            &mut e,
+            "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+             [AMD/ATI] Radeon 8060S [1002:73a0] (rev c1)",
+        );
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        assert_eq!(e.gpus[0].gfx_target, "gfx1030", "{:?}", e.gpus);
+        assert_eq!(e.gpus[0].is_apu, Some(false), "{:?}", e.gpus);
+    }
+
+    /// A Raven Ridge laptop with a discrete card, as a real host reads it.
+    ///
+    /// No lookup table names Raven: its PCI row resolves no target and so
+    /// carries the scan's "not an APU" default. The gfx902 target arrives only
+    /// from KFD's topology, so the kernel-membership pass is where the verdict
+    /// must follow it where `rocminfo` is absent or prints no `Memory
+    /// Properties:` line. Without that, the host reports no APU and the
+    /// `fix-9-igpu-dgpu` gate stays shut on the shape it exists for.
+    #[test]
+    fn a_kernel_topology_target_decides_the_verdict_of_a_row_the_pci_scan_could_not_name() {
+        let mut e = Examination::default();
+        apply_lspci_gpus(
+            &mut e,
+            "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+             [AMD/ATI] Raven Ridge [Radeon Vega Series / Radeon Vega Mobile Series] [1002:15dd] (rev c4)\n\
+             0000:01:00.0 Display controller [0380]: Advanced Micro Devices, Inc. \
+             [AMD/ATI] Device [1002:7480] (rev c7)",
+        );
+        assert_eq!(e.gpus.len(), 2, "{:?}", e.gpus);
+        assert_eq!(
+            (e.gpus[0].gfx_target.as_str(), e.gpus[0].is_apu),
+            ("", Some(false)),
+            "the premise: nothing names Raven from its PCI row: {:?}",
+            e.gpus[0]
+        );
+
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                crate::KfdGpuNode {
+                    pci_id: "0000:01:00.0".to_owned(),
+                    gfx_target: "gfx1102".to_owned(),
+                },
+                crate::KfdGpuNode {
+                    pci_id: "0000:03:00.0".to_owned(),
+                    gfx_target: "gfx902".to_owned(),
+                },
+            ],
+        );
+        let raven = e.gpus.iter().find(|g| g.pci_id == "0000:03:00.0").unwrap();
+        assert_eq!(raven.gfx_target, "gfx902", "{raven:?}");
+        assert_eq!(raven.is_apu, Some(true), "{raven:?}");
+        let dgpu = e.gpus.iter().find(|g| g.pci_id == "0000:01:00.0").unwrap();
+        assert_eq!(dgpu.is_apu, Some(false), "{dgpu:?}");
+
+        summarise_gpu_categories(&mut e);
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "both gate fix-9-igpu-dgpu: {:?}",
+            e.gpus
+        );
+    }
+
+    /// A GPU known only from the kernel topology -- no `lspci`, as in an
+    /// ordinary ROCm container -- takes the target rule from no verdict: the
+    /// Vega and RDNA2 APUs this list now names (gfx902, gfx909, gfx1037) are
+    /// integrated, and a discrete or unknown target makes no claim.
+    #[test]
+    fn a_kernel_only_gpu_with_a_newly_listed_apu_target_is_integrated() {
+        let node = |pci_id: &str, gfx_target: &str| crate::KfdGpuNode {
+            pci_id: pci_id.to_owned(),
+            gfx_target: gfx_target.to_owned(),
+        };
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                node("0000:03:00.0", "gfx902"),
+                node("0000:04:00.0", "gfx909"),
+                node("0000:05:00.0", "gfx1037"),
+                node("0000:06:00.0", "gfx1201"),
+                node("0000:07:00.0", "gfx1170"),
+            ],
+        );
+        let verdicts: Vec<_> = e.gpus.iter().map(|g| g.is_apu).collect();
+        assert_eq!(
+            verdicts,
+            [Some(true), Some(true), Some(true), None, None],
+            "{:?}",
+            e.gpus
+        );
     }
 
     #[test]
@@ -2742,21 +3061,33 @@ mod tests {
     fn the_pci_lines_examine_57_and_58_plant_read_as_their_scenarios_assume() {
         // Scenarios examine-57 and examine-58 plant these constants beside a
         // kernel node. examine-57 shows the kernel's target replacing the name
-        // table's only if the table reads its line as something else, and
-        // examine-58 shows the kernel's target filling a gap only if the table
-        // reads its line as nothing, so both premises are pinned here.
+        // table's only if the scan reads its line as something else, and
+        // through the name table rather than the device id; examine-58 shows
+        // the kernel's target filling a gap only if the scan reads its line
+        // as nothing. Each line goes through the scan itself, so a premise
+        // the device-id table would bypass fails here.
+        let scan = |line: &str| {
+            let mut e = Examination::default();
+            apply_lspci_gpus(&mut e, line);
+            assert_eq!(e.gpus.len(), 1, "{line}");
+            (e.gpus[0].gfx_target.clone(), e.gpus[0].is_apu)
+        };
         let phoenix = TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_GFX1103;
-        assert!(is_lspci_gpu_line(phoenix));
+        let device_id = extract_lspci_device_id(phoenix).expect("a [1002:xxxx] tag");
         assert_eq!(
-            classify_amd_marketing_name(&extract_lspci_name(phoenix)),
-            ("gfx1103".to_owned(), true)
+            crate::gfx_target::gfx_target_from_amd_pci_device_id(&device_id),
+            None,
+            "the PCI-id table now knows {device_id}, so the scan never asks the name \
+             table for examine-57's line: plant a Phoenix id the table lacks"
         );
+        assert_eq!(scan(phoenix), ("gfx1103".to_owned(), Some(true)));
         let unnamed = TEST_FIXTURE_LSPCI_LINE_NAME_TABLE_READS_AS_NOTHING;
-        assert!(is_lspci_gpu_line(unnamed));
+        let device_id = extract_lspci_device_id(unnamed).expect("a [1002:xxxx] tag");
         assert_eq!(
-            classify_amd_marketing_name(&extract_lspci_name(unnamed)),
-            (String::new(), false)
+            crate::gfx_target::gfx_target_from_amd_pci_device_id(&device_id),
+            None
         );
+        assert_eq!(scan(unnamed), (String::new(), Some(false)));
     }
 
     #[test]
@@ -2767,7 +3098,7 @@ mod tests {
         // the table at `apu_verdict_from_target`). Without one (a `rocminfo` that does not print
         // it), the target rule applies to the target the entry ends with: an
         // entry already integrated (a codename's verdict, with the kernel's
-        // gfx909, which the APU family list lacks) stays integrated, and one
+        // gfx1170, which no APU family names) stays integrated, and one
         // with no verdict keeps none.
         let entry = |pci_id: &str, gfx: &str, is_apu: Option<bool>| Gpu {
             name: "AMD GPU".to_owned(),
@@ -2778,9 +3109,9 @@ mod tests {
         };
         let mut e = Examination {
             gpus: vec![
-                entry("0000:03:00.0", "gfx909", Some(true)),
-                entry("0000:04:00.0", "gfx909", None),
-                entry("0000:05:00.0", "gfx909", None),
+                entry("0000:03:00.0", "gfx1170", Some(true)),
+                entry("0000:04:00.0", "gfx1170", None),
+                entry("0000:05:00.0", "gfx1170", None),
                 entry("0000:06:00.0", "gfx1100", Some(true)),
                 // A held gfx1100 the scan called discrete, and an agent at the
                 // same address reporting gfx1103: the target stays gfx1100,
@@ -2802,9 +3133,9 @@ mod tests {
         apply_rocminfo_gpu_agents(
             &mut e,
             &rocminfo_listing_with_memory(&[
-                ("gfx909", "AMD Radeon Vega 8", Some(0x300), None),
-                ("gfx909", "AMD Radeon Vega 8", Some(0x400), None),
-                ("gfx909", "AMD Radeon Vega 8", Some(0x500), Some("APU")),
+                ("gfx1170", "AMD Radeon Graphics", Some(0x300), None),
+                ("gfx1170", "AMD Radeon Graphics", Some(0x400), None),
+                ("gfx1170", "AMD Radeon Graphics", Some(0x500), Some("APU")),
                 ("gfx1100", "AMD Radeon RX 7900 XTX", Some(0x600), Some("")),
                 ("gfx1103", "AMD Radeon 780M Graphics", Some(0x700), None),
                 (
@@ -2977,8 +3308,8 @@ mod tests {
                 // APU family, no flag, and no address: the target rule says
                 // integrated.
                 ("gfx1151", "AMD Radeon 8060S Graphics", None, None),
-                // Flagged `APU` (gfx909 is not on the family list).
-                ("gfx909", "AMD Radeon Vega 8", Some(AT_04), Some("APU")),
+                // Flagged `APU` (gfx1170 is on no family list).
+                ("gfx1170", "AMD Radeon Graphics", Some(AT_04), Some("APU")),
                 // Outside the families, no flag: no claim.
                 ("gfx1100", "AMD Radeon RX 7900 XTX", Some(AT_C4), None),
             ]),
@@ -2992,7 +3323,7 @@ mod tests {
         };
         assert_eq!(e.gpus.len(), 3, "{:#?}", e.gpus);
         assert_eq!(verdict("gfx1151"), Some(true));
-        assert_eq!(verdict("gfx909"), Some(true));
+        assert_eq!(verdict("gfx1170"), Some(true));
         assert_eq!(verdict("gfx1100"), None);
         let names: Vec<(&str, &str)> = e
             .gpus
@@ -3003,7 +3334,7 @@ mod tests {
             names,
             vec![
                 ("gfx1151", "AMD Radeon 8060S Graphics"),
-                ("gfx909", "AMD Radeon Vega 8"),
+                ("gfx1170", "AMD Radeon Graphics"),
                 ("gfx1100", "AMD Radeon RX 7900 XTX"),
             ]
         );

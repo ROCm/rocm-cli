@@ -6327,9 +6327,9 @@ RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-(49|50|51|52|53) '
 
 `examine-56` plants a native Linux machine whose kernel topology has one gfx1103 integrated GPU at `0000:c4:00.0`, an `lspci` stand-in that lists an empty bus, and a `rocminfo` stand-in that reports that GPU at the same `BDFID` as "AMD Radeon 780M Graphics", with the architecture gfx1100 only while `HSA_OVERRIDE_GFX_VERSION` is 11.0.0 in its environment (as the real runtime does) and gfx1103 otherwise, and `Memory Properties: APU` either way (the runtime reads that from the device). The scenario sets the variable, and the stand-in leaves a marker file in the scenario directory when it runs with it; the Then step requires that marker, so the inspection's own `rocminfo` run must have seen the override, and a scenario that lost the variable fails instead of passing on the native listing. `rocm examine --json` must keep the card's own gfx1103 with `is_apu: true` (so `has_apu` is true and `has_discrete_amd` false) and take the runtime's model name: a `rocminfo` reading fills a gfx target only where the entry has none, so `gpus[].gfx_target` stays the native target that `rocm diagnose`'s override check holds against the framework's arch list. What it proves is that the overridden target does not replace the card's own; it does not prove where the integrated verdict comes from, because gfx1103 is an APU-family target, which gives `true` without the runtime's reading. The runtime's `Memory Properties` reading deciding the verdict is proved by the unit test `a_matched_agents_verdict_is_its_memory_properties_reading_or_else_the_target_rule`. It runs on the Linux lanes and needs no GPU; the unit test behind the kept target is `an_overridden_runtime_target_does_not_replace_the_cards_own`, and the command after examine-59 runs both.
 
-`examine-57` plants a native Linux machine whose `lspci` stand-in lists a "Phoenix1" at `0000:05:00.0`, which the examination's name table reads as gfx1103, an integrated GPU, and whose kernel topology has a gfx1100 node at that address. `rocm examine --json` must list the one GPU with the kernel's gfx1100 and `is_apu: false` (so `has_apu` is false and `has_discrete_amd` true): the kernel's target replaces a target the PCI scan guessed from the name, and the verdict the scan derived with that guess goes with it (the verdict rules are the table at `apu_verdict_from_target` in [linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs)). Krackan Point is where the tables themselves disagree (the name table gfx1150, the device-id map gfx1152, which is right unconfirmed). The disagreement is planted rather than taken from a real part so that it does not depend on one table entry. It runs on the Linux lanes and needs no GPU; the unit test behind it is `the_kernels_target_fills_or_replaces_the_scans_and_the_verdict_follows_the_rules`.
+`examine-57` plants a native Linux machine whose `lspci` stand-in lists a "Phoenix2" at `0000:05:00.0`, whose device id (`15c8`) the PCI-id table lacks and whose name the examination's name table reads as gfx1103, an integrated GPU, and whose kernel topology has a gfx1100 node at that address. `rocm examine --json` must list the one GPU with the kernel's gfx1100 and `is_apu: false` (so `has_apu` is false and `has_discrete_amd` true): the kernel's target replaces a target the PCI scan guessed from the name, and the verdict the scan derived with that guess goes with it (the verdict rules are the table at `apu_verdict_from_target` in [linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs)). The disagreement is planted rather than taken from a real part so that it does not depend on one table entry. It runs on the Linux lanes and needs no GPU; the unit test behind it is `the_kernels_target_fills_or_replaces_the_scans_and_the_verdict_follows_the_rules`.
 
-`examine-58` plants a native Linux machine whose `lspci` stand-in lists a nameless "Device 7fff" at `0000:c3:00.0`, an id no table knows, so the scan has no target for it and calls it discrete by default; its kernel topology has a gfx1151 node at that address, and its `rocminfo` stand-in lists no GPU. `rocm examine --json` must list the one GPU with gfx1151 and `is_apu: true` (so `has_apu` is true and `has_discrete_amd` false), the shape of a Strix Halo whose `pci.ids` has no name for it. It runs on the Linux lanes and needs no GPU; the unit test behind it is the same, and `the_pci_lines_examine_57_and_58_plant_read_as_their_scenarios_assume` pins what the name table reads from both planted lines.
+`examine-58` plants a native Linux machine whose `lspci` stand-in lists a nameless "Device 7fff" at `0000:c3:00.0`, an id no table knows, so the scan has no target for it and calls it discrete by default; its kernel topology has a gfx1151 node at that address, and its `rocminfo` stand-in lists no GPU. `rocm examine --json` must list the one GPU with gfx1151 and `is_apu: true` (so `has_apu` is true and `has_discrete_amd` false), the shape of a Strix Halo whose `pci.ids` has no name for it. It runs on the Linux lanes and needs no GPU; the unit test behind it is the same, and `the_pci_lines_examine_57_and_58_plant_read_as_their_scenarios_assume` runs both planted lines through the `lspci` scan and pins what it reads from each, including that the PCI-id table lacks both device ids.
 
 `examine-59` plants the same two GPUs as `examine-55`, with a `rocminfo` stand-in that lists both, in the same order and with the same architectures, but prints no `BDFID:` line for either. Without a bus address nothing says which card a reading belongs to, so `rocm examine --json` must apply neither: each GPU keeps its own gfx target, the kernel-topology placeholder name and `is_apu: null`, and the notes carry one "2 GPU reading(s) from rocminfo could not be matched to a listed GPU" note that names both readings with "(no bus address)". Both are asserted in the one scenario, so a note that is printed while a reading is applied anyway, or a refusal with no note, fails it. It runs on the Linux lanes and needs no GPU; the unit test behind it is `agents_without_an_address_are_never_paired_by_position`.
 
@@ -6484,6 +6484,76 @@ anything: an absent node (EAI-8457 states the scenario does not apply with no
 `detect_gpu_count` has **no** sysfs fallback and returns `None`, so `--gpu auto`
 there ranks from the sysfs VRAM rows alone. `kfd_readable`'s doc comment carries
 the same statement next to the code.
+
+## Integrated Or Discrete GPU
+
+`rocm examine` reports each AMD GPU's `gfx_target` and `is_apu`. `rocm
+diagnose` raises `fix-9-igpu-dgpu` from `is_apu`, only when a host has both an
+integrated and a discrete AMD GPU. `rocm serve` withholds its low-VRAM warning
+on a single-GPU host whose detected `gfx_target` is an APU family, whose "VRAM"
+is a BIOS carve-out of system RAM: `vram_capacity_is_meaningful` in
+[gpu_policy.rs](../apps/rocm/src/gpu_policy.rs) asks `gfx_is_apu_family`, the
+predicate `is_apu` is derived from, rather than reading `is_apu` itself, and
+`rocm diagnose --model` asks the same check before judging a fit against that
+carve-out.
+
+`examine-69` in [examine.feature](../tests/e2e-cucumber/features/examine.feature)
+covers the PCI scan end to end on every Linux lane, GPU or not. It puts a
+stand-in `lspci` and an empty `rocminfo` on `PATH` and points the simulated host
+root at an empty tree, so the five planted rows are the only GPUs. The RX 7900
+XTX is classified by its marketing name, the Raphael iGPU by its device id alone
+(the `Device` row `lspci` prints when `pci.ids` has no name), Krackan Point and
+Renoir by their device ids (the scan asks the id first, so their codenames are
+not consulted), and Mendocino by its codename alone. The codename rows for the
+other Vega and RDNA iGPUs are covered at unit level
+(`examine_names_a_gpu_by_its_codename_from_the_shared_table`).
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-69 '
+```
+
+`examine-70` covers the kernel-topology route the same way, for an integrated
+GPU no lookup table names. Its simulated host root carries a KFD topology node
+per card, and its two `lspci` rows resolve no target (a Raven Ridge iGPU and an
+unnamed `Device` row), so the gfx902 and gfx1102 the topology reports are the
+only evidence. The Raven Ridge iGPU must come out integrated and the other card
+discrete:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-70 '
+```
+
+`examine-71` drops the PCI scan altogether, as an ordinary ROCm container with
+no `pciutils` does: the stand-in `lspci` lists nothing and neither topology node
+states a PCI address, so both GPUs are listed from the topology alone. The
+kernel states no packaging, so the target rule (`apu_verdict_from_target` in
+[linux_gpus.rs](../crates/rocm-core/src/examine/linux_gpus.rs)) decides: the
+Mendocino's gfx1037 is in an APU family and comes out integrated, and the RX
+9070 XT's gfx1201 makes no claim (`is_apu: null`), so the host reports an
+integrated GPU and no discrete one. The same rule for gfx902 and gfx909 is
+covered at unit level
+(`a_kernel_only_gpu_with_a_newly_listed_apu_target_is_integrated`).
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-71 '
+```
+
+How `rocminfo` readings are matched and applied is covered by `examine-55` to
+`examine-59` and the unit tests beside `apply_rocminfo_gpu_agents`. On top of
+those, [examine_gpu_proptests.rs](../crates/rocm-core/src/examine_gpu_proptests.rs)
+holds that an APU the PCI scan identified stays integrated whatever a `rocminfo`
+agent at its address reports, target or `Memory Properties:` line
+(`rocminfo_never_downgrades_an_apu_verdict`), and that the APU family list and
+the target rule agree with ground truth for every target a host reports, in any
+case or suffix. The Windows display property draws adapters that print only the
+generic `AMD Radeon(TM) Graphics`, so a display probe that stopped reading the
+PNP device id fails it. The property harness asserts floors on how much of each
+strategy its properties draw from reaches the region they are about, and prints
+the measured rates:
+
+```bash
+cargo test -p rocm-core --lib -- examine::gpu_proptests --nocapture
+```
 
 ## Windows Runtime Preflight
 

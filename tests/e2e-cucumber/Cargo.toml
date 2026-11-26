@@ -108,7 +108,7 @@ shlex.workspace = true
 # to any one of these copies should look at the others.
 #
 # `test-support` for the planted `lspci` lines examine-57 and examine-58 share
-# with the rocm-core unit test that pins how the name table reads them.
+# with the rocm-core unit test that pins how the PCI scan reads them.
 rocm-core = { path = "../../crates/rocm-core", features = ["test-support"] }
 # `test-util` pauses tokio's clock in the retry loops' unit tests
 # (`#[tokio::test(start_paused = true)]`), so their timing assertions read a
