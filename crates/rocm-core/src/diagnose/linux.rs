@@ -790,7 +790,14 @@ fn svm_evidence(e: &Examination) -> (bool, String) {
     match hit {
         Some(line) => (
             true,
-            format!("the kernel log reports an SVM mapping failure: {line}"),
+            format!(
+                "the kernel log reports an SVM mapping failure, so a reservation was refused \
+                 against this host's memory ceiling: {line}. That ceiling is worked out from \
+                 installed RAM rather than from amdgpu.gttsize, so this line does not on its own \
+                 show that the aperture parameters caused it: a model loaded by mmap, another \
+                 process holding KFD memory, or an oversized BIOS carve-out are refused the same \
+                 way"
+            ),
         ),
         None => (
             false,
@@ -949,6 +956,13 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
              used, and it is the figure to raise for a larger model. Leave the carve-out at the \
              smallest value the board will boot and drive the display with, commonly 512 MiB to \
              4 GiB. The carve-out is what the GPU reports as its own VRAM."
+                .to_owned(),
+            "An SVM mapping failure in the kernel log is a reservation refused against the \
+             host-memory ceiling, which is worked out from installed RAM. Raising the aperture \
+             does not move that ceiling, so if the failure persists after this change look at \
+             what else draws on host memory: a model loaded by mmap, another process still \
+             holding KFD memory, or a BIOS carve-out large enough to shrink the RAM the ceiling \
+             is derived from."
                 .to_owned(),
             "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms \
              packages are installed, because they ship their own copy of TTM. Set the name your \
@@ -2417,6 +2431,35 @@ mod tests {
                 .any(|line| line.contains("SVM mapping failed, exceeds resident system memory")),
             "the matched kernel line must be quoted: {:?}",
             finding.evidence
+        );
+
+        // This line alone clears the match threshold, so it alone can carry a
+        // plan that rewrites the aperture -- while the ceiling the reservation
+        // was refused against is derived from installed RAM, not from
+        // `amdgpu.gttsize`. The evidence therefore has to say that the
+        // connection is not shown, and name the other things that are refused
+        // the same way, or the report asserts a cause it cannot support.
+        let svm = finding
+            .evidence
+            .iter()
+            .find(|line| line.contains("SVM mapping failure"))
+            .expect("the SVM verdict is always stated");
+        assert!(
+            svm.contains("does not on its own show"),
+            "the attribution to the aperture parameters must be qualified: {svm}"
+        );
+        for other in ["mmap", "holding KFD memory", "BIOS carve-out"] {
+            assert!(
+                svm.contains(other),
+                "the other causes that are refused the same way must be named ({other}): {svm}"
+            );
+        }
+        let notes = &finding.fix.as_ref().expect("a fix").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("Raising the aperture does not move that ceiling")),
+            "the plan must say what to look at when it does not clear the failure: {notes:?}"
         );
 
         // Without it, the finding says where it looked and does not claim the
