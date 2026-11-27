@@ -6,12 +6,14 @@ SPDX-License-Identifier: MIT
 
 # vLLM adapter
 
-`rocm-engine-vllm` is a first-party adapter around an existing vLLM
-installation. It is intended for Linux and WSL ROCm GPU serving.
+`rocm-engine-vllm` is a first-party adapter for vLLM. It is intended for Linux
+and WSL ROCm GPU serving.
 
-The adapter does not install vLLM automatically and does not run CPU mode.
-Install or build vLLM in a ROCm-capable Python environment first, then make the
-`vllm` command visible to ROCm CLI.
+`rocm engines install vllm` installs vLLM into a ROCm CLI-managed runtime.
+`rocm serve --engine vllm` never installs it, and the adapter does not run CPU
+mode. To serve with a vLLM that you installed or built yourself, make the
+`vllm` command visible to ROCm CLI: put it on `PATH`, or set
+`ROCM_CLI_VLLM_COMMAND` or `ROCM_CLI_VLLM_PYTHON`.
 
 Native Windows vLLM serving is skipped in this adapter. On native Windows,
 `rocm serve --engine vllm`, `rocm engines install vllm` and
@@ -20,10 +22,13 @@ runtime check, download, or launch; `rocm engines list` shows the same decision
 as `runtime: unsupported_native_windows`. Use WSL or Linux for vLLM ROCm
 serving, or the Lemonade engine (`--engine lemonade`). No CPU fallback is used.
 
-For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
-the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
-TheRock torch packages or target a different ROCm soname set; that is not a
-valid no-fallback setup for ROCm CLI GPU serving.
+If you install vLLM into a ROCm CLI-managed TheRock runtime yourself instead of
+with `rocm engines install vllm`, build it from source against that runtime's
+TheRock PyTorch stack. A prebuilt vLLM ROCm wheel that you install by hand can
+replace the TheRock torch packages or target a different ROCm soname set; that
+is not a valid no-fallback setup for ROCm CLI GPU serving.
+`rocm engines install vllm` handles the torch packages itself (see "Torch
+alignment on engine install").
 
 Building from source compiles HIP sources, so it needs the ROCm compiler
 toolchain. That is opt-in: install the runtime with `rocm install sdk --devel`,

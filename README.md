@@ -25,14 +25,21 @@ full-screen terminal user interface (TUI) dashboard for GPU telemetry, model ser
 
 It ships as prebuilt binaries (`rocm` and `rocmd`) for Linux and Windows
 (x86_64), needs no Python, Rust, or existing ROCm install, and includes
-inference engine adapters for Lemonade and vLLM.
+inference engine adapters for Lemonade, vLLM, and AIM.
+
+<!-- GitHub-only: every docs/rocm-docs/ wrapper that includes README text
+starts at or below the platform-support-table-start marker (install/installation.md
+and compatibility.md start exactly at it), so the site never links to itself.
+Keep this link above the marker. -->
+For the full documentation, see the
+[ROCm CLI documentation](https://rocm.docs.amd.com/projects/rocm-cli/en/latest/).
 
 <!-- platform-support-table-start -->
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
-| Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
+| Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and the Lemonade, vLLM, and AIM engines |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory and running managed servers, without per-server throughput; no vLLM or AIM |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; includes the live dashboard; GPU serving is confirmed only for Lemonade in the end-to-end test run on Strix Halo and for vLLM on a pre-release ROCm 10.2 SDK; AIM is not yet verified |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
