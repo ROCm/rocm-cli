@@ -242,12 +242,28 @@ async fn catalog_warns_aim_entry_is_stale(world: &mut E2eWorld) {
     );
 }
 
+/// Which kind of memory a scenario planted, and so which fit label its rows
+/// have to carry.
+///
+/// Recorded by the planting Given steps because that label is the subject of
+/// half this cluster: a Then accepting either would pass on an integrated part
+/// whose rows claim "fits this GPU", which is precisely the claim
+/// `assess_model_readiness` refuses to make about one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingMemoryKind {
+    /// A discrete card's own VRAM.
+    Dedicated,
+    /// An integrated part's pool, shared with the operating system.
+    SharedPool,
+}
+
 /// Plant the GPU capacity the recommendation is selected on.
 ///
 /// `ROCM_E2E_FORCE_GPU_TOTAL_GIB` is the `e2e-test-hooks` seam for this: the
 /// no-GPU lane measures no capacity and the GPU lanes cannot be made small, so a
 /// planted figure is the only way a narrowed listing is reachable from a test.
 fn plant_gpu_capacity_gib(world: &mut E2eWorld, total_gib: u32) {
+    world.listing_gpu_memory_kind = Some(ListingMemoryKind::Dedicated);
     world
         .command_env
         .push(("ROCM_E2E_FORCE_GPU_TOTAL_GIB", total_gib.to_string().into()));
@@ -303,6 +319,7 @@ const SMALL_SHARED_POOL_BYTES: u64 = SMALL_GPU_TOTAL_GIB as u64 * 1024 * 1024 * 
 /// a different machine from one nobody measured: the GPU is present and known to
 /// share memory, and only the amount is missing.
 fn plant_integrated_gpu(world: &mut E2eWorld, aperture_bytes: Option<u64>) {
+    world.listing_gpu_memory_kind = Some(ListingMemoryKind::SharedPool);
     crate::e2e::diagnose_steps::plant_single_gpu_with_memory(
         world,
         crate::e2e::diagnose_steps::GFX1151_TARGET_VERSION,
@@ -334,6 +351,7 @@ async fn an_unreadable_shared_pool_machine(world: &mut E2eWorld) {
     "a machine whose graphics share memory with the rest of the system and report no memory of their own"
 )]
 async fn a_shared_pool_machine_with_no_vram_counters(world: &mut E2eWorld) {
+    world.listing_gpu_memory_kind = Some(ListingMemoryKind::SharedPool);
     crate::e2e::diagnose_steps::plant_single_gpu_with_memory(
         world,
         crate::e2e::diagnose_steps::GFX1151_TARGET_VERSION,
@@ -374,6 +392,65 @@ async fn assert_offer_reaches_past_the_carve_out(world: &mut E2eWorld) {
         discriminating.iter().any(|id| output.contains(id.as_str())),
         "none of {discriminating:?} is offered, so the listing was narrowed against the \
          carve-out rather than the shared pool:\n{output}"
+    );
+}
+
+/// A listing row, as `render_model_registry_text_with_context_and_host` writes
+/// it: two spaces, the canonical id, two more spaces, then the quant and the
+/// fit label.
+///
+/// Matched as a prefix rather than by a bare substring search because the
+/// listing's closing paragraph names two curated models as `rocm serve`
+/// examples — `Qwen/Qwen3.6-27B` and `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`,
+/// both far above this scenario's pool. A plain `contains` would find those and
+/// report an offer that was never made.
+fn names_in_an_offered_row(output: &str, canonical_model_id: &str) -> bool {
+    let prefix = format!("  {canonical_model_id}  ");
+    output.lines().any(|line| line.starts_with(&prefix))
+}
+
+/// The other half of the narrowing: what is gone.
+///
+/// `every model offered is one this machine can run` reads only the rows that
+/// were printed, so it is satisfied by any listing whose rows all say they fit
+/// — including one narrowed against a figure far larger than the pool, where
+/// the models this machine cannot run are offered *with* a `fits this shared
+/// pool` label beside them. Nothing else in this scenario would see that.
+///
+/// The recipes named are the ones the `featured` flag used to select, which is
+/// the defect the cluster exists for: that short list is what an unnarrowed
+/// host still falls back to (`platform_offer`'s `fit == None` arm), and every
+/// one of its members needs more than this pool holds. So removing the
+/// narrowing, or widening the figure it uses, puts at least one of them back on
+/// offer and fails here.
+#[then("no model too large for that pool is offered")]
+async fn assert_too_large_models_are_absent(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let pool_gib = SMALL_SHARED_POOL_BYTES as f64 / 1024.0_f64.powi(3);
+    let too_large = rocm_core::builtin_model_recipe_registry()
+        .recipes
+        .iter()
+        .filter(|recipe| rocm_core::model_recipe_featured(recipe))
+        .filter(|recipe| {
+            recipe
+                .min_gpu_mem_gb
+                .is_some_and(|min| f64::from(min) > pool_gib)
+        })
+        .map(|recipe| recipe.canonical_model_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !too_large.is_empty(),
+        "every featured recipe now fits a {pool_gib} GiB pool, so this scenario can no longer \
+         tell a narrowed listing from the unnarrowed fallback"
+    );
+    let offered = too_large
+        .iter()
+        .filter(|id| names_in_an_offered_row(output, id))
+        .collect::<Vec<_>>();
+    assert!(
+        offered.is_empty(),
+        "{offered:?} need more than the {pool_gib} GiB this machine's pool holds, so a listing \
+         that offers them was not narrowed on that pool:\n{output}"
     );
 }
 
@@ -503,14 +580,28 @@ async fn user_asks_for_recommendations(world: &mut E2eWorld) {
 #[then("every model offered is one this machine can run")]
 async fn assert_every_offer_fits(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
-    // Either label, because the row names the kind of memory it was weighed
-    // against: a discrete card's own VRAM, or an integrated part's shared pool.
-    // Which of the two is right for a given host is not this step's business --
-    // `the rows say the memory is shared` is where that is pinned, because a
-    // permissive check here would let the card wording pass on an APU.
+    // The label the planted host must produce, not either of the two. Accepting
+    // either made this step permissive exactly where it matters: on a shared
+    // pool, "fits this GPU" claims of an integrated part what
+    // `assess_model_readiness` refuses to claim about it -- clearing a ceiling
+    // the operating system also draws on is `Degraded`, never `Ready`. The kind
+    // is recorded by whichever Given planted the host, so the scenario states
+    // it rather than this step guessing from the text it is judging.
+    let (expected, wrong) = match world
+        .listing_gpu_memory_kind
+        .expect("no step planted this machine's memory")
+    {
+        ListingMemoryKind::Dedicated => ("fits this GPU", "fits this shared pool"),
+        ListingMemoryKind::SharedPool => ("fits this shared pool", "fits this GPU"),
+    };
     assert!(
-        output.contains("fits this GPU") || output.contains("fits this shared pool"),
-        "a narrowed listing must offer something and say it fits:\n{output}"
+        output.contains(expected),
+        "a narrowed listing must offer something and say it {expected:?}:\n{output}"
+    );
+    assert!(
+        !output.contains(wrong),
+        "the rows name the wrong kind of memory ({wrong:?}) for the machine this scenario \
+         planted:\n{output}"
     );
     assert!(
         !output.contains("needs a larger GPU") && !output.contains("larger than this shared pool"),

@@ -133,11 +133,17 @@ Feature: Model catalog listing
   # is no VRAM. The pool is still readable, so the answer is still narrowed --
   # and it has to match what `rocm diagnose --model` says about the same host,
   # which judges it on that pool.
+  #
+  # This machine has no carve-out to weigh against by mistake, so -10's
+  # carve-out discrimination has no subject here. What it can still be told
+  # apart from is a listing narrowed on too large a figure, or not narrowed at
+  # all -- hence the absence step, which names the models the pool cannot hold.
   @id:model-catalog-narrows-shared-memory-with-no-vram-reading @requires-os:linux
   Scenario: model-catalog-12 - A machine whose graphics report no memory of their own is narrowed on the shared pool
     Given a machine whose graphics share memory with the rest of the system and report no memory of their own
     When the user asks which models are recommended
     Then every model offered is one this machine can run
+    And no model too large for that pool is offered
     And each offered row says the memory it was weighed against is shared
     And the user is told that memory is shared with everything else running
 
