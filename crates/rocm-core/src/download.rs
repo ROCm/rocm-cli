@@ -21,6 +21,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::disk_space;
+use crate::http_proxy::ProxyConfig;
 
 /// Attempts a download makes before giving up. The first attempt is not a
 /// retry, so this is one initial try plus two retries.
@@ -83,6 +84,11 @@ pub struct DownloadRequest<'a> {
     /// the server's own `Content-Length`.
     pub expected_len: Option<u64>,
     pub expected_sha256: Option<&'a str>,
+    /// Proxy settings for the transfer. `None` reads the standard proxy
+    /// variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`) from the
+    /// environment on each attempt; a caller that already holds a
+    /// [`ProxyConfig`] (a test, above all) passes it instead.
+    pub proxy: Option<&'a ProxyConfig>,
 }
 
 impl<'a> DownloadRequest<'a> {
@@ -95,6 +101,7 @@ impl<'a> DownloadRequest<'a> {
             max_bytes: None,
             expected_len: None,
             expected_sha256: None,
+            proxy: None,
         }
     }
 }
@@ -251,7 +258,11 @@ fn download_attempt(
     // Resume from whatever a previous attempt already wrote. A missing file is
     // simply a fresh start.
     let resume_from = fs::metadata(partial_path).map_or(0, |meta| meta.len());
-    let mut call = ureq::get(request.url).timeout(request.timeout);
+    let builder = match request.proxy {
+        Some(proxy) => proxy.agent_builder(request.url),
+        None => crate::http_proxy::agent_builder(request.url),
+    };
+    let mut call = builder.build().get(request.url).timeout(request.timeout);
     for (name, value) in request.headers {
         call = call.set(name, value);
     }
@@ -1104,5 +1115,87 @@ mod tests {
         let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(800), 2);
         let delays: Vec<u128> = (0..5).map(|_| backoff.next_delay().as_millis()).collect();
         assert_eq!(delays, vec![100, 200, 400, 800, 800]);
+    }
+
+    /// Proxy settings that send every URL to the loopback "proxy" on `port`.
+    fn proxy_on(port: u16) -> ProxyConfig {
+        let proxy = format!("http://127.0.0.1:{port}");
+        ProxyConfig::from_lookup(move |name| (name == "http_proxy").then(|| proxy.clone()))
+    }
+
+    /// The reported failure: a host that can only reach the internet through
+    /// a proxy. The target name does not resolve, so the bytes arrive only if
+    /// the request is sent to the proxy, which gets the absolute URL.
+    #[test]
+    fn download_goes_through_the_configured_proxy() -> Result<()> {
+        let body = download_body();
+        let (proxy_port, proxy) =
+            spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let dir = download_scratch("proxied");
+        let destination = dir.join("artifact.bin");
+        let url = "http://sdk-mirror.invalid/artifact.bin";
+        let proxy_config = proxy_on(proxy_port);
+
+        let result = download_file_streaming(&DownloadRequest {
+            proxy: Some(&proxy_config),
+            ..DownloadRequest::new(url, &destination, Duration::from_secs(10))
+        });
+
+        // Fail on the download itself before waiting for the proxy thread:
+        // with no request ever sent to it, the thread never ends.
+        if let Err(error) = result {
+            fs::remove_dir_all(&dir).ok();
+            return Err(error.context("the proxy was never asked for the file"));
+        }
+        let requests = proxy.join().expect("proxy thread")?;
+        let written = fs::read(&destination).ok();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(written.as_deref(), Some(body.as_slice()));
+        assert!(
+            requests[0].starts_with(&format!("GET {url} HTTP/1.1\r\n")),
+            "the proxy must be asked for the absolute URL, got: {}",
+            requests[0]
+        );
+        Ok(())
+    }
+
+    /// Serializes the test below, which sets a process environment variable.
+    static PROXY_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The path every production download takes: no proxy is passed, so the
+    /// request reads `http_proxy` from the process environment. The other
+    /// proxy tests inject the settings and never reach this branch.
+    #[test]
+    fn download_reads_the_proxy_from_the_environment_by_default() -> Result<()> {
+        let _guard = PROXY_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = download_body();
+        let (proxy_port, proxy) =
+            spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+        let _env = crate::test_env::RestoredEnvVar::set("http_proxy", Path::new(&proxy_url));
+        let dir = download_scratch("env-proxied");
+        let destination = dir.join("artifact.bin");
+        let url = "http://sdk-mirror.invalid/artifact.bin";
+
+        let result = download_file_streaming(&DownloadRequest::new(
+            url,
+            &destination,
+            Duration::from_secs(10),
+        ));
+
+        if let Err(error) = result {
+            fs::remove_dir_all(&dir).ok();
+            return Err(error.context("the proxy named in the environment was never asked"));
+        }
+        let requests = proxy.join().expect("proxy thread")?;
+        let written = fs::read(&destination).ok();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(written.as_deref(), Some(body.as_slice()));
+        assert!(requests[0].starts_with(&format!("GET {url} HTTP/1.1\r\n")));
+        Ok(())
     }
 }

@@ -535,7 +535,7 @@ pub(super) fn download_file(
 /// install.
 fn head_content_length(url: &str) -> Option<u64> {
     let timeout = Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS);
-    let agent = ureq::AgentBuilder::new()
+    let agent = rocm_core::http_proxy::agent_builder(url)
         // `timeout_connect` takes precedence over `timeout` and defaults to 30s,
         // so without it a host that blackholes rather than refuses would stall
         // the probe well past the intended ceiling.
@@ -609,7 +609,7 @@ fn http_get(
     // timeout. Without this, a blackholed host stalls the connect phase for the full
     // overall timeout on every request instead of failing fast.
     let connect_timeout = timeout.min(Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS));
-    let agent = ureq::AgentBuilder::new()
+    let agent = rocm_core::http_proxy::agent_builder(url)
         .timeout_connect(connect_timeout)
         .timeout(timeout)
         .build();

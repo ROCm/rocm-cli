@@ -12,7 +12,8 @@ Feature: TheRock "next" ROCm 10 install layout
   # by exact arch, so a request that reads it also needs a raw GFX arch.
   #
   # Scenarios 01-05 and 16-23 point source overrides at loopback fixtures
-  # through the explicit trust gate. Scenario 06 proves the same overrides are
+  # through the explicit trust gate; scenario 24 does too, but names a host that
+  # resolves nowhere on purpose, reached only through a proxy fixture. Scenario 06 proves the same overrides are
   # inert when the trust gate is absent; scenario 07 supplies the live GPU
   # evidence.
   #
@@ -378,3 +379,15 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user tries to preview a nightly tarball SDK install for arch gfx1200 pinned to the earlier stream's last build date
     Then the install fails
     And the failure names the first build date of the newer layout and points to a wheel install that resolves that earlier nightly
+
+  # A host that reaches the internet only through a corporate proxy sets the
+  # standard proxy variables and expects the install to follow them, as wget and
+  # curl do. The catalog is named by a host that resolves nowhere, so the
+  # preview can read it only by asking the proxy, which the fixture server plays.
+  @id:therock-next-24-tarball-catalog-is-read-through-the-configured-proxy @requires-os:linux
+  Scenario: therock-next-24 - A tarball SDK preview reads its catalog through the configured proxy
+    Given a canonical release tarball fixture and a ROCm 10 tarball fixture with a tests sibling
+    And the ROCm 10 tarball catalog is reachable only through the HTTP proxy setting
+    When the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview resolves the ROCm 10 tarball catalog behind the proxy
+    And the preview selects the real tarball artifact
