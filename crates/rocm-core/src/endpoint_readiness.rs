@@ -407,8 +407,15 @@ pub fn managed_service_endpoint_model_ready(
 /// Interactive `rocm serve` startup deadline.
 ///
 /// `rocmd`'s server-recover watcher uses the same bound so it does not restart
-/// a live process that has not opened its port yet.
+/// a live process that has not opened its port yet, and the Lemonade engine's
+/// direct `llama-server` readiness wait uses it as its ceiling.
 pub const SERVE_STARTUP_DEADLINE: Duration = Duration::from_mins(30);
+
+/// How long a starting server may stay silent before a wait calls it stuck.
+///
+/// The interactive `rocm serve` wait and the Lemonade engine's direct readiness
+/// wait both use it; each measures silence its own way.
+pub const SERVE_SILENT_LOAD_LIMIT: Duration = Duration::from_mins(5);
 
 /// How far along a managed service's endpoint is.
 ///

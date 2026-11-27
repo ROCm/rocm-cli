@@ -81,7 +81,7 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
 
     let registry = registry_dir(world);
     std::fs::create_dir_all(&registry).expect("failed to create registry dir");
-    let manifest = runtime_manifest_json(key, family, &install_root);
+    let manifest = runtime_manifest_json(key, family, PLANTED_VERSION, &install_root);
     std::fs::write(registry.join(format!("{key}.json")), manifest)
         .expect("failed to write runtime manifest");
     install_root
@@ -126,7 +126,7 @@ fn services_dir(world: &E2eWorld) -> PathBuf {
 
 /// A minimal valid read-only tarball runtime manifest (matches the CLI's on-disk
 /// schema). Written as plain JSON — black-box, not a typed import from the crates.
-fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String {
+fn runtime_manifest_json(key: &str, family: &str, version: &str, install_root: &Path) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "runtime_key": key,
         // The human-facing identifier keeps the `therock-release:<family>` form (the
@@ -136,7 +136,7 @@ fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String
         "format": "tarball",
         "family": family,
         "family_source": "manual",
-        "version": PLANTED_VERSION,
+        "version": version,
         "install_root": install_root,
         "selected_artifact_url": format!("https://example.invalid/{key}.tar.gz"),
         "read_only": true,
@@ -450,7 +450,7 @@ fn write_import_manifest(world: &E2eWorld) -> PathBuf {
     let manifest_path = root.path().join("import-manifest.json");
     std::fs::write(
         &manifest_path,
-        runtime_manifest_json(IMPORT_KEY, "gfx1151", &install_root),
+        runtime_manifest_json(IMPORT_KEY, "gfx1151", PLANTED_VERSION, &install_root),
     )
     .expect("failed to write import manifest");
     manifest_path
@@ -703,6 +703,132 @@ async fn mark_service_on_other_runtime(world: &mut E2eWorld) {
 }
 
 // ── When ───────────────────────────────────────────────────────────
+
+// ── Slow-copy SDK advisory (issue #1143) ───────────────────────────
+
+/// A planted ROCm SDK 10.2.0 runtime: the version with the slow pageable copies on
+/// WSL2. The key and family are distinct from [`GOOD_SDK_KEY`]'s because the install
+/// root is named after the family.
+const SLOW_SDK_KEY: &str = "release-wheel-multi-arch-10-2-0-aaaaaaaaaaaaaaaa";
+const SLOW_SDK_FAMILY: &str = "gfx1151";
+const SLOW_SDK_VERSION: &str = "10.2.0";
+/// The runtime the advisory sends users to: ROCm SDK 10.1.0.
+const GOOD_SDK_KEY: &str = "release-wheel-multi-arch-10-1-0-bbbbbbbbbbbbbbbb";
+const GOOD_SDK_FAMILY: &str = "gfx942";
+const GOOD_SDK_VERSION: &str = "10.1.0";
+
+/// The phrase that identifies the advisory in `rocm` output. Its full text is
+/// pinned by the unit tests in `apps/rocm/src/runtime_advisory.rs`; the scenarios
+/// here are about when it appears.
+const SLOW_SDK_ADVISORY: &str = "warning: ROCm SDK 10.2.0 on WSL2";
+
+/// Where the simulated host root of this scenario lives.
+fn simulated_host_root(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root")
+}
+
+/// Hand the simulated host root to the next `rocm` run: `run_rocm_with_scenario_env`
+/// consumes the scenario env, so each run asks for it again.
+fn push_simulated_host_root(world: &mut E2eWorld) {
+    let root = simulated_host_root(world).into_os_string();
+    world.command_env.push(("ROCM_CLI_TEST_HOST_ROOT", root));
+}
+
+#[given("a WSL2 host")]
+async fn wsl2_host(world: &mut E2eWorld) {
+    // `/dev/dxg` alone makes the product read the host as WSL2 (`is_wsl_host`).
+    let host = simulated_host_root(world);
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/dxg"), "").expect("failed to plant /dev/dxg");
+}
+
+#[given("a host that is not WSL2")]
+async fn host_that_is_not_wsl2(world: &mut E2eWorld) {
+    // An empty simulated root, so the machine the suite happens to run on (which
+    // may be WSL2) cannot decide the scenario.
+    std::fs::create_dir_all(simulated_host_root(world)).expect("failed to create the host root");
+}
+
+fn plant_runtime_version(world: &E2eWorld, key: &str, family: &str, version: &str) {
+    let install_root = planted_install_root(world, family);
+    std::fs::create_dir_all(&install_root).expect("failed to create install root");
+    std::fs::write(install_root.join("payload.txt"), "payload")
+        .expect("failed to write runtime payload");
+    let registry = registry_dir(world);
+    std::fs::create_dir_all(&registry).expect("failed to create registry dir");
+    std::fs::write(
+        registry.join(format!("{key}.json")),
+        runtime_manifest_json(key, family, version, &install_root),
+    )
+    .expect("failed to write runtime manifest");
+}
+
+#[given("a registered ROCm SDK 10.2.0 runtime and a registered ROCm SDK 10.1.0 runtime")]
+async fn slow_and_good_sdk_runtimes(world: &mut E2eWorld) {
+    plant_runtime_version(world, SLOW_SDK_KEY, SLOW_SDK_FAMILY, SLOW_SDK_VERSION);
+    plant_runtime_version(world, GOOD_SDK_KEY, GOOD_SDK_FAMILY, GOOD_SDK_VERSION);
+}
+
+#[when("the user activates the ROCm SDK 10.2.0 runtime")]
+async fn activate_slow_sdk(world: &mut E2eWorld) {
+    push_simulated_host_root(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["runtimes", "activate", SLOW_SDK_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
+/// The activation the advisory itself names (`rocm runtimes activate <runtime_key>`
+/// for a 10.1.0 runtime that `rocm runtimes list` shows).
+#[when("the user activates the ROCm SDK 10.1.0 runtime")]
+async fn activate_good_sdk(world: &mut E2eWorld) {
+    push_simulated_host_root(world);
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["runtimes", "activate", GOOD_SDK_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
+#[then(
+    "the activation succeeds and warns that model loading can be slow on WSL2 and names ROCm SDK 10.1.0"
+)]
+async fn activation_warns_about_slow_sdk(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(&format!("runtime_key: {SLOW_SDK_KEY}")),
+        "expected {SLOW_SDK_KEY} activated, got:\n{out}"
+    );
+    let warning = out
+        .lines()
+        .find(|line| line.starts_with(SLOW_SDK_ADVISORY))
+        .unwrap_or_else(|| panic!("no slow-SDK warning in:\n{out}"));
+    assert!(
+        warning.contains("rocm install sdk --version 10.1.0")
+            && warning.contains("rocm runtimes activate <runtime_key>"),
+        "the warning names the way out: {warning}"
+    );
+}
+
+/// Following the warning's advice has to leave the 10.1.0 runtime the active one,
+/// not merely silence the warning.
+#[then("the ROCm SDK 10.1.0 runtime is the active runtime")]
+async fn good_sdk_is_active(world: &mut E2eWorld) {
+    assert_eq!(active_runtime_key(world), GOOD_SDK_KEY);
+}
+
+#[then("the activation succeeds without that warning")]
+async fn activation_has_no_slow_sdk_warning(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(out.contains("runtime activated"), "{out}");
+    assert!(
+        !combined(world).contains(SLOW_SDK_ADVISORY),
+        "unexpected slow-SDK warning:\n{}",
+        combined(world)
+    );
+}
 
 #[when("the user activates the first runtime")]
 async fn activate_first(world: &mut E2eWorld) {

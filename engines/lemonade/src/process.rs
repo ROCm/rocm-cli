@@ -486,7 +486,7 @@ pub(crate) fn wait_for_lemonade_cli_status_with_parent(
     )
 }
 
-fn summarize_startup_log_tail(log_path: Option<&Path>, limit: usize) -> String {
+pub(crate) fn summarize_startup_log_tail(log_path: Option<&Path>, limit: usize) -> String {
     let Some(log_path) = log_path else {
         return "no Lemonade startup log path was configured".to_owned();
     };

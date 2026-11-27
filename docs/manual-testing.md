@@ -300,6 +300,9 @@ Expected result:
   running local servers left on the previous runtime. Nothing is serving yet at
   this point, so it must read `services_on_previous_runtime: 0`. A fixed note
   about running services in place of that count means this test fails.
+- On a WSL2 host, activating a ROCm SDK 10.2.0 runtime also prints a one-line
+  `warning:` that names `rocm install sdk --version 10.1.0`; activating a 10.1.0
+  runtime prints none. Elsewhere, no runtime prints it.
 - `rocm runtimes activate <runtime_key> --restart-services` without `--yes`
   refuses, names `--restart-services --yes` as the way to repeat it, and leaves
   the active runtime alone. Section 4 exercises the same report and the same

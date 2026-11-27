@@ -406,6 +406,11 @@ fn apply_runtime_update_with(
         // command saved since.
         let activation = activate_runtime(paths, config, &installed.runtime_key)?;
         append_update_activate_summary(&mut output, &activation);
+        if let Some(advisory) =
+            crate::runtime_advisory::advisory_for_runtime_key(paths, &activation.runtime_key)
+        {
+            let _ = writeln!(output, "{advisory}");
+        }
     } else {
         let _ = writeln!(
             output,

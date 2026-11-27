@@ -1302,6 +1302,13 @@ without taking `--restart-services` themselves, so the note names the
 `rocm runtimes activate` invocation that does, instead of a flag to add to
 whatever was just run.
 
+On a WSL2 host, `activate`, `rollback`, `rocm update --apply --activate`,
+`rocm install sdk` and a Lemonade `rocm serve` end with a one-line `warning:` (on
+stderr for `serve`) when the runtime is ROCm SDK 10.2.0, which loaded models far
+more slowly than 10.1.0 on the host it was measured on. It names
+`rocm install sdk --version 10.1.0` and `rocm runtimes activate <runtime-key>` as
+the way back; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md).
+
 The note's command re-activates the runtime that is already active, which moves
 the servers without moving the runtime. Re-activating the active runtime prints
 `changed_from_runtime_key: <unchanged>` and keeps the existing rollback target.
@@ -1965,6 +1972,9 @@ when the model is already being served and still starting, it waits on that
 server instead (an already-serving one is reported at once). Watch the download with
 `rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
+A Lemonade `llama-server` started directly is stopped once it exits (reported at
+once), after 5 minutes without new log output, or after 30 minutes, and the
+failure quotes the end of its log.
 
 #### Choosing the model form
 

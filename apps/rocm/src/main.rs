@@ -57,6 +57,7 @@ mod python_install;
 mod remote;
 mod rocm_argv;
 mod runtime_adopt;
+mod runtime_advisory;
 mod runtime_install_finalize;
 mod runtime_registry;
 mod runtime_services;

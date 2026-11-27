@@ -1066,6 +1066,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         visible_gpu_indices.as_deref(),
         gpu_vram.as_deref(),
     )?;
+    crate::runtime_advisory::advise_serve(&paths, &selected_engine, cpu_only, &resolved_selection);
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`

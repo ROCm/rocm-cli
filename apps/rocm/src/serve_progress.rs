@@ -57,7 +57,7 @@ pub(crate) const PIPED_SERVE_STATUS_BUDGET: Duration = Duration::from_secs(45);
 pub(crate) const SILENT_UNREACHABLE: Duration = SILENT_LOAD;
 
 /// A load line that stops changing while the endpoint has not listed the model.
-pub(crate) const SILENT_LOAD: Duration = Duration::from_mins(5);
+pub(crate) const SILENT_LOAD: Duration = rocm_core::SERVE_SILENT_LOAD_LIMIT;
 
 const POLL: Duration = Duration::from_millis(250);
 const LOG_TAIL_LINES: usize = 40;

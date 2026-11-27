@@ -30,6 +30,13 @@ the other platforms, see [Installing ROCm CLI](installation.md).
 :end-before: "## TheRock Runtime Env In WSL"
 ```
 
+## Known issue: ROCm SDK 10.2.0 loads models slowly
+
+```{include} ../../wsl.md
+:start-after: "## Known Issue: ROCm SDK 10.2.0 Loads Models Slowly"
+:end-before: "## Diagnosing A WSL Host"
+```
+
 ## Diagnosing a WSL host
 
 ```{include} ../../wsl.md
