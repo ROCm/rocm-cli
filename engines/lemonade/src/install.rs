@@ -1488,6 +1488,10 @@ mod tests {
         assert!(previous_dir.join("old.txt").is_file());
         assert!(staging_dir.join("new.txt").is_file());
         assert!(!runtime_dir.exists());
+
+        // The advice the message gives recovers the old tree.
+        fs::rename(&previous_dir, &runtime_dir).unwrap();
+        assert!(runtime_dir.join("old.txt").is_file());
     }
 
     /// The old tree cannot be moved aside (a file in it is held open): nothing
