@@ -42,8 +42,9 @@ use serde::Deserialize;
 
 use crate::cross_crate_reads;
 
-/// Default base ref used when none is supplied on the command line. Matches
-/// [`crate::verify_commits`] so both commands diff against the same point.
+/// Default base ref used when none is supplied on the command line. Always
+/// plain `origin/main`; `verify-commits` may instead pick a closer
+/// `origin/release/*` base (see its `detect_base`).
 pub(crate) const DEFAULT_BASE: &str = "origin/main";
 
 /// The workspace dependency graph, reduced to what selection needs: each

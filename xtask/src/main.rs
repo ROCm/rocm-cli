@@ -227,7 +227,8 @@ pub(crate) enum Command {
     /// DCO `Signed-off-by` trailer.
     VerifyCommits {
         /// Base ref for the `<base>..HEAD` range. Defaults to the PR base branch
-        /// (`origin/$GITHUB_BASE_REF`) in CI, otherwise `origin/main`.
+        /// (`origin/$GITHUB_BASE_REF`) in CI, otherwise whichever of `origin/main`
+        /// and `origin/release/*` is closest to `HEAD`.
         #[arg(long)]
         base: Option<String>,
         /// Strict mode: require GitHub to report each signature as "Verified"
