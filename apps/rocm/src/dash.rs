@@ -869,6 +869,11 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
     let endpoint = v1_base(&endpoint);
 
     // Resolve the model: use the provided value or probe GET {endpoint}/models.
+    //
+    // First-listed, not the served-model preference `rocm_dash_tui::llm::pick_served_model`
+    // applies for the chat tab's managed endpoints: `--endpoint` is a URL the user
+    // named, so nothing records what it was launched with and there is no model to
+    // prefer. `--model` is the explicit override when the first listed is wrong.
     let model = if let Some(m) = model {
         m
     } else {

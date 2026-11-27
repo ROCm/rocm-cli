@@ -341,6 +341,11 @@ mod scripted_metrics_tests {
 #[derive(Clone)]
 struct ServerState {
     model_name: String,
+    /// Extra ids `/v1/models` lists *before* `model_name`, so a scenario can
+    /// simulate a Lemonade server that lists every model it has downloaded
+    /// rather than the one it has loaded. Empty for every server that does not
+    /// care, which lists `model_name` alone.
+    models_listed_before: Vec<String>,
     /// `Some` only when this server was started via
     /// [`MockServer::start_with_metrics`]; drives the `/metrics` route. Kept as
     /// an `Option` (rather than always registering the route) so a plain
@@ -539,6 +544,7 @@ impl MockServer {
         let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
+            models_listed_before: Vec::new(),
             metrics: None,
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
@@ -585,6 +591,7 @@ impl MockServer {
         let scripted = Arc::new(ScriptedMetrics::new());
         let state = ServerState {
             model_name: model_name.to_string(),
+            models_listed_before: Vec::new(),
             metrics: None,
             scripted_metrics: Some(Arc::clone(&scripted)),
             last_chat_request: Arc::clone(&last_chat_request),
@@ -659,6 +666,26 @@ impl MockServer {
         .await
     }
 
+    /// A server that lists `models_listed_before` ahead of `model_name` on
+    /// `/v1/models`, as Lemonade does when the host has several models
+    /// downloaded: the listing is the catalogue on disk, not the loaded model,
+    /// so the served one need not be first.
+    pub async fn start_listing_other_models_first(
+        model_name: &str,
+        models_listed_before: &[&str],
+    ) -> Self {
+        Self::spawn_listing(
+            model_name,
+            models_listed_before
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect(),
+            false,
+            None,
+        )
+        .await
+    }
+
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
         Self::spawn_with(model_name, with_metrics, None).await
     }
@@ -668,11 +695,21 @@ impl MockServer {
         with_metrics: bool,
         tool_call: Option<Arc<ScriptedToolCall>>,
     ) -> Self {
+        Self::spawn_listing(model_name, Vec::new(), with_metrics, tool_call).await
+    }
+
+    async fn spawn_listing(
+        model_name: &str,
+        models_listed_before: Vec<String>,
+        with_metrics: bool,
+        tool_call: Option<Arc<ScriptedToolCall>>,
+    ) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
         let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
+            models_listed_before,
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
@@ -722,6 +759,7 @@ impl MockServer {
         let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
+            models_listed_before: Vec::new(),
             metrics: None,
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
@@ -800,6 +838,7 @@ impl MockServer {
         let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
+            models_listed_before: Vec::new(),
             metrics: None,
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
@@ -1082,10 +1121,13 @@ pub fn write_service_record_with(
 }
 
 async fn handle_models(State(state): State<ServerState>) -> Json<Value> {
-    Json(json!({
-        "object": "list",
-        "data": [{"id": state.model_name, "object": "model"}]
-    }))
+    let data = state
+        .models_listed_before
+        .iter()
+        .chain(std::iter::once(&state.model_name))
+        .map(|id| json!({"id": id, "object": "model"}))
+        .collect::<Vec<_>>();
+    Json(json!({"object": "list", "data": data}))
 }
 
 async fn handle_metrics(State(state): State<ServerState>) -> String {
