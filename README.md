@@ -1028,7 +1028,7 @@ On a WSL2 host, `activate`, `rollback`, `rocm update --apply --activate`,
 stderr for `serve`) when the runtime is ROCm SDK 10.2.0, which loaded models far
 more slowly than 10.1.0 on the host it was measured on. It names
 `rocm install sdk --version 10.1.0` and `rocm runtimes activate <runtime-key>` as
-the way back; see [docs/wsl.md](docs/wsl.md).
+the way back; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md).
 
 The note's command re-activates the runtime that is already active, which moves
 the servers without moving the runtime. Re-activating the active runtime prints
