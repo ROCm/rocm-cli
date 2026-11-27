@@ -290,7 +290,8 @@ Follow these steps:
    `lemonade`. The lines mean:
 
    - `active_runtime_status`: `ready` means a managed ROCm runtime is already
-     active, so you can skip step 3.
+     active, so you can skip step 3. `unset` means no managed ROCm runtime is
+     installed yet, so continue with step 3.
    - `effective_default_engine`: `lemonade` or `vllm`. The engine decides which
      model you serve in step 4.
 
@@ -324,22 +325,33 @@ Follow these steps:
 
 5. Send the model a prompt. Pass the same model name you served:
 
+   - `lemonade`:
+
+     ```
+     rocm chat --provider local --model qwen --prompt "Explain ROCm in one sentence"
+     ```
+
+   - `vllm`:
+
+     ```
+     rocm chat --provider local --model Qwen/Qwen2.5-1.5B-Instruct --prompt "Explain ROCm in one sentence"
+     ```
+
+   To open the interactive chat instead, run `rocm chat` with no options. Chat
+   is a preview feature.
+
+6. Stop the server. List the running servers:
+
    ```
-   rocm chat --provider local --model qwen --prompt "Explain ROCm in one sentence"
+   rocm services list
    ```
 
-   On a `vllm` engine, use `--model Qwen/Qwen2.5-1.5B-Instruct`. To open the
-   interactive chat instead, run `rocm chat` with no options. Chat is a preview
-   feature.
-
-6. Stop the server with the `stop` command from the deployment summary. It has
-   this form:
+   Each server has a `stop:` line with its full command. Run that command. It
+   has this form:
 
    ```
    rocm services stop <service-id> --yes
    ```
-
-   To find the service ID later, run `rocm services list`.
 
 For other models and engine options, see
 [Configure ROCm and serve a model](#configure-rocm-and-serve-a-model) and
