@@ -375,7 +375,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let mut config = RocmCliConfig::load(&paths)?;
     // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
     // selection would actually consult it: no explicit `--engine` and no non-empty
-    // configured `default_engine`.
+    // configured `default_engine`. With an engine named, `host_gpu_shares_system_memory`
+    // below detects the gfx target itself, and only for vLLM with no memory value set.
     let host_gpu_summary = if engine
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())

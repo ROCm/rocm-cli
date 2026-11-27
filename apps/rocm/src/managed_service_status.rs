@@ -182,11 +182,12 @@ pub(crate) fn live_managed_services_for_model(
 /// This is the equality [`crate::service_launch::managed_service_reuse_refusal`]
 /// requires of a recipe before it lets a running service be reused, asked early
 /// enough for the caller to leave something out of the recipe it is about to
-/// request. The model is matched as [`live_managed_services_for_model`] matches
-/// it, leniently and without the engine's canonical id, so a near name can
-/// answer true for a service the spawn then refuses to reuse: the caller must
-/// treat true as "do not add anything", never as "this will be reused". Costs
-/// what that function costs, a liveness refresh of the registry.
+/// request. The record is found as reuse finds it ([`find_live_managed_service`]:
+/// same engine, canonical model id equal to `model_ref`), so a model whose name
+/// merely contains another's never answers true. That is exact only for an engine
+/// whose canonical id is the request ref, which holds for vLLM (`resolve_model_response`
+/// in `engines/vllm/src/process.rs`); the caller passes the request ref. Costs
+/// what [`live_managed_services_for_model`] costs, a liveness refresh of the registry.
 pub(crate) fn live_service_started_with(
     paths: &AppPaths,
     engine: &str,
@@ -197,13 +198,8 @@ pub(crate) fn live_service_started_with(
         return false;
     };
     live_managed_services_for_model(paths, engine, model_ref).is_some_and(|records| {
-        records.iter().any(|record| {
-            record.engine == engine
-                && (service_model_names_match(&record.model_ref, model_ref)
-                    || service_model_names_match(&record.canonical_model_id, model_ref))
-                && managed_service_is_live(record)
-                && record.engine_recipe_json == requested
-        })
+        find_live_managed_service(&records, engine, model_ref)
+            .is_some_and(|record| record.engine_recipe_json == requested)
     })
 }
 
@@ -1108,7 +1104,7 @@ mod tests {
             "vllm-started-with",
             "vllm",
             "qwen",
-            "qwen-canonical",
+            "qwen",
             "127.0.0.1",
             11_522,
             "managed",
@@ -1155,6 +1151,16 @@ mod tests {
         assert!(
             !live_service_started_with(&paths, "vllm", "another-model", None),
             "another model's service is not this one"
+        );
+        // A name that merely contains the served one is another model: reuse
+        // matches the canonical id exactly, so this must not count.
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen-72b", None),
+            "a longer name is not the served model"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qw", None),
+            "a shorter name is not the served model"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())

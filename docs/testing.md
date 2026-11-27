@@ -5575,8 +5575,9 @@ hardware:
 On an APU whose GPU shares system memory, `rocm serve` starts vLLM with
 `--gpu-memory-utilization 0.3` when nothing else chose a value, and prints a
 note saying so (see [vllm.md](vllm.md#apus-whose-gpu-shares-system-memory)).
-Scenarios in `features/model_serving.feature`, each reading the engine recipe
-the launch recorded, not only the screen. The test-only `ready` hook of the
+Scenarios in `features/model_serving.feature`; serve-72 to serve-74 read the
+engine recipe the launch recorded, not only the screen, and serve-75 asserts
+that the running server was reused. The test-only `ready` hook of the
 managed-launch fixture records that recipe, and the planted host root stands in
 for the GPU the mock lane does not have (`@requires-no-gpu`, Linux only):
 
@@ -5586,8 +5587,9 @@ for the GPU the mock lane does not have (`@requires-no-gpu`, Linux only):
   `--gpu-memory-utilization 0.8` is never replaced.
 - `serve-74` (`@id:serve-discrete-gpu-vllm-keeps-its-own-default`): a discrete
   GPU keeps vLLM's own reservation.
-- `serve-75` (`@id:serve-apu-reuses-a-server-started-without-the-default`): a running vLLM server started without the default is still reused
-  rather than refused over "different serve options".
+- `serve-75` (`@id:serve-apu-reuses-a-server-started-without-the-default`): a
+  running vLLM server started without the default is still reused rather than
+  refused over "different serve options".
 
 Unit coverage, including the multi-GPU exemption and the live-service
 comparison:
@@ -5595,6 +5597,7 @@ comparison:
 ```bash
 cargo test -p rocm --bin rocm the_apu_default_needs_an_apu_target_and_an_attributable_count
 cargo test -p rocm --bin rocm a_second_gpu_makes_the_apu_target_unattributable
+cargo test -p rocm --bin rocm the_apu_default_reads_the_target_from_the_summary_when_there_is_one
 cargo test -p rocm --bin rocm the_default_never_overrides_a_value_the_user_or_recipe_chose
 cargo test -p rocm --bin rocm a_live_service_counts_only_when_it_was_started_with_the_same_recipe
 ```

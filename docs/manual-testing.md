@@ -1988,7 +1988,7 @@ Windows it reads `Engine: vllm (named with --engine; no entry for vllm exists
 on this OS, so the flag changed nothing).`, and the rest of the report is the
 same as without `--engine`.
 
-### 6c. The APU memory default
+### 6f. The APU memory default
 
 Needs an APU host (for example Strix Halo, native or WSL2) with no discrete GPU
 beside it. Run without `--gpu-memory-utilization`:
@@ -2007,9 +2007,11 @@ Expected result:
   default note is printed.
 - With the first server still running, `rocm serve` for the same model reuses
   it instead of refusing over "different serve options".
-- On a host with a discrete GPU (or a second GPU), no default is applied.
+- On a host where `amd-smi` lists a second GPU (a discrete one), no default is
+  applied. If the count cannot be read (no `amd-smi`), it counts as one GPU and
+  the default is applied.
 - A model larger than 0.3 of the machine's memory fails to start under the
-  default; the out-of-memory note tells you to raise the value.
+  default; the `note:` printed with the default says a larger value is needed.
 
 ## 7. vLLM Endpoint Key Coverage
 

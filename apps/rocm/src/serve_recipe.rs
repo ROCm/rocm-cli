@@ -8,7 +8,8 @@
 //! engine's launch recipe hint: mapping the catalog's engine record onto the
 //! protocol hint, then layering the explicit `--tool-call-parser`,
 //! `--gpu-memory-utilization`, `--temperature`/`--top-p`/`--max-tokens` and
-//! `--engine-env` controls on top.
+//! `--engine-env` controls on top, and last the one default rocm-cli chooses
+//! (a smaller vLLM memory reservation on a GPU that shares system memory).
 //! `serve()` is the only production caller; nothing here calls back into it.
 
 use std::fmt::Write as _;
@@ -378,7 +379,8 @@ pub(crate) fn engine_recipe_with_shared_memory_default(
         "this GPU shares system memory, where vLLM's default reservation (most of the device's \
          memory) has crashed the engine at startup; reserving {value} instead \
          (--gpu-memory-utilization {value}). Pass `--gpu-memory-utilization <fraction greater \
-         than 0 and at most 1>` to choose another value."
+         than 0 and at most 1>` to choose another value; a model that does not fit in that \
+         share needs a larger one."
     );
     (Some(hint), Some(note))
 }
@@ -693,8 +695,9 @@ mod tests {
 
     #[test]
     fn gpu_memory_utilization_absent_without_explicit_flag() {
-        // rocm-cli ships no default: with nothing supplied the recipe is left
-        // alone, so vLLM applies its own default rather than one rocm-cli owns.
+        // This override ships no default: with nothing supplied it leaves the recipe
+        // alone. The one default rocm-cli does choose (a GPU sharing system memory)
+        // is a separate transform, `engine_recipe_with_shared_memory_default`.
         assert_eq!(parse_gpu_memory_utilization(None).unwrap(), None);
         assert!(engine_recipe_with_gpu_memory_utilization_override("vllm", None, None).is_none());
         let authored = EngineRecipeHint {
