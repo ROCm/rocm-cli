@@ -863,6 +863,11 @@ behaviour wanted, so un-ignoring it is the fix's acceptance test.
 A gap in user-observable CLI behaviour that an e2e scenario covers is tracked
 with an xfail row in `tests/e2e-cucumber/expectations.toml` instead.
 
+Two unit tests in [expectation.rs](../tests/e2e-cucumber/src/expectation.rs)
+keep that file and the feature files agreeing: every row names a scenario that
+exists, and every scenario whose comment says "Expected to FAIL" has a row. The
+[e2e README](../tests/e2e-cucumber/README.md) says where such a comment goes.
+
 ## Lemonade serving and dashboard regressions
 
 The real GPU scenarios `serve-lemonade-inference` and
@@ -6982,18 +6987,18 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   The other half of ROCMAI-912 is the advice, not the measurement: the
   `fix-24-apu-unified-memory` catalog entry, which reads `amdgpu.gttsize` and
   `ttm.pages_limit` off `/proc/cmdline` and the amdkfd SVM failures out of the
-  recent kernel log. `diagnose-94`, `diagnose-95` and `diagnose-96`
+  recent kernel log. `diagnose-95`, `diagnose-96` and `diagnose-97`
   (`@requires-os:linux`; these are Linux kernel parameters) extend the same
   planted gfx1151 host with a `/proc/cmdline`, a `/proc/meminfo` reporting
   128 GiB, and a `journalctl` of their own on the CLI's `PATH` - the kernel log
   is obtained by running a command, not by reading a file, so the host-root seam
-  cannot supply it. `diagnose-94` plants a `ttm.pages_limit` a third of what
+  cannot supply it. `diagnose-95` plants a `ttm.pages_limit` a third of what
   `amdgpu.gttsize` asks for and requires the smaller ceiling to be named, a
   consistent pair sized to installed RAM to be offered, and the BIOS carve-out
-  to stay in the notes rather than appear among the commands. `diagnose-95` is
+  to stay in the notes rather than appear among the commands. `diagnose-96` is
   the negative: the same host with a page limit that covers its aperture gets no
   finding, which is what stops the entry firing on the mere presence of the
-  parameters. `diagnose-96` plants the driver's own
+  parameters. `diagnose-97` plants the driver's own
   `SVM mapping failed, exceeds resident system memory limit` line, requires it
   to be reported as a cause, then removes it and requires the report to say the
   recent log was read rather than that the machine never failed. The `kvm_amd`
@@ -7001,7 +7006,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   a detector widened to match the bare word fails
   `an_svm_mapping_failure_is_kept_and_the_virtualisation_lines_are_not` in
   [examine/host_env.rs](../crates/rocm-core/src/examine/host_env.rs) and
-  `diagnose-95` here. **No APU runs this entry on real hardware**: no CI lane
+  `diagnose-96` here. **No APU runs this entry on real hardware**: no CI lane
   and no development machine has one whose `gttsize` and `pages_limit` are set,
   so every check of it is simulated.
 
@@ -7035,20 +7040,20 @@ plan to ask again about that path, the path quoted where the platform's shell
 needs it, so the step accepts it bare or quoted). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
 nothing, and the answer lists the model and the projector, marked as one.
 
-Scenarios `diagnose-56` and `diagnose-97` to `diagnose-99` cover the repository
+Scenarios `diagnose-56` and `diagnose-98` to `diagnose-100` cover the repository
 answer, against a stand-in hub that serves a listing and range requests over the
 same tiny GGUF fixture and counts every connection: a bare `owner/repo` sized at
 the `--context-size` given (`diagnose-56`), one row per quantization smallest
 first with the projector left out and three different weight figures showing a
-header was read per file (`diagnose-97`), a repository of fifteen quantizations
+header was read per file (`diagnose-98`), a repository of fifteen quantizations
 whose rows past the cap say why they were not read while the connection count
-shows the requests stopped (`diagnose-98`), and a repository holding only a
-projector, answered from the file list alone (`diagnose-99`).
+shows the requests stopped (`diagnose-99`), and a repository holding only a
+projector, answered from the file list alone (`diagnose-100`).
 
 Those four ask in `--json`, and plant no GPU, so on a hosted runner nothing is
 measured, every row of the table reads "not compared", and the two sentences
 only the text report carries — the heading above the table and the plan under
-it — take their other branch. `diagnose-100` is what reaches them.
+it — take their other branch. `diagnose-101` is what reaches them.
 It plants a discrete card with 8 GiB of its own beside the fifteen-quantization
 repository and reads the report as a person does: the heading's denominator has
 to be the twelve the cap let it compare rather than the fifteen rows printed,
@@ -7059,7 +7064,7 @@ reason `diagnose-81` is — the seam the card is planted through re-roots Linux
 paths only — and otherwise ungated, so the blocking mock lane runs it.
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[7-9]|diagnose-100)'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[7-9]|diagnose-101)'
 ```
 
 ## Doctor Report Preflight

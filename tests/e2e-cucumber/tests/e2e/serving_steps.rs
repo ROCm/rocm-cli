@@ -189,6 +189,7 @@ async fn serve_failure_evidence(
         .isolated_root
         .as_ref()
         .map(|root| root.path().to_owned());
+    let stop_env = world.isolate_env();
     let (stop_status, backend_evidence) =
         e2e_cucumber::lemonade_diagnostics::backend_evidence_around_stop(
             move || {
@@ -197,7 +198,7 @@ async fn serve_failure_evidence(
                     .ok_or_else(|| "the scenario has no isolated root".to_owned())
             },
             engine,
-            move || stop_services_in(isolated_root.as_deref()),
+            move || stop_services_in(isolated_root.as_deref(), &stop_env),
         )
         .await;
     serve_attempt_report(&ServeAttempt {
@@ -620,16 +621,22 @@ fn default_engine_serve_target() -> &'static str {
 /// attempt shares the device with this one, and that must be visible in the
 /// failure rather than inferred from a serve that looks broken.
 fn stop_scenario_services(world: &E2eWorld) -> String {
-    stop_services_in(world.isolated_root.as_ref().map(tempfile::TempDir::path))
+    stop_services_in(
+        world.isolated_root.as_ref().map(tempfile::TempDir::path),
+        &world.isolate_env(),
+    )
 }
 
 /// [`stop_scenario_services`] on the scenario's isolated root rather than the
 /// world, so a caller that must hand the stop to a `Send` closure (the world holds
 /// PTY handles and is not `Sync`) can capture the path alone.
-fn stop_services_in(isolated_root: Option<&std::path::Path>) -> String {
+fn stop_services_in(
+    isolated_root: Option<&std::path::Path>,
+    env: &[(&'static str, std::ffi::OsString)],
+) -> String {
     isolated_root.map_or_else(
         || "not attempted: scenario has no isolated root".to_owned(),
-        crate::stop_managed_services,
+        |root| crate::stop_managed_services(root, env),
     )
 }
 
@@ -5594,5 +5601,82 @@ async fn assert_scripted_stop_not_marked_failed(world: &mut E2eWorld) {
     assert_ne!(
         engine_state["status"], "failed",
         "engine state wrongly marked failed: {engine_state}"
+    );
+}
+
+// ── Device policies the command offers ─────────────────────────────
+
+#[when("the user serves a model under each device policy the command offers")]
+async fn user_serves_under_each_device_policy(world: &mut E2eWorld) {
+    let (help, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let policies = e2e_cucumber::help_text::advertised_values(&help, "device");
+    // A harness guard, not the contract: `serve --help` has always advertised
+    // some device policy, so an empty list means this step could not read the
+    // shape it renders today, not that the command stopped offering any. It is
+    // its own failure so a help-format change cannot be mistaken for the command
+    // refusing a policy it advertises.
+    assert!(
+        !policies.is_empty(),
+        "could not read any device policy out of `--device`'s block in `serve --help`, in \
+         either an inline `[possible values: ...]` or a `Possible values:` list of `- name:` \
+         entries. This is a harness read failure, not a verdict on the command:\n{help}"
+    );
+    let (model, engine, _) = host_serve_target();
+    // One line per policy, so a failure names which one was refused. This runs
+    // only where there is no GPU, so no serve can actually start and each of
+    // these returns promptly.
+    let mut transcript = Vec::new();
+    for policy in &policies {
+        let (stdout, stderr, rc) = crate::run_rocm(
+            world,
+            &["serve", model, "--engine", engine, "--device", policy],
+        );
+        transcript.push(format!("{policy}\t{rc}\t{stdout}{stderr}"));
+    }
+    world.cli_outputs = Some(transcript);
+}
+
+#[then("no policy is refused for being that policy")]
+async fn assert_no_policy_refused(world: &mut E2eWorld) {
+    let transcript = world
+        .cli_outputs
+        .as_ref()
+        .expect("no serve attempts recorded");
+    // On this lane every policy is refused for the same host-level reason, that
+    // the machine has no GPU, and that refusal is not what this scenario is
+    // about. What it must not find is a refusal aimed at the POLICY: a command
+    // that offers a choice and then rejects the user for making it.
+    //
+    // Matched on the refusal wording rather than on "named the policy and
+    // failed", because the ordinary host-level refusal names the policy too
+    // (`device_policy: gpu_required; no active ROCm runtime is configured`), so a
+    // name-plus-nonzero-rc rule would call every run on this lane a rejection.
+    // Three wordings are recognised: the two `parse_device_policy` in
+    // `apps/rocm/src/gpu_policy.rs` uses to turn a policy down for being that
+    // policy ("CPU mode is not a fallback path", "unsupported device policy"),
+    // and clap's own, which is what a value that is advertised but not accepted
+    // as a value looks like. Matched lowercased, which is why the literals below
+    // differ in case from the source. If a product wording moves, this falls back
+    // to the clap branch alone, still a check but no longer the one described, so
+    // a miss here means the strings need re-sourcing, not that the command
+    // stopped refusing.
+    let rejected: Vec<&String> = transcript
+        .iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("cpu mode is not a fallback path")
+                || lower.contains("unsupported device policy")
+                || (lower.contains("invalid value") && lower.contains("--device"))
+        })
+        .collect();
+    assert!(
+        rejected.is_empty(),
+        "`serve --help` offers these device policies, but the command refuses one for being \
+         what it is:\n{}",
+        rejected
+            .iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

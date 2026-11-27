@@ -790,7 +790,14 @@ fn svm_evidence(e: &Examination) -> (bool, String) {
     match hit {
         Some(line) => (
             true,
-            format!("the kernel log reports an SVM mapping failure: {line}"),
+            format!(
+                "the kernel log reports an SVM mapping failure, so a reservation was refused \
+                 against this host's memory ceiling: {line}. That ceiling is worked out from \
+                 installed RAM rather than from amdgpu.gttsize, so this line does not on its own \
+                 show that the aperture parameters caused it: a model loaded by mmap, another \
+                 process holding KFD memory, or an oversized BIOS carve-out are refused the same \
+                 way"
+            ),
         ),
         None => (
             false,
@@ -809,10 +816,20 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
 
     let gttsize = e.amdgpu_gttsize_mib;
     let pages_limit = e.ttm_pages_limit;
-    // Nothing to say about a machine with no integrated GPU that has set
-    // neither parameter and whose recent kernel log is clean: every piece of
-    // evidence this entry reasons over is absent.
-    if !e.has_apu && gttsize.is_none() && pages_limit.is_none() && e.dmesg_amdgpu_tail.is_empty() {
+    // Every conclusion this entry reaches is about the pool an integrated GPU
+    // shares with the operating system, and its plan rewrites the two kernel
+    // parameters that size that pool. A discrete card allocates from its own
+    // VRAM, so the same parameters on such a host -- set for a different
+    // machine, or left on the cmdline after the APU they were meant for -- say
+    // nothing about it, and an SVM reservation that failed there failed for
+    // another reason.
+    //
+    // Gated once, for the whole entry, rather than per arm: only the
+    // `(None, None)` arm below used to ask, so a discrete host that merely
+    // carried `amdgpu.gttsize` or `ttm.pages_limit` scored and was handed a
+    // full integrated-GPU plan. `a_discrete_host_carrying_the_parameters_is_not_given_an_apu_plan`
+    // drives each of the other three arms on such a host.
+    if !e.has_apu {
         return zero(APU_UNIFIED_MEMORY_FIX_ID, TITLE);
     }
 
@@ -846,9 +863,16 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
         }
         (Some(mib), None) => {
             score += 25;
+            // Whichever of the two figures is smaller governs, as the
+            // `(Some, Some)` arm above states outright. So "TTM's default
+            // decides instead" is only true when that default is below the
+            // aperture asked for: a conservative `gttsize` under half of RAM
+            // governs itself, and naming TTM there would send the user to
+            // change the wrong thing. Stated as the bound it is.
             evidence.push(format!(
                 "amdgpu.gttsize={mib} (MiB) is set but ttm.pages_limit is not, so TTM's default \
-                 of about half of installed RAM decides instead"
+                 of about half of installed RAM applies as well, and the smaller of the two is \
+                 what the aperture ends up being"
             ));
         }
         (None, Some(pages)) => {
@@ -859,7 +883,9 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
                 pages / TTM_PAGES_PER_MIB,
             ));
         }
-        (None, None) if e.has_apu => {
+        // No `if e.has_apu` guard: the entry returned above unless this host
+        // has one.
+        (None, None) => {
             score += 15;
             evidence.push(
                 "this machine has an integrated GPU and sets neither amdgpu.gttsize nor \
@@ -868,7 +894,6 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
                     .to_owned(),
             );
         }
-        (None, None) => {}
     }
 
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_APU_UNIFIED_MEMORY);
@@ -894,8 +919,8 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
         ));
         format!(
             "Give the integrated GPU a {} GiB aperture by setting amdgpu.gttsize={mib} together \
-             with ttm.pages_limit={pages}, and raise the BIOS carve-out as the notes say. This \
-             means editing GRUB and rebooting.",
+             with ttm.pages_limit={pages}. Leave the BIOS carve-out alone unless the notes \
+             below say otherwise. This means editing GRUB and rebooting.",
             mib / 1024
         )
     } else {
@@ -903,8 +928,9 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
         commands
             .push("# Installed RAM could not be read here, so size the pair yourself:".to_owned());
         commands.push("free -g".to_owned());
-        "Set amdgpu.gttsize and ttm.pages_limit as a consistent pair sized to installed RAM, and \
-         raise the BIOS carve-out as the notes say. This means editing GRUB and rebooting."
+        "Set amdgpu.gttsize and ttm.pages_limit as a consistent pair sized to installed RAM. \
+         Leave the BIOS carve-out alone unless the notes below say otherwise. This means \
+         editing GRUB and rebooting."
             .to_owned()
     };
     commands.extend([
@@ -928,10 +954,22 @@ pub(super) fn check_24_apu_unified_memory(e: &Examination, symptom: &str) -> Dia
                 .to_owned(),
         notes: vec![
             "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for \
-             UMA Frame Buffer Size, Dedicated Graphics Memory or GART size, and give it the \
-             largest value the board offers that still leaves the operating system enough RAM. \
-             The carve-out is what the GPU reports as its own VRAM; the GTT aperture above is \
-             memory on top of it."
+             UMA Frame Buffer Size, Dedicated Graphics Memory or GART size. Do not simply give \
+             it the largest value on offer. The carve-out is taken from the operating system's \
+             RAM for as long as the machine is on, and the host-memory ceiling an SVM \
+             reservation is checked against is worked out from the RAM that is left -- so \
+             raising it can cause the very failure this entry reports. The GTT aperture the \
+             commands above set is memory on top of the carve-out, handed out only as it is \
+             used, and it is the figure to raise for a larger model. Leave the carve-out at the \
+             smallest value the board will boot and drive the display with, commonly 512 MiB to \
+             4 GiB. The carve-out is what the GPU reports as its own VRAM."
+                .to_owned(),
+            "An SVM mapping failure in the kernel log is a reservation refused against the \
+             host-memory ceiling, which is worked out from installed RAM. Raising the aperture \
+             does not move that ceiling, so if the failure persists after this change look at \
+             what else draws on host memory: a model loaded by mmap, another process still \
+             holding KFD memory, or a BIOS carve-out large enough to shrink the RAM the ceiling \
+             is derived from."
                 .to_owned(),
             "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms \
              packages are installed, because they ship their own copy of TTM. Set the name your \
@@ -2402,6 +2440,35 @@ mod tests {
             finding.evidence
         );
 
+        // This line alone clears the match threshold, so it alone can carry a
+        // plan that rewrites the aperture -- while the ceiling the reservation
+        // was refused against is derived from installed RAM, not from
+        // `amdgpu.gttsize`. The evidence therefore has to say that the
+        // connection is not shown, and name the other things that are refused
+        // the same way, or the report asserts a cause it cannot support.
+        let svm = finding
+            .evidence
+            .iter()
+            .find(|line| line.contains("SVM mapping failure"))
+            .expect("the SVM verdict is always stated");
+        assert!(
+            svm.contains("does not on its own show"),
+            "the attribution to the aperture parameters must be qualified: {svm}"
+        );
+        for other in ["mmap", "holding KFD memory", "BIOS carve-out"] {
+            assert!(
+                svm.contains(other),
+                "the other causes that are refused the same way must be named ({other}): {svm}"
+            );
+        }
+        let notes = &finding.fix.as_ref().expect("a fix").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("Raising the aperture does not move that ceiling")),
+            "the plan must say what to look at when it does not clear the failure: {notes:?}"
+        );
+
         // Without it, the finding says where it looked and does not claim the
         // machine never failed.
         let mut clean = apu_host();
@@ -2455,6 +2522,139 @@ mod tests {
                 .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
             "{:?}",
             report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A paste that only names the two parameters is not a fault report.
+    ///
+    /// `keyword_score` keeps the top two weights and sums them, so two entries
+    /// at 25 reach `MIN_SCORE_FOR_MATCH` exactly. Both of these match the
+    /// output of `cat /proc/cmdline` -- the first command this entry's own plan
+    /// tells the user to run -- so a healthy machine whose owner pasted it
+    /// matched and was handed the GRUB-editing remediation. The same defect
+    /// `KEYWORDS_VLLM_EXTENSION_LOAD` was fixed for, and the same test shape.
+    #[test]
+    fn a_cmdline_paste_alone_cannot_reach_the_threshold_by_summing() {
+        let mut healthy = apu_host();
+        // Consistent pair and a clean log: the structural arms contribute 0, so
+        // whatever is left is the keyword table on its own.
+        healthy.amdgpu_gttsize_mib = Some(98_304);
+        healthy.ttm_pages_limit = Some(25_165_824);
+        let cmdline = "BOOT_IMAGE=/vmlinuz root=/dev/nvme0n1p2 ro quiet splash \
+                       amdgpu.gttsize=98304 ttm.pages_limit=25165824";
+        let finding = check_24_apu_unified_memory(&healthy, cmdline);
+        assert!(
+            finding.score < MIN_SCORE_FOR_MATCH,
+            "a cmdline paste from a healthy machine must not reach a verdict: {finding:?}"
+        );
+        // Beside something that names an actual failure it still carries.
+        let with_failure = format!(
+            "{cmdline}\namdgpu: SVM mapping failed, exceeds resident \
+             system memory limit"
+        );
+        assert!(
+            check_24_apu_unified_memory(&healthy, &with_failure).score >= MIN_SCORE_FOR_MATCH,
+            "the parameters must still add to a real failure report"
+        );
+    }
+
+    /// Each single-parameter arm, on the host it exists for.
+    ///
+    /// Both were driven only by the discrete-host test, which exists to prove
+    /// they score 0 there -- so neither arm's score or wording was pinned on an
+    /// APU. Driving `(Some, None)` with a `gttsize` below half of installed RAM
+    /// is what shows the message had to change: TTM's default does not "decide
+    /// instead" there, because the smaller of the two figures governs and that
+    /// is `gttsize` itself.
+    #[test]
+    fn each_single_parameter_arm_is_pinned_on_the_apu_it_is_for() {
+        // 128 GiB installed, so TTM's default is about 64 GiB; this asks for 32.
+        let mut gttsize_only = apu_host();
+        gttsize_only.amdgpu_gttsize_mib = Some(32_768);
+        let finding = check_24_apu_unified_memory(&gttsize_only, "");
+        assert_eq!(finding.score, 25, "{finding:?}");
+        let evidence = finding
+            .evidence
+            .iter()
+            .find(|line| line.contains("amdgpu.gttsize=32768"))
+            .expect("the arm states what it found");
+        assert!(
+            evidence.contains("the smaller of the two is what the aperture ends up being"),
+            "a gttsize under half of RAM governs itself, so TTM must not be named as deciding: \
+             {evidence}"
+        );
+
+        let mut pages_only = apu_host();
+        pages_only.ttm_pages_limit = Some(8_388_608);
+        let finding = check_24_apu_unified_memory(&pages_only, "");
+        assert_eq!(finding.score, 25, "{finding:?}");
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|line| line.contains("allows at most 32768 MiB")),
+            "the arm has to convert the page limit it found: {:?}",
+            finding.evidence
+        );
+    }
+
+    /// The parameters on a machine with no integrated GPU say nothing about it.
+    ///
+    /// A discrete card allocates from its own VRAM, so `amdgpu.gttsize` and
+    /// `ttm.pages_limit` left on such a host's cmdline -- copied from another
+    /// machine, or outliving the APU they were set for -- are not a fault of
+    /// its, and an SVM reservation that failed there failed for another reason.
+    /// The sibling above only exercises the host that set *neither*, which the
+    /// early return covered on its own; this drives each of the other three
+    /// `(gttsize, pages_limit)` arms, which scored on any host and handed a
+    /// discrete machine a plan to resize an aperture it does not use.
+    #[test]
+    fn a_discrete_host_carrying_the_parameters_is_not_given_an_apu_plan() {
+        let discrete = |gttsize, pages_limit| {
+            let mut e = linux_base();
+            e.has_discrete_amd = true;
+            e.has_apu = false;
+            e.system_ram_gib = Some(64.0);
+            e.amdgpu_gttsize_mib = gttsize;
+            e.ttm_pages_limit = pages_limit;
+            // The log an APU would be scored 50 for.
+            e.dmesg_amdgpu_tail = vec![
+                "amdgpu: svm_range_new: failed to reserve memory, already allocated by svm"
+                    .to_owned(),
+            ];
+            e
+        };
+        // Inconsistent pair, gttsize alone, pages_limit alone: every arm that
+        // used to score without asking whose GPU it was.
+        for (gttsize, pages_limit) in [
+            (Some(98_304), Some(1_048_576)),
+            (Some(98_304), None),
+            (None, Some(1_048_576)),
+        ] {
+            let e = discrete(gttsize, pages_limit);
+            let diagnosis = check_24_apu_unified_memory(&e, "");
+            assert_eq!(
+                diagnosis.score, 0,
+                "{gttsize:?}/{pages_limit:?}: {diagnosis:?}"
+            );
+            let report = diagnose(&e, "");
+            assert!(
+                report
+                    .matched
+                    .iter()
+                    .all(|d| d.id != crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID),
+                "{gttsize:?}/{pages_limit:?}: {:?}",
+                report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+        }
+        // The same inconsistent pair on an APU is the fault this entry exists
+        // for, so the gate above is scoping and not a blanket silence.
+        let mut apu = discrete(Some(98_304), Some(1_048_576));
+        apu.has_apu = true;
+        apu.has_discrete_amd = false;
+        assert!(
+            check_24_apu_unified_memory(&apu, "").score > 0,
+            "the gate must not silence the host this entry is for"
         );
     }
 

@@ -6992,7 +6992,7 @@ fn plant_fake_journalctl(world: &E2eWorld, kernel_log: &str) {
 /// `run_rocm_with_scenario_env` takes `command_env` rather than borrowing it, so
 /// a scenario that runs the CLI twice gets the real host on the second run
 /// unless it re-states the fixture. That is not a detail worth discovering from
-/// a mysterious result: without this, the second run of diagnose-96 described
+/// a mysterious result: without this, the second run of diagnose-98 described
 /// the runner instead of the planted APU.
 fn restate_planted_machine_env(world: &mut E2eWorld) {
     world.command_env.push((
@@ -7082,6 +7082,148 @@ async fn apu_whose_kernel_log_reports_an_svm_failure(world: &mut E2eWorld) {
 #[when("the user asks the CLI to diagnose that machine's memory limits, in machine-readable form")]
 async fn user_diagnoses_unified_memory(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["diagnose", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+// ── A device group the machine cannot name ─────────────────────────
+
+/// The remedy a device-permission failure is diagnosed with.
+const DEVICE_PERMISSION_FIX_ID: &str = "fix-4-render-group";
+
+/// A symptom that makes the device-permission cause score on any bare-metal
+/// Linux host, so the diagnosis never depends on what is wrong with the runner.
+const DEVICE_PERMISSION_SYMPTOM: &str = "unable to open /dev/kfd";
+
+/// The group `stat` prints for an owning id with no entry in the group database,
+/// which is the state a container inherits when the device's group exists on the
+/// host but not inside it.
+#[cfg(unix)]
+const UNNAMEABLE_GROUP: &str = "UNKNOWN";
+
+/// The group database the scenario's machine has: the only groups the stand-in
+/// `getent` knows, and so the only ones the diagnosis may name. Fixed rather than
+/// read from the runner's `/etc/group`, which the scenario's simulated host root
+/// does not replace and a lane without a `render` group would otherwise change.
+const PLANTED_GROUPS: [(&str, u32); 2] = [("render", 110), ("video", 44)];
+
+/// The text of a stand-in `getent` for `getent group <names>`: print the
+/// [`PLANTED_GROUPS`] entries among the names and exit `0` when every name was
+/// found, `2` otherwise, as `getent(1)` does. It answers nothing else.
+#[cfg(unix)]
+fn stand_in_getent_script() -> String {
+    use std::fmt::Write as _;
+
+    let mut script =
+        String::from("#!/bin/sh\nrc=0\nshift\nfor name in \"$@\"; do\n  case \"$name\" in\n");
+    for (name, gid) in PLANTED_GROUPS {
+        let _ = writeln!(script, "    {name}) echo '{name}:x:{gid}:' ;;");
+    }
+    script.push_str("    *) rc=2 ;;\n  esac\ndone\nexit $rc\n");
+    script
+}
+
+/// Plant a host whose `/dev/kfd` belongs to [`UNNAMEABLE_GROUP`].
+///
+/// The device is a plain file under the scenario's simulated host root, and a
+/// stand-in `stat` answers for that one path, so the premise holds on any Linux
+/// lane, GPU or not, and WSL2 included. A stand-in `getent` answers the group
+/// lookups from [`PLANTED_GROUPS`], because the diagnosis asks the group database
+/// through `PATH` and not through the host root. Every `rocm` call that follows carries
+/// the host root through `command_env`; the one made here to prove the premise
+/// carries it explicitly.
+#[cfg(unix)]
+fn plant_device_in_unnameable_group(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    let device = host.join("dev").join("kfd");
+    std::fs::create_dir_all(device.parent().expect("the device has a parent"))
+        .expect("failed to create the planted /dev");
+    std::fs::write(&device, "").expect("failed to plant the device node");
+
+    let real_stat = ["/usr/bin/stat", "/bin/stat"]
+        .into_iter()
+        .map(std::path::Path::new)
+        .find(|candidate| candidate.is_file())
+        .expect("no real `stat` binary to hand other calls to");
+    let bin = root.join("stat-stand-in");
+    std::fs::create_dir_all(&bin).expect("failed to create the stand-in directory");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("stat"),
+        e2e_cucumber::stand_in_stat::stand_in_stat_script(
+            &device,
+            "crw-rw----",
+            "root",
+            UNNAMEABLE_GROUP,
+            real_stat,
+        ),
+    )
+    .expect("failed to plant the stand-in stat");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("getent"),
+        stand_in_getent_script(),
+    )
+    .expect("failed to plant the stand-in getent");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+
+    // Prove the premise through the CLI's own inspection before relying on it:
+    // a stand-in that is not reached, or a binary that ignores the host root,
+    // would otherwise let the scenario pass on the runner's real device.
+    let host_str = host.to_str().expect("the host root is not UTF-8");
+    let path_str = path.to_str().expect("PATH is not UTF-8");
+    let (report, _, _) = crate::run_rocm_with_env(
+        world,
+        &["examine", "--json"],
+        &[("ROCM_CLI_TEST_HOST_ROOT", host_str), ("PATH", path_str)],
+    );
+    let json: serde_json::Value = serde_json::from_str(&report)
+        .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{report}"));
+    let stated = json
+        .get("kfd")
+        .and_then(|device| device.get("owner_group"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        stated,
+        Some(UNNAMEABLE_GROUP),
+        "the inspection does not report /dev/kfd as owned by group {UNNAMEABLE_GROUP:?}, so the \
+         planted premise did not take:\n{report}"
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+    world.command_env.push(("PATH", path));
+}
+
+#[cfg(not(unix))]
+fn plant_device_in_unnameable_group(_world: &mut E2eWorld) {
+    unreachable!("the stand-in stat is only reached by @requires-os:linux scenarios");
+}
+
+#[given("a machine whose GPU device belongs to a group the machine cannot name")]
+async fn machine_with_gpu_device_in_unnameable_group(world: &mut E2eWorld) {
+    plant_device_in_unnameable_group(world);
+}
+
+#[when("the user diagnoses a device-permission failure on that machine")]
+async fn user_diagnoses_device_permission_failure(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            DEVICE_PERMISSION_SYMPTOM,
+            "--top",
+            "20",
+        ],
+    );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -7242,5 +7384,37 @@ async fn assert_absent_svm_failure_is_qualified(world: &mut E2eWorld) {
         verdict.contains("recent kernel log") && verdict.contains("would not be seen here"),
         "\"no SVM failures\" and \"none in the window that was read\" are different answers, and \
          only the second one is true: {verdict}"
+    );
+}
+#[then("every group named in the remedy exists on the machine")]
+async fn assert_named_groups_exist(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause = cause_block(output, DEVICE_PERMISSION_FIX_ID).join("\n");
+    assert!(
+        !cause.is_empty(),
+        "the symptom did not produce the `{DEVICE_PERMISSION_FIX_ID}` cause:\n{output}"
+    );
+    let command = e2e_cucumber::usermod_groups::usermod_line(&cause)
+        .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{cause}"));
+    let proposed = e2e_cucumber::usermod_groups::groups_in_usermod_command(command);
+    // An empty either side makes the check below vacuous: no proposed groups
+    // means nothing is tested, and no known groups means everything is reported
+    // unknown. Both are harness read failures, not a verdict on the product.
+    assert!(
+        !proposed.is_empty(),
+        "no group names could be read out of the proposed command, so nothing was checked:\n  \
+         {command}"
+    );
+    let known: Vec<&str> = PLANTED_GROUPS.iter().map(|(name, _)| *name).collect();
+    let unknown: Vec<&String> = proposed
+        .iter()
+        .filter(|group| !known.contains(&group.as_str()))
+        .collect();
+    // A command naming a group that does not exist cannot work, and gives the
+    // user no way to see why.
+    assert!(
+        unknown.is_empty(),
+        "the remedy tells the user to join {unknown:?}, which the planted group database \
+         ({known:?}) does not hold:\n  {command}"
     );
 }

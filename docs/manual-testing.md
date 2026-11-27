@@ -2982,7 +2982,7 @@ gone, and `real-cache/keep` is still there.
 
 Needs a machine whose only AMD GPU is integrated — a Strix Halo, Strix Point,
 Phoenix or Rembrandt part. Nothing in CI has one, and the e2e scenarios
-(`diagnose-94` to `diagnose-96`) plant a simulated one, so this is the only
+(`diagnose-95` to `diagnose-97`) plant a simulated one, so this is the only
 check of `fix-24-apu-unified-memory` against real firmware and a real driver.
 
 First, read what the machine has:

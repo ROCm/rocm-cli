@@ -266,14 +266,25 @@ pub(super) const KEYWORDS_APU_UNIFIED_MEMORY: KeywordTable = &[
         30,
         "error says a host buffer is already covered by an SVM range",
     ),
+    // 20, not 25, and the pair of them is the reason. `keyword_score` keeps the
+    // top **two** weights and sums them, so two entries at 25 total exactly
+    // `MIN_SCORE_FOR_MATCH`. These two name only the parameters -- not a
+    // failure -- and both appear in the output of `cat /proc/cmdline`, which
+    // this entry's own plan tells the user to capture first. A healthy host
+    // whose owner pasted that would have matched and been handed the
+    // GRUB-editing plan. At 20 they sum to 40 and must be joined by something
+    // that names an actual failure, while still carrying a real paste over the
+    // line beside one (50 + 20 = 70). Pinned by
+    // `a_cmdline_paste_alone_cannot_reach_the_threshold_by_summing`; the same
+    // defect, and the same fix, as `KEYWORDS_VLLM_EXTENSION_LOAD` above.
     (
         r"(?:amd)?ttm\.pages_limit",
-        25,
+        20,
         "user mentions the ttm.pages_limit kernel parameter",
     ),
     (
         r"amdgpu\.gttsize",
-        25,
+        20,
         "user mentions the amdgpu.gttsize kernel parameter",
     ),
 ];
