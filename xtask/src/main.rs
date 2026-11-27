@@ -29,6 +29,7 @@ mod e2e_report;
 mod engine_stdio_client_contract;
 mod env_mutation_contract;
 mod eval_fixtures;
+mod gpu_rerun_rate;
 mod lychee;
 mod manifest;
 mod module_size;
@@ -362,6 +363,16 @@ pub(crate) enum Command {
     /// baseline, and a rise in the latest is a lower bound. Sends and files
     /// nothing. Counts are reports, not people.
     ReportRollup(report_rollup::Args),
+    /// Print the share of merge-queue entries in which a GPU lane was re-run,
+    /// against the 5% target, from the GitHub Actions API through `gh`.
+    ///
+    /// An entry is a `merge_group` run of `ci.yml`; a re-run is a job of
+    /// `e2e-selfhosted.yml` named `E2E tests (...)` that ran again on an
+    /// attempt above 1 (not skipped, and not a copy GitHub carries over from
+    /// an earlier attempt). Also prints how many entries had a GPU lane fail
+    /// on its first attempt and how many are still in progress.
+    /// Reads and prints only; never a gate, and exits 0 whatever the rate.
+    GpuRerunRate(gpu_rerun_rate::Args),
     /// Compute a mechanical GO/NO-GO release-readiness verdict and status
     /// table from the nightly build/E2E results and commits since the last
     /// release tag, plus the categorized facts an LLM narrative step drafts
@@ -526,6 +537,7 @@ fn run() -> Result<()> {
         } => e2e_report::run(&artifacts_dir, &html_out)?,
         Command::E2eQueueImport(args) => e2e_queue_import::run(&args)?,
         Command::ReportRollup(args) => report_rollup::run(&args)?,
+        Command::GpuRerunRate(args) => gpu_rerun_rate::run(&args)?,
         Command::ReleaseReadiness {
             since_tag,
             e2e_report,

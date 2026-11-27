@@ -1189,6 +1189,61 @@ cargo test -p e2e-cucumber --lib capability::tests
 cargo test -p xtask every_self_hosted_lane_declares_whether_it_has_a_gpu
 ```
 
+## GPU-lane re-runs in the merge queue
+
+The GPU lanes are not required checks, so a red one never holds the merge
+queue, and re-running one there is never needed to land a pull request. The
+target is to keep those re-runs under 5% of merge-queue entries. This measures
+it from the GitHub Actions API (needs an authenticated `gh`):
+
+```bash
+cargo xtask gpu-rerun-rate               # the last 30 days, as text
+cargo xtask gpu-rerun-rate --days 7 --json
+cargo xtask gpu-rerun-rate --repo OWNER/NAME
+```
+
+An entry is one `merge_group` run of `ci.yml`, keyed by its head commit, so a
+pull request that re-enters the queue counts again. A re-run is a job of that
+entry's `e2e-selfhosted.yml` run whose name starts with `E2E tests (` and that
+ran again on a later attempt: an attempt above 1, not skipped, and neither a
+start nor a finish time that an earlier attempt of that job has. A later
+attempt also lists every job it did not run again, keeping the original start
+time (or, for a cancelled job, the original finish time), so a "re-run failed
+jobs" counts only the lanes that failed and a re-run of the report job alone
+counts none. A lane that ran again counts whatever it concluded on that
+attempt, `cancelled` included, and so does one that was asked to run again and
+has not started yet. An entry counts once however many lanes or attempts it
+re-ran. A retry loop inside a step leaves nothing in the API and is not
+counted. Only the lanes whose `if:` in
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml) admits
+`merge_group` run in the queue, so the figure covers those lanes alone.
+
+The output also gives how many entries had a GPU lane conclude `failure` on its
+first attempt, which is what a re-run would have been for. A `cancelled` lane
+is left out there: the API reports a lane that hit its `timeout-minutes` as
+`cancelled`, the same as a lane of a group the queue dropped, so lane timeouts
+are not in that count. The output names each re-run entry with its lanes and highest attempt.
+Entries whose GPU run is still in progress are counted and reported as such: a
+re-run still to come is not in the figure yet, so the newest entries are
+provisional.
+
+The figure is strictly under the target or it is not: 1 entry in 20 is 5.0%,
+which is not under 5%. The printed percentage is rounded down to one decimal,
+so it never lands on the other side of the target from the verdict: 19 in 383
+(4.96%) prints as 4.9%.
+
+It reads and prints, exits 0 whatever the rate, and is not a CI gate. The API
+lists at most 1000 runs for a filtered query, so a window holding that many
+`merge_group` runs is refused with a request for a shorter `--days` rather than
+counted short. The definitions and the computation are in
+[gpu_rerun_rate.rs](../xtask/src/gpu_rerun_rate.rs), whose unit tests need no
+network; one of them ties the `E2E tests (` prefix to the hardware lanes in
+[e2e-selfhosted.yml](../.github/workflows/e2e-selfhosted.yml):
+
+```bash
+cargo test -p xtask gpu_rerun_rate
+```
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
