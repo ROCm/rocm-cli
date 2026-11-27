@@ -71,6 +71,17 @@ pub const UV_CACHE_DIR_ENV: &str = "UV_CACHE_DIR";
 /// choice about rocm-cli.
 pub const UV_CACHE_DIR_OVERRIDE_ENV: &str = "ROCM_CLI_UV_CACHE_DIR";
 
+/// Environment variable `uv` reads to locate the interpreters `uv python install` fetches.
+pub const UV_PYTHON_INSTALL_DIR_ENV: &str = "UV_PYTHON_INSTALL_DIR";
+
+/// Where `uv python install` puts the interpreters rocm-cli provisions.
+///
+/// Under the managed root so an isolated `ROCM_CLI_DATA_DIR` is self-contained and deleting it leaves no
+/// interpreter behind (issue #1137).
+fn managed_python_dir(root: &Path) -> PathBuf {
+    crate::runtime::normalize_runtime_path_for_host(root).join("python")
+}
+
 /// Where the `uv` cache for a spawned command comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UvCacheSource {
@@ -156,7 +167,39 @@ fn meaningful_cache_dir(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Note this colocates with the *data directory*, not with a `--prefix` install root; see
 /// the `--prefix` caveat in `docs/manual-testing.md`.
 pub fn uv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
-    uv_command_env_for_cache(uv_cache_source(paths))
+    uv_command_env_with(
+        paths,
+        uv_cache_source(paths),
+        std::env::var_os(UV_PYTHON_INSTALL_DIR_ENV).as_deref(),
+    )
+}
+
+/// [`uv_command_env`] with the ambient values passed in, so a test can take either side
+/// without touching the process environment.
+fn uv_command_env_with(
+    paths: &AppPaths,
+    cache: UvCacheSource,
+    inherited_python_dir: Option<&OsStr>,
+) -> Vec<(String, String)> {
+    let mut env = uv_command_env_for_cache(cache);
+    if let Some(dir) = resolve_uv_python_install_dir(paths, inherited_python_dir) {
+        env.push((UV_PYTHON_INSTALL_DIR_ENV.to_owned(), dir));
+    }
+    env
+}
+
+/// The managed interpreter directory to hand `uv`, or `None` when an ambient
+/// [`UV_PYTHON_INSTALL_DIR_ENV`] already names one (kept, as the cache variable is, so a
+/// deliberate choice is honoured). Blank values count as unset.
+fn resolve_uv_python_install_dir(paths: &AppPaths, inherited: Option<&OsStr>) -> Option<String> {
+    if meaningful_cache_dir(inherited).is_some() {
+        return None;
+    }
+    Some(
+        managed_python_dir(&paths.data_dir)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn uv_command_env_for_cache(cache: UvCacheSource) -> Vec<(String, String)> {
@@ -1010,6 +1053,28 @@ All installed packages are compatible
             )
         );
         assert!(env.iter().any(|(key, _)| key == "UV_HTTP_TIMEOUT"));
+    }
+
+    #[test]
+    fn command_env_hands_uv_the_python_leaf_under_the_data_dir() {
+        let paths = test_paths("/managed/root");
+        let cache = UvCacheSource::Managed(PathBuf::from("/managed/root/uv-cache"));
+        let value = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(key, _)| key == UV_PYTHON_INSTALL_DIR_ENV)
+                .map(|(_, value)| value.clone())
+        };
+        let env = uv_command_env_with(&paths, cache.clone(), None);
+        assert_eq!(
+            value(&env).map(PathBuf::from),
+            Some(PathBuf::from("/managed/root").join("python"))
+        );
+        // A blank leftover is not a choice.
+        let env = uv_command_env_with(&paths, cache.clone(), Some(OsStr::new(" ")));
+        assert!(value(&env).is_some());
+        // An ambient choice is left for uv to read itself, not overridden.
+        let env = uv_command_env_with(&paths, cache, Some(OsStr::new("/shared/python")));
+        assert_eq!(value(&env), None);
     }
 
     #[test]

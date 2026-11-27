@@ -451,6 +451,12 @@ pub(super) fn managed_python_version(requirement: PythonRequirement) -> String {
     PythonResolverEnv::from_process_env().managed_python_version(requirement)
 }
 
+/// Set on `uv python install` so it leaves no launcher or registry entry outside the data dir.
+const UV_PYTHON_INSTALL_NO_LAUNCHER_ENV: [(&str, &str); 2] = [
+    ("UV_PYTHON_INSTALL_BIN", "0"),
+    ("UV_PYTHON_INSTALL_REGISTRY", "0"),
+];
+
 fn ensure_managed_python(
     paths: &AppPaths,
     requirement: PythonRequirement,
@@ -495,8 +501,13 @@ fn ensure_managed_python(
         }
     };
     let install_output = Command::new(&uv)
+        // uv would otherwise write a launcher under `~/.local/bin` (or a Windows
+        // registry entry) that outlives the data dir. Environment variables rather
+        // than `--no-bin`/`--no-registry`, which uv before 0.8.0 rejects; older uv
+        // ignores unknown variables.
         .args(["python", "install", &version])
         .envs(uv_command_env(paths))
+        .envs(UV_PYTHON_INSTALL_NO_LAUNCHER_ENV)
         .stdin(Stdio::null())
         .stdout(install_stdio())
         .stderr(install_stdio())
@@ -2986,6 +2997,56 @@ exit 1
                 "reuse={reuse}: the save, not the lock, must be what failed: {message}"
             );
         }
+        Ok(())
+    }
+
+    /// The `uv python install` call keeps its interpreter and its launchers inside the data
+    /// dir: the install directory is `<data-dir>/python` and the launcher and registry
+    /// switches are off. Run against a fake `uv` that logs its environment.
+    #[cfg(unix)]
+    #[test]
+    fn python_install_spawn_confines_interpreter_and_launchers_to_the_data_dir() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        if std::env::var_os("UV_PYTHON_INSTALL_DIR").is_some() {
+            // An ambient choice is deliberately passed through, so there is nothing to pin.
+            return Ok(());
+        }
+        let (root, paths) = test_paths("ensure-python-install-env");
+        let python_dir = root.join("uv-python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        let log = root.join("uv.log");
+        let dir = managed_tools_dir(&paths.data_dir).join("uv").join("latest");
+        fs::create_dir_all(&dir)?;
+        let script = format!(
+            "#!/bin/sh\necho \"$* dir=$UV_PYTHON_INSTALL_DIR bin=$UV_PYTHON_INSTALL_BIN reg=$UV_PYTHON_INSTALL_REGISTRY\" >> '{log}'\nif [ \"$1 $2\" = \"python find\" ]; then echo '{python}'; fi\nexit 0\n",
+            log = log.display(),
+            python = python.display(),
+        );
+        write_fake_executable(&dir.join(rocm_core::uv_binary_name()), script)?;
+
+        let requirement = python_requirement(SourceLayout::Canonical);
+        let version = managed_python_version(requirement);
+        let result = ensure_managed_python(&paths, requirement, version.clone());
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        let expected_dir = paths.data_dir.join("python");
+        fs::remove_dir_all(root).ok();
+        assert!(result.is_ok(), "install failed");
+        let install = calls
+            .lines()
+            .find(|line| line.starts_with("python install"))
+            .unwrap_or_else(|| panic!("uv python install never ran: {calls}"));
+        assert_eq!(
+            install,
+            format!(
+                "python install {version} dir={} bin=0 reg=0",
+                expected_dir.display()
+            )
+        );
         Ok(())
     }
 
