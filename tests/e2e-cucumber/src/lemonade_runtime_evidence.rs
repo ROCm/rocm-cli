@@ -71,7 +71,7 @@ const ARCHIVE_SUBDIR: &str = "lemonade-runtime-evidence";
 
 /// The evidence for the Lemonade runtime tree at `runtime_dir`: the
 /// `lemonade backends` listing, then the files and the directory tree that
-/// decide what that listing says.
+/// may explain what that listing says.
 pub async fn collect(runtime_dir: &Path) -> String {
     let mut report = format!("Lemonade runtime tree: {}\n\n", runtime_dir.display());
     report.push_str(&lemonade_backends(runtime_dir, BACKENDS_TIMEOUT).await);
@@ -189,13 +189,14 @@ fn files(runtime_dir: &Path) -> String {
 /// What is on disk under `bin/llamacpp`, one row per entry: its path from there,
 /// its kind, and for a file its size and, on Unix, its mode. A link is named with
 /// its target and not followed, so the walk does not leave the tree below
-/// `bin/llamacpp`. No cap stops the walk, and each says in a row when it left
-/// something out: [`MAX_TREE_DIRECTORIES`] directories and [`MAX_TREE_FILES`]
-/// other entries in all, and [`MAX_FILES_PER_DIRECTORY`] other entries per
-/// directory, each with how many; [`MAX_TREE_DEPTH`] levels and
-/// [`MAX_ENTRIES_READ_PER_DIRECTORY`] reads per directory, each with that it did,
-/// not how many. The names in [`ALWAYS_LISTED_PREFIXES`] are exempt from the file
-/// caps.
+/// `bin/llamacpp` (the engine's own lookup does follow links, so a linked build
+/// directory shows here as a link and nothing more). No cap truncates silently,
+/// and each says in a row when it left something out:
+/// [`MAX_TREE_DIRECTORIES`] directories and [`MAX_TREE_FILES`] other entries in
+/// all, and [`MAX_FILES_PER_DIRECTORY`] other entries per directory, each with
+/// how many; [`MAX_TREE_DEPTH`] levels and [`MAX_ENTRIES_READ_PER_DIRECTORY`]
+/// reads per directory, each with that it did, not how many. The names in
+/// [`ALWAYS_LISTED_PREFIXES`] are exempt from the file caps.
 fn llamacpp_tree(runtime_dir: &Path) -> String {
     let root = runtime_dir.join("bin").join("llamacpp");
     let mut tree = Tree {
@@ -338,7 +339,8 @@ const fn mode_suffix(_metadata: &std::fs::Metadata) -> String {
 /// Every file directly under `runtime_dir` whose name starts `.rocm-cli-` and
 /// holds `.json`: the records the engine keeps there between installs (a failed
 /// alignment writes `.rocm-cli-alignment-failed.json`, which the steps in
-/// `tests/e2e/lemonade_install_steps.rs` hard-code as `ALIGNMENT_FAILURE_RECORD`).
+/// `tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs` hard-code as
+/// `ALIGNMENT_FAILURE_RECORD`).
 /// The pattern is wider than that one name on purpose: a record renamed or added
 /// by the engine is still attached, and so is a temporary file a crashed atomic
 /// write left beside one (`rocm-core`'s `write_file_atomically`, in
@@ -406,12 +408,24 @@ fn section(report: &mut String, path: &Path) {
 }
 
 /// The first [`MAX_BYTES`] of the regular file at `path`. Anything else, a link
-/// included, is refused rather than opened, so the report cannot carry a file
-/// from outside the tree and a pipe cannot stall it. The kind is read just before
-/// the open, so a path swapped for a link in between is not guarded against.
+/// included, is refused rather than opened, so the report does not carry a file
+/// that `path` itself links to and a pipe cannot stall it. Only the last path
+/// component is checked, so a link in a parent directory is followed, and the
+/// kind is read just before the open, so a path swapped for a link in between is
+/// not guarded against.
 fn read_clamped(path: &Path) -> std::io::Result<String> {
-    if !std::fs::symlink_metadata(path)?.is_file() {
-        return Err(std::io::Error::other("not a regular file: not opened"));
+    let file_type = std::fs::symlink_metadata(path)?.file_type();
+    if !file_type.is_file() {
+        let kind = if file_type.is_symlink() {
+            "link"
+        } else if file_type.is_dir() {
+            "directory"
+        } else {
+            "other"
+        };
+        return Err(std::io::Error::other(format!(
+            "not a regular file: not opened ({kind})"
+        )));
     }
     let mut body = Vec::new();
     std::fs::File::open(path)?
@@ -642,7 +656,7 @@ mod tests {
     #[test]
     fn a_directory_with_more_entries_than_are_read_says_so() {
         let root = tempfile::tempdir().unwrap();
-        for index in 0..(MAX_ENTRIES_READ_PER_DIRECTORY + 3) {
+        for index in 0..=MAX_ENTRIES_READ_PER_DIRECTORY {
             write(root.path(), &format!("bin/llamacpp/f{index:05}"), "");
         }
         let tree = llamacpp_tree(root.path());
@@ -768,10 +782,49 @@ mod tests {
         .unwrap();
         let report = records(root.path());
         assert!(
-            report.contains("not a regular file: not opened"),
+            report.contains("not a regular file: not opened (link)"),
             "{report}"
         );
         assert!(!report.contains("outside the tree"), "{report}");
+    }
+
+    /// Exactly as many entries as are read is not a cut-off, and says nothing.
+    #[test]
+    fn a_directory_with_exactly_the_entries_read_says_nothing_about_a_cut_off() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..MAX_ENTRIES_READ_PER_DIRECTORY {
+            write(root.path(), &format!("bin/llamacpp/f{index:05}"), "");
+        }
+        let tree = llamacpp_tree(root.path());
+        assert!(!tree.contains("entries were read"), "{tree}");
+    }
+
+    /// A pipe in place of a file must not stall the failure report, which is what
+    /// opening it would do: the guard refuses anything that is not a regular
+    /// file, not only links. The read runs on its own thread so that a broken
+    /// guard fails the test instead of hanging it.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_in_place_of_a_record_is_refused_not_opened() {
+        let root = tempfile::tempdir().unwrap();
+        let pipe = root.path().join(".rocm-cli-alignment-failed.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        let runtime_dir = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(records(&runtime_dir));
+        });
+        let report = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("reading a pipe as a record stalled");
+        assert!(
+            report.contains("not a regular file: not opened (other)"),
+            "{report}"
+        );
     }
 
     #[test]
