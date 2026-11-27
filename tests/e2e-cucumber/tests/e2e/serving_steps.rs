@@ -1615,24 +1615,25 @@ async fn setup_background_model(world: &mut E2eWorld) {
     // never assert on real generation — only that a served model answers. So it
     // doesn't need a real GPU serve: on a host WITH an AMD GPU we still exercise
     // the real `rocm serve --managed` path (extra real coverage where hardware
-    // exists), but on a no-GPU host we back it with the in-process MockServer +
-    // a planted managed-service record. This lets the scenarios drop
+    // exists), but where `backs_background_model_with_mock` holds we back it with
+    // the in-process MockServer + a planted managed-service record. This lets the scenarios drop
     // `@requires-gpu` and run on the GitHub-hosted mock lane every PR, with no
     // coverage loss. Real inference stays covered by the `@requires-gpu`
     // serve-*-inference scenarios.
     //
     // The same holds on a GPU lane whose pre-warm recorded the serving engine as
-    // not applicable (an unpinned nightly SDK with no vLLM build): a real serve
-    // can only fail on the missing engine, so the mock backs it there too
-    // (`HostCapability::backs_background_model_with_mock`).
-    if !e2e_cucumber::capability::host_capability().backs_background_model_with_mock() {
-        setup_gpu_model(world).await;
-    } else {
+    // not applicable: a real serve can only fail on the missing engine, so the
+    // mock backs it there too (`HostCapability::backs_background_model_with_mock`,
+    // which says when). `expectation::resolve` then ignores engine-keyed xfail
+    // rows for these scenarios, since the real engine never runs.
+    if e2e_cucumber::capability::host_capability().backs_background_model_with_mock() {
         let mock = MockServer::start("TestModel/E2E-1B").await;
         world.endpoint = Some(mock.base_url());
         world.model_name = Some("TestModel/E2E-1B".to_string());
         world.mock = Some(mock);
         world.register_mock_service();
+    } else {
+        setup_gpu_model(world).await;
     }
 }
 

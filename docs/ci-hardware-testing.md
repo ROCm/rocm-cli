@@ -869,10 +869,11 @@ Two failures of the pre-warm's installs are not the lane's failure:
   first attempt.
 - **vLLM refusing an unpinned nightly SDK** (`has no static build pin`). The pre-warm
   records the reason in `e2e-engine-not-applicable.txt` in the runtimes directory,
-  and the suite reports the scenarios that serve with vLLM (serve, bench and chat scenarios, and any that pin the engine) as not applicable
-  instead of running each into the refusal. A pinned nightly, the release channel
+  and the suite reports the `@requires-gpu` scenarios that serve with vLLM (serve, bench and chat scenarios, and any that pin the engine) as not applicable
+  instead of running each into the refusal; the chat scenarios without `@requires-gpu` (chat-06, chat-07) run against the mock server and their vLLM-keyed expected-failure rows are ignored. A pinned nightly, the release channel
   and every other engine's failure stay fatal. This is temporary: remove it, the
-  marker and its reader in the harness once vLLM wheels for the 10.3 SDK exist and
+  marker and its readers in the harness (`resolve` and
+  `backs_background_model_with_mock`) once vLLM wheels for the 10.3 SDK exist and
   the discover table in
   [`discover_builds.rs`](../engines/vllm/src/discover_builds.rs) has a 10.3 row.
 
