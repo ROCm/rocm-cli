@@ -207,3 +207,5 @@ Do **not** open a public GitHub Issue for security vulnerabilities. See [SECURIT
 ## License
 
 By contributing you agree that your contributions will be licensed under the [MIT License](https://github.com/ROCm/rocm-cli/blob/main/LICENSE.TXT).
+
+<!-- probe: write-path check, safe to discard -->
