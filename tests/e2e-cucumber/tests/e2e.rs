@@ -1531,9 +1531,15 @@ fn inference_timeout_for(world: &E2eWorld) -> u64 {
 /// listing several models is not chatted with at its first entry.
 ///
 /// `tools` is merged into the request body for the tool-definitions scenario.
-/// The exchange itself lives in [`e2e_cucumber::chat_request`], which runs it
-/// off the scenario-polling thread so a step blocked on a `rocm` command
-/// elsewhere cannot time it out.
+/// `thinking` says whether a reasoning model may think first; see
+/// [`e2e_cucumber::chat_request::Thinking`]. The exchange itself lives in
+/// [`e2e_cucumber::chat_request`], which runs it off the scenario-polling thread
+/// so a step blocked on a `rocm` command elsewhere cannot time it out.
+///
+/// When every attempt fails, the panic carries the scenario's service log and
+/// the router's `/health` next to the attempts' diagnostics (see
+/// [`e2e_cucumber::serve_log::chat_failure_evidence`]): the log is archived
+/// here because teardown stops the service and deletes it.
 ///
 /// Retries once on a TRANSPORT failure of either request, and only for a
 /// scenario expected to PASS — the same rule the serve relaunch uses. The FIRST
@@ -1548,6 +1554,7 @@ pub async fn request_chat_completion(
     world: &mut E2eWorld,
     prompt: &str,
     tools: Option<serde_json::Value>,
+    thinking: e2e_cucumber::chat_request::Thinking,
 ) -> serde_json::Value {
     let endpoint = world.endpoint.clone().expect("no endpoint configured");
     // Only the FIRST attempt gets this scenario's full (possibly `@serve-timeout`
@@ -1565,18 +1572,47 @@ pub async fn request_chat_completion(
     } else {
         vec![first, retry]
     };
-    e2e_cucumber::chat_request::request_chat_completion(
+    let failure = match e2e_cucumber::chat_request::request_chat_completion(
         &endpoint,
         world.model_name.as_deref(),
         prompt,
         tools,
+        thinking,
         &budgets,
     )
     .await
+    {
+        Ok(response) => return response,
+        Err(failure) => failure,
+    };
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .map(|root| root.path().join("data").join("services"))
+        .unwrap_or_default();
+    let evidence = e2e_cucumber::serve_log::chat_failure_evidence(
+        &endpoint,
+        &services_dir,
+        &results_path(),
+        world.current_scenario.as_deref().unwrap_or("scenario"),
+    )
+    .await;
+    panic!("{failure}\n{evidence}");
 }
 
+/// The chat of the scenarios that only assert a reply from the right model.
+///
+/// It asks for no thinking, which on a small reasoning model is what keeps the
+/// reply inside the inference budget (see
+/// [`e2e_cucumber::chat_request::Thinking`]).
 pub async fn send_chat(world: &mut E2eWorld) {
-    let response = request_chat_completion(world, "Hello", None).await;
+    let response = request_chat_completion(
+        world,
+        "Hello",
+        None,
+        e2e_cucumber::chat_request::Thinking::Off,
+    )
+    .await;
     world.chat_response = Some(response);
 }
 
