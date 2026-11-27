@@ -362,13 +362,103 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
     report
 }
 
+/// Whether a loopback bind on `port` succeeds right now.
+///
+/// A refused `connect()` only proves nothing is *listening*; a socket that is
+/// bound but not listening refuses connections yet still fails every later
+/// `bind`, which is what a harness step that claims the port needs. Binding is
+/// the check that matches that use. The probe listener is dropped before
+/// returning.
+pub fn port_is_bindable(port: u16) -> std::io::Result<()> {
+    std::net::TcpListener::bind(("127.0.0.1", port)).map(drop)
+}
+
+/// Text naming whatever holds loopback TCP `port`, for a failure message.
+///
+/// Runs `ss` (every socket state, so a bound-but-not-listening or lingering
+/// socket shows too) and `fuser -v`, and reports each tool's output or why it
+/// could not run. Best-effort and Linux-only; elsewhere it says so.
+pub fn port_holders(port: u16) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let ss = run_probe("ss", &["-tanp", &format!("sport = :{port}")]);
+        let fuser = run_probe("fuser", &["-v", &format!("{port}/tcp")]);
+        format!("ss -tanp 'sport = :{port}':\n{ss}\nfuser -v {port}/tcp:\n{fuser}")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("no holder listing for port {port} on this platform")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_probe(program: &str, args: &[&str]) -> String {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => {
+            // `fuser -v` prints its table on stderr, `ss` on stdout.
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let text = text.trim_end();
+            if text.is_empty() {
+                format!("(no output, {})", out.status)
+            } else {
+                text.to_string()
+            }
+        }
+        Err(e) => format!("(could not run {program}: {e})"),
+    }
+}
+
+/// Wait until loopback `port` both refuses connects and can be bound, or
+/// `budget` runs out.
+///
+/// `probe` answers one poll: `(connect_was_refused, bind_result)`. `retry` runs
+/// between polls (the harness uses it to kill listeners again). Returns `None`
+/// once the port is usable, or a note naming what was still wrong and who holds
+/// the port ([`port_holders`]) when the budget ran out. Never fails: a serve that
+/// follows reports the note in its own failure evidence.
+pub async fn wait_for_port_usable<P, Fut, R>(
+    port: u16,
+    budget: Duration,
+    poll: Duration,
+    mut probe: P,
+    mut retry: R,
+) -> Option<String>
+where
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = (bool, std::io::Result<()>)>,
+    R: FnMut(),
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let (refused, bindable) = probe().await;
+        if refused && bindable.is_ok() {
+            return None;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Some(format!(
+                "port {port} still unavailable after {budget:?} (connect refused: {refused}, bind: {bindable:?})\n{}",
+                port_holders(port)
+            ));
+        }
+        retry();
+        tokio::time::sleep(poll).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
-        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_engine,
-        serve_attempt_report, serve_cli_budget, service_log_tail, slugify, tail_lines,
+        engine_from_serve_args, parse_log_path, port_is_bindable, read_clamped, read_clamped_file,
+        reported_engine, serve_attempt_report, serve_cli_budget, service_log_tail, slugify,
+        tail_lines, wait_for_port_usable,
     };
+    // Only the Linux-gated test below calls it; the listing is Linux-only.
+    #[cfg(target_os = "linux")]
+    use super::port_holders;
 
     #[test]
     fn cli_budget_outlasts_the_readiness_timeout_by_a_bounded_margin() {
@@ -716,5 +806,74 @@ managed service launched
         }
         // A silent stream is a finding, so it is labelled rather than dropped.
         assert!(report.contains("stderr: (empty)"), "{report}");
+    }
+
+    #[test]
+    fn bindable_check_reports_a_held_port() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(port_is_bindable(port).is_err());
+        drop(held);
+        assert!(port_is_bindable(port).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn port_holders_lists_the_socket_holding_the_port() {
+        // Skip where `ss` is absent: the listing then holds only the failure text.
+        if std::process::Command::new("ss").arg("-V").output().is_err() {
+            return;
+        }
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let text = port_holders(port);
+        let ss_section = text.split("fuser -v").next().unwrap();
+        assert!(ss_section.contains("LISTEN"), "{text}");
+        assert!(ss_section.contains(&format!("127.0.0.1:{port}")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_port_usable_waits_out_a_bound_but_refused_port() {
+        let polls = std::cell::Cell::new(0u32);
+        let retries = std::cell::Cell::new(0u32);
+        let note = wait_for_port_usable(
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                polls.set(polls.get() + 1);
+                // Refused throughout, but bind fails for the first 3 polls.
+                let bind = if polls.get() <= 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+                } else {
+                    Ok(())
+                };
+                std::future::ready((true, bind))
+            },
+            || retries.set(retries.get() + 1),
+        )
+        .await;
+        assert_eq!(note, None);
+        assert_eq!((polls.get(), retries.get()), (4, 3));
+    }
+
+    #[tokio::test]
+    async fn wait_for_port_usable_reports_the_port_when_the_budget_runs_out() {
+        let note = wait_for_port_usable(
+            1,
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            || {
+                std::future::ready((
+                    true,
+                    Err(std::io::Error::from(std::io::ErrorKind::AddrInUse)),
+                ))
+            },
+            || {},
+        )
+        .await
+        .expect("a port that never frees must produce a note");
+        assert!(note.contains("port 1 still unavailable"), "{note}");
+        assert!(note.contains("AddrInUse"), "{note}");
     }
 }

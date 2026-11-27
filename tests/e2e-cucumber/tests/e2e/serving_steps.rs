@@ -318,7 +318,8 @@ const ASSISTANT_PORT: u16 = 8001;
 /// Polls until nothing answers on the port (bounded), killing any listener.
 ///
 /// Returns a one-line description of the device state the next serve starts on
-/// (see [`wait_for_free_vram`]). Callers that only need the reset can ignore it;
+/// (see [`wait_for_free_vram`]), followed by a note naming the port's holder when
+/// the port never became usable. Callers that only need the reset can ignore it;
 /// a serve that then fails to become ready reports it, because "the previous
 /// engine had not released the GPU yet" is otherwise invisible in the log.
 async fn ensure_serve_port_free() -> String {
@@ -334,18 +335,36 @@ async fn ensure_serve_port_free() -> String {
     // Vulkan (EAI-7052) and starves the vLLM serve under test; no scenario needs it.
     kill_listeners_on_port(SERVE_PORT);
     kill_listeners_on_port(ASSISTANT_PORT);
-    let deadline = Instant::now() + Duration::from_mins(1);
-    loop {
-        // TcpStream connect succeeds only while something holds the port.
-        let free = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
-            .await
-            .is_err();
-        if free || Instant::now() >= deadline {
-            break;
-        }
-        kill_listeners_on_port(SERVE_PORT);
-        kill_listeners_on_port(ASSISTANT_PORT);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait longer than Linux's 60 s TIME_WAIT. Observed locally with `lemond`
+    // 2026.44.1 and 2026.45.3: after a request it closed first and a SIGKILL,
+    // `ss -tan` showed a TIME-WAIT socket on the port with no process behind
+    // it, connects were refused (so a connect-only check called the port
+    // free), `bind` failed with EADDRINUSE even with SO_REUSEADDR, and
+    // `fuser`/`lsof` listed nothing. The likely mechanism, not checked in
+    // `lemond` itself, is that the TIME_WAIT bucket inherits the dead
+    // listener's lack of SO_REUSEADDR. A refused connect alone proves only that
+    // nothing listens, so require a successful bind as well.
+    let port_note = e2e_cucumber::serve_log::wait_for_port_usable(
+        SERVE_PORT,
+        Duration::from_secs(90),
+        Duration::from_secs(2),
+        || async {
+            let refused = tokio::net::TcpStream::connect(("127.0.0.1", SERVE_PORT))
+                .await
+                .is_err();
+            (
+                refused,
+                e2e_cucumber::serve_log::port_is_bindable(SERVE_PORT),
+            )
+        },
+        || {
+            kill_listeners_on_port(SERVE_PORT);
+            kill_listeners_on_port(ASSISTANT_PORT);
+        },
+    )
+    .await;
+    if let Some(note) = &port_note {
+        eprintln!("{note}");
     }
     // The port closing does NOT mean the prior serve's VRAM is back: a killed
     // vLLM releases ~tens of GiB of device memory only as the process fully
@@ -356,7 +375,11 @@ async fn ensure_serve_port_free() -> String {
     // request, so the next serve dies with "Free memory ... less than desired GPU
     // memory utilization" (engine core init failed). Wait for the device to
     // actually drain before returning.
-    wait_for_free_vram().await
+    let device_state = wait_for_free_vram().await;
+    match port_note {
+        None => device_state,
+        Some(note) => format!("{device_state}\n{note}"),
+    }
 }
 
 /// How long to wait for a stopped engine to hand its device memory back.

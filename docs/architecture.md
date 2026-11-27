@@ -840,7 +840,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | [`src/reader_failure.rs`](../tests/e2e-cucumber/src/reader_failure.rs) | Failure state shared between a background terminal reader and its waiters. | flat |
 | [`src/runtime_root.rs`](../tests/e2e-cucumber/src/runtime_root.rs) | `check_runtime_root_not_nested`: judges the active runtime folder `rocm examine` prints and rejects a doubly nested `runtimes/wheel` path. | flat |
 | [`src/send_until.rs`](../tests/e2e-cucumber/src/send_until.rs) | Retry loop for sending an idempotent terminal input until its effect appears. | flat |
-| [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail. | flat |
+| [`src/serve_log.rs`](../tests/e2e-cucumber/src/serve_log.rs) | Reads back a managed serve's service log and builds the failure report for a serve step, quoting the log tail; also the serve-port wait (`wait_for_port_usable`) and holder listing (`port_holders`) the harness uses when 11435 is not bindable. | flat |
 | [`src/serve_plan.rs`](../tests/e2e-cucumber/src/serve_plan.rs) | Explains why a `rocm serve` run printed no `resolved model:` line by keeping stderr's refusal alongside stdout. | flat |
 | [`src/shared_runtime.rs`](../tests/e2e-cucumber/src/shared_runtime.rs) | Picks which runtime a scenario activates out of the shared pre-warmed runtime tree, which may hold more than one. | flat |
 | [`src/shell_quote.rs`](../tests/e2e-cucumber/src/shell_quote.rs) | `single_quoted`, the one shell-quoting helper the stand-in script writers (`stand_in_stat`, `stand_in_uname`) share, with unit tests for a quote, a space and shell metacharacters. | flat |
