@@ -248,7 +248,8 @@ serve_timeout_secs = 600
 # `@requires-bare-metal` and `@requires-engine:lemonade`, so on Linux it only runs
 # where lemonade is the effective engine, as on the rows above. The cause is not
 # established; the failure now carries `lemonade backends`, the pin file, the
-# ROCm build version files and the install log (ROCMAI-1318). Not `flaky`: it is
+# ROCm build version files, the install log, the `bin/llamacpp` directory tree and
+# the engine's `.rocm-cli-*.json` records (ROCMAI-1318). Not `flaky`: it is
 # deterministic, so a pass is a stale row to delete.
 [["runtime-lemonade-backend-alignment-failure-remembered"]]
 when = { effective_engine = "lemonade", os = "linux" }
