@@ -10761,6 +10761,13 @@ fi
             ),
             (
                 "windows-release",
+                "Wheel builder self-test",
+                &["build_wheel.py --self-test"],
+                &[],
+                HEAVY,
+            ),
+            (
+                "windows-release",
                 "Pinned key consistency check",
                 &["cargo xtask verify-pinned-keys"],
                 &[],

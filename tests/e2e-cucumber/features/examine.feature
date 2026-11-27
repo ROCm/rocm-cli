@@ -1051,3 +1051,32 @@ Feature: GPU detection and system inspection
     Then the inspection reports the GPU as unsupported by the official stack
     And the inspection does not say a Vulkan driver is missing
     And the inspection asks for vulkaninfo to confirm
+
+  # The help's own worked examples are the first thing a new user copies, so a
+  # model named there has to be one this CLI can serve. The check accepts either
+  # form the README documents, a name the model listing knows or an explicit
+  # `owner/repo` reference, so it does not prescribe which model the examples use.
+  #
+  # The help used to name a model the CLI could not resolve; #296 (EAI-8011)
+  # swapped it for a catalog alias. This guards that fix.
+  #
+  # Known limit: the scenario reads only `rocm help` and `rocm serve --help`, and
+  # checks the `rocm serve <model>` examples in them, so a model named in another
+  # command's examples (a `rocm chat` example, say) is not checked here.
+  @id:examine-help-serve-example-names-a-resolvable-model
+  Scenario: examine-69 - Every model the help offers as an example is one the CLI can resolve
+    When the user reads the serve examples the help offers
+    Then every model named there is one the CLI can resolve
+
+  # Running the CLI with no subcommand and running its dashboard command open two
+  # different screens. When the help describes them as one, a reader cannot learn
+  # what the plain command does or that there is anything else to reach.
+  #
+  # The help used to call the plain command the dashboard; #296 (EAI-8011) now
+  # describes it as the launcher. This guards that fix, and reads the one sentence
+  # about the plain command rather than the whole help, so a mention of the
+  # dashboard elsewhere in it does not trip the check.
+  @id:examine-help-describes-the-default-command
+  Scenario: examine-70 - The help tells the two ways of opening a screen apart
+    When the user asks for help
+    Then running the CLI with no subcommand is not described as the dashboard command

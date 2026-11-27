@@ -2226,6 +2226,19 @@ Expected result:
   (scenario `lifecycle-34`).
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change and
   fish completions stay too, and they do (scenario `lifecycle-25`).
+- Run from a Python environment (a `pyvenv.cfg` at the environment's root, or a
+  `RECORD` in its `site-packages` listing the executable, as `pip`, `pipx` and
+  `uv tool` leave), `rocm uninstall --dry-run` says `binary removal skipped
+  because <path> sits in a Python environment` and names `pip uninstall
+  rocm-cli`, `pipx uninstall rocm-cli` and `uv tool uninstall rocm-cli`. No
+  binary and no `PATH` change is planned, and `--force-dev-binaries` does not
+  change that (scenario `uninstall-26`). The same binary in an ordinary install
+  folder is still planned for removal (scenario `uninstall-27`). To check it by
+  hand, `python -m venv /tmp/v`, copy `rocm` and `rocmd` into `/tmp/v/bin`
+  (`Scripts` on Windows) and run
+  `/tmp/v/bin/rocm uninstall --dry-run --keep-config --keep-data --keep-cache`.
+  A Windows `pipx` or `uv tool` launcher copied to a folder with no Python
+  environment around it is not recognised ([release-trust.md](release-trust.md)).
 - On a home folder ROCm CLI never touched, the dry run says
   `Nothing managed by rocm-cli would be removed.` and leaves the home folder
   empty (scenario `uninstall-06`): run

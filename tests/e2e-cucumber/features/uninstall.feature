@@ -330,3 +330,26 @@ Feature: Uninstall
     And the refusal says nothing was removed
     And the config folder is still there
     And the link in the home folder is still there
+
+  # `pip install rocm-cli` puts the real `rocm` and `rocmd` in the Python
+  # environment's script folder and records them in the wheel's RECORD. Removing
+  # them behind pip's back leaves pip reporting a package it can no longer
+  # remove, so a binary run from such an environment is left to its package
+  # manager; the same binary in an ordinary install folder is still removed. Both
+  # are dry runs from a copy of the binary under test, so nothing is removed and
+  # the copy is checked to still be there. Windows `pipx` and `uv tool` copy the
+  # launcher into a folder with no Python environment around it, which this
+  # cannot tell from an ordinary install; docs/release-trust.md says so.
+  @id:uninstall-leaves-python-installed-binaries-to-pip
+  Scenario: uninstall-26 - A binary inside a Python environment is left to its package manager
+    Given a copy of the CLI inside a Python virtual environment
+    When the user dry-runs an uninstall from the copy in the Python environment
+    Then the uninstall leaves the binaries to the package manager and names its commands
+    And the copy in the Python environment is still there
+
+  @id:uninstall-still-plans-an-ordinary-install-for-removal
+  Scenario: uninstall-27 - A binary in an ordinary install folder is still planned for removal
+    Given a copy of the CLI in a plain install folder with no Python environment around it
+    When the user dry-runs an uninstall from the copy in the plain install folder
+    Then the uninstall plans to remove the binary
+    And the copy in the plain install folder is still there

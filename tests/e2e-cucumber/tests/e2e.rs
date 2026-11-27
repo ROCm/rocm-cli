@@ -55,6 +55,7 @@ mod e2e {
     pub mod symptom_file_steps;
     pub mod therock_steps;
     pub mod tui_driver;
+    pub mod uninstall_python_steps;
     pub mod uninstall_steps;
     pub mod update_steps;
     pub mod vllm_tensorizer_steps;
@@ -106,6 +107,13 @@ pub struct E2eWorld {
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
+    /// Output of a SECOND command, for a scenario whose point is that two commands
+    /// agree: the human `examine` report against its `--json` form, help examples
+    /// against the model listing. Usually that command's stdout.
+    ///
+    /// Keep `cli_stderr` for what a command wrote to stderr: a step that reads a
+    /// second command's stdout out of it looks like a claim about stderr.
+    pub cli_other_output: Option<String>,
     pub cli_rc: Option<i32>,
     /// One entry per `rocm serve` run a scenario made, with the stderr and exit
     /// code `cli_outputs` has no room for (see `e2e_cucumber::serve_plan`).
@@ -443,6 +451,7 @@ impl Default for E2eWorld {
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
+            cli_other_output: None,
             cli_rc: None,
             serve_runs: None,
             cli_elapsed: None,
@@ -876,7 +885,8 @@ impl Drop for E2eWorld {
         // hence the returned status is discarded here. The serve retry, where a
         // failed stop changes the next attempt's meaning, does read it.
         if let Some(root) = &self.isolated_root {
-            stop_managed_services(root.path());
+            let env = self.isolate_env();
+            stop_managed_services(root.path(), &env);
         }
         // A scenario that made the audit directory read-only must give it back
         // before the TempDir below tries to remove it, even if a step panicked.
@@ -904,7 +914,10 @@ impl Drop for E2eWorld {
 /// record existed yet, or the stop failed, the next attempt runs against a device
 /// the previous one still owns, and the run must say so rather than let it look
 /// like a genuinely broken serve.
-fn stop_managed_services(root: &std::path::Path) -> String {
+fn stop_managed_services(
+    root: &std::path::Path,
+    env: &[(&'static str, std::ffi::OsString)],
+) -> String {
     let services_dir = root.join("data").join("services");
     let entries = match std::fs::read_dir(&services_dir) {
         Ok(entries) => entries,
@@ -936,9 +949,14 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         }
         let mut cmd = std::process::Command::new(rocm_binary());
         cmd.args(["services", "stop", service_id, "--yes"]);
-        cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
-        cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
-        cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
+        // The scenario's own environment (`E2eWorld::isolate_env`), not a rebuilt
+        // subset of it: the cache directory in particular is not always
+        // `root/cache` (a CI lane redirects it to a shared dir, see `cache_dir_for`),
+        // so a hand-rolled copy runs the stop against a different cache
+        // directory than the scenario used.
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         outcomes.push(match cmd.output() {
             Ok(out) if out.status.success() => format!("{service_id}: stopped"),
             Ok(out) => format!(

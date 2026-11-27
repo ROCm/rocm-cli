@@ -157,10 +157,15 @@ select scenarios with the gating kept.
 
 ## Tags and per-scenario expectations
 
-There is no tag-filter tiering. Each CI job runs the **whole** suite
-(`cargo xtask e2e`, no `-t` filter); the harness resolves every scenario to
-**pass / xfail / skip** at runtime from its capability tags plus the known-bug
-matrix, then reconciles the actual result against that expectation.
+Each CI job runs the suite as a whole (`cargo xtask e2e`, no `-t` filter); the
+harness resolves every scenario to **pass / xfail / skip** at runtime from its
+capability tags plus the known-bug matrix, then reconciles the actual result
+against that expectation.
+
+Four tags tier the suite at runtime rather than by a `-t` filter, so a scenario
+carrying one runs only where its opt-in is set: `@nightly` (`E2E_INCLUDE_NIGHTLY`),
+`@lifecycle` (`E2E_INCLUDE_LIFECYCLE`), `@requires-docker` (`E2E_INCLUDE_DOCKER`)
+and `@merge-queue` (`E2E_MERGE_QUEUE`).
 
 ### Naming
 
@@ -196,6 +201,8 @@ Scenarios carry stable-id and capability tags:
 | `@requires-multi-gpu` | Premise is a job that can reach **more than one** AMD GPU. The gate counts the GPUs the kernel exposes to this job (its KFD GPU nodes; the amdgpu DRM cards only as a hedge where KFD lists no GPU node or its topology cannot be read, and on that fallback the count can describe the whole host), not the cards on the PCI bus, which on a shared runner can list more than the job may use. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, a host whose kernel exposes no KFD GPU node or amdgpu DRM card (WSL, which reaches its GPU through the `/dev/dxg` passthrough instead, so counts 0 even where `@requires-gpu` passes), and any host whose count could not be read (non-Linux, or a Linux host where `/dev/kfd` exists but neither its KFD topology nor the DRM class can be read). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which off WSL mirrors the product's KFD+DRM rule (on WSL the product instead counts one device when the ROCm passthrough is ready, where the probe counts 0) rather than counting `amd-smi list` — the gate must ask the same "how many devices does the kernel expose" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
+| `@requires-no-gpu` | Premise is a host with no usable AMD GPU (e.g. a GPU-required serve that must fail fast). The inverse of `@requires-gpu`: resolves to **skip** on a host that has one, so it runs on the GitHub-hosted mock job. |
+| `@requires-gfx-target` | Needs a detected chip name but not the GPU itself (e.g. a resolver dry-run). Resolves to **skip** where the probe found no gfx target; unlike `@requires-gpu` it can run on a WSL host whose GPU passthrough is not ready. |
 | `@requires-dir-permissions` | Premise is a directory that refuses new files once its write bits are cleared. Resolves to **skip** for a user those bits do not bind: root, which is what the self-hosted WSL2 guest runs the suite as. The capability probe's `dir_permissions_bind` clears the write bits on a directory under the temp root and tries to create a file in it. `@requires-os:linux` cannot express this: root on Linux is still `linux`, and the scenario would pass without testing anything. Always **skip** on Windows, which has no such bits. |
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
@@ -204,6 +211,8 @@ Scenarios carry stable-id and capability tags:
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). A matching xfail row's `serve_timeout_secs` overrides it, even with a shorter value, which also lowers the CLI's own readiness caps. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios, the native-Windows vLLM refusal scenarios serve-33/34/35, and the side-by-side runtime scenarios runtime-lifecycle-19/20/21. |
+| `@requires-docker` | Premise is a second machine stood up as a container (the successful `rocm remote` paths). Resolves to **skip** unless `E2E_INCLUDE_DOCKER=1` is set, which the GitHub-hosted `E2E tests` lane does, and a container runtime answers. |
+| `@merge-queue` | Heavy real-GPU serve, redundant with a cheaper per-engine canary on the PR path. Resolves to **skip** unless `E2E_MERGE_QUEUE` is set; [`e2e-selfhosted.yml`](../../.github/workflows/e2e-selfhosted.yml) sets it for `merge_group` events only. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
@@ -213,6 +222,13 @@ matches a condition is expected to fail (xfail); if it then passes, that is an
 `flaky = true` tolerate either outcome while still reporting the intermittent
 bug. See `src/expectation.rs` for the resolver and `expectations.toml`'s header
 for the condition grammar.
+
+A scenario whose comment block says **"Expected to FAIL"** keeps that comment
+directly above its `@id:` tag line, with no blank line between them. Two unit
+tests in [`src/expectation.rs`](src/expectation.rs) hold the prose and the file to each other: a row
+must name a scenario that exists, and such a comment must have a row. A blank
+line breaks the binding, and the test then fails naming the comment's own file
+and line. Delete the comment together with the row when the bug is fixed.
 
 On a GPU host, a `serve` precondition that never publishes its model is
 relaunched once — but only for a scenario expected to pass; a known bug keeps its
