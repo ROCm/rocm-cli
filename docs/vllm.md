@@ -129,13 +129,14 @@ discover through *different* rows, each pinning its own vLLM minor. `10.0.0` rea
 vLLM from the production index; `10.1.0` and `10.2.0` read it from a separate
 staging host, where AMD stages their vLLM builds.
 
-The `10.0.0` and `10.1.0` rows take their torch stack from the stable `whl-next`
-index, which is also where `rocm install sdk` resolves those SDKs' own
-`+rocmX.Y` torch from. For those two rows vLLM's discovery is independent of the
-SDK install: it resolves its own torch, torchvision, and torchaudio pins fresh
-from the row's own static version prefixes, instead of reusing what the SDK
-install resolved. The SDK install might have resolved a different torch version
-than the row pins.
+The `10.0.0` row takes its torch stack from the stable `whl-next` index.
+
+The `10.1.0` row does not discover its torch stack by series anymore. It keeps
+the torch, torchvision and torchaudio the SDK install already resolved, checks
+them against the row's series and the SDK's ROCm line, and then realigns to
+those exact builds from the index the runtime manifest recorded. When no
+manifest for the SDK's interpreter recorded an index, it falls back to the
+row's stable `whl-next` index.
 
 The `10.2.0` row does not discover its torch stack. It keeps the torch,
 torchvision and torchaudio the SDK install already resolved (`torch 2.14.*`,
@@ -180,6 +181,12 @@ Every resolved pin that carries a `+rocmX.Y` local version is checked against
 the SDK's own major.minor before installing, so an index that happens to serve
 more than one ROCm line at once cannot silently install the wrong line's wheel
 onto this SDK.
+
+For `flash-attn` and `amd-aiter`, when discovery sees a pin whose
+`+rocmX.Y` local tag names another ROCm line but the same index also serves a
+plain wheel for that release, the installer retries that release as
+`pkg===<release>` (no local tag) from the same index and uses it if it matches.
+If that retry is unavailable, the original cross-line pin is still refused.
 
 If AMD's index has no compatible build for a package, the resolver fails and the
 install fails instead of falling back to an unpinned or CPU install.
