@@ -556,9 +556,12 @@ fn e2e_simulate_gpu_fault_launch() -> bool {
 /// Only the engine's own lines and the shared prefix of that bail are planted.
 /// The sentence the scenario asserts is composed by
 /// [`crate::serve_summary::fatal_startup_note`] from the engine's line. The bail
-/// is in the log because the supervisor writes it there on a real launch, and
-/// the note has to find the engine's line past it rather than read the bail's
-/// quotation of it as the failure.
+/// is in the log because the supervisor writes it there on a real launch, after
+/// the engine's line, as here. The first marker line wins, so the engine's line
+/// is what the note quotes whether or not the bail is skipped: that the bail is
+/// never read as a failure of its own is pinned by `rocm-core`'s
+/// `the_engines_own_bail_is_not_read_back_as_a_second_failure`, not by the
+/// scenario.
 #[cfg(feature = "e2e-oom-fault-injection")]
 fn gpu_fault_startup_log() -> String {
     let fault = "(EngineCore pid=7) ERROR 11-16 11:48:44 [core.py:700] HSA_STATUS_ERROR_EXCEPTION: \

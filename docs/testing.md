@@ -2911,7 +2911,8 @@ stops after 45 seconds and a terminal at a stall or after 30 minutes), until the
 server answers or its engine gives up
 (vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
 and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`; a vLLM engine that logs a fatal error stops the wait at once,
-see `serve-68`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
+see `serve-72` for what the failure says and the unit test
+`a_fatal_engine_error_ends_the_readiness_wait_at_once` for the timing); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
 by the argument parser, covered by a unit test. Run the log follow above from a
 second terminal to watch the download.
 

@@ -3804,8 +3804,12 @@ async fn assert_gpu_fault_named(world: &mut E2eWorld) {
     );
     // The engine's own line is what names the cause. The planted log carries it
     // twice, once as the engine wrote it and once quoted by the supervisor's
-    // bail; the note must show the engine's, which starts with the fault and not
-    // with rocm-cli's own prefix.
+    // bail, which a real launch writes after it. The first marker line wins, so
+    // this passes whether or not the bail is skipped; the skip itself is pinned
+    // by `the_engines_own_bail_is_not_read_back_as_a_second_failure` in
+    // `crates/rocm-core/src/vllm_fatal.rs`. What is asserted here is that the
+    // note shows the engine's line, which starts with the fault and not with
+    // rocm-cli's own prefix.
     assert!(
         flattened
             .contains("HSA_STATUS_ERROR_EXCEPTION:AnHSAILoperationresultedinahardwareexception"),

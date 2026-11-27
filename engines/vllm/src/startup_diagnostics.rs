@@ -147,8 +147,11 @@ impl FatalLogWatch {
     ///
     /// A missing or unreadable log reports nothing: the watch is a shortcut past
     /// the readiness timeout, not a requirement of it. An unterminated last line
-    /// is left to the next call rather than consumed, so a marker the engine is
-    /// still writing is not split across two reads. A log that shrank (replaced
+    /// is neither scanned nor consumed and is left to the next call, so a marker
+    /// the engine is still writing is neither split across two reads nor
+    /// reported cut short. The one exception is an unbroken run as long as the
+    /// read budget ([`FATAL_WATCH_MAX_READ`]), which is scanned and consumed so
+    /// the watch cannot stand still on it. A log that shrank (replaced
     /// or truncated) is read again from its start.
     pub(crate) fn poll(&mut self) -> Option<String> {
         use std::io::{Read, Seek, SeekFrom};
@@ -166,7 +169,6 @@ impl FatalLogWatch {
         file.take(FATAL_WATCH_MAX_READ)
             .read_to_end(&mut chunk)
             .ok()?;
-        let found = rocm_core::vllm_fatal_startup_line(&String::from_utf8_lossy(&chunk));
         let consumed = match chunk.iter().rposition(|byte| *byte == b'\n') {
             Some(newline) => newline + 1,
             // One unbroken run as long as the read budget: take it, or the
@@ -174,8 +176,11 @@ impl FatalLogWatch {
             None if chunk.len() as u64 >= FATAL_WATCH_MAX_READ => chunk.len(),
             None => 0,
         };
+        // Only what is consumed is scanned: a line still being written is not
+        // read at all, so a bail never quotes it cut short, and the next call
+        // scans it whole.
         self.offset += consumed as u64;
-        found
+        rocm_core::vllm_fatal_startup_line(&String::from_utf8_lossy(&chunk[..consumed]))
     }
 }
 
@@ -1525,6 +1530,66 @@ WARNING Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot
             watch.poll().as_deref(),
             Some("GPU stall detected on queue 3")
         );
+    }
+
+    #[test]
+    fn a_marker_still_being_written_is_not_reported_cut_short() {
+        // The poll lands in the middle of the marker's own line. The text so far
+        // already contains a marker (`HSA_STATUS_ERROR_`), but the line is not
+        // finished, so it is neither reported nor consumed: the bail would
+        // otherwise quote a truncated line and stop the engine on its strength.
+        let (_dir, path) = watched_log();
+        let mut watch = FatalLogWatch::new(Some(&path));
+        append(&path, "INFO ok\nERROR HSA_STATUS_ERROR_");
+        assert_eq!(watch.poll(), None);
+        assert_eq!(
+            watch.offset,
+            "INFO ok\n".len() as u64,
+            "the unterminated line stays unconsumed"
+        );
+        append(&path, "EXCEPTION: hardware exception\n");
+        assert_eq!(
+            watch.poll().as_deref(),
+            Some("ERROR HSA_STATUS_ERROR_EXCEPTION: hardware exception")
+        );
+    }
+
+    #[test]
+    fn a_poll_that_lands_mid_line_leaves_the_whole_line_for_the_next_one() {
+        // The common case: the chunk holds no newline at all, because the poll
+        // landed inside the first line written since the last one. Nothing is
+        // consumed, so the next poll reads the line from its start.
+        let (_dir, path) = watched_log();
+        let mut watch = FatalLogWatch::new(Some(&path));
+        append(&path, "GPU stall det");
+        assert_eq!(watch.poll(), None);
+        assert_eq!(watch.offset, 0, "an unterminated chunk is not consumed");
+        append(&path, "ected on queue 3\n");
+        assert_eq!(
+            watch.poll().as_deref(),
+            Some("GPU stall detected on queue 3")
+        );
+    }
+
+    #[test]
+    fn an_unbroken_run_as_long_as_the_read_budget_does_not_stall_the_watch() {
+        // A run with no newline that fills the whole read budget is taken, or
+        // the watch would read the same bytes on every poll and never reach what
+        // follows them. One byte short of the budget is still an unfinished line.
+        let (_dir, path) = watched_log();
+        let mut watch = FatalLogWatch::new(Some(&path));
+        let budget = usize::try_from(FATAL_WATCH_MAX_READ).expect("budget fits in usize");
+        append(&path, &"x".repeat(budget - 1));
+        assert_eq!(watch.poll(), None);
+        assert_eq!(watch.offset, 0, "a run under the budget is left unconsumed");
+        append(&path, "x");
+        assert_eq!(watch.poll(), None);
+        assert_eq!(
+            watch.offset, FATAL_WATCH_MAX_READ,
+            "a run that fills the budget is consumed"
+        );
+        append(&path, "\nEngineCore failed to start\n");
+        assert_eq!(watch.poll().as_deref(), Some("EngineCore failed to start"));
     }
 
     #[test]
