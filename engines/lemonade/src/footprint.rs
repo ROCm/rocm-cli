@@ -125,7 +125,7 @@ pub(crate) fn plan_install_preflight(
         .is_some_and(|other| storage_lists(paths, other));
     // `prepare_embeddable` replaces the whole runtime folder, backends
     // included, whenever `needs_extraction` says so, so that is the space the
-    // install frees before the backend is prepared.
+    // install normally frees before the backend is prepared.
     let replaced_bytes = if extraction && runtime_dir.exists() {
         directory_bytes(&runtime_dir)
     } else {
@@ -177,7 +177,7 @@ pub(crate) fn host_refusal_outcome(installed_tree: Option<&Path>) -> String {
 
 /// Total size of the files under `dir`, best effort: symlinks are not followed
 /// and anything unreadable counts as zero, because this only sizes the space an
-/// install is about to free.
+/// install is about to replace, and normally frees.
 fn directory_bytes(dir: &Path) -> u64 {
     let mut total = 0_u64;
     let mut stack = vec![dir.to_path_buf()];
