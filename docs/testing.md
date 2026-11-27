@@ -7459,12 +7459,13 @@ answers slower than the wait. The manual check is in
 ## Offline vLLM Companion Recovery
 
 [vllm_companion.feature](../tests/e2e-cucumber/features/vllm_companion.feature)
-covers three Linux scenarios without downloads or a GPU. The
-`vllm-companion-01` outline checks SDK 10.1 and 10.2: plain `flash-attn` and
-`amd-aiter` versions are installed with strict `===` requirements, the recovery
-warning is printed, and the SDK torch/torchvision/torchaudio stack is retained
-and realigned from its recorded index. `vllm-companion-02` checks that a
-cross-line companion with no plain wheel is refused before any package install.
+covers three Linux scenarios without downloads or a GPU. `vllm-companion-01`
+(SDK 10.1) and `vllm-companion-02` (SDK 10.2) each check that the plain
+`flash-attn` and `amd-aiter` versions are installed with strict `===`
+requirements, the recovery warning is printed, and the SDK
+torch/torchvision/torchaudio stack is retained and realigned from its recorded
+index. `vllm-companion-03` checks that a cross-line companion with no plain
+wheel is refused before any package install.
 The [step definitions](../tests/e2e-cucumber/tests/e2e/vllm_companion_steps.rs)
 use shell stand-ins that record installed versions separately from command arguments.
 
