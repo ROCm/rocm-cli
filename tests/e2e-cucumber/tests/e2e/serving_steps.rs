@@ -134,9 +134,9 @@ async fn model_is_ready_with_key(
 
 /// The OpenAI-compatible base URL every GPU serve scenario serves on (see
 /// [`SERVE_PORT`]), and the model listing readiness is judged by.
-static SERVE_BASE_URL: LazyLock<String> =
+pub(crate) static SERVE_BASE_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1"));
-static MODELS_URL: LazyLock<String> =
+pub(crate) static MODELS_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1/models"));
 
 /// The one-line verdict on a `--managed` serve that launched cleanly and then
@@ -165,7 +165,7 @@ fn stall_headline(invocation: &str, ready_substr: &str, timeout_secs: u64) -> St
 ///
 /// Mirrors what [`setup_gpu_model`] has always collected, so a stalled serve
 /// reports the same evidence wherever it happens.
-async fn serve_failure_evidence(
+pub(crate) async fn serve_failure_evidence(
     world: &mut E2eWorld,
     engine: Option<&str>,
     headline: &str,
@@ -303,7 +303,7 @@ async fn serve_and_wait_with_key(
 /// service lives in a different isolated dir, so this scenario's `rocm` can't
 /// stop it. Left unchecked, servers accumulate and oversubscribe the GPU until
 /// the job times out.
-const SERVE_PORT: u16 = 11435;
+pub(crate) const SERVE_PORT: u16 = 11435;
 
 /// The port the CLI's built-in local assistant (lemonade Qwen3-4B) listens on.
 /// The CLI auto-starts this assistant independently of any scenario; on Instinct
@@ -321,7 +321,7 @@ const ASSISTANT_PORT: u16 = 8001;
 /// (see [`wait_for_free_vram`]). Callers that only need the reset can ignore it;
 /// a serve that then fails to become ready reports it, because "the previous
 /// engine had not released the GPU yet" is otherwise invisible in the log.
-async fn ensure_serve_port_free() -> String {
+pub(crate) async fn ensure_serve_port_free() -> String {
     // Always kill any listener on the shared port — NOT just one that already
     // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
     // port and GPU memory without yet serving /v1/models; if we only checked HTTP
@@ -582,7 +582,7 @@ async fn reserve_default_serve_port(world: &mut E2eWorld) {
 /// exercised exactly once, in the `@nightly` `serve-large-model-inference`
 /// scenario (Qwen3.6-27B) — never on the per-PR path. Do not raise a serve
 /// scenario's model unless a smaller one genuinely cannot prove the assertion.
-fn host_serve_target() -> (&'static str, &'static str, &'static str) {
+pub(crate) fn host_serve_target() -> (&'static str, &'static str, &'static str) {
     if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
         // GGUF via lemonade's llama.cpp backend; endpoint reports e.g.
         // Qwen3-0.6B-Q4_0.gguf, so "Qwen3-0.6B" is the distinctive substring.

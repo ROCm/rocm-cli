@@ -3175,6 +3175,11 @@ guards fresh-create behaviour only: it checks that a real serve's newly
 written key file is mode 0600 on the Linux GPU lanes, which held before this
 repair too, so it is a guard against a regression in that path, not evidence
 for the repair.
+For a public bind, the `networking-05` scenario
+([networking.feature](../tests/e2e-cucumber/features/networking.feature)) serves a model on
+`--host 0.0.0.0 --allow-public-bind` and checks that a request without the key and one with a
+wrong key get 401, while the generated key it printed is accepted. It runs on
+the MI300X vLLM lane only; native Windows and lemonade-default hosts skip it.
 
 ```bash
 cargo test -p rocm-core --lib owner_only

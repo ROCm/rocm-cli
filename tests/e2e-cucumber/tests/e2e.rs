@@ -34,6 +34,7 @@ mod e2e {
     pub mod dependency_guard_steps;
     pub mod diagnose_steps;
     pub mod driver_steps;
+    pub mod endpoint_auth_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod host_guard;
@@ -88,6 +89,11 @@ pub struct E2eWorld {
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
+    /// The endpoint API key `rocm serve` issued for a public bind, captured from
+    /// the launch output. `None` for a loopback serve, which is credential-free.
+    /// Used by the public-bind auth scenario to prove the endpoint really enforces
+    /// the key it printed (see `e2e::endpoint_auth_steps`).
+    pub endpoint_api_key: Option<String>,
     pub model_name: Option<String>,
     /// Stdout of the `rocm serve` that this scenario's Given step launched,
     /// kept so a Then can assert on the deployment summary it printed.
@@ -443,6 +449,7 @@ impl Default for E2eWorld {
             hub_requests: None,
             artifact_marker_path: None,
             endpoint: None,
+            endpoint_api_key: None,
             model_name: None,
             serve_summary: None,
             chat_response: None,
