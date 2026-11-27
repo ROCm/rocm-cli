@@ -107,6 +107,15 @@ pub(crate) enum Command {
     /// leading `#1`, `#2` are ranking positions for reading order only; `rocm fix`
     /// takes the id, not the position. An established cause that leaves the GPU
     /// unreachable is listed first, and the closing line names the first cause.
+    ///
+    /// On Linux it also sizes an integrated GPU's share of system memory
+    /// (`fix-24-apu-unified-memory`): `amdgpu.gttsize` counts MiB and
+    /// `ttm.pages_limit` counts 4 KiB pages, so a page limit below
+    /// `gttsize x 256` caps the aperture however large `gttsize` reads, and it
+    /// is that smaller ceiling the report names. It also reads the amdkfd
+    /// `SVM mapping failed` line out of the recent kernel log; only a bounded
+    /// window of that log is read, so its absence is reported as such rather
+    /// than as "this machine has never failed".
     Diagnose {
         /// Raw error text from the user; sharpens keyword scoring. A few failure
         /// modes show only in such text (a vLLM out-of-memory error, for one).

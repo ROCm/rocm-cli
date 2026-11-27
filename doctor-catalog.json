@@ -461,6 +461,19 @@
       "needs_sudo": false,
       "needs_reboot": false,
       "needs_relogin": false
+    },
+    {
+      "id": "fix-24-apu-unified-memory",
+      "title": "Size the GTT aperture and the TTM page limit to usable RAM",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": true,
+      "needs_relogin": false
     }
   ],
   "exit_codes": {

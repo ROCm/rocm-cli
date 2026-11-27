@@ -45,7 +45,9 @@ pub use engine::{
     VLLM_EXTENSION_LOAD_CANONICAL_SYMPTOM, VLLM_IMPORT_CANONICAL_SYMPTOM,
     VLLM_OOM_CANONICAL_SYMPTOM,
 };
-pub use linux::{AMDGPU_MISSING_EVIDENCE, dkms_driver_plan_is_supported};
+pub use linux::{
+    AMDGPU_MISSING_EVIDENCE, APU_UNIFIED_MEMORY_FIX_ID, dkms_driver_plan_is_supported,
+};
 pub use report::{
     SYMPTOM_DID_NOT_CONTRIBUTE_NOTE, render_report_json, render_report_text, upstream_route,
 };

@@ -320,7 +320,7 @@ this check prevents.
      changes nothing.
 
    [reference.md](reference.md)'s table marks the entries that are not print-only.
-   The other 25 are **print-only** on every host (bootloader, kernel, reinstall,
+   The other 26 are **print-only** on every host (bootloader, kernel, reinstall,
    Windows driver, …): the CLI never performs those.
 
    To apply an `auto` fix, or a `needs-argument` fix with its argument, go in this
