@@ -6931,6 +6931,15 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   commands read that shape of machine and must not disagree about whether its
   memory was readable.
 
+  All four are `@requires-os:linux` and need no GPU, so their coverage is the
+  ungated Linux lanes, and that is deliberate — the planted root answers every
+  probe, so a lane with real integrated hardware would be reading the same
+  fixture. Do not count the self-hosted `e2e-gpu-strix-ubuntu` lane as the
+  gfx1151 coverage for them: it is not a required check and skips whenever the
+  pool has no runner, as it did on the change that added these scenarios. The
+  listing against an APU's own readings is checked by hand instead — section 20
+  of [manual-testing.md](manual-testing.md).
+
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question
