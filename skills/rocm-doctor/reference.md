@@ -69,21 +69,27 @@ that were ignored.
   `has_match` is false. [Framework routing](#framework-routing) lists what it returns.
 - `model` — set only when `--model <ref>` was passed; otherwise not set. Answers
   "will this model run here", without downloading the weights: for a curated
-  model from the recipe catalog and this host's GPU/RAM, and for a GGUF outside
-  the catalog with an `estimate` from its file header (below). Its fields include
+  model from the recipe catalog and this host's GPU/RAM, for one GGUF file
+  outside the catalog with an `estimate` from that file's header, and for a
+  whole GGUF repository with a `quantizations` object carrying a row per
+  quantization it publishes (both below). Its fields include
   `verdict`, `evidence[]`, `alternatives[]`, `undetermined_reason`, `warnings[]`,
-  `fix` and `route`; `warnings[]` carries, for a GGUF estimate that was
-  compared with the GPU, the standing note on which options `rocm serve` does not
-  take. `verdict` is one of `ready`, `degraded`, `blocked`,
+  `fix` and `route`; `warnings[]` carries the caveat that the figures are
+  estimates wherever any were worked out, the standing note on which options
+  `rocm serve` does not take, and — on a repository answer — the note that a
+  device-visibility mask leaves unverified which card the rows were compared
+  with (for one file that last note sits in `estimate.notes` instead).
+  `verdict` is one of `ready`, `degraded`, `blocked`,
   `undetermined` — treat `undetermined` as "the CLI could not find out", never as
   evidence the model is incompatible. `alternatives[]` are curated models, each with the `model_ref` to pass to `rocm serve`. `model.fix` has
   the shape of a diagnosis `fix` with an empty `fix_id`: no catalog entry stands
   behind it, so `rocm fix` would reject one, and its steps are relayed rather than
   applied.
   `route` says where to report a model the CLI cannot answer for.
-  For a GGUF outside the catalog (a local `.gguf` path, or `owner/repo:QUANT`)
-  the verdict stays `undetermined` and an `estimate` object is added, sized from
-  the file's header (the weights are never downloaded). Its fields, by group:
+  For one GGUF file outside the catalog (a local `.gguf` path, or
+  `owner/repo:QUANT`) the verdict stays `undetermined` and an `estimate` object
+  is added, sized from the file's header (the weights are never downloaded).
+  Its fields, by group:
   where it came from (`source`, `architecture`, `layers`); the outcome
   (`outcome` is `fits`, `does_not_fit` or `cannot_estimate`, and with
   `cannot_estimate` the `cannot_estimate_reason` and `detail` say why; the
@@ -116,6 +122,25 @@ that were ignored.
   It is an estimate, not a tested minimum: report it as one.
   The CPU-fallback rule and what to do with a suggestion are in
   [SKILL.md](SKILL.md), Rules.
+  A bare `owner/repo` names a repository rather than one file: the verdict
+  stays `undetermined`, no `estimate` is set, and the figures arrive in
+  `quantizations` instead — `repository` (as the user wrote it),
+  `quantizations[]` (a row per quantization the repository publishes, smallest
+  first), `projectors` (how many of its GGUF files are multimodal projectors,
+  which are not language models and are not sized) and `context_size` (what
+  every row was sized for). A row is flat, and `answer` says which kind of row
+  it is: `estimated` carries the `estimate` fields above, and `not_estimated`
+  carries `reason` — `budget_spent` (the budget the whole repository read
+  shares ran out first), `too_many_quantizations` (the repository publishes
+  more than one command reads) or `header_unreadable` — with a `detail` saying
+  which in words. Every row carries `file` (the name in the repository),
+  `quantization` (the label read off that name, null when the name carries
+  none) and `size_bytes`. A row the command did not reach says so and is never
+  filled in from another quantization's header, so treat a `not_estimated` row
+  as unknown rather than as one that does not fit. The rows carry each
+  quantization's total and not the parts behind it: asking about one by name
+  (`owner/repo:QUANT`) is what produces the full `estimate` for it, which is
+  what `model.fix` offers.
 
 ### `rocm fix [<id>] [--yes] [--dry-run] [--device-index N] [--json]`
 

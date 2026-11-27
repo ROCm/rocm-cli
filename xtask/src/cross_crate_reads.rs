@@ -53,6 +53,10 @@ use crate::affected::{self, Graph, Selection};
 ///   every `rocm ...` command shown there, `rocm` compiles in the assistant
 ///   skill, and xtask's tests read the pinned release key under `docs/keys` and
 ///   other docs (`docs/nightly-on-the-queue.md`, `docs/testing.md`, ...).
+///   `rocm-core` reads `README.md` too: `the_readme_spells_the_probe_cap_as_the_constant_sets_it`
+///   holds the quantization cap the README prints to `MAX_PROBED_QUANTIZATIONS`,
+///   so editing that sentence alone has to run this crate's tests or the pin is
+///   a figure nothing checks.
 /// - `skills/rocm-doctor/`: the e2e crate's `skill_reference` test (a plain
 ///   test target) parses the skill's catalog table. CI runs it in the `test`
 ///   job's `cargo nextest` over this selection and in the `windows-debug`
@@ -68,7 +72,7 @@ use crate::affected::{self, Graph, Selection};
 ///   engine's.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
-    ("README.md", &["rocm", "xtask"]),
+    ("README.md", &["rocm", "rocm-core", "xtask"]),
     ("docs/", &["rocm", "xtask"]),
     ("skills/", &["rocm", "xtask"]),
     ("skills/rocm-doctor/", &["e2e-cucumber"]),
@@ -201,6 +205,14 @@ mod tests {
             let names = selected_names(&[path]);
             assert!(names.contains("rocm"), "{path}: {names:?}");
             assert!(names.contains("xtask"), "{path}: {names:?}");
+        }
+        // Only the README reaches `rocm-core`, and only because one of its
+        // tests holds a figure the README prints. `docs/` and `skills/` have no
+        // such reader, and must not pull the crate in with them -- that is the
+        // difference between a selection and a catch-all.
+        assert!(selected_names(&["README.md"]).contains("rocm-core"));
+        for path in ["docs/testing.md", "skills/rocm-cli-assistant/SKILL.md"] {
+            let names = selected_names(&[path]);
             assert!(!names.contains("rocm-core"), "{path}: {names:?}");
         }
     }

@@ -16,8 +16,10 @@
 //! rather than streamed, because streaming it is exactly the download this
 //! exists to avoid.
 
+use crate::gguf::GgufHeader;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -37,6 +39,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// sixteen minutes.
 const TOTAL_BUDGET: Duration = Duration::from_mins(2);
 const DEFAULT_HUB: &str = "https://huggingface.co";
+/// The most quantizations one repository probe reads a header for.
+///
+/// A GGUF repository publishes a dozen or so; each header is its own range
+/// read, so an unbounded loop over a repository with a hundred files would make
+/// a hundred requests. The ones past this are reported as not estimated, with
+/// the reason, rather than left out.
+pub const MAX_PROBED_QUANTIZATIONS: usize = 12;
 
 /// A model reference that names a GGUF file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +53,9 @@ pub enum GgufRef {
     /// A path on this machine.
     Local(PathBuf),
     /// `owner/repo` on Hugging Face, with the quantization label or file name
-    /// after a colon. The variant is optional here so that a reference without
-    /// one can be refused with a message, not mistaken for something else.
+    /// after a colon. The variant is optional because a reference without one
+    /// names the whole repository, which is answered for every quantization in
+    /// it ([`GgufSource::probe_quantizations`]) rather than as one file.
     Hub {
         owner: String,
         repo: String,
@@ -76,7 +86,7 @@ fn is_safe_component(component: &str) -> bool {
 /// A file name may also carry `+`, which hub file names do (`m+x-Q4_K_M.gguf`):
 /// it reaches the hub percent-encoded, so it is as safe as the other characters,
 /// and refusing it would leave such a file impossible to name exactly.
-fn is_safe_variant(variant: &str) -> bool {
+pub(crate) fn is_safe_variant(variant: &str) -> bool {
     if is_safe_component(variant) {
         return true;
     }
@@ -91,10 +101,10 @@ fn is_safe_variant(variant: &str) -> bool {
 /// A file that exists on this machine is that file, whatever its name looks
 /// like. Otherwise `owner/repo:variant` is a Hugging Face repository, a name
 /// ending in `.gguf` is a local path (that does not exist, so it is reported as
-/// not openable rather than sent to the hub), and a bare `owner/repo` is a
-/// repository with no variant, recognised so the caller can say a quantization is
-/// needed. Returns `None` for names, aliases and anything else, so a catalog model
-/// never reaches this module.
+/// not openable rather than sent to the hub), and a bare `owner/repo` is the
+/// repository itself, which [`GgufSource::probe_quantizations`] answers for
+/// every quantization in it. Returns `None` for names, aliases and anything
+/// else, so a catalog model never reaches this module.
 #[must_use]
 pub fn parse_gguf_ref(model_ref: &str) -> Option<GgufRef> {
     parse_gguf_ref_with(model_ref, &|path| path.is_file())
@@ -385,6 +395,96 @@ fn names_for_error(files: &[&HubFile]) -> String {
     }
 }
 
+/// The language-model GGUFs of a repository, one entry per quantization,
+/// smallest first.
+///
+/// Multimodal projectors are left out ([`names_projector`]): they are not
+/// language models, so there is nothing to size them against. The shards of one
+/// split model collapse to their lowest-numbered shard, so a four-way split is
+/// one entry rather than four. A file the listing did not size sorts last,
+/// because its size is only learnt by asking for it.
+///
+/// Smallest first is also the order [`LiveGgufSource::probe_quantizations`]
+/// reads headers in: a run the budget cuts short then answers a contiguous run
+/// of the smallest quantizations, which are the ones a host that cannot take
+/// the whole repository is most likely to be able to run.
+#[must_use]
+pub fn repository_quantizations(files: &[HubFile]) -> Vec<HubFile> {
+    let mut singles: Vec<HubFile> = Vec::new();
+    let mut sets: BTreeMap<String, (u32, HubFile)> = BTreeMap::new();
+    for file in files
+        .iter()
+        .filter(|file| file.name.to_ascii_lowercase().ends_with(".gguf"))
+        .filter(|file| !names_projector(&file.name))
+    {
+        match shard_parts(&file.name) {
+            Some((set, index)) => {
+                let lowest = sets.entry(set).or_insert_with(|| (index, file.clone()));
+                if index < lowest.0 {
+                    *lowest = (index, file.clone());
+                }
+            }
+            None => singles.push(file.clone()),
+        }
+    }
+    let mut all = singles;
+    all.extend(sets.into_values().map(|(_, file)| file));
+    all.sort_by(|left, right| {
+        left.size
+            .is_none()
+            .cmp(&right.size.is_none())
+            .then(left.size.cmp(&right.size))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    all
+}
+
+/// Why a quantization of a repository has no header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotProbed {
+    /// The shared deadline passed before this file's header was read.
+    BudgetSpent,
+    /// The repository holds more quantizations than one command reads
+    /// ([`MAX_PROBED_QUANTIZATIONS`]).
+    TooManyQuantizations,
+    /// The header was asked for and could not be read.
+    Unreadable,
+}
+
+/// What reading one quantization's header found.
+#[derive(Debug)]
+pub enum QuantProbeOutcome {
+    /// The header, read inside the budget.
+    Read(Box<GgufHeader>),
+    /// No header, and why not, in words.
+    NotRead { reason: NotProbed, detail: String },
+}
+
+/// One quantization of a repository, as a probe found it.
+#[derive(Debug)]
+pub struct QuantProbe {
+    /// The GGUF file in the repository, by full name.
+    pub file: String,
+    /// The size of the whole file in bytes, when it is known: from the listing,
+    /// or from the `HEAD` the probe sent when the listing left it out. `None`
+    /// for a file that was never reached.
+    pub size: Option<u64>,
+    pub outcome: QuantProbeOutcome,
+}
+
+/// Every language-model GGUF of a repository, each with its header or the
+/// reason it has none.
+#[derive(Debug)]
+pub struct RepositoryProbe {
+    /// One entry per quantization, smallest first, as
+    /// [`repository_quantizations`] ordered them.
+    pub quants: Vec<QuantProbe>,
+    /// How many GGUF files of the repository are multimodal projectors, which
+    /// are not language models and are left out of `quants`. Counted so a
+    /// repository with nothing to size can say which kind of nothing it has.
+    pub projectors: usize,
+}
+
 /// `Read + Seek`, as one object-safe trait.
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
@@ -458,6 +558,24 @@ pub trait GgufSource {
     /// its file name) is a multimodal projector: then the error is a
     /// [`ProjectorNamed`], which a caller can downcast to.
     fn open(&self, reference: &GgufRef) -> Result<OpenedGguf>;
+
+    /// Read a GGUF header for each quantization a repository publishes, under
+    /// one shared budget.
+    ///
+    /// A header per file, never one header reused with the others' sizes: the
+    /// weights are the file's size less *its* header, and the input embedding
+    /// is clamped against *its* next tensor, so a borrowed header would state
+    /// another file's breakdown with this file's confidence. A quantization the
+    /// budget or [`MAX_PROBED_QUANTIZATIONS`] left unread comes back as
+    /// [`QuantProbeOutcome::NotRead`] with the reason, never as a guess.
+    ///
+    /// # Errors
+    ///
+    /// When the repository itself cannot be listed. A file that could not be
+    /// read is an entry of the answer, not an error.
+    fn probe_quantizations(&self, _owner: &str, _repo: &str) -> Result<RepositoryProbe> {
+        bail!("this model source does not read Hugging Face repositories")
+    }
 }
 
 /// The real source: the local filesystem and Hugging Face.
@@ -524,6 +642,57 @@ impl LiveGgufSource {
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
+    }
+
+    /// Where one file of a repository is fetched from: each path segment
+    /// percent-encoded, never handed to the filesystem.
+    fn hub_file_url(&self, owner: &str, repo: &str, name: &str) -> String {
+        let path: Vec<String> = name
+            .split('/')
+            .map(crate::report_delivery::percent_encode)
+            .collect();
+        format!(
+            "{}/{owner}/{repo}/resolve/main/{}",
+            self.hub,
+            path.join("/")
+        )
+    }
+
+    /// Read one quantization's header, and the size it was sized against. The
+    /// failure says whether the shared budget stopped the read or the file
+    /// could not be read at all.
+    fn read_one_header(
+        &self,
+        agent: &ureq::Agent,
+        owner: &str,
+        repo: &str,
+        file: &HubFile,
+        deadline: Instant,
+    ) -> std::result::Result<(GgufHeader, u64), HubFailure> {
+        let url = self.hub_file_url(owner, repo, &file.name);
+        // The listing carries a size for a file the hub stores whole; if it
+        // left one out, the file's own headers say -- at the cost of one more
+        // request from the same budget.
+        let size = match file.size {
+            Some(size) => size,
+            None => head_size(agent, &url, deadline)?,
+        };
+        let mut reader = RangedReader::new(agent.clone(), url, size).with_deadline(deadline);
+        match crate::gguf::parse_gguf_header(&mut reader) {
+            Ok(header) => Ok((header, size)),
+            // Bytes that are not a GGUF header are the file's own answer, and
+            // stay that whether the parse finished with the budget to spare or
+            // with it long gone. Only a window the reader never got hold of
+            // can be the budget, and the reader is the one that knows.
+            Err(error) => {
+                let error = anyhow!("the GGUF header could not be read: {error}");
+                Err(if reader.stopped_by_the_budget() {
+                    HubFailure::budget(error)
+                } else {
+                    HubFailure::unreadable(error)
+                })
+            }
+        }
     }
 
     fn list_files(
@@ -663,25 +832,17 @@ impl GgufSource for LiveGgufSource {
             } => {
                 let Some(variant) = variant else {
                     bail!(
-                        "`{owner}/{repo}` needs a quantization to read: use \
-                         `{owner}/{repo}:QUANT` (for example `{owner}/{repo}:Q4_K_M`) or a file \
-                         name ending in .gguf"
+                        "`{owner}/{repo}` names a repository, not one file: \
+                         `probe_quantizations` answers for every quantization in it, and `open` \
+                         needs one named, as `{owner}/{repo}:QUANT` (for example \
+                         `{owner}/{repo}:Q4_K_M`) or a file name ending in .gguf"
                     );
                 };
                 let agent = Self::agent();
                 let deadline = Instant::now() + self.budget;
                 let files = self.list_files(&agent, owner, repo, deadline)?;
                 let file = select_gguf_file(&files, variant)?;
-                let path: Vec<String> = file
-                    .name
-                    .split('/')
-                    .map(crate::report_delivery::percent_encode)
-                    .collect();
-                let url = format!(
-                    "{}/{owner}/{repo}/resolve/main/{}",
-                    self.hub,
-                    path.join("/")
-                );
+                let url = self.hub_file_url(owner, repo, &file.name);
                 // The listing carries a size for a file the hub stores whole; if
                 // it left one out, the file's own headers say.
                 let size = match file.size {
@@ -696,6 +857,85 @@ impl GgufSource for LiveGgufSource {
             }
         }
     }
+
+    fn probe_quantizations(&self, owner: &str, repo: &str) -> Result<RepositoryProbe> {
+        let agent = Self::agent();
+        // One deadline for the listing and every header after it. A deadline
+        // per file would let a repository of a dozen quantizations hold the
+        // command for twenty-four minutes.
+        let deadline = Instant::now() + self.budget;
+        let files = self.list_files(&agent, owner, repo, deadline)?;
+        let projectors = files
+            .iter()
+            .filter(|file| file.name.to_ascii_lowercase().ends_with(".gguf"))
+            .filter(|file| names_projector(&file.name))
+            .count();
+        let candidates = repository_quantizations(&files);
+        let mut quants = Vec::with_capacity(candidates.len());
+        for (index, file) in candidates.iter().enumerate() {
+            let not_read = |reason, detail| QuantProbe {
+                file: file.name.clone(),
+                size: file.size,
+                outcome: QuantProbeOutcome::NotRead { reason, detail },
+            };
+            if index >= MAX_PROBED_QUANTIZATIONS {
+                quants.push(not_read(
+                    NotProbed::TooManyQuantizations,
+                    format!(
+                        "only the {MAX_PROBED_QUANTIZATIONS} smallest quantizations of a \
+                         repository are read in one command; ask about this one by name to size \
+                         it"
+                    ),
+                ));
+                continue;
+            }
+            // Checked before the request rather than left to the request's own
+            // timeout, so a budget that is already spent costs no connection.
+            if Instant::now() >= deadline {
+                quants.push(not_read(
+                    NotProbed::BudgetSpent,
+                    budget_spent_detail(self.budget),
+                ));
+                continue;
+            }
+            match self.read_one_header(&agent, owner, repo, file, deadline) {
+                Ok((header, size)) => quants.push(QuantProbe {
+                    file: file.name.clone(),
+                    size: Some(size),
+                    outcome: QuantProbeOutcome::Read(Box::new(header)),
+                }),
+                // A read the shared deadline stopped is the budget running
+                // out, not the file being unreadable: the next quantization
+                // would fail the same way whatever it holds. Which of the two
+                // it was comes from the read itself and not from the clock
+                // here -- a `404`, or a file whose bytes are not a GGUF, is
+                // unreadable even when the deadline passed while it was being
+                // found out, and telling that row "the budget ran out; ask
+                // about this quantization by name" would promise a remedy that
+                // runs into the same failure.
+                Err(failure) if failure.budget_expired => quants.push(not_read(
+                    NotProbed::BudgetSpent,
+                    budget_spent_detail(self.budget),
+                )),
+                Err(failure) => {
+                    quants.push(not_read(
+                        NotProbed::Unreadable,
+                        format!("{:#}", failure.error),
+                    ));
+                }
+            }
+        }
+        Ok(RepositoryProbe { quants, projectors })
+    }
+}
+
+/// What a quantization the shared deadline cut off is told.
+fn budget_spent_detail(budget: Duration) -> String {
+    format!(
+        "the {} seconds a repository read has in all ran out before this file's header was \
+         reached; ask about this quantization by name to size it on its own",
+        budget.as_secs()
+    )
 }
 
 /// How long is left before `deadline`, as the timeout for the next request.
@@ -714,6 +954,87 @@ fn time_left(deadline: Instant) -> io::Result<Duration> {
 /// CDN, and a chain longer than this is a loop or a mirror that is not one.
 const MAX_REDIRECTS: usize = 5;
 
+/// A hub read that failed, and whether the shared budget is what stopped it.
+///
+/// The two are different answers to the user. A quantization the budget cut
+/// off is read by naming it on its own, because that gives the one header this
+/// command skipped a budget to itself; a quantization whose file could not be
+/// read gets the same failure again however it is asked for, and telling it as
+/// the budget sends the reader round a loop.
+///
+/// Carried from where the failure happened rather than worked out afterwards
+/// from the clock. A read that fails at all is likely to be the one that spent
+/// the budget, so "the deadline has passed" is true of a file the hub answered
+/// `404` for and of a file whose bytes are not a GGUF just as often as it is
+/// true of a read the clock really stopped. What failed says which; when it
+/// failed does not.
+#[derive(Debug)]
+struct HubFailure {
+    error: anyhow::Error,
+    /// The shared deadline is what stopped this read: the request was refused
+    /// before it went out because the budget was already spent, or it timed
+    /// out on a timeout that is never longer than what the budget had left.
+    budget_expired: bool,
+}
+
+impl HubFailure {
+    /// A failure the file, the hub or the response is responsible for, which
+    /// asking again for this file alone would only repeat.
+    const fn unreadable(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            budget_expired: false,
+        }
+    }
+
+    /// A failure the shared budget is responsible for.
+    const fn budget(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            budget_expired: true,
+        }
+    }
+}
+
+impl std::fmt::Display for HubFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+// Written out rather than left to anyhow's blanket conversion, which this type
+// deliberately does not qualify for: a caller that does not care which of the
+// two it was -- `open`, `list_files` -- gets the error and drops the question,
+// and one that does has to take `HubFailure` and keep it.
+impl From<HubFailure> for anyhow::Error {
+    fn from(failure: HubFailure) -> Self {
+        failure.error
+    }
+}
+
+/// Whether the shared deadline is what stopped a request, rather than the hub
+/// answering for the file.
+///
+/// A status is the hub's own answer -- `404` for a file that is not there,
+/// `401` for a repository that is gated, a server error -- and stays that
+/// answer however late it lands. Only a transport failure can be the clock,
+/// and only with the deadline behind it: the timeout every request is given is
+/// what is left of the budget, capped, so a transport failure before the
+/// deadline is a hub that is unreachable or a connection that broke.
+fn stopped_by_the_budget(error: &ureq::Error, now: Instant, deadline: Instant) -> bool {
+    matches!(error, ureq::Error::Transport(_)) && now >= deadline
+}
+
+/// Whether an `io` failure reading a response body is the socket's own deadline
+/// firing. That deadline is what is left of the shared budget, so a body read
+/// it stops is the budget running out; a body that simply ended early is not.
+fn is_a_read_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
 /// Send one request and follow its redirects by hand, each hop under what is
 /// left of `deadline`, keeping the `Range` header on every hop.
 ///
@@ -728,27 +1049,33 @@ fn send(
     deadline: Instant,
     range: Option<&str>,
     what: &str,
-) -> Result<ureq::Response> {
+) -> std::result::Result<ureq::Response, HubFailure> {
     let mut current = url.to_owned();
     for _ in 0..=MAX_REDIRECTS {
-        let mut request = agent
-            .request(method, &current)
-            .timeout(time_left(deadline).map_err(|error| anyhow!("{error}"))?);
+        let left = time_left(deadline).map_err(|error| HubFailure::budget(anyhow!("{error}")))?;
+        let mut request = agent.request(method, &current).timeout(left);
         if let Some(range) = range {
             request = request.set("Range", range);
         }
-        let response = request
-            .call()
-            .map_err(|error| describe_http_error(&error, what))?;
+        let response = request.call().map_err(|error| {
+            let described = describe_http_error(&error, what);
+            if stopped_by_the_budget(&error, Instant::now(), deadline) {
+                HubFailure::budget(described)
+            } else {
+                HubFailure::unreadable(described)
+            }
+        })?;
         if !matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
             return Ok(response);
         }
-        let location = response
-            .header("Location")
-            .ok_or_else(|| anyhow!("the hub redirected {what} without saying where"))?;
-        current = redirect_target(&current, location, what)?;
+        let location = response.header("Location").ok_or_else(|| {
+            HubFailure::unreadable(anyhow!("the hub redirected {what} without saying where"))
+        })?;
+        current = redirect_target(&current, location, what).map_err(HubFailure::unreadable)?;
     }
-    bail!("the hub redirected {what} more than {MAX_REDIRECTS} times")
+    Err(HubFailure::unreadable(anyhow!(
+        "the hub redirected {what} more than {MAX_REDIRECTS} times"
+    )))
 }
 
 /// Where a redirect from `current` to `location` goes, or why it is refused: it
@@ -786,12 +1113,22 @@ fn redirect_target(current: &str, location: &str, what: &str) -> Result<String> 
 }
 
 /// The size of a remote file from its `Content-Length`, without fetching it.
-fn head_size(agent: &ureq::Agent, url: &str, deadline: Instant) -> Result<u64> {
+fn head_size(
+    agent: &ureq::Agent,
+    url: &str,
+    deadline: Instant,
+) -> std::result::Result<u64, HubFailure> {
     let response = send(agent, "HEAD", url, deadline, None, "the model file")?;
     response
         .header("Content-Length")
         .and_then(|value| value.trim().parse().ok())
-        .ok_or_else(|| anyhow!("the hub did not report how large the model file is"))
+        .ok_or_else(|| {
+            // A `HEAD` that came back is the hub answering about this file, so
+            // what it left out is the file's own answer, not the clock.
+            HubFailure::unreadable(anyhow!(
+                "the hub did not report how large the model file is"
+            ))
+        })
 }
 
 /// A remote file as `Read + Seek`, fetched in windows by `Range` request.
@@ -804,6 +1141,12 @@ pub struct RangedReader {
     window_start: u64,
     fetched: u64,
     deadline: Instant,
+    /// Whether the shared budget stopped one of the fetches made through this
+    /// reader. Remembered rather than returned: `Read` answers in `io::Error`,
+    /// and `parse_gguf_header` reports what it could not parse, so the reason
+    /// a window never arrived would otherwise be a sentence inside a sentence
+    /// by the time a caller had to act on it.
+    budget_expired: bool,
 }
 
 impl RangedReader {
@@ -818,7 +1161,15 @@ impl RangedReader {
             window_start: 0,
             fetched: 0,
             deadline: Instant::now() + TOTAL_BUDGET,
+            budget_expired: false,
         }
+    }
+
+    /// Whether the shared budget, rather than the file or the hub, is what
+    /// stopped a fetch this reader made.
+    #[must_use]
+    const fn stopped_by_the_budget(&self) -> bool {
+        self.budget_expired
     }
 
     /// Stop reading at `deadline`, however many windows are left.
@@ -844,15 +1195,21 @@ impl RangedReader {
                 MAX_FETCH_BYTES / (1024 * 1024)
             )));
         }
-        let response = send(
+        let range = format!("bytes={}-{}", self.position, end - 1);
+        let response = match send(
             &self.agent,
             "GET",
             &self.url,
             self.deadline,
-            Some(&format!("bytes={}-{}", self.position, end - 1)),
+            Some(&range),
             "the model file",
-        )
-        .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        ) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.budget_expired |= failure.budget_expired;
+                return Err(io::Error::other(format!("{:#}", failure.error)));
+            }
+        };
         // 200 means the server ignored the range and would send the whole file.
         if response.status() != 206 {
             return Err(io::Error::other(format!(
@@ -884,6 +1241,11 @@ impl RangedReader {
         // A body that ends early surfaces as `UnexpectedEof`, which would read as
         // "the header ends here". It is the connection that ended.
         if let Err(error) = response.into_reader().take(wanted).read_to_end(&mut window) {
+            // The headers arrived inside the budget and the body did not. The
+            // socket carries what is left of the shared deadline, so a read it
+            // timed out is the budget running out; a connection that ended for
+            // any other reason is the response being broken.
+            self.budget_expired |= is_a_read_timeout(&error) && Instant::now() >= self.deadline;
             return Err(io::Error::other(format!(
                 "the connection ended after {} of the {wanted} bytes asked for: {error}",
                 window.len()
@@ -957,6 +1319,39 @@ mod tests {
         }
     }
 
+    /// The README spells the cap out as a figure, where `rocm diagnose --help`
+    /// is generated from the constant and `docs/manual-testing.md` points the
+    /// reader at that help. A number copied into prose has nothing holding it
+    /// to [`MAX_PROBED_QUANTIZATIONS`], so this does: raising the cap without
+    /// the README, or editing the README's figure on its own, fails here.
+    #[test]
+    fn the_readme_spells_the_probe_cap_as_the_constant_sets_it() {
+        const PHRASE: &str = " smallest quantizations at most";
+        let readme = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+        )
+        .expect("README.md at the repo root");
+        // One place says it, so there is no second copy for a wrong figure to
+        // hide in, and the assertion below cannot be satisfied by the sentence
+        // it was not meant for.
+        assert_eq!(
+            readme.matches(PHRASE).count(),
+            1,
+            "the README has to say `N{PHRASE}` exactly once"
+        );
+        let expected = format!("{MAX_PROBED_QUANTIZATIONS}{PHRASE}");
+        let at = readme.find(&expected).unwrap_or_else(|| {
+            panic!(
+                "the README does not say `{expected}`; the code reads {MAX_PROBED_QUANTIZATIONS}"
+            )
+        });
+        // `12` must be the whole figure, not the tail of `112`.
+        assert!(
+            !readme[..at].ends_with(|c: char| c.is_ascii_digit()),
+            "the README's figure is longer than {MAX_PROBED_QUANTIZATIONS}"
+        );
+    }
+
     #[test]
     fn a_reference_is_read_as_a_hub_repository_a_path_or_neither() {
         assert_eq!(
@@ -975,7 +1370,8 @@ mod tests {
                 variant: Some("model-Q4_K_M.gguf".into())
             })
         );
-        // A bare repository is recognised so it can be refused with a message.
+        // A bare repository is recognised as the repository itself, which is
+        // answered for every quantization in it rather than as one file.
         assert_eq!(
             parse_gguf_ref("owner/repo"),
             Some(GgufRef::Hub {
@@ -1268,6 +1664,129 @@ mod tests {
         );
     }
 
+    /// A loopback server that answers a range request's headers at once, with
+    /// a `Content-Length` it then does not honour: the body never comes, and
+    /// the connection is held open for `stall`. The shape of a hub that got as
+    /// far as answering and then stopped sending.
+    fn headers_then_stall_server(stall: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                thread::spawn(move || {
+                    let mut byte = [0_u8; 1];
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-15/1048576\r\n\
+                         Content-Length: 16\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.flush();
+                    thread::sleep(stall);
+                });
+            }
+        });
+        base
+    }
+
+    /// A body the socket's own deadline cut off is the shared budget running
+    /// out; a body that simply ended is the response being broken. Both leave
+    /// the same line of [`RangedReader::fill`] as an `io` error, so the reader
+    /// is where the two have to be told apart -- by the time it reaches
+    /// `probe_quantizations` the reason is a sentence inside a sentence, and a
+    /// row that says "the budget ran out" offers a remedy the other one does
+    /// not have.
+    #[test]
+    fn a_body_the_deadline_cut_off_is_the_budget_and_one_that_ended_early_is_not() {
+        let base = headers_then_stall_server(Duration::from_secs(5));
+        let mut stalled =
+            RangedReader::new(LiveGgufSource::agent(), format!("{base}/m.gguf"), 1 << 20)
+                .with_deadline(Instant::now() + Duration::from_millis(300));
+        let mut buffer = [0_u8; 16];
+        let began = Instant::now();
+        let error = stalled
+            .read(&mut buffer)
+            .expect_err("the body never arrived");
+        assert!(
+            began.elapsed() < Duration::from_secs(4),
+            "the deadline did not cut the body read off: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            stalled.stopped_by_the_budget(),
+            "a body the deadline cut off is the budget: {error}"
+        );
+        // The same line, a different cause: the hub answers the range and the
+        // connection ends partway through the body, with the budget nowhere
+        // near spent. Nothing about that is the clock.
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::ShortBody,
+            listing_of(&[("m-Q4_K_M.gguf", 1 << 20)]),
+        );
+        let mut broken = RangedReader::new(
+            LiveGgufSource::agent(),
+            format!("{}/o/r/resolve/main/m-Q4_K_M.gguf", hub.base),
+            1 << 20,
+        )
+        .with_deadline(Instant::now() + Duration::from_secs(30));
+        let error = broken.read(&mut buffer).expect_err("the body was short");
+        assert!(
+            !broken.stopped_by_the_budget(),
+            "a connection that ended early is the response, not the clock: {error}"
+        );
+    }
+
+    /// Which of the two answers a failed read gets is decided by what failed,
+    /// not by when it failed. A status is the hub's own answer about the file
+    /// and stays that however late it lands; only a transport failure can be
+    /// the clock, and only with the deadline behind it.
+    ///
+    /// The distinction is the row's remedy. "The budget ran out" tells the
+    /// reader to name this quantization on its own, which for a `404` or a
+    /// gated repository walks into the same failure again -- and a read that
+    /// fails at all is a likely one to have been running when the shared
+    /// deadline passed, so the clock on its own would get this wrong often.
+    #[test]
+    fn a_status_the_hub_chose_is_never_the_budget_however_late_it_lands() {
+        let a_while = Duration::from_mins(1);
+        let spent = Instant::now()
+            .checked_sub(a_while)
+            .expect("the clock reaches back a minute");
+        let running = Instant::now() + a_while;
+        let status = ureq::Error::Status(404, ureq::Response::new(404, "Not Found", "").unwrap());
+        assert!(
+            !stopped_by_the_budget(&status, Instant::now(), spent),
+            "a 404 is the hub's answer about this file, whenever it arrives"
+        );
+        let unreachable = ureq::AgentBuilder::new()
+            .build()
+            .get("http://127.0.0.1:1/nothing-listens-here")
+            .timeout(Duration::from_millis(500))
+            .call()
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(unreachable, ureq::Error::Transport(_)),
+            "premise: this has to be a transport failure, not a status: {unreachable:?}"
+        );
+        assert!(
+            stopped_by_the_budget(&unreachable, Instant::now(), spent),
+            "a transport failure with the deadline behind it is the budget"
+        );
+        assert!(
+            !stopped_by_the_budget(&unreachable, Instant::now(), running),
+            "a hub that cannot be reached while the budget still has time left is not the budget"
+        );
+    }
+
     /// A loopback server that accepts every connection, counts it, and answers
     /// nothing for `stall`: the shape of a hub that has stopped responding.
     fn stalling_server(stall: Duration) -> (String, Arc<Mutex<usize>>) {
@@ -1507,7 +2026,10 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("needs a quantization"), "{error}");
+        assert!(
+            error.contains("names a repository, not one file"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2511,5 +3033,227 @@ mod tests {
         let encode = crate::report_delivery::percent_encode;
         assert_eq!(encode("m Q4+K.gguf"), "m%20Q4%2BK.gguf");
         assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    /// A listing of `(name, size)` pairs, as the hub returns it.
+    fn listing_of(files: &[(&str, u64)]) -> String {
+        let siblings: Vec<String> = files
+            .iter()
+            .map(|(name, size)| format!(r#"{{"rfilename":"{name}","size":{size}}}"#))
+            .collect();
+        format!(r#"{{"siblings":[{}]}}"#, siblings.join(","))
+    }
+
+    /// Which files of the repository were actually fetched, in request order
+    /// and without the repeats a multi-window read would make.
+    fn files_fetched(hub: &FakeHub) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for request in hub.requests.lock().unwrap().iter() {
+            let name = request
+                .rsplit("/resolve/main/")
+                .next()
+                .unwrap_or(request)
+                .to_owned();
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+        seen
+    }
+
+    /// Which quantizations a repository offers, and in what order they are
+    /// read: projectors are not models, the shards of one split model are one
+    /// entry, and the smallest comes first.
+    #[test]
+    fn a_repositorys_quantizations_drop_projectors_collapse_shards_and_sort_smallest_first() {
+        let files = [
+            file("m-Q8_0.gguf", 8),
+            file("mmproj-m-f16.gguf", 2),
+            file("m-Q2_K.gguf", 2),
+            file("notes.md", 1),
+            file("m-F16-00002-of-00003.gguf", 5),
+            file("m-F16-00001-of-00003.gguf", 5),
+            file("m-F16-00003-of-00003.gguf", 5),
+            HubFile {
+                name: "m-unsized.gguf".to_owned(),
+                size: None,
+            },
+        ];
+        let names: Vec<String> = repository_quantizations(&files)
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "m-Q2_K.gguf",
+                "m-F16-00001-of-00003.gguf",
+                "m-Q8_0.gguf",
+                "m-unsized.gguf",
+            ],
+            "projectors and non-GGUFs are left out, the three shards are one entry (the first), \
+             and a file the listing did not size comes last"
+        );
+    }
+
+    /// The repository arm reads one header per quantization -- never one header
+    /// reused for the rest -- and reads them smallest first. The hub's own
+    /// request log is the evidence: one file fetched per quantization, in size
+    /// order.
+    #[test]
+    fn every_quantization_of_a_repository_gets_its_own_header_read_smallest_first() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Honour,
+            listing_of(&[
+                ("m-Q8_0.gguf", 3 << 20),
+                ("mmproj-m-f16.gguf", 1 << 20),
+                ("m-Q2_K.gguf", 1 << 20),
+                ("m-Q4_K_M.gguf", 2 << 20),
+            ]),
+        );
+        let probe = LiveGgufSource::with_hub(&hub.base)
+            .probe_quantizations("o", "r")
+            .unwrap();
+        assert_eq!(probe.projectors, 1, "the projector is counted, not sized");
+        let read: Vec<(&str, bool)> = probe
+            .quants
+            .iter()
+            .map(|quant| {
+                (
+                    quant.file.as_str(),
+                    matches!(quant.outcome, QuantProbeOutcome::Read(_)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("m-Q2_K.gguf", true),
+                ("m-Q4_K_M.gguf", true),
+                ("m-Q8_0.gguf", true),
+            ]
+        );
+        // Each quantization is sized against its own file's size, which is what
+        // makes a per-file header necessary rather than one header scaled.
+        let sizes: Vec<Option<u64>> = probe.quants.iter().map(|quant| quant.size).collect();
+        assert_eq!(sizes, [Some(1 << 20), Some(2 << 20), Some(3 << 20)]);
+        assert_eq!(
+            files_fetched(&hub),
+            ["m-Q2_K.gguf", "m-Q4_K_M.gguf", "m-Q8_0.gguf"],
+            "the projector must never be fetched, and the order is smallest first"
+        );
+    }
+
+    /// The cap on how many quantizations one command reads is a cap on
+    /// requests, not only on what the output says: the files past it are never
+    /// asked for, and each is reported as not estimated with the reason.
+    #[test]
+    fn a_repository_larger_than_the_cap_stops_requesting_and_says_which_were_not_read() {
+        let over = MAX_PROBED_QUANTIZATIONS + 3;
+        let names: Vec<String> = (0..over)
+            .map(|index| format!("m-Q{index:02}_K.gguf"))
+            .collect();
+        let files: Vec<(&str, u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), (index as u64 + 1) << 20))
+            .collect();
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Honour,
+            listing_of(&files),
+        );
+        let probe = LiveGgufSource::with_hub(&hub.base)
+            .probe_quantizations("o", "r")
+            .unwrap();
+        assert_eq!(probe.quants.len(), over, "every quantization gets a row");
+        assert_eq!(
+            files_fetched(&hub).len(),
+            MAX_PROBED_QUANTIZATIONS,
+            "the cap must stop the requests, not just the wording"
+        );
+        for quant in &probe.quants[MAX_PROBED_QUANTIZATIONS..] {
+            assert!(
+                matches!(
+                    quant.outcome,
+                    QuantProbeOutcome::NotRead {
+                        reason: NotProbed::TooManyQuantizations,
+                        ..
+                    }
+                ),
+                "{quant:?}"
+            );
+        }
+        assert!(
+            probe.quants[..MAX_PROBED_QUANTIZATIONS]
+                .iter()
+                .all(|quant| matches!(quant.outcome, QuantProbeOutcome::Read(_))),
+            "{:?}",
+            probe.quants
+        );
+    }
+
+    /// The budget is shared by the whole repository read, so a hub too slow to
+    /// answer them all stops making requests rather than spending a fresh
+    /// deadline on each file. The request log is the proof: the quantizations
+    /// after the budget ran out were never asked for.
+    #[test]
+    fn a_repository_read_that_runs_out_of_budget_stops_requesting() {
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            // Every answer for a model file takes 1.5 s.
+            Serve::Slow,
+            listing_of(&[
+                ("m-Q2_K.gguf", 1 << 20),
+                ("m-Q4_K_M.gguf", 2 << 20),
+                ("m-Q5_K_M.gguf", 3 << 20),
+                ("m-Q8_0.gguf", 4 << 20),
+                ("m-F16.gguf", 5 << 20),
+            ]),
+        );
+        let began = Instant::now();
+        let probe = LiveGgufSource::with_hub(&hub.base)
+            .with_budget(Duration::from_secs(2))
+            .probe_quantizations("o", "r")
+            .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "a deadline per file would have taken 7.5 s: {:?}",
+            began.elapsed()
+        );
+        assert_eq!(probe.quants.len(), 5, "every quantization still gets a row");
+        let fetched = files_fetched(&hub);
+        assert!(
+            fetched.len() < 5,
+            "the budget did not stop the requests: {fetched:?}"
+        );
+        assert!(
+            probe
+                .quants
+                .iter()
+                .any(|quant| matches!(quant.outcome, QuantProbeOutcome::Read(_))),
+            "premise: at least one header must be read before the budget runs out, or this \
+             proves nothing about stopping: {:?}",
+            probe.quants
+        );
+        for quant in &probe.quants {
+            if !fetched.contains(&quant.file) {
+                assert!(
+                    matches!(
+                        quant.outcome,
+                        QuantProbeOutcome::NotRead {
+                            reason: NotProbed::BudgetSpent,
+                            ..
+                        }
+                    ),
+                    "`{}` was never fetched, so it has to say the budget ran out: {quant:?}",
+                    quant.file
+                );
+            }
+        }
     }
 }

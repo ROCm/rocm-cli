@@ -1535,9 +1535,9 @@ Some references are handled specially:
   projector file is not recognized as one; it is read like any other GGUF.
 - A file that exists on this machine is read as that file even when its name
   looks like `owner/repo:QUANT`.
-- A bare `owner/repo`, with no quantization, names a repository instead of a
-  file and is answered like any other model outside the catalog: undetermined,
-  with nothing read.
+- A bare `owner/repo`, with no quantization, names a repository rather than a
+  file, and is answered for every quantization it publishes — see
+  [a whole repository at once](#a-whole-repository-at-once) below.
 
 Instead of a recipe's minimum, `diagnose` reads the file's header, which holds
 the layer count, the KV head count and head width, and the tensor shapes. For a
@@ -1650,6 +1650,41 @@ read, the answer stays `undetermined` but still shows what the file needs.
 Layouts the formula does not describe (a file that is one shard of a split
 model, latent attention, a model with no attention layers) are reported as such
 instead of being estimated.
+
+##### A whole repository at once
+
+A GGUF repository usually publishes the same model at a dozen quantizations,
+and picking one before you know which your GPU can hold is guesswork. Name the
+repository with no `:QUANT` and every quantization in it is answered at once:
+
+```
+rocm diagnose --model owner/repo
+```
+
+The report lists them smallest first, each with its quantization, the size of
+its file and its verdict, so the one a modest machine can run is at the top.
+`--context-size` and `--kv-cache-type` apply to every row, and each row's
+figures are built the same way, from the same parts, as the single-file
+estimate above. What a row does not carry is the breakdown: it gives the
+total, and asking about that quantization by name (`owner/repo:QUANT`) gives
+the parts and the list of what would make it fit.
+
+Each row is read from its own file's header: the weights are a file's size less
+*its* header, so one quantization's header is never reused to size another.
+That costs one request per quantization, so the read is bounded twice — the
+12 smallest quantizations at most, and the same two-minute budget for the
+whole repository. Anything past either is listed as **not estimated**, with the
+reason, and never guessed; naming that quantization on its own reads and sizes
+it. A row can also be *read* and still not sizeable — one shard of a split
+model carries the metadata and not the weights — and that row says so
+separately, because naming it alone gives the same answer rather than a size.
+The
+header line counts only the quantizations this host's memory produced a verdict
+for, so it never reports as "does not fit" a file that was never read, or one
+whose layout the estimate declines to judge — each of those says so on its own
+row instead. A multimodal
+projector is not a language model and is left out, and a repository whose only
+GGUF files are projectors says so rather than showing an empty list.
 
 ### Curated models
 

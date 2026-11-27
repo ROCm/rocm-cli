@@ -848,14 +848,15 @@ Feature: Diagnosing failures and listing fixes
     And the plan is to ask again about that path
 
   # owner/repo with no :QUANT names a repository, and every file in it is a
-  # different model, so nothing is read; with a context size the user is told
-  # what would make it answerable. The stand-in hub shows no request was made.
-  @id:diagnose-a-bare-repository-with-a-context-size-asks-for-a-quantization
-  Scenario: diagnose-56 - A bare repository with a context size is told to name a quantization, and nothing is fetched
-    Given a Hugging Face endpoint that records every request made to it
+  # different model. The CLI used to answer that by asking the user to pick one
+  # blind; it now sizes each of them, and `--context-size` applies to every row
+  # rather than to nothing. The repository is named with no quantization and the
+  # context size is asked for, so a row sized at the default would show.
+  @id:diagnose-a-bare-repository-with-a-context-size-sizes-every-quantization
+  Scenario: diagnose-56 - A bare repository with a context size sizes every quantization at that size
+    Given a Hugging Face repository publishing three quantizations and a multimodal projector
     When the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form
-    Then the answer says the reference names a repository and asks for a quantization
-    And no request reached the endpoint
+    Then every quantization was sized at 8192 tokens
 
   # A quantization that matches nothing lists what the repository does hold,
   # and a multimodal projector is among the files listed, marked as one, rather
@@ -1510,10 +1511,10 @@ Feature: Diagnosing failures and listing fixes
     And the CLI offers a consistent pair sized to usable RAM, needing sudo and a reboot
     And the BIOS carve-out is given as advice rather than as a command to run
 
-  # The other direction, and the reason diagnose-89 means anything: the same
+  # The other direction, and the reason diagnose-94 means anything: the same
   # planted machine with a page limit that covers its aperture, and the same
   # clean kernel log, is correctly configured. An entry that fired on the mere
-  # presence of the parameters would pass diagnose-89 and fail here.
+  # presence of the parameters would pass diagnose-94 and fail here.
   @id:diagnose-apu-agreeing-limits-are-not-a-fault @requires-os:linux
   Scenario: diagnose-96 - An integrated GPU whose two limits agree is not told to change them
     Given an integrated-GPU machine whose GTT aperture and TTM page limit agree
@@ -1537,3 +1538,78 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI reports the kernel's own SVM mapping failure as the cause
     When that machine's kernel log no longer carries the failure, and the CLI is asked again
     Then the report says only that the recent log was read, not that the machine never failed
+
+  # The question a user who does not know which quantization to pick actually
+  # has. A GGUF repository publishes the same model a dozen times over at sizes
+  # that differ by a factor of five, and naming one of them is what the CLI used
+  # to require. Naming the repository now answers for every quantization in it.
+  #
+  # The projector is the control: a repository's mmproj file is a GGUF, is not a
+  # language model, and must neither be sized nor fetched. The weights assertion
+  # is the other one: the three files are declared at three sizes, so three rows
+  # carrying three different weight figures is what shows a header was read per
+  # file rather than one header's figures repeated -- which is the design
+  # decision behind the whole feature, and the one a shortcut would break
+  # invisibly.
+  @id:diagnose-a-bare-repository-answers-for-every-quantization
+  Scenario: diagnose-98 - A repository named without a quantization is answered for every quantization it publishes
+    Given a Hugging Face repository publishing three quantizations and a multimodal projector
+    When the user asks the CLI whether that repository would run, in machine-readable form
+    Then every quantization is answered in its own right, smallest first, and the projector is not among them
+    And the endpoint was asked for the file list and one header per quantization
+
+  # A header per quantization is a request per quantization, so a repository of
+  # a hundred files would be a hundred requests. The cap stops the reading, and
+  # the quantizations past it are rows that say why they were not read rather
+  # than rows left out -- an answer that silently listed only the ones it read
+  # would read as the whole repository.
+  #
+  # The request count is the assertion that matters: the wording can be printed
+  # by a build that went on fetching regardless.
+  @id:diagnose-a-repository-past-the-probe-cap-says-which-were-not-read
+  Scenario: diagnose-99 - A repository with more quantizations than one command reads stops asking and says which it did not read
+    Given a Hugging Face repository publishing fifteen quantizations
+    When the user asks the CLI whether that repository would run, in machine-readable form
+    Then the quantizations past the cap are reported as not estimated, with the reason
+    And the endpoint was asked for no more headers than the cap allows
+
+  # The empty case, which must not read like a complete one. A repository whose
+  # only GGUF is a multimodal projector has nothing a context estimate applies
+  # to, and a table with no rows under it would read as "nothing fits". It says
+  # which kind of nothing it found, and reads no header to find out: the file
+  # list alone settles it, as diagnose-52 relies on for a projector named
+  # exactly.
+  @id:diagnose-a-repository-of-only-projectors-has-nothing-to-size
+  Scenario: diagnose-100 - A repository whose only GGUF files are multimodal projectors is told it holds no language model
+    Given a Hugging Face repository that holds only a multimodal projector
+    When the user asks the CLI whether that repository would run, in machine-readable form
+    Then the CLI says the repository holds no language model, and no header was read
+
+  # The two sentences a person reads off a repository answer, and the only ones
+  # of it a machine never sees: the heading above the table and the plan under
+  # it. diagnose-98 to diagnose-100 ask in `--json`, where no heading is
+  # rendered, and they plant no GPU -- so on a hosted runner nothing is
+  # measured, every row reads "not compared", and both sentences take their
+  # other branch. Neither was reached by any scenario before this one.
+  #
+  # So this plants a discrete card with memory of its own, and asks the
+  # fifteen-quantization repository of diagnose-99 in the form a person reads.
+  # Both halves of the fixture are load-bearing. The card is what makes the
+  # rows comparisons rather than bare requirements, so the heading exists at
+  # all; and the cap leaves three of the fifteen unread, which is what makes
+  # the heading's denominator and the row count different numbers -- a heading
+  # counting rows would say fifteen over a table where three say they were
+  # never read. The same unread rows are why the plan may not say "the largest
+  # that fits": the largest files are the ones the cap dropped, and a maximum
+  # over files this command never saw would be a claim it has no basis for.
+  #
+  # @requires-os:linux for the reason diagnose-81 is: the simulation seam the
+  # card is planted through re-roots Linux paths only. It is otherwise ungated
+  # and runs on the blocking mock lane.
+  @id:diagnose-a-repository-answer-counts-and-plans-from-what-it-compared @requires-os:linux
+  Scenario: diagnose-101 - A repository answer on a machine with measurable memory counts and plans from what it actually compared
+    Given a Hugging Face repository publishing fifteen quantizations
+    And a machine whose only GPU is a discrete card with memory of its own
+    When the user asks the CLI whether that repository would run, and reads the report
+    Then the heading counts the quantizations that were compared, not every row of the table
+    And the plan offers the largest quantization it read that fits, and says that is what it is

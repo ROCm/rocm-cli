@@ -6850,7 +6850,8 @@ produce them on an arbitrary real host.
 ### GGUF estimate (models outside the catalog)
 
 A GGUF reference outside the catalog (a local `.gguf` path, or
-`owner/repo:QUANT`) is estimated from its header instead:
+`owner/repo:QUANT`) is estimated from its header instead, and a bare
+`owner/repo` is answered for every quantization it publishes (`model.quantizations`):
 `rocm diagnose --model <ref> --context-size N --kv-cache-type f16|q8_0|q4_0`.
 The verdict stays `undetermined` (`model_not_curated`); the answer is
 `model.estimate`, with outcome `fits`, `does_not_fit` or `cannot_estimate`, and
@@ -6888,10 +6889,26 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   records the ranges it is asked for, so a read of the weights would show, and
   that also answers with a wrong or missing `Content-Range`, a dropped body, a
   missing size in the listing and in the `HEAD`, a gated repository and a slow
-  reply. [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs)
+  reply. The repository probe is tested against the same server: which files it
+  offers (projectors dropped, the shards of one split model collapsed to the
+  first, smallest first), one header read per quantization and none for the
+  projector, and -- asserted on the server's own request log rather than on the
+  wording -- that the per-command cap and the shared budget each stop the
+  requests being made.
+- [gguf_repo_fit.rs](../crates/rocm-core/src/gguf_repo_fit.rs): the
+  repository-level answer -- each quantization sized from its own file's size,
+  a quantization past the budget reported as not estimated with its reason
+  rather than left out or guessed, the rows rendered smallest first with the
+  label read off the file name (and a family name starting with `Q` not
+  mistaken for one), a repository whose only GGUFs are projectors, a listing
+  that could not be read, a host that none of the quantizations fits, and the
+  guard that leaves every reference naming one file alone.
+- [diagnose_model_sends_no_token.rs](../apps/rocm/tests/diagnose_model_sends_no_token.rs):
   runs `rocm diagnose --model owner/repo:QUANT` against such a server with every
   Hugging Face token variable set, and checks that the listing, `HEAD` and
-  range requests carry no `Authorization` or `Cookie` header.
+  range requests carry no `Authorization` or `Cookie` header. It belongs to the
+  hub reads rather than to `gguf_repo_fit.rs`, whose own tests are the list
+  above.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
   host-memory states (dedicated, none, unknown, an APU's measured shared pool,
   an APU whose pool could not be read), what is attached to a
@@ -7036,17 +7053,39 @@ depends on the host's VRAM, so it is covered by the unit tests, not by a
 scenario. Nothing in either runs against a real GPU
 load; see [manual-testing.md](manual-testing.md) for the check that does.
 
-Scenarios `diagnose-53` to `diagnose-56` cover the refusals, all host-independent:
+Scenarios `diagnose-53` to `diagnose-55` cover the refusals, all host-independent:
 the context options without `--model` (a usage error naming it), a curated model
-asked about a context size (told the options do not apply, no estimate), a
+asked about a context size (told the options do not apply, no estimate), and a
 `.gguf` path that does not exist (named as not opened, no upstream route, and a
 plan to ask again about that path, the path quoted where the platform's shell
-needs it, so the step accepts it bare or quoted), and a bare `owner/repo` with a context size
-(told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
+needs it, so the step accepts it bare or quoted). Scenario `diagnose-57` asks the stand-in hub for a quantization that matches
 nothing, and the answer lists the model and the projector, marked as one.
 
+Scenarios `diagnose-56` and `diagnose-98` to `diagnose-100` cover the repository
+answer, against a stand-in hub that serves a listing and range requests over the
+same tiny GGUF fixture and counts every connection: a bare `owner/repo` sized at
+the `--context-size` given (`diagnose-56`), one row per quantization smallest
+first with the projector left out and three different weight figures showing a
+header was read per file (`diagnose-98`), a repository of fifteen quantizations
+whose rows past the cap say why they were not read while the connection count
+shows the requests stopped (`diagnose-99`), and a repository holding only a
+projector, answered from the file list alone (`diagnose-100`).
+
+Those four ask in `--json`, and plant no GPU, so on a hosted runner nothing is
+measured, every row of the table reads "not compared", and the two sentences
+only the text report carries — the heading above the table and the plan under
+it — take their other branch. `diagnose-101` is what reaches them.
+It plants a discrete card with 8 GiB of its own beside the fifteen-quantization
+repository and reads the report as a person does: the heading's denominator has
+to be the twelve the cap let it compare rather than the fifteen rows printed,
+and the plan has to offer the largest quantization it *read* that fits, in
+those words, since the files the cap dropped are the large ones and a maximum
+over them would have nothing behind it. It is `@requires-os:linux` for the
+reason `diagnose-81` is — the seam the card is planted through re-roots Linux
+paths only — and otherwise ungated, so the blocking mock lane runs it.
+
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7])'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7]|diagnose-9[7-9]|diagnose-101)'
 ```
 
 ## Doctor Report Preflight

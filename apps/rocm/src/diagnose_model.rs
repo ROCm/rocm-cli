@@ -109,11 +109,17 @@ pub(crate) fn attach_gguf_estimate(
     gguf_source: &dyn GgufSource,
     vram: Option<&[GpuVramUsage]>,
 ) {
-    let _spinner = reads_from_the_hub(readiness).then(|| {
-        crate::cli_progress::AnimatedSpinner::start(format!(
-            "Reading the GGUF header of {} from Hugging Face...",
-            readiness.model_ref
-        ))
+    let _spinner = hub_read(readiness).map(|read| {
+        crate::cli_progress::AnimatedSpinner::start(match read {
+            HubRead::OneFile => format!(
+                "Reading the GGUF header of {} from Hugging Face...",
+                readiness.model_ref
+            ),
+            HubRead::EveryQuantization => format!(
+                "Reading a GGUF header for each quantization of {} from Hugging Face...",
+                readiness.model_ref
+            ),
+        })
     });
     attach_gguf_estimate_with(
         readiness,
@@ -125,19 +131,48 @@ pub(crate) fn attach_gguf_estimate(
     );
 }
 
-/// Whether estimating this answer reads a file header from the hub: a catalog
-/// miss named as `owner/repo:QUANT` (or `owner/repo:file.gguf`). A curated model,
-/// a local path and a bare `owner/repo` make no request.
-fn reads_from_the_hub(readiness: &ModelReadiness) -> bool {
-    readiness.undetermined_reason == Some(UndeterminedReason::ModelNotCurated)
-        && readiness.canonical_model_id.is_none()
-        && matches!(
-            rocm_core::gguf_source::parse_gguf_ref(&readiness.model_ref),
-            Some(rocm_core::gguf_source::GgufRef::Hub {
-                variant: Some(_),
-                ..
-            })
-        )
+/// What a hub read for this answer would be, for the spinner to say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HubRead {
+    /// One file, named as `owner/repo:QUANT` or `owner/repo:file.gguf`.
+    OneFile,
+    /// A bare `owner/repo`: a header for each quantization it publishes.
+    EveryQuantization,
+}
+
+/// Whether estimating this answer reads from the hub, and what it reads. A
+/// curated model, a local path and a reference that is not a GGUF make no
+/// request.
+///
+/// The repository arm asks [`rocm_core::gguf_repo_fit::names_a_bare_repository`],
+/// which is also what decides whether the probe runs, so the spinner cannot
+/// promise a read that does not happen or stay silent through one that does.
+fn hub_read(readiness: &ModelReadiness) -> Option<HubRead> {
+    // Asked first, and with nothing in front of it: `names_a_bare_repository`
+    // applies the catalog gate itself -- an answer the catalog resolved is not
+    // a bare repository to it either -- so a copy of that gate here would be a
+    // second thing to keep in step with the probe, which is the one thing this
+    // function exists to avoid.
+    if rocm_core::gguf_repo_fit::names_a_bare_repository(readiness).is_some() {
+        return Some(HubRead::EveryQuantization);
+    }
+    // The one-file arm has no such shared decider. `parse_gguf_ref` reads the
+    // reference and nothing else, so the gate is applied here for that arm
+    // alone: a curated `owner/repo:QUANT` still parses as a hub file, and the
+    // catalog answers it without a request.
+    if readiness.undetermined_reason != Some(UndeterminedReason::ModelNotCurated)
+        || readiness.canonical_model_id.is_some()
+    {
+        return None;
+    }
+    matches!(
+        rocm_core::gguf_source::parse_gguf_ref(&readiness.model_ref),
+        Some(rocm_core::gguf_source::GgufRef::Hub {
+            variant: Some(_),
+            ..
+        })
+    )
+    .then_some(HubRead::OneFile)
 }
 
 /// [`attach_gguf_estimate`] with whether a mask is set passed in, so a test can
@@ -150,9 +185,16 @@ fn attach_gguf_estimate_with(
     vram: Option<&[GpuVramUsage]>,
     mask_set: bool,
 ) {
-    // The one step that can touch a file or the network, and only for a GGUF
-    // reference the catalog does not carry; it reads the header, not the weights.
+    // The two steps that can touch a file or the network, and only for a GGUF
+    // reference the catalog does not carry: this one reads the header of the
+    // file named, and the repository step below reads one header per
+    // quantization. Headers, never weights.
     attach_context_estimate(readiness, context, host, gguf_source);
+    // The repository arm of the same question. `attach_context_estimate` sizes
+    // one named file and leaves a bare `owner/repo` alone; this sizes every
+    // quantization the repository publishes, and does nothing for any other
+    // reference, so the two never both act on one answer.
+    rocm_core::gguf_repo_fit::attach_repository_fit(readiness, context, host, gguf_source);
     // Which card a device-visibility mask selects, in `amd-smi`'s numbering, has
     // not been verified on a multi-GPU machine, so an estimate that compared
     // memory says so when it could have compared the wrong card. After the
@@ -202,12 +244,13 @@ fn mask_set_where(is_set: impl Fn(&str) -> bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_core::gguf_fit::{ContextEstimate, FitRequest};
+    use rocm_core::gguf_fit::ContextEstimate;
     use rocm_core::model_readiness::{AcceleratorMemory, ModelCatalogSource};
 
-    /// The spinner is for a hub read only: a catalog miss named `owner/repo:QUANT`.
-    /// A local path, a bare repository, a name that is not a GGUF reference and a
-    /// curated model make no request, so they get none.
+    /// The spinner is for a hub read only, and says which read it covers: one
+    /// named file, or every quantization of a bare repository. A local path, a
+    /// name that is not a GGUF reference and a curated model make no request,
+    /// so they get none.
     #[test]
     fn only_a_hub_gguf_outside_the_catalog_is_read_from_the_hub() {
         let registry = rocm_core::builtin_model_recipe_registry();
@@ -224,48 +267,114 @@ mod tests {
                 None,
             )
         };
-        assert!(reads_from_the_hub(&answer(
-            "some-lab/never-curated-7b:Q4_K_M"
-        )));
-        assert!(reads_from_the_hub(&answer(
-            "some-lab/never-curated-7b:dir/m-Q4_K_M.gguf"
-        )));
-        for model in [
-            "models/m.gguf",
-            "some-lab/never-curated-7b",
-            "not-a-gguf-at-all",
-        ] {
-            assert!(!reads_from_the_hub(&answer(model)), "{model}");
+        assert_eq!(
+            hub_read(&answer("some-lab/never-curated-7b:Q4_K_M")),
+            Some(HubRead::OneFile)
+        );
+        assert_eq!(
+            hub_read(&answer("some-lab/never-curated-7b:dir/m-Q4_K_M.gguf")),
+            Some(HubRead::OneFile)
+        );
+        // A bare repository now reads too -- a header per quantization -- so
+        // the spinner says that rather than naming one file.
+        assert_eq!(
+            hub_read(&answer("some-lab/never-curated-7b")),
+            Some(HubRead::EveryQuantization)
+        );
+        for model in ["models/m.gguf", "not-a-gguf-at-all"] {
+            assert_eq!(hub_read(&answer(model)), None, "{model}");
         }
         let curated = &registry.recipes[0].canonical_model_id;
-        assert!(!reads_from_the_hub(&answer(curated)), "{curated}");
+        assert_eq!(hub_read(&answer(curated)), None, "{curated}");
     }
 
-    /// A readiness whose estimate compared memory, built without a network or a file.
+    /// The catalog gate the one-file arm applies for itself, in the one state
+    /// where only that arm can apply it: a reference the catalog *did* answer
+    /// that is still written `owner/repo:QUANT`. The repository arm's gate
+    /// lives inside `names_a_bare_repository`, so nothing it does covers this,
+    /// and dropping the gate as a duplicate of that one would draw a spinner
+    /// promising a hub read for an answer that makes no request.
+    ///
+    /// Built by taking a real answer about an uncurated reference and marking
+    /// it answered, each way round separately: a recipe whose canonical id
+    /// carries a quantization would arrive exactly so.
+    #[test]
+    fn a_catalog_answer_written_as_a_hub_file_still_reads_nothing() {
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+            system_ram_gib: None,
+        };
+        let uncurated = || {
+            crate::model_fit::assess_model_for_host(
+                "some-lab/never-curated-7b:Q4_K_M",
+                &ModelCatalogSource::Available(&registry),
+                &host,
+                None,
+                None,
+            )
+        };
+        // The premise: unanswered, this reference is a hub read.
+        assert_eq!(hub_read(&uncurated()), Some(HubRead::OneFile));
+        let mut resolved = uncurated();
+        resolved.canonical_model_id = Some("some-lab/curated-7b".to_owned());
+        assert_eq!(
+            hub_read(&resolved),
+            None,
+            "the catalog named this model, so there is nothing to read from the hub: {resolved:?}"
+        );
+        let mut settled = uncurated();
+        settled.undetermined_reason = None;
+        assert_eq!(
+            hub_read(&settled),
+            None,
+            "the answer is not waiting on the catalog, so no hub read follows it: {settled:?}"
+        );
+    }
+
+    /// A readiness whose estimate compared memory, built without a network: the
+    /// header comes from the in-memory [`tiny_gguf`] through [`OneFile`].
+    ///
+    /// Sized for real rather than hand-assembled from
+    /// [`ContextEstimate::unreadable`] with `available_gib` poked in
+    /// afterwards. That shape -- the host's memory with no total beside it --
+    /// is exactly the one `note_unverified_mask` must leave alone, so a fixture
+    /// built that way would have stood for "compared" while being the opposite
+    /// of it, and the test below would have certified the bug.
     fn readiness_with_a_compared_estimate() -> ModelReadiness {
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+            system_ram_gib: Some(64.0),
+        };
+        let registry = rocm_core::builtin_model_recipe_registry();
         let mut readiness = crate::model_fit::assess_model_for_host(
             "some-lab/never-curated-7b:Q4_K_M",
-            &ModelCatalogSource::Unreachable {
-                detail: "not needed here".to_owned(),
-            },
-            &HostFacts {
-                accelerator_memory: AcceleratorMemory::Dedicated(24.0),
-                system_ram_gib: None,
-            },
+            // A reachable catalog that does not carry this reference: that is
+            // what `attach_context_estimate` sizes a GGUF for. An unreachable
+            // catalog leaves a different undetermined reason behind and gets no
+            // estimate at all.
+            &ModelCatalogSource::Available(&registry),
+            &host,
             None,
             None,
         );
-        let mut estimate = ContextEstimate::unreadable(
-            "x.gguf",
-            &FitRequest {
-                context_size: 4096,
-                context_size_defaulted: true,
-                kv_cache_type: KvCacheType::F16,
-            },
-            &anyhow::anyhow!("not read"),
+        // No rows and no mask: the caveat is what each caller applies itself.
+        attach_gguf_estimate_with(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host,
+            &OneFile(tiny_gguf()),
+            None,
+            false,
         );
-        estimate.available_gib = Some(24.0);
-        readiness.estimate = Some(estimate);
+        assert!(
+            readiness
+                .estimate
+                .as_ref()
+                .is_some_and(ContextEstimate::compared_with_memory),
+            "premise: the fixture has to be an estimate that really was compared: {:?}",
+            readiness.estimate
+        );
         readiness
     }
 

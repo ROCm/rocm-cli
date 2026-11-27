@@ -672,11 +672,15 @@ mod tests {
         assert_eq!(sel, Selection::Packages(want));
     }
 
-    /// A graph with the two crates whose tests read docs and skills from outside
-    /// their own directory, and a leaf that reads nothing.
+    /// A graph with the crates whose tests read docs and skills from outside
+    /// their own directory, and a leaf that reads nothing. `rocm-core` is one of
+    /// them, for `README.md` alone, and has to exist here: a declared reader the
+    /// graph does not know widens the selection to the whole workspace, which
+    /// would pass this test for the wrong reason.
     fn reader_graph() -> Graph {
         let crate_dirs = vec![
             ("rocm".to_string(), "apps/rocm".to_string()),
+            ("rocm-core".to_string(), "crates/rocm-core".to_string()),
             ("xtask".to_string(), "xtask".to_string()),
             ("leaf".to_string(), "crates/leaf".to_string()),
         ];
@@ -701,7 +705,6 @@ mod tests {
         for path in [
             "docs/nightly-on-the-queue.md",
             "docs/testing.md",
-            "README.md",
             "skills/rocm-cli-assistant/SKILL.md",
         ] {
             assert_eq!(
@@ -710,6 +713,14 @@ mod tests {
                 "{path}"
             );
         }
+        // The README has a third reader: `rocm-core` holds the quantization cap
+        // the README prints. Asserted apart from the others so that the extra
+        // crate is this file's claim about the README specifically, rather than
+        // something every doc quietly drags in.
+        assert_eq!(
+            select_with_readers(&["README.md".to_string()], &reader_graph()),
+            Selection::Packages(names(&["rocm", "rocm-core", "xtask"]))
+        );
     }
 
     /// The widening adds to the directory-based selection and keeps its other
