@@ -203,8 +203,9 @@ waiting out the load did not produce a working server. Setting
 did not shorten the model load (about 14 minutes with it too). These are two runs
 of one model on one host.
 
-`rocm runtimes activate`, `rocm install sdk` and `rocm serve` print a `warning:`
-when the runtime they act on is SDK 10.2.0 on a WSL2 host. To move to 10.1.0, run
+`rocm runtimes activate`, `rocm runtimes rollback`, `rocm update --apply --activate`,
+`rocm install sdk` and a Lemonade `rocm serve` print a `warning:` when the runtime
+they act on is SDK 10.2.0 on a WSL2 host. To move to 10.1.0, run
 `rocm install sdk --version 10.1.0`, or `rocm runtimes activate <runtime_key>` for
 a 10.1.0 runtime that `rocm runtimes list` already shows.
 
@@ -217,10 +218,11 @@ log.
 
 `llama-server` writes nothing to its log while it copies the model to the GPU, so
 a load that is slow enough to take more than five minutes (several GiB at 20 MiB/s)
-is still stopped by that silence limit, here (`DIRECT_SERVER_READY_POLICY` in
-[direct_llama.rs](../engines/lemonade/src/direct_llama.rs)) and in the interactive
-wait that `rocm serve` runs (`SILENT_LOAD` in
-[serve_progress.rs](../apps/rocm/src/serve_progress.rs)). The limit is not raised,
+is still stopped by that silence limit (`SERVE_SILENT_LOAD_LIMIT` in
+`crates/rocm-core/src/endpoint_readiness.rs`), both by the engine
+(`DIRECT_SERVER_READY_POLICY` in `engines/lemonade/src/direct_llama.rs`) and by the
+interactive wait that `rocm serve` runs (`SILENT_LOAD` in
+`apps/rocm/src/serve_progress.rs`). The limit is not raised,
 because the measurement above ended in a fault after the load. Moving to 10.1.0 is
 the way past it.
 

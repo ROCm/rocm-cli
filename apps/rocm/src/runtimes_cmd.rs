@@ -203,6 +203,11 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                     &result.runtime_key
                 )
             );
+            if let Some(advisory) =
+                crate::runtime_advisory::advisory_for_runtime_key(&paths, &result.runtime_key)
+            {
+                println!("{advisory}");
+            }
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
             let (severity, detail) =

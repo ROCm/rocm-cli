@@ -475,10 +475,13 @@ Feature: Runtime lifecycle state machine
   # activated, and the way out it names has to work: activating a registered
   # 10.1.0 runtime ends the warning. The host is simulated (`/dev/dxg` under a
   # test host root), so the scenario holds on a machine that is not WSL2 and on
-  # one that is. The same warning is printed by `rocm install sdk` and by
-  # `rocm serve`; neither can run on the mock lane (no download, no GPU), so their
-  # text and when it appears are covered by unit tests in
-  # apps/rocm/src/runtime_advisory.rs and apps/rocm/src/runtime_install_finalize.rs.
+  # one that is. The same warning is printed by `rocm runtimes rollback`,
+  # `rocm update --apply --activate`, `rocm install sdk` and a Lemonade
+  # `rocm serve`. The last two cannot run on the mock lane without a download or a
+  # GPU, so their wiring is covered by unit tests (the planted-manifest lookup in
+  # apps/rocm/src/runtime_advisory.rs and the finalized install report in
+  # apps/rocm/src/runtime_install_finalize.rs); the `rocm serve` call site itself is
+  # one line with no scenario or unit test of its own.
   @id:runtime-lifecycle-activate-warns-about-slow-sdk-on-wsl @requires-os:linux
   Scenario: runtime-lifecycle-33 - Activating ROCm SDK 10.2.0 on WSL2 warns that loading a model can be slow, and activating 10.1.0 ends the warning
     Given a WSL2 host
@@ -487,6 +490,7 @@ Feature: Runtime lifecycle state machine
     Then the activation succeeds and warns that model loading can be slow on WSL2 and names ROCm SDK 10.1.0
     When the user activates the ROCm SDK 10.1.0 runtime
     Then the activation succeeds without that warning
+    And the ROCm SDK 10.1.0 runtime is the active runtime
 
   # The measurement was made on WSL2 only, so the same runtime elsewhere must not
   # be called slow.

@@ -2287,17 +2287,22 @@ way back to 10.1.0 ([wsl.md](wsl.md#known-issue-rocm-sdk-1020-loads-models-slowl
 (`runtime-lifecycle-33`) activates a planted 10.2.0 runtime on a simulated WSL2
 host (`/dev/dxg` under `ROCM_CLI_TEST_HOST_ROOT`), expects the warning, then
 follows the command the warning names (`rocm runtimes activate` for a registered
-10.1.0 runtime) and expects the warning gone;
+10.1.0 runtime), expects the warning gone and the 10.1.0 runtime to be the active
+one; the other command it names, `rocm install sdk --version 10.1.0`, is only
+checked to parse, because installing needs a download;
 `@id:runtime-lifecycle-slow-sdk-warning-is-wsl-only` (`runtime-lifecycle-34`) is the
 same activation on a host that is not WSL2 and expects none. `rocm install sdk`
 and `rocm serve` cannot run on the mock lane, so the advisory's text and the
-versions and hosts it applies to are pinned by `runtime_advisory.rs`'s unit tests,
-and the install report by
-`render_sdk_install_success_warns_for_the_slow_sdk_on_wsl_only`:
+versions, hosts and serve engines it applies to are pinned by
+[runtime_advisory.rs](../apps/rocm/src/runtime_advisory.rs)'s unit tests (including
+the lookup from a planted manifest), and the install report by
+`a_finalized_slow_sdk_install_report_carries_the_warning_on_wsl` in
+[runtime_install_finalize.rs](../apps/rocm/src/runtime_install_finalize.rs). The
+single `rocm serve` call site is not covered by a test:
 
 ```bash
 cargo xtask e2e -- -n 'runtime-lifecycle-3[34] '
-cargo test -p rocm --bin rocm -- runtime_advisory render_sdk_install_success
+cargo test -p rocm --bin rocm -- runtime_advisory slow_sdk
 ```
 
 Activate one validated runtime:

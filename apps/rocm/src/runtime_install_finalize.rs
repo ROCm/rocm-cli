@@ -1740,6 +1740,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// The version in the warning comes from the manifest the install left, through
+    /// the real finalization: an installed 10.2.0 runtime warns on WSL2 in the report.
+    #[test]
+    fn a_finalized_slow_sdk_install_report_carries_the_warning_on_wsl() -> Result<()> {
+        let (_root, paths) = test_paths("install-sdk-slow-advisory");
+        crate::test_support::write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-10-2-0",
+            "therock-release:gfx1151",
+            "10.2.0",
+            1,
+        )?;
+        let finalized = finalize_successful_sdk_install(&paths)?
+            .context("the install should finalize the planted runtime")?;
+        let report = render_sdk_install_success_on(&finalized, true);
+        assert!(
+            report.contains("warning: ROCm SDK 10.2.0 on WSL2"),
+            "{report}"
+        );
+        assert!(
+            !render_sdk_install_success_on(&finalized, false).contains("warning:"),
+            "not WSL2"
+        );
+        Ok(())
+    }
+
     #[test]
     fn install_sdk_fails_when_the_install_left_a_runtime_that_cannot_open_a_device() -> Result<()> {
         let (_root, paths) = test_paths("install-sdk-unusable");

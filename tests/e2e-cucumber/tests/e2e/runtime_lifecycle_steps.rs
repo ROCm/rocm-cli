@@ -812,6 +812,13 @@ async fn activation_warns_about_slow_sdk(world: &mut E2eWorld) {
     );
 }
 
+/// Following the warning's advice has to leave the 10.1.0 runtime the active one,
+/// not merely silence the warning.
+#[then("the ROCm SDK 10.1.0 runtime is the active runtime")]
+async fn good_sdk_is_active(world: &mut E2eWorld) {
+    assert_eq!(active_runtime_key(world), GOOD_SDK_KEY);
+}
+
 #[then("the activation succeeds without that warning")]
 async fn activation_has_no_slow_sdk_warning(world: &mut E2eWorld) {
     let out = ok_output(world);
