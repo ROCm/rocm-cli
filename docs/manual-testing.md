@@ -2967,3 +2967,26 @@ ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
 
 Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
 gone, and `real-cache/keep` is still there.
+
+## 22. One-Shot Local Chat With No Built-In Assistant Running
+
+The automated scenarios (`chat-25` to `chat-28`) cover these against a mock
+server; repeat them by hand with a real one. Start a server for any model that
+is not the built-in assistant, for example
+`rocm serve 'unsloth/Qwen3-0.6B-GGUF:Q4_K_M' --engine lemonade --wait`, and make
+sure the built-in assistant (`Qwen3-4B-Instruct-2507-GGUF`) is not running.
+
+```bash
+rocm chat --provider local --prompt "What is 17*23?"; echo "exit=$?"
+rocm chat --tools --provider local --prompt "What is 17*23?"; echo "exit=$?"
+rocm chat --provider local --model nobody/serves-this --prompt "Hello"; echo "exit=$?"
+```
+
+Expected result for each: nothing on standard output, exit non-zero, and an
+error on stderr that says a local server is running and lists it by the name
+`--model` takes. The first prints a `rocm chat --provider local --model <name>
+--prompt …` command, and running that command answers. The second prints the
+same command without `--tools` and says why it is left out. The third says no
+ready server serves `nobody/serves-this`. With no server running at all, the
+first command prints `No local assistant is running yet.` on stderr and exits
+non-zero.

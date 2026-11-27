@@ -2896,6 +2896,29 @@ cargo xtask e2e -- -n "chat-24"
 cargo test -p rocm-dash-tui --lib chat_runtime
 ```
 
+`rocm chat --provider local` without `--model` answers only through the
+built-in assistant, so a ready server serving another model is named instead of
+reported as missing. `chat-25` (`chat-local-ready-other-server-is-named`),
+`chat-26` (`chat-local-no-server-fails`), `chat-27`
+(`chat-local-ready-other-server-with-tools`) and `chat-28`
+(`chat-local-unserved-model-lists-ready-servers`) drive the CLI against a
+planted non-assistant server, no server, the same server with `--tools`, and a
+`--model` nothing serves. Each requires a non-zero exit with an empty standard
+output and the message on stderr (the ready server listed by its `--model`
+name with the command that uses it, `--tools` left out of that command with the
+reason, or "No local assistant is running yet."). `chat-25`, `chat-27` and
+`chat-28` also require that the served model never received the prompt (its
+readiness probe is not the prompt), and `chat-25` then runs the command it was
+shown and requires that the reply prints and the model receives the prompt:
+
+```bash
+cargo xtask e2e -- -n "chat-25"
+cargo xtask e2e -- -n "chat-26"
+cargo xtask e2e -- -n "chat-27"
+cargo xtask e2e -- -n "chat-28"
+cargo test -p rocm --bin rocm chat::turn
+```
+
 Log browser smoke:
 
 ```bash

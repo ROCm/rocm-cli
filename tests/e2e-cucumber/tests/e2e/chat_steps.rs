@@ -621,3 +621,188 @@ async fn no_line_holding_the_folder_is_offered(world: &mut E2eWorld) {
         "a refused turn must offer no command line on stderr either:\n{stderr}"
     );
 }
+
+// ── Local chat with no usable server (chat-25 .. chat-28) ───────────
+
+/// A model no planted service serves, for chat-28.
+const UNSERVED_MODEL: &str = "Nobody/Serves-This";
+
+/// Run `rocm chat --provider local --prompt Hello` with `extra` arguments in
+/// front, and keep stdout, stderr and the exit code for the `Then` steps; every
+/// scenario here expects a failure, which they check.
+fn run_local_chat_for_failure(world: &mut E2eWorld, extra: &[&str]) {
+    let mut args = vec!["chat"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--provider", "local", "--prompt", "Hello"]);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user sends a one-shot chat prompt through the CLI without naming a model")]
+async fn user_sends_oneshot_chat_without_a_model(world: &mut E2eWorld) {
+    run_local_chat_for_failure(world, &[]);
+}
+
+#[when(
+    "the user sends a one-shot chat prompt with ROCm tools through the CLI without naming a model"
+)]
+async fn user_sends_oneshot_tools_chat_without_a_model(world: &mut E2eWorld) {
+    run_local_chat_for_failure(world, &["--tools"]);
+}
+
+#[when("the user sends a one-shot chat prompt through the CLI naming a model no server serves")]
+async fn user_sends_oneshot_chat_for_an_unserved_model(world: &mut E2eWorld) {
+    run_local_chat_for_failure(world, &["--model", UNSERVED_MODEL]);
+}
+
+fn chat_stderr(world: &E2eWorld) -> &str {
+    world.cli_stderr.as_deref().expect("no command was run")
+}
+
+/// The commands the message prints for the user to run: its indented
+/// `rocm chat` lines.
+fn offered_chat_commands(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("rocm chat "))
+        .collect()
+}
+
+#[then("the CLI fails and nothing is printed to standard output")]
+async fn cli_fails_with_empty_stdout(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().expect("no command was run");
+    let rc = world.cli_rc.expect("no command was run");
+    assert_ne!(
+        rc,
+        0,
+        "nothing could answer, so the CLI must not exit 0:\n{stdout}\n{}",
+        chat_stderr(world)
+    );
+    assert!(
+        stdout.is_empty(),
+        "the message belongs on stderr, not stdout:\n{stdout}"
+    );
+}
+
+#[then("the CLI says a local server is running and prints the chat command naming that model")]
+async fn cli_names_the_ready_server(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let stderr = chat_stderr(world);
+    assert!(
+        stderr.contains("A local server is running") && stderr.contains(&format!("  {model}\n")),
+        "the message must say a server is running and list it by name:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("No local assistant is running yet."),
+        "a ready server must not be reported as missing:\n{stderr}"
+    );
+    let commands = offered_chat_commands(stderr);
+    assert!(
+        commands
+            .iter()
+            .any(|line| line.starts_with(&format!("rocm chat --provider local --model {model}"))),
+        "the message must print the command that uses the ready server:\n{stderr}"
+    );
+}
+
+#[when("the user runs the chat command the CLI printed")]
+async fn user_runs_the_printed_chat_command(world: &mut E2eWorld) {
+    // The advice is only worth printing if following it clears the condition
+    // that printed it, so run exactly the line shown, minus the program name.
+    let stderr = chat_stderr(world).to_owned();
+    let line = offered_chat_commands(&stderr)
+        .into_iter()
+        .next()
+        .expect("the CLI printed no chat command");
+    let args: Vec<String> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|arg| arg.trim_matches('\'').to_owned())
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
+    assert!(
+        rc == 0,
+        "the printed command must work (rc={rc}):\n{stdout}\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the served model received the prompt")]
+async fn served_model_received_the_prompt(world: &mut E2eWorld) {
+    let requests = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .chat_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.to_string().contains("Hello")),
+        "the model must receive the prompt when the printed command is run, got {requests:?}"
+    );
+}
+
+#[then("the CLI says on stderr that no local assistant is running yet")]
+async fn cli_says_no_assistant_on_stderr(world: &mut E2eWorld) {
+    let stderr = chat_stderr(world);
+    assert!(
+        stderr.contains("No local assistant is running yet."),
+        "stderr must say no local assistant is running:\n{stderr}"
+    );
+}
+
+#[then("the CLI offers a chat command for that model without --tools and says why")]
+async fn cli_offers_a_command_without_tools(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let stderr = chat_stderr(world);
+    let commands = offered_chat_commands(stderr);
+    assert!(
+        commands
+            .iter()
+            .any(|line| line.starts_with(&format!("rocm chat --provider local --model {model}"))),
+        "the message must print a chat command for the ready server:\n{stderr}"
+    );
+    assert!(
+        commands.iter().all(|line| !line.contains("--tools")),
+        "the offered command must not keep --tools:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--tools is left out")
+            && stderr.contains("only with the built-in assistant"),
+        "the message must say why --tools is left out:\n{stderr}"
+    );
+}
+
+#[then("the CLI says no ready server serves that model and lists the ready one")]
+async fn cli_lists_the_ready_server_for_an_unserved_model(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let stderr = chat_stderr(world);
+    assert!(
+        stderr.contains(&format!("No ready local server serves `{UNSERVED_MODEL}`"))
+            && stderr.contains(&format!("  {model}\n")),
+        "the message must name the unserved model and list what is ready:\n{stderr}"
+    );
+}
+
+#[then("the served model never received the prompt")]
+async fn served_model_never_received_the_prompt(world: &mut E2eWorld) {
+    // The CLI's own readiness probe ("Say ok.") reaches the model on the way to
+    // finding it ready; the user's prompt must not.
+    let requests = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .chat_requests();
+    let sent = requests
+        .iter()
+        .filter(|request| request.to_string().contains("Hello"))
+        .collect::<Vec<_>>();
+    assert!(
+        sent.is_empty(),
+        "nothing may be sent to the model, but it received {sent:?}"
+    );
+}
