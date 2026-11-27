@@ -575,20 +575,21 @@ jobs:
   #
   # Only a pull request from this repository: a fork's token cannot dispatch, and
   # the queue only checks out branches of this repository. A run the queue does
-  # not take (too many going, or the nightly's window) fails this job, with the
+  # not take (too many going, or no healthy worker) fails this job, with the
   # queue's reason, rather than passing: a missing report is never green.
   e2e-gpu-queue:
     name: E2E tests (MI325X, queue)
     runs-on: ubuntu-24.04 # one LTS: only calls the GitHub API and copies files
-    # The queue run's own limit is 286 min; the dispatch and the download add
-    # 10 min: 296. A GitHub-hosted job ends at 360 min whatever is set here.
-    timeout-minutes: 296
+    # The queue run's own limit is 341 min; the dispatch and the download add
+    # 10 min: 351. A GitHub-hosted job ends at 360 min whatever is set here.
+    timeout-minutes: 351
     needs: [changes]
     permissions:
       actions: write
-    # Set when the queue refused for the nightly window: a skip of this job, not a
-    # failure. The gfx942 check in `e2e-report` still needs a self-hosted pass then:
-    # a skipped lane is never a pass.
+    # Set when this job skipped itself (the queue side is switched off, or this
+    # branch adds queue-pr-run.yml): a skip, not a failure. The gfx942 check in
+    # `e2e-report` still needs a self-hosted pass then: a skipped lane is never
+    # a pass.
     outputs:
       skipped: ${{ steps.queue.outputs.skipped }}
     # No `always()`: a job that keeps its condition true through a cancellation
@@ -708,16 +709,8 @@ jobs:
           mkdir -p queue-results report
           gh run download "$run_id" --name queue-pr-run-results --dir queue-results ||
             echo "::warning::the queue run published no results"
-          # The nightly's window is by design, not a fault: the lane is skipped
-          # for this push, said in the summary, and the job ends green with no
-          # report, which the consolidated report reads as skipped. Any other
-          # refusal stays red.
-          if [ -f queue-results/refused.txt ] && [[ "$(head -n 1 queue-results/refused.txt)" == nightly:* ]]; then
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::the queue lane does not run for this push: the nightly window"
-            echo "The queue lane will not run for this push: the queue side keeps its GPUs for the nightly while the nightly's window lasts. Re-run this job once the window has passed." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          # Every refusal fails the job, whatever its reason: a lane the queue did
+          # not take is never a silent green.
           if [ -f queue-results/refused.txt ]; then
             echo "::error::the queue did not take the run: $(head -n 1 queue-results/refused.txt)"
             echo "The queue did not take the run: $(head -n 1 queue-results/refused.txt)" >> "$GITHUB_STEP_SUMMARY"

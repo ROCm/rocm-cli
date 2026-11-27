@@ -51,7 +51,8 @@ long it waited. The job waits until every lane has finished or been
 cancelled, then publishes the run as below. The job log starts with the run's inputs
 (below). Only one run goes at a time: a second
 dispatch waits for the first, and the queue side refuses one while another,
-however started, is unfinished. GitHub keeps at most one job waiting, so a
+however started, is unfinished (a pull request's run, below, is not one of them: it is another kind
+of run, with a limit of its own, and it does not hold the nightly back). GitHub keeps at most one job waiting, so a
 third dispatch, or the nightly schedule, replaces a dispatch still waiting
 and that one never runs. The branch must exist in this repository;
 otherwise the job fails at once.
@@ -76,19 +77,17 @@ run is the primary gfx942 check and the self-hosted one the second.
 
 A pull request's run is a preset of the queue side: one GPU model (MI325X, which
 has the same gfx942 target as the MI300X), the
-`release` channel alone and no `@nightly` scenarios, a lane that waits at most 45
+`release` channel alone and no `@nightly` scenarios, a lane that waits at most 100
 minutes to be started and runs at most 75, and a limited number of such runs
-at once (the queue side sets the limit). The
-queue side does not take one while the nightly goes, or when it has no healthy
-MI325X worker: the gate job then fails with the reason the queue gave, which is
-capacity, not a failing test (the consolidated report's gfx942 check,
-[`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh), still counts a run the
-queue refused as a lane that ran and failed). The nightly window is the exception, being by design:
-the gate ends green with a note in its summary to re-run once the window has
-passed (the queue side defines the window), and
-the consolidated report reads the lane as skipped, not missing; the gfx942 check
-still needs a passing report from the self-hosted lane, since a skipped lane is
-never a pass. A superseded push cancels the gate job, which cancels
+at once (the queue side sets the limit). A pull request's run goes at any hour,
+the nightly's included: the nightly's MI325X lane is one GPU, held for about
+half an hour on the nights checked, and the queue has many more MI325X GPUs. The queue side does not
+take a run when too many are going, or when it has no healthy MI325X worker: the
+gate job then fails with the reason the queue gave, which is capacity, not a
+failing test (the consolidated report's gfx942 check,
+[`mi300x-gate.sh`](../.github/scripts/mi300x-gate.sh), counts a run the queue
+refused as a lane that ran and failed). No refusal is a skip: a lane the queue
+did not take is never a silent green. A superseded push cancels the gate job, which cancels
 the run it started, freeing the runner; the queue side's lanes are left to their
 own budgets. The queue run tests the branch as it is when the run starts, not
 the pull request's merge with its base, which the self-hosted lane checks out.
@@ -114,9 +113,8 @@ this repository, so the gate's tests pin the gate's half only (the
 the same two constants the script is checked against):
 
 - **A refusal.** A run the queue did not take publishes `refused.txt` in
-  `queue-pr-run-results`, whose first line is the reason. A reason that starts
-  with `nightly:` is the nightly window and skips the gate; any other reason
-  fails it.
+  `queue-pr-run-results`, whose first line is the reason. Any reason fails the
+  gate, and the gate shows it.
 - **The report.** The MI325X lane's release-channel report is
   `mi325x/release/results/report.json` in that artifact, and its whole
   `results` directory is the job's report. A run with none fails the gate. While
@@ -385,11 +383,13 @@ the whole is 34530 s, 576 min. Its `timeout-minutes` is 596: that, and 20 min
 for the runner's own delays and the upload of the lanes' files, which the same
 limit covers.
 
-For `queue-pr-run.yml`, with `W` 2700 s and `R` 4500 s (a pull request's lanes,
-as in "Pull requests" above), the wait is 9780 s and the whole is 15930 s, 266 min. Its
-`timeout-minutes` is 286, by the same 20 min. The gate job `e2e-gpu-queue` waits
+For `queue-pr-run.yml`, with `W` 6000 s and `R` 4500 s (a pull request's lanes,
+as in "Pull requests" above), the wait is 13080 s and the whole is 19230 s, 321 min. Its
+`timeout-minutes` is 341, by the same 20 min. The gate job `e2e-gpu-queue` waits
 for it on a GitHub-hosted runner, which ends a job after 360 min, so its limit
-is the run's plus 10 min for the dispatch and the download: 296.
+is the run's plus 10 min for the dispatch and the download: 351. That leaves 9 min
+below GitHub's limit, so a longer `W` needs a gate that does not hold a job for the
+whole run.
 
 ## What the workflow requires
 

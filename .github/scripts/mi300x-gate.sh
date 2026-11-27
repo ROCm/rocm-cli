@@ -159,7 +159,7 @@ mark=":white_check_mark:"
   echo "- queue lane, MI325X (\`e2e-gpu-queue\`): ${queue_label} (result: ${QUEUE_RESULT:-absent})"
   echo "- self-hosted lane, MI300X (\`e2e-gpu\`): ${selfhosted_label} (result: ${selfhosted_result:-absent})"
   if [[ "${queue}" = absent && "${required}" = true ]]; then
-    echo "- The queue lane did not run for this push (switched off, or refused for the nightly window), and a skipped lane is never a pass: re-run once it can, or when the self-hosted lane has a runner."
+    echo "- The queue lane did not run for this push (switched off, or this branch adds queue-pr-run.yml), and a skipped lane is never a pass: re-run once it can, or when the self-hosted lane has a runner."
   fi
   if [[ "${settle_unknown}" = true && "${required}" = true ]]; then
     echo "- The self-hosted result is unknown, counted as absent and never as a pass: the settle job (\`e2e-gpu-settled\`) ended ${SETTLE_RESULT}."
