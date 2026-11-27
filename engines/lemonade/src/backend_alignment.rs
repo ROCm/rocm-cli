@@ -761,7 +761,7 @@ fn fetch_github_json(url: &str) -> Result<Value> {
     // `timeout_connect` takes precedence over `timeout` and defaults to 30s, so without
     // it a host that blackholes rather than refuses would stall well past the intended
     // ceiling. The overall timeout also covers reading the listing.
-    let agent = ureq::AgentBuilder::new()
+    let agent = rocm_core::http_proxy::agent_builder(url)
         .timeout_connect(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
         .build();

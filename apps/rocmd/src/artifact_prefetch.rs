@@ -208,6 +208,7 @@ pub(crate) fn prefetch_artifact_value_with_policy(
         max_bytes: Some(max_bytes),
         expected_len: Some(size_bytes),
         expected_sha256: Some(&expected_sha256),
+        proxy: None,
     })
     .with_context(|| format!("failed to prefetch artifact `{artifact_ref}`"))?;
     let actual_sha256 = outcome.sha256;

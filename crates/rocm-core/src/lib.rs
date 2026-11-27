@@ -32,6 +32,7 @@ pub mod gguf_fit;
 pub mod gguf_source;
 pub mod hardware_root;
 pub mod host_gpu;
+pub mod http_proxy;
 mod jsonl_store;
 pub mod log_tail;
 pub mod managed_child;

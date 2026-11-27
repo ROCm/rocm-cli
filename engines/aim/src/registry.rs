@@ -70,8 +70,8 @@ fn is_docker_hub_ref(normalized: &str) -> bool {
     !(first.contains('.') || first.contains(':') || first == "localhost")
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+fn agent(url: &str) -> ureq::Agent {
+    rocm_core::http_proxy::agent_builder(url)
         .timeout_connect(DEFAULT_TIMEOUT)
         .timeout(DEFAULT_TIMEOUT)
         .build()
@@ -81,7 +81,7 @@ fn anonymous_pull_token(repo: &str) -> Result<String> {
     let url = format!(
         "https://{AUTH_HOST}/token?service=registry.docker.io&scope=repository:{repo}:pull"
     );
-    let body: Value = agent()
+    let body: Value = agent(&url)
         .get(&url)
         .set("User-Agent", "rocm-cli")
         .call()
@@ -105,7 +105,7 @@ pub(crate) fn fetch_image_metadata(image_ref: &str) -> Result<AimImageMetadata> 
     let token = anonymous_pull_token(&repo)?;
 
     let manifest_url = format!("https://{REGISTRY_HOST}/v2/{repo}/manifests/{reference}");
-    let manifest: Value = agent()
+    let manifest: Value = agent(&manifest_url)
         .get(&manifest_url)
         .set("User-Agent", "rocm-cli")
         .set("Authorization", &format!("Bearer {token}"))
@@ -125,7 +125,7 @@ pub(crate) fn fetch_image_metadata(image_ref: &str) -> Result<AimImageMetadata> 
         .with_context(|| format!("manifest for {image_ref} had no config digest"))?;
 
     let blob_url = format!("https://{REGISTRY_HOST}/v2/{repo}/blobs/{config_digest}");
-    let config: Value = agent()
+    let config: Value = agent(&blob_url)
         .get(&blob_url)
         .set("User-Agent", "rocm-cli")
         .set("Authorization", &format!("Bearer {token}"))

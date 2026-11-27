@@ -802,6 +802,33 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
 }
 
+/// A host name that resolves nowhere, so a fixture behind it is reachable only
+/// by asking the proxy named in `HTTP_PROXY`.
+const PROXIED_CATALOG_HOST: &str = "sdk-catalog.invalid";
+
+fn proxied_next_tarball_base() -> String {
+    format!("http://{PROXIED_CATALOG_HOST}/tarball/next/")
+}
+
+#[given("the ROCm 10 tarball catalog is reachable only through the HTTP proxy setting")]
+async fn next_tarball_catalog_behind_proxy(world: &mut E2eWorld) {
+    let proxy = server_base(world);
+    // Later entries win, so this replaces the loopback catalog base the
+    // fixture step set with one that resolves nowhere.
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_NEXT_TARBALL_BASE",
+        proxied_next_tarball_base().into(),
+    ));
+    // Lower-case names win over upper-case ones, and a host's own `NO_PROXY`
+    // could exempt the catalog, so name both spellings and clear the exemption.
+    for name in ["HTTP_PROXY", "http_proxy"] {
+        world.command_env.push((name, proxy.clone().into()));
+    }
+    for name in ["NO_PROXY", "no_proxy"] {
+        world.command_env.push((name, "".into()));
+    }
+}
+
 /// Size and pacing for the paced tarball fixture below: large enough (versus
 /// the chunk size) that several chunk boundaries — and therefore several
 /// observable progress frames — land before the transfer completes, and slow
@@ -2078,6 +2105,21 @@ async fn preview_installs_verified_torchaudio(world: &mut E2eWorld) {
 #[then("the preview resolves the ROCm 10 tarball catalog")]
 async fn preview_resolves_next_tarball_catalog(world: &mut E2eWorld) {
     let base = next_tarball_base(world);
+    assert_contains(
+        world,
+        &format!("canonical_source: {base}"),
+        "next tarball catalog",
+    );
+    assert_contains(
+        world,
+        &format!("tarball_url: {base}{NEXT_REAL_TARBALL}"),
+        "selected artifact url",
+    );
+}
+
+#[then("the preview resolves the ROCm 10 tarball catalog behind the proxy")]
+async fn preview_resolves_next_tarball_catalog_behind_proxy(world: &mut E2eWorld) {
+    let base = proxied_next_tarball_base();
     assert_contains(
         world,
         &format!("canonical_source: {base}"),

@@ -1553,7 +1553,12 @@ and `therock-next-19` are the same two shapes for a tarball install;
 newest layout at its newest build that has PyTorch wheels, and a build date on
 either side of the 2026-08-22/2026-08-23 boundary reads the stream that holds
 it; `therock-next-23` is the tarball refusal for a nightly pin before that
-boundary, run together with the wheel install it points to. `update-11` holds
+boundary, run together with the wheel install it points to.
+`therock-next-24` reads a tarball catalog through `HTTP_PROXY`: the catalog is
+named by a host that resolves nowhere, so the preview succeeds only by asking the
+proxy the fixture server plays (the transfer itself is covered by
+`download_goes_through_the_configured_proxy` in
+[download.rs](../crates/rocm-core/src/download.rs)). `update-11` holds
 that an update installs from the layout its runtime recorded: a runtime of the
 earlier release stream recorded with only a family label still updates, instead
 of being refused for an exact arch. The live counterparts, which resolve the real indexes and so run on
