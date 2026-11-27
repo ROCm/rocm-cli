@@ -19,8 +19,8 @@ use crate::{ENGINE_NAME, LLAMACPP_RECIPE, ROCM_BACKEND_NAME, current_unix_millis
 /// (not the CLI's own manifest) so the version check survives even when the
 /// manifest lives under a data dir that is not shared with the runtime tree
 /// (e.g. each e2e scenario's isolated data dir vs. a shared runtime tree).
-/// Living inside `runtime_dir` rather than beside it also means a wipe of the
-/// tree removes the marker in the same operation — "marker present implies
+/// Living inside `runtime_dir` rather than beside it also means replacing the
+/// tree replaces the marker in the same operation — "marker present implies
 /// extraction completed" holds by construction. Without this marker,
 /// [`prepare_embeddable`] can never prove the shared tree is already current,
 /// wipes it, and re-extracts on every call — destroying any llama.cpp backend
@@ -102,8 +102,8 @@ pub(crate) fn installed_runtime_version(runtime_dir: &Path) -> Option<String> {
 }
 
 /// Record `version` as installed into `runtime_dir`. Marker lives inside
-/// `runtime_dir` (not beside it) so `remove_dir_all(runtime_dir)` clears it as
-/// part of the same wipe that removes the tree it describes — "marker present
+/// `runtime_dir` (not beside it) so it is swapped out together with the tree it
+/// describes — "marker present
 /// implies extraction completed" holds by construction, with no separate
 /// bookkeeping to keep in sync.
 pub(crate) fn record_runtime_version(runtime_dir: &Path, version: &str) -> Result<()> {
@@ -176,19 +176,20 @@ where
         &version,
         lemond_path_in(&runtime_dir).is_file(),
     ) {
-        if runtime_dir.exists() {
-            fs::remove_dir_all(&runtime_dir)
-                .with_context(|| format!("failed to clear {}", runtime_dir.display()))?;
-        }
         let extract_root = root
             .join("extract")
             .join(format!("{}", current_unix_millis()));
-        fs::create_dir_all(&extract_root)?;
-        extract_archive(&archive, &extract_root)?;
-        let embeddable_root = find_embeddable_root(&extract_root)?;
-        copy_tree(&embeddable_root, &runtime_dir)?;
+        let staging_dir = staging_dir_for(&runtime_dir);
+        // The new tree is built beside `runtime_dir` and swapped in only once
+        // it is complete, so a failed extraction or copy leaves the installed
+        // runtime as it was.
+        let staged = stage_runtime(&archive, &extract_root, &staging_dir, &version);
         fs::remove_dir_all(&extract_root).ok();
-        record_runtime_version(&runtime_dir, &version)?;
+        if let Err(err) = staged {
+            fs::remove_dir_all(&staging_dir).ok();
+            return Err(err);
+        }
+        swap_in_runtime(&staging_dir, &runtime_dir)?;
     }
     drop(archive_guard);
     let lemond = lemond_path_in(&runtime_dir);
@@ -210,6 +211,158 @@ where
         backend_name: ROCM_BACKEND_NAME.to_owned(),
         installed_at_unix_ms: current_unix_millis(),
     })
+}
+
+/// Where a new runtime tree is built before it replaces `runtime_dir`: a
+/// sibling, so the final rename never crosses a filesystem.
+pub(crate) fn staging_dir_for(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.with_file_name("runtime.staging")
+}
+
+/// Where the runtime being replaced is parked while the new one is moved in.
+pub(crate) fn previous_dir_for(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.with_file_name("runtime.previous")
+}
+
+/// Extracts `archive` and builds the complete runtime tree, version marker
+/// included, in `staging_dir`. Touches nothing outside `extract_root` and
+/// `staging_dir`; the caller removes `extract_root` either way and
+/// `staging_dir` when this fails.
+fn stage_runtime(
+    archive: &Path,
+    extract_root: &Path,
+    staging_dir: &Path,
+    version: &str,
+) -> Result<()> {
+    // A leftover from an interrupted run; `copy_tree` needs the path free.
+    if staging_dir.exists() {
+        fs::remove_dir_all(staging_dir)
+            .with_context(|| format!("failed to clear {}", staging_dir.display()))?;
+    }
+    fs::create_dir_all(extract_root)?;
+    extract_archive(archive, extract_root)?;
+    let embeddable_root = find_embeddable_root(extract_root)?;
+    copy_tree(&embeddable_root, staging_dir)?;
+    record_runtime_version(staging_dir, version)
+}
+
+/// Replaces `runtime_dir` with the finished tree in `staging_dir`. The old tree
+/// is renamed aside rather than deleted first, so a rename that fails puts it
+/// back, and it is removed only after the new one is in place. An old tree
+/// already aside while `runtime_dir` is missing (a swap interrupted between its
+/// two renames) is kept as the one to put back rather than cleared. Removes
+/// `staging_dir` on every failure except one that leaves the old tree only in
+/// `runtime.previous`, where the new tree is kept beside it.
+///
+/// `runtime.staging` and `runtime.previous` are not scoped to a version, and
+/// only the per-archive lock (`archive_guard`), which is per version, is held
+/// across staging and the swap. A second process installing a different
+/// version at the same time can therefore delete this process's
+/// `runtime.staging` as a leftover, or read its in-flight swap as an
+/// interrupted one. Between the two renames `runtime_dir` does not exist, so
+/// any other reader of the tree (a running server, `rocm storage`) can also
+/// find it missing for that moment. Both stay accepted, unrecovered
+/// limitations; the window is one rename, not the whole extraction.
+fn swap_in_runtime(staging_dir: &Path, runtime_dir: &Path) -> Result<()> {
+    swap_in_runtime_with(staging_dir, runtime_dir, |from, to| fs::rename(from, to))
+}
+
+/// [`swap_in_runtime`] with the rename injectable, so a test can fail any one
+/// of its renames, which a real filesystem does not do on demand.
+fn swap_in_runtime_with(
+    staging_dir: &Path,
+    runtime_dir: &Path,
+    rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let warning = swap_in_runtime_using(staging_dir, runtime_dir, rename, |dir| {
+        fs::remove_dir_all(dir)
+    })?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+/// The swap itself. Returns the warning for an old tree that could not be
+/// removed once the new one was in place, so a test can see it and the tree
+/// state it leaves; `remove` is injectable for the same reason as `rename`.
+fn swap_in_runtime_using(
+    staging_dir: &Path,
+    runtime_dir: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<Option<String>> {
+    let previous_dir = previous_dir_for(runtime_dir);
+    if runtime_dir.exists() {
+        let moved_aside = (|| -> Result<()> {
+            if previous_dir.exists() {
+                fs::remove_dir_all(&previous_dir).with_context(|| {
+                    format!(
+                        "failed to clear {}; the installed runtime was left as it is",
+                        previous_dir.display()
+                    )
+                })?;
+            }
+            rename(runtime_dir, &previous_dir).with_context(|| {
+                format!(
+                    "failed to move the installed runtime {} aside; it was left as it is",
+                    runtime_dir.display()
+                )
+            })
+        })();
+        if let Err(err) = moved_aside {
+            fs::remove_dir_all(staging_dir).ok();
+            return Err(err);
+        }
+    }
+    // What a failed final rename has to put back: set whenever the old tree is
+    // aside, whether this call put it there or an interrupted one did.
+    let fallback = previous_dir.exists();
+    if let Err(err) = rename(staging_dir, runtime_dir) {
+        let restored = fallback && rename(&previous_dir, runtime_dir).is_ok();
+        let kept_aside = fallback && !restored;
+        if !kept_aside {
+            fs::remove_dir_all(staging_dir).ok();
+        }
+        return Err(err).with_context(|| {
+            let state = if restored {
+                "; the installed runtime was restored".to_owned()
+            } else if kept_aside {
+                format!(
+                    "; the installed runtime could not be put back and is in {}: rename it to {} to recover it",
+                    previous_dir.display(),
+                    runtime_dir.display()
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "failed to move the new runtime into {}{state}",
+                runtime_dir.display()
+            )
+        });
+    }
+    // Nothing was moved aside on a fresh install, so there is nothing to remove.
+    Ok(if fallback {
+        remove_previous_runtime(&previous_dir, remove)
+    } else {
+        None
+    })
+}
+
+/// Removes the old runtime the swap left in `previous_dir`. The new runtime is
+/// already in place, so a failure here does not fail the install (a file held
+/// open or a scanner can block it); the returned warning says the old tree is
+/// still on the drive.
+fn remove_previous_runtime(
+    previous_dir: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Option<String> {
+    let err = remove(previous_dir).err()?;
+    Some(format!(
+        "warning: the new Lemonade runtime is in place, but the previous one in {} could not be removed ({err}); delete it to free its space",
+        previous_dir.display()
+    ))
 }
 
 pub(crate) fn manifest_path(paths: &AppPaths) -> PathBuf {
@@ -1084,22 +1237,526 @@ mod tests {
         );
     }
 
+    /// Runs a `--reinstall` over an installed `1.0.0` runtime (a `lemond`, a
+    /// stale file and a backend the user installed) with `archive` as the
+    /// download, and returns the result with the runtime directory, the root
+    /// and the guard that removes them.
+    fn reinstall_over_installed_runtime(
+        archive: &Path,
+    ) -> (Result<()>, PathBuf, PathBuf, tempfile::TempDir) {
+        let guard = tempfile::tempdir().unwrap();
+        let env_root = guard.path().to_path_buf();
+        let paths = AppPaths {
+            config_dir: env_root.join("config"),
+            data_dir: env_root.join("data"),
+            cache_dir: env_root.join("cache"),
+        };
+        let root = lemonade_root(&paths, Some(&env_root));
+        let runtime_dir = runtime_dir_in(&root);
+        fs::create_dir_all(runtime_dir.join("bin").join("llamacpp")).unwrap();
+        fs::write(lemond_path_in(&runtime_dir), b"old lemond").unwrap();
+        fs::write(lemonade_path_in(&runtime_dir), b"old lemonade").unwrap();
+        fs::write(runtime_dir.join("stale.txt"), b"only in 1.0.0").unwrap();
+        record_runtime_version(&runtime_dir, "1.0.0").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(archive).unwrap()));
+        let result = prepare_embeddable_with(
+            &paths,
+            Some(&env_root),
+            true,
+            "1.1.0",
+            &sha256,
+            |_, destination| {
+                fs::copy(archive, destination)?;
+                Ok(())
+            },
+        )
+        .map(|_| ());
+        (result, runtime_dir, root, guard)
+    }
+
+    /// Nothing the reinstall built beside `runtime/` may outlive it.
+    fn assert_no_reinstall_leftovers(root: &Path) {
+        assert!(
+            !root.join("runtime.staging").exists(),
+            "staging left behind"
+        );
+        assert!(
+            !root.join("runtime.previous").exists(),
+            "old tree left behind"
+        );
+        let extracted = fs::read_dir(root.join("extract")).map_or(0, Iterator::count);
+        assert_eq!(extracted, 0, "extraction directory left behind");
+    }
+
+    /// The bug: `--reinstall` deleted `runtime/` before extracting, so an
+    /// extraction that failed left the engine with no binaries. A corrupt
+    /// archive whose digest matches (the stand-in here for any extraction
+    /// failure, such as a full disk) fails in `extract_archive`, after the old
+    /// tree used to be gone. Reverting to delete-then-extract fails this test.
+    #[test]
+    fn failed_reinstall_extraction_keeps_the_installed_runtime() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("corrupt");
+        fs::write(&archive, b"not an archive").unwrap();
+
+        let (result, runtime_dir, root, _guard) = reinstall_over_installed_runtime(&archive);
+
+        assert!(result.is_err(), "a corrupt archive must fail the reinstall");
+        assert_eq!(
+            fs::read(lemond_path_in(&runtime_dir)).unwrap(),
+            b"old lemond"
+        );
+        assert!(runtime_dir.join("stale.txt").is_file());
+        assert!(runtime_dir.join("bin").join("llamacpp").is_dir());
+        assert_eq!(
+            installed_runtime_version(&runtime_dir).as_deref(),
+            Some("1.0.0")
+        );
+        assert_no_reinstall_leftovers(&root);
+    }
+
+    /// An archive that extracts but holds no embeddable root (the binaries) must
+    /// not replace a working runtime either: `find_embeddable_root` fails before
+    /// anything is staged.
+    #[test]
+    fn reinstall_with_an_archive_lacking_the_embeddable_root_keeps_the_installed_runtime() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("no-binaries");
+        write_embeddable_archive(&archive, &[("README".to_owned(), b"hello".to_vec())]);
+
+        let (result, runtime_dir, root, _guard) = reinstall_over_installed_runtime(&archive);
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("no Lemonade embeddable root found"),
+            "{message}"
+        );
+        assert_eq!(
+            fs::read(lemond_path_in(&runtime_dir)).unwrap(),
+            b"old lemond"
+        );
+        assert_eq!(
+            installed_runtime_version(&runtime_dir).as_deref(),
+            Some("1.0.0")
+        );
+        assert_no_reinstall_leftovers(&root);
+    }
+
+    /// The other half: a reinstall whose extraction succeeds replaces the whole
+    /// tree, so nothing only the old version had survives and the marker names
+    /// the new version.
+    #[test]
+    fn successful_reinstall_replaces_the_runtime_with_the_new_tree() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("good");
+        write_embeddable_with_pins(&archive, "{}");
+
+        let (result, runtime_dir, root, _guard) = reinstall_over_installed_runtime(&archive);
+
+        result.unwrap();
+        assert_eq!(fs::read(lemond_path_in(&runtime_dir)).unwrap(), b"lemond");
+        assert_eq!(
+            fs::read(lemonade_path_in(&runtime_dir)).unwrap(),
+            b"lemonade"
+        );
+        assert!(!runtime_dir.join("stale.txt").exists());
+        assert!(
+            runtime_dir
+                .join("resources/backend_versions.json")
+                .is_file()
+        );
+        assert_eq!(
+            installed_runtime_version(&runtime_dir).as_deref(),
+            Some("1.1.0")
+        );
+        assert_no_reinstall_leftovers(&root);
+    }
+
+    /// A failure while the new tree is being built, after `runtime.staging`
+    /// exists (the disk-full or permissions case the issue names), keeps the old
+    /// runtime and removes the staging directory. The archive holds a directory
+    /// where the version marker has to be written, so the copy succeeds and
+    /// recording the marker is what fails. Removing the cleanup of the staging
+    /// directory in `prepare_embeddable_with` fails this test.
+    #[test]
+    fn failure_after_staging_exists_keeps_the_runtime_and_removes_staging() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("marker-is-a-directory");
+        write_embeddable_archive(
+            &archive,
+            &[
+                (platform_binary_name("lemond"), b"lemond".to_vec()),
+                (platform_binary_name("lemonade"), b"lemonade".to_vec()),
+                (format!("{RUNTIME_VERSION_MARKER}/inner"), b"x".to_vec()),
+            ],
+        );
+
+        let (result, runtime_dir, root, _guard) = reinstall_over_installed_runtime(&archive);
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("failed to record installed"), "{message}");
+        assert_eq!(
+            fs::read(lemond_path_in(&runtime_dir)).unwrap(),
+            b"old lemond"
+        );
+        assert_no_reinstall_leftovers(&root);
+    }
+
+    /// A rename that fails after the old tree was moved aside puts it back.
+    #[test]
+    fn swap_in_runtime_restores_the_old_tree_when_the_new_one_cannot_move_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(runtime_dir.join("old.txt"), b"old").unwrap();
+        // Nothing to move in: the staging directory was never created.
+        let staging_dir = staging_dir_for(&runtime_dir);
+
+        let err = swap_in_runtime(&staging_dir, &runtime_dir).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("the installed runtime was restored"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(runtime_dir.join("old.txt")).unwrap(), b"old");
+        assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// A `runtime.staging` left by an interrupted run is cleared before the next
+    /// extraction, or `copy_tree` (which needs the path free) would fail the
+    /// next install that extracts; that install's failure cleanup would then
+    /// remove it.
+    #[test]
+    fn an_install_clears_a_staging_directory_an_interrupted_run_left() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("good");
+        write_embeddable_with_pins(&archive, "{}");
+        let guard = tempfile::tempdir().unwrap();
+        let env_root = guard.path().to_path_buf();
+        let paths = AppPaths {
+            config_dir: env_root.join("config"),
+            data_dir: env_root.join("data"),
+            cache_dir: env_root.join("cache"),
+        };
+        let root = lemonade_root(&paths, Some(&env_root));
+        let stale = staging_dir_for(&runtime_dir_in(&root));
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("stray.txt"), b"half-copied").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+
+        let manifest = prepare_embeddable_with(
+            &paths,
+            Some(&env_root),
+            false,
+            "1.1.0",
+            &sha256,
+            |_, destination| {
+                fs::copy(&archive, destination)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!manifest.runtime_dir.join("stray.txt").exists());
+        assert!(lemond_path_in(&manifest.runtime_dir).is_file());
+        assert_no_reinstall_leftovers(&root);
+    }
+
+    /// Builds an installed `runtime/` and a finished `runtime.staging/`.
+    fn runtime_and_staging(dir: &Path) -> (PathBuf, PathBuf) {
+        let runtime_dir = dir.join("runtime");
+        let staging_dir = staging_dir_for(&runtime_dir);
+        for (tree, name) in [(&runtime_dir, "old.txt"), (&staging_dir, "new.txt")] {
+            fs::create_dir_all(tree).unwrap();
+            fs::write(tree.join(name), b"x").unwrap();
+        }
+        (runtime_dir, staging_dir)
+    }
+
+    fn denied() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")
+    }
+
+    /// The new tree cannot move in: the old one is put back, the unusable
+    /// staging directory is removed, and the message says both.
+    #[test]
+    fn failed_final_rename_restores_the_old_tree_and_removes_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+        let mut calls = 0;
+
+        let err = swap_in_runtime_with(&staging_dir, &runtime_dir, |from, to| {
+            calls += 1;
+            if from == staging_dir {
+                Err(denied())
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("the installed runtime was restored"),
+            "{err:#}"
+        );
+        assert_eq!(calls, 3, "aside, failed move in, put back");
+        assert!(runtime_dir.join("old.txt").is_file());
+        assert!(!staging_dir.exists());
+        assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// Removing the old tree after a successful swap is best effort: when it
+    /// fails the swap still succeeds with the new tree in place, and the
+    /// warning names the folder still holding the old tree's space.
+    #[test]
+    fn a_previous_runtime_that_cannot_be_removed_is_reported_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+        let previous_dir = previous_dir_for(&runtime_dir);
+
+        let warning = swap_in_runtime_using(
+            &staging_dir,
+            &runtime_dir,
+            |from, to| fs::rename(from, to),
+            |_| Err(denied()),
+        )
+        .unwrap()
+        .expect("a failed removal is reported");
+
+        assert!(
+            warning.contains("the new Lemonade runtime is in place")
+                && warning.contains(&previous_dir.display().to_string())
+                && warning.contains("could not be removed")
+                && warning.contains("delete it to free its space"),
+            "{warning}"
+        );
+        assert!(runtime_dir.join("new.txt").is_file());
+        assert!(!runtime_dir.join("old.txt").exists());
+        assert!(previous_dir.join("old.txt").is_file());
+        assert!(!staging_dir.exists());
+    }
+
+    /// A removal that works reports nothing and leaves only the new tree.
+    #[test]
+    fn a_swap_that_removes_the_previous_runtime_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+
+        let warning = swap_in_runtime_using(
+            &staging_dir,
+            &runtime_dir,
+            |from, to| fs::rename(from, to),
+            |dir| fs::remove_dir_all(dir),
+        )
+        .unwrap();
+
+        assert_eq!(warning, None);
+        assert!(runtime_dir.join("new.txt").is_file());
+        assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// When the old tree cannot be put back either, the message names where it
+    /// is and how to recover it, and the new tree is kept beside it.
+    #[test]
+    fn failed_restore_names_where_the_old_tree_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+        let previous_dir = previous_dir_for(&runtime_dir);
+        fs::write(lemond_path_in(&runtime_dir), b"old lemond").unwrap();
+        fs::write(lemonade_path_in(&runtime_dir), b"old lemonade").unwrap();
+        record_runtime_version(&runtime_dir, "1.0.0").unwrap();
+
+        let err = swap_in_runtime_with(&staging_dir, &runtime_dir, |from, to| {
+            if from == runtime_dir {
+                fs::rename(from, to)
+            } else {
+                Err(denied())
+            }
+        })
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!(
+                "could not be put back and is in {}: rename it to {} to recover it",
+                previous_dir.display(),
+                runtime_dir.display()
+            )),
+            "{message}"
+        );
+        assert!(previous_dir.join("old.txt").is_file());
+        assert!(staging_dir.join("new.txt").is_file());
+        assert!(!runtime_dir.exists());
+
+        // The advice the message gives recovers the old tree: it is installed
+        // again, at its own version, so a plain install keeps it.
+        fs::rename(&previous_dir, &runtime_dir).unwrap();
+        let installed = installed_runtime_version(&runtime_dir);
+        assert_eq!(installed.as_deref(), Some("1.0.0"));
+        assert!(!needs_extraction(
+            false,
+            installed.as_deref(),
+            "1.0.0",
+            lemond_path_in(&runtime_dir).is_file()
+        ));
+    }
+
+    /// The old tree cannot be moved aside (a file in it is held open): nothing
+    /// changed, and the message says so.
+    #[test]
+    fn failed_move_aside_leaves_the_installed_runtime_and_removes_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+
+        let err =
+            swap_in_runtime_with(&staging_dir, &runtime_dir, |_, _| Err(denied())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("it was left as it is"),
+            "{err:#}"
+        );
+        assert!(runtime_dir.join("old.txt").is_file());
+        assert!(!staging_dir.exists());
+        assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// A leftover `runtime.previous` that cannot be cleared stops the swap before
+    /// anything moves: the installed runtime stays and the error says so.
+    #[test]
+    fn failed_clear_of_a_leftover_previous_leaves_the_installed_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+        // A file where the directory should be: `remove_dir_all` refuses it.
+        fs::write(previous_dir_for(&runtime_dir), "not a directory").unwrap();
+
+        let err = swap_in_runtime_with(&staging_dir, &runtime_dir, |from, to| fs::rename(from, to))
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("the installed runtime was left as it is"),
+            "{err:#}"
+        );
+        assert!(runtime_dir.join("old.txt").is_file());
+        assert!(!staging_dir.exists());
+    }
+
+    /// `rocm storage` and `runtime uninstall` read the install's parts from this
+    /// list: the folders an interrupted reinstall leaves must be among them.
+    #[test]
+    fn install_tree_dirs_lists_the_reinstall_scratch_folders() {
+        let root = Path::new("/data/lemonade");
+        let dirs = crate::install_tree_dirs(root);
+        for name in [
+            "runtime",
+            "runtime.staging",
+            "runtime.previous",
+            "downloads",
+            "extract",
+        ] {
+            assert!(dirs.contains(&root.join(name)), "{name} missing: {dirs:?}");
+        }
+    }
+
+    /// A fresh install has no runtime to move aside: the new tree moves in and
+    /// nothing is left beside it. (The removal warning is printed, not
+    /// returned, so this does not assert its absence.)
+    #[test]
+    fn swap_in_runtime_on_a_fresh_install_moves_the_new_tree_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let staging_dir = staging_dir_for(&runtime_dir);
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("new.txt"), b"new").unwrap();
+
+        swap_in_runtime(&staging_dir, &runtime_dir).unwrap();
+
+        assert!(runtime_dir.join("new.txt").is_file());
+        assert!(!staging_dir.exists());
+        assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// With no runtime installed there is nothing to restore, so a failed move
+    /// must not say there was.
+    #[test]
+    fn swap_in_runtime_on_a_fresh_install_does_not_claim_a_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let staging_dir = staging_dir_for(&runtime_dir);
+
+        let err = swap_in_runtime(&staging_dir, &runtime_dir).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(!message.contains("restored"), "{message}");
+        assert!(!runtime_dir.exists());
+    }
+
+    /// A swap interrupted between its two renames leaves the old tree only in
+    /// `runtime.previous`. The next swap must not delete it: when the new tree
+    /// cannot move in either, the old one goes back.
+    #[test]
+    fn swap_in_runtime_keeps_an_old_tree_left_aside_by_an_interrupted_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let previous_dir = previous_dir_for(&runtime_dir);
+        fs::create_dir_all(&previous_dir).unwrap();
+        fs::write(previous_dir.join("old.txt"), b"old").unwrap();
+        let staging_dir = staging_dir_for(&runtime_dir);
+
+        swap_in_runtime(&staging_dir, &runtime_dir).unwrap_err();
+
+        assert_eq!(fs::read(runtime_dir.join("old.txt")).unwrap(), b"old");
+        assert!(!previous_dir.exists());
+    }
+
+    /// A leftover `runtime.previous` next to an installed runtime is cleared,
+    /// and the swap still completes.
+    #[test]
+    fn swap_in_runtime_replaces_the_runtime_and_clears_a_leftover_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let previous_dir = previous_dir_for(&runtime_dir);
+        let staging_dir = staging_dir_for(&runtime_dir);
+        for (tree, name) in [
+            (&runtime_dir, "current.txt"),
+            (&previous_dir, "leftover.txt"),
+            (&staging_dir, "new.txt"),
+        ] {
+            fs::create_dir_all(tree).unwrap();
+            fs::write(tree.join(name), b"x").unwrap();
+        }
+
+        swap_in_runtime(&staging_dir, &runtime_dir).unwrap();
+
+        assert!(runtime_dir.join("new.txt").is_file());
+        assert!(!runtime_dir.join("current.txt").exists());
+        assert!(!previous_dir.exists());
+        assert!(!staging_dir.exists());
+    }
+
     /// Writes an embeddable archive in the host's format holding the two
     /// binaries and a packaged `resources/backend_versions.json`.
     fn write_embeddable_with_pins(archive: &Path, pins: &str) {
-        let files = [
-            (platform_binary_name("lemond"), b"lemond".to_vec()),
-            (platform_binary_name("lemonade"), b"lemonade".to_vec()),
-            (
-                "resources/backend_versions.json".to_owned(),
-                pins.as_bytes().to_vec(),
-            ),
-        ];
+        write_embeddable_archive(
+            archive,
+            &[
+                (platform_binary_name("lemond"), b"lemond".to_vec()),
+                (platform_binary_name("lemonade"), b"lemonade".to_vec()),
+                (
+                    "resources/backend_versions.json".to_owned(),
+                    pins.as_bytes().to_vec(),
+                ),
+            ],
+        );
+    }
+
+    /// Writes an embeddable archive in the host's format holding `files` under
+    /// an `embeddable/` root.
+    fn write_embeddable_archive(archive: &Path, files: &[(String, Vec<u8>)]) {
         let file = fs::File::create(archive).unwrap();
         if runtime_is_windows() {
             let mut writer = zip::ZipWriter::new(file);
             let options = zip::write::SimpleFileOptions::default();
-            for (name, body) in &files {
+            for (name, body) in files {
                 writer
                     .start_file(format!("embeddable/{name}"), options)
                     .unwrap();
@@ -1109,7 +1766,7 @@ mod tests {
         } else {
             let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
             let mut builder = tar::Builder::new(encoder);
-            for (name, body) in &files {
+            for (name, body) in files {
                 let mut header = tar::Header::new_ustar();
                 header.set_size(body.len() as u64);
                 header.set_mode(0o755);

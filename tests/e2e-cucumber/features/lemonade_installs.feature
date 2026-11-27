@@ -17,7 +17,8 @@ Feature: Lemonade installs on disk
   # lemonade-installs-01 and -02 need the `rocm/e2e-test-hooks` build
   # `cargo xtask e2e` makes, to report a nearly full drive without filling a
   # real one; lemonade-installs-07, -08 and -09 need it to report old host
-  # libraries on a host whose libraries are new.
+  # libraries on a host whose libraries are new; lemonade-installs-10 needs it to
+  # report a nearly full drive for a reinstall.
 
   @id:lemonade-installs-refused-without-space
   Scenario: lemonade-installs-01 - A Lemonade install the drive cannot hold is refused before downloading
@@ -107,3 +108,23 @@ Feature: Lemonade installs on disk
     And the pinned Lemonade is already installed in the data folder
     When the user installs the Lemonade engine
     Then the Lemonade install is refused for the host's libraries and the installed copy is left as it is
+
+  # A reinstall extracts the new Lemonade beside the installed one and swaps it
+  # in only once that works, so the old copy's space is not free for the
+  # extraction. On a drive with less room than any install needs, the reinstall
+  # is refused, and the installed copy, which the refusal must not touch, stays.
+  # That a reinstall whose extraction fails keeps the installed copy is covered
+  # by the unit tests in engines/lemonade/src/install.rs: the archive's digest is
+  # pinned, so a scenario cannot hand the install a corrupt one.
+  # The pinned version is read from a refusal on an old host, as in
+  # lemonade-installs-09, so this is Linux only; the host-library check is then
+  # turned off so the reinstall reaches the space check.
+  @id:lemonade-installs-reinstall-refused-without-space-keeps-installed-copy @requires-os:linux
+  Scenario: lemonade-installs-10 - A Lemonade reinstall the drive cannot hold is refused and leaves the installed copy as it is
+    Given this host's glibc is older than the pinned Lemonade server needs and it has no OpenSSL 3
+    And the pinned Lemonade is already installed in the data folder
+    And the installed Lemonade is larger than the free space an install needs
+    And the user has turned off the Lemonade host-library check
+    And the drive for a new Lemonade install cannot hold even Lemonade itself
+    When the user reinstalls the Lemonade engine
+    Then the Lemonade reinstall is refused and the installed copy is left as it is
