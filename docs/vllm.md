@@ -387,9 +387,10 @@ vLLM claims a fixed fraction of each GPU's **total** video RAM (VRAM) for
 weights plus KV cache. The fraction is not based on the free VRAM, and it is not
 scaled to the model. On a large card, a small model therefore still reserves a large slice.
 
-ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
-applies unless a value comes from somewhere else: either a model's catalog
-recipe or, taking precedence over it, the flag below:
+ROCm CLI sets no `--gpu-memory-utilization` of its own on a discrete GPU, so
+vLLM's own default applies unless a value comes from somewhere else: either a
+model's catalog recipe or, taking precedence over it, the flag below. The one
+exception is an APU whose GPU shares system memory, described next:
 
 ```bash
 rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
@@ -402,8 +403,45 @@ serve output, for other engines. An out-of-range or unparsable value fails the
 command instead of falling back silently.
 
 Earlier releases pinned this to `0.80` to leave display or WSL headroom. That
-pin is gone, so an unchanged command now reserves vLLM's own (higher) default.
-Pass `--gpu-memory-utilization 0.8` to restore the previous reservation.
+pin is gone, so on a discrete GPU an unchanged command now reserves vLLM's own
+(higher) default; on an APU it reserves 0.3 (see below). Pass
+`--gpu-memory-utilization 0.8` to restore the previous reservation.
+
+### APUs, whose GPU shares system memory
+
+On a unified-memory APU (Strix Halo, for example) vLLM's default is a share of
+the machine's memory, not of a card's own: on a 108 GiB device it sized a ~98 GiB
+KV cache for a 0.6B model, and on a Strix Halo under WSL2 that crashed the engine
+during startup in 3 of 4 runs, with `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` (see
+[#1132](https://github.com/ROCm/rocm-cli/issues/1132)). The same host served in both
+reported runs with `--gpu-memory-utilization 0.3`.
+
+So when the host's GPU is an APU part and you pass no `--gpu-memory-utilization`
+(and the model's recipe sets none), `rocm serve` starts vLLM with 0.3 and prints
+a `note:` saying it did. This is a workaround for that fault, not a tuned value:
+the fault is not proven to depend on the size, and 0.3 is the only fraction that
+was reported to work. Pass `--gpu-memory-utilization 0.8` (or any fraction in
+`(0, 1]`) to choose your own; an explicit value is never changed.
+
+The reservation covers the weights plus the KV cache, so 0.3 of the machine's
+memory is also a ceiling on the model: a model larger than that share (a 32B
+FP8 model on a 108 GiB pool, for example) fails to start under the default.
+Raise the value with `--gpu-memory-utilization` for such a model; the `note:`
+`rocm serve` prints about the default says so. The out-of-memory advice shown
+after a failed start is the same for every host and is written for a discrete
+GPU: it suggests lowering the reservation (for example to 0.5), which on an APU
+is above the 0.3 default, so read it as "choose a value that fits".
+
+A vLLM server for the same model that is already running with the recipe you
+ask for, for example one started before this default existed, is reused as it is:
+the default is not added to the request, so it cannot make `rocm serve` refuse
+the running server over "different serve options".
+
+It applies only when `rocm serve` can attribute the APU to the server's GPU: a
+host on which `amd-smi` lists more than one GPU (a discrete GPU beside the APU)
+keeps vLLM's default, because the one detected target cannot say which GPU the
+server uses. A count that cannot be read (no `amd-smi`, or it declines to run)
+counts as one GPU, so the default is applied then.
 
 ### Shared or busy GPUs
 

@@ -62,6 +62,7 @@ mod runtime_registry;
 mod runtime_services;
 mod runtime_uninstall;
 mod runtimes_cmd;
+mod serve_aim;
 mod serve_cmd;
 mod serve_device_probe;
 mod serve_port;

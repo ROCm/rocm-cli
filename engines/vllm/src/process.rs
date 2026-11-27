@@ -787,10 +787,12 @@ fn apply_vllm_rocm10_discover_env(
 /// and graph-mode flags materially change how much VRAM vLLM claims, and a
 /// wiring mistake there is invisible until a live GPU launch.
 ///
-/// Notably absent: `--gpu-memory-utilization`. rocm-cli deliberately does not
-/// supply a default — vLLM's own default applies unless the user asks for a
-/// specific fraction via `rocm serve --gpu-memory-utilization`, which arrives
-/// here through the engine recipe's `required_flags`.
+/// Notably absent: `--gpu-memory-utilization`. This function supplies none:
+/// vLLM's own default applies unless `rocm serve` put the flag in the engine
+/// recipe's `required_flags`, which it does for an explicit
+/// `--gpu-memory-utilization`, for a catalog recipe's own value, and for a GPU
+/// that shares system memory (`engine_recipe_with_shared_memory_default` in the
+/// `rocm` binary's `serve_recipe.rs`).
 ///
 /// `require_api_key` adds the `--middleware` that enforces the endpoint key on
 /// every route (see [`crate::endpoint_auth`]).

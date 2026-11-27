@@ -1244,3 +1244,53 @@ Feature: Model serving
   Scenario: serve-71 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
+
+  # ROCm/rocm-cli#1135 (mitigation for #1132): vLLM reserves most of the device's
+  # memory by default, which on an APU is most of the machine's, and on a Strix Halo
+  # under WSL2 that crashed the engine at startup while 0.3 served. So `rocm serve`
+  # hands vLLM 0.3 when the host's GPU shares system memory and nothing else chose a
+  # value, and says it did. The three scenarios pin the decision from each side: it
+  # is made on an APU, it never replaces a value the user passed, and a discrete GPU
+  # keeps vLLM's own default. Each reads the engine recipe recorded for the launch,
+  # which is what the engine is started with, and not only the line on screen: the
+  # note and the flag are produced in different places. Same test-only hook as
+  # @id:serve-smoke-failure-summary, which also carries the planted machine's
+  # GPU-free launch; @requires-no-gpu because the planted host root stands in for
+  # the GPU the mock lane does not have.
+  @id:serve-apu-vllm-reserves-a-smaller-share @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-72 - A vLLM launch on an APU reserves a smaller share of memory and says so
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a managed vLLM launch that becomes ready and whose engine answers
+    When the user opens the interactive serve summary against that engine
+    Then the deployment summary says vLLM was given a smaller memory reservation
+    And the launched vLLM server was started with a 0.3 memory reservation
+
+  @id:serve-apu-vllm-keeps-the-users-reservation @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-73 - A memory reservation the user asked for is not replaced on an APU
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a managed vLLM launch that becomes ready and whose engine answers
+    When the user opens the interactive serve summary against that engine asking for a 0.8 memory reservation
+    Then the launched vLLM server was started with a 0.8 memory reservation
+    And the deployment summary does not mention a default memory reservation
+
+  @id:serve-discrete-gpu-vllm-keeps-its-own-default @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-74 - A discrete GPU is left on vLLM's own memory reservation
+    Given a machine whose only GPU is a discrete card that also reports a system-memory aperture
+    And a managed vLLM launch that becomes ready and whose engine answers
+    When the user opens the interactive serve summary against that engine
+    Then the launched vLLM server was left on vLLM's own memory reservation
+    And the deployment summary does not mention a default memory reservation
+
+  # The APU default must not make a server that is already running unreusable.
+  # Reuse requires the running service's recorded recipe to equal the requested
+  # one, so a default added to the request alone read as "different serve options"
+  # and refused a server started by a build that predates the default, telling the
+  # user to stop a working server for a request that asked for nothing different.
+  # Same planted server as @id:serve-reuse-exempt-from-no-gpu-refusal, which
+  # fails the same way on a lane whose real GPU is an APU.
+  @id:serve-apu-reuses-a-server-started-without-the-default @requires-no-gpu @requires-os:linux
+  Scenario: serve-75 - A vLLM server started without the APU memory default is still reused
+    Given a machine whose only GPU shares system memory, with the pool it may use readable
+    And a live managed vLLM serve is already running
+    When the user opens its interactive serve summary
+    Then the summary reflects the reused already-running service

@@ -176,6 +176,33 @@ pub(crate) fn live_managed_services_for_model(
         .then_some(records)
 }
 
+/// Whether a live managed service for `engine` and `model_ref` was started with
+/// exactly `recipe`, as `rocm serve` would record it.
+///
+/// This is the equality [`crate::service_launch::managed_service_reuse_refusal`]
+/// requires of a recipe before it lets a running service be reused, asked early
+/// enough for the caller to leave something out of the recipe it is about to
+/// request. The record is found as reuse finds it ([`find_live_managed_service`]:
+/// same engine, canonical model id equal to `model_ref`), so a model whose name
+/// merely contains another's never answers true. That is exact only for an engine
+/// whose canonical id is the request ref, which holds for vLLM (`resolve_model_response`
+/// in `engines/vllm/src/process.rs`); the caller passes the request ref. Costs
+/// what [`live_managed_services_for_model`] costs, a liveness refresh of the registry.
+pub(crate) fn live_service_started_with(
+    paths: &AppPaths,
+    engine: &str,
+    model_ref: &str,
+    recipe: Option<&rocm_engine_protocol::EngineRecipeHint>,
+) -> bool {
+    let Ok(requested) = recipe.map(serde_json::to_string).transpose() else {
+        return false;
+    };
+    live_managed_services_for_model(paths, engine, model_ref).is_some_and(|records| {
+        find_live_managed_service(&records, engine, model_ref)
+            .is_some_and(|record| record.engine_recipe_json == requested)
+    })
+}
+
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// The real process ids a record tracks.
@@ -1052,6 +1079,88 @@ mod tests {
         assert!(
             find_live_managed_service(&records, "lemonade", "not-this-model").is_none(),
             "the canonical-id term must still discriminate"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The recipe check a request makes before adding a default: a live service
+    /// started with exactly the recipe counts, one started with another, or none
+    /// for this engine and model, does not.
+    #[test]
+    fn a_live_service_counts_only_when_it_was_started_with_the_same_recipe() -> Result<()> {
+        use rocm_engine_protocol::{ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint};
+
+        let hint = |flags: &[&str]| EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
+            ..EngineRecipeHint::default()
+        };
+        let (root, paths) = test_paths("live-service-started-with");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "vllm-started-with",
+            "vllm",
+            "qwen",
+            "qwen",
+            "127.0.0.1",
+            11_522,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.engine_recipe_json = None;
+        record.write()?;
+
+        // Started with no recipe at all, as a server from before the default was.
+        assert!(live_service_started_with(&paths, "vllm", "qwen", None));
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--x"]))),
+            "a different recipe is not the one the service runs"
+        );
+        // The common real case: a server of a model whose catalog recipe carries
+        // tool-parser flags recorded `Some`. Equal counts; `None` and another
+        // value do not. Weakening the comparison to "both absent" turns the
+        // first assertion red.
+        record.engine_recipe_json = Some(serde_json::to_string(&hint(&["--x"]))?);
+        record.write()?;
+        assert!(
+            live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--x"]))),
+            "a service started with this exact recipe is the one requested"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen", None),
+            "a recorded recipe is not the same as asking for none"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen", Some(&hint(&["--y"]))),
+            "a service started with another recipe is not the one requested"
+        );
+        record.engine_recipe_json = None;
+        record.write()?;
+        assert!(
+            !live_service_started_with(&paths, "lemonade", "qwen", None),
+            "another engine's service is not this one"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "another-model", None),
+            "another model's service is not this one"
+        );
+        // A name that merely contains the served one is another model: reuse
+        // matches the canonical id exactly, so this must not count.
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qwen-72b", None),
+            "a longer name is not the served model"
+        );
+        assert!(
+            !live_service_started_with(&paths, "vllm", "qw", None),
+            "a shorter name is not the served model"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
