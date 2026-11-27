@@ -287,6 +287,16 @@ async fn detect_local_chat_with_probe(
     let base = tokio::task::spawn_blocking(probe).await.ok().flatten()?;
 
     // Best-effort model query; fall back to the neutral default on any failure.
+    //
+    // This stays on `fetch_first_model` where `managed_chat_config` prefers the
+    // served model via `crate::llm::pick_served_model`, because that preference
+    // needs a model to prefer and there is none here: this branch is reached only
+    // when `detect_managed_chat` found no managed service, so nothing records what
+    // the server on this well-known port was launched with. Recovering it would
+    // mean asking the server what it has loaded rather than what it lists, which
+    // is per-engine; for Lemonade `rocm_dash_collectors::lemonade::LemonadeHealth`
+    // already parses that, but nothing here identifies which engine answered the
+    // probe, so wiring it in needs an engine-identification step this does not have.
     let model = fetch_first_model(base)
         .await
         .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_MODEL.to_string());
@@ -411,11 +421,15 @@ pub(super) async fn fetch_first_model(base_url: &str) -> Option<String> {
 /// placeholder, which 404s on servers that register the model under its real id
 /// (`The model 'local-model' does not exist`). When the endpoint is reachable
 /// (`probe_ok`) and the user set no explicit model, query `/v1/models` and adopt
-/// the served id — mirroring the discovery [`detect_local_chat`] already does
-/// for the auto-detected path. Otherwise the config is returned untouched: an
-/// explicit model always wins, and an unreachable endpoint is never probed
-/// (no fetch timeout) nor silently replaced. The `/v1/models` fold is delegated
-/// to the pure [`with_discovered_model`].
+/// the first id listed — the same discovery [`detect_local_chat`] does on its
+/// well-known-port branch, and not the served-model preference
+/// [`managed_chat_config`] applies through [`crate::llm::pick_served_model`]:
+/// the endpoint here is one the user named, so nothing records what it was
+/// launched with and there is no model to prefer. A user who needs a specific one
+/// passes it explicitly, which wins below. Otherwise the config is returned
+/// untouched: an explicit model always wins, and an unreachable endpoint is never
+/// probed (no fetch timeout) nor silently replaced. The `/v1/models` fold is
+/// delegated to the pure [`with_discovered_model`].
 pub(super) async fn discover_configured_chat_model(
     cfg: crate::llm::LlmConfig,
     explicit_model: Option<&str>,
@@ -606,6 +620,12 @@ mod tests {
     /// The chat must ask for the model the service was launched with: asking for
     /// the first listed makes Lemonade evict the served model and reload another
     /// with its default 4096-token window. Fails when the first listed id wins.
+    ///
+    /// The registry is given the id in a different case from the one the server
+    /// lists, so only the lookup can produce the expected value: the registry
+    /// fallback in [`managed_chat_config`] would answer with the lowercase form,
+    /// and the first-listed fallback with the other model. Spelling both the same
+    /// way would let a lookup that returned nothing at all still pass here.
     #[tokio::test]
     async fn managed_endpoint_chats_with_the_launched_model_not_the_first_listed() {
         let base = spawn_models_server(
@@ -613,7 +633,7 @@ mod tests {
         );
         let picked = ManagedChatEndpoint {
             base_url: base.clone(),
-            model: Some("Qwen3-4B-Instruct-2507-GGUF".to_string()),
+            model: Some("qwen3-4b-instruct-2507-gguf".to_string()),
         };
         let cfg = managed_chat_config(&picked).await.expect("endpoint config");
         assert_eq!(cfg.base_url, base);

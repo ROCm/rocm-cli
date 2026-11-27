@@ -307,3 +307,25 @@ Feature: Chat and endpoint detection
     And none of the provider's wire detail is shown
     When the user quits interactive chat
     Then interactive chat exits successfully
+
+  # A Lemonade server lists every model downloaded on the host, not the one it
+  # has loaded, so the first id on `/v1/models` is whichever sorts first on disk.
+  # Asking for that one makes Lemonade evict the served model and load it
+  # instead, at whatever context window it picks for itself — on a host whose
+  # memory it cannot read, 4096 tokens, which is smaller than the Chat tab's own
+  # opening prompt. The window `rocm serve` sized is then gone and the first turn
+  # fails.
+  #
+  # The unit tests beside the picker drive it directly, so nothing held the real
+  # TUI to putting the served model's id on the wire. This asserts on the body
+  # the endpoint actually received.
+  @id:chat-talks-to-the-served-model-not-the-first-listed @requires-os:linux
+  Scenario: chat-25 - The chat talks to the served model, not the first one the server lists
+    Given a running managed model whose server lists another model first
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    When the user accepts the local endpoint
+    And the user sends a message to the managed model
+    Then the chat request names the model the service was launched with
+    When the user quits interactive chat
+    Then interactive chat exits successfully

@@ -509,6 +509,65 @@ async fn managed_model_refusing_context_overflow(world: &mut E2eWorld) {
     });
 }
 
+/// The id listed ahead of the served one. It sorts first, as the model that
+/// shadows the served one on a real host does.
+const UNSERVED_MODEL_LISTED_FIRST: &str = "AnotherModel/E2E-0.5B";
+
+#[given("a running managed model whose server lists another model first")]
+async fn managed_model_listing_another_first(world: &mut E2eWorld) {
+    let model = "TestModel/E2E-1B";
+    let mock =
+        MockServer::start_listing_other_models_first(model, &[UNSERVED_MODEL_LISTED_FIRST]).await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some(model.to_string());
+    world.mock = Some(mock);
+    // The service record is what names the served model, so the chat has
+    // something to prefer over the first id the listing offers.
+    world.register_mock_service_with(ServiceRecordOptions {
+        inference_verified: true,
+        ..ServiceRecordOptions::default()
+    });
+}
+
+#[then("the chat request names the model the service was launched with")]
+async fn chat_request_names_the_served_model(world: &mut E2eWorld) {
+    // Wait for the user's own turn, not merely for a request: the local-endpoint
+    // detection probe (`Say ok.`) is itself a chat request and lands first, so
+    // reading the newest body without matching races the TUI's async send and
+    // can assert against the probe instead.
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request_where(default_timeout(), |body| {
+            body.get("messages")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|messages| {
+                    messages.iter().any(|m| {
+                        m.get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|c| c.contains(MANAGED_MODEL_PROMPT))
+                    })
+                })
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the user's chat turn never reached the endpoint: {e}"));
+    let sent = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("chat request carried no model field:\n{body}"));
+    let served = world
+        .model_name
+        .as_deref()
+        .expect("the scenario recorded no served model");
+    assert_eq!(
+        sent, served,
+        "the chat asked for {sent:?}; the service was launched with {served:?}. Requesting a \
+         model the server merely lists makes Lemonade evict the served one and reload at its \
+         own default context window."
+    );
+}
+
 #[given(
     "a running managed model answers a request to start a server with a tool call carrying two sets of arguments"
 )]
