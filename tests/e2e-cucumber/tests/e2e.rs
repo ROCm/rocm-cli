@@ -908,12 +908,15 @@ impl Drop for E2eWorld {
 /// scenario. Black-box: reads the service_id from each on-disk record and calls
 /// `rocm services stop <id> --yes` with the same isolated env the scenario used.
 ///
-/// Returns a one-line account of what it found and how each stop went. Teardown
-/// discards it — there, a failure to stop is unfortunate but has no reader. The
-/// serve retry quotes it, because there this is the load-bearing step: if no
-/// record existed yet, or the stop failed, the next attempt runs against a device
-/// the previous one still owns, and the run must say so rather than let it look
-/// like a genuinely broken serve.
+/// Returns a one-line account of what it found and how each stop went. A stop
+/// that failed quotes the stop's stderr as one line, header first and cut to a
+/// maximum length (see [`e2e_cucumber::stop_failure_summary`]), since stderr is
+/// where the stop says why.
+/// Teardown discards the account — there, a failure to stop is unfortunate but
+/// has no reader. The serve retry quotes it, because there this is the
+/// load-bearing step: if no record existed yet, or the stop failed, the next
+/// attempt runs against a device the previous one still owns, and the run must
+/// say so rather than let it look like a genuinely broken serve.
 fn stop_managed_services(
     root: &std::path::Path,
     env: &[(&'static str, std::ffi::OsString)],
