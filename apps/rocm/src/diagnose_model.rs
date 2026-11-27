@@ -148,13 +148,22 @@ enum HubRead {
 /// which is also what decides whether the probe runs, so the spinner cannot
 /// promise a read that does not happen or stay silent through one that does.
 fn hub_read(readiness: &ModelReadiness) -> Option<HubRead> {
+    // Asked first, and with nothing in front of it: `names_a_bare_repository`
+    // applies the catalog gate itself -- an answer the catalog resolved is not
+    // a bare repository to it either -- so a copy of that gate here would be a
+    // second thing to keep in step with the probe, which is the one thing this
+    // function exists to avoid.
+    if rocm_core::gguf_repo_fit::names_a_bare_repository(readiness).is_some() {
+        return Some(HubRead::EveryQuantization);
+    }
+    // The one-file arm has no such shared decider. `parse_gguf_ref` reads the
+    // reference and nothing else, so the gate is applied here for that arm
+    // alone: a curated `owner/repo:QUANT` still parses as a hub file, and the
+    // catalog answers it without a request.
     if readiness.undetermined_reason != Some(UndeterminedReason::ModelNotCurated)
         || readiness.canonical_model_id.is_some()
     {
         return None;
-    }
-    if rocm_core::gguf_repo_fit::names_a_bare_repository(readiness).is_some() {
-        return Some(HubRead::EveryQuantization);
     }
     matches!(
         rocm_core::gguf_source::parse_gguf_ref(&readiness.model_ref),
@@ -277,6 +286,50 @@ mod tests {
         }
         let curated = &registry.recipes[0].canonical_model_id;
         assert_eq!(hub_read(&answer(curated)), None, "{curated}");
+    }
+
+    /// The catalog gate the one-file arm applies for itself, in the one state
+    /// where only that arm can apply it: a reference the catalog *did* answer
+    /// that is still written `owner/repo:QUANT`. The repository arm's gate
+    /// lives inside `names_a_bare_repository`, so nothing it does covers this,
+    /// and dropping the gate as a duplicate of that one would draw a spinner
+    /// promising a hub read for an answer that makes no request.
+    ///
+    /// Built by taking a real answer about an uncurated reference and marking
+    /// it answered, each way round separately: a recipe whose canonical id
+    /// carries a quantization would arrive exactly so.
+    #[test]
+    fn a_catalog_answer_written_as_a_hub_file_still_reads_nothing() {
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+            system_ram_gib: None,
+        };
+        let uncurated = || {
+            crate::model_fit::assess_model_for_host(
+                "some-lab/never-curated-7b:Q4_K_M",
+                &ModelCatalogSource::Available(&registry),
+                &host,
+                None,
+                None,
+            )
+        };
+        // The premise: unanswered, this reference is a hub read.
+        assert_eq!(hub_read(&uncurated()), Some(HubRead::OneFile));
+        let mut resolved = uncurated();
+        resolved.canonical_model_id = Some("some-lab/curated-7b".to_owned());
+        assert_eq!(
+            hub_read(&resolved),
+            None,
+            "the catalog named this model, so there is nothing to read from the hub: {resolved:?}"
+        );
+        let mut settled = uncurated();
+        settled.undetermined_reason = None;
+        assert_eq!(
+            hub_read(&settled),
+            None,
+            "the answer is not waiting on the catalog, so no hub read follows it: {settled:?}"
+        );
     }
 
     /// A readiness whose estimate compared memory, built without a network: the
