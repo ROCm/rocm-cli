@@ -658,7 +658,9 @@ impl LiveGgufSource {
         )
     }
 
-    /// Read one quantization's header, and the size it was sized against.
+    /// Read one quantization's header, and the size it was sized against. The
+    /// failure says whether the shared budget stopped the read or the file
+    /// could not be read at all.
     fn read_one_header(
         &self,
         agent: &ureq::Agent,
@@ -666,7 +668,7 @@ impl LiveGgufSource {
         repo: &str,
         file: &HubFile,
         deadline: Instant,
-    ) -> Result<(GgufHeader, u64)> {
+    ) -> std::result::Result<(GgufHeader, u64), HubFailure> {
         let url = self.hub_file_url(owner, repo, &file.name);
         // The listing carries a size for a file the hub stores whole; if it
         // left one out, the file's own headers say -- at the cost of one more
@@ -676,9 +678,21 @@ impl LiveGgufSource {
             None => head_size(agent, &url, deadline)?,
         };
         let mut reader = RangedReader::new(agent.clone(), url, size).with_deadline(deadline);
-        let header = crate::gguf::parse_gguf_header(&mut reader)
-            .map_err(|error| anyhow!("the GGUF header could not be read: {error}"))?;
-        Ok((header, size))
+        match crate::gguf::parse_gguf_header(&mut reader) {
+            Ok(header) => Ok((header, size)),
+            // Bytes that are not a GGUF header are the file's own answer, and
+            // stay that whether the parse finished with the budget to spare or
+            // with it long gone. Only a window the reader never got hold of
+            // can be the budget, and the reader is the one that knows.
+            Err(error) => {
+                let error = anyhow!("the GGUF header could not be read: {error}");
+                Err(if reader.stopped_by_the_budget() {
+                    HubFailure::budget(error)
+                } else {
+                    HubFailure::unreadable(error)
+                })
+            }
+        }
     }
 
     fn list_files(
@@ -890,15 +904,24 @@ impl GgufSource for LiveGgufSource {
                     size: Some(size),
                     outcome: QuantProbeOutcome::Read(Box::new(header)),
                 }),
-                // A read that failed *because* the shared deadline passed is
-                // the budget running out, not the file being unreadable: the
-                // next quantization would fail the same way whatever it holds.
-                Err(_) if Instant::now() >= deadline => quants.push(not_read(
+                // A read the shared deadline stopped is the budget running
+                // out, not the file being unreadable: the next quantization
+                // would fail the same way whatever it holds. Which of the two
+                // it was comes from the read itself and not from the clock
+                // here -- a `404`, or a file whose bytes are not a GGUF, is
+                // unreadable even when the deadline passed while it was being
+                // found out, and telling that row "the budget ran out; ask
+                // about this quantization by name" would promise a remedy that
+                // runs into the same failure.
+                Err(failure) if failure.budget_expired => quants.push(not_read(
                     NotProbed::BudgetSpent,
                     budget_spent_detail(self.budget),
                 )),
-                Err(error) => {
-                    quants.push(not_read(NotProbed::Unreadable, format!("{error:#}")));
+                Err(failure) => {
+                    quants.push(not_read(
+                        NotProbed::Unreadable,
+                        format!("{:#}", failure.error),
+                    ));
                 }
             }
         }
@@ -931,6 +954,87 @@ fn time_left(deadline: Instant) -> io::Result<Duration> {
 /// CDN, and a chain longer than this is a loop or a mirror that is not one.
 const MAX_REDIRECTS: usize = 5;
 
+/// A hub read that failed, and whether the shared budget is what stopped it.
+///
+/// The two are different answers to the user. A quantization the budget cut
+/// off is read by naming it on its own, because that gives the one header this
+/// command skipped a budget to itself; a quantization whose file could not be
+/// read gets the same failure again however it is asked for, and telling it as
+/// the budget sends the reader round a loop.
+///
+/// Carried from where the failure happened rather than worked out afterwards
+/// from the clock. A read that fails at all is likely to be the one that spent
+/// the budget, so "the deadline has passed" is true of a file the hub answered
+/// `404` for and of a file whose bytes are not a GGUF just as often as it is
+/// true of a read the clock really stopped. What failed says which; when it
+/// failed does not.
+#[derive(Debug)]
+struct HubFailure {
+    error: anyhow::Error,
+    /// The shared deadline is what stopped this read: the request was refused
+    /// before it went out because the budget was already spent, or it timed
+    /// out on a timeout that is never longer than what the budget had left.
+    budget_expired: bool,
+}
+
+impl HubFailure {
+    /// A failure the file, the hub or the response is responsible for, which
+    /// asking again for this file alone would only repeat.
+    const fn unreadable(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            budget_expired: false,
+        }
+    }
+
+    /// A failure the shared budget is responsible for.
+    const fn budget(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            budget_expired: true,
+        }
+    }
+}
+
+impl std::fmt::Display for HubFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+// Written out rather than left to anyhow's blanket conversion, which this type
+// deliberately does not qualify for: a caller that does not care which of the
+// two it was -- `open`, `list_files` -- gets the error and drops the question,
+// and one that does has to take `HubFailure` and keep it.
+impl From<HubFailure> for anyhow::Error {
+    fn from(failure: HubFailure) -> Self {
+        failure.error
+    }
+}
+
+/// Whether the shared deadline is what stopped a request, rather than the hub
+/// answering for the file.
+///
+/// A status is the hub's own answer -- `404` for a file that is not there,
+/// `401` for a repository that is gated, a server error -- and stays that
+/// answer however late it lands. Only a transport failure can be the clock,
+/// and only with the deadline behind it: the timeout every request is given is
+/// what is left of the budget, capped, so a transport failure before the
+/// deadline is a hub that is unreachable or a connection that broke.
+fn stopped_by_the_budget(error: &ureq::Error, now: Instant, deadline: Instant) -> bool {
+    matches!(error, ureq::Error::Transport(_)) && now >= deadline
+}
+
+/// Whether an `io` failure reading a response body is the socket's own deadline
+/// firing. That deadline is what is left of the shared budget, so a body read
+/// it stops is the budget running out; a body that simply ended early is not.
+fn is_a_read_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
 /// Send one request and follow its redirects by hand, each hop under what is
 /// left of `deadline`, keeping the `Range` header on every hop.
 ///
@@ -945,27 +1049,33 @@ fn send(
     deadline: Instant,
     range: Option<&str>,
     what: &str,
-) -> Result<ureq::Response> {
+) -> std::result::Result<ureq::Response, HubFailure> {
     let mut current = url.to_owned();
     for _ in 0..=MAX_REDIRECTS {
-        let mut request = agent
-            .request(method, &current)
-            .timeout(time_left(deadline).map_err(|error| anyhow!("{error}"))?);
+        let left = time_left(deadline).map_err(|error| HubFailure::budget(anyhow!("{error}")))?;
+        let mut request = agent.request(method, &current).timeout(left);
         if let Some(range) = range {
             request = request.set("Range", range);
         }
-        let response = request
-            .call()
-            .map_err(|error| describe_http_error(&error, what))?;
+        let response = request.call().map_err(|error| {
+            let described = describe_http_error(&error, what);
+            if stopped_by_the_budget(&error, Instant::now(), deadline) {
+                HubFailure::budget(described)
+            } else {
+                HubFailure::unreadable(described)
+            }
+        })?;
         if !matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
             return Ok(response);
         }
-        let location = response
-            .header("Location")
-            .ok_or_else(|| anyhow!("the hub redirected {what} without saying where"))?;
-        current = redirect_target(&current, location, what)?;
+        let location = response.header("Location").ok_or_else(|| {
+            HubFailure::unreadable(anyhow!("the hub redirected {what} without saying where"))
+        })?;
+        current = redirect_target(&current, location, what).map_err(HubFailure::unreadable)?;
     }
-    bail!("the hub redirected {what} more than {MAX_REDIRECTS} times")
+    Err(HubFailure::unreadable(anyhow!(
+        "the hub redirected {what} more than {MAX_REDIRECTS} times"
+    )))
 }
 
 /// Where a redirect from `current` to `location` goes, or why it is refused: it
@@ -1003,12 +1113,22 @@ fn redirect_target(current: &str, location: &str, what: &str) -> Result<String> 
 }
 
 /// The size of a remote file from its `Content-Length`, without fetching it.
-fn head_size(agent: &ureq::Agent, url: &str, deadline: Instant) -> Result<u64> {
+fn head_size(
+    agent: &ureq::Agent,
+    url: &str,
+    deadline: Instant,
+) -> std::result::Result<u64, HubFailure> {
     let response = send(agent, "HEAD", url, deadline, None, "the model file")?;
     response
         .header("Content-Length")
         .and_then(|value| value.trim().parse().ok())
-        .ok_or_else(|| anyhow!("the hub did not report how large the model file is"))
+        .ok_or_else(|| {
+            // A `HEAD` that came back is the hub answering about this file, so
+            // what it left out is the file's own answer, not the clock.
+            HubFailure::unreadable(anyhow!(
+                "the hub did not report how large the model file is"
+            ))
+        })
 }
 
 /// A remote file as `Read + Seek`, fetched in windows by `Range` request.
@@ -1021,6 +1141,12 @@ pub struct RangedReader {
     window_start: u64,
     fetched: u64,
     deadline: Instant,
+    /// Whether the shared budget stopped one of the fetches made through this
+    /// reader. Remembered rather than returned: `Read` answers in `io::Error`,
+    /// and `parse_gguf_header` reports what it could not parse, so the reason
+    /// a window never arrived would otherwise be a sentence inside a sentence
+    /// by the time a caller had to act on it.
+    budget_expired: bool,
 }
 
 impl RangedReader {
@@ -1035,7 +1161,15 @@ impl RangedReader {
             window_start: 0,
             fetched: 0,
             deadline: Instant::now() + TOTAL_BUDGET,
+            budget_expired: false,
         }
+    }
+
+    /// Whether the shared budget, rather than the file or the hub, is what
+    /// stopped a fetch this reader made.
+    #[must_use]
+    const fn stopped_by_the_budget(&self) -> bool {
+        self.budget_expired
     }
 
     /// Stop reading at `deadline`, however many windows are left.
@@ -1061,15 +1195,21 @@ impl RangedReader {
                 MAX_FETCH_BYTES / (1024 * 1024)
             )));
         }
-        let response = send(
+        let range = format!("bytes={}-{}", self.position, end - 1);
+        let response = match send(
             &self.agent,
             "GET",
             &self.url,
             self.deadline,
-            Some(&format!("bytes={}-{}", self.position, end - 1)),
+            Some(&range),
             "the model file",
-        )
-        .map_err(|error| io::Error::other(format!("{error:#}")))?;
+        ) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.budget_expired |= failure.budget_expired;
+                return Err(io::Error::other(format!("{:#}", failure.error)));
+            }
+        };
         // 200 means the server ignored the range and would send the whole file.
         if response.status() != 206 {
             return Err(io::Error::other(format!(
@@ -1101,6 +1241,11 @@ impl RangedReader {
         // A body that ends early surfaces as `UnexpectedEof`, which would read as
         // "the header ends here". It is the connection that ended.
         if let Err(error) = response.into_reader().take(wanted).read_to_end(&mut window) {
+            // The headers arrived inside the budget and the body did not. The
+            // socket carries what is left of the shared deadline, so a read it
+            // timed out is the budget running out; a connection that ended for
+            // any other reason is the response being broken.
+            self.budget_expired |= is_a_read_timeout(&error) && Instant::now() >= self.deadline;
             return Err(io::Error::other(format!(
                 "the connection ended after {} of the {wanted} bytes asked for: {error}",
                 window.len()
@@ -1516,6 +1661,129 @@ mod tests {
                     .iter()
                     .all(|request| request.ends_with("/o/r/resolve/main/dir/m%2Bx-Q4_K_M.gguf")),
             "{requests:?}"
+        );
+    }
+
+    /// A loopback server that answers a range request's headers at once, with
+    /// a `Content-Length` it then does not honour: the body never comes, and
+    /// the connection is held open for `stall`. The shape of a hub that got as
+    /// far as answering and then stopped sending.
+    fn headers_then_stall_server(stall: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                thread::spawn(move || {
+                    let mut byte = [0_u8; 1];
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-15/1048576\r\n\
+                         Content-Length: 16\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.flush();
+                    thread::sleep(stall);
+                });
+            }
+        });
+        base
+    }
+
+    /// A body the socket's own deadline cut off is the shared budget running
+    /// out; a body that simply ended is the response being broken. Both leave
+    /// the same line of [`RangedReader::fill`] as an `io` error, so the reader
+    /// is where the two have to be told apart -- by the time it reaches
+    /// `probe_quantizations` the reason is a sentence inside a sentence, and a
+    /// row that says "the budget ran out" offers a remedy the other one does
+    /// not have.
+    #[test]
+    fn a_body_the_deadline_cut_off_is_the_budget_and_one_that_ended_early_is_not() {
+        let base = headers_then_stall_server(Duration::from_secs(5));
+        let mut stalled =
+            RangedReader::new(LiveGgufSource::agent(), format!("{base}/m.gguf"), 1 << 20)
+                .with_deadline(Instant::now() + Duration::from_millis(300));
+        let mut buffer = [0_u8; 16];
+        let began = Instant::now();
+        let error = stalled
+            .read(&mut buffer)
+            .expect_err("the body never arrived");
+        assert!(
+            began.elapsed() < Duration::from_secs(4),
+            "the deadline did not cut the body read off: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            stalled.stopped_by_the_budget(),
+            "a body the deadline cut off is the budget: {error}"
+        );
+        // The same line, a different cause: the hub answers the range and the
+        // connection ends partway through the body, with the budget nowhere
+        // near spent. Nothing about that is the clock.
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::ShortBody,
+            listing_of(&[("m-Q4_K_M.gguf", 1 << 20)]),
+        );
+        let mut broken = RangedReader::new(
+            LiveGgufSource::agent(),
+            format!("{}/o/r/resolve/main/m-Q4_K_M.gguf", hub.base),
+            1 << 20,
+        )
+        .with_deadline(Instant::now() + Duration::from_secs(30));
+        let error = broken.read(&mut buffer).expect_err("the body was short");
+        assert!(
+            !broken.stopped_by_the_budget(),
+            "a connection that ended early is the response, not the clock: {error}"
+        );
+    }
+
+    /// Which of the two answers a failed read gets is decided by what failed,
+    /// not by when it failed. A status is the hub's own answer about the file
+    /// and stays that however late it lands; only a transport failure can be
+    /// the clock, and only with the deadline behind it.
+    ///
+    /// The distinction is the row's remedy. "The budget ran out" tells the
+    /// reader to name this quantization on its own, which for a `404` or a
+    /// gated repository walks into the same failure again -- and a read that
+    /// fails at all is a likely one to have been running when the shared
+    /// deadline passed, so the clock on its own would get this wrong often.
+    #[test]
+    fn a_status_the_hub_chose_is_never_the_budget_however_late_it_lands() {
+        let a_while = Duration::from_mins(1);
+        let spent = Instant::now()
+            .checked_sub(a_while)
+            .expect("the clock reaches back a minute");
+        let running = Instant::now() + a_while;
+        let status = ureq::Error::Status(404, ureq::Response::new(404, "Not Found", "").unwrap());
+        assert!(
+            !stopped_by_the_budget(&status, Instant::now(), spent),
+            "a 404 is the hub's answer about this file, whenever it arrives"
+        );
+        let unreachable = ureq::AgentBuilder::new()
+            .build()
+            .get("http://127.0.0.1:1/nothing-listens-here")
+            .timeout(Duration::from_millis(500))
+            .call()
+            .expect_err("nothing listens on port 1");
+        assert!(
+            matches!(unreachable, ureq::Error::Transport(_)),
+            "premise: this has to be a transport failure, not a status: {unreachable:?}"
+        );
+        assert!(
+            stopped_by_the_budget(&unreachable, Instant::now(), spent),
+            "a transport failure with the deadline behind it is the budget"
+        );
+        assert!(
+            !stopped_by_the_budget(&unreachable, Instant::now(), running),
+            "a hub that cannot be reached while the budget still has time left is not the budget"
         );
     }
 
