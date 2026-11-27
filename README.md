@@ -2264,7 +2264,7 @@ confirm, and which `--keep-` flag keeps it.
 
 The Python interpreters rocm-cli provisions live in `<data-dir>/python` and go
 with the data folder. An ambient `UV_PYTHON_INSTALL_DIR` is honoured instead, and
-that directory is left alone.
+that directory is left alone unless it sits inside a folder being removed.
 
 `rocm uninstall` removes a config, data, or cache folder inside your home
 folder as usual. It never removes:

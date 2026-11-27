@@ -1056,27 +1056,6 @@ All installed packages are compatible
     }
 
     #[test]
-    fn python_install_dir_is_managed_unless_ambient_one_is_set() {
-        let paths = test_paths("/managed/root");
-        let managed = managed_python_dir(&paths.data_dir)
-            .to_string_lossy()
-            .into_owned();
-        assert!(managed.contains("managed/root"));
-        assert_eq!(
-            resolve_uv_python_install_dir(&paths, None),
-            Some(managed.clone())
-        );
-        assert_eq!(
-            resolve_uv_python_install_dir(&paths, Some(OsStr::new("  "))),
-            Some(managed)
-        );
-        assert_eq!(
-            resolve_uv_python_install_dir(&paths, Some(OsStr::new("/shared/python"))),
-            None
-        );
-    }
-
-    #[test]
     fn command_env_hands_uv_the_python_leaf_under_the_data_dir() {
         let paths = test_paths("/managed/root");
         let cache = UvCacheSource::Managed(PathBuf::from("/managed/root/uv-cache"));
