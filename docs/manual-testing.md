@@ -637,8 +637,8 @@ same refusal as above, and the `runtime` folder is exactly as it was, with no
 reinstall during extraction (Ctrl+C) must likewise leave `runtime` working. It
 can leave an `extract/<number>` folder, and `runtime.staging` if it was
 interrupted while copying; only a later install that extracts again
-(`--reinstall` or a new Lemonade version) clears `runtime.staging`, and
-`rocm storage` counts both.
+(`--reinstall`, a new Lemonade version, or a missing server binary) clears
+`runtime.staging`, and `rocm storage` counts both.
 
 To check the refusal of a Linux or WSL host too old for the pinned Lemonade
 server (no download needed): the pinned build needs glibc 2.38 and OpenSSL 3

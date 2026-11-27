@@ -259,7 +259,10 @@ fn stage_runtime(
 /// across staging and the swap. A second process installing a different
 /// version at the same time can therefore delete this process's
 /// `runtime.staging` as a leftover, or read its in-flight swap as an
-/// interrupted one. That stays an accepted, unrecovered limitation.
+/// interrupted one. Between the two renames `runtime_dir` does not exist, so
+/// any other reader of the tree (a running server, `rocm storage`) can also
+/// find it missing for that moment. Both stay accepted, unrecovered
+/// limitations; the window is one rename, not the whole extraction.
 fn swap_in_runtime(staging_dir: &Path, runtime_dir: &Path) -> Result<()> {
     swap_in_runtime_with(staging_dir, runtime_dir, |from, to| fs::rename(from, to))
 }
@@ -293,8 +296,12 @@ fn swap_in_runtime_using(
     if runtime_dir.exists() {
         let moved_aside = (|| -> Result<()> {
             if previous_dir.exists() {
-                fs::remove_dir_all(&previous_dir)
-                    .with_context(|| format!("failed to clear {}", previous_dir.display()))?;
+                fs::remove_dir_all(&previous_dir).with_context(|| {
+                    format!(
+                        "failed to clear {}; the installed runtime was left as it is",
+                        previous_dir.display()
+                    )
+                })?;
             }
             rename(runtime_dir, &previous_dir).with_context(|| {
                 format!(
@@ -1611,6 +1618,26 @@ mod tests {
         assert!(runtime_dir.join("old.txt").is_file());
         assert!(!staging_dir.exists());
         assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// A leftover `runtime.previous` that cannot be cleared stops the swap before
+    /// anything moves: the installed runtime stays and the error says so.
+    #[test]
+    fn failed_clear_of_a_leftover_previous_leaves_the_installed_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+        // A file where the directory should be: `remove_dir_all` refuses it.
+        fs::write(previous_dir_for(&runtime_dir), "not a directory").unwrap();
+
+        let err = swap_in_runtime_with(&staging_dir, &runtime_dir, |from, to| fs::rename(from, to))
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("the installed runtime was left as it is"),
+            "{err:#}"
+        );
+        assert!(runtime_dir.join("old.txt").is_file());
+        assert!(!staging_dir.exists());
     }
 
     /// `rocm storage` and `runtime uninstall` read the install's parts from this
