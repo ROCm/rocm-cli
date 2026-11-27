@@ -491,9 +491,10 @@ Expected result:
 
 - The engine uses its selected supported GPU backend, ROCm or Vulkan. The
   deployment summary's `device:` row is the engine's own account of the backend
-  it was launched on (Lemonade reads back the `backend_requested` it recorded),
-  so check it by reading that row rather than inferring it from the absence of a
-  fallback warning. Every engine reports it in the same
+  it was launched on (Lemonade reads back the `backend_requested` it recorded
+  and reports its family, so a `rocm-stable` or `rocm-nightly` llama.cpp build
+  shows as `rocm`), so check it by reading that row rather than inferring it
+  from the absence of a fallback warning. Every engine reports it in the same
   `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect something like
   `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted when the launch
   pinned none (no `--gpu`, nothing recorded in the engine's `gpu_indices`) and
