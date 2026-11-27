@@ -21,6 +21,7 @@ use an in-process axum server; GPU-tier tests run real model serving.
 ## Prerequisites
 
 - Rust toolchain (cargo)
+- A Linux host, native or WSL2, or a native Windows host; the tags decide which scenarios apply on each ([CI lanes](#tags-and-per-scenario-expectations)). Every Windows CI lane sets `ROCM_CLI_BINARY`, so `cargo xtask e2e`'s own build step is not run on Windows in CI.
 - For GPU-tier tests: an AMD GPU with ROCm drivers and `rocm` binary on PATH
 
 ## Directory layout
