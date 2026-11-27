@@ -341,22 +341,54 @@ pub(super) fn probe_container(e: &mut Examination) {
 /// its evidence from these constants.
 pub(crate) const DMESG_LINES_SCANNED: usize = 400;
 
-/// How many matching lines [`probe_dmesg_amdgpu`] keeps, the newest ones.
+/// How many matching lines [`probe_dmesg_amdgpu`] keeps in total, the newest
+/// ones.
+///
+/// [`amdgpu_log_hits`] splits this budget across two buckets rather than
+/// applying it to one list. A GPU reset or a firmware load prints `ring` and
+/// `psp` lines by the dozen, and against a single newest-wins list that burst
+/// would push an older `SVM mapping failed` out of the window -- so the one
+/// check that reads those lines would report "no SVM failure in the recent
+/// kernel log" on a machine whose log still held one.
 pub(crate) const DMESG_HITS_KEPT: usize = 15;
 
 /// The kernel log line the amdkfd driver leaves when an SVM range could not be
 /// reserved, lower-cased for matching.
 ///
 /// `pr_info("SVM mapping failed, exceeds resident system memory limit\n")` in
-/// `drivers/gpu/drm/amd/amdkfd/kfd_svm.c`'s `svm_range_new`, reached when
-/// `amdgpu_amdkfd_reserve_mem_limit` refuses the registration. The line is
-/// carried through to the user by `check_24_apu_unified_memory`, so the probe's
-/// keyword list and the check's detector read the same constant.
+/// `drivers/gpu/drm/amd/amdkfd/kfd_svm.c`'s `svm_range_new` (v6.12, line 339),
+/// reached when `amdgpu_amdkfd_reserve_mem_limit` refuses the registration. The
+/// line is carried through to the user by `check_24_apu_unified_memory`, so the
+/// probe's keyword list and the check's detector read the same constant.
 pub(crate) const SVM_MAPPING_FAILED: &str = "svm mapping failed";
 
 /// The companion line, emitted when a host buffer the application asked the GPU
 /// to use is already covered by an SVM range.
+///
+/// A different file and a louder level than [`SVM_MAPPING_FAILED`], which is
+/// worth keeping straight because the two are easily assumed to share a site:
+/// this one is `pr_err` in `kfd_ioctl_alloc_memory_of_gpu`, in
+/// `drivers/gpu/drm/amd/amdkfd/kfd_chardev.c` (v6.12, lines 1065 and 1078),
+/// under `#if IS_ENABLED(CONFIG_HSA_AMD_SVM)`. It has two spellings there --
+/// `"Address: 0x%llx already allocated by SVM\n"` when the requested virtual
+/// address is already in an SVM range, and
+/// `"User Buffer Address: 0x%llx already allocated by SVM\n"` for the userptr
+/// case -- and the common tail below matches both.
 pub(crate) const SVM_ALREADY_ALLOCATED: &str = "already allocated by svm";
+
+/// Whether `line` is one of the amdkfd SVM lines the unified-memory check
+/// reads, matched case-insensitively.
+///
+/// One predicate, shared by [`amdgpu_log_hits`] -- which gives these lines a
+/// bucket of their own so unrelated amdgpu chatter cannot evict them -- and by
+/// `check_24_apu_unified_memory`, which reads them back out of
+/// `dmesg_amdgpu_tail`. Were the two to drift apart, the probe would be
+/// reserving space for lines the check does not recognise while dropping the
+/// ones it does, and the reserved bucket would protect nothing.
+pub(crate) fn is_svm_log_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains(SVM_MAPPING_FAILED) || lower.contains(SVM_ALREADY_ALLOCATED)
+}
 
 /// The phrases that make an amdgpu kernel-log line worth keeping, matched
 /// against the lower-cased line.
@@ -388,8 +420,18 @@ const INTERESTING_DMESG_PHRASES: &[&str] = &[
 /// the unrelated AMD-V lines a host prints at boot (`kvm_amd`'s `SVM` messages
 /// name the virtualisation extension, not shared virtual memory), which is the
 /// flooding this filter exists to prevent.
+///
+/// The budget is split rather than shared. [`is_svm_log_line`] matches get
+/// first call on it, and only what they leave goes to the rest, so an SVM
+/// failure cannot be evicted by `ring` or `psp` chatter that happens to be
+/// newer -- the eviction that would make the unified-memory check say the
+/// recent log holds no failure when it does. The total is still capped at
+/// [`DMESG_HITS_KEPT`], and the survivors are returned in the order the kernel
+/// printed them rather than grouped by bucket, so timestamps still read
+/// forwards.
 fn amdgpu_log_hits(text: &str) -> Vec<String> {
-    let mut hits: Vec<String> = Vec::new();
+    // Position in the log, the line, and which bucket it belongs to.
+    let mut hits: Vec<(usize, String, bool)> = Vec::new();
     for line in text.lines() {
         if !line.contains("amdgpu") && !line.contains("amdkfd") {
             continue;
@@ -399,11 +441,34 @@ fn amdgpu_log_hits(text: &str) -> Vec<String> {
             .iter()
             .any(|phrase| lower.contains(phrase))
         {
-            hits.push(line.trim().chars().take(300).collect());
+            let kept: String = line.trim().chars().take(300).collect();
+            // `lower` is already lower-cased, but `is_svm_log_line` is the
+            // predicate the reader uses and must stay the single definition.
+            let is_svm = is_svm_log_line(&kept);
+            hits.push((hits.len(), kept, is_svm));
         }
     }
-    let start = hits.len().saturating_sub(DMESG_HITS_KEPT);
-    hits.split_off(start)
+
+    let svm_total = hits.iter().filter(|(_, _, is_svm)| *is_svm).count();
+    let mut svm_budget = svm_total.min(DMESG_HITS_KEPT);
+    let mut other_budget = DMESG_HITS_KEPT - svm_budget;
+
+    // Newest first, so that what a full bucket drops is its oldest.
+    let mut selected: Vec<(usize, String)> = Vec::new();
+    for (index, line, is_svm) in hits.into_iter().rev() {
+        let budget = if is_svm {
+            &mut svm_budget
+        } else {
+            &mut other_budget
+        };
+        if *budget == 0 {
+            continue;
+        }
+        *budget -= 1;
+        selected.push((index, line));
+    }
+    selected.sort_by_key(|(index, _)| *index);
+    selected.into_iter().map(|(_, line)| line).collect()
 }
 
 pub(super) fn probe_dmesg_amdgpu(e: &mut Examination) {
@@ -515,6 +580,63 @@ mod tests {
             "the oldest five must have been dropped, not the newest: {:?}",
             hits[0]
         );
+    }
+
+    /// An SVM failure survives a later burst of unrelated amdgpu chatter.
+    ///
+    /// A GPU reset or a firmware load prints `ring` and `psp` lines by the
+    /// dozen. Against one newest-wins list those would evict an older
+    /// `SVM mapping failed`, and `check_24_apu_unified_memory` would then tell
+    /// a user whose kernel log holds a real failure that the recent log holds
+    /// none -- the one answer this evidence must never give wrongly. The
+    /// reserved bucket in [`amdgpu_log_hits`] is what prevents it.
+    #[test]
+    fn an_svm_failure_survives_a_later_flood_of_unrelated_amdgpu_lines() {
+        use std::fmt::Write as _;
+
+        // Oldest line in the log, and the only one that matters.
+        let svm = "[ 100.0] amdgpu: SVM mapping failed, exceeds resident system memory limit";
+        let mut log = format!("{svm}\n");
+        // Comfortably more than the whole budget, all of them newer, all of
+        // them matching `INTERESTING_DMESG_PHRASES` for a different reason.
+        let flood = DMESG_HITS_KEPT + 5;
+        for n in 0..flood {
+            let _ = writeln!(log, "[ 2{n:02}.0] amdgpu: ring gfx_0.0.0 test failed #{n}");
+            let _ = writeln!(log, "[ 3{n:02}.0] amdgpu: psp command failed #{n}");
+        }
+
+        let hits = amdgpu_log_hits(&log);
+        assert!(
+            hits.len() <= DMESG_HITS_KEPT,
+            "the reserved bucket must not raise the overall cap: {}",
+            hits.len()
+        );
+        assert!(
+            hits.iter().any(|line| line == svm),
+            "the SVM line must outrank {flood} newer ring/psp lines, or a real failure goes \
+             unseen: {hits:#?}"
+        );
+        // It is the only SVM line, so it keeps exactly one slot and the rest of
+        // the window is still spent on the newest of everything else.
+        assert_eq!(
+            hits.len(),
+            DMESG_HITS_KEPT,
+            "the remaining budget must still be filled: {hits:#?}"
+        );
+        assert_eq!(
+            hits[0], svm,
+            "chronological order must survive the split, oldest first: {hits:#?}"
+        );
+        assert!(
+            hits.last().is_some_and(|line| line.contains("psp")),
+            "the newest unrelated line must still be kept: {hits:#?}"
+        );
+        // And the predicate the check reads with agrees with the bucket that
+        // saved the line.
+        assert!(is_svm_log_line(svm));
+        assert!(!is_svm_log_line(
+            "[ 200.0] amdgpu: ring gfx_0.0.0 test failed #0"
+        ));
     }
 
     /// The message and the state it describes, asserted together: an

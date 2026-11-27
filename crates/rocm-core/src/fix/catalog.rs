@@ -1054,19 +1054,20 @@ pub(super) const RECIPES: &[FixRecipe] = &[
     // The generic plan below is what `rocm fix` prints when asked for this id
     // directly, with no host to size it against. `check_24_apu_unified_memory`
     // in diagnose/linux.rs builds its own copy with the figures filled in from
-    // the examined machine's installed RAM, the way fix-7 and fix-12 build
+    // the examined machine's usable RAM, the way fix-7 and fix-12 build
     // theirs per package-manager family, so the two are deliberately not
     // byte-identical and this id is not in
     // `diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`.
     FixRecipe {
         fix_id: crate::diagnose::APU_UNIFIED_MEMORY_FIX_ID,
-        title: "Size the GTT aperture and the TTM page limit to installed RAM",
+        title: "Size the GTT aperture and the TTM page limit to usable RAM",
         rationale: "An integrated GPU has no VRAM of its own: it allocates from system memory through a GTT aperture whose ceiling is set by amdgpu.gttsize, by ttm.pages_limit and by the BIOS carve-out. The two kernel parameters are in different units -- gttsize counts MiB, pages_limit counts 4 KiB pages -- so a pages_limit below gttsize x 256 silently caps the aperture however large gttsize is, and a model that should fit fails to load.",
         commands: &[
             "cat /proc/cmdline",
-            "free -g                                # installed RAM, to size the pair against",
+            "free -g                                # usable RAM, to size the pair against",
             "# Edit /etc/default/grub and put BOTH parameters on GRUB_CMDLINE_LINUX_DEFAULT,",
-            "# sized to about three quarters of installed RAM and consistent with each other:",
+            "# sized to about three quarters of usable RAM and consistent with each other:",
+            "# (usable RAM, not the RAM on the board: MemTotal is already net of the carve-out.)",
             "#   amdgpu.gttsize=<MiB> ttm.pages_limit=<MiB x 256>",
             "sudo $EDITOR /etc/default/grub",
             "sudo update-grub                       # Debian/Ubuntu",
@@ -1082,7 +1083,7 @@ pub(super) const RECIPES: &[FixRecipe] = &[
         verify_linux: None,
         notes: &[
             "The BIOS carve-out is a firmware setting, not a command: in the UEFI setup look for UMA Frame Buffer Size, Dedicated Graphics Memory or GART size. Do not simply give it the largest value on offer. The carve-out is taken from the operating system's RAM for as long as the machine is on, and the host-memory ceiling an SVM reservation is checked against is worked out from the RAM that is left -- so raising it can cause the very failure this entry reports. The GTT aperture the commands above set is memory on top of the carve-out, handed out only as it is used, and it is the figure to raise for a larger model. Leave the carve-out at the smallest value the board will boot and drive the display with, commonly 512 MiB to 4 GiB. The carve-out is what the GPU reports as its own VRAM.",
-            "An SVM mapping failure in the kernel log is a reservation refused against the host-memory ceiling, which is worked out from installed RAM. Raising the aperture does not move that ceiling, so if the failure persists after this change look at what else draws on host memory: a model loaded by mmap, another process still holding KFD memory, or a BIOS carve-out large enough to shrink the RAM the ceiling is derived from.",
+            "An SVM mapping failure in the kernel log is a reservation refused against the host-memory ceiling, which the kernel works out from MemTotal -- the RAM it reports as usable, already net of the BIOS carve-out -- and not from the RAM installed on the board. Raising the aperture does not move that ceiling, so if the failure persists after this change look at what else draws on host memory: a model loaded by mmap, another process still holding KFD memory, or a BIOS carve-out large enough to shrink the RAM the ceiling is derived from.",
             "ttm.pages_limit is called amdttm.pages_limit when the out-of-tree amdgpu-dkms packages are installed, because they ship their own copy of TTM. Set the name your own driver uses; setting the other one has no effect.",
         ],
         doc_url: None,

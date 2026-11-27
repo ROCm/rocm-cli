@@ -753,8 +753,12 @@ closing line names the first cause listed.
   different units - `gttsize` counts MiB, `pages_limit` counts 4 KiB pages - so
   a `pages_limit` below `gttsize` x 256 caps the aperture however large
   `gttsize` reads. `rocm diagnose` names that smaller ceiling specifically and
-  offers both parameters sized to installed RAM; the carve-out is a firmware
-  setting, so it is given as advice rather than as a command to run.
+  offers both parameters sized to usable RAM (`MemTotal`, which is already net
+  of the carve-out, and is the same figure the kernel derives its own
+  host-memory ceiling from); the carve-out is a firmware setting, so it is
+  given as advice rather than as a command to run. Below about 8 GiB of usable
+  RAM no pair is offered at all, because three quarters of that would sit above
+  the kernel's ceiling and be refused anyway; the plan says so instead.
   `rocm examine --json` shows the values it read as `amdgpu_gttsize_mib`,
   `ttm_pages_limit` and `system_ram_gib`. The same entry reports the kernel's
   own `SVM mapping failed, exceeds resident system memory limit` line when it

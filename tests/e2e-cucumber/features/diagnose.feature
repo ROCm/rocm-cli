@@ -1507,7 +1507,7 @@ Feature: Diagnosing failures and listing fixes
     Given an integrated-GPU machine whose GTT aperture and TTM page limit disagree with each other
     When the user asks the CLI to diagnose that machine's memory limits, in machine-readable form
     Then the CLI names the page limit as the ceiling that really applies
-    And the CLI offers a consistent pair sized to installed RAM, needing sudo and a reboot
+    And the CLI offers a consistent pair sized to usable RAM, needing sudo and a reboot
     And the BIOS carve-out is given as advice rather than as a command to run
 
   # The other direction, and the reason diagnose-89 means anything: the same

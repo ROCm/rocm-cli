@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 //! Operating-system facts the host summary reports: kernel version, distro name,
-//! CPU model and installed RAM.
+//! CPU model and usable RAM.
+//!
+//! "Usable" is `MemTotal` on Linux, which is what the page allocator was given
+//! and so is already net of firmware reservations such as an integrated GPU's
+//! BIOS carve-out. It is not the RAM installed on the board.
 
 use super::capture::{
     OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,

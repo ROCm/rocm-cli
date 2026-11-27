@@ -464,7 +464,7 @@
     },
     {
       "id": "fix-24-apu-unified-memory",
-      "title": "Size the GTT aperture and the TTM page limit to installed RAM",
+      "title": "Size the GTT aperture and the TTM page limit to usable RAM",
       "platforms": [
         {
           "os": "linux",

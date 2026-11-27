@@ -33,9 +33,11 @@ mod windows;
 mod wsl;
 
 use framework::probe_framework;
-pub(crate) use host_env::{
-    DMESG_HITS_KEPT, DMESG_LINES_SCANNED, SVM_ALREADY_ALLOCATED, SVM_MAPPING_FAILED,
-};
+// The two SVM phrase constants are deliberately not re-exported: the only
+// reader outside `host_env` matched on them by hand, and now shares
+// `is_svm_log_line` with the probe instead, so that the lines given a reserved
+// place in the kept window are exactly the lines the check recognises.
+pub(crate) use host_env::{DMESG_HITS_KEPT, DMESG_LINES_SCANNED, is_svm_log_line};
 use host_env::{
     probe_container, probe_cpu_linux, probe_cpu_windows, probe_dmesg_amdgpu, probe_env, probe_os,
     probe_shared_memory,
@@ -266,7 +268,21 @@ pub struct Examination {
     // hardware
     pub cpu_vendor: String,
     pub cpu_model: String,
-    /// Installed system memory in GiB, from `MemTotal` in `/proc/meminfo`.
+    /// System memory in GiB the kernel reports as usable, from `MemTotal` in
+    /// `/proc/meminfo`.
+    ///
+    /// **Not installed RAM.** `MemTotal` counts what the page allocator was
+    /// given, which is already net of the firmware reservations in the e820
+    /// map -- the integrated GPU's BIOS carve-out among them. So on an APU this
+    /// figure reads lower than the RAM on the board, by roughly the carve-out,
+    /// and calling it installed RAM would overstate it by exactly the amount
+    /// the carve-out took.
+    ///
+    /// Usable RAM is nonetheless the right figure for the unified-memory
+    /// advice, not a second-best one: the kernel's own ceiling on host memory
+    /// the KFD will hand out is derived from the same number.
+    /// `amdgpu_amdkfd_gpuvm_init_mem_limits` takes `si_meminfo`'s `totalram`,
+    /// which is what `MemTotal` prints.
     ///
     /// Linux only, and `None` where it could not be read. Collected because an
     /// integrated GPU allocates out of this memory rather than out of VRAM of

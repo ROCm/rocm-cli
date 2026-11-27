@@ -6562,8 +6562,13 @@ async fn assert_gguf_text_report_names_its_pool_as_shared(world: &mut E2eWorld) 
 
 // ── An APU's GTT/TTM limits and the kernel's SVM failures (ROCMAI-912) ──
 
-/// Installed RAM for the unified-memory fixtures, in kB as `/proc/meminfo`
-/// spells it: 128 GiB, a Strix Halo configuration.
+/// Usable RAM for the unified-memory fixtures, in kB as `/proc/meminfo` spells
+/// it: 128 GiB, a Strix Halo configuration.
+///
+/// `MemTotal`, so this is what the kernel reports as usable rather than the RAM
+/// on the board -- the carve-out has already come off it. Comfortably above the
+/// floor below which the entry recommends no pair at all, which is the point:
+/// these scenarios exercise the branch that does size a pair.
 const UNIFIED_MEMORY_RAM_KB: u64 = 128 * 1024 * 1024;
 
 /// `amdgpu.gttsize` as the fixtures set it, in MiB: 96 GiB.
@@ -6594,16 +6599,25 @@ const UNIFIED_MEMORY_CAPPED_PAGES: u64 = 32 * 1024 * PAGES_PER_MIB;
 ///
 /// The `kvm_amd` lines are not filler: an AMD host really does print them at
 /// boot, they contain the letters `SVM`, and they are about the virtualisation
-/// extension rather than shared virtual memory. A detector that widened its
-/// line filter to match `svm` would report them as a mapping failure.
+/// extension rather than shared virtual memory. They are here to hold the
+/// *line filter* in `examine/host_env.rs`, which keeps a kernel-log line only
+/// when it says `amdgpu` or `amdkfd`. Widened to a bare `svm`, that filter
+/// would admit these two, and the phrase list would then match them on
+/// `already allocated by svm`'s weaker neighbours -- so a healthy host would
+/// carry boot noise in `dmesg_amdgpu_tail`.
 const KERNEL_LOG_WITHOUT_SVM_FAILURE: &str = "\
 [    3.100000] kvm_amd: SVM: Virtual VMLOAD VMSAVE supported
 [    3.100001] kvm_amd: SVM: LBR virtualization supported
 [    4.200000] amdgpu: amdgpu_device_init completed";
 
 /// The line the amdkfd driver prints when a host-memory reservation is refused
-/// (`pr_info` in `kfd_svm.c`'s `svm_range_new`), with the `amdgpu: ` prefix
-/// `amdgpu.h`'s `pr_fmt` puts on it.
+/// (`pr_info` in `drivers/gpu/drm/amd/amdkfd/kfd_svm.c`'s `svm_range_new`),
+/// with the `amdgpu: ` prefix `amdgpu.h`'s `pr_fmt` puts on it.
+///
+/// Not to be confused with the `already allocated by SVM` line the same driver
+/// can print: that one is `pr_err` in `kfd_chardev.c`'s
+/// `kfd_ioctl_alloc_memory_of_gpu` and reports an address collision, not an
+/// exhausted memory ceiling.
 const KERNEL_SVM_FAILURE_LINE: &str =
     "[ 1234.567890] amdgpu: SVM mapping failed, exceeds resident system memory limit";
 
@@ -6915,7 +6929,7 @@ async fn assert_page_limit_named_as_the_real_ceiling(world: &mut E2eWorld) {
     );
 }
 
-#[then("the CLI offers a consistent pair sized to installed RAM, needing sudo and a reboot")]
+#[then("the CLI offers a consistent pair sized to usable RAM, needing sudo and a reboot")]
 async fn assert_sized_pair_is_offered(world: &mut E2eWorld) {
     let finding = unified_memory_finding(world);
     let fix = &finding["fix"];

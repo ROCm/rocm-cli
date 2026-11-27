@@ -2989,11 +2989,20 @@ amdgpu.gttsize=32768 ttm.pages_limit=2097152
 Expected result: `rocm diagnose` reports `fix-24-apu-unified-memory` as a
 match, and its evidence names `capped at 8192 MiB` — the ceiling the page limit
 really imposes, not the 32768 MiB the aperture asks for. The plan offers a pair
-sized to this machine's installed RAM (three quarters of it, rounded down to a
+sized to this machine's usable RAM (three quarters of it, rounded down to a
 whole GiB, with the page limit 256× the MiB figure), says it needs sudo and a
 reboot, and leaves the BIOS carve-out in the notes rather than among the
 commands. `rocm fix fix-24-apu-unified-memory` prints the plan and changes
 nothing.
+
+"Usable" rather than "installed" is the figure to check it against: the pair is
+sized from `MemTotal`, which is what `free -g` totals and is already net of the
+BIOS carve-out, so on a board with 32 GiB fitted and a 4 GiB carve-out the plan
+sizes against roughly 28 GiB, not 32. That is deliberate — the kernel derives
+its own host-memory ceiling from the same number. On a machine with less than
+about 8 GiB usable the plan offers no pair at all and says why instead; an APU
+small enough to hit that is unlikely to be on hand, so it is covered by unit
+tests rather than here.
 
 Finally, apply the pair the plan offered, reboot, and run the verify line it
 printed:

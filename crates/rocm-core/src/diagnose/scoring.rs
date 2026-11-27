@@ -242,8 +242,17 @@ pub(super) const KEYWORDS_IOMMU_HANG: KeywordTable = &[
 /// (`crate::examine::SVM_MAPPING_FAILED`), which clears
 /// [`MIN_SCORE_FOR_MATCH`](super::MIN_SCORE_FOR_MATCH) alone because nothing
 /// else in the kernel prints it: it comes from one `pr_info` in
-/// `kfd_svm.c`'s `svm_range_new`, on the one path where a host-memory
-/// reservation was refused.
+/// `drivers/gpu/drm/amd/amdkfd/kfd_svm.c`'s `svm_range_new`, on the one path
+/// where a host-memory reservation was refused.
+///
+/// The `already allocated by svm` entry is a different line from a different
+/// file, which is why it scores lower rather than sharing that reasoning: it
+/// is `pr_err` in `kfd_ioctl_alloc_memory_of_gpu`, in
+/// `drivers/gpu/drm/amd/amdkfd/kfd_chardev.c`, and it reports an address
+/// collision between a buffer the application registered and an existing SVM
+/// range. That is a different fault from running out of host memory, and it is
+/// not always one the aperture parameters explain, so it is weighted as
+/// corroboration rather than as proof.
 ///
 /// The rest stay below the threshold on their own. A bare `ttm.pages_limit` or
 /// `amdgpu.gttsize` only says the user is talking about the parameters, which
