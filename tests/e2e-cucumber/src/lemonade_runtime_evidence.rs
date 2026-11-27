@@ -331,7 +331,7 @@ fn mode_suffix(metadata: &std::fs::Metadata) -> String {
 }
 
 #[cfg(not(unix))]
-fn mode_suffix(_metadata: &std::fs::Metadata) -> String {
+const fn mode_suffix(_metadata: &std::fs::Metadata) -> String {
     String::new()
 }
 
