@@ -80,6 +80,21 @@ pub fn reported_engine(serve_stdout: &str) -> Option<&str> {
         .filter(|engine| !engine.is_empty())
 }
 
+/// The OpenAI-compatible base URL a serve printed on its `endpoint:` row, if any.
+///
+/// `rocm serve` without `--port` takes the first bindable port from 11435
+/// upward, so a port something else holds moves the service (#1130); the
+/// printed row is the only account of where it went. The last matching row
+/// wins, and `anthropic endpoint:` rows are not matched.
+#[must_use]
+pub fn reported_endpoint(serve_output: &str) -> Option<&str> {
+    serve_output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("endpoint:"))
+        .map(str::trim)
+        .rfind(|url| url.starts_with("http://") && url.ends_with("/v1"))
+}
+
 /// The engine named on a `rocm serve` command line.
 ///
 /// Accepts `--engine X` and `--engine=X`. `None` when no engine was requested:
@@ -366,9 +381,26 @@ pub fn serve_attempt_report(attempt: &ServeAttempt<'_>) -> String {
 mod tests {
     use super::{
         MAX_ARCHIVED_LOG_BYTES, SERVE_CLI_MARGIN_SECS, ServeAttempt, archive_service_log,
-        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_engine,
-        serve_attempt_report, serve_cli_budget, service_log_tail, slugify, tail_lines,
+        engine_from_serve_args, parse_log_path, read_clamped, read_clamped_file, reported_endpoint,
+        reported_engine, serve_attempt_report, serve_cli_budget, service_log_tail, slugify,
+        tail_lines,
     };
+
+    #[test]
+    fn reported_endpoint_reads_the_port_the_serve_moved_to() {
+        let out = "Port: automatic; endpoint shown after launch\n  endpoint: http://127.0.0.1:11436/v1\n  anthropic endpoint: http://127.0.0.1:11436/anthropic\n";
+        assert_eq!(reported_endpoint(out), Some("http://127.0.0.1:11436/v1"));
+    }
+
+    #[test]
+    fn reported_endpoint_is_none_without_a_usable_row() {
+        assert_eq!(reported_endpoint(""), None);
+        assert_eq!(reported_endpoint("endpoint: shown after launch\n"), None);
+        assert_eq!(
+            reported_endpoint("anthropic endpoint: http://127.0.0.1:1/v1\n"),
+            None
+        );
+    }
 
     #[test]
     fn cli_budget_outlasts_the_readiness_timeout_by_a_bounded_margin() {
