@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::ROCM_BACKEND_NAME;
 use anyhow::{Result, bail};
 use rocm_engine_protocol::{DevicePolicy, EngineDeviceAvailability, GpuSelection};
 use serde_json::Value;
@@ -134,13 +135,38 @@ pub(crate) const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     }
 }
 
+/// The backend word the `device:` row carries for a recorded `backend_requested`.
+///
+/// The router records the Lemonade backend (`rocm`, `vulkan`), but the direct
+/// route records the `bin/llamacpp/<dir>` its packaged llama-server runs from,
+/// and for ROCm that is a build channel (`rocm-stable`, `rocm-nightly`). A
+/// channel is a build directory inside the ROCm family, not a backend, and the
+/// row is documented to name the backend (`vulkan`/`rocm`), so the whole ROCm
+/// family reports as `rocm`. Every other word is reported as recorded. Only the
+/// report is folded: the state keeps the directory, which the e2e step
+/// `assert_simple_model_served_directly` (scenario
+/// `serve-lemonade-simple-registered-direct-route`) reads to check that the served
+/// directory belongs to the selected backend.
+fn reported_backend(backend: &str) -> &str {
+    let backend = backend.trim();
+    let family = backend
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("rocm"));
+    if family && (backend.len() == 4 || backend[4..].starts_with('-')) {
+        ROCM_BACKEND_NAME
+    } else {
+        backend
+    }
+}
+
 /// The device string reported once a model is loaded: the backend this service
 /// was launched on (`rocm`, `vulkan`, …), the pinned GPU ordinal when known, and
 /// the GPU name recorded at launch.
 ///
 /// Read back from the service's own recorded `backend_requested` rather than
 /// from a hardcoded value — so it follows the backend selection this launch
-/// actually made, including a ROCm-to-Vulkan fallback. It is this engine's
+/// actually made, including a ROCm-to-Vulkan fallback — and folded to the backend
+/// word by [`reported_backend`]. It is this engine's
 /// account of what it asked llama.cpp for, not an independent measurement of
 /// which device executed, which is why the CLI's docs say the row *reports* a
 /// device rather than naming the one observed.
@@ -154,7 +180,7 @@ pub(crate) const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
 /// moved next to the formatter.
 pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
     rocm_engine_protocol::format_reported_device(
-        backend,
+        reported_backend(backend),
         state.and_then(rocm_engine_protocol::first_gpu_index_from_state),
         state.and_then(gpu_name_from_state).as_deref(),
     )
@@ -264,6 +290,33 @@ mod tests {
         );
         // Without a recorded ordinal the backend is still reported truthfully.
         assert_eq!(reported_device(None, "rocm"), "rocm");
+    }
+
+    #[test]
+    fn reported_device_names_the_backend_family_not_the_build_directory() {
+        // The direct route records the `bin/llamacpp/<dir>` the packaged
+        // llama-server runs from (`rocm-stable`, `rocm-nightly`) as its
+        // `backend_requested`. The row is documented to carry the backend, so the
+        // build directory must not reach it.
+        let state = json!({ "gpu_indices": [0], "gpu_name": "AMD Instinct MI300X" });
+        for recorded in [
+            "rocm",
+            "ROCM",
+            "rocm-stable",
+            "rocm-nightly",
+            "ROCm-Stable",
+            " rocm ",
+        ] {
+            assert_eq!(
+                reported_device(Some(&state), recorded),
+                "rocm gpu 0 (AMD Instinct MI300X)",
+                "recorded backend `{recorded}`"
+            );
+        }
+        assert_eq!(reported_device(None, "rocm-stable"), "rocm");
+        // Only the ROCm family folds: Vulkan and anything else keep their own word.
+        assert_eq!(reported_device(None, "vulkan"), "vulkan");
+        assert_eq!(reported_device(None, "rocmish"), "rocmish");
     }
 
     #[test]

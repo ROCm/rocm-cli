@@ -926,14 +926,22 @@ mod tests {
     use super::*;
 
     /// Characterization: health and chat read the served name from the persisted
-    /// state. This holds with or without this change (`healthcheck_service_at`
-    /// already preferred `canonical_model_id`), so it guards the reading, not the
-    /// writing; `router_state_keeps_requested_text_and_records_router_name` covers
-    /// what a router serve persists.
+    /// state. That part holds with or without the device-row fold
+    /// (`healthcheck_service_at` already preferred `canonical_model_id`), so it
+    /// guards the reading, not the writing;
+    /// `router_state_keeps_requested_text_and_records_router_name` covers what a
+    /// router serve persists. The same run also pins the `device` word the health
+    /// answer reports for each route's recorded backend, which does depend on the
+    /// fold in `device_policy::reported_device`.
     #[test]
     fn health_and_chat_read_the_served_name_from_the_persisted_state() {
         use crate::test_http::{Reply, spawn_fixture};
-        for (tag, served_name) in [("router", "Qwen3-0.6B-GGUF"), ("direct", "qwen-smoke")] {
+        // The backend each route records: the router records the Lemonade backend
+        // word, the direct route the `bin/llamacpp/<dir>` its llama-server runs from.
+        for (tag, served_name, recorded_backend, reported_backend) in [
+            ("router", "Qwen3-0.6B-GGUF", "vulkan", "vulkan"),
+            ("direct", "qwen-smoke", "rocm-stable", "rocm"),
+        ] {
             let expected = served_name.to_owned();
             let (port, server) = spawn_fixture(Duration::from_secs(5), move |recorded| {
                 let chat = recorded.method == "POST";
@@ -942,7 +950,7 @@ mod tests {
                     body: if chat {
                         json!({"choices": [{"message": {"content": "ok"}}]})
                     } else {
-                        json!({"all_models_loaded": [{"model_name": expected, "recipe_options": {"llamacpp_backend": "vulkan"}}]})
+                        json!({"all_models_loaded": [{"model_name": expected, "recipe_options": {"llamacpp_backend": recorded_backend}}]})
                     }
                     .to_string(),
                     last: chat,
@@ -997,7 +1005,7 @@ mod tests {
             }
             crate::state::merge_json_state(
                 &request.state_path,
-                &json!({"backend_requested": "vulkan"}),
+                &json!({"backend_requested": recorded_backend}),
             )
             .unwrap();
             let response = healthcheck_service_at(&request.state_path).unwrap();
@@ -1013,6 +1021,16 @@ mod tests {
                 .to_owned();
             let state = crate::state::read_service_state(&request.state_path).unwrap();
             assert_eq!(response.status, "ready");
+            // The row names the backend, never the build directory behind it, while
+            // the state keeps the directory that
+            // `assert_simple_model_served_directly` (serve-58) reads.
+            assert_eq!(
+                response.device.split_whitespace().next(),
+                Some(reported_backend),
+                "{tag}: {}",
+                response.device
+            );
+            assert_eq!(state["backend_requested"], recorded_backend);
             assert_eq!(state["model_ref"], "qwen-smoke");
             assert_eq!(chat_model, served_name);
             assert_eq!(state["canonical_model_id"], served_name);
