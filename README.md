@@ -2426,6 +2426,18 @@ folder that reaches the CLI through the assistant's request is held to the
 rule, even if you named it first.
 See the LLM tool-use design notes in the documentation for the exact set.
 
+With `--provider local` and no `--model`, `--prompt` uses only the built-in
+assistant (`Qwen3-4B-Instruct-2507-GGUF`). When it is not running but another
+local server is ready, the command fails with an error on stderr that says a
+server is running, lists each ready server by the name `--model` accepts and
+prints the `rocm chat --provider local --model <name>` command that uses it;
+with `--tools` that command leaves `--tools` out, because ROCm tools work only
+with the built-in assistant. A `--model` that no ready server serves gets the
+same list. When nothing can answer the prompt, nothing is sent and the exit code
+is non-zero. With no server at all the error on stderr says "No local assistant
+is running yet." and how to start one. With `--tools`, a read-only status
+question can still be answered from the CLI's own checks and exits 0.
+
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
 That backend logs a warning and ignores all three sampling flags. This is an

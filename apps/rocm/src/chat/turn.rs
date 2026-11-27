@@ -287,14 +287,12 @@ fn render_chat_prompt_result_unsanitized(
                         report_chat_tool_progress(&mut progress, "Running ROCm status check.");
                         response
                     } else {
-                        return Ok(ChatPromptResult {
-                            rendered: local_chat_service_needed_text(
-                                service_needed_model,
-                                user_prompt,
-                                rocm_tools,
-                            ),
-                            approval: None,
-                        });
+                        return Err(local_chat_service_needed_error(
+                            paths,
+                            service_needed_model,
+                            user_prompt,
+                            rocm_tools,
+                        ));
                     }
                 }
                 Err(error) => return Err(error),
@@ -316,14 +314,12 @@ fn render_chat_prompt_result_unsanitized(
         ) {
             Ok(response) => response,
             Err(error) if provider == "local" && local_provider_missing_service_error(&error) => {
-                return Ok(ChatPromptResult {
-                    rendered: local_chat_service_needed_text(
-                        service_needed_model,
-                        user_prompt,
-                        rocm_tools,
-                    ),
-                    approval: None,
-                });
+                return Err(local_chat_service_needed_error(
+                    paths,
+                    service_needed_model,
+                    user_prompt,
+                    rocm_tools,
+                ));
             }
             Err(error) => return Err(error),
         }
@@ -729,6 +725,111 @@ fn local_rocm_tools_assistant_model(provider: &str, rocm_tools: bool) -> Option<
     (provider == "local" && rocm_tools).then_some(providers::BUILTIN_ASSISTANT_MODEL_ID)
 }
 
+/// What no ready local server can answer: an error, because nothing was sent.
+/// It is an `Err` so `rocm chat --prompt` exits non-zero with the text on
+/// stderr instead of exiting 0 with a normal-looking answer.
+///
+/// With no ready server it tells the user to start one. With a ready server
+/// that the request does not select (the default is the built-in assistant
+/// alone, and `--model` names one), it says a server is running, lists each by
+/// the name `--model` accepts, and prints the command that uses it.
+fn local_chat_service_needed_error(
+    paths: &AppPaths,
+    model: Option<&str>,
+    prompt: &str,
+    rocm_tools: bool,
+) -> anyhow::Error {
+    let ready = providers::ready_local_service_model_names(paths);
+    let text = if ready.is_empty() {
+        local_chat_service_needed_text(model, prompt, rocm_tools)
+    } else {
+        local_chat_other_service_text(&ready, model, prompt, rocm_tools)
+    };
+    anyhow::anyhow!(sanitize_terminal_text(&text))
+}
+
+fn local_chat_args(model: Option<&str>, prompt: &str, rocm_tools: bool) -> Vec<String> {
+    let mut chat_args = vec!["chat".to_owned()];
+    if rocm_tools {
+        chat_args.push("--tools".to_owned());
+    }
+    chat_args.push("--provider".to_owned());
+    chat_args.push("local".to_owned());
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+        chat_args.push("--model".to_owned());
+        chat_args.push(model.to_owned());
+    }
+    if !prompt.trim().is_empty() {
+        chat_args.push("--prompt".to_owned());
+        chat_args.push(prompt.to_owned());
+    }
+    chat_args
+}
+
+/// The error for a request no ready server answers while others are ready.
+/// `ready` holds the names `--model` accepts, and is not empty.
+///
+/// `--tools` is dropped from the commands it prints: `--tools` always talks to
+/// the built-in assistant (`local_rocm_tools_assistant_model`), so a command
+/// that kept it would ignore the model it names.
+fn local_chat_other_service_text(
+    ready: &[String],
+    model: Option<&str>,
+    prompt: &str,
+    rocm_tools: bool,
+) -> String {
+    let mut output = String::new();
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+        let _ = writeln!(
+            output,
+            "No ready local server serves `{model}`, but a local server is running."
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "A local server is running, but not the built-in assistant ({}).",
+            providers::BUILTIN_ASSISTANT_MODEL_ID
+        );
+        let _ = writeln!(
+            output,
+            "Without --model, `rocm chat --provider local` uses only the built-in assistant."
+        );
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Ready local servers (the name `--model` takes):");
+    for name in ready {
+        let _ = writeln!(output, "  {name}");
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "To chat with {}, run:",
+        if ready.len() == 1 {
+            "it"
+        } else {
+            "one of them"
+        }
+    );
+    for name in ready {
+        let _ = writeln!(
+            output,
+            "  {}",
+            format_structured_tool_call("rocm", &local_chat_args(Some(name), prompt, false))
+        );
+    }
+    if rocm_tools {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "--tools is left out of that command: ROCm tools work only with the built-in assistant ({}), so a chat with another model cannot run them.",
+            providers::BUILTIN_ASSISTANT_MODEL_ID
+        );
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Nothing was sent and nothing was changed.");
+    output.trim_end().to_owned()
+}
+
 fn local_chat_service_needed_text(model: Option<&str>, prompt: &str, rocm_tools: bool) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "No local assistant is running yet.");
@@ -776,20 +877,7 @@ fn local_chat_service_needed_text(model: Option<&str>, prompt: &str, rocm_tools:
             format_structured_tool_call("rocm", &example_args)
         );
     }
-    let mut chat_args = vec!["chat".to_owned()];
-    if rocm_tools {
-        chat_args.push("--tools".to_owned());
-    }
-    chat_args.push("--provider".to_owned());
-    chat_args.push("local".to_owned());
-    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
-        chat_args.push("--model".to_owned());
-        chat_args.push(model.to_owned());
-    }
-    if !prompt.trim().is_empty() {
-        chat_args.push("--prompt".to_owned());
-        chat_args.push(prompt.to_owned());
-    }
+    let chat_args = local_chat_args(model, prompt, rocm_tools);
     let _ = writeln!(output);
     let _ = writeln!(
         output,
@@ -1671,11 +1759,12 @@ install therock";
     #[test]
     fn local_chat_without_service_explains_serve_before_chat_without_llm_setup() {
         let (_root, paths) = test_paths("local-chat-no-service-guidance");
-        let result =
+        // An error, not a result: nothing was sent, so `rocm chat --prompt`
+        // must exit non-zero (chat-26 asserts the exit and stderr end to end).
+        let rendered =
             render_chat_prompt_result(&paths, "local", None, "Check this ROCm setup", true)
-                .expect("missing local assistant should render guidance");
-        assert!(result.approval.is_none());
-        let rendered = result.rendered;
+                .expect_err("missing local assistant should be an error")
+                .to_string();
 
         assert!(rendered.contains("No local assistant is running yet."));
         assert!(rendered.contains("First-time ROCm setup does not need an LLM"));
@@ -1689,6 +1778,40 @@ install therock";
         assert!(rendered.contains("Nothing was changed."));
         assert!(!rendered.contains("install sdk"));
         assert!(!rendered.contains("setup TheRock with an LLM"));
+    }
+
+    #[test]
+    fn local_chat_with_another_ready_server_names_it_and_its_command() {
+        let ready = vec!["org/model:Q4".to_owned(), "other".to_owned()];
+
+        let text = local_chat_other_service_text(&ready, None, "What is 17*23?", false);
+        assert!(text.contains("A local server is running"), "{text}");
+        assert!(!text.contains("No local assistant"), "{text}");
+        assert!(text.contains("\n  org/model:Q4\n"), "{text}");
+        assert!(text.contains("\n  other\n"), "{text}");
+        assert!(
+            text.contains("rocm chat --provider local --model org/model:Q4 --prompt"),
+            "{text}"
+        );
+        assert!(!text.contains("--tools"), "{text}");
+        assert!(text.contains("Nothing was sent"), "{text}");
+
+        let with_tools = local_chat_other_service_text(&ready[..1], None, "status", true);
+        assert!(with_tools.contains("--tools is left out"), "{with_tools}");
+        assert!(
+            with_tools
+                .lines()
+                .filter(|line| line.trim_start().starts_with("rocm chat "))
+                .all(|line| !line.contains("--tools")),
+            "{with_tools}"
+        );
+
+        let unserved = local_chat_other_service_text(&ready[..1], Some("nobody/x"), "hi", false);
+        assert!(
+            unserved.contains("No ready local server serves `nobody/x`"),
+            "{unserved}"
+        );
+        assert!(unserved.contains("\n  org/model:Q4\n"), "{unserved}");
     }
 
     #[test]

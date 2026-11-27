@@ -307,3 +307,51 @@ Feature: Chat and endpoint detection
     And none of the provider's wire detail is shown
     When the user quits interactive chat
     Then interactive chat exits successfully
+
+  # `rocm chat --provider local` without `--model` answers only through the
+  # built-in assistant, so a ready server serving another model used to be
+  # reported as "no local assistant is running" and the command exited 0 with
+  # nothing sent. Now the CLI fails, says a server is running, lists each ready
+  # server by the name `--model` accepts and prints the command that uses it.
+  # The scenario asserts the message together with the state it describes: the
+  # served model received no request. Runs on mock (no GPU).
+  @id:chat-local-ready-other-server-is-named
+  Scenario: chat-25 - A ready server that is not the built-in assistant is named, with the command that uses it
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user sends a one-shot chat prompt through the CLI without naming a model
+    Then the CLI fails and nothing is printed to standard output
+    And the CLI says a local server is running and prints the chat command naming that model
+    And the served model never received the prompt
+
+  # With no server at all the guidance to start one stays, but the command now
+  # fails like any other that could not do what was asked, with the message on
+  # stderr. Runs on mock (no GPU).
+  @id:chat-local-no-server-fails
+  Scenario: chat-26 - With no local server running the chat CLI fails and says no local assistant is running
+    When the user sends a one-shot chat prompt through the CLI without naming a model
+    Then the CLI fails and nothing is printed to standard output
+    And the CLI says on stderr that no local assistant is running yet
+
+  # `--tools` always talks to the built-in assistant, so the command offered for
+  # the ready server cannot keep it; the message says why rather than dropping
+  # the flag silently. Runs on mock (no GPU).
+  @id:chat-local-ready-other-server-with-tools
+  Scenario: chat-27 - With ROCm tools and a ready server that is not the built-in assistant, the advice drops --tools and says why
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user sends a one-shot chat prompt with ROCm tools through the CLI without naming a model
+    Then the CLI fails and nothing is printed to standard output
+    And the CLI offers a chat command for that model without --tools and says why
+    And the served model never received the prompt
+
+  # A `--model` no ready server serves used to read as a missing server too.
+  # The error now lists what is ready. Runs on mock (no GPU).
+  @id:chat-local-unserved-model-lists-ready-servers
+  Scenario: chat-28 - Naming a model no ready server serves lists the servers that are ready
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user sends a one-shot chat prompt through the CLI naming a model no server serves
+    Then the CLI fails and nothing is printed to standard output
+    And the CLI says no ready server serves that model and lists the ready one
+    And the served model never received the prompt

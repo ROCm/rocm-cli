@@ -495,6 +495,21 @@ fn select_local_chat_service(
         })
 }
 
+/// The name `--model` accepts for each ready local service, newest first and
+/// without repeats. `select_local_chat_service` matches the name a service
+/// serves (`served_model_name`) among others, so each name listed here selects
+/// that service.
+pub(crate) fn ready_local_service_model_names(paths: &AppPaths) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for service in ready_local_services(paths).unwrap_or_default() {
+        let name = service.served_model_name();
+        if !names.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
 const fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
     local_service_priority(service) != usize::MAX
 }
@@ -1455,6 +1470,13 @@ mod tests {
         let status = provider_status(&paths, "local")?;
         assert_eq!(status.auth_status, "no_ready_builtin_assistant_service");
         assert_eq!(status.models, vec!["sshleifer/tiny-gpt2".to_owned()]);
+        // Each name listed for the user selects that service when passed as --model.
+        let names = ready_local_service_model_names(&paths);
+        assert_eq!(names, vec!["sshleifer/tiny-gpt2".to_owned()]);
+        assert_eq!(
+            select_local_chat_service(&paths, Some(&names[0]))?.service_id,
+            "svc-custom"
+        );
         assert_eq!(
             select_local_chat_service(&paths, Some("tiny-gpt2"))?.service_id,
             "svc-custom"
