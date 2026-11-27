@@ -452,7 +452,7 @@ The I/O-heavy collector implementations behind `rocm-dash-core`'s traits (amd-sm
 | [`host.rs`](../crates/rocm-dash-collectors/src/host.rs) | `HostCollector`: CPU, memory and swap from `sysinfo`, sampled once per tick into `SystemMetrics`. Disk and network rates are not collected yet and stay 0. | flat |
 | [`lemonade.rs`](../crates/rocm-dash-collectors/src/lemonade.rs) | The Lemonade Server collector: pure parsers over its stats and health endpoints, and the discovery of a running server's loaded models, one row per model. | flat |
 | [`parallel.rs`](../crates/rocm-dash-collectors/src/parallel.rs) | `parallel_scrape`: runs an async scrape against many targets concurrently on a `JoinSet`. | flat |
-| [`vllm_prom.rs`](../crates/rocm-dash-collectors/src/vllm_prom.rs) | The vLLM Prometheus `/metrics` scraper: request gauges, KV-cache usage, the generation-token counter and the latency histogram sums. | flat |
+| [`vllm_prom.rs`](../crates/rocm-dash-collectors/src/vllm_prom.rs) | The vLLM Prometheus `/metrics` scraper: request gauges, KV-cache usage, the generation-token counter and the latency histogram sums. It reads vLLM's current series names first and falls back to the legacy ones for older servers. | flat |
 | [`winperf.rs`](../crates/rocm-dash-collectors/src/winperf.rs) | Live Windows GPU metrics from OS performance counters, with temperature, power and clocks from ADLX when the AMD driver's DLL is present. | flat |
 
 Boundaries:

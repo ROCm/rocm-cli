@@ -20,9 +20,9 @@ vllm:num_requests_running{model=\"x\"} 17
 # HELP vllm:num_requests_waiting waiting.
 # TYPE vllm:num_requests_waiting gauge
 vllm:num_requests_waiting{model=\"x\"} 4
-# HELP vllm:gpu_cache_usage_perc kv.
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{model=\"x\"} 0.873
+# HELP vllm:kv_cache_usage_perc kv.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model=\"x\"} 0.873
 ";
 
 #[tokio::test]

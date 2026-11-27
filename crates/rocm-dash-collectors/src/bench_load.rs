@@ -893,8 +893,8 @@ mod tests {
              vllm:num_requests_waiting {waiting}\n\
              vllm:time_to_first_token_seconds_sum {ttft_sum}\n\
              vllm:time_to_first_token_seconds_count {ttft_count}\n\
-             vllm:time_per_output_token_seconds_sum 0\n\
-             vllm:time_per_output_token_seconds_count 0\n"
+             vllm:inter_token_latency_seconds_sum 0\n\
+             vllm:inter_token_latency_seconds_count 0\n"
         )
     }
 
@@ -1873,8 +1873,8 @@ mod tests {
              vllm:num_requests_waiting {waiting}\n\
              vllm:time_to_first_token_seconds_sum {ttft_sum}\n\
              vllm:time_to_first_token_seconds_count {ttft_count}\n\
-             vllm:time_per_output_token_seconds_sum {tpot_sum}\n\
-             vllm:time_per_output_token_seconds_count {tpot_count}\n"
+             vllm:inter_token_latency_seconds_sum {tpot_sum}\n\
+             vllm:inter_token_latency_seconds_count {tpot_count}\n"
         )
     }
 
