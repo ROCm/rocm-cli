@@ -38,6 +38,9 @@ for _logger_name in ("sphinx.rocm_docs.projects", "sphinx.rocm_docs.theme"):
 # -- Project information ---------------------------------------------------
 
 project = "ROCm CLI"
+# The latest ROCm CLI release. The `latest` site built from the latest docs branch
+# uses this value too (through `html_title` below), so bump it when a release ships,
+# together with the heading in release-notes.md and the row in release.md.
 version = "0.3.0"
 release = version
 author = "Advanced Micro Devices, Inc."
@@ -88,8 +91,14 @@ ROCM_CORE_SDK_URL = "https://rocm.docs.amd.com/en/latest/"
 
 def _point_core_sdk_link_to_latest(app, pagename, templatename, context, doctree):  # noqa: ARG001
     # On docs-X.Y.Z branches rocm-docs-core resolves every sister project to
-    # that same version, but the ROCm Core SDK has no docs-0.3.0 build.
-    context["projects"] = {**context["projects"], "rocm": ROCM_CORE_SDK_URL}
+    # that same version, but the ROCm Core SDK has no docs-0.3.0 build. On the
+    # latest build, which comes from the latest docs branch, it already
+    # resolves to the latest ROCm docs (see
+    # rocm_docs.projects), so this changes only the trailing slash there.
+    context["projects"] = {
+        **context.get("projects", {}),
+        "rocm": ROCM_CORE_SDK_URL,
+    }
 
 
 def setup(app):
