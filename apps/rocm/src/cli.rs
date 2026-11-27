@@ -408,7 +408,9 @@ pub(crate) enum Command {
     /// In a terminal with no --prompt, opens the interactive chat (switch providers
     /// there with /provider; --provider, --model, and --tools don't apply). With
     /// --prompt, or a prompt piped on standard input, sends that one prompt and prints
-    /// the reply without terminal escape sequences. With --tools, an assistant-chosen
+    /// the reply without terminal escape sequences. With --provider local and no
+    /// ready server that answers the prompt, it exits non-zero with the reason on
+    /// stderr, naming any other ready server and the --model that uses it. With --tools, an assistant-chosen
     /// value a Windows shell reads as syntax (', &, %) is refused, not offered to
     /// paste, unless it came from your own request (`install therock into <folder>`).
     /// Use `rocm config enable-provider` and `rocm config set-provider-key` first to
