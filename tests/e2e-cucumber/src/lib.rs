@@ -201,30 +201,40 @@ pub fn cli_failure_report(args: &[&str], rc: i32, stdout: &str, stderr: &str) ->
     )
 }
 
-/// One line summing up a failed `rocm services stop`.
+/// What a failed `rocm services stop` said on stderr, on one line.
 ///
-/// That is its `Error:` line, which is the report's header (`Local server stop
-/// not confirmed`) for an unconfirmed stop, rather than the report's last detail
-/// line; otherwise the last non-blank line.
+/// The first line that starts with `Error:` comes first: `main` in
+/// `apps/rocm/src/main.rs` (`render_error_for_terminal`) puts that prefix on the
+/// report, whose header is `Local server stop not confirmed` for an unconfirmed
+/// stop. The other non-blank lines follow in their original order, and the
+/// lines are trimmed and joined with ` | `. Those other lines are the only
+/// account of why the stop was not confirmed (which process is still running,
+/// that the engine's own stop failed and how, what was kept):
+/// `render_unconfirmed_service_stop` in `apps/rocm/src/services_text.rs`
+/// renders them. Output with no such line is joined in the order it came. The
+/// result is cut to [`STOP_FAILURE_SUMMARY_MAX_CHARS`] characters, keeping the
+/// head, so one chatty stop cannot flood the failure it is quoted in.
 pub fn stop_failure_summary(stderr: &str) -> String {
-    stderr
+    let mut lines: Vec<&str> = stderr
         .lines()
-        .find(|line| line.starts_with("Error:"))
-        .map_or_else(|| last_line(stderr), last_line)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if let Some(at) = lines.iter().position(|line| line.starts_with("Error:")) {
+        lines[..=at].rotate_right(1);
+    }
+    let trimmed: Vec<&str> = lines.iter().map(|line| line.trim()).collect();
+    clip(&trimmed.join(" | "), STOP_FAILURE_SUMMARY_MAX_CHARS)
 }
 
-/// The last non-blank line of `text`, clipped, for a one-line failure summary.
-fn last_line(text: &str) -> String {
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.chars().count() > 200 {
-        format!("{}…", line.chars().take(200).collect::<String>())
+/// The most characters [`stop_failure_summary`] returns, before its ellipsis.
+pub const STOP_FAILURE_SUMMARY_MAX_CHARS: usize = 1500;
+
+/// `text` cut to `max` characters, with an ellipsis when anything was cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max).collect::<String>())
     } else {
-        line.to_owned()
+        text.to_owned()
     }
 }
 
@@ -282,39 +292,102 @@ pub use e2e_report as report;
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_response_is_successful, cli_failure_report, lifecycle_binary_dir, number_after_phrase,
-        stop_failure_summary, user_path_write_region,
+        STOP_FAILURE_SUMMARY_MAX_CHARS, chat_response_is_successful, cli_failure_report,
+        lifecycle_binary_dir, number_after_phrase, stop_failure_summary, user_path_write_region,
     };
     use std::path::Path;
 
     #[test]
-    fn stop_failure_summary_prefers_the_error_line_over_the_last_line() {
-        let stderr = "Error: Local server stop not confirmed\n  \
-                      kept: the server record\n  check: `ps -p 4242`\n\n";
+    fn stop_failure_summary_keeps_the_header_and_the_detail_that_explains_it() {
+        // The shape `render_unconfirmed_service_stop` prints: the header, then
+        // the lines that say why. The header comes first, ahead of an earlier
+        // warning, and none of the detail is dropped.
+        let stderr = "warning: something earlier\n\
+                      Error: Local server stop not confirmed\n  \
+                      service: aim-1\n  \
+                      not confirmed: the engine's own stop failed: docker stop timed out\n  \
+                      kept: the server record, which still names its processes\n\n";
         assert_eq!(
             stop_failure_summary(stderr),
-            "Error: Local server stop not confirmed"
+            "Error: Local server stop not confirmed | warning: something earlier | \
+             service: aim-1 | \
+             not confirmed: the engine's own stop failed: docker stop timed out | \
+             kept: the server record, which still names its processes"
         );
     }
 
     #[test]
-    fn stop_failure_summary_falls_back_to_the_last_non_blank_line() {
+    fn stop_failure_summary_without_an_error_line_joins_what_there_is() {
         let stderr = "warning: something earlier\nthread panicked at main.rs\n  \n";
-        assert_eq!(stop_failure_summary(stderr), "thread panicked at main.rs");
+        assert_eq!(
+            stop_failure_summary(stderr),
+            "warning: something earlier | thread panicked at main.rs"
+        );
         assert_eq!(stop_failure_summary(""), "");
         assert_eq!(
             stop_failure_summary("warning\n  indented detail  \n"),
-            "indented detail",
-            "the chosen line is trimmed"
+            "warning | indented detail",
+            "each line is trimmed"
         );
-        let long = format!("Error: {}", "x".repeat(300));
+    }
+
+    #[test]
+    fn stop_failure_summary_is_clipped_so_one_chatty_stop_cannot_flood_a_failure() {
+        let long = format!("Error: {}", "x".repeat(5000));
         let summary = stop_failure_summary(&long);
         assert_eq!(
             summary.chars().count(),
-            201,
-            "clipped to 200 plus an ellipsis"
+            STOP_FAILURE_SUMMARY_MAX_CHARS + 1,
+            "clipped to the maximum plus an ellipsis"
         );
+        assert!(summary.starts_with("Error: xxx"), "{summary}");
         assert!(summary.ends_with('…'), "{summary}");
+        let exact = "y".repeat(STOP_FAILURE_SUMMARY_MAX_CHARS);
+        assert_eq!(
+            stop_failure_summary(&exact),
+            exact,
+            "a summary at the limit is not clipped"
+        );
+    }
+
+    #[test]
+    fn stop_failure_summary_counts_characters_not_bytes() {
+        let exact = "é".repeat(STOP_FAILURE_SUMMARY_MAX_CHARS);
+        assert_eq!(
+            stop_failure_summary(&exact),
+            exact,
+            "a multibyte summary at the limit is not clipped"
+        );
+        let over = "é".repeat(STOP_FAILURE_SUMMARY_MAX_CHARS + 1);
+        assert_eq!(
+            stop_failure_summary(&over),
+            format!("{}…", "é".repeat(STOP_FAILURE_SUMMARY_MAX_CHARS)),
+            "one character over is cut to the maximum plus an ellipsis"
+        );
+    }
+
+    #[test]
+    fn stop_failure_summary_moves_only_the_first_unindented_error_line_to_the_front() {
+        assert_eq!(
+            stop_failure_summary("note\nError: first\nError: second\n"),
+            "Error: first | note | Error: second",
+            "the first one leads and the second stays where it was"
+        );
+        assert_eq!(
+            stop_failure_summary("a\nb\nError: x\nc\n"),
+            "Error: x | a | b | c",
+            "every line ahead of the header follows it, in its original order"
+        );
+        assert_eq!(
+            stop_failure_summary("note\n  Error: relayed under the report\n"),
+            "note | Error: relayed under the report",
+            "an indented line is a detail, not the header"
+        );
+        assert_eq!(
+            stop_failure_summary("note\nError (stopped early): x\n"),
+            "note | Error (stopped early): x",
+            "the header is `Error:` and nothing near it"
+        );
     }
 
     /// What `rocm fix fix-6-path --yes` prints *before* it does anything: the
