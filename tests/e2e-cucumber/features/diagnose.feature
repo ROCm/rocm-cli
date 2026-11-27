@@ -1538,6 +1538,7 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI reports the kernel's own SVM mapping failure as the cause
     When that machine's kernel log no longer carries the failure, and the CLI is asked again
     Then the report says only that the recent log was read, not that the machine never failed
+
   # The question a user who does not know which quantization to pick actually
   # has. A GGUF repository publishes the same model a dozen times over at sizes
   # that differ by a factor of five, and naming one of them is what the CLI used
@@ -1586,13 +1587,13 @@ Feature: Diagnosing failures and listing fixes
 
   # The two sentences a person reads off a repository answer, and the only ones
   # of it a machine never sees: the heading above the table and the plan under
-  # it. diagnose-97 to diagnose-99 ask in `--json`, where no heading is
+  # it. diagnose-98 to diagnose-100 ask in `--json`, where no heading is
   # rendered, and they plant no GPU -- so on a hosted runner nothing is
   # measured, every row reads "not compared", and both sentences take their
   # other branch. Neither was reached by any scenario before this one.
   #
   # So this plants a discrete card with memory of its own, and asks the
-  # fifteen-quantization repository of diagnose-98 in the form a person reads.
+  # fifteen-quantization repository of diagnose-99 in the form a person reads.
   # Both halves of the fixture are load-bearing. The card is what makes the
   # rows comparisons rather than bare requirements, so the heading exists at
   # all; and the cap leaves three of the fifteen unread, which is what makes
