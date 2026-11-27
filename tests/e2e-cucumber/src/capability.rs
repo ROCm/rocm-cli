@@ -204,6 +204,17 @@ use e2e_report::ENGINE_NOT_APPLICABLE_MARKER;
 pub use e2e_report::OOM_FAULT_INJECTION_ENV;
 
 impl HostCapability {
+    /// Whether a scenario that only needs *some* served model answering over
+    /// HTTP (`a model is served in the background`) is backed by the in-process
+    /// mock instead of a real `rocm serve`: on a host with no usable GPU, and
+    /// on a lane whose pre-warm recorded the serving engine as not applicable
+    /// ([`Self::engine_not_applicable`]), where a real serve can only fail on
+    /// the missing engine. Scenarios that assert on real generation are
+    /// `@requires-gpu` and skipped there by `expectation::resolve`.
+    pub const fn backs_background_model_with_mock(&self) -> bool {
+        !self.has_amd_gpu || self.engine_not_applicable.is_some()
+    }
+
     /// Whether a given engine can actually START on this host. Distinct from
     /// "adapter present": vLLM's adapter is built-in everywhere but cannot run on
     /// native Windows or on non-vLLM-preferred families; lemonade runs anywhere.
@@ -1539,6 +1550,32 @@ mod tests {
     #[test]
     fn no_gpu_defaults_to_lemonade() {
         assert_eq!(effective_serve_engine(None, "other"), "lemonade");
+    }
+
+    #[test]
+    fn background_model_uses_the_mock_where_no_real_serve_can_run() {
+        let mut cap = HostCapability {
+            os_family: "linux".to_owned(),
+            is_wsl: false,
+            gfx_target: Some("gfx942".to_owned()),
+            has_amd_gpu: true,
+            amd_gpu_count: Some(1),
+            available_engines: vec!["vllm".to_owned()],
+            effective_serve_engine: "vllm".to_owned(),
+            platform_slug: "mi300x".to_owned(),
+            oom_fault_injection: false,
+            case_sensitive_fs: true,
+            dir_permissions_bind: true,
+            driver_status: String::new(),
+            probe_error: None,
+            engine_not_applicable: None,
+        };
+        assert!(!cap.backs_background_model_with_mock());
+        cap.engine_not_applicable = Some("vllm publishes no build".to_owned());
+        assert!(cap.backs_background_model_with_mock());
+        cap.engine_not_applicable = None;
+        cap.has_amd_gpu = false;
+        assert!(cap.backs_background_model_with_mock());
     }
 
     #[test]

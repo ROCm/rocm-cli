@@ -696,6 +696,17 @@ pub fn resolve(
     // (2) xfail override.
     if let Some(id) = &decl.id {
         for entry in matrix.entries_for(id) {
+            // A scenario without `requires-gpu` on a lane whose engine is not
+            // applicable runs against the in-process mock (see
+            // `HostCapability::backs_background_model_with_mock`), so a bug keyed
+            // on the real engine cannot manifest: the row would only turn into a
+            // stale XPASS.
+            if !decl.requires_gpu
+                && cap.engine_not_applicable.is_some()
+                && entry.when.effective_engine.is_some()
+            {
+                continue;
+            }
             if entry.when.matches(cap, engine) {
                 return Expectation::ExpectXfail {
                     bug: entry.bug.clone(),
@@ -3196,5 +3207,43 @@ flaky = true
                 "{id} with requires-gpu serves with the real engine and must be skipped"
             );
         }
+    }
+
+    /// chat-06 has a vLLM-keyed expected-failure row. On a lane whose engine is
+    /// not applicable it runs against the mock, so the row must not apply (it
+    /// would be a stale XPASS); with a real engine the row still applies.
+    #[test]
+    fn engine_keyed_xfail_row_is_ignored_where_the_mock_backs_the_scenario() {
+        let m = Expectations::parse(
+            r#"
+[["chat-tool-definitions-accepted"]]
+when = { effective_engine = "vllm" }
+bug = "EAI-7223"
+reason = "tool definitions rejected"
+"#,
+        )
+        .unwrap();
+        let included = Included {
+            nightly: false,
+            lifecycle: false,
+            docker: false,
+            merge_queue: false,
+        };
+        let chat06 = decl(&["id:chat-tool-definitions-accepted"]);
+        let chat07 = decl(&["id:chat-end-to-end-local-model"]);
+        let mut mi300x = cap("mi300x");
+        assert!(matches!(
+            resolve(&chat06, &mi300x, &m, included),
+            Expectation::ExpectXfail { .. }
+        ));
+        mi300x.engine_not_applicable = Some("vllm has no build for this SDK".to_owned());
+        assert_eq!(
+            resolve(&chat06, &mi300x, &m, included),
+            Expectation::ExpectPass
+        );
+        assert_eq!(
+            resolve(&chat07, &mi300x, &m, included),
+            Expectation::ExpectPass
+        );
     }
 }
