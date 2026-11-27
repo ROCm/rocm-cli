@@ -1378,10 +1378,11 @@ mod tests {
     }
 
     /// A `runtime.staging` left by an interrupted run is cleared before the next
-    /// extraction, or `copy_tree` (which needs the path free) would fail every
-    /// install after it.
+    /// extraction, or `copy_tree` (which needs the path free) would fail the
+    /// next install that extracts; that install's failure cleanup would then
+    /// remove it.
     #[test]
-    fn reinstall_clears_a_staging_directory_an_interrupted_run_left() {
+    fn an_install_clears_a_staging_directory_an_interrupted_run_left() {
         let archive_dir = tempfile::tempdir().unwrap();
         let archive = archive_dir.path().join("good");
         write_embeddable_with_pins(&archive, "{}");
@@ -1466,6 +1467,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
         let previous_dir = previous_dir_for(&runtime_dir);
+        fs::write(lemond_path_in(&runtime_dir), b"old lemond").unwrap();
+        fs::write(lemonade_path_in(&runtime_dir), b"old lemonade").unwrap();
+        record_runtime_version(&runtime_dir, "1.0.0").unwrap();
 
         let err = swap_in_runtime_with(&staging_dir, &runtime_dir, |from, to| {
             if from == runtime_dir {
@@ -1489,9 +1493,17 @@ mod tests {
         assert!(staging_dir.join("new.txt").is_file());
         assert!(!runtime_dir.exists());
 
-        // The advice the message gives recovers the old tree.
+        // The advice the message gives recovers the old tree: it is installed
+        // again, at its own version, so a plain install keeps it.
         fs::rename(&previous_dir, &runtime_dir).unwrap();
-        assert!(runtime_dir.join("old.txt").is_file());
+        let installed = installed_runtime_version(&runtime_dir);
+        assert_eq!(installed.as_deref(), Some("1.0.0"));
+        assert!(!needs_extraction(
+            false,
+            installed.as_deref(),
+            "1.0.0",
+            lemond_path_in(&runtime_dir).is_file()
+        ));
     }
 
     /// The old tree cannot be moved aside (a file in it is held open): nothing

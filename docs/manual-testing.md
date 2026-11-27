@@ -609,7 +609,9 @@ then `rocm engines install lemonade`. Expected result:
   in [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs).
 
 To check what a Lemonade install says about its size (no download needed for
-the refusal): with a debug build, set
+the refusal): with a build made with
+`cargo build -p rocm --features rocm/e2e-test-hooks` (without that feature the
+variable is ignored and the install really runs), set
 `ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` (1 MiB free), then in a fresh data
 folder run `rocm engines install lemonade --yes`. Expected result:
 
