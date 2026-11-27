@@ -293,10 +293,21 @@ pub(super) fn died_during_wait(
             "the server for service `{service_id}` was stopped before it became ready"
         ));
     }
-    let message = format!(
-        "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `{}` for its output",
-        crate::service_hints::service_logs_hint(service_id)
-    );
+    // The timeout advice is for a server that ran out its readiness budget. One
+    // that stopped on a fatal engine error did not, and a longer timeout would
+    // not have changed it, so it is not offered there; the note
+    // `report_ended_launch` appends names the error instead.
+    let message = if died_on_fatal_engine_error(paths, service_id) {
+        format!(
+            "the server exited before it became ready; see `{}` for its output",
+            crate::service_hints::service_logs_hint(service_id)
+        )
+    } else {
+        format!(
+            "the server exited before it became ready (vLLM and AIM give up after 5 minutes by default; `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` / `ROCM_CLI_AIM_READY_TIMEOUT_SECS` allow longer); see `{}` for its output",
+            crate::service_hints::service_logs_hint(service_id)
+        )
+    };
     // The record is already settled above — the verdict it returned is what
     // chose the message — so only the audit line and the memory guidance are
     // left. Settling a second time would re-stamp a record that a concurrent
@@ -307,6 +318,27 @@ pub(super) fn died_during_wait(
         "exited during --wait",
         message
     )))
+}
+
+/// Whether the service's own log shows the engine stopping on a fatal error
+/// (see [`crate::serve_summary::fatal_startup_note`]), the condition the
+/// `append_oom_serve_note` that [`report_ended_launch`] calls reports for the
+/// same launch. Only a vLLM launch is asked: its log is the one that note reads.
+fn died_on_fatal_engine_error(paths: &AppPaths, service_id: &str) -> bool {
+    let Ok(record) = ManagedServiceRecord::read_manifest(paths, service_id) else {
+        return false;
+    };
+    record.engine.eq_ignore_ascii_case("vllm")
+        && crate::serve_summary::fatal_startup_note(
+            "starting",
+            &crate::services_text::read_optional_tail_lines(
+                &record.log_path,
+                rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES,
+                "service log",
+            )
+            .join("\n"),
+        )
+        .is_some()
 }
 
 /// Settle a launch whose server ended before it became ready, record it in
@@ -480,6 +512,9 @@ pub(super) fn record_wait_outcome(
 ///   ready (nothing to blame on memory), so a scenario can point its port at a
 ///   mock engine and watch what the summary does when the post-launch smoke test
 ///   then fails.
+/// - `gpu-fault`: the launch failed the way [`e2e_simulate_oom_launch`]'s default
+///   one does (`starting`, an owned log) but its log carries a GPU fault instead
+///   of an allocator failure; see [`gpu_fault_startup_log`].
 /// - `extension-load`: the launch died the way a vLLM compiled extension that
 ///   failed to load kills it, and the fabrication stops at the log. What the
 ///   user then sees is built by the engine's own
@@ -488,8 +523,9 @@ pub(super) fn record_wait_outcome(
 ///   [`simulate_extension_load_launch_failure`].
 #[cfg(feature = "e2e-oom-fault-injection")]
 pub(crate) fn e2e_simulate_oom_launch() -> bool {
-    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH")
-        .is_some_and(|value| value == "1" || value == "ready" || value == "extension-load")
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| {
+        value == "1" || value == "ready" || value == "extension-load" || value == "gpu-fault"
+    })
 }
 
 /// Whether the armed hook is in its `ready` mode (see [`e2e_simulate_oom_launch`]).
@@ -503,6 +539,41 @@ fn e2e_simulate_ready_launch() -> bool {
 #[cfg(feature = "e2e-oom-fault-injection")]
 fn e2e_simulate_extension_load_failure() -> bool {
     std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "extension-load")
+}
+
+/// Whether the armed hook is in its `gpu-fault` mode (see
+/// [`e2e_simulate_oom_launch`]).
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn e2e_simulate_gpu_fault_launch() -> bool {
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "gpu-fault")
+}
+
+/// Test-only (see [`e2e_simulate_oom_launch`]): the startup log a vLLM launch
+/// leaves behind when its engine core died on a GPU fault, with the API server
+/// still up, followed by the bail the engine's readiness wait writes back into
+/// the shared log when it stops on that line.
+///
+/// Only the engine's own lines and the shared prefix of that bail are planted.
+/// The sentence the scenario asserts is composed by
+/// [`crate::serve_summary::fatal_startup_note`] from the engine's line. The bail
+/// is in the log because the supervisor writes it there on a real launch, after
+/// the engine's line, as here. The first marker line wins, so the engine's line
+/// is what the note quotes whether or not the bail is skipped: that the bail is
+/// never read as a failure of its own is pinned by `rocm-core`'s
+/// `the_engines_own_bail_is_not_read_back_as_a_second_failure`, not by the
+/// scenario.
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn gpu_fault_startup_log() -> String {
+    let fault = "(EngineCore pid=7) ERROR 11-16 11:48:44 [core.py:700] HSA_STATUS_ERROR_EXCEPTION: \
+                 An HSAIL operation resulted in a hardware exception";
+    format!(
+        "(APIServer pid=6) INFO 11-16 11:48:20 [utils.py:253] non-default args\n\
+         (EngineCore pid=7) INFO 11-16 11:48:40 [core.py:98] Initializing engine\n\
+         {fault}\n\
+         (EngineCore pid=7) ERROR 11-16 11:48:44 [core.py:701] EngineCore failed to start.\n\
+         Error: {}{fault}) in the startup log; the server will not become ready\n",
+        rocm_core::VLLM_FATAL_STARTUP_DETECTED_PREFIX
+    )
 }
 
 /// Test-only (see [`e2e_simulate_oom_launch`]): the startup log a vLLM launch
@@ -613,6 +684,8 @@ pub(super) const SIMULATED_STARTUP_EXIT_SCRIPT: &str = "echo 'e2e stand-in engin
 ///   real allocator OOM signature.
 ///   [`crate::serve_summary::append_oom_serve_note`] then renders the memory-knob
 ///   guidance.
+/// - `gpu-fault` mode: the same, with a log that carries a GPU fault instead;
+///   the note then names that fault. See [`gpu_fault_startup_log`].
 /// - `ready` mode: the launch became ready — `status: "ready"`, the record marked
 ///   inference-verified, and `log_path: None` (nothing failed to start), so the
 ///   caller's smoke test runs against whatever answers on `host:port`.
@@ -692,8 +765,9 @@ pub(super) fn simulate_oom_managed_launch(
     // only the raw OOM line can never see the newest-first scan land on
     // rocm-cli's own sentence instead of the user's error.
     let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-    std::fs::write(
-        &record.log_path,
+    let log_text = if e2e_simulate_gpu_fault_launch() {
+        gpu_fault_startup_log()
+    } else {
         format!(
             "{real_line}\n\
              Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
@@ -707,9 +781,10 @@ pub(super) fn simulate_oom_managed_launch(
             rocm_core::VLLM_OOM_DETECTED_PREFIX,
             rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
             rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
-        ),
-    )
-    .with_context(|| format!("failed to write {}", record.log_path.display()))?;
+        )
+    };
+    std::fs::write(&record.log_path, log_text)
+        .with_context(|| format!("failed to write {}", record.log_path.display()))?;
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url: format!("{}/v1", format_http_base_url(host, port)),
@@ -2412,6 +2487,50 @@ mod tests {
         assert!(
             !engine_state.contains("\"failed\""),
             "nor may its engine state file say failed: {engine_state}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn died_during_wait_names_a_fatal_engine_error_and_drops_the_timeout_advice() {
+        let (root, paths) = test_paths("wait-died-fatal");
+        paths.ensure().expect("paths");
+        let mut record = record_tracking_pid(&paths, std::process::id(), "starting");
+        record.engine = "vllm".to_owned();
+        record.write().expect("write");
+        fs::write(
+            &record.log_path,
+            "INFO loading weights\n\
+             (EngineCore pid=7) ERROR HSA_STATUS_ERROR_EXCEPTION: hardware exception\n\
+             (EngineCore pid=7) ERROR EngineCore failed to start.\n",
+        )
+        .expect("log");
+        let id = record.service_id;
+        let pending = EndpointReadiness::Unreachable;
+        let message = died_during_wait(&paths, &id, true, pending, |_| false)
+            .expect("died")
+            .to_string();
+        assert!(
+            message.contains("HSA_STATUS_ERROR_EXCEPTION: hardware exception"),
+            "the cause is named: {message}"
+        );
+        assert!(
+            !message.contains("ROCM_CLI_VLLM_READY_TIMEOUT_SECS"),
+            "a longer timeout would not have helped: {message}"
+        );
+
+        // Same log, another engine: its log is not read for a vLLM fault.
+        let mut record = ManagedServiceRecord::read_manifest(&paths, &id).unwrap();
+        record.engine = "lemonade".to_owned();
+        "starting".clone_into(&mut record.status);
+        record.write().expect("write");
+        let message = died_during_wait(&paths, &id, true, pending, |_| false)
+            .expect("died")
+            .to_string();
+        assert!(!message.contains("HSA_STATUS_ERROR"), "{message}");
+        assert!(
+            message.contains("ROCM_CLI_VLLM_READY_TIMEOUT_SECS"),
+            "{message}"
         );
         let _ = fs::remove_dir_all(root);
     }

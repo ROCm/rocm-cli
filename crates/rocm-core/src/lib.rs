@@ -71,6 +71,7 @@ mod test_env;
 #[cfg(test)]
 mod test_support;
 pub mod uv;
+pub mod vllm_fatal;
 pub mod vllm_oom;
 pub mod windows_driver;
 pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
@@ -284,6 +285,7 @@ pub use uv::{
     uv_pip_check_args, uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject,
     violations_requiring,
 };
+pub use vllm_fatal::{VLLM_FATAL_STARTUP_DETECTED_PREFIX, vllm_fatal_startup_line};
 pub use vllm_oom::{
     VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
     vllm_oom_display_line,

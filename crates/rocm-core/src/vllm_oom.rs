@@ -51,8 +51,10 @@ pub const VLLM_OOM_DIAGNOSE_COMMAND: &str = "rocm diagnose --symptom";
 /// vLLM never prints either marker.
 ///
 /// Pinned by `the_engine_hint_is_never_quoted_back_as_the_users_own_line`.
-fn is_rocm_authored_log_line(segment: &str) -> bool {
-    segment.contains(VLLM_OOM_DETECTED_PREFIX) || segment.contains(VLLM_OOM_DIAGNOSE_COMMAND)
+pub(crate) fn is_rocm_authored_log_line(segment: &str) -> bool {
+    segment.contains(VLLM_OOM_DETECTED_PREFIX)
+        || segment.contains(VLLM_OOM_DIAGNOSE_COMMAND)
+        || segment.contains(crate::vllm_fatal::VLLM_FATAL_STARTUP_DETECTED_PREFIX)
 }
 
 /// Whether one log segment carries a genuine out-of-memory failure, scored with

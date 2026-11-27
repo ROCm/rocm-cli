@@ -2910,7 +2910,9 @@ waiting, with no CLI-side stall limit or deadline (without `--wait`, piped outpu
 stops after 45 seconds and a terminal at a stall or after 30 minutes), until the
 server answers or its engine gives up
 (vLLM and AIM stop after 5 minutes by default, see `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`
-and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
+and `ROCM_CLI_AIM_READY_TIMEOUT_SECS`; a vLLM engine that logs a fatal error stops the wait at once,
+see `serve-72` for what the failure says and the unit test
+`a_fatal_engine_error_ends_the_readiness_wait_at_once` for the timing); either way an exit fails the command. `--wait` with `--verbose` is refused (`serve-43`); `--foreground` is refused
 by the argument parser, covered by a unit test. Run the log follow above from a
 second terminal to watch the download.
 
@@ -5655,8 +5657,8 @@ a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
 `@requires-oom-fault-injection` skip no longer applies, and the scenario fails
 for the wrong reason instead of being reported as skipped. Do not select it by
 name on that route, nor any other `@requires-oom-fault-injection` scenario
-(`@id:serve-smoke-failure-summary` and `@id:serve-vllm-extension-load-hint` carry
-the same tag). Note also that `-n` matches the scenario *name*
+(`@id:serve-smoke-failure-summary`, `@id:serve-vllm-extension-load-hint` and
+`@id:serve-vllm-fatal-startup-error-named` carry the same tag). Note also that `-n` matches the scenario *name*
 (`serve-41 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it selects nothing and the run fails with
 `0 scenarios executed` (see [E2E runs that test nothing fail](#e2e-runs-that-test-nothing-fail)).
@@ -5685,7 +5687,12 @@ command the scenario asserts are computed by `extension_load_failure_hint` in
 [`engines/vllm/src/startup_diagnostics.rs`](../engines/vllm/src/startup_diagnostics.rs).
 That is the half `@id:diagnose-recognises-a-vllm-extension-load-failure`
 (diagnose-80) cannot reach: it drives `rocm diagnose --symptom` directly and
-never `rocm serve`. No process is spawned, and
+never `rocm serve`. `@id:serve-vllm-fatal-startup-error-named` (serve-72) arms it with
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=gpu-fault`, which plants a startup log whose engine core died
+on a GPU fault; the scenario asserts the summary names that line and does not blame memory.
+The other half, that the readiness wait stops on the line within seconds instead of at the
+timeout, is `a_fatal_engine_error_ends_the_readiness_wait_at_once` in
+[`engines/vllm/src/process.rs`](../engines/vllm/src/process.rs). No process is spawned, and
 the seam compiles out entirely without the feature, so a build that does not
 enable it behaves exactly as the shipped binary does.
 

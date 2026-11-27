@@ -19,7 +19,7 @@ use crate::runtime::{
     VllmRuntime, ensure_therock_compat_shims, runtime_bin_paths, runtime_has_discover_build,
     therock_library_path_entries, therock_library_path_entries_for_launch,
 };
-use crate::startup_diagnostics::startup_log_context;
+use crate::startup_diagnostics::{FatalLogWatch, fatal_startup_message, startup_log_context};
 use crate::{ServeHttpRequest, engine_recipe_launch_args};
 
 /// How long a stop waits for the server to actually exit after each signal
@@ -877,7 +877,10 @@ pub(crate) fn prepend_path_entries(
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
 /// Uses a monotonic clock (`Instant`) so wall-clock adjustments cannot corrupt the
 /// timeout, and surfaces an early process exit immediately instead of waiting out
-/// the full readiness window.
+/// the full readiness window. The child exiting is not the only way a startup
+/// fails: the API server outlives a dead engine core, so the startup log is
+/// followed too and a fatal line in it (see [`FatalLogWatch`]) ends the wait at
+/// once, with the line named.
 fn wait_for_vllm_ready(
     child: &mut std::process::Child,
     host: &str,
@@ -889,6 +892,7 @@ fn wait_for_vllm_ready(
     let start = Instant::now();
     let endpoint = format!("http://{host}:{port}");
     let poll_interval = Duration::from_millis(500);
+    let mut fatal_watch = FatalLogWatch::new(log_path);
 
     loop {
         // Surface an early process exit (bad model ref, missing deps, etc.)
@@ -904,6 +908,10 @@ fn wait_for_vllm_ready(
                     log_path
                 )
             );
+        }
+
+        if let Some(fatal_line) = fatal_watch.poll() {
+            bail!("{}", fatal_startup_message(&fatal_line, log_path));
         }
 
         if start.elapsed() > timeout {
@@ -1350,6 +1358,92 @@ mod tests {
         .expect_err("unsupported recipe contract should fail");
 
         assert!(error.to_string().contains("unsupported"));
+    }
+    /// The engine core dies and the API server stays up and silent (the
+    /// reported failure): the stand-in writes the fatal line, then sleeps far
+    /// past the readiness timeout. The wait must end on the line, within a poll
+    /// or two, naming it and carrying the log tail, not at the timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_fatal_engine_error_ends_the_readiness_wait_at_once() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log = dir.path().join("vllm.log");
+        let log_file = fs::File::create(&log).expect("create log");
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "echo 'INFO loading weights'; \
+                 echo '(EngineCore pid=7) ERROR HSA_STATUS_ERROR_EXCEPTION: hardware exception'; \
+                 echo '(EngineCore pid=7) ERROR EngineCore failed to start.'; \
+                 sleep 60",
+            ])
+            .stdout(log_file)
+            .spawn()
+            .expect("spawn stand-in server");
+
+        let started = Instant::now();
+        let outcome = wait_for_vllm_ready(
+            &mut child,
+            "127.0.0.1",
+            1,
+            "some/model",
+            Duration::from_mins(1),
+            Some(&log),
+        );
+        let waited = started.elapsed();
+        child.kill().ok();
+        child.wait().ok();
+
+        let message = format!(
+            "{:#}",
+            outcome.expect_err("a fatal engine error must fail the wait")
+        );
+        assert!(
+            waited < Duration::from_secs(20),
+            "the wait ran {waited:?}, far past the fatal line: {message}"
+        );
+        assert!(
+            message.contains("HSA_STATUS_ERROR_EXCEPTION: hardware exception"),
+            "the first fatal line is the cause the message names: {message}"
+        );
+        assert!(message.contains("Startup log, last"), "{message}");
+        assert!(message.contains("INFO loading weights"), "{message}");
+        assert!(
+            !message.contains("failed to become ready within"),
+            "this is not the timeout path: {message}"
+        );
+    }
+
+    /// The same child with no fatal line is still waited on: the early exit is
+    /// driven by the line, not by the log having content.
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_log_does_not_end_the_readiness_wait() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let log = dir.path().join("vllm.log");
+        let log_file = fs::File::create(&log).expect("create log");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "echo 'INFO loading weights: 40%'; sleep 60"])
+            .stdout(log_file)
+            .spawn()
+            .expect("spawn stand-in server");
+
+        let outcome = wait_for_vllm_ready(
+            &mut child,
+            "127.0.0.1",
+            1,
+            "some/model",
+            Duration::from_secs(2),
+            Some(&log),
+        );
+        child.kill().ok();
+        child.wait().ok();
+
+        let message = format!("{:#}", outcome.expect_err("never ready"));
+        assert!(
+            message.contains("failed to become ready within 2 seconds"),
+            "a healthy log runs the wait to its timeout: {message}"
+        );
     }
     #[test]
     fn vllm_ready_timeout_uses_default_without_override() {
