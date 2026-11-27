@@ -110,7 +110,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
                 disabled,
                 try_llamacpp_backend_alignment,
                 install_best_llamacpp_backend,
-                newest_llamacpp_rocm_stable_tag_for,
+                llamacpp_builds_for,
                 SystemTime::now,
                 &mut |message| eprintln!("Warning: {message}"),
             )
@@ -446,7 +446,7 @@ fn align_llamacpp_backend_to_version(
     disabled: bool,
     mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
-    mut newest_tag_with_asset: impl FnMut(&str) -> Result<String>,
+    mut lookup_builds: impl FnMut(&str, Option<&str>) -> Result<LlamacppBuilds>,
     now: impl Fn() -> SystemTime,
     warn: &mut impl FnMut(String),
 ) -> Result<Option<String>> {
@@ -454,6 +454,58 @@ fn align_llamacpp_backend_to_version(
         fallback_install(manifest, false)?;
         return Ok(None);
     }
+    // Ask the release listing what exists before downloading anything: a download
+    // of an archive the listing shows is absent only 404s, and Lemonade's installer
+    // retries it (and rocm-cli retries the whole install once more) before giving up.
+    let pinned_tag = read_backend_versions_llamacpp_tag(backend_versions_path);
+    let builds = match lookup_builds(target_version, pinned_tag.as_deref()) {
+        Ok(builds) => Some(builds),
+        Err(error) => {
+            eprintln!(
+                "Warning: could not look up a llama.cpp build that ships an archive for ROCm \
+                 {target_version}: {error:#}"
+            );
+            None
+        }
+    };
+    // Tier 1 is skipped only on the listing's word that the pinned build lacks the
+    // archive. A build the listing does not show, or no listing at all, is still
+    // attempted, as before.
+    let tier1_known_missing = builds
+        .as_ref()
+        .is_some_and(|builds| builds.pinned_build_ships_asset == Some(false));
+    let newest = builds.map(|builds| builds.newest_with_asset);
+    let latest_tag = newest
+        .as_ref()
+        .and_then(|found| found.as_ref().ok().cloned());
+    let tier2_tag = match newest {
+        Some(Ok(tag)) if pinned_tag.as_deref() != Some(tag.as_str()) => Some(tag),
+        // The pinned tag already is that build; Tier 1 is trying it.
+        Some(Ok(_)) | None => None,
+        Some(Err(error)) => {
+            if tier1_known_missing {
+                eprintln!(
+                    "Warning: no llama.cpp build ships a ROCm {target_version} backend yet \
+                     ({error:#}); keeping Lemonade's pinned ROCm {pinned_version} backend."
+                );
+            } else {
+                eprintln!(
+                    "Warning: could not look up a llama.cpp build that ships an archive for \
+                     ROCm {target_version}: {error:#}"
+                );
+            }
+            None
+        }
+    };
+    if tier1_known_missing && tier2_tag.is_none() {
+        // Neither tier has a build to download, so the pin is left as it is and the
+        // pinned backend installs unforced, as on every path that skips alignment.
+        // The warning above says so; `align_downloads_nothing_when_the_listing_shows_no_build_ships_the_archive`
+        // asserts both the unchanged pin files and the single unforced install.
+        fallback_install(manifest, false)?;
+        return Ok(None);
+    }
+
     if let Err(error) =
         write_backend_versions_therock_version(backend_versions_path, target_version)
     {
@@ -468,7 +520,13 @@ fn align_llamacpp_backend_to_version(
     // only runs when the pin actually changed (the `pinned_version == target_version`
     // check above), so a backend already on disk was installed against the OLD
     // pin and must not be trusted just because it happens to still resolve.
-    if align(manifest, target_version, true, "its pinned llama.cpp build") {
+    if tier1_known_missing {
+        eprintln!(
+            "Lemonade's pinned llama.cpp build {} ships no archive for ROCm {target_version}; \
+             trying the newest build that does.",
+            pinned_tag.as_deref().unwrap_or("(none)")
+        );
+    } else if align(manifest, target_version, true, "its pinned llama.cpp build") {
         forget_alignment_failure(manifest, warn);
         return Ok(Some(target_version.to_owned()));
     }
@@ -480,30 +538,17 @@ fn align_llamacpp_backend_to_version(
     // cut) does not track that. Point at the newest build that actually ships an
     // archive for the active ROCm version instead, still paired with that version,
     // forcing a real reinstall attempt regardless of whatever Tier 1 left on disk.
-    let pinned_tag = read_backend_versions_llamacpp_tag(backend_versions_path);
-    let found_tag_lookup = newest_tag_with_asset(target_version);
-    let found_tag_applied = match &found_tag_lookup {
-        Ok(tag) if pinned_tag.as_deref() != Some(tag.as_str()) => {
-            match write_backend_versions_llamacpp_tag(backend_versions_path, tag) {
-                Ok(()) => true,
-                Err(error) => {
-                    eprintln!(
-                        "Warning: could not pin Lemonade's backend to llama.cpp {tag}: \
-                         {error:#}"
-                    );
-                    false
-                }
+    let found_tag_applied = match tier2_tag {
+        Some(tag) => match write_backend_versions_llamacpp_tag(backend_versions_path, &tag) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "Warning: could not pin Lemonade's backend to llama.cpp {tag}: {error:#}"
+                );
+                false
             }
-        }
-        // The pinned tag already is that build — Tier 1 already tried it.
-        Ok(_) => false,
-        Err(error) => {
-            eprintln!(
-                "Warning: could not look up a llama.cpp build that ships an archive for ROCm \
-                 {target_version}: {error:#}"
-            );
-            false
-        }
+        },
+        None => false,
     };
     if found_tag_applied
         && align(
@@ -562,7 +607,7 @@ fn align_llamacpp_backend_to_version(
                 target_rocm_version: target_version.to_owned(),
                 pinned_rocm_version: pinned_version.to_owned(),
                 pinned_llamacpp_tag: pinned_tag,
-                latest_llamacpp_tag: found_tag_lookup.ok(),
+                latest_llamacpp_tag: latest_tag,
                 lemonade_version: manifest.version.clone(),
                 failed_at_unix_secs: unix_secs(now()),
             };
@@ -748,16 +793,57 @@ fn newest_llamacpp_tag_with_asset(
         .map(|(_, tag)| tag.to_owned())
 }
 
-/// The newest [`LLAMACPP_ROCM_STABLE_REPO`] build that ships an archive for
-/// `rocm_version` on this platform (e.g. `b12003`), queried directly rather than
-/// assumed — the whole reason Tier 2 exists is that the embeddable's own pinned
-/// tag cannot be trusted to have a matching-ROCm-version asset.
-fn newest_llamacpp_rocm_stable_tag_for(rocm_version: &str) -> Result<String> {
-    newest_llamacpp_rocm_stable_tag_via(rocm_version, fetch_github_json)
+/// What the [`LLAMACPP_ROCM_STABLE_REPO`] release listing says about the archives
+/// alignment could download for one ROCm version on this platform.
+struct LlamacppBuilds {
+    /// The newest build that ships the archive (e.g. `b12003`); the error says
+    /// that none of the listed releases does.
+    newest_with_asset: Result<String>,
+    /// Whether the build `backend_versions.json` pins ships the archive, from the
+    /// listing or, for a build older than the listing reaches, from a lookup of
+    /// that release by tag. `None` when nothing is pinned or that lookup failed:
+    /// only `Some(false)` is GitHub's word that a download of it would 404.
+    pinned_build_ships_asset: Option<bool>,
 }
 
-/// GET `url` from the GitHub API and parse the body as JSON.
-fn fetch_github_json(url: &str) -> Result<Value> {
+/// Whether one GitHub release object lists `asset` as uploaded.
+fn release_has_asset(release: &Value, asset: &str) -> bool {
+    release
+        .get("assets")
+        .and_then(Value::as_array)
+        .is_some_and(|assets| {
+            assets.iter().any(|candidate| {
+                candidate.get("name").and_then(Value::as_str) == Some(asset)
+                    && candidate.get("state").and_then(Value::as_str) == Some("uploaded")
+            })
+        })
+}
+
+/// Whether the release tagged `tag` in a GitHub release listing ships `asset`;
+/// `None` when the listing has no such release.
+///
+/// Unlike [`newest_llamacpp_tag_with_asset`] this does not skip drafts and
+/// prereleases: Lemonade downloads by tag, so a prerelease the pin names is
+/// downloadable.
+fn release_ships_asset(releases: &Value, tag: &str, asset: &str) -> Option<bool> {
+    let release = releases
+        .as_array()?
+        .iter()
+        .find(|release| release.get("tag_name").and_then(Value::as_str) == Some(tag))?;
+    Some(release_has_asset(release, asset))
+}
+
+/// Query [`LLAMACPP_ROCM_STABLE_REPO`]'s releases for the archives alignment to
+/// `rocm_version` could use: the newest build that ships one (queried directly
+/// rather than assumed, since the embeddable's own pinned tag cannot be trusted to
+/// have a matching-ROCm-version asset, which is the whole reason Tier 2 exists),
+/// and whether `pinned_tag` itself does.
+fn llamacpp_builds_for(rocm_version: &str, pinned_tag: Option<&str>) -> Result<LlamacppBuilds> {
+    llamacpp_builds_via(rocm_version, pinned_tag, fetch_github_json)
+}
+
+/// GET `url` from the GitHub API and parse the body as JSON; `None` for a 404.
+fn fetch_github_json(url: &str) -> Result<Option<Value>> {
     // `timeout_connect` takes precedence over `timeout` and defaults to 30s, so without
     // it a host that blackholes rather than refuses would stall well past the intended
     // ceiling. The overall timeout also covers reading the listing.
@@ -765,33 +851,63 @@ fn fetch_github_json(url: &str) -> Result<Value> {
         .timeout_connect(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
         .build();
-    let response = agent
-        .get(url)
-        .set("User-Agent", "rocm-cli")
-        .call()
-        .with_context(|| format!("failed to query {url}"))?;
+    let response = match agent.get(url).set("User-Agent", "rocm-cli").call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("failed to query {url}")),
+    };
     response
         .into_json()
+        .map(Some)
         .with_context(|| format!("failed to parse response from {url}"))
 }
 
-/// [`newest_llamacpp_rocm_stable_tag_for`] with the listing fetch injected, so
+/// [`llamacpp_builds_for`] with the GitHub fetch injected (`None` for a 404), so
 /// a test reaches the host-platform choice without the network.
-fn newest_llamacpp_rocm_stable_tag_via(
+fn llamacpp_builds_via(
     rocm_version: &str,
-    fetch: impl FnOnce(&str) -> Result<Value>,
-) -> Result<String> {
+    pinned_tag: Option<&str>,
+    mut fetch: impl FnMut(&str) -> Result<Option<Value>>,
+) -> Result<LlamacppBuilds> {
     let url = format!(
         "https://api.github.com/repos/{LLAMACPP_ROCM_STABLE_REPO}/releases?per_page={LLAMACPP_RELEASES_SEARCHED}"
     );
-    let body = fetch(&url)?;
+    let body = fetch(&url)?.with_context(|| format!("{url} not found"))?;
     let windows = runtime_is_windows();
-    newest_llamacpp_tag_with_asset(&body, rocm_version, windows).with_context(|| {
-        format!(
-            "none of the {LLAMACPP_RELEASES_SEARCHED} newest {LLAMACPP_ROCM_STABLE_REPO} \
-             releases ships {}",
-            llamacpp_rocm_stable_asset_name("<tag>", rocm_version, windows)
-        )
+    let newest_with_asset = newest_llamacpp_tag_with_asset(&body, rocm_version, windows)
+        .with_context(|| {
+            format!(
+                "none of the {LLAMACPP_RELEASES_SEARCHED} newest {LLAMACPP_ROCM_STABLE_REPO} \
+                 releases ships {}",
+                llamacpp_rocm_stable_asset_name("<tag>", rocm_version, windows)
+            )
+        });
+    let pinned_build_ships_asset = pinned_tag.and_then(|tag| {
+        let asset = llamacpp_rocm_stable_asset_name(tag, rocm_version, windows);
+        release_ships_asset(&body, tag, &asset).or_else(|| {
+            // Releases are published about twice a day, so the build an embeddable
+            // pins is usually older than the listing reaches; look that one up by tag.
+            // A tag from a hand-edited pin file is only put in a URL when it is plain.
+            if !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return None;
+            }
+            let url = format!(
+                "https://api.github.com/repos/{LLAMACPP_ROCM_STABLE_REPO}/releases/tags/{tag}"
+            );
+            match fetch(&url) {
+                Ok(Some(release)) => Some(release_has_asset(&release, &asset)),
+                // No release by that tag, so no archive to download from it.
+                Ok(None) => Some(false),
+                Err(_) => None,
+            }
+        })
+    });
+    Ok(LlamacppBuilds {
+        newest_with_asset,
+        pinned_build_ships_asset,
     })
 }
 
@@ -1523,7 +1639,7 @@ mod tests {
     #[test]
     fn align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps() {
         // This pins `align`'s own half of the opt-out contract in isolation: the pin
-        // and llama.cpp tag stay byte-identical and `align`/`newest_tag_with_asset` are never
+        // and llama.cpp tag stay byte-identical and `align`/`lookup_builds` are never
         // called. The real production gate -- whether this function is even reached
         // with `disabled == true` in the first place -- lives one level up, in
         // `prepare_llamacpp_backend_for_active_rocm_impl`; see
@@ -1550,7 +1666,7 @@ mod tests {
                 );
                 Ok(())
             },
-            |_target| panic!("disabled means tier 2's tag lookup must not run either"),
+            |_target, _pinned| panic!("disabled means the release lookup must not run either"),
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2157,7 +2273,12 @@ mod tests {
                 true
             },
             |_manifest, _force_reinstall| panic!("tier 1 succeeded; no fallback install"),
-            |_target| panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
+            |target, pinned| {
+                // The listing is read before any download, to tell Tier 1 whether
+                // the pinned build can 404; here it ships the archive, so Tier 1 runs.
+                assert_eq!((target, pinned), ("7.14.0", Some("b11580")));
+                listed_builds(Ok("b12003"), Some(true))
+            },
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2168,6 +2289,20 @@ mod tests {
             Some("7.14.0".to_owned())
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What the injected release lookup returns: the newest build shipping the
+    /// archive (or the reason none does) and whether the pinned build ships it.
+    fn listed_builds(
+        newest_with_asset: std::result::Result<&str, &str>,
+        pinned_build_ships_asset: Option<bool>,
+    ) -> Result<LlamacppBuilds> {
+        Ok(LlamacppBuilds {
+            newest_with_asset: newest_with_asset
+                .map(str::to_owned)
+                .map_err(|reason| anyhow!("{reason}")),
+            pinned_build_ships_asset,
+        })
     }
 
     /// One `GET /repos/lemonade-sdk/llama.cpp/releases` entry, trimmed to the
@@ -2347,29 +2482,109 @@ mod tests {
             llamacpp_release("b11945", "2026-10-28T00:47:33Z", &[this_host]),
         ]);
         let mut requested = String::new();
-        let tag = newest_llamacpp_rocm_stable_tag_via("10.1.0", |url| {
+        let builds = llamacpp_builds_via("10.1.0", Some("b11960"), |url| {
             requested = url.to_owned();
-            Ok(releases)
+            Ok(Some(releases.clone()))
         })
         .unwrap();
-        assert_eq!(tag, "b11945");
+        assert_eq!(builds.newest_with_asset.unwrap(), "b11945");
+        assert_eq!(
+            builds.pinned_build_ships_asset,
+            Some(false),
+            "the pinned build is listed, and ships only the other platform's archive"
+        );
         assert_eq!(
             requested,
             "https://api.github.com/repos/lemonade-sdk/llama.cpp/releases?per_page=30"
         );
 
-        let missing = newest_llamacpp_rocm_stable_tag_via("7.13.0", |_| {
-            Ok(json!([llamacpp_release(
+        let missing = llamacpp_builds_via("7.13.0", Some("b11945"), |_| {
+            Ok(Some(json!([llamacpp_release(
                 "b11945",
                 "2026-10-28T00:47:33Z",
                 &[this_host]
-            )]))
+            )])))
         })
-        .unwrap_err();
-        assert!(format!("{missing:#}").contains("rocm-7.13"), "{missing:#}");
-        let failed =
-            newest_llamacpp_rocm_stable_tag_via("10.1.0", |_| Err(anyhow!("offline"))).unwrap_err();
+        .unwrap();
+        let reason = missing.newest_with_asset.unwrap_err();
+        assert!(format!("{reason:#}").contains("rocm-7.13"), "{reason:#}");
+        assert_eq!(missing.pinned_build_ships_asset, Some(false));
+        let failed = llamacpp_builds_via("10.1.0", None, |_| Err(anyhow!("offline")))
+            .map(|_| ())
+            .unwrap_err();
         assert!(format!("{failed:#}").contains("offline"), "{failed:#}");
+    }
+
+    #[test]
+    fn a_pinned_build_older_than_the_listing_is_looked_up_by_tag() {
+        // Issue 1158: the embeddable's pin (b11580) was days older than the 30 newest
+        // releases, so the listing alone could never say its archive was missing and
+        // Tier 1 still downloaded it. Such a build is asked about by tag.
+        let this_host_asset =
+            llamacpp_rocm_stable_asset_name("b11580", "10.2.0", runtime_is_windows());
+        let listing = json!([llamacpp_release(
+            "b12120",
+            "2026-11-05T04:35:00Z",
+            &["llama-b12120-bin-ubuntu-rocm-10.1-x64.tar.gz"]
+        )]);
+        let lookup = |tag: &str, by_tag: Result<Option<Value>>| {
+            let mut requested = Vec::new();
+            let mut by_tag = Some(by_tag);
+            let builds = llamacpp_builds_via("10.2.0", Some(tag), |url| {
+                requested.push(url.to_owned());
+                if url.contains("/releases/tags/") {
+                    by_tag.take().expect("the tag is asked about once")
+                } else {
+                    Ok(Some(listing.clone()))
+                }
+            })
+            .unwrap();
+            (builds.pinned_build_ships_asset, requested)
+        };
+
+        let (ships, requested) = lookup(
+            "b11580",
+            Ok(Some(llamacpp_release(
+                "b11580",
+                "2026-10-01T00:00:00Z",
+                &[&this_host_asset],
+            ))),
+        );
+        assert_eq!(ships, Some(true));
+        assert_eq!(
+            requested[1],
+            "https://api.github.com/repos/lemonade-sdk/llama.cpp/releases/tags/b11580"
+        );
+        let (ships, _) = lookup(
+            "b11580",
+            Ok(Some(llamacpp_release(
+                "b11580",
+                "2026-10-01T00:00:00Z",
+                &["llama-b11580-bin-ubuntu-rocm-10.1-x64.tar.gz"],
+            ))),
+        );
+        assert_eq!(
+            ships,
+            Some(false),
+            "the release exists without the 10.2 archive"
+        );
+        let (ships, _) = lookup("b11580", Ok(None));
+        assert_eq!(
+            ships,
+            Some(false),
+            "no release by that tag: a download 404s"
+        );
+        let (ships, _) = lookup("b11580", Err(anyhow!("rate limited")));
+        assert_eq!(ships, None, "a failed lookup cannot vouch either way");
+
+        // A build the listing already shows is not asked about again, and a tag that
+        // is not plain is never put in a URL.
+        let (ships, requested) = lookup("b12120", Err(anyhow!("must not be asked")));
+        assert_eq!(ships, Some(false));
+        assert_eq!(requested.len(), 1);
+        let (ships, requested) = lookup("b1/../x", Err(anyhow!("must not be asked")));
+        assert_eq!(ships, None);
+        assert_eq!(requested.len(), 1);
     }
 
     #[test]
@@ -2398,12 +2613,12 @@ mod tests {
                 align_calls > 1
             },
             |_manifest, _force_reinstall| panic!("tier 2 succeeded; no fallback install"),
-            |target| {
+            |target, _pinned| {
                 assert_eq!(
                     target, "7.14.0",
                     "tier 2 looks for a build that ships the active ROCm version's archive"
                 );
-                Ok("b12003".to_owned())
+                listed_builds(Ok("b12003"), Some(true))
             },
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
@@ -2445,7 +2660,7 @@ mod tests {
                 assert!(force_reinstall);
                 Ok(())
             },
-            |_target| Ok("b12003".to_owned()),
+            |_target, _pinned| listed_builds(Ok("b12003"), Some(true)),
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2493,7 +2708,7 @@ mod tests {
                 assert!(force_reinstall);
                 Ok(())
             },
-            |_target| Ok("b12003".to_owned()),
+            |_target, _pinned| listed_builds(Ok("b12003"), Some(true)),
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2534,7 +2749,7 @@ mod tests {
             },
             // The pinned tag is the build Tier 2 found, which Tier 1 already tried:
             // Tier 2's own reinstall must not be attempted.
-            |_target| Ok("b11580".to_owned()),
+            |_target, _pinned| listed_builds(Ok("b11580"), Some(true)),
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2547,6 +2762,202 @@ mod tests {
             "reverted to the original pinned version"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_downloads_nothing_when_the_listing_shows_no_build_ships_the_archive() {
+        // The bug this guards (issue 1158): with no 10.2 build published, Tier 1 still
+        // downloaded the pinned build's 10.2 archive, which 404s, and every download
+        // is retried. When the listing shows the pinned build lacks the archive and no
+        // other build has it, no install of any kind may be attempted beyond the
+        // ordinary unforced one, and the pin files stay as shipped.
+        let dir = scratch_dir("align-nothing-published");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
+        let shipped = fs::read(&path).unwrap();
+        let mut manifest = test_manifest(dir.clone());
+        let mut fallback_installs = Vec::new();
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.2.0",
+            "10.1.0",
+            false,
+            |_manifest, _target, _force_reinstall, label| {
+                panic!("a download of a build the listing lacks was attempted: {label}")
+            },
+            |_manifest, force_reinstall| {
+                fallback_installs.push(force_reinstall);
+                Ok(())
+            },
+            |_target, _pinned| {
+                listed_builds(
+                    Err("none of the 30 newest releases ships the archive"),
+                    Some(false),
+                )
+            },
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(fallback_installs, [false], "one ordinary, unforced install");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            shipped,
+            "the pin must not be rewritten for a build that cannot be downloaded"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_goes_straight_to_tier2_when_the_pinned_build_lacks_the_archive() {
+        let dir = scratch_dir("align-pinned-build-lacks-archive");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
+        let mut manifest = test_manifest(dir.clone());
+        let mut labels = Vec::new();
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.2.0",
+            "10.1.0",
+            false,
+            |_manifest, _target, _force_reinstall, label| {
+                labels.push(label.to_owned());
+                true
+            },
+            |_manifest, _force_reinstall| panic!("tier 2 succeeded; no fallback install"),
+            |_target, _pinned| listed_builds(Ok("b12100"), Some(false)),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
+        );
+
+        assert_eq!(result.unwrap(), Some("10.2.0".to_owned()));
+        assert_eq!(
+            labels,
+            ["the newest llama.cpp build for this ROCm version"],
+            "the pinned build is known to 404, so only the newer build is downloaded"
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b12100".to_owned())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_reverts_both_pins_when_tier2_alone_fails_after_tier1_was_skipped() {
+        let dir = scratch_dir("align-tier1-skipped-tier2-fails");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
+        let mut manifest = test_manifest(dir.clone());
+        let mut align_calls = 0;
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.2.0",
+            "10.1.0",
+            false,
+            |_manifest, _target, _force_reinstall, _label| {
+                align_calls += 1;
+                false
+            },
+            |_manifest, force_reinstall| {
+                assert!(force_reinstall, "the revert fallback always forces");
+                Ok(())
+            },
+            |_target, _pinned| listed_builds(Ok("b12100"), Some(false)),
+            || SystemTime::UNIX_EPOCH,
+            &mut |_| {},
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(align_calls, 1, "tier 1 was skipped; only tier 2 ran");
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("10.1.0".to_owned())
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b11580".to_owned())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_still_tries_tier1_when_the_listing_cannot_vouch_either_way() {
+        // Only `Some(false)` is the listing's word that Tier 1 would 404. A pinned
+        // build older than the listing reaches (`None`), and a listing that could
+        // not be fetched at all, must behave as before: Tier 1 is attempted.
+        let lookups: [fn() -> Result<LlamacppBuilds>; 2] = [
+            || listed_builds(Err("none of the 30 newest releases ships it"), None),
+            || bail!("offline"),
+        ];
+        for lookup in lookups {
+            let dir = scratch_dir("align-listing-cannot-vouch");
+            let path = dir.join("backend_versions.json");
+            write_backend_versions_fixture(&path, "10.1.0", "b11580");
+            let mut manifest = test_manifest(dir.clone());
+            let mut labels = Vec::new();
+
+            let result = align_llamacpp_backend_to_version(
+                &mut manifest,
+                &path,
+                "10.2.0",
+                "10.1.0",
+                false,
+                |_manifest, _target, _force_reinstall, label| {
+                    labels.push(label.to_owned());
+                    true
+                },
+                |_manifest, _force_reinstall| panic!("tier 1 succeeded; no fallback install"),
+                |_target, _pinned| lookup(),
+                || SystemTime::UNIX_EPOCH,
+                &mut |_| {},
+            );
+
+            assert_eq!(result.unwrap(), Some("10.2.0".to_owned()));
+            assert_eq!(labels, ["its pinned llama.cpp build"]);
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn release_ships_asset_distinguishes_missing_from_unlisted() {
+        let mut unfinished = llamacpp_release("b3", "2026-11-03T00:00:00Z", &["llama-b3.tar.gz"]);
+        unfinished["prerelease"] = json!(true);
+        unfinished["assets"][0]["state"] = json!("open");
+        let releases = json!([
+            llamacpp_release("b1", "2026-11-01T00:00:00Z", &["llama-b1.tar.gz"]),
+            llamacpp_release("b2", "2026-11-02T00:00:00Z", &["other.tar.gz"]),
+            unfinished,
+        ]);
+        assert_eq!(
+            release_ships_asset(&releases, "b1", "llama-b1.tar.gz"),
+            Some(true)
+        );
+        assert_eq!(
+            release_ships_asset(&releases, "b2", "llama-b2.tar.gz"),
+            Some(false)
+        );
+        assert_eq!(
+            release_ships_asset(&releases, "b3", "llama-b3.tar.gz"),
+            Some(false),
+            "an asset not reported as uploaded cannot be downloaded"
+        );
+        assert_eq!(
+            release_ships_asset(&releases, "b0", "llama-b0.tar.gz"),
+            None,
+            "a build the listing does not reach is unknown, not missing"
+        );
+        assert_eq!(
+            release_ships_asset(&json!({}), "b1", "llama-b1.tar.gz"),
+            None
+        );
     }
 
     #[test]
@@ -2581,7 +2992,7 @@ mod tests {
                 assert!(force_reinstall);
                 Ok(())
             },
-            |_target| bail!("network unavailable"),
+            |_target, _pinned| bail!("network unavailable"),
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2623,7 +3034,7 @@ mod tests {
                 assert!(force_reinstall);
                 bail!("network unavailable")
             },
-            |_target| Ok("b12003".to_owned()),
+            |_target, _pinned| listed_builds(Ok("b12003"), Some(true)),
             || SystemTime::UNIX_EPOCH,
             &mut |_| {},
         );
@@ -2919,7 +3330,7 @@ mod tests {
                         first_installs.push(force_reinstall);
                         Ok(())
                     },
-                    |_target| Ok("b10952".to_owned()),
+                    |_target, _pinned| listed_builds(Ok("b10952"), Some(true)),
                     || at(FAILED_AT),
                     &mut |message| panic!("the record is writable: {message}"),
                 )
@@ -3519,7 +3930,7 @@ mod tests {
                     !tier2 || attempts == 2
                 },
                 |_manifest, _force| panic!("a verified alignment needs no fallback install"),
-                |_target| Ok("b10952".to_owned()),
+                |_target, _pinned| listed_builds(Ok("b10952"), Some(true)),
                 || at(FAILED_AT + 25 * HOUR),
                 &mut |message| warnings.push(message),
             );
@@ -3554,7 +3965,7 @@ mod tests {
             false,
             |_manifest, _target, _force, _label| true,
             |_manifest, _force| panic!("a verified alignment needs no fallback install"),
-            |_target| panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
+            |_target, _pinned| listed_builds(Ok("b10952"), Some(true)),
             || at(FAILED_AT),
             &mut |message| warnings.push(message),
         );
@@ -3600,7 +4011,7 @@ mod tests {
                 installs.push(force_reinstall);
                 Ok(())
             },
-            |_target| Ok("b10952".to_owned()),
+            |_target, _pinned| listed_builds(Ok("b10952"), Some(true)),
             || at(FAILED_AT),
             &mut |message| warnings.push(message),
         );
