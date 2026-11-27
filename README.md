@@ -345,7 +345,15 @@ Follow these steps:
 
    - `active_runtime_status`: `ready` means a managed ROCm runtime is already
      active, so you can skip step 3. `unset` means no managed ROCm runtime is
-     installed yet, so continue with step 3.
+     active yet, so continue with step 3. Any other value means a runtime is
+     recorded but can't be used:
+     - `unusable (<reason>)` gives the reason the runtime fails ROCm CLI's check.
+     - `missing_manifest` means the manifest of the configured runtime is
+       missing.
+     - `ambiguous_runtime_id` means the default runtime ID matches more than one
+       installed runtime.
+
+     `rocm runtimes list` shows each installed runtime and its status.
    - `effective_default_engine`: `lemonade` or `vllm`. The engine decides which
      model you serve in step 4.
 
@@ -986,15 +994,14 @@ free-form answer, `rocm install driver` and its `--reconcile` form, and `rocmd`'
 host snapshot, MCP and sandbox paths. Each of those pays one `vulkaninfo` (or, on
 Windows, one registry read) per gather.
 
-It does not run on the lean scope, `ExamineSummary::gather_without_driver_facts`,
-which the runtime-install finalizer uses to read the GPU target: that leaves
-`vulkan` as `None`, meaning "not probed", which reads as unknown rather than as a
+It does not run when a runtime install reads only the GPU target: that leaves
+`vulkan` unset, meaning "not probed", which reads as unknown rather than as a
 false "no Vulkan".
 
 `rocm engines` and the `rocm diagnose` finding `info-20-gpu-no-rocm-support` still
 speak from the gfx table alone, so they can name Vulkan on a host where `rocm
 examine` would say otherwise; spawning `vulkaninfo` (and PowerShell on Windows)
-was judged too expensive for a plain listing command.
+costs too much for a plain listing command.
 
 On such an integrated GPU, `rocm serve` on Lemonade chooses the llama.cpp
 context window itself. Lemonade sizes it from the memory it can see and, when
@@ -1958,11 +1965,10 @@ description below.
 
 One caveat, because rocm is not the only writer. The Lemonade and vLLM adapters
 see a SIGTERM'd server as an unsuccessful exit, so they write `failed` to the
-engine state file themselves, and `refresh_from_engine_state` reads that back
-into the record. A deliberate stop of a real adapter-backed service can
-therefore still end up showing `failed`. That is the adapter's verdict rather
-than this stop-versus-crash check, and nothing covers it: the stop scenarios all
-use the scripted engine or planted records, so no real-adapter stop is exercised.
+engine state file themselves, and ROCm CLI reads that back into the record. A
+deliberate stop of a real adapter-backed service can therefore still end up
+showing `failed`. That is the adapter's verdict rather than this
+stop-versus-crash check.
 
 The distinction is made from the stop's own recorded evidence, not from the
 record's status: a reconciliation that merely notices the processes are gone
@@ -2459,7 +2465,9 @@ command yourself with that value. A folder the CLI takes from your own
 request, such as `install therock into <folder>`, is shown as you typed it; a
 folder that reaches the CLI through the assistant's request is held to the
 rule, even if you named it first.
-See the LLM tool-use design notes in the documentation for the exact set.
+See the
+[LLM tool-use design notes](https://github.com/ROCm/rocm-cli/blob/main/docs/llm-tool-use.md)
+for the exact set.
 
 In the interactive chat session, if no local engine is reachable and no API
 key or URL is configured, chat falls back to the no-key ChatGPT OAuth sign-in.
