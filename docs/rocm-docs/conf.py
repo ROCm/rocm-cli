@@ -92,7 +92,8 @@ ROCM_CORE_SDK_URL = "https://rocm.docs.amd.com/en/latest/"
 def _point_core_sdk_link_to_latest(app, pagename, templatename, context, doctree):  # noqa: ARG001
     # On docs-X.Y.Z branches rocm-docs-core resolves every sister project to
     # that same version, but the ROCm Core SDK has no docs-0.3.0 build. On the
-    # latest build from main it already resolves to the latest ROCm docs (see
+    # latest build, which comes from the latest docs branch, it already
+    # resolves to the latest ROCm docs (see
     # rocm_docs.projects), so this changes only the trailing slash there.
     context["projects"] = {
         **context.get("projects", {}),
