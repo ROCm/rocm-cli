@@ -73,7 +73,9 @@ syn = { version = "3", default-features = false, features = ["full", "parsing", 
 # which never blocks an install.
 # Default features are off because 0.40's `gpu` feature calls `statx` directly,
 # which glibc 2.17 (the manylinux2014 release build) does not provide, so the
-# link fails. Only CPU, memory and disk figures are used.
+# link fails. Only CPU, memory and disk figures are used. `multithread` (rayon)
+# is not among 0.40's default features and is not enabled here, so the CPU
+# refresh is single-threaded either way.
 sysinfo = { version = "0.40", default-features = false, features = ["system", "disk", "linux-tmpfs"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
