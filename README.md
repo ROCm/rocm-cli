@@ -1383,7 +1383,9 @@ Lemonade installs into the active ROCm runtime's folder, a copy inside a ROCm
 install is reused as soon as that install becomes active, and is never marked
 reclaimable. Only the data folder's copy, which no ROCm install owns, is marked
 reclaimable. Nothing removes it automatically: delete its `runtime`,
-`downloads` and `extract` folders to free the space.
+`downloads` and `extract` folders, and the `runtime.staging` and
+`runtime.previous` folders if an interrupted reinstall left them, to free the
+space.
 
 A copy is only called unused when Lemonade's install record points at another
 copy that is really there. If the record names a folder with no install, or
@@ -1447,7 +1449,10 @@ install starts, and a smaller one needs less. So it stops before downloading
 only when the drive cannot hold Lemonade itself (about 16 MiB). With less room
 than the ROCm backend or the finished install, it warns and continues. An
 install that replaces the existing one (`--reinstall`, or a new Lemonade
-version) deletes it first, so its space counts as free and the notice says so.
+version) deletes it before the backend is downloaded, so its space counts as free
+for that download and the notice says so. The new Lemonade is extracted beside
+the old one and swapped in only once that succeeds, so a failed extraction leaves
+the existing install in place.
 On Windows the backend download's own progress appears in the console.
 
 `--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and

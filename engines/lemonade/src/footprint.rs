@@ -28,7 +28,7 @@ use rocm_core::{
 
 use crate::install::{
     installed_runtime_version, lemonade_root, lemond_path_in, manifest_path, needs_extraction,
-    runtime_dir_in,
+    previous_dir_for, runtime_dir_in, staging_dir_for,
 };
 
 /// Download size of an install that fetches the llama.cpp ROCm backend: the
@@ -71,10 +71,13 @@ pub(crate) struct InstallPreflight {
     /// ROCm installs; a recorded install anywhere else is announced but not
     /// listed, and a pointer to it would be false.
     pub(crate) other_install_listed: bool,
-    /// Bytes the install deletes before it extracts: the existing runtime
-    /// folder when this install replaces it (`--reinstall`, a new Lemonade
-    /// version, or a missing server binary), whose space is free by the time
-    /// the download starts. Zero when the tree is kept.
+    /// Bytes of the existing runtime folder when this install replaces it
+    /// (`--reinstall`, a new Lemonade version, or a missing server binary),
+    /// whose space is free by the time the backend download starts: the folder
+    /// is removed once the new embeddable tree is swapped in
+    /// (`swap_in_runtime`), which `lib.rs`'s `install_and_record` completes
+    /// before it prepares the backend. It is still on the drive while that new
+    /// tree is extracted. Zero when the tree is kept.
     pub(crate) replaced_bytes: u64,
     /// Free bytes on the drive holding `target_root`, when known.
     pub(crate) available: Option<u64>,
@@ -117,9 +120,9 @@ pub(crate) fn plan_install_preflight(
     let other_install_listed = other_install
         .as_deref()
         .is_some_and(|other| storage_lists(paths, other));
-    // `prepare_embeddable` removes the whole runtime folder, backends included,
-    // before it extracts whenever `needs_extraction` says so, so that is the
-    // space the install frees first.
+    // `prepare_embeddable` replaces the whole runtime folder, backends
+    // included, whenever `needs_extraction` says so, so that is the space the
+    // install frees before the backend is prepared.
     let replaced_bytes = if extraction && runtime_dir.exists() {
         directory_bytes(&runtime_dir)
     } else {
@@ -216,7 +219,7 @@ impl InstallPreflight {
         ];
         if self.replaced_bytes > 0 {
             lines.push(format!(
-                "  The existing Lemonade install here ({}) is replaced first, and that space is counted as free.",
+                "  The existing Lemonade install here ({}) is replaced once the new one is extracted beside it, and that space is counted as free for the backend.",
                 format_bytes(self.replaced_bytes)
             ));
         }
@@ -247,9 +250,11 @@ impl InstallPreflight {
         let Some(free_now) = self.available else {
             return SpaceVerdict::Fits;
         };
-        // The install deletes the existing runtime folder before it downloads,
-        // so its space counts. The warnings say so, so the figure shown is the
-        // one compared.
+        // The existing runtime folder is deleted before the backend downloads,
+        // so its space counts for the backend warnings, which say so, so the
+        // figure shown is the one compared. The minimum below does not count
+        // it: the old folder is still on the drive while the new embeddable
+        // tree is extracted beside it.
         let available = free_now.saturating_add(self.replaced_bytes);
         let room = if self.replaced_bytes > 0 {
             format!(
@@ -265,10 +270,10 @@ impl InstallPreflight {
             )
         };
         let minimum = rocm_core::with_margin(MIN_INSTALL_BYTES);
-        if available < minimum {
+        if free_now < minimum {
             return SpaceVerdict::Refuse(format!(
                 "{} Nothing was downloaded.",
-                insufficient_space_message(OPERATION, &self.target_root, minimum, available)
+                insufficient_space_message(OPERATION, &self.target_root, minimum, free_now)
             ));
         }
         // The margin is working room for the comparison only. What is printed is
@@ -326,12 +331,17 @@ pub fn install_tree_root(paths: &AppPaths, env_root: Option<&Path>) -> PathBuf {
 /// The parts of a Lemonade tree that make up the install itself.
 ///
 /// That is the extracted runtime with its backends, the cached archive, and
-/// leftover extraction scratch. Deliberately not the whole folder: under
+/// leftover scratch: the extraction folder and the `runtime.staging` and
+/// `runtime.previous` folders an interrupted reinstall can leave beside the
+/// runtime. Deliberately not the whole folder: under
 /// `<data>/engines/lemonade` the same folder also holds the install record, logs
 /// and server state.
-pub fn install_tree_dirs(tree_root: &Path) -> [PathBuf; 3] {
+pub fn install_tree_dirs(tree_root: &Path) -> [PathBuf; 5] {
+    let runtime_dir = runtime_dir_in(tree_root);
     [
-        runtime_dir_in(tree_root),
+        staging_dir_for(&runtime_dir),
+        previous_dir_for(&runtime_dir),
+        runtime_dir,
         tree_root.join("downloads"),
         tree_root.join("extract"),
     ]
@@ -707,6 +717,12 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("Nothing was downloaded."), "{message}");
+        // The old folder is still on the drive while the new tree is extracted
+        // beside it, so its space does not lift the refusal.
+        assert!(matches!(
+            preflight_with(Some(2 * MIB), 30 * GIB).space_verdict(),
+            SpaceVerdict::Refuse(_)
+        ));
 
         // Room for Lemonade itself but not for the ROCm backend download: warned
         // and allowed, because a smaller backend may still fit.
@@ -782,10 +798,12 @@ mod tests {
         assert_eq!((download.as_str(), disk.as_str()), ("4.4 GiB", "25.0 GiB"));
     }
 
-    /// An install that replaces the existing runtime folder deletes it before
-    /// downloading (`prepare_embeddable` removes the whole folder, backends
+    /// An install that replaces the existing runtime folder removes it once the
+    /// new embeddable tree is swapped in (`swap_in_runtime`), before the backend
+    /// downloads (`prepare_embeddable` removes the whole folder, backends
     /// included), so its space is free by then. The preflight sizes that folder,
-    /// counts it, and says so; an install that keeps the tree frees nothing.
+    /// counts it for the backend warnings, and says so; an install that keeps
+    /// the tree frees nothing.
     #[test]
     fn a_reinstall_counts_the_space_of_the_install_it_replaces() {
         let temp = tempfile::tempdir().unwrap();
@@ -807,7 +825,7 @@ mod tests {
         let notice = reinstall.notice_lines().join("\n");
         assert!(
             notice.contains(&format!(
-                "The existing Lemonade install here ({}) is replaced first, and that space is counted as free.",
+                "The existing Lemonade install here ({}) is replaced once the new one is extracted beside it, and that space is counted as free for the backend.",
                 format_bytes(reinstall.replaced_bytes)
             )),
             "{notice}"
@@ -817,7 +835,12 @@ mod tests {
         fs::remove_dir_all(runtime_dir_in(&tree).join("bin")).unwrap();
         let kept = plan_install_preflight(&paths, None, false, |_| Some(2 * GIB)).unwrap();
         assert_eq!(kept.replaced_bytes, 0);
-        assert!(!kept.notice_lines().join("\n").contains("replaced first"));
+        assert!(
+            !kept
+                .notice_lines()
+                .join("\n")
+                .contains("The existing Lemonade install here")
+        );
 
         // The verdict counts it: 2 GiB free warns for the ROCm backend, but the
         // same drive with a 24 GiB install about to be deleted does not.

@@ -2531,6 +2531,14 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   the install on the old-host hooks. It checks that the refusal says the
   installed copy stays as it is rather than "Nothing was downloaded.", and that
   every file of the planted tree is unchanged.
+- `lemonade-installs-10` plants a tree of the pinned Lemonade larger than the
+  refusal threshold in the data folder, reports a nearly full drive and
+  reinstalls. It checks the reinstall is refused (the old copy's space does not
+  count while the new one is extracted beside it) and that every file of the
+  planted tree is unchanged and no `runtime.staging` or `runtime.previous` was
+  left. That a failed extraction keeps the installed runtime is covered by the
+  unit tests in [install.rs](../engines/lemonade/src/install.rs), because the
+  archive's digest is pinned and no scenario can supply a corrupt one.
 - `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
   and checks `rocm storage report` lists both and flags the unused one.
 - `lemonade-installs-04` uninstalls that runtime and checks the install record

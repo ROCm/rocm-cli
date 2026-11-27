@@ -779,7 +779,7 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
         if usage.reclaimable {
             let _ = writeln!(
                 output,
-                "      note: reclaimable; Lemonade installs into the active ROCm install's folder, so this copy is only used while no ROCm install is active. Nothing removes it automatically: delete its runtime, downloads and extract folders to free the space"
+                "      note: reclaimable; Lemonade installs into the active ROCm install's folder, so this copy is only used while no ROCm install is active. Nothing removes it automatically: delete its runtime, downloads and extract folders, and the runtime.staging and runtime.previous folders if an interrupted reinstall left them, to free the space"
             );
         } else if usage.status == EngineInstallStatus::Unused {
             let _ = writeln!(

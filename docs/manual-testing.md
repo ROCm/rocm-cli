@@ -624,6 +624,20 @@ folder run `rocm engines install lemonade --yes`. Expected result:
   carries on: Lemonade picks the backend after this point and a smaller one may
   fit. (Stop it before the download if you do not want one.)
 
+To check that a reinstall keeps the installed Lemonade when it cannot finish:
+with the Lemonade installed in the data folder, run
+`rocm engines install lemonade --reinstall --yes` with
+`ROCM_E2E_LEMONADE_FREE_SPACE_BYTES=1048576` on a build made with
+`cargo build -p rocm --features rocm/e2e-test-hooks` (without that feature the
+variable is ignored and the reinstall really runs). Expected result: the
+same refusal as above, and the `runtime` folder is exactly as it was, with no
+`runtime.staging` or `runtime.previous` beside it. Interrupting a real
+reinstall during extraction (Ctrl+C) must likewise leave `runtime` working. It
+can leave an `extract/<number>` folder, and `runtime.staging` if it was
+interrupted while copying; only a later install that extracts again
+(`--reinstall` or a new Lemonade version) clears `runtime.staging`, and
+`rocm storage` counts both.
+
 To check the refusal of a Linux or WSL host too old for the pinned Lemonade
 server (no download needed): the pinned build needs glibc 2.38 and OpenSSL 3
 (`libssl.so.3`). On a real older host, such as Ubuntu 22.04 (glibc 2.35) or

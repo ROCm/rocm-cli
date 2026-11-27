@@ -118,6 +118,17 @@ async fn user_installs_lemonade(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user reinstalls the Lemonade engine")]
+async fn user_reinstalls_lemonade(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["engines", "install", "lemonade", "--reinstall", "--yes"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the Lemonade install is refused before anything is downloaded")]
 async fn assert_lemonade_install_refused(world: &mut E2eWorld) {
     let output = combined_output(world);
@@ -297,6 +308,56 @@ async fn plant_pinned_lemonade_install(world: &mut E2eWorld) {
     std::fs::write(tree.join("runtime").join("runtime-version.txt"), &version)
         .expect("failed to write the runtime version marker");
     world.planted_tree_snapshot = Some(tree_files(&tree));
+}
+
+/// Grows the planted tree past the refusal threshold (`MIN_INSTALL_BYTES` plus
+/// its margin, about 48 MiB), so a
+/// reinstall that counted the old tree's space as free would pass it with the
+/// 1 MiB the drive reports. The new tree is extracted beside the old one, so
+/// that space is not free for the extraction: the reinstall must be refused.
+#[given("the installed Lemonade is larger than the free space an install needs")]
+async fn grow_planted_lemonade_install(world: &mut E2eWorld) {
+    let tree = data_folder_tree(world);
+    let backend = tree
+        .join("runtime")
+        .join("bin")
+        .join("llamacpp")
+        .join("rocm-stable");
+    std::fs::write(backend.join("payload.bin"), vec![0_u8; 64 * 1024 * 1024])
+        .expect("failed to grow the backend payload");
+    world.planted_tree_snapshot = Some(tree_files(&tree));
+}
+
+#[then("the Lemonade reinstall is refused and the installed copy is left as it is")]
+async fn assert_reinstall_refused_and_installed_copy_kept(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "the reinstall must fail when the drive cannot hold the new copy beside the old:\n{output}"
+    );
+    assert!(
+        output.contains("Installing Lemonade"),
+        "no install notice: the binary under test was probably built without the \
+         `rocm/e2e-test-hooks` feature, which `cargo xtask e2e` enables:\n{output}"
+    );
+    assert!(
+        output.contains("not enough free disk space to install Lemonade:"),
+        "missing the space refusal:\n{output}"
+    );
+    let tree = data_folder_tree(world);
+    let before = world
+        .planted_tree_snapshot
+        .as_ref()
+        .expect("no planted tree snapshot - did the Given run?");
+    assert!(
+        &tree_files(&tree) == before,
+        "the installed tree changed despite the refusal:\n{output}"
+    );
+    assert!(
+        !tree.join("runtime.staging").exists() && !tree.join("runtime.previous").exists(),
+        "a refused reinstall left scratch folders beside the runtime:\n{output}"
+    );
 }
 
 #[then(
