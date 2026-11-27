@@ -6020,8 +6020,7 @@ async fn assert_unreadable_shared_pool_claims_no_figure(world: &mut E2eWorld) {
     // `UnifiedMemoryUnreadable` branch really emits; the branch does not use
     // the "...and this host offers {}" template the old guard was written
     // against at all.
-    let said_so = "the figure for the memory pool its engine allocates from could not be read \
-                   here";
+    let said_so = "the figure for that pool could not be read here";
     assert!(
         evidence.iter().any(|line| line.contains(said_so)),
         "the report must say the pool could not be read, in its own words, or everything below \
@@ -6300,9 +6299,11 @@ async fn assert_gguf_estimate_names_its_pool_as_shared(world: &mut E2eWorld) {
     // figures is told which kind of number sits beside them. Both are asserted
     // because a renderer that dropped the note would still set the flag.
     assert!(
-        notes.iter().any(|note| note
-            .contains("the ceiling on a pool it shares with the operating system")
-            && note.contains("how much is free depends on what else is running")),
+        notes
+            .iter()
+            .any(|note| note.contains(
+                "the ceiling on a pool this integrated GPU shares with the operating system"
+            ) && note.contains("how much is free depends on what else is running")),
         "a bare \"fits\" against a shared ceiling reads as \"this much memory is waiting for \
          it\", and nothing here measured how much of the pool is free, so the estimate has to \
          say so: {notes:#?}"
