@@ -236,6 +236,14 @@ pub(crate) fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'sta
         "15bf" | "164f" | "1900" | "1901" => Some("gfx1103"),
         // RDNA3.5 APUs with public PCI IDs that map cleanly to one gfx target.
         "1114" => Some("gfx1152"),
+        // Strix Halo points its KFD node at `gfx_target_version` 110501
+        // (gfx1151) for device 1586. Older packaged copies of `pci.ids` have no
+        // name for the id, so a name lookup cannot resolve it there. On Windows
+        // the display-adapter path reads this id out of `PCI\VEN_1002&DEV_...`
+        // instead (`gfx_target_from_pnp_device_id`, `parse_windows_display_gfx_target`).
+        // Reading device ids from `lspci` is the other half of #507 and is not
+        // wired up yet, so this row reaches only the Windows paths today.
+        "1586" => Some("gfx1151"),
         // Navi 48: Radeon RX 9070 / 9070 XT / 9070 GRE.
         "7550" => Some("gfx1201"),
         _ => None,
@@ -1042,6 +1050,7 @@ mod tests {
             ("164F", "gfx1103"),
             ("1900", "gfx1103"),
             ("1114", "gfx1152"),
+            ("1586", "gfx1151"),
             // Vega APUs: Renoir, Cezanne, Lucienne, Barcelo.
             ("1636", "gfx90c"),
             ("1638", "gfx90c"),
