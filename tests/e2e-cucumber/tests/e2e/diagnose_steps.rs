@@ -5440,15 +5440,51 @@ fn row_label(row: &serde_json::Value) -> String {
         .to_owned()
 }
 
-/// How many connections the stand-in hub accepted, after a moment for one in
-/// flight to be counted.
-fn hub_connections(world: &E2eWorld) -> usize {
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    world
-        .hub_requests
-        .as_ref()
-        .expect("no stand-in hub")
-        .load(std::sync::atomic::Ordering::SeqCst)
+/// How long the request count is given to reach the figure expected of it.
+/// Generous, because it is only ever waited out when the count is wrong: a run
+/// that makes the right requests leaves this loop as soon as the last of them
+/// is counted.
+const HUB_COUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the count then has to stay there. A request the CLI should not have
+/// made is already on the listener's backlog by the time it exits, so this is a
+/// margin for the accept loop to get to it, not a wait for anything to happen.
+const HUB_COUNT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Assert the stand-in hub accepted exactly `expected` connections, and no more.
+///
+/// The CLI has exited by the time a `Then` step runs, so every request it made
+/// has been sent; the stand-in hub's accept loop may still be a moment behind
+/// in counting them. Polled rather than slept on: a fixed pause is a guess at
+/// how slow the runner is, and a loaded runner that needed a moment longer
+/// failed the assertion with a count that was merely not in yet. This waits
+/// only as long as the count is still short, up to [`HUB_COUNT_TIMEOUT`], and
+/// says so plainly when it never gets there.
+///
+/// Reaching the figure is not enough on its own -- a count on its way past the
+/// figure passes through it -- so the count also has to hold still for
+/// [`HUB_COUNT_SETTLE`] afterwards. `why` says what the figure means, and is
+/// printed whichever way the check fails.
+fn assert_hub_connections(world: &E2eWorld, expected: usize, why: &str) {
+    let counter = world.hub_requests.as_ref().expect("no stand-in hub");
+    let seen = || counter.load(std::sync::atomic::Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + HUB_COUNT_TIMEOUT;
+    while seen() < expected && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        seen(),
+        expected,
+        "the stand-in hub was asked {} time(s) within {HUB_COUNT_TIMEOUT:?}, not {expected}: \
+         {why}",
+        seen()
+    );
+    std::thread::sleep(HUB_COUNT_SETTLE);
+    assert_eq!(
+        seen(),
+        expected,
+        "the stand-in hub was asked again after it had been asked {expected} time(s): {why}"
+    );
 }
 
 #[given("a Hugging Face repository publishing three quantizations and a multimodal projector")]
@@ -5622,10 +5658,10 @@ async fn assert_every_quantization_is_answered(world: &mut E2eWorld) {
 
 #[then("the endpoint was asked for the file list and one header per quantization")]
 async fn assert_the_hub_was_asked_once_per_quantization(world: &mut E2eWorld) {
-    assert_eq!(
-        hub_connections(world),
+    assert_hub_connections(
+        world,
         1 + REPOSITORY_QUANTIZATIONS.len(),
-        "one listing request and one header read per quantization, and nothing for the projector"
+        "one listing request and one header read per quantization, and nothing for the projector",
     );
 }
 
@@ -5666,10 +5702,10 @@ async fn assert_the_quantizations_past_the_cap_say_why(world: &mut E2eWorld) {
 
 #[then("the endpoint was asked for no more headers than the cap allows")]
 async fn assert_the_hub_was_asked_no_more_than_the_cap(world: &mut E2eWorld) {
-    assert_eq!(
-        hub_connections(world),
+    assert_hub_connections(
+        world,
         1 + MAX_PROBED_QUANTIZATIONS,
-        "the cap has to stop the requests, not only the wording"
+        "the cap has to stop the requests, not only the wording",
     );
 }
 
@@ -5689,10 +5725,10 @@ async fn assert_a_projector_only_repository_has_nothing_to_size(world: &mut E2eW
         quantization_rows(&model).is_empty(),
         "a projector was offered as a quantization: {model:#}"
     );
-    assert_eq!(
-        hub_connections(world),
+    assert_hub_connections(
+        world,
         1,
-        "only the file list may be asked for when there is no language model to size"
+        "only the file list may be asked for when there is no language model to size",
     );
 }
 
