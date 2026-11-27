@@ -73,11 +73,13 @@ pub(crate) struct InstallPreflight {
     pub(crate) other_install_listed: bool,
     /// Bytes of the existing runtime folder when this install replaces it
     /// (`--reinstall`, a new Lemonade version, or a missing server binary),
-    /// whose space is free by the time the backend download starts: the folder
-    /// is removed once the new embeddable tree is swapped in
-    /// (`swap_in_runtime`), which `lib.rs`'s `install_and_record` completes
-    /// before it prepares the backend. It is still on the drive while that new
-    /// tree is extracted. Zero when the tree is kept.
+    /// whose space is normally free by the time the backend download starts:
+    /// `swap_in_runtime` removes the folder once the new embeddable tree is in
+    /// place, which `lib.rs`'s `install_and_record` completes before it prepares
+    /// the backend. That removal is best effort: when it fails the install still
+    /// succeeds with a warning and the old tree keeps its space, so the figure
+    /// can overstate the room the backend download has. It is still on the drive
+    /// while the new tree is extracted. Zero when the tree is kept.
     pub(crate) replaced_bytes: u64,
     /// Free bytes on the drive holding `target_root`, when known.
     pub(crate) available: Option<u64>,

@@ -253,6 +253,12 @@ fn stage_runtime(
 /// two renames) is kept as the one to put back rather than cleared. Removes
 /// `staging_dir` on every failure except one that leaves the old tree only in
 /// `runtime.previous`, where the new tree is kept beside it.
+///
+/// `runtime.staging` and `runtime.previous` are not scoped to a version and
+/// nothing locks the tree, so a second process installing a different version
+/// at the same time can read this process's in-flight swap as an interrupted
+/// one. That is the same unserialised case as two such installs racing for the
+/// backend pin, and it stays an accepted, unrecovered limitation.
 fn swap_in_runtime(staging_dir: &Path, runtime_dir: &Path) -> Result<()> {
     swap_in_runtime_with(staging_dir, runtime_dir, |from, to| fs::rename(from, to))
 }
@@ -311,13 +317,27 @@ fn swap_in_runtime_with(
         });
     }
     // Nothing was moved aside on a fresh install, so there is nothing to remove.
-    if fallback && let Err(err) = fs::remove_dir_all(&previous_dir) {
-        eprintln!(
-            "warning: the new Lemonade runtime is in place, but the previous one in {} could not be removed ({err}); delete it to free its space",
-            previous_dir.display()
-        );
+    if fallback
+        && let Some(warning) = remove_previous_runtime(&previous_dir, |dir| fs::remove_dir_all(dir))
+    {
+        eprintln!("{warning}");
     }
     Ok(())
+}
+
+/// Removes the old runtime the swap left in `previous_dir`. The new runtime is
+/// already in place, so a failure here does not fail the install (a file held
+/// open or a scanner can block it); the returned warning says the old tree is
+/// still on the drive, and its space is not free for the backend download.
+fn remove_previous_runtime(
+    previous_dir: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Option<String> {
+    let err = remove(previous_dir).err()?;
+    Some(format!(
+        "warning: the new Lemonade runtime is in place, but the previous one in {} could not be removed ({err}); delete it to free its space",
+        previous_dir.display()
+    ))
 }
 
 pub(crate) fn manifest_path(paths: &AppPaths) -> PathBuf {
@@ -1458,6 +1478,32 @@ mod tests {
         assert!(runtime_dir.join("old.txt").is_file());
         assert!(!staging_dir.exists());
         assert!(!previous_dir_for(&runtime_dir).exists());
+    }
+
+    /// Removing the old tree after a successful swap is best effort: a failure
+    /// is reported as a warning that names the folder still holding the space,
+    /// and success reports nothing.
+    #[test]
+    fn a_previous_runtime_that_cannot_be_removed_is_reported_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous_dir = dir.path().join("runtime.previous");
+        fs::create_dir_all(&previous_dir).unwrap();
+
+        let warning = remove_previous_runtime(&previous_dir, |_| Err(denied())).unwrap();
+
+        assert!(
+            warning.contains("the new Lemonade runtime is in place")
+                && warning.contains(&previous_dir.display().to_string())
+                && warning.contains("could not be removed")
+                && warning.contains("delete it to free its space"),
+            "{warning}"
+        );
+        assert!(previous_dir.is_dir(), "a failed removal leaves the tree");
+        assert_eq!(
+            remove_previous_runtime(&previous_dir, |dir| fs::remove_dir_all(dir)),
+            None
+        );
+        assert!(!previous_dir.exists());
     }
 
     /// When the old tree cannot be put back either, the message names where it

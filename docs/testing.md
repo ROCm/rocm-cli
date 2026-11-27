@@ -2531,7 +2531,7 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   the install on the old-host hooks. It checks that the refusal says the
   installed copy stays as it is rather than "Nothing was downloaded.", and that
   every file of the planted tree is unchanged.
-- `lemonade-installs-10` plants a tree of the pinned Lemonade larger than the
+- `lemonade-installs-10` (Linux) plants a tree of the pinned Lemonade larger than the
   refusal threshold in the data folder, reports a nearly full drive and
   reinstalls. It checks the reinstall is refused (the old copy's space does not
   count while the new one is extracted beside it) and that every file of the
