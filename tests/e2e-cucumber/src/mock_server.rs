@@ -115,9 +115,9 @@ vllm:num_requests_running{{model=\"mock\"}} {running}
 # HELP vllm:num_requests_waiting Number of requests waiting to be processed.
 # TYPE vllm:num_requests_waiting gauge
 vllm:num_requests_waiting{{model=\"mock\"}} 0
-# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{{model=\"mock\"}} 0.25
+# HELP vllm:kv_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{{model=\"mock\"}} 0.25
 # HELP vllm:generation_tokens_total Number of generation tokens processed.
 # TYPE vllm:generation_tokens_total counter
 vllm:generation_tokens_total{{model=\"mock\"}} {gen_tokens_total}
@@ -125,10 +125,10 @@ vllm:generation_tokens_total{{model=\"mock\"}} {gen_tokens_total}
 # TYPE vllm:time_to_first_token_seconds histogram
 vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
 vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {tick}
-# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
-# TYPE vllm:time_per_output_token_seconds histogram
-vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
-vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
+# HELP vllm:inter_token_latency_seconds Histogram of time per output token.
+# TYPE vllm:inter_token_latency_seconds histogram
+vllm:inter_token_latency_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:inter_token_latency_seconds_count{{model=\"mock\"}} {tpot_count}
 "
                 ))
             }
@@ -149,10 +149,10 @@ vllm:generation_tokens_total{{model=\"mock\"}} {n}
 # TYPE vllm:time_to_first_token_seconds histogram
 vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
 vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {tick}
-# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
-# TYPE vllm:time_per_output_token_seconds histogram
-vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
-vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
+# HELP vllm:inter_token_latency_seconds Histogram of time per output token.
+# TYPE vllm:inter_token_latency_seconds histogram
+vllm:inter_token_latency_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:inter_token_latency_seconds_count{{model=\"mock\"}} {tpot_count}
 "
                 ))
             }
@@ -168,9 +168,9 @@ vllm:num_requests_running{model=\"mock\"} 1
 # HELP vllm:num_requests_waiting Number of requests waiting to be processed.
 # TYPE vllm:num_requests_waiting gauge
 vllm:num_requests_waiting{model=\"mock\"} 0
-# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{model=\"mock\"} 0.25
+# HELP vllm:kv_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model=\"mock\"} 0.25
 "
                     .to_string(),
                 )
@@ -200,10 +200,10 @@ vllm:generation_tokens_total{{model=\"mock\"}} {n}
 # TYPE vllm:time_to_first_token_seconds histogram
 vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
 vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {tick}
-# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
-# TYPE vllm:time_per_output_token_seconds histogram
-vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
-vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tick}
+# HELP vllm:inter_token_latency_seconds Histogram of time per output token.
+# TYPE vllm:inter_token_latency_seconds histogram
+vllm:inter_token_latency_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:inter_token_latency_seconds_count{{model=\"mock\"}} {tick}
 "
                 ))
             }
@@ -491,9 +491,9 @@ vllm:num_requests_running{{model=\"mock\"}} 1
 # HELP vllm:num_requests_waiting Number of requests waiting to be processed.
 # TYPE vllm:num_requests_waiting gauge
 vllm:num_requests_waiting{{model=\"mock\"}} 0
-# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{{model=\"mock\"}} 0.25
+# HELP vllm:kv_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{{model=\"mock\"}} 0.25
 # HELP vllm:generation_tokens_total Number of generation tokens processed.
 # TYPE vllm:generation_tokens_total counter
 vllm:generation_tokens_total{{model=\"mock\"}} {gen_tokens_total}
@@ -501,10 +501,10 @@ vllm:generation_tokens_total{{model=\"mock\"}} {gen_tokens_total}
 # TYPE vllm:time_to_first_token_seconds histogram
 vllm:time_to_first_token_seconds_sum{{model=\"mock\"}} {ttft_sum_s}
 vllm:time_to_first_token_seconds_count{{model=\"mock\"}} {ttft_count}
-# HELP vllm:time_per_output_token_seconds Histogram of time per output token.
-# TYPE vllm:time_per_output_token_seconds histogram
-vllm:time_per_output_token_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
-vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
+# HELP vllm:inter_token_latency_seconds Histogram of time per output token.
+# TYPE vllm:inter_token_latency_seconds histogram
+vllm:inter_token_latency_seconds_sum{{model=\"mock\"}} {tpot_sum_s}
+vllm:inter_token_latency_seconds_count{{model=\"mock\"}} {tpot_count}
 "
         )
     }

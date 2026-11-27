@@ -106,8 +106,9 @@ pub struct InstanceSample {
     /// engines that don't expose the histogram.
     pub ttft_sum_s: Option<f64>,
     pub ttft_count: Option<f64>,
-    /// Cumulative vLLM `time_per_output_token_seconds_sum` / `_count` histogram
-    /// readings; windowed into `Instance.tpot_ms` the same way.
+    /// Cumulative vLLM `inter_token_latency_seconds_sum` / `_count` histogram
+    /// readings (the legacy `time_per_output_token_seconds` pair on older
+    /// vLLM); windowed into `Instance.tpot_ms` the same way.
     pub tpot_sum_s: Option<f64>,
     pub tpot_count: Option<f64>,
 }

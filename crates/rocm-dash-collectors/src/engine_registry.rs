@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn parse_sample_dispatches_to_the_engine_parser() {
         // vLLM Prometheus text → the unchanged vLLM parser (kv-cache 0..1 → 0..100).
-        let vllm_body = "vllm:gpu_cache_usage_perc 0.5\nvllm:num_requests_running 3\n";
+        let vllm_body = "vllm:kv_cache_usage_perc 0.5\nvllm:num_requests_running 3\n";
         let vllm_sample = EngineKind::Vllm.parse_sample(vllm_body);
         assert_eq!(vllm_sample.kv_cache_usage_pct, Some(50.0));
         assert_eq!(vllm_sample.running_reqs, Some(3));

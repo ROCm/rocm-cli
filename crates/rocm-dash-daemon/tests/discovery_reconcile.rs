@@ -112,8 +112,8 @@ fn vllm_metrics() -> String {
 vllm:num_requests_running{model=\"mock\"} 1
 # TYPE vllm:num_requests_waiting gauge
 vllm:num_requests_waiting{model=\"mock\"} 0
-# TYPE vllm:gpu_cache_usage_perc gauge
-vllm:gpu_cache_usage_perc{model=\"mock\"} 0.25
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model=\"mock\"} 0.25
 # TYPE vllm:generation_tokens_total counter
 vllm:generation_tokens_total{model=\"mock\"} 100
 ",
