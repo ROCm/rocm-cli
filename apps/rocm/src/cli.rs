@@ -412,8 +412,10 @@ pub(crate) enum Command {
     /// value a Windows shell reads as syntax (', &, %) is refused, not offered to
     /// paste, unless it came from your own request (`install therock into <folder>`).
     /// Use `rocm config enable-provider` and `rocm config set-provider-key` first to
-    /// configure a remote provider; the `local` provider talks to a running server. On
-    /// Linux/WSL the interactive chat shares the dashboard's telemetry daemon the way
+    /// configure a remote provider. The `local` provider talks to a model that `rocm serve`
+    /// runs on this machine: without --model it uses only the built-in assistant model
+    /// (Qwen3-4B-Instruct-2507-GGUF on Lemonade), and any other served model needs
+    /// --model. On Linux/WSL the interactive chat shares the dashboard's telemetry daemon the way
     /// `rocm dash` does, and, like it, prints why that daemon was failing after it
     /// closes, including when it is ended with Ctrl-C, SIGINT or SIGTERM.
     #[command(after_help = "EXAMPLES:\n  \
