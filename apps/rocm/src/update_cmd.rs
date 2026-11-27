@@ -711,7 +711,7 @@ mod tests {
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
         );
         assert!(
-            rendered.contains("undoes only this one activation"),
+            rendered.contains("only one step back is remembered"),
             "the hint should state the single-step limit up front, not just in --help:\n{rendered}"
         );
 
