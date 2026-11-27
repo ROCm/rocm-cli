@@ -30,7 +30,9 @@
 //! failure.
 
 use anyhow::{Result, anyhow, bail};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Smallest slack added on top of a requirement, covering filesystem metadata,
 /// rounding, and the last few writes of an install.
@@ -238,10 +240,31 @@ fn listed_mounts() -> Vec<(PathBuf, u64)> {
 /// Flatten a disk listing into mount points, or an empty list when the
 /// platform could not enumerate disks at all. An empty list leaves
 /// `mount_for_path` with nothing to match, so callers get "unknown" and never
-/// block the operation.
-fn mounts_of<E>(disks: Result<sysinfo::Disks, E>) -> Vec<(PathBuf, u64)> {
-    let Ok(disks) = disks else {
-        return Vec::new();
+/// block the operation. The failure is reported once per process on stderr,
+/// since every later check would otherwise report "unknown" with no trace of
+/// why.
+fn mounts_of<E: Display>(disks: Result<sysinfo::Disks, E>) -> Vec<(PathBuf, u64)> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    mounts_reporting_to(disks, &WARNED, |line| eprintln!("{line}"))
+}
+
+/// [`mounts_of`] with the once-per-process flag and the warning sink passed in,
+/// so a test can drive both without touching process state.
+fn mounts_reporting_to<E: Display>(
+    disks: Result<sysinfo::Disks, E>,
+    warned: &AtomicBool,
+    emit: impl FnOnce(String),
+) -> Vec<(PathBuf, u64)> {
+    let disks = match disks {
+        Ok(disks) => disks,
+        Err(error) => {
+            if !warned.swap(true, Ordering::Relaxed) {
+                emit(format!(
+                    "warning: could not list disks ({error}); free-space checks report unknown space and do not block"
+                ));
+            }
+            return Vec::new();
+        }
     };
     disks
         .iter()
@@ -905,8 +928,16 @@ mod tests {
     fn a_failed_disk_enumeration_reports_unknown_space_and_never_blocks() {
         // sysinfo 0.40 made listing disks fallible. The failure must surface as
         // "no mounts", which `select_mount` cannot match and `classify_space`
-        // reports as unknown, rather than as a panic or an invented figure.
-        let mounts = mounts_of::<&str>(Err("the platform could not list disks"));
+        // reports as unknown, rather than as a panic or an invented figure. The
+        // warning's claim that checks "report unknown space and do not block" is
+        // asserted against that resulting state in this same test.
+        let warned = AtomicBool::new(false);
+        let mut lines = Vec::new();
+        let mounts = mounts_reporting_to::<&str>(
+            Err("the platform could not list disks"),
+            &warned,
+            |line| lines.push(line),
+        );
         assert!(mounts.is_empty(), "{mounts:?}");
         let selected = select_mount(Path::new("/var/cache/rocm"), &mounts);
         assert_eq!(selected, None);
@@ -914,6 +945,25 @@ mod tests {
             classify_space(u64::MAX, selected.map(|(_, available)| available)),
             SpaceCheck::Unknown
         ));
+        assert_eq!(
+            lines,
+            [
+                "warning: could not list disks (the platform could not list disks); \
+                 free-space checks report unknown space and do not block"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_disk_enumeration_failure_warns_only_once() {
+        let warned = AtomicBool::new(false);
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            let mounts =
+                mounts_reporting_to::<&str>(Err("unsupported"), &warned, |line| lines.push(line));
+            assert!(mounts.is_empty(), "{mounts:?}");
+        }
+        assert_eq!(lines.len(), 1, "{lines:?}");
     }
 
     #[test]
