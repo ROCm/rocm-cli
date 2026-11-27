@@ -92,8 +92,12 @@ mod tests {
         // keep ticking, with nothing to show for the host, rather than panic.
         let mut c = HostCollector::from_system::<&str>(Err("unsupported platform"));
         let m = c.tick();
-        assert!(m.cpu_per_core_pct.is_empty(), "{m:?}");
-        assert_eq!(m.memory_total_mb, 0, "{m:?}");
-        assert_eq!(m.swap_total_mb, 0, "{m:?}");
+        // Whole-struct comparison through JSON (`SystemMetrics` has no
+        // `PartialEq`), so a field added later is covered without editing this.
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::to_value(SystemMetrics::default()).unwrap(),
+            "{m:?}"
+        );
     }
 }
