@@ -299,8 +299,8 @@ pub struct ContextEstimate {
     /// note in `notes` and the evidence line in [`evidence_lines`] both have to
     /// describe the same figure, and when they derived it separately they
     /// disagreed in one report -- "the GPU with the most dedicated VRAM ... has
-    /// 24576 MiB" a few lines above "this host's integrated GPU has no
-    /// dedicated VRAM".
+    /// 24576 MiB" a few lines above a note calling the same figure a shared
+    /// ceiling.
     #[serde(default)]
     pub available_is_shared_pool: bool,
     /// The largest context that fits at `kv_cache_type`: a multiple of 256, or
@@ -1678,18 +1678,32 @@ mod tests {
     // The three memory states the readiness check distinguishes. In each the
     // figures the file allows are still reported, and in none is anything
     // compared.
+    //
+    // The third element is a fragment of `detail`, not only of the reason: the
+    // enum tells a caller which state this is, the detail is what a reader is
+    // shown, and the two can drift. Each fragment is chosen to be absent from
+    // the wording that site used to carry -- the unreadable-pool arm in
+    // particular said "this host has no dedicated VRAM", which is false of an
+    // integrated GPU that reports a BIOS carve-out, so a fragment shared with
+    // that sentence would let it come back unnoticed.
     #[test]
     fn memory_that_cannot_be_compared_still_reports_what_the_model_needs() {
         let (header, size) = llama(GIB_U as usize / 1024);
-        for (memory, reason) in [
-            (AcceleratorMemory::None, CannotEstimateReason::NoGpu),
+        for (memory, reason, detail_fragment) in [
+            (
+                AcceleratorMemory::None,
+                CannotEstimateReason::NoGpu,
+                "no GPU is visible to ROCm",
+            ),
             (
                 AcceleratorMemory::Unknown,
                 CannotEstimateReason::AcceleratorMemoryUnknown,
+                "the GPU memory on this host could not be read",
             ),
             (
                 AcceleratorMemory::UnifiedMemoryUnreadable,
                 CannotEstimateReason::UnifiedMemoryUnreadable,
+                "allocates from a pool it shares with the operating system",
             ),
         ] {
             let result = estimate(&header, size, 4096, KvCacheType::F16, memory);
@@ -1699,6 +1713,14 @@ mod tests {
                 "{memory:?}"
             );
             assert_eq!(result.cannot_estimate_reason, Some(reason));
+            let detail = result
+                .detail
+                .as_deref()
+                .unwrap_or_else(|| panic!("{memory:?}: nothing was said about why"));
+            assert!(
+                detail.contains(detail_fragment),
+                "{memory:?}: the detail must say {detail_fragment:?}, got {detail:?}"
+            );
             assert!(
                 result.total_gib.is_some(),
                 "{memory:?}: the need was not reported"

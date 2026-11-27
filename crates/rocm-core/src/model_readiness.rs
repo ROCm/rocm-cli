@@ -1728,11 +1728,19 @@ mod tests {
             Some(60.0),
             "the verdict is reached against the pool, not the carve-out beside it"
         );
+        // Anchored on a fragment that names the subject, not on the bare
+        // "shares with the operating system" the negative assertions elsewhere
+        // in this file use. The sentence this site used to carry -- "this
+        // host's integrated GPU has no dedicated VRAM: that figure is the
+        // ceiling on a pool it shares with the operating system ..." --
+        // contained the shorter phrase too, so restoring the retired denial
+        // would not have been caught. It was retired because an integrated GPU
+        // usually does report VRAM: the BIOS carve-out, which is exactly what
+        // the APU fixtures plant.
         assert!(
-            ample
-                .evidence
-                .iter()
-                .any(|line| line.contains("shares with the operating system")),
+            ample.evidence.iter().any(|line| {
+                line.contains("a pool this integrated GPU shares with the operating system")
+            }),
             "`degraded` without the reason reads as a property of the model: {:?}",
             ample.evidence
         );
