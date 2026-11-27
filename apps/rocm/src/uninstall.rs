@@ -129,7 +129,10 @@ pub(crate) const UNINSTALL_AFTER_HELP: &str = "Never removes /, your home folder
 system location (/usr, /etc, /lib, /run, ...; Windows, Program Files, ProgramData, ...), or a shared \
 folder (anything directly under /, /var/lib, /mnt/<drive>, ...). Outside your home folder it \
 removes only a folder holding the .rocm-cli-root file ROCm CLI writes into folders it creates. A \
-refusal stops the whole uninstall and says what clears it. See the README for the full rules.\n\n\
+refusal stops the whole uninstall and says what clears it. A rocm run from a Python environment \
+(installed by pip, pipx or uv tool) is left in place, with the command that removes it: `pip \
+uninstall rocm-cli`, `pipx uninstall rocm-cli` or `uv tool uninstall rocm-cli`. See the README for \
+the full rules.\n\n\
 EXAMPLES:\n  \
 rocm uninstall --dry-run\n  \
 rocm uninstall\n  \
@@ -1060,6 +1063,26 @@ fn delete_running_executable(exe: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_help_and_the_python_skip_notice_name_the_same_commands() {
+        // The help's claim that a binary in a Python environment is left in place
+        // is proved by scenario `uninstall-26` (the notice and no planned binary);
+        // this pins that help and notice name the same removal commands, which
+        // `python_install::skip_notice` is the source of.
+        let notice = crate::python_install::skip_notice(Path::new("venv/bin/rocm"));
+        for command in [
+            "pip uninstall rocm-cli",
+            "pipx uninstall rocm-cli",
+            "uv tool uninstall rocm-cli",
+        ] {
+            assert!(
+                UNINSTALL_AFTER_HELP.contains(command),
+                "help lacks {command}"
+            );
+            assert!(notice.contains(command), "notice lacks {command}");
+        }
+    }
 
     /// A fresh directory under the system temp dir, removed on drop.
     struct Scratch(PathBuf);

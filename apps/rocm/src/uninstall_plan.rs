@@ -62,7 +62,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, daemon_binary_path};
 
 use crate::managed_service_status::load_managed_services;
-use crate::{remote, uninstall};
+use crate::{python_install, remote, uninstall};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UninstallOptions {
@@ -653,7 +653,8 @@ pub(crate) fn build_uninstall_plan_with(
 /// Plan removing the installed binaries beside the running one, which
 /// `current_exe` names, undoing the installer's PATH change for their folder,
 /// and removing the fish completion script it recorded writing for them.
-/// `--keep-binaries` keeps all three, and so does a cargo build's folder.
+/// `--keep-binaries` keeps all three, and so does a cargo build's folder or a
+/// Python environment a package manager may own (`python_install.rs`).
 pub(crate) fn plan_installed_binaries(
     plan: &mut UninstallPlan,
     options: &UninstallOptions,
@@ -677,6 +678,16 @@ pub(crate) fn plan_installed_binaries(
             "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
             current_exe.display()
         ));
+        return Ok(());
+    }
+    // A wheel's files are listed in its `RECORD`; deleting them behind pip's
+    // back leaves pip reporting a package it can no longer remove.
+    // `--force-dev-binaries` does not reach this: it is read only in the
+    // `is_dev_binary_layout` check above, and nothing here consults it (the unit
+    // test `force_dev_binaries_does_not_reach_a_python_environment` in
+    // `python_install.rs` runs the plan with it set).
+    if python_install::is_python_managed_layout(&current_exe) {
+        plan.skipped.push(python_install::skip_notice(&current_exe));
         return Ok(());
     }
     let binaries = collect_installed_binary_candidates(&current_exe)?;

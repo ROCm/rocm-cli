@@ -55,6 +55,7 @@ mod e2e {
     pub mod symptom_file_steps;
     pub mod therock_steps;
     pub mod tui_driver;
+    pub mod uninstall_python_steps;
     pub mod uninstall_steps;
     pub mod update_steps;
     pub mod vllm_tensorizer_steps;

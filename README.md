@@ -255,6 +255,22 @@ If your shell can't find the `rocm` command, for example with
 The directory is `~/.local/bin` on Linux, `%USERPROFILE%\.local\bin` on Windows,
 or the folder you set with `ROCM_CLI_INSTALL_DIR`.
 
+### Python package (not published yet)
+
+The release workflow also builds `rocm-cli` as a Python wheel for Linux x86_64
+and Windows x86_64: the same prebuilt `rocm` and `rocmd` binaries that are in
+the signed release archives, with no Python code and no source distribution.
+The wheels are built and tested on every release, but publishing them to PyPI
+is switched off until the project name is registered and its publisher is
+configured, so `pip install rocm-cli` does not work yet. Use the installers
+above.
+
+A binary that a Python package manager installed is left alone by
+`rocm uninstall`, which says to remove it with `pip uninstall rocm-cli`,
+`pipx uninstall rocm-cli` or `uv tool uninstall rocm-cli` instead. See
+`docs/release-trust.md` for how this channel is secured, and for the one layout
+(a Windows `pipx` or `uv tool` launcher) the uninstall cannot recognise.
+
 ## Build from source
 
 Building requires [Rust](https://rustup.rs/); the pinned toolchain in
@@ -2722,7 +2738,10 @@ the folder before anything is removed.
 
 When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the ROCm CLI binaries in that build
-directory.
+directory. It also skips binary removal when `rocm` runs from a Python
+environment that a package manager (`pip`, `pipx`, `uv tool`) may own, and names
+the command that removes it (`pip uninstall rocm-cli`); `--force-dev-binaries`
+does not change that.
 
 Before removing anything, `uninstall` prints warnings, among them:
 

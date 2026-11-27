@@ -21,7 +21,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 const USER_FILE: &str = "keep.txt";
 
-fn root(world: &E2eWorld) -> &Path {
+pub(super) fn root(world: &E2eWorld) -> &Path {
     world
         .isolated_root
         .as_ref()
@@ -155,9 +155,14 @@ fn run_uninstall_in(world: &mut E2eWorld, flags: &[&str], cwd: Option<&Path>) {
 
 /// Run `rocm <args>` confined to the scenario root (see [`isolated_env`]).
 fn run_command_in(world: &mut E2eWorld, args: &[&str], cwd: Option<&Path>) {
+    run_binary_in(world, &crate::rocm_binary(), args, cwd);
+}
+
+/// [`run_command_in`] for a `rocm` other than the one under test: a copy of it
+/// somewhere else, whose own folder is what `rocm uninstall` judges.
+pub(super) fn run_binary_in(world: &mut E2eWorld, binary: &str, args: &[&str], cwd: Option<&Path>) {
     let env = isolated_env(world);
-    let binary = crate::rocm_binary();
-    let mut cmd = std::process::Command::new(&binary);
+    let mut cmd = std::process::Command::new(binary);
     cmd.args(args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
@@ -637,7 +642,7 @@ async fn still_no_folders(world: &mut E2eWorld) {
 
 // ── Then ───────────────────────────────────────────────────────────
 
-fn output(world: &E2eWorld) -> &str {
+pub(super) fn output(world: &E2eWorld) -> &str {
     world
         .cli_output
         .as_deref()
