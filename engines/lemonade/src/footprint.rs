@@ -7,7 +7,9 @@
 //! A fresh install is a multi-gigabyte download and a tree several times that
 //! size: on a Windows gfx1151 host, Lemonade's `llamacpp:rocm` backend fetched
 //! 4.7 GB (Lemonade's own `Total:` line) and the finished tree measured 24.3 GiB,
-//! almost all of it the ROCm runtime Lemonade bundles with the backend. Before
+//! almost all of it the ROCm runtime Lemonade bundles with the backend (which it
+//! does not, when the active ROCm SDK is offered to it and matches; see
+//! [`crate::sdk_root`]). Before
 //! this module the only thing a user saw was a one-line "Preparing..." and then,
 //! from `rocm serve`, up to ten silent minutes. [`plan_install_preflight`] decides
 //! whether an install is about to write a new tree, and [`InstallPreflight`]
@@ -30,6 +32,7 @@ use crate::install::{
     installed_runtime_version, lemonade_root, lemond_path_in, manifest_path, needs_extraction,
     runtime_dir_in,
 };
+use crate::sdk_root::OfferedSdk;
 
 /// Download size of an install that fetches the llama.cpp ROCm backend: the
 /// embeddable archive plus the backend. Lemonade printed `Total: 4.7 GB`
@@ -78,6 +81,15 @@ pub(crate) struct InstallPreflight {
     pub(crate) replaced_bytes: u64,
     /// Free bytes on the drive holding `target_root`, when known.
     pub(crate) available: Option<u64>,
+    /// The managed ROCm SDK Lemonade is offered as its ROCm runtime
+    /// ([`crate::sdk_root`]), when there is one it will accept. Set by the
+    /// caller from the same process environment the install then runs with, so
+    /// the notice says what the install does.
+    pub(crate) offered_sdk: Option<OfferedSdk>,
+    /// Why the active ROCm SDK could not be offered to Lemonade, when there is
+    /// one and offering it failed (the root could not be staged). Lemonade then
+    /// gets the SDK root as it is, which it does not accept on Linux.
+    pub(crate) sdk_offer_failure: Option<String>,
 }
 
 /// Outcome of comparing the preflight's free space with the install's size.
@@ -132,6 +144,8 @@ pub(crate) fn plan_install_preflight(
         other_install_listed,
         replaced_bytes,
         available,
+        offered_sdk: None,
+        sdk_offer_failure: None,
     })
 }
 
@@ -214,6 +228,24 @@ impl InstallPreflight {
                 disk_text(),
             ),
         ];
+        if let Some(sdk) = self.offered_sdk.as_ref() {
+            // The figures above are what a fresh ROCm runtime costs, which is
+            // what is downloaded when the SDK's version is not the one the
+            // backend is built for. The line says both, so neither is a surprise.
+            lines.push(match sdk.version.as_deref() {
+                Some(version) => format!(
+                    "  The active ROCm SDK ({version}) is offered to Lemonade as its ROCm runtime. When its ROCm version matches the one the backend is built for, only the llama.cpp backend is downloaded and those sizes do not apply; when it does not, Lemonade downloads a ROCm runtime of its own."
+                ),
+                // A root with no version file is taken whatever its version, so
+                // there is no mismatch for Lemonade to answer with a download.
+                None => "  The active ROCm SDK is offered to Lemonade as its ROCm runtime. Its version could not be read, so Lemonade takes it as it is: only the llama.cpp backend is downloaded and those sizes do not apply.".to_owned(),
+            });
+        }
+        if let Some(failure) = self.sdk_offer_failure.as_ref() {
+            lines.push(format!(
+                "  Lemonade will not reuse the active ROCm SDK ({failure}), so it downloads a ROCm runtime of its own."
+            ));
+        }
         if self.replaced_bytes > 0 {
             lines.push(format!(
                 "  The existing Lemonade install here ({}) is replaced first, and that space is counted as free.",
@@ -232,6 +264,17 @@ impl InstallPreflight {
             ));
         }
         lines
+    }
+
+    /// What the low-space warnings add when the active ROCm SDK is offered: their
+    /// figures include the ROCm runtime Lemonade would otherwise download, which
+    /// an SDK of the matching version spares it.
+    const fn reuse_caveat(&self) -> &'static str {
+        if self.offered_sdk.is_some() {
+            " Those sizes include a ROCm runtime that the active ROCm SDK may spare Lemonade."
+        } else {
+            ""
+        }
     }
 
     /// Whether the drive can hold the install.
@@ -276,14 +319,16 @@ impl InstallPreflight {
         // for the same download.
         if available < rocm_core::with_margin(FRESH_INSTALL_DOWNLOAD_BYTES) {
             return SpaceVerdict::Tight(format!(
-                "Warning: {room}, and Lemonade's llama.cpp ROCm backend alone is a download of up to about {} (plus room to unpack it). The install will continue: if Lemonade picks a smaller backend for this GPU it may fit, otherwise it will fail partway through.",
-                download_text()
+                "Warning: {room}, and Lemonade's llama.cpp ROCm backend alone is a download of up to about {} (plus room to unpack it). The install will continue: if Lemonade picks a smaller backend for this GPU it may fit, otherwise it will fail partway through.{}",
+                download_text(),
+                self.reuse_caveat()
             ));
         }
         if available < rocm_core::with_margin(FRESH_INSTALL_DISK_BYTES) {
             return SpaceVerdict::Tight(format!(
-                "Warning: free disk space may be insufficient to install Lemonade's llama.cpp ROCm backend: up to about {} needed (plus room to work in), and {room}. The install will continue, but may fail partway through.",
-                disk_text()
+                "Warning: free disk space may be insufficient to install Lemonade's llama.cpp ROCm backend: up to about {} needed (plus room to work in), and {room}. The install will continue, but may fail partway through.{}",
+                disk_text(),
+                self.reuse_caveat()
             ));
         }
         SpaceVerdict::Fits
@@ -689,6 +734,106 @@ mod tests {
             other_install_listed: false,
             replaced_bytes,
             available,
+            offered_sdk: None,
+            sdk_offer_failure: None,
+        }
+    }
+
+    /// With an SDK offered the notice says so, with its version, and says what
+    /// happens when its version is not the backend's: the sizes it still
+    /// prints are those of Lemonade's own ROCm runtime, and that is what is
+    /// downloaded then. Without one, nothing is said about an SDK.
+    #[test]
+    fn the_notice_says_when_the_active_sdk_is_offered_to_lemonade() {
+        let without = preflight_with(Some(100 * GIB), 0).notice_lines().join("\n");
+        assert!(!without.contains("ROCm SDK"), "{without}");
+
+        let mut preflight = preflight_with(Some(100 * GIB), 0);
+        preflight.offered_sdk = Some(OfferedSdk {
+            version: Some("10.1.0".to_owned()),
+        });
+        let notice = preflight.notice_lines().join("\n");
+        assert!(
+            notice.contains(
+                "The active ROCm SDK (10.1.0) is offered to Lemonade as its ROCm runtime."
+            ),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("only the llama.cpp backend is downloaded"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Lemonade downloads a ROCm runtime of its own"),
+            "{notice}"
+        );
+        // The sizes line is still there, ahead of the line that qualifies it.
+        let sizes = notice
+            .find("a download of up to about")
+            .expect("sizes line");
+        let offered = notice.find("is offered to Lemonade").expect("offer line");
+        assert!(sizes < offered, "{notice}");
+
+        // A root accepted without a version file is offered without one, and
+        // Lemonade takes such a root whatever its version: the line does not
+        // threaten a download.
+        preflight.offered_sdk = Some(OfferedSdk { version: None });
+        let notice = preflight.notice_lines().join("\n");
+        assert!(
+            notice.contains("The active ROCm SDK is offered to Lemonade"),
+            "{notice}"
+        );
+        assert!(notice.contains("Lemonade takes it as it is"), "{notice}");
+        assert!(
+            !notice.contains("downloads a ROCm runtime of its own"),
+            "{notice}"
+        );
+    }
+
+    /// An SDK that could not be offered is said not to be reused, with the reason,
+    /// and not said to be offered. The state it reports is covered where the
+    /// failure is produced: `a_root_that_cannot_be_staged_leaves_rocm_path_at_the_sdk`
+    /// in `process.rs`, which also checks the text the install prints.
+    #[test]
+    fn the_notice_says_when_the_active_sdk_could_not_be_offered() {
+        let mut preflight = preflight_with(Some(100 * GIB), 0);
+        preflight.sdk_offer_failure = Some("no room to stage".to_owned());
+        let notice = preflight.notice_lines().join("\n");
+        assert!(
+            notice.contains(
+                "Lemonade will not reuse the active ROCm SDK (no room to stage), so it downloads a ROCm runtime of its own."
+            ),
+            "{notice}"
+        );
+        assert!(!notice.contains("is offered to Lemonade"), "{notice}");
+    }
+
+    /// The low-space warnings quote what a fresh ROCm runtime costs, so with an
+    /// SDK offered they say it may be spared; without one they do not.
+    #[test]
+    fn the_low_space_warnings_say_the_active_sdk_may_spare_the_runtime() {
+        let warning_for = |offered: bool, available: u64| {
+            let mut preflight = preflight_with(Some(available), 0);
+            if offered {
+                preflight.offered_sdk = Some(OfferedSdk {
+                    version: Some("10.1.0".to_owned()),
+                });
+            }
+            let SpaceVerdict::Tight(warning) = preflight.space_verdict() else {
+                panic!("{available} bytes is below the sizes quoted");
+            };
+            warning
+        };
+        // Below the download, and between the download and the finished tree.
+        for available in [2 * GIB, 10 * GIB] {
+            assert!(
+                warning_for(true, available).ends_with("may spare Lemonade."),
+                "{available}"
+            );
+            assert!(
+                !warning_for(false, available).contains("may spare Lemonade"),
+                "{available}"
+            );
         }
     }
 

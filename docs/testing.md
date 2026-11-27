@@ -2531,6 +2531,19 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   the install on the old-host hooks. It checks that the refusal says the
   installed copy stays as it is rather than "Nothing was downloaded.", and that
   every file of the planted tree is unchanged.
+- `lemonade-installs-10` and `-11` (Linux) plant a managed SDK with the Linux
+  wheel layout (only `libamdhip64.so.7`, as the wheel ships it) and report the
+  drive nearly full, so the install stops before downloading. `-10` plants a
+  version file: it checks that the install says the active ROCm SDK is offered
+  to Lemonade as its ROCm runtime, and that the root staged for it in the data
+  folder's `sdk-root` folder links to the SDK's HIP library and carries its
+  version (the refusal for space leaves that root behind). `-11` plants no
+  version file: it checks that the install does not say the SDK is offered and
+  that no root is staged, because Lemonade would take a version-less root for
+  any ROCm version. That Lemonade then skips its download is its own decision
+  and needs a real backend download, so it is a manual check
+  ([manual-testing.md](manual-testing.md)) and unit-tested as a mirror of
+  its probe in [sdk_root.rs](../engines/lemonade/src/sdk_root.rs).
 - `lemonade-installs-03` plants a data-folder copy and a copy inside a runtime
   and checks `rocm storage report` lists both and flags the unused one.
 - `lemonade-installs-04` uninstalls that runtime and checks the install record
@@ -2541,6 +2554,14 @@ Lemonade copies ROCm CLI keeps (ROCMAI-825), all on the mock lane:
   removed with it, and uninstall then leaves it). A copy inside a registered
   runtime is never marked reclaimable, because it is reused when that runtime
   becomes active; two registered runtimes are covered by a unit test.
+
+The variables Windows hands a logged `lemond` start are unit-tested in
+[process.rs](../engines/lemonade/src/process.rs): the arguments and variables
+(`a_logged_windows_start_is_given_the_lemonade_environment`, Linux), and the
+spawn itself, which runs a script and reads the log
+(`a_logged_lemond_start_on_windows_receives_the_lemonade_environment`, on the
+Windows job). The one line in `spawn_lemond_unchecked` that connects the two
+compiles only on Windows and has no test of its own.
 
 Run them alone with `cargo xtask e2e -- -n "lemonade-installs-"`.
 

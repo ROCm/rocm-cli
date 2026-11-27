@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, RocmCliConfig, active_managed_therock_environment, format_http_base_url,
-    http_get_text_with_auth, prepend_runtime_paths, runtime_is_linux, runtime_is_windows,
+    AppPaths, ManagedRuntimeEnvironment, RocmCliConfig, active_managed_therock_environment,
+    format_http_base_url, http_get_text_with_auth, prepend_runtime_paths, runtime_is_linux,
+    runtime_is_windows,
 };
 use rocm_engine_protocol::EngineRecipeHint;
 use serde_json::Value;
@@ -18,14 +19,27 @@ use std::time::Duration;
 use crate::device_policy::device_policy_name;
 use crate::install::LemonadeInstallManifest;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
+use crate::sdk_root::OfferedSdk;
 use crate::state::{MAX_TAIL_READ, parse_http_endpoint, resolve_lemonade_model_ref};
 use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
+/// Environment variables to set on a child: a name and a value.
+#[cfg(any(windows, test))]
+type EnvironmentVars = Vec<(&'static str, OsString)>;
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LemonadeProcessEnvironment {
+    /// What `ROCM_PATH` is set to: the managed SDK's root, or a root staged for it
+    /// (see [`crate::sdk_root`]).
     rocm_root: Option<PathBuf>,
+    /// The managed SDK, when `rocm_root` is a root Lemonade's own probe accepts,
+    /// so it can reuse the SDK instead of downloading a ROCm runtime of its own.
+    pub(crate) offered_sdk: Option<OfferedSdk>,
+    /// Why the managed SDK could not be offered, when it could not: the install
+    /// notice says so. `rocm_root` is then the SDK's own root.
+    pub(crate) offer_failure: Option<String>,
     pub(crate) path_entries: Vec<PathBuf>,
     pub(crate) library_entries: Vec<PathBuf>,
     pub(crate) gpu_indices: Vec<u32>,
@@ -177,16 +191,8 @@ fn spawn_lemond_unchecked(
 ) -> Result<LemondChild> {
     #[cfg(windows)]
     if let Some(log_path) = log_path {
-        let args = vec![
-            child_process_path(&manifest.runtime_dir),
-            "--host".to_owned(),
-            host.to_owned(),
-            "--port".to_owned(),
-            port.to_string(),
-        ];
-        let pid = rocm_core::spawn_hidden_console_with_log(&manifest.lemond, &args, &[], log_path)
-            .with_context(|| format!("failed to start {}", manifest.lemond.display()))?;
-        return Ok(LemondChild::Pid(pid));
+        let (args, vars) = windows_logged_start(manifest, host, port, process_env, parent)?;
+        return spawn_lemond_logged(&manifest.lemond, &args, &vars, log_path);
     }
 
     let mut command = ProcessCommand::new(&manifest.lemond);
@@ -214,6 +220,62 @@ fn spawn_lemond_unchecked(
         .spawn()
         .with_context(|| format!("failed to start {}", manifest.lemond.display()))
         .map(LemondChild::Child)
+}
+
+/// The arguments and the environment a Windows `lemond` start that logs its
+/// output runs with. The environment is the one the other start applies:
+/// `ROCM_PATH` and the SDK's directories on `PATH` are how `lemond` finds the
+/// managed SDK, `HIP_VISIBLE_DEVICES` pins the GPUs, and `LEMONADE_API_KEY` is how
+/// it is told to require a key.
+#[cfg(any(windows, test))]
+fn windows_logged_start(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<(Vec<String>, EnvironmentVars)> {
+    let args = vec![
+        child_process_path(&manifest.runtime_dir),
+        "--host".to_owned(),
+        host.to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+    ];
+    let vars = lemonade_process_environment_vars(process_env, parent)?;
+    Ok((args, vars))
+}
+
+/// The variables in the form the Windows spawn helpers take them: a name and a
+/// value that is a path only in being an `OsStr`. The helper builds the
+/// child's environment block from the parent's plus these, replacing a variable
+/// of the same name whatever its case.
+#[cfg(any(windows, test))]
+fn windows_env_overrides<'a>(
+    vars: &'a [(&'static str, OsString)],
+) -> Vec<(&'static str, &'a Path)> {
+    vars.iter()
+        .map(|(name, value)| (*name, Path::new(value)))
+        .collect()
+}
+
+/// Start `program` on Windows with its output going to `log_path` and `vars`
+/// in its environment.
+#[cfg(windows)]
+fn spawn_lemond_logged(
+    program: &Path,
+    args: &[String],
+    vars: &[(&'static str, OsString)],
+    log_path: &Path,
+) -> Result<LemondChild> {
+    let pid = rocm_core::spawn_hidden_console_with_log(
+        program,
+        args,
+        &windows_env_overrides(vars),
+        log_path,
+    )
+    .with_context(|| format!("failed to start {}", program.display()))?;
+    Ok(LemondChild::Pid(pid))
 }
 
 /// Open the service log in append mode, starting it over first for
@@ -353,12 +415,52 @@ pub(crate) fn lemonade_process_environment() -> Result<LemonadeProcessEnvironmen
     let Some(env) = active_managed_therock_environment(&paths, &config)? else {
         return Ok(LemonadeProcessEnvironment::default());
     };
-    Ok(LemonadeProcessEnvironment {
-        rocm_root: env.rocm_root,
+    Ok(process_environment_for(
+        &crate::install::lemonade_root(&paths, None),
+        env,
+        runtime_is_windows(),
+    ))
+}
+
+/// The Lemonade process environment for the active managed runtime `env`,
+/// offering its SDK to Lemonade as the ROCm runtime to use ([`crate::sdk_root`]).
+///
+/// A root that cannot be staged is not an error: `ROCM_PATH` is then the SDK's own
+/// root, which is what it was before the SDK was offered, and the reason is kept in
+/// `offer_failure` for the install notice. Printing it here would repeat it for
+/// every environment built, and would claim a download in places (a server start)
+/// where none follows.
+fn process_environment_for(
+    lemonade_root: &Path,
+    env: ManagedRuntimeEnvironment,
+    windows: bool,
+) -> LemonadeProcessEnvironment {
+    let mut offer_failure = None;
+    let (rocm_root, offered_sdk) = match env.rocm_root {
+        None => (None, None),
+        Some(sdk_root) => {
+            match crate::sdk_root::offer_sdk(
+                lemonade_root,
+                &sdk_root,
+                &env.library_entries,
+                windows,
+            ) {
+                Ok(offer) => (Some(offer.rocm_root), offer.offered),
+                Err(error) => {
+                    offer_failure = Some(format!("{error:#}"));
+                    (Some(sdk_root), None)
+                }
+            }
+        }
+    };
+    LemonadeProcessEnvironment {
+        rocm_root,
+        offered_sdk,
+        offer_failure,
         path_entries: env.path_entries,
         library_entries: env.library_entries,
         gpu_indices: Vec::new(),
-    })
+    }
 }
 
 /// Apply the Lemonade process environment to `command`, with the parent runtime
@@ -1116,6 +1218,241 @@ mod tests {
             marker.exists(),
             "the disabled check still kept lemond from starting"
         );
+    }
+
+    /// The Windows spawn helper takes the variables as a separate argument, and
+    /// the start that logs `lemond`'s output was passing it none. This is the
+    /// conversion of the variable set into that argument: every variable, with
+    /// its value, in order. The start itself is covered by
+    /// `a_logged_windows_start_is_given_the_lemonade_environment` (the arguments
+    /// and variables it passes, Linux) and the Windows-only
+    /// `a_logged_lemond_start_on_windows_receives_the_lemonade_environment` (the
+    /// spawn). The one line that hands the first to the second, in
+    /// `spawn_lemond_unchecked`, compiles only on Windows and has no test of its own.
+    #[test]
+    fn every_variable_becomes_a_windows_override_with_its_value() {
+        let vars = vec![
+            ("ROCM_PATH", OsString::from(r"C:\sdk\_rocm_sdk_core")),
+            ("PATH", OsString::from(r"C:\sdk\bin;C:\Windows")),
+            ("LEMONADE_API_KEY", OsString::from("secret")),
+        ];
+        let overrides = windows_env_overrides(&vars);
+        assert_eq!(
+            overrides,
+            [
+                ("ROCM_PATH", Path::new(r"C:\sdk\_rocm_sdk_core")),
+                ("PATH", Path::new(r"C:\sdk\bin;C:\Windows")),
+                ("LEMONADE_API_KEY", Path::new("secret")),
+            ]
+        );
+        assert!(windows_env_overrides(&[]).is_empty());
+    }
+
+    /// The real Windows spawn, with the real helper: a child started with a log
+    /// sees the variables it was given, replacing the parent's of the same name.
+    /// The variables are the ones `windows_logged_start` builds, which is what
+    /// `spawn_lemond_unchecked` passes. The SDK's directory is a real one,
+    /// because the `PATH` the variables carry keeps only entries that exist. Runs
+    /// on the Windows CI job, the only place this code is compiled.
+    #[cfg(windows)]
+    #[test]
+    fn a_logged_lemond_start_on_windows_receives_the_lemonade_environment() {
+        let dir = crate::test_support::scratch_dir("lemond-logged-env");
+        let script = dir.join("emit.bat");
+        // A .bat run through cmd with one path argument, as rocm-core's own
+        // Windows log test does: `CreateProcessW` cannot run a .bat directly.
+        fs::write(
+            &script,
+            "@echo off\r\necho rocm_path=%ROCM_PATH%\r\necho path=%PATH%\r\n",
+        )
+        .unwrap();
+        let log = dir.join("lemond.log");
+        let sdk_bin = dir.join("sdk-bin");
+        fs::create_dir_all(&sdk_bin).unwrap();
+        let env = LemonadeProcessEnvironment {
+            rocm_root: Some(PathBuf::from(r"C:\sdk\_rocm_sdk_core")),
+            path_entries: vec![sdk_bin.clone()],
+            ..LemonadeProcessEnvironment::default()
+        };
+        let (_, vars) = windows_logged_start(
+            &test_manifest(),
+            "127.0.0.1",
+            8000,
+            &env,
+            &ParentRuntimeEnvironment::current(),
+        )
+        .unwrap();
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        let mut child = spawn_lemond_logged(
+            Path::new(&comspec),
+            &["/c".to_owned(), script.to_string_lossy().into_owned()],
+            &vars,
+            &log,
+        )
+        .unwrap();
+        let status = child.wait().unwrap();
+        let output = fs::read_to_string(&log).unwrap();
+        fs::remove_dir_all(&dir).ok();
+        assert!(status.success(), "{status}: {output}");
+        assert!(
+            output.contains(r"rocm_path=C:\sdk\_rocm_sdk_core"),
+            "ROCM_PATH did not reach the child:\n{output}"
+        );
+        assert!(
+            output
+                .to_lowercase()
+                .contains(&format!("path={};", sdk_bin.display()).to_lowercase()),
+            "the SDK's directory is not first on the child's PATH:\n{output}"
+        );
+    }
+
+    /// The Windows start that logs `lemond`'s output is given the arguments of
+    /// the server and the whole Lemonade environment: `ROCM_PATH`, the SDK's
+    /// `PATH` entries, the GPU pinning. It was given none of the variables.
+    /// Runs where a confined parent environment exists (Linux); the Windows-only
+    /// spawn test below builds the same variables on its own gate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_logged_windows_start_is_given_the_lemonade_environment() {
+        let dir = crate::test_support::scratch_dir("windows-logged-start");
+        let sdk_bin = dir.join("bin");
+        fs::create_dir_all(&sdk_bin).unwrap();
+        let env = LemonadeProcessEnvironment {
+            rocm_root: Some(dir.join("_rocm_sdk_core")),
+            path_entries: vec![sdk_bin.clone()],
+            gpu_indices: vec![1],
+            ..LemonadeProcessEnvironment::default()
+        };
+        let parent = ParentRuntimeEnvironment::rooted_at(&dir);
+        let (args, vars) =
+            windows_logged_start(&test_manifest(), "127.0.0.1", 8123, &env, &parent).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(args, ["rt", "--host", "127.0.0.1", "--port", "8123"]);
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            var("ROCM_PATH").as_deref(),
+            Some(&*dir.join("_rocm_sdk_core").to_string_lossy())
+        );
+        assert!(
+            var("PATH").is_some_and(|path| path.starts_with(&*sdk_bin.to_string_lossy())),
+            "{vars:?}"
+        );
+        assert_eq!(var("HIP_VISIBLE_DEVICES").as_deref(), Some("1"));
+    }
+
+    #[cfg(unix)]
+    fn managed_environment(
+        rocm_root: &Path,
+        library_entries: Vec<PathBuf>,
+    ) -> ManagedRuntimeEnvironment {
+        ManagedRuntimeEnvironment {
+            rocm_root: Some(rocm_root.to_path_buf()),
+            path_entries: vec![rocm_root.join("bin")],
+            library_entries,
+        }
+    }
+
+    /// With a Linux wheel-layout SDK active, `ROCM_PATH` is the root staged for
+    /// it, and that is what Lemonade is told: the environment variables carry
+    /// the staged root, the loader path still carries the SDK's libraries, and
+    /// the SDK is recorded as offered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rocm_path_is_the_root_staged_for_the_active_sdk() {
+        let dir = crate::test_support::scratch_dir("process-env-staged");
+        let sdk = dir.join("_rocm_sdk_core");
+        fs::create_dir_all(sdk.join("lib")).unwrap();
+        fs::create_dir_all(sdk.join(".info")).unwrap();
+        fs::write(sdk.join("lib").join("libamdhip64.so.7"), b"hip").unwrap();
+        fs::write(sdk.join(".info").join("version"), "10.1.0\n").unwrap();
+        let lemonade_root = dir.join("lemonade");
+
+        let env = process_environment_for(
+            &lemonade_root,
+            managed_environment(&sdk, vec![sdk.join("lib")]),
+            false,
+        );
+        let staged = env.rocm_root.clone().expect("a ROCm root is set");
+        assert!(
+            staged.starts_with(lemonade_root.join("sdk-root")),
+            "{staged:?}"
+        );
+        assert_eq!(
+            env.offered_sdk,
+            Some(OfferedSdk {
+                version: Some("10.1.0".to_owned())
+            })
+        );
+
+        let parent = ParentRuntimeEnvironment::rooted_at(&dir);
+        let vars = lemonade_process_environment_vars(&env, &parent).unwrap();
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(var("ROCM_PATH"), Some(staged.into_os_string()));
+        let loader_path =
+            var("LD_LIBRARY_PATH").expect("the SDK's libraries are on the loader path");
+        assert!(
+            loader_path
+                .to_string_lossy()
+                .starts_with(&*sdk.join("lib").to_string_lossy()),
+            "{loader_path:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A root that cannot be staged falls back to the SDK's own, which is what
+    /// `ROCM_PATH` was before the SDK was offered, and the SDK is not recorded
+    /// as offered: the install notice must not claim a reuse that will not
+    /// happen.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_staged_leaves_rocm_path_at_the_sdk() {
+        let dir = crate::test_support::scratch_dir("process-env-unstaged");
+        let sdk = dir.join("_rocm_sdk_core");
+        fs::create_dir_all(sdk.join("lib")).unwrap();
+        fs::write(sdk.join("lib").join("libamdhip64.so.7"), b"hip").unwrap();
+        // The folder that would hold the staged root is a file.
+        let lemonade_root = dir.join("lemonade");
+        fs::write(&lemonade_root, b"not a folder").unwrap();
+        fs::create_dir_all(sdk.join(".info")).unwrap();
+        fs::write(sdk.join(".info").join("version"), "10.1.0\n").unwrap();
+
+        let env = process_environment_for(&lemonade_root, managed_environment(&sdk, vec![]), false);
+        assert_eq!(env.rocm_root, Some(sdk));
+        assert_eq!(env.offered_sdk, None);
+        // The reason is kept for the install notice, which prints it (see
+        // `the_notice_says_when_the_active_sdk_could_not_be_offered` in
+        // `footprint.rs`); nothing is printed here, where it would repeat for
+        // every environment built.
+        assert!(
+            env.offer_failure
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{:?}",
+            env.offer_failure
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No managed runtime means no `ROCM_PATH` and nothing offered.
+    #[test]
+    fn no_managed_runtime_offers_nothing() {
+        let env = process_environment_for(
+            Path::new("unused"),
+            ManagedRuntimeEnvironment::default(),
+            false,
+        );
+        assert_eq!(env.rocm_root, None);
+        assert_eq!(env.offered_sdk, None);
     }
 
     /// Build the real backend-install command for a console state and report

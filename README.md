@@ -1391,7 +1391,9 @@ followed. The two archive rows the report prints are tagged
 The report also lists `Engine installs`: each Lemonade copy on disk and its
 size. Lemonade installs into the active ROCm runtime's own folder when one is
 active and into the data folder otherwise, so a machine that installed
-Lemonade before its first SDK can hold two full copies (about 25 GiB each).
+Lemonade before its first SDK can hold two full copies (about 25 GiB each when
+Lemonade downloaded a ROCm runtime of its own; see
+[Inference engines](#inference-engines)).
 
 The copy Lemonade runs from is `in use`. A copy it is not using right now is
 marked `not used right now`, which is not a promise it stays unused. Because
@@ -1449,13 +1451,32 @@ record, so it tries the alignment again sooner. See
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns all of this off.
 
+Lemonade's ROCm backend also needs a ROCm runtime, and unless it is given one
+it downloads its own: several gigabytes, separate from the managed SDK. ROCm
+CLI offers it the active SDK instead, through `ROCM_PATH`, and Lemonade uses
+the SDK when its `major.minor` ROCm version matches the one the backend is
+built for (the pin above, which ROCm CLI sets to the SDK's version where it
+can). Then only the llama.cpp backend is downloaded; on a Linux gfx1151 host
+the whole Lemonade tree measured 1.4 GB, not the 25 GiB of one that carries its
+own ROCm runtime. On Linux the SDK's wheel layout has no
+unversioned `libamdhip64.so`, which is what Lemonade looks for, so ROCm CLI
+stages a small root of its own in `<data>/engines/lemonade/sdk-root` whose
+`lib/libamdhip64.so` links to the SDK's HIP library and whose `.info/version`
+copies the SDK's version; the libraries llama.cpp loads still come from the
+SDK. An SDK whose version differs, for example one newer than any Lemonade
+llama.cpp ROCm build, is not reused: Lemonade downloads its own ROCm runtime
+as it always did, and `rocm storage report` lists it with the rest of the
+Lemonade tree. The install notice below says whether the SDK is offered.
+
 Before Lemonade writes a new install, whether from
 `rocm engines install lemonade` or the first `rocm serve` that needs it, it
 prints:
 
 - The folder it is installing into
 - The download (up to about 4.4 GiB) and disk use (up to about 25 GiB) of its
-  llama.cpp ROCm backend
+  llama.cpp ROCm backend with a ROCm runtime of its own
+- Whether the active ROCm SDK is offered to Lemonade as its ROCm runtime, and
+  that the sizes above do not apply when Lemonade uses it
 - Any Lemonade install it is not reusing
 
 The backend figures are upper bounds: Lemonade picks the backend after the

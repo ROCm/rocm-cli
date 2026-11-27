@@ -624,6 +624,30 @@ folder run `rocm engines install lemonade --yes`. Expected result:
   carries on: Lemonade picks the backend after this point and a smaller one may
   fit. (Stop it before the download if you do not want one.)
 
+To check that Lemonade uses the active ROCm SDK instead of downloading a ROCm
+runtime of its own (a GPU host where Lemonade selects `llamacpp:rocm`, with a
+release SDK active that Lemonade's backend is built for, such as 10.1.x against
+the pin in `resources/backend_versions.json`), run
+`rocm engines install lemonade --yes` in a fresh data folder. Expected result:
+
+- The install notice has a line `The active ROCm SDK (<version>) is offered to
+  Lemonade as its ROCm runtime.`
+- Lemonade's backend install shows `[1/1]` with the llama.cpp archive only, no
+  `[2/2]` ROCm runtime step, and `<runtime>/bin` holds `llamacpp` and no
+  `therock` or `therock-wheels` folder.
+- On Linux, `<data>/engines/lemonade/sdk-root/<name>/lib/libamdhip64.so` links to
+  the SDK's `libamdhip64.so.<N>`, and `.info/version` holds the SDK's version.
+- `rocm serve Qwen3-0.6B-GGUF --engine lemonade --managed` is ready on
+  the GPU, and `/proc/<llama-server pid>/maps` (Linux) names
+  `libamdhip64`, `libhipblas` and `librocblas` from the SDK, not from the
+  Lemonade tree. `Qwen3.5-0.8B-GGUF` serves through the router route the same way.
+- With an SDK of another `major.minor` version (for example 10.2.0 against a 10.1
+  pin that cannot be aligned), the notice says the same, but the backend install
+  shows a `[2/2] ROCm runtime` step: Lemonade downloaded its own.
+- On Windows, the same install shows `[1/1]`, and `lemond` was started with
+  `ROCM_PATH` set to the SDK's `_rocm_sdk_core` folder (the Environment tab of
+  Process Explorer's properties for `lemond.exe`).
+
 To check the refusal of a Linux or WSL host too old for the pinned Lemonade
 server (no download needed): the pinned build needs glibc 2.38 and OpenSSL 3
 (`libssl.so.3`). On a real older host, such as Ubuntu 22.04 (glibc 2.35) or

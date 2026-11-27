@@ -264,7 +264,53 @@ ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT=1 rocm engines install lemonade --ye
 
 Use it if you have hand-edited `backend_versions.json` to pin a specific
 version, matching that file's own documented use as a first-party
-customization point.
+customization point. It does not change whether the SDK is offered to Lemonade
+(next section); with the pin left where it is, the SDK is reused only when its
+version matches that pin.
+
+## Lemonade and the active ROCm SDK
+
+Lemonade's `llamacpp:rocm` backend install downloads a ROCm runtime of its own
+(TheRock wheels, or a tarball where Python is not usable) unless
+`BackendUtils::resolve_rocm_root` finds a ROCm root it accepts. It reads
+`ROCM_PATH` first, takes a root with a HIP runtime library in it, and then
+`has_matching_system_rocm_runtime` accepts that root when the root's version
+file (`.info/version`, `share/rocm/version` or `version`) names the same
+`major.minor` as `backend_versions.json`'s `therock.version`, or when the root
+has no version file. The engine sets `ROCM_PATH` for every process it starts
+for Lemonade (`lemonade_process_environment_vars` in
+[process.rs](../engines/lemonade/src/process.rs)) and the alignment above sets
+the pin to the SDK's version, so the managed SDK is reused whenever the two
+versions match. [sdk_root.rs](../engines/lemonade/src/sdk_root.rs) covers the
+one part of the probe the SDK does not meet:
+
+- On Windows the SDK root's `bin` holds `amdhip64_7.dll`, which the probe
+  accepts, so `ROCM_PATH` is the SDK root itself.
+- On Linux the probe wants an unversioned `libamdhip64.so` in `lib` or `lib64`
+  and the wheel layout has only `libamdhip64.so.7`. The engine stages
+  `<data>/engines/lemonade/sdk-root/<digest of the SDK root>/` with
+  `lib/libamdhip64.so` linking to the SDK's library and `.info/version` copied
+  from the SDK, and sets `ROCM_PATH` to it. Nothing else is read from that
+  folder: the libraries llama.cpp loads come from the SDK through the loader
+  paths the engine sets (`LD_LIBRARY_PATH` on Linux, `PATH` on Windows).
+- An SDK with no readable version file is not staged, because a root with none
+  is accepted for any version. An SDK for which no root can be staged, or
+  staging fails, leaves `ROCM_PATH` at the SDK root and Lemonade downloads its
+  own runtime, as it did before.
+
+A different `major.minor` is not reused: Lemonade downloads its own runtime
+(measured on Linux with a 10.2.0 SDK against the 10.1 pin when the alignment
+could not find a 10.2 llama.cpp build). Only the SDK's own `_rocm_sdk_core`
+version file is read for the comparison, so a nightly SDK whose build string
+carries a date suffix compares by what that file records (`10.1.0` for
+`10.1.0a20260822`).
+
+Since the check is Lemonade's, the engine does not duplicate it: the install
+notice says the SDK is offered and what happens when its version does not
+match, and Lemonade's own `[1/1]` or `[2/2]` progress shows which happened.
+On Windows the SDK's `amdhip64_7.dll` and `amd_comgr_3.dll` are not copied next
+to Lemonade's server as Lemonade does for its own runtime, so the driver's
+copies in `System32` load; the other libraries come from the SDK.
 
 ## Pinned runtime versions
 

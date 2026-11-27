@@ -414,6 +414,122 @@ fn record_install_at(world: &E2eWorld, runtime_dir: &std::path::Path) {
     .expect("failed to write install record");
 }
 
+/// The version the planted SDK records, as an SDK's own version file does.
+const SDK_VERSION: &str = "10.1.0";
+
+/// Plant a managed ROCm SDK in the layout a Linux wheel install has: the HIP
+/// runtime under its versioned name only, so Lemonade's probe (which looks for
+/// `libamdhip64.so`) does not accept it as it is.
+fn plant_linux_wheel_sdk(world: &E2eWorld, version_file: bool) {
+    plant_runtime(world, false);
+    let root = runtime_install_root(world);
+    std::fs::create_dir_all(root.join("lib")).expect("failed to create the SDK's lib");
+    std::fs::write(root.join("lib").join("libamdhip64.so.7"), b"hip")
+        .expect("failed to write the HIP library");
+    if version_file {
+        std::fs::create_dir_all(root.join(".info")).expect("failed to create .info");
+        std::fs::write(
+            root.join(".info").join("version"),
+            format!("{SDK_VERSION}\n"),
+        )
+        .expect("failed to write the SDK's version");
+    }
+    // The registry entry of an SDK that imports: the engine only takes a runtime
+    // whose probe recorded that it did, and reads the SDK's root from it.
+    let registry_entry = data_dir(world)
+        .join("runtimes")
+        .join("registry")
+        .join(format!("{RUNTIME_KEY}.json"));
+    let mut entry: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&registry_entry).expect("failed to read the registry entry"),
+    )
+    .expect("failed to parse the registry entry");
+    entry["rocm_sdk"] = serde_json::json!({
+        "import_ok": true,
+        "rocm_sdk_version": SDK_VERSION,
+        "root_path": root,
+        "library_paths": [root.join("lib")],
+    });
+    std::fs::write(
+        &registry_entry,
+        serde_json::to_string_pretty(&entry).expect("failed to serialize the registry entry"),
+    )
+    .expect("failed to write the registry entry");
+}
+
+#[given("a ROCm SDK is active that has the Linux wheel layout and a version file")]
+async fn plant_active_sdk_with_version(world: &mut E2eWorld) {
+    plant_linux_wheel_sdk(world, true);
+}
+
+#[given("a ROCm SDK is active that has the Linux wheel layout and no version file")]
+async fn plant_active_sdk_without_version(world: &mut E2eWorld) {
+    plant_linux_wheel_sdk(world, false);
+}
+
+/// The roots staged for Lemonade: the folders under `<data>/engines/lemonade/sdk-root`.
+fn staged_roots(world: &E2eWorld) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(data_folder_tree(world).join("sdk-root")) else {
+        return Vec::new();
+    };
+    entries.flatten().map(|entry| entry.path()).collect()
+}
+
+#[then("the user is told the active ROCm SDK is offered to Lemonade as its ROCm runtime")]
+async fn assert_sdk_offered_notice(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    let expected =
+        format!("The active ROCm SDK ({SDK_VERSION}) is offered to Lemonade as its ROCm runtime.");
+    assert!(
+        output.contains(&expected),
+        "missing `{expected}` (without the `rocm/e2e-test-hooks` build the install \
+         is a real one):\n{output}"
+    );
+}
+
+#[then("the root staged for that SDK links to the SDK's HIP library and carries its version")]
+async fn assert_staged_root(world: &mut E2eWorld) {
+    let roots = staged_roots(world);
+    assert_eq!(roots.len(), 1, "one staged root expected: {roots:?}");
+    let root = &roots[0];
+    // The two things Lemonade's probe and version check read, nothing else.
+    assert_eq!(
+        std::fs::read_link(root.join("lib").join("libamdhip64.so"))
+            .expect("lib/libamdhip64.so is not a link"),
+        runtime_install_root(world)
+            .join("lib")
+            .join("libamdhip64.so.7")
+    );
+    assert!(
+        root.join("lib").join("libamdhip64.so").exists(),
+        "the link must resolve to the SDK's library"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".info").join("version"))
+            .expect("the staged root has no version file"),
+        format!("{SDK_VERSION}\n")
+    );
+}
+
+#[then("the user is not told an ROCm SDK is offered to Lemonade and no root is staged")]
+async fn assert_sdk_not_offered(world: &mut E2eWorld) {
+    let output = combined_output(world);
+    assert!(
+        output.contains("Installing Lemonade"),
+        "no install notice (see the other scenarios' note on the \
+         `rocm/e2e-test-hooks` build):\n{output}"
+    );
+    assert!(
+        !output.contains("is offered to Lemonade"),
+        "the SDK is claimed as offered though no root was staged for it:\n{output}"
+    );
+    assert!(
+        staged_roots(world).is_empty(),
+        "a root was staged for an SDK with no readable version: {:?}",
+        staged_roots(world)
+    );
+}
+
 #[given("Lemonade was installed in the data folder and again inside a ROCm install")]
 async fn plant_two_lemonade_installs(world: &mut E2eWorld) {
     plant_runtime(world, false);
