@@ -892,6 +892,11 @@ request are decided together by `mi300x-gate.sh`, see above); on a
 `continue-on-error: true` lane that is the only red signal for such a failure.
 The nightly report job applies the same check to every nightly lane.
 
+Because no lane blocks the queue, re-running one in the merge queue is never
+needed to land a pull request. `cargo xtask gpu-rerun-rate` counts how often it
+happens anyway, as a share of merge-queue entries against a 5% target; see
+[GPU-lane re-runs in the merge queue](testing.md#gpu-lane-re-runs-in-the-merge-queue).
+
 A lane the harness failed after its run (no scenario executed, or no GPU
 scenario, `@requires-gpu` or `@requires-multi-gpu`, on an `E2E_EXPECT_GPU=1`
 lane) records the reason in its `platform.json`, and its row reads FAIL with the reason under "Needs
