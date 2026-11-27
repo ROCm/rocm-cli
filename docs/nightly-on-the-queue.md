@@ -81,7 +81,7 @@ has the same gfx942 target as the MI300X), the
 minutes to be started and runs at most 75, and a limited number of such runs
 at once (the queue side sets the limit). A pull request's run goes at any hour,
 the nightly's included: the nightly's MI325X lane is one GPU, held for about
-half an hour on the nights checked, and the queue has many more MI325X GPUs. The queue side does not
+half an hour on the night checked, and the queue has many more MI325X GPUs. The queue side does not
 take a run when too many are going, or when it has no healthy MI325X worker: the
 gate job then fails with the reason the queue gave, which is capacity, not a
 failing test (the consolidated report's gfx942 check,
