@@ -2433,7 +2433,7 @@ server is running, lists each ready server by the name `--model` accepts and
 prints the `rocm chat --provider local --model <name>` command that uses it;
 with `--tools` that command leaves `--tools` out, because ROCm tools work only
 with the built-in assistant. A `--model` that no ready server serves gets the
-same list. When nothing can answer the prompt, nothing is sent and the exit code
+same list. When nothing can answer the prompt, the prompt is not sent and the exit code
 is non-zero. With no server at all the error on stderr says "No local assistant
 is running yet." and how to start one. With `--tools`, a read-only status
 question can still be answered from the CLI's own checks and exits 0.

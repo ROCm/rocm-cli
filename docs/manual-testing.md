@@ -2965,7 +2965,7 @@ sure the built-in assistant (`Qwen3-4B-Instruct-2507-GGUF`) is not running.
 
 ```bash
 rocm chat --provider local --prompt "What is 17*23?"; echo "exit=$?"
-rocm chat --tools --provider local --prompt "Set up ROCm"; echo "exit=$?"
+rocm chat --tools --provider local --prompt "What is 17*23?"; echo "exit=$?"
 rocm chat --provider local --model nobody/serves-this --prompt "Hello"; echo "exit=$?"
 ```
 

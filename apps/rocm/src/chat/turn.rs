@@ -826,7 +826,7 @@ fn local_chat_other_service_text(
         );
     }
     let _ = writeln!(output);
-    let _ = writeln!(output, "Nothing was sent and nothing was changed.");
+    let _ = writeln!(output, "Your prompt was not sent.");
     output.trim_end().to_owned()
 }
 
@@ -1794,7 +1794,7 @@ install therock";
             "{text}"
         );
         assert!(!text.contains("--tools"), "{text}");
-        assert!(text.contains("Nothing was sent"), "{text}");
+        assert!(text.contains("Your prompt was not sent."), "{text}");
 
         let with_tools = local_chat_other_service_text(&ready[..1], None, "status", true);
         assert!(with_tools.contains("--tools is left out"), "{with_tools}");
