@@ -4,8 +4,9 @@
 # Dispatched by a pull request's gate job in e2e-selfhosted.yml, on main, with the
 # branch to test. It is queue-run.yml with the pull request preset: the queue side
 # runs one GPU model on the release channel, with a shorter wait and run time than
-# the nightly, a limited number at once (the queue side sets the limit), and it
-# does not take one while the nightly goes (it refuses, and this job then fails with that reason in refused.txt).
+# the nightly, and a limited number at once (the queue side sets the limit). A run
+# the queue side does not take is refused, whatever the hour, and this job then fails with
+# that reason in refused.txt.
 # Like queue-run.yml it needs no credential and no permission, and the runner
 # runs only the allow-listed workflows as they are on main; that is enforced on
 # the runner, outside this repository.
@@ -44,13 +45,13 @@ jobs:
   run:
     name: Run and publish
     runs-on: [queue-report]
-    # A lane waits at most 45 min to be started, then runs for at most 75 min
+    # A lane waits at most 100 min to be started, then runs for at most 75 min
     # counted from its start. Following the run to its end and finishing it can
     # take 75 min more, and a start held behind another job's finish is asked
-    # again for about 70 min more, so the publish command gives up after 266 min
+    # again for about 70 min more, so the publish command gives up after 321 min
     # at the latest (docs/nightly-on-the-queue.md has the sum). 20 min are margin
-    # for the runner's own delays and the upload: 286 min.
-    timeout-minutes: 286
+    # for the runner's own delays and the upload: 341 min.
+    timeout-minutes: 341
     steps:
       # Anyone who can dispatch names the branch, not only the gate job, so it is
       # checked here, on main, and not only in the gate: a plain branch name that

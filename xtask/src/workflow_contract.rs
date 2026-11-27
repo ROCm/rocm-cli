@@ -3287,8 +3287,8 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
             "a missing report fails whatever the needs result:\n{log}"
         );
 
-        // A gate that skipped itself for the nightly window ends green with no
-        // report, and is not missing; the same lane without that output is.
+        // A gate that skipped itself on purpose (the queue side is switched off)
+        // ends green with no report, and is not missing; the same lane without that output is.
         let mut self_skipped = all("success");
         self_skipped[victim_at].1 = "success+skipped";
         let (code, log, _) = run_report_check(&step, &self_skipped, Some(&without_victim));
@@ -13723,13 +13723,13 @@ permissions:
             gate.contains("gh workflow run queue-pr-run.yml --ref main -f \"branch=${HEAD_REF}\""),
             "the gate must dispatch queue-pr-run.yml on main with the PR's branch"
         );
-        // The nightly window is a skip, not a failure: only that refusal ends
-        // green, and it says so in an output the report check reads.
+        // No refusal is a skip: a lane the queue did not take, the nightly's hour
+        // included, ends red with the queue's reason. The two skips that remain
+        // (the switch is off, the branch adds the workflow) are the gate's own,
+        // before any dispatch, and say so in an output the report check reads.
         assert!(
-            gate.contains("== nightly:* ]]")
-                && gate.contains("skipped=true")
-                && gate.contains("Re-run this job once the window has passed"),
-            "a nightly-window refusal must end the gate green with a skip note"
+            !gate.contains("nightly:") && !gate.contains("window"),
+            "the gate must not treat any refusal reason, the nightly's included, as a skip"
         );
         assert!(
             gate.contains("outputs:\n      skipped: ${{ steps.queue.outputs.skipped }}"),
@@ -13793,12 +13793,10 @@ permissions:
     }
 
     /// The queue side's half of the gate's contract, as the gate reads it: the
-    /// first line of `refused.txt` starts with this when the queue refused for
-    /// the nightly's window, and the MI325X lane's release report sits at this
-    /// path of the `queue-pr-run-results` artifact. The queue side is not in this
-    /// repository: these are the gate's half, shared by the script check, the
+    /// MI325X lane's release report sits at this path of the
+    /// `queue-pr-run-results` artifact. The queue side is not in this
+    /// repository: this is the gate's half, shared by the script check, the
     /// mock runs and the doc check below so none can drift alone.
-    const QUEUE_NIGHTLY_REFUSAL: &str = "nightly:";
     const QUEUE_REPORT_PATH: &str = "mi325x/release/results/report.json";
     /// The lane the queue side ran pull requests on before it moved to mi325x: the
     /// gate still reads it, so either order of the two deployments works. Only the
@@ -14179,26 +14177,32 @@ esac
 
     #[test]
     #[cfg(unix)]
-    fn queue_gate_script_skips_only_for_the_nightly_window() {
+    fn queue_gate_script_fails_on_every_refusal_the_nightly_included() {
         if !jq_available() {
             return;
         }
-        let nightly = format!("{QUEUE_NIGHTLY_REFUSAL} the nightly's GPUs are reserved\n");
-        let window = run_gate_script(&Gate {
+        // A refusal naming the nightly is red, with the queue's reason, like any
+        // other: the queue side used to refuse that way for the nightly's hours,
+        // and the gate ended green on it.
+        let nightly = run_gate_script(&Gate {
             conclusion: "failure",
-            results: Some(vec![("refused.txt", nightly.as_str())]),
+            results: Some(vec![(
+                "refused.txt",
+                "nightly: the nightly's GPUs are reserved\n",
+            )]),
             ..Gate::default()
         });
-        assert_eq!(window.code, 0, "{}", window.log);
-        assert!(window.output.contains("skipped=true"), "{}", window.output);
+        assert_eq!(nightly.code, 1, "{}", nightly.log);
+        assert!(!nightly.output.contains("skipped"), "{}", nightly.output);
         assert!(
-            window.summary.contains("window has passed"),
+            nightly
+                .summary
+                .contains("nightly: the nightly's GPUs are reserved"),
             "{}",
-            window.summary
+            nightly.summary
         );
-        assert!(window.report.is_empty());
-        // Any other refusal stays red, with the queue's reason, and is no skip.
-        // Only the first line counts: `nightly:` later in the file is not a window.
+        assert!(nightly.report.is_empty());
+        // Every other refusal reason is red too, whatever a later line says.
         let capacity = run_gate_script(&Gate {
             conclusion: "failure",
             results: Some(vec![(
@@ -14463,10 +14467,6 @@ esac
         let text = read_workflow("e2e-selfhosted.yml");
         let gate = without_comments(job_block(&text, "e2e-gpu-queue"));
         assert!(
-            gate.contains(&format!("== {QUEUE_NIGHTLY_REFUSAL}*")),
-            "the gate must read the nightly refusal by its `{QUEUE_NIGHTLY_REFUSAL}` prefix"
-        );
-        assert!(
             gate.contains("queue-results/refused.txt")
                 && gate.contains(&format!(
                     "results=queue-results/{}",
@@ -14479,7 +14479,7 @@ esac
                 .join("../docs/nightly-on-the-queue.md"),
         )
         .expect("read docs/nightly-on-the-queue.md");
-        for needle in [QUEUE_NIGHTLY_REFUSAL, QUEUE_REPORT_PATH, "refused.txt"] {
+        for needle in [QUEUE_REPORT_PATH, "refused.txt"] {
             assert!(
                 doc.contains(needle),
                 "docs/nightly-on-the-queue.md must state the queue contract: `{needle}`"
@@ -15048,7 +15048,7 @@ esac
         let (nightly_wait, nightly_run) = queue_run_limits(&flat);
         for (file, wait_secs, run_secs) in [
             ("queue-run.yml", nightly_wait, nightly_run),
-            ("queue-pr-run.yml", 45 * 60, 75 * 60),
+            ("queue-pr-run.yml", 100 * 60, 75 * 60),
         ] {
             let bound_secs = publish_bound_secs(wait_secs, run_secs);
             let follow_secs = publish_follow_secs(wait_secs, run_secs);
@@ -15091,8 +15091,8 @@ esac
             run_timeouts.push(timeout);
         }
         assert!(
-            flat.contains("lane that waits at most 45 minutes to be started and runs at most 75"),
-            "the doc must give a pull request's lane limits, 45 and 75 min, which the bound above uses"
+            flat.contains("lane that waits at most 100 minutes to be started and runs at most 75"),
+            "the doc must give a pull request's lane limits, 100 and 75 min, which the bound above uses"
         );
         let selfhosted = read_workflow("e2e-selfhosted.yml");
         let gate = job_timeout_minutes(job_block(&selfhosted, "e2e-gpu-queue"));
