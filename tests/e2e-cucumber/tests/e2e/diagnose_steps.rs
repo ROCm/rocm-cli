@@ -2880,7 +2880,7 @@ async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
             }
             "unified_memory_unreadable" => {
                 assert!(
-                    evidence.contains("no dedicated VRAM"),
+                    evidence.contains("shares with the operating system"),
                     "the APU reason has to name the missing dedicated-VRAM pool, or the user \
                      reads it as a fact about the model: {model:#}"
                 );
@@ -5782,7 +5782,7 @@ async fn assert_cli_settings_and_installs_unchanged(world: &mut E2eWorld) {
 
 /// `gfx_target_version` for gfx1151 (Strix Halo), in the kernel's decimal
 /// encoding: major 11, minor 5, step 1.
-const GFX1151_TARGET_VERSION: u32 = 110_501;
+pub(crate) const GFX1151_TARGET_VERSION: u32 = 110_501;
 
 /// `gfx_target_version` for gfx1100 (Radeon RX 7900 / PRO W7900), a discrete
 /// part that `gfx_is_apu_family` does not match.
@@ -5798,7 +5798,7 @@ const GFX1100_TARGET_VERSION: u32 = 110_000;
 /// too. An assertion that the carve-out is absent could then not tell the two
 /// apart. `"4.5 GiB"` can only have come from this fixture. See
 /// [`carve_out_as_rendered`].
-const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+pub(crate) const CARVE_OUT_BYTES: u64 = 4 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
 
 /// A 60 GiB aperture, in bytes: a Strix-Halo-shaped `mem_info_gtt_total`. Far
 /// enough from the carve-out that a verdict reached against the wrong one is
@@ -5826,7 +5826,7 @@ const SECOND_CARD_APERTURE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// `vram_total_bytes` is `None` for the host that reports no VRAM telemetry at
 /// all -- the Linux spelling of a Windows APU with no ROCm build, where
 /// `amd-smi` is not installed and nothing else says how much memory the GPU has.
-fn plant_single_gpu_with_memory(
+pub(crate) fn plant_single_gpu_with_memory(
     world: &mut E2eWorld,
     gfx_target_version: u32,
     vram_total_bytes: Option<u64>,
@@ -6227,8 +6227,7 @@ async fn assert_unreadable_shared_pool_claims_no_figure(world: &mut E2eWorld) {
     // `UnifiedMemoryUnreadable` branch really emits; the branch does not use
     // the "...and this host offers {}" template the old guard was written
     // against at all.
-    let said_so = "the figure for the memory pool its engine allocates from could not be read \
-                   here";
+    let said_so = "the figure for that pool could not be read here";
     assert!(
         evidence.iter().any(|line| line.contains(said_so)),
         "the report must say the pool could not be read, in its own words, or everything below \
@@ -6454,7 +6453,7 @@ async fn assert_cpu_only_recipe_is_untouched_by_the_pool(world: &mut E2eWorld) {
     assert!(
         !evidence
             .iter()
-            .any(|line| line.contains("no dedicated VRAM")),
+            .any(|line| line.contains("shares with the operating system")),
         "the report volunteered GPU evidence for a recipe whose engine allocates from system \
          memory: {model:#}"
     );
@@ -6507,9 +6506,11 @@ async fn assert_gguf_estimate_names_its_pool_as_shared(world: &mut E2eWorld) {
     // figures is told which kind of number sits beside them. Both are asserted
     // because a renderer that dropped the note would still set the flag.
     assert!(
-        notes.iter().any(|note| note
-            .contains("the ceiling on a pool it shares with the operating system")
-            && note.contains("how much is free depends on what else is running")),
+        notes
+            .iter()
+            .any(|note| note.contains(
+                "the ceiling on a pool this integrated GPU shares with the operating system"
+            ) && note.contains("how much is free depends on what else is running")),
         "a bare \"fits\" against a shared ceiling reads as \"this much memory is waiting for \
          it\", and nothing here measured how much of the pool is free, so the estimate has to \
          say so: {notes:#?}"

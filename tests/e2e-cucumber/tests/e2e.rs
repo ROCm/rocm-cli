@@ -190,6 +190,12 @@ pub struct E2eWorld {
     /// a run whose failure is already the expected outcome — see the relaunch
     /// budget in `setup_gpu_model`.
     pub expect_xfail: bool,
+    /// Which kind of GPU memory a `model_catalog.feature` Given step planted,
+    /// so the step that checks the offered rows can require the one label that
+    /// host must produce instead of accepting either. Recorded here rather than
+    /// read back from `command_env`, which the first `rocm` invocation drains.
+    /// `None` outside those scenarios.
+    pub listing_gpu_memory_kind: Option<e2e::model_catalog_steps::ListingMemoryKind>,
     /// Extra environment for this scenario's next `rocm` invocation. A Given step
     /// records a behavioral precondition here; the When step remains a plain user
     /// action and consumes the fixture without exposing its mechanism in Gherkin.
@@ -467,6 +473,7 @@ impl Default for E2eWorld {
             legacy_rocm_path: None,
             serve_timeout_override: None,
             expect_xfail: false,
+            listing_gpu_memory_kind: None,
             command_env: Vec::new(),
             command_dir: None,
             route_statuses: Vec::new(),

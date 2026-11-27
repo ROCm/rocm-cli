@@ -2824,17 +2824,26 @@ Expected result:
 
 ## 20. Curated Models Narrowed To This Machine
 
-Needs two hosts to be meaningful, **both with discrete GPUs**: one large (an
-MI300X) and one small (a 16 GiB Radeon or similar). The mock lane covers the
-logic with a forced memory figure; what it cannot do is read a real machine.
+Needs three hosts to be meaningful: a large discrete GPU (an MI300X), a small
+discrete GPU (a 16 GiB Radeon or similar), and **an APU** (a Ryzen 7 4700U, a
+Strix Halo, or any integrated part). The mock lane covers the logic against a
+planted host — a simulated APU's sysfs under `ROCM_CLI_TEST_HOST_ROOT`.
 
-An integrated GPU is deliberately *not* one of them yet. `rocm` classifies an
-APU's shared pool as unreadable rather than as a memory figure, so an APU takes
-the unmeasured branch below and its listing is **unchanged** by this check. That
-is the honest current behaviour, not an oversight: reading the pool is
-`rocmai-912` / #1054's `Unified { gtt_total_gib }`, and narrowing an APU on a
-figure nothing measured would be the invented claim this whole area exists to
-remove. Re-point this section at an APU once that lands.
+Do not read the self-hosted `e2e-gpu-strix-ubuntu` lane as covering the APU
+case. It is where these scenarios *would* run on real gfx1151 hardware, but it
+is not a required check and is skipped whenever the pool has no runner — it was
+skipped on the change that wrote this section. Even when it does run it proves
+less than it looks: the planted root answers every probe there too, so the CLI
+is reading the fixture rather than the machine under it. This section is the
+only check of the listing against an APU's *own* readings, and nothing in CI
+substitutes for it.
+
+The APU case is the one this section was waiting on. `rocm` now reads an
+integrated part's shared pool through `Unified { gtt_total_gib }` (`rocmai-912`
+/ #1054), so an APU is narrowed on that pool rather than taking the unmeasured
+branch. The pool is a ceiling the operating system draws on too, which is why
+the listing qualifies it rather than presenting it as memory set aside for the
+model.
 
 ```bash
 rocm model
@@ -2855,12 +2864,31 @@ Expected result, on the small host:
 - No row says `needs a larger GPU`: a recommendation and a refusal cannot both
   be true of the same row.
 
+Expected result, on the APU host:
+
+- The models listed are ones its shared pool can hold. On a 4700U, whose pool
+  reads around 7.7 GiB, that means the small GGUF recipes and none of the
+  17 GiB-and-larger ones.
+- The closing note names the narrowing *and* says the memory is shared:
+  `That figure is a ceiling on memory this GPU shares with the operating system,
+  not memory set aside for it: how much is free depends on what else is running.`
+- Cross-check the figure it narrowed on -- `rocm model --verbose` prints it as
+  `reason: shared GPU memory pool N GiB`, on each row that declares a minimum;
+  the recipes declaring none say so instead, and the curated listing carries no
+  number at all -- against `rocm diagnose --model <model>` on the same host. Off
+  WSL the two read the pool through the same classifier, so a disagreement is a
+  bug in one of the two call sites. On WSL they are allowed to differ, for the
+  reason `host_model_listing_facts` documents: the listing takes a gfx target as
+  evidence of a GPU, where the diagnosis asks the examination's `rocm_sees_gpu`.
+
 Expected result, on a host whose GPU memory cannot be read (no amd-smi reading,
-a GPU the CLI cannot measure, **or any APU** — see above):
+a GPU the CLI cannot measure, or an APU whose aperture is unreadable — an older
+kernel, a container, a driver that does not report it):
 
 - The list is *not* narrowed, and ends with `This machine's GPU memory could not
   be read, so these are not filtered to what it can run.` An unmeasured machine
-  must not be told its options are narrow.
+  must not be told its options are narrow — and sharing memory is not the same
+  as having a readable amount of it.
 
 Then ask the assistant the same question, which must get the same answer:
 

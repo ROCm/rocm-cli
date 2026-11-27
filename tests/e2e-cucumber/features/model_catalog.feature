@@ -73,6 +73,7 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     Then every model offered is one this machine can run
     And the user is told the offer was narrowed to this machine
+    And the user is not told anything about shared memory
 
   @id:model-catalog-says-when-nothing-fits @requires-os:linux
   Scenario: model-catalog-07 - A machine too small for any curated model is told so
@@ -101,3 +102,57 @@ Feature: Model catalog listing
     When the user asks which models are recommended
     And an assistant on the same machine asks the same question through its tools
     Then the assistant is given the same recommendations the user saw
+
+  # The machine the whole listing exists for: an integrated GPU with no memory
+  # of its own, which was offered the unfiltered catalog because the only figure
+  # it has is a pool it shares with the rest of the system. It is narrowed on
+  # that pool now -- and told what the pool is, because a ceiling the desktop
+  # also draws on is not memory set aside for the model.
+  @id:model-catalog-narrows-a-machine-whose-graphics-share-memory @requires-os:linux
+  Scenario: model-catalog-10 - A machine whose graphics share system memory is recommended models that fit it
+    Given a machine whose graphics share memory with the rest of the system, with room for only the smaller models
+    When the user asks which models are recommended
+    Then every model offered is one this machine can run
+    And the offer includes a model too large for the carve-out the adapter reports
+    And each offered row says the memory it was weighed against is shared
+    And the user is told the offer was narrowed to this machine
+    And the user is told that memory is shared with everything else running
+
+  # Sharing memory is not the same as having a readable amount of it. An
+  # integrated GPU whose pool could not be read is still a machine nobody
+  # measured, and gets the unmeasured answer rather than a narrowing.
+  @id:model-catalog-does-not-narrow-unreadable-shared-memory @requires-os:linux
+  Scenario: model-catalog-11 - A machine whose shared memory cannot be read is not narrowed
+    Given a machine whose graphics share memory with the rest of the system, and that amount cannot be read
+    When the user asks which models are recommended
+    Then the recommendations are not narrowed to this machine
+    And the user is told the list is not specific to it
+
+  # The same machine with no ROCm build for its graphics, which is how an
+  # integrated GPU usually arrives: nothing reports a VRAM figure, because there
+  # is no VRAM. The pool is still readable, so the answer is still narrowed --
+  # and it has to match what `rocm diagnose --model` says about the same host,
+  # which judges it on that pool.
+  #
+  # This machine has no carve-out to weigh against by mistake, so -10's
+  # carve-out discrimination has no subject here. What it can still be told
+  # apart from is a listing narrowed on too large a figure, or not narrowed at
+  # all -- hence the absence step, which names the models the pool cannot hold.
+  @id:model-catalog-narrows-shared-memory-with-no-vram-reading @requires-os:linux
+  Scenario: model-catalog-12 - A machine whose graphics report no memory of their own is narrowed on the shared pool
+    Given a machine whose graphics share memory with the rest of the system and report no memory of their own
+    When the user asks which models are recommended
+    Then every model offered is one this machine can run
+    And no model too large for that pool is offered
+    And each offered row says the memory it was weighed against is shared
+    And the user is told that memory is shared with everything else running
+
+  # The per-recipe detail reaches the same host, and has to describe the figure
+  # the same way: a row that calls a shared pool "VRAM" asserts memory the part
+  # does not have.
+  @id:model-catalog-detail-names-shared-memory @requires-os:linux
+  Scenario: model-catalog-13 - The per-recipe detail calls shared memory what it is
+    Given a machine whose graphics share memory with the rest of the system, with room for only the smaller models
+    When the user asks for the model catalog in verbose detail
+    Then each recipe's memory verdict names the shared pool rather than VRAM
+    And the remedy it offers is one this machine can act on

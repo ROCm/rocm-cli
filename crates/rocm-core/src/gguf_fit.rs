@@ -299,8 +299,8 @@ pub struct ContextEstimate {
     /// note in `notes` and the evidence line in [`evidence_lines`] both have to
     /// describe the same figure, and when they derived it separately they
     /// disagreed in one report -- "the GPU with the most dedicated VRAM ... has
-    /// 24576 MiB" a few lines above "this host's integrated GPU has no
-    /// dedicated VRAM".
+    /// 24576 MiB" a few lines above a note calling the same figure a shared
+    /// ceiling.
     #[serde(default)]
     pub available_is_shared_pool: bool,
     /// The largest context that fits at `kv_cache_type`: a multiple of 256, or
@@ -853,9 +853,9 @@ pub fn estimate_fit(
             ),
             AcceleratorMemory::UnifiedMemoryUnreadable => (
                 CannotEstimateReason::UnifiedMemoryUnreadable,
-                "this host has no dedicated VRAM, and the figure for the memory pool its engine \
-                 allocates from could not be read here, so there is nothing to compare the \
-                 figures against",
+                "this host's GPU allocates from a pool it shares with the operating system, \
+                 and the figure for that pool could not be read here, so there is nothing to \
+                 compare the figures against",
             ),
             // `Dedicated` and `Unified` both carry a figure, so neither reaches
             // this branch; the arm exists because the match is exhaustive.
@@ -879,8 +879,8 @@ pub fn estimate_fit(
     if memory.is_shared_pool() {
         estimate.available_is_shared_pool = true;
         estimate.notes.push(
-            "this host's integrated GPU has no dedicated VRAM: the memory compared against is \
-             the ceiling on a pool it shares with the operating system, so how much is free \
+            "the memory compared against is the ceiling on a pool this integrated GPU shares \
+             with the operating system, not memory set aside for it, so how much is free \
              depends on what else is running"
                 .to_owned(),
         );
@@ -1678,18 +1678,32 @@ mod tests {
     // The three memory states the readiness check distinguishes. In each the
     // figures the file allows are still reported, and in none is anything
     // compared.
+    //
+    // The third element is a fragment of `detail`, not only of the reason: the
+    // enum tells a caller which state this is, the detail is what a reader is
+    // shown, and the two can drift. Each fragment is chosen to be absent from
+    // the wording that site used to carry -- the unreadable-pool arm in
+    // particular said "this host has no dedicated VRAM", which is false of an
+    // integrated GPU that reports a BIOS carve-out, so a fragment shared with
+    // that sentence would let it come back unnoticed.
     #[test]
     fn memory_that_cannot_be_compared_still_reports_what_the_model_needs() {
         let (header, size) = llama(GIB_U as usize / 1024);
-        for (memory, reason) in [
-            (AcceleratorMemory::None, CannotEstimateReason::NoGpu),
+        for (memory, reason, detail_fragment) in [
+            (
+                AcceleratorMemory::None,
+                CannotEstimateReason::NoGpu,
+                "no GPU is visible to ROCm",
+            ),
             (
                 AcceleratorMemory::Unknown,
                 CannotEstimateReason::AcceleratorMemoryUnknown,
+                "the GPU memory on this host could not be read",
             ),
             (
                 AcceleratorMemory::UnifiedMemoryUnreadable,
                 CannotEstimateReason::UnifiedMemoryUnreadable,
+                "allocates from a pool it shares with the operating system",
             ),
         ] {
             let result = estimate(&header, size, 4096, KvCacheType::F16, memory);
@@ -1699,6 +1713,14 @@ mod tests {
                 "{memory:?}"
             );
             assert_eq!(result.cannot_estimate_reason, Some(reason));
+            let detail = result
+                .detail
+                .as_deref()
+                .unwrap_or_else(|| panic!("{memory:?}: nothing was said about why"));
+            assert!(
+                detail.contains(detail_fragment),
+                "{memory:?}: the detail must say {detail_fragment:?}, got {detail:?}"
+            );
             assert!(
                 result.total_gib.is_some(),
                 "{memory:?}: the need was not reported"
@@ -1736,8 +1758,8 @@ mod tests {
     /// two places, and `model_readiness` prints both in one report -- evidence
     /// bullets first, then the estimate's notes. While they derived the
     /// shared-pool fact separately, an APU got "the GPU with the most dedicated
-    /// VRAM ... has 24576 MiB" a few lines above "this host's integrated GPU
-    /// has no dedicated VRAM". Asserted as a relation between the two renderers
+    /// VRAM ... has 24576 MiB" a few lines above a note calling the same figure
+    /// a shared ceiling. Asserted as a relation between the two renderers
     /// rather than as two literal strings, so rewording either cannot quietly
     /// restore the contradiction.
     #[test]
@@ -1760,7 +1782,7 @@ mod tests {
             let evidence = evidence_lines(&estimate).join("\n");
             let says_dedicated = evidence.contains("dedicated VRAM");
             let notes = estimate.notes.join("\n");
-            let denies_dedicated = notes.contains("no dedicated VRAM");
+            let denies_dedicated = notes.contains("shares with the operating system");
             assert!(
                 !(says_dedicated && denies_dedicated),
                 "shared={shared}: one report called the same figure dedicated VRAM and not \

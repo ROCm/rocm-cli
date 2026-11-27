@@ -1660,6 +1660,14 @@ rather than printing an empty list, and where this machine's GPU memory could no
 be read the list is not narrowed at all and says it is not host-specific — an
 unmeasured machine is never told its options are narrow.
 
+An integrated GPU has no memory of its own, so the figure its list is narrowed
+against is the pool it shares with the operating system, and the closing line
+says so — how much of that pool is free depends on what else is running. A
+machine whose shared pool cannot be read counts as unmeasured and is not
+narrowed: sharing memory and having a readable amount of it are different
+things. `--verbose` names the figure the same way, as a shared pool rather than
+as VRAM.
+
 Pass `--verbose` to list every recipe, including ones hidden from the default
 list and ones too large for this machine, with details such as aliases, data
 type, minimum GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker

@@ -513,7 +513,9 @@ rocm update --json")]
     ///
     /// The default list is the curated recommendations, narrowed to the models this
     /// machine's GPU memory can hold and saying so; where that memory could not be read
-    /// it is not narrowed, and says that instead. The AMD Inference Microservices
+    /// it is not narrowed, and says that instead. On an integrated GPU the figure is the
+    /// pool it shares with the operating system, named as such rather than as VRAM, and
+    /// a shared pool that cannot be read counts as unmeasured. The AMD Inference Microservices
     /// (AIM) catalog of pre-built Docker images is not part of it: use --verbose to see
     /// every AIM image with the GPU families it supports, how many GPUs it needs, and
     /// whether it requires a Hugging Face token. Serve one with

@@ -43,6 +43,7 @@ use rocm_core::{
 use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
 
 use crate::engine_ipc::{builtin_engine_available, resolve_engine_binary_path_with_paths};
+use crate::model_fit::ListingGpuMemory;
 use crate::{PlatformRuleOut, engine_ruled_out_by_platform_with};
 
 /// The first words of every curated `rocm model` heading, whichever recipe
@@ -51,6 +52,23 @@ const MODEL_CATALOG_HEADER_PREFIX: &str = "Recommended models";
 
 /// The first line of the `rocm model --verbose` listing.
 const MODEL_CATALOG_VERBOSE_HEADER: &str = "model recipes";
+
+/// What the figure an integrated GPU was weighed against actually is.
+///
+/// Held here because the unit tests and the e2e steps match it as a literal,
+/// and a sentence spelled out in four places drifts in three of them.
+///
+/// It does not say the GPU "has no dedicated VRAM". Such a part usually does
+/// report some: the BIOS carve-out, which the simulated hosts behind
+/// `model-catalog-10` and `-13` plant as a VRAM counter and which the docs call
+/// a carve-out. (`model-catalog-12` plants none, which is the other shape this
+/// wording has to stay true on.) The claim that is true, and the one that
+/// matters to a reader
+/// deciding whether a narrowed list will hold, is about the figure used: it is
+/// a ceiling on memory shared with the operating system rather than memory set
+/// aside for the model.
+pub(crate) const SHARED_POOL_NOTE: &str = " That figure is a ceiling on memory this GPU shares with the operating system, not memory \
+     set aside for it: how much is free depends on what else is running.";
 
 /// Whether `text` is one of the two `rocm model` listings this module renders.
 ///
@@ -181,10 +199,10 @@ const MAX_RECOMMENDATIONS_PER_PLATFORM: usize = 3;
 /// They stay reachable: `rocm serve` takes any model, and `rocm model
 /// --verbose` lists every recipe with what it needs. What they do not do is
 /// get *recommended* on the strength of a figure nobody supplied.
-fn recipe_fits_gpu(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: f64) -> bool {
+fn recipe_fits_gpu(recipe: &ModelRecipeRecord, gpu_memory_gib: f64) -> bool {
     recipe
         .min_gpu_mem_gb
-        .is_some_and(|required| aggregate_gpu_vram_gib >= f64::from(required))
+        .is_some_and(|required| gpu_memory_gib >= f64::from(required))
 }
 
 /// The recommendation order within one hardware group: most capable first.
@@ -313,9 +331,14 @@ fn recipe_engine_gfx_unsupported(
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
     _paths: Option<&AppPaths>,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory: Option<ListingGpuMemory>,
     _host_ram_gib: Option<f64>,
 ) -> String {
+    // Selection weighs the figure alone. The row label and the closing note
+    // both read the kind as well, which is why the whole value travels rather
+    // than only the number -- and why this local is not named for VRAM, which
+    // is exactly what it is not on half the hosts that reach here.
+    let measured_gib = gpu_memory.map(|gpu| gpu.total_gib);
     let mut output = String::new();
     let registry = match load_model_recipe_registry() {
         Ok(registry) => registry,
@@ -331,11 +354,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     let show_all = !matches!(registry.source, ModelRecipeRegistrySource::BuiltIn);
     // Only the built-in catalog is narrowed to what runs here; `None` also means
     // "do not filter", which is what an unmeasured host gets.
-    let fit = if show_all {
-        None
-    } else {
-        aggregate_gpu_vram_gib
-    };
+    let fit = if show_all { None } else { measured_gib };
     let visible = registry.recipes.iter().collect::<Vec<_>>();
     let platforms = model_catalog_platforms(&registry);
     let host_gfx_family = detect_host_gfx_target()
@@ -386,8 +405,10 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
                 .quantization
                 .clone()
                 .unwrap_or_else(|| model_recipe_memory_label(recipe));
-            let fit_label = aggregate_gpu_vram_gib
-                .and_then(|available| model_recipe_gpu_fit_label(recipe, available))
+            let fit_label = gpu_memory
+                .and_then(|gpu| {
+                    model_recipe_gpu_fit_label(recipe, gpu.total_gib, gpu.is_shared_pool)
+                })
                 .map_or_else(String::new, |label| format!("  {label}"));
             let _ = writeln!(
                 output,
@@ -399,6 +420,19 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     // Say why the list is the length it is. Without this a narrowed list reads
     // as a small catalog, and an empty one reads as a broken command.
     if !show_all {
+        // An integrated GPU was weighed against a ceiling on memory it shares
+        // with the operating system, not against memory set aside for the model.
+        // Every branch that reached a verdict carries that, because a narrowed
+        // list otherwise reads as a promise that the models left in it will fit
+        // whatever else the machine is doing -- the same
+        // unknown-presented-as-a-fact this listing exists to stop. The
+        // unmeasured branch below says nothing about it: no figure was weighed
+        // there, so there is no figure to qualify.
+        let shared_pool_note = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+            SHARED_POOL_NOTE
+        } else {
+            ""
+        };
         if fit.is_none() {
             let _ = writeln!(
                 output,
@@ -410,16 +444,19 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
                 output,
                 "\nNone of the curated models fit this machine's GPU memory. You can still serve \
                  a smaller model of your own, and `rocm model --verbose` lists every curated \
-                 recipe with what it needs."
+                 recipe with what it needs.{shared_pool_note}"
             );
         } else if also_fit_total > 0 {
             let _ = writeln!(
                 output,
                 "\nNarrowed to what this machine can run; {also_fit_total} more curated model(s) \
-                 also fit. `rocm model --verbose` lists them all."
+                 also fit. `rocm model --verbose` lists them all.{shared_pool_note}"
             );
         } else {
-            let _ = writeln!(output, "\nNarrowed to what this machine can run.");
+            let _ = writeln!(
+                output,
+                "\nNarrowed to what this machine can run.{shared_pool_note}"
+            );
         }
     }
     if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
@@ -448,23 +485,40 @@ fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
 /// `None` where the recipe declares no minimum: the comparison has no subject,
 /// and saying "fits" on the strength of a figure nobody wrote down is the same
 /// unknown-read-as-a-fact that [`recipe_fits_gpu`] exists to refuse.
+///
+/// On a shared pool both labels change, for the two different reasons the rest
+/// of this file already gives. "fits this GPU" would claim of an integrated part
+/// exactly what `assess_model_readiness` refuses to claim about it — clearing an
+/// aperture the operating system also draws on is `Degraded`, never `Ready` —
+/// and "needs a larger GPU" would tell its owner to fit a card the machine has
+/// no slot for. The closing note qualifies the list as a whole, but a row is
+/// read on its own, and the signed-index path prints rows with no closing note
+/// at all.
 fn model_recipe_gpu_fit_label(
     recipe: &ModelRecipeRecord,
     available_gib: f64,
+    is_shared_pool: bool,
 ) -> Option<&'static str> {
     let required = recipe.min_gpu_mem_gb?;
-    Some(if available_gib >= f64::from(required) {
-        "fits this GPU"
-    } else {
-        "needs a larger GPU"
-    })
+    Some(
+        match (available_gib >= f64::from(required), is_shared_pool) {
+            (true, false) => "fits this GPU",
+            (true, true) => "fits this shared pool",
+            (false, false) => "needs a larger GPU",
+            (false, true) => "larger than this shared pool",
+        },
+    )
 }
 
 pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
     paths: Option<&AppPaths>,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory: Option<ListingGpuMemory>,
     host_ram_gib: Option<f64>,
 ) -> String {
+    // `--verbose` lists every recipe whatever the host is, so the shared-pool
+    // distinction never changes *which* rows appear here -- but it does change
+    // what each row's `reason` line calls the figure, so the whole value is
+    // handed down rather than just the number.
     let mut output = String::new();
     let _ = writeln!(output, "{MODEL_CATALOG_VERBOSE_HEADER}");
     let registry = match load_model_recipe_registry() {
@@ -526,13 +580,7 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         }
         append_model_recipe_metadata_lines(&mut output, recipe, paths);
         append_model_host_ram_fit_lines(&mut output, recipe, host_ram_gib);
-        append_model_fit_lines(
-            &mut output,
-            recipe,
-            aggregate_gpu_vram_gib,
-            &host_gpu,
-            paths,
-        );
+        append_model_fit_lines(&mut output, recipe, gpu_memory, &host_gpu, paths);
         append_model_engine_support_lines(&mut output, recipe, paths, &docker_reachable);
         if recipe.trust_remote_code {
             let _ = writeln!(output, "      trust_remote_code: true");
@@ -903,10 +951,22 @@ fn append_model_host_ram_fit_lines(
 fn append_model_fit_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory: Option<ListingGpuMemory>,
     host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
     paths: Option<&AppPaths>,
 ) {
+    let gpu_memory_gib = gpu_memory.map(|gpu| gpu.total_gib);
+    // Name what the figure *is*, not only how large it is. An integrated GPU
+    // has no VRAM, so calling its pool that asserts memory private to the card
+    // -- the claim `assess_model_readiness` refuses for this very host, forcing
+    // `Degraded` rather than `Ready`. Before this change an APU reached here
+    // with no figure and took the `unknown` arm; saying the wrong thing is
+    // worse than saying nothing, so the figure arrives labelled.
+    let memory_label = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+        "shared GPU memory pool"
+    } else {
+        "aggregate GPU VRAM"
+    };
     let engine_target = preferred_engine_action_target(recipe, host_gpu, paths);
     match recipe.min_gpu_mem_gb {
         None => {
@@ -923,15 +983,42 @@ fn append_model_fit_lines(
                 engine_target
             );
         }
-        Some(required) => match aggregate_gpu_vram_gib {
+        Some(required) => match gpu_memory_gib {
             Some(available) if available >= f64::from(required) => {
                 let _ = writeln!(output, "      gpu_fit: supported");
                 let _ = writeln!(
                     output,
-                    "      reason: aggregate GPU VRAM {} meets recipe minimum {}",
+                    "      reason: {memory_label} {} meets recipe minimum {}",
                     format_gib(available),
                     format_gib(f64::from(required))
                 );
+                // The row a user acts on, and the last place this qualification
+                // was missing. `assess_model_readiness` answers `Degraded` for
+                // this exact host and recipe and never `Ready`, because clearing
+                // a ceiling the operating system also draws on says nothing
+                // about what is free. Without this, `--verbose` reports a bare
+                // `supported` while `rocm diagnose --model` hedges about the
+                // same pair -- and the closing note that carries this everywhere
+                // else in the curated listing has no counterpart in this
+                // renderer.
+                //
+                // The `DEGRADED` half of the sentence is a claim about another
+                // command, so it is held by scenarios that run that command on
+                // a planted APU rather than by this renderer's own tests:
+                // `diagnose-81` on a host whose pool is read, and `diagnose-91`
+                // on one with no VRAM telemetry at all, both require
+                // `rocm diagnose --model` to answer degraded and say the pool is
+                // shared rather than set aside. `diagnose-85` pins the other
+                // side -- a CPU-only recipe is not softened by a pool it never
+                // allocates from -- so the claim cannot be satisfied by always
+                // degrading.
+                if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+                    let _ = writeln!(
+                        output,
+                        "      note: that pool is shared with the operating system, so how much of it is free depends on what else is running; `rocm diagnose --model {}` weighs the same figure and will not promise more than DEGRADED",
+                        recipe_display_ref(recipe)
+                    );
+                }
                 let _ = writeln!(
                     output,
                     "      action: use /plan serve {} with {}",
@@ -943,17 +1030,30 @@ fn append_model_fit_lines(
                 let _ = writeln!(output, "      gpu_fit: unsupported");
                 let _ = writeln!(
                     output,
-                    "      reason: aggregate GPU VRAM {} is below recipe minimum {}",
+                    "      reason: {memory_label} {} is below recipe minimum {}",
                     format_gib(available),
                     format_gib(f64::from(required))
                 );
-                let _ = writeln!(
-                    output,
-                    "      action: choose a recipe with min_gpu_mem <= {} or use a GPU with at least {} before serving",
-                    format_gib(available),
-                    format_gib(f64::from(required))
-                );
-                append_manual_alternative_lines(output, recipe, aggregate_gpu_vram_gib);
+                // An integrated GPU's pool is BIOS and driver policy, not a
+                // card, so "use a GPU with at least N" is advice its owner
+                // cannot act on -- there is no card to swap. Both halves of the
+                // sentence move together, because the smaller-recipe half is
+                // the only one left that is actually actionable there.
+                let _ = if gpu_memory.is_some_and(|gpu| gpu.is_shared_pool) {
+                    writeln!(
+                        output,
+                        "      action: choose a recipe with min_gpu_mem <= {} -- the figure above is the pool this machine allows its integrated graphics, not a card that can be swapped for a larger one",
+                        format_gib(available)
+                    )
+                } else {
+                    writeln!(
+                        output,
+                        "      action: choose a recipe with min_gpu_mem <= {} or use a GPU with at least {} before serving",
+                        format_gib(available),
+                        format_gib(f64::from(required))
+                    )
+                };
+                append_manual_alternative_lines(output, recipe, gpu_memory_gib);
             }
             None => {
                 let _ = writeln!(output, "      gpu_fit: unknown");
@@ -983,9 +1083,9 @@ fn append_model_fit_lines(
 fn append_manual_alternative_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory_gib: Option<f64>,
 ) {
-    let alternatives = manual_alternative_recommendations(recipe, aggregate_gpu_vram_gib);
+    let alternatives = manual_alternative_recommendations(recipe, gpu_memory_gib);
     if alternatives.is_empty() {
         let _ = writeln!(output, "      manual_alternatives: <none declared>");
     } else {
@@ -1013,11 +1113,11 @@ fn append_manual_alternative_lines(
 #[allow(dead_code)]
 fn manual_alternative_recommendations(
     recipe: &ModelRecipeRecord,
-    aggregate_gpu_vram_gib: Option<f64>,
+    gpu_memory_gib: Option<f64>,
 ) -> Vec<String> {
     let catalog = builtin_model_recipes();
     rocm_core::model_readiness::curated_alternatives(Some(recipe), &catalog, &|candidate| {
-        recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib)
+        recipe_is_manual_fit(candidate, gpu_memory_gib)
     })
     .into_iter()
     .map(|(candidate_ref, candidate)| {
@@ -1047,12 +1147,10 @@ fn manual_alternative_recommendations(
 }
 
 #[allow(dead_code)]
-fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: Option<f64>) -> bool {
+fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, gpu_memory_gib: Option<f64>) -> bool {
     match recipe.min_gpu_mem_gb {
         None => true,
-        Some(required) => {
-            aggregate_gpu_vram_gib.is_some_and(|available| available >= f64::from(required))
-        }
+        Some(required) => gpu_memory_gib.is_some_and(|available| available >= f64::from(required)),
     }
 }
 
@@ -1394,7 +1492,11 @@ mod tests {
         // (~54) but not Gemma-4-31B (~62), and the one that does not fit is no
         // longer offered rather than offered with a refusal beside it --
         // "recommended" and "needs a larger GPU" cannot both be true of a row.
-        let rendered = render_model_registry_text_with_context_and_host(None, Some(60.0), None);
+        let rendered = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(60.0)),
+            None,
+        );
 
         assert!(rendered.contains("fits this GPU"));
         assert!(
@@ -1405,6 +1507,207 @@ mod tests {
         assert!(
             rendered.contains("Narrowed to what this machine can run"),
             "the narrowing must be stated, or a short list reads as a small catalog: {rendered}"
+        );
+    }
+
+    /// An integrated GPU is narrowed on the pool it shares with the operating
+    /// system, and the listing says that is what the figure was.
+    ///
+    /// The same figure is rendered twice, once as a shared ceiling and once as a
+    /// discrete card's VRAM, because the selection is identical between them --
+    /// only the caveat differs. Asserting its presence alone would pass on a
+    /// build that printed it for every host, which would be a false claim on the
+    /// discrete majority.
+    #[test]
+    fn an_integrated_gpu_is_narrowed_on_its_shared_pool_and_told_the_pool_is_shared() {
+        const SHARED_CAVEAT: &str = SHARED_POOL_NOTE;
+
+        let shared = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(60.0)),
+            None,
+        );
+        assert!(
+            shared.contains("Narrowed to what this machine can run"),
+            "a measured pool must narrow the listing the way measured VRAM does: {shared}"
+        );
+        assert!(
+            shared.contains(SHARED_CAVEAT),
+            "a narrowed shared pool reads as a promise of free memory unless it is \
+             qualified: {shared}"
+        );
+
+        let dedicated = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(60.0)),
+            None,
+        );
+        assert!(
+            !dedicated.contains(SHARED_CAVEAT),
+            "a discrete card's VRAM is not shared with the OS, so saying it is would be \
+             false: {dedicated}"
+        );
+    }
+
+    /// Each row says which kind of memory it was weighed against.
+    ///
+    /// The closing note qualifies the list as a whole, but a row is read on its
+    /// own — and the signed-index path prints rows with no closing note at all,
+    /// so on that path the label is the only thing that can carry it. Both
+    /// polarities move: "fits this GPU" would claim of an integrated part what
+    /// `assess_model_readiness` refuses to claim (clearing a shared aperture is
+    /// `Degraded`, never `Ready`), and "needs a larger GPU" would tell its owner
+    /// to fit a card the machine has no slot for.
+    #[test]
+    fn a_row_says_whether_it_was_weighed_against_a_card_or_a_shared_pool() {
+        let recipes = builtin_model_recipes();
+        let declared = recipes
+            .iter()
+            .find(|recipe| recipe.min_gpu_mem_gb.is_some())
+            .expect("the catalog ships recipes with declared GPU minimums");
+        let required = f64::from(declared.min_gpu_mem_gb.expect("a minimum"));
+
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required, false),
+            Some("fits this GPU")
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required, true),
+            Some("fits this shared pool"),
+            "a shared ceiling is not the card-of-its-own this phrasing implies"
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required / 2.0, false),
+            Some("needs a larger GPU")
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(declared, required / 2.0, true),
+            Some("larger than this shared pool"),
+            "there is no larger card to fit on a machine whose graphics have no memory of \
+             their own"
+        );
+    }
+
+    /// `--verbose` names an integrated GPU's figure for what it is.
+    ///
+    /// Every per-recipe row weighs the same number, so before this the verdict
+    /// lines on an APU and on a discrete card of the same size were byte-for-byte
+    /// identical — both claiming "aggregate GPU VRAM", which is the one phrase
+    /// that asserts memory private to the card. An APU reached these rows with no
+    /// figure at all until the listing started measuring one, so this is a claim
+    /// the change introduced rather than one it inherited.
+    ///
+    /// Both the fits and the does-not-fit verdicts are checked, because they
+    /// build their reason lines separately and only one was wrong at a time while
+    /// this was being fixed.
+    #[test]
+    fn verbose_calls_a_shared_pool_a_pool_and_a_discrete_card_vram() {
+        let minimums = builtin_model_recipes()
+            .iter()
+            .filter_map(|recipe| recipe.min_gpu_mem_gb)
+            .collect::<Vec<_>>();
+        let smallest = f64::from(*minimums.iter().min().expect("a declared minimum"));
+        let largest = f64::from(*minimums.iter().max().expect("a declared minimum"));
+
+        // Above the smallest and below the largest, so one row reaches the
+        // "meets" verdict and another the "is below" verdict in the same render.
+        let figure = f64::midpoint(smallest, largest);
+
+        let shared = render_model_registry_verbose_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(figure)),
+            None,
+        );
+        assert!(
+            shared.contains("shared GPU memory pool") && !shared.contains("aggregate GPU VRAM"),
+            "an integrated GPU has no VRAM, so no row may call its pool that: {shared}"
+        );
+
+        let dedicated = render_model_registry_verbose_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(figure)),
+            None,
+        );
+        assert!(
+            dedicated.contains("aggregate GPU VRAM") && !dedicated.contains("shared GPU memory"),
+            "a discrete card's VRAM is its own, and calling it shared would be the same \
+             misstatement in reverse: {dedicated}"
+        );
+    }
+
+    /// The shared-memory caveat reaches the *other* two closing messages too.
+    ///
+    /// Three branches can report a verdict — nothing fits, narrowed with more
+    /// also fitting, and narrowed with no remainder — and only the middle one
+    /// was covered, because both earlier tests happened to pick figures landing
+    /// there. Deleting the caveat from either of the others left every test
+    /// green. The figures are derived from the catalog rather than written down,
+    /// so a recipe added tomorrow cannot silently move a case into an arm it was
+    /// not written for.
+    #[test]
+    fn the_shared_memory_caveat_reaches_the_nothing_fits_and_bare_narrowed_messages() {
+        const SHARED_CAVEAT: &str = SHARED_POOL_NOTE;
+
+        let minimums = builtin_model_recipes()
+            .iter()
+            .filter_map(|recipe| recipe.min_gpu_mem_gb)
+            .collect::<Vec<_>>();
+        let smallest = f64::from(
+            *minimums
+                .iter()
+                .min()
+                .expect("the catalog ships recipes with declared GPU minimums"),
+        );
+
+        // Below every declared minimum, so the listing offers nothing.
+        let nothing_fits = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(smallest / 2.0)),
+            None,
+        );
+        assert!(
+            nothing_fits.contains("None of the curated models fit"),
+            "{nothing_fits}"
+        );
+        assert!(
+            nothing_fits.contains(SHARED_CAVEAT),
+            "a host told nothing fits is being told so about a shared ceiling, and the figure \
+             it was judged against has to say so: {nothing_fits}"
+        );
+
+        // Exactly the smallest minimum: the fewest recipes that can still be
+        // offered, which is what empties the "and N more also fit" remainder and
+        // reaches the bare narrowed message.
+        let bare = render_model_registry_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::shared_pool(smallest)),
+            None,
+        );
+        assert!(
+            bare.contains(&format!(
+                "Narrowed to what this machine can run.{SHARED_CAVEAT}"
+            )),
+            "the bare narrowed message must carry the caveat immediately, with no remainder \
+             clause between them: {bare}"
+        );
+    }
+
+    /// An APU whose aperture could not be read reaches the renderer as "no
+    /// figure", so it takes the unmeasured branch and is not narrowed. The
+    /// caveat has nothing to qualify there and must not appear: the listing
+    /// would otherwise explain a narrowing it did not perform.
+    #[test]
+    fn an_unreadable_pool_is_not_narrowed_and_carries_no_shared_caveat() {
+        let rendered = render_model_registry_text_with_context_and_host(None, None, None);
+
+        assert!(
+            rendered.contains("could not be read"),
+            "an unmeasured host must be told its list is not specific to it: {rendered}"
+        );
+        assert!(!rendered.contains(SHARED_POOL_NOTE.trim()), "{rendered}");
+        assert!(
+            !rendered.contains("Narrowed to what this machine can run"),
+            "{rendered}"
         );
     }
 
@@ -1421,9 +1724,14 @@ mod tests {
             .expect("the catalog ships recipes with no declared GPU minimum");
 
         assert_eq!(
-            model_recipe_gpu_fit_label(undeclared, 0.25),
+            model_recipe_gpu_fit_label(undeclared, 0.25, false),
             None,
             "a model with no declared minimum must not be labelled against a host's memory"
+        );
+        assert_eq!(
+            model_recipe_gpu_fit_label(undeclared, 0.25, true),
+            None,
+            "nor against a shared pool, which is a figure in exactly the same way"
         );
     }
 
@@ -1835,8 +2143,11 @@ mod tests {
 
     #[test]
     fn render_model_registry_text_reports_supported_and_unsupported_gpu_fit() {
-        let rendered =
-            render_model_registry_verbose_text_with_context_and_host(None, Some(16.0), None);
+        let rendered = render_model_registry_verbose_text_with_context_and_host(
+            None,
+            Some(ListingGpuMemory::dedicated(16.0)),
+            None,
+        );
 
         assert!(rendered.contains("gpu_fit: supported"));
         assert!(rendered.contains("aggregate GPU VRAM 16 GiB meets recipe minimum 12 GiB"));

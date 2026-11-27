@@ -166,7 +166,7 @@ impl AcceleratorMemory {
     /// cannot fit however free the machine is -- but clearing it does not make
     /// the model `Ready`, because the pool is shared. The verdict side of that
     /// is in `assess_model_readiness`, not here.
-    pub(crate) const fn measured_gib(self) -> Option<f64> {
+    pub const fn measured_gib(self) -> Option<f64> {
         match self {
             Self::Dedicated(gib)
             | Self::Unified {
@@ -178,7 +178,7 @@ impl AcceleratorMemory {
 
     /// Whether the figure above is a ceiling on memory shared with the
     /// operating system rather than a dedicated pool.
-    pub(crate) const fn is_shared_pool(self) -> bool {
+    pub const fn is_shared_pool(self) -> bool {
         matches!(self, Self::Unified { .. })
     }
 }
@@ -570,9 +570,9 @@ fn assess(
             readiness.verdict = ModelVerdict::Undetermined;
             readiness.undetermined_reason = Some(UndeterminedReason::UnifiedMemoryUnreadable);
             readiness.evidence.push(format!(
-                "this recipe needs {}, but this host has no dedicated VRAM and the figure for \
-                 the memory pool its engine allocates from could not be read here; there is \
-                 nothing to run today that would change this answer",
+                "this recipe needs {}, but this host's GPU allocates from a pool it shares \
+                 with the operating system and the figure for that pool could not be read here; \
+                 there is nothing to run today that would change this answer",
                 format_gib(required)
             ));
             readiness.fix = None;
@@ -689,9 +689,9 @@ fn assess(
         let was_ready = readiness.verdict == ModelVerdict::Ready;
         readiness.verdict = ModelVerdict::Degraded;
         readiness.evidence.push(
-            "this host's integrated GPU has no dedicated VRAM: that figure is the ceiling on a \
-             pool it shares with the operating system, not memory set aside for the model, so \
-             how much of it is free depends on what else is running"
+            "that figure is the ceiling on a pool this integrated GPU shares with the \
+             operating system, not memory set aside for the model, so how much of it is free \
+             depends on what else is running"
                 .to_owned(),
         );
         if was_ready {
@@ -1671,7 +1671,7 @@ mod tests {
             readiness
                 .evidence
                 .iter()
-                .any(|line| line.contains("no dedicated VRAM")),
+                .any(|line| line.contains("shares with the operating system")),
             "the report has to say why, in terms an APU user can act on: {:?}",
             readiness.evidence
         );
@@ -1728,11 +1728,19 @@ mod tests {
             Some(60.0),
             "the verdict is reached against the pool, not the carve-out beside it"
         );
+        // Anchored on a fragment that names the subject, not on the bare
+        // "shares with the operating system" the negative assertions elsewhere
+        // in this file use. The sentence this site used to carry -- "this
+        // host's integrated GPU has no dedicated VRAM: that figure is the
+        // ceiling on a pool it shares with the operating system ..." --
+        // contained the shorter phrase too, so restoring the retired denial
+        // would not have been caught. It was retired because an integrated GPU
+        // usually does report VRAM: the BIOS carve-out, which is exactly what
+        // the APU fixtures plant.
         assert!(
-            ample
-                .evidence
-                .iter()
-                .any(|line| line.contains("shares with the operating system")),
+            ample.evidence.iter().any(|line| {
+                line.contains("a pool this integrated GPU shares with the operating system")
+            }),
             "`degraded` without the reason reads as a property of the model: {:?}",
             ample.evidence
         );
@@ -1860,7 +1868,7 @@ mod tests {
     ///
     /// The shared-pool check is the last thing `assess` does, and it used to
     /// fire on the host alone: any `Ready`/`Degraded` verdict on an APU was
-    /// downgraded, told "this host's integrated GPU has no dedicated VRAM" and
+    /// downgraded, told the figure is a shared ceiling and
     /// handed a plan about freeing memory and serving. For a
     /// `cpu_only` recipe that is a remediation for a device the model does not
     /// touch -- and one attached to evidence no earlier branch put in the
@@ -1937,7 +1945,7 @@ mod tests {
             readiness
                 .evidence
                 .iter()
-                .any(|line| line.contains("no dedicated VRAM")),
+                .any(|line| line.contains("shares with the operating system")),
             "premise: the shared-pool gate must also have fired: {:?}",
             readiness.evidence
         );
@@ -2005,7 +2013,7 @@ mod tests {
         assert!(
             !cpu.evidence
                 .iter()
-                .any(|line| line.contains("no dedicated VRAM")),
+                .any(|line| line.contains("shares with the operating system")),
             "the report volunteered GPU evidence for a `cpu_only` recipe: {:?}",
             cpu.evidence
         );
@@ -2065,7 +2073,7 @@ mod tests {
                 !readiness
                     .evidence
                     .iter()
-                    .any(|line| line.contains("no dedicated VRAM")),
+                    .any(|line| line.contains("shares with the operating system")),
                 "{}: the report claimed the pool was too small for a model it never sized: {:?}",
                 recipe.canonical_model_id,
                 readiness.evidence
