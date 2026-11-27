@@ -889,7 +889,6 @@ fn local_chat_service_needed_text(model: Option<&str>, prompt: &str, rocm_tools:
         output,
         "For the guided flow, run `rocm`, choose Start a local model, start a model, then choose Chat."
     );
-    let _ = writeln!(output, "Nothing was changed.");
     output.trim_end().to_owned()
 }
 
@@ -1775,7 +1774,7 @@ install therock";
         ));
         assert!(!rendered.contains("sshleifer/tiny-gpt2"));
         assert!(rendered.contains("rocm chat --tools --provider local --prompt"));
-        assert!(rendered.contains("Nothing was changed."));
+        assert!(!rendered.contains("Nothing was changed."));
         assert!(!rendered.contains("install sdk"));
         assert!(!rendered.contains("setup TheRock with an LLM"));
     }

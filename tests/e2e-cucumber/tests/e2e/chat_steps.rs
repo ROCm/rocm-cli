@@ -708,6 +708,44 @@ async fn cli_names_the_ready_server(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user runs the chat command the CLI printed")]
+async fn user_runs_the_printed_chat_command(world: &mut E2eWorld) {
+    // The advice is only worth printing if following it clears the condition
+    // that printed it, so run exactly the line shown, minus the program name.
+    let stderr = chat_stderr(world).to_owned();
+    let line = offered_chat_commands(&stderr)
+        .into_iter()
+        .next()
+        .expect("the CLI printed no chat command");
+    let args: Vec<String> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|arg| arg.trim_matches('\'').to_owned())
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
+    assert!(
+        rc == 0,
+        "the printed command must work (rc={rc}):\n{stdout}\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the served model received the prompt")]
+async fn served_model_received_the_prompt(world: &mut E2eWorld) {
+    let requests = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .chat_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.to_string().contains("Hello")),
+        "the model must receive the prompt when the printed command is run, got {requests:?}"
+    );
+}
+
 #[then("the CLI says on stderr that no local assistant is running yet")]
 async fn cli_says_no_assistant_on_stderr(world: &mut E2eWorld) {
     let stderr = chat_stderr(world);

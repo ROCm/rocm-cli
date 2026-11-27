@@ -323,6 +323,9 @@ Feature: Chat and endpoint detection
     Then the CLI fails and nothing is printed to standard output
     And the CLI says a local server is running and prints the chat command naming that model
     And the served model never received the prompt
+    When the user runs the chat command the CLI printed
+    Then the CLI prints the assistant's reply
+    And the served model received the prompt
 
   # With no server at all the guidance to start one stays, but the command now
   # fails like any other that could not do what was asked, with the message on

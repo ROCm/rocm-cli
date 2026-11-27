@@ -2906,8 +2906,10 @@ planted non-assistant server, no server, the same server with `--tools`, and a
 `--model` nothing serves. Each requires a non-zero exit with an empty standard
 output and the message on stderr (the ready server listed by its `--model`
 name with the command that uses it, `--tools` left out of that command with the
-reason, or "No local assistant is running yet."), and the served model never to
-have received the prompt (its readiness probe is not the prompt):
+reason, or "No local assistant is running yet."). `chat-25`, `chat-27` and
+`chat-28` also require that the served model never received the prompt (its
+readiness probe is not the prompt), and `chat-25` then runs the command it was
+shown and requires that the reply prints and the model receives the prompt:
 
 ```bash
 cargo xtask e2e -- -n "chat-25"
