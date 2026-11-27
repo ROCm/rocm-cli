@@ -8379,7 +8379,6 @@ The following component(s) are licensed under Apache License 2.0:
   - num-conv 0.2.2 <https://github.com/jhpratt/num-conv>
   - objc2-core-foundation 0.3.2 <https://github.com/madsmtm/objc2>
   - objc2-io-kit 0.3.2 <https://github.com/madsmtm/objc2>
-  - objc2-open-directory 0.3.2 <https://github.com/madsmtm/objc2>
   - pin-project-internal 1.1.13 <https://github.com/taiki-e/pin-project>
   - pin-project-lite 0.2.17 <https://github.com/taiki-e/pin-project-lite>
   - pin-project 1.1.13 <https://github.com/taiki-e/pin-project>
@@ -10794,9 +10793,6 @@ The following component(s) are licensed under MIT License:
   - async-stream-impl 0.3.6 <https://github.com/tokio-rs/async-stream>
   - async-stream 0.3.6 <https://github.com/tokio-rs/async-stream>
   - libm 0.2.16 <https://github.com/rust-lang/compiler-builtins>
-  - objc2-encode 4.1.0 <https://github.com/madsmtm/objc2>
-  - objc2-foundation 0.3.2 <https://github.com/madsmtm/objc2>
-  - objc2 0.6.4 <https://github.com/madsmtm/objc2>
   - peg-macros 0.6.3 <https://github.com/kevinmehall/rust-peg>
   - peg-runtime 0.6.3 <https://github.com/kevinmehall/rust-peg>
 
@@ -11167,7 +11163,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - sysinfo 0.39.6 <https://github.com/GuillaumeGomez/sysinfo>
+  - sysinfo 0.40.1 <https://github.com/GuillaumeGomez/sysinfo>
 
 The MIT License (MIT)
 
