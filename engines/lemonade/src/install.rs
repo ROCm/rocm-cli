@@ -254,11 +254,12 @@ fn stage_runtime(
 /// `staging_dir` on every failure except one that leaves the old tree only in
 /// `runtime.previous`, where the new tree is kept beside it.
 ///
-/// `runtime.staging` and `runtime.previous` are not scoped to a version and
-/// nothing locks the tree, so a second process installing a different version
-/// at the same time can read this process's in-flight swap as an interrupted
-/// one. That is the same unserialised case as two such installs racing for the
-/// backend pin, and it stays an accepted, unrecovered limitation.
+/// `runtime.staging` and `runtime.previous` are not scoped to a version, and
+/// only the per-archive lock (`archive_guard`), which is per version, is held
+/// across staging and the swap. A second process installing a different
+/// version at the same time can therefore delete this process's
+/// `runtime.staging` as a leftover, or read its in-flight swap as an
+/// interrupted one. That stays an accepted, unrecovered limitation.
 fn swap_in_runtime(staging_dir: &Path, runtime_dir: &Path) -> Result<()> {
     swap_in_runtime_with(staging_dir, runtime_dir, |from, to| fs::rename(from, to))
 }
@@ -268,8 +269,26 @@ fn swap_in_runtime(staging_dir: &Path, runtime_dir: &Path) -> Result<()> {
 fn swap_in_runtime_with(
     staging_dir: &Path,
     runtime_dir: &Path,
-    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<()> {
+    let warning = swap_in_runtime_using(staging_dir, runtime_dir, rename, |dir| {
+        fs::remove_dir_all(dir)
+    })?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+/// The swap itself. Returns the warning for an old tree that could not be
+/// removed once the new one was in place, so a test can see it and the tree
+/// state it leaves; `remove` is injectable for the same reason as `rename`.
+fn swap_in_runtime_using(
+    staging_dir: &Path,
+    runtime_dir: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<Option<String>> {
     let previous_dir = previous_dir_for(runtime_dir);
     if runtime_dir.exists() {
         let moved_aside = (|| -> Result<()> {
@@ -317,18 +336,17 @@ fn swap_in_runtime_with(
         });
     }
     // Nothing was moved aside on a fresh install, so there is nothing to remove.
-    if fallback
-        && let Some(warning) = remove_previous_runtime(&previous_dir, |dir| fs::remove_dir_all(dir))
-    {
-        eprintln!("{warning}");
-    }
-    Ok(())
+    Ok(if fallback {
+        remove_previous_runtime(&previous_dir, remove)
+    } else {
+        None
+    })
 }
 
 /// Removes the old runtime the swap left in `previous_dir`. The new runtime is
 /// already in place, so a failure here does not fail the install (a file held
 /// open or a scanner can block it); the returned warning says the old tree is
-/// still on the drive, and its space is not free for the backend download.
+/// still on the drive.
 fn remove_previous_runtime(
     previous_dir: &Path,
     remove: impl FnOnce(&Path) -> std::io::Result<()>,
@@ -1480,16 +1498,23 @@ mod tests {
         assert!(!previous_dir_for(&runtime_dir).exists());
     }
 
-    /// Removing the old tree after a successful swap is best effort: a failure
-    /// is reported as a warning that names the folder still holding the space,
-    /// and success reports nothing.
+    /// Removing the old tree after a successful swap is best effort: when it
+    /// fails the swap still succeeds with the new tree in place, and the
+    /// warning names the folder still holding the old tree's space.
     #[test]
     fn a_previous_runtime_that_cannot_be_removed_is_reported_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
-        let previous_dir = dir.path().join("runtime.previous");
-        fs::create_dir_all(&previous_dir).unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+        let previous_dir = previous_dir_for(&runtime_dir);
 
-        let warning = remove_previous_runtime(&previous_dir, |_| Err(denied())).unwrap();
+        let warning = swap_in_runtime_using(
+            &staging_dir,
+            &runtime_dir,
+            |from, to| fs::rename(from, to),
+            |_| Err(denied()),
+        )
+        .unwrap()
+        .expect("a failed removal is reported");
 
         assert!(
             warning.contains("the new Lemonade runtime is in place")
@@ -1498,12 +1523,29 @@ mod tests {
                 && warning.contains("delete it to free its space"),
             "{warning}"
         );
-        assert!(previous_dir.is_dir(), "a failed removal leaves the tree");
-        assert_eq!(
-            remove_previous_runtime(&previous_dir, |dir| fs::remove_dir_all(dir)),
-            None
-        );
-        assert!(!previous_dir.exists());
+        assert!(runtime_dir.join("new.txt").is_file());
+        assert!(!runtime_dir.join("old.txt").exists());
+        assert!(previous_dir.join("old.txt").is_file());
+        assert!(!staging_dir.exists());
+    }
+
+    /// A removal that works reports nothing and leaves only the new tree.
+    #[test]
+    fn a_swap_that_removes_the_previous_runtime_reports_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime_dir, staging_dir) = runtime_and_staging(dir.path());
+
+        let warning = swap_in_runtime_using(
+            &staging_dir,
+            &runtime_dir,
+            |from, to| fs::rename(from, to),
+            |dir| fs::remove_dir_all(dir),
+        )
+        .unwrap();
+
+        assert_eq!(warning, None);
+        assert!(runtime_dir.join("new.txt").is_file());
+        assert!(!previous_dir_for(&runtime_dir).exists());
     }
 
     /// When the old tree cannot be put back either, the message names where it

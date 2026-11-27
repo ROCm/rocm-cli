@@ -78,8 +78,9 @@ pub(crate) struct InstallPreflight {
     /// place, which `lib.rs`'s `install_and_record` completes before it prepares
     /// the backend. That removal is best effort: when it fails the install still
     /// succeeds with a warning and the old tree keeps its space, so the figure
-    /// can overstate the room the backend download has. It is still on the drive
-    /// while the new tree is extracted. Zero when the tree is kept.
+    /// can overstate the room the backend download has. The old folder is also
+    /// still on the drive while the new tree is extracted. Zero when the tree
+    /// is kept.
     pub(crate) replaced_bytes: u64,
     /// Free bytes on the drive holding `target_root`, when known.
     pub(crate) available: Option<u64>,
@@ -252,8 +253,8 @@ impl InstallPreflight {
         let Some(free_now) = self.available else {
             return SpaceVerdict::Fits;
         };
-        // The existing runtime folder is deleted before the backend downloads,
-        // so its space counts for the backend warnings, which say so, so the
+        // The existing runtime folder is normally deleted before the backend
+        // downloads, so its space counts for the backend warnings, which say so, so the
         // figure shown is the one compared. The minimum below does not count
         // it: the old folder is still on the drive while the new embeddable
         // tree is extracted beside it.
@@ -803,7 +804,7 @@ mod tests {
     /// An install that replaces the existing runtime folder removes it once the
     /// new embeddable tree is swapped in (`swap_in_runtime`), before the backend
     /// downloads (`prepare_embeddable` removes the whole folder, backends
-    /// included), so its space is free by then. The preflight sizes that folder,
+    /// included), so its space is normally free by then. The preflight sizes that folder,
     /// counts it for the backend warnings, and says so; an install that keeps
     /// the tree frees nothing.
     #[test]
